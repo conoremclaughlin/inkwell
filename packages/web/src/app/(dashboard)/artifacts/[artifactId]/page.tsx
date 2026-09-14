@@ -400,7 +400,7 @@ export default function ArtifactDetailPage() {
               <input
                 value={commentSlug}
                 onChange={(event) => setCommentSlug(event.target.value)}
-                placeholder="Agent ID (optional, e.g. lumen)"
+                placeholder="SB slug (optional, e.g. lumen)"
                 className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm sm:max-w-xs focus:border-gray-400 focus:outline-none"
               />
               <Button

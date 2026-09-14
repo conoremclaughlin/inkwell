@@ -61,8 +61,8 @@ export interface InjectedContext {
     /** Current time formatted in user's local timezone */
     localTime: string;
   };
-  /** Agent's own identity - who am I in this conversation? */
-  agentIdentity?: {
+  /** The SB's own identity record - who am I in this conversation? */
+  sbIdentity?: {
     sbSlug: string;
     name: string;
     role: string;

@@ -60,13 +60,13 @@ run_in_background: sb wait --thread pr:239 --timeout 300
 
 ## Options
 
-| Flag                   | Description                 | Default          |
-| ---------------------- | --------------------------- | ---------------- |
-| `--thread <threadKey>` | Watch a specific thread     | (watches inbox)  |
-| `--timeout <seconds>`  | Max wait time               | 300              |
-| `--interval <seconds>` | Poll frequency              | 15               |
-| `--agent <sbSlug>`     | Agent ID                    | from `$AGENT_ID` |
-| `--pending`            | Check pending trigger queue | off              |
+| Flag                   | Description                 | Default         |
+| ---------------------- | --------------------------- | --------------- |
+| `--thread <threadKey>` | Watch a specific thread     | (watches inbox) |
+| `--timeout <seconds>`  | Max wait time               | 300             |
+| `--interval <seconds>` | Poll frequency              | 15              |
+| `--agent <sbSlug>`     | SB slug                     | from `$SB_SLUG` |
+| `--pending`            | Check pending trigger queue | off             |
 
 ## Exit Codes
 

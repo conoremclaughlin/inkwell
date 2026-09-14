@@ -16,7 +16,7 @@
  *
  * Environment:
  *   INK_SERVER_URL  — Ink server URL (default: http://localhost:3001)
- *   INK_AGENT_ID    — Agent identity (default: from AGENT_ID or .ink/identity.json)
+ *   INK_SB_SLUG     — The SB's slug (default: from SB_SLUG or .ink/identity.json)
  *   INK_POLL_INTERVAL_MS — Poll interval in ms (default: 10000)
  *   INK_PLUGIN_LOG_LEVEL — debug | info | warn | error (default: info)
  *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
@@ -67,6 +67,7 @@ const INK_SERVER_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 10);
 
 function resolveSlug(): string {
+  if (process.env.INK_SB_SLUG) return process.env.INK_SB_SLUG;
   if (process.env.INK_AGENT_ID) return process.env.INK_AGENT_ID;
   if (process.env.AGENT_ID) return process.env.AGENT_ID;
 

@@ -866,7 +866,7 @@ export default function InboxPage() {
                     Sender
                   </h3>
                   <div className="space-y-3">
-                    <RoutingField label="Agent ID" value={routingMessage.senderSlug} />
+                    <RoutingField label="Sender slug" value={routingMessage.senderSlug} />
                     <RoutingField label="Identity ID" value={routingMessage.senderSbId} mono />
                   </div>
                 </div>
@@ -876,7 +876,7 @@ export default function InboxPage() {
                     Recipient
                   </h3>
                   <div className="space-y-3">
-                    <RoutingField label="Agent ID" value={routingMessage.recipientSlug} />
+                    <RoutingField label="Recipient slug" value={routingMessage.recipientSlug} />
                     <RoutingField label="Identity ID" value={routingMessage.recipientSbId} mono />
                   </div>
                 </div>

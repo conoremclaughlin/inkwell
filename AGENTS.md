@@ -11,17 +11,17 @@ This is the **canonical reference** for all AI agents working in this repository
 Identity is resolved in layers. **Stop at the first match** - do not continue checking lower layers:
 
 1. **System prompt override**: If the system prompt contains an "Identity Override" section naming your slug, use that. **Stop here.**
-2. **Environment variable**: Run `echo $SB_SLUG` in a shell (falling back to `$AGENT_ID`, its pre-rename name, which long-running processes still carry). If it returns a non-empty value, use that as your sbSlug. **Stop here.**
+2. **Environment variable**: Run `echo $SB_SLUG` in a shell. If it returns a non-empty value, use that as your sbSlug. **Stop here.**
 3. **Repo-level identity**: Read `.ink/identity.json` in the current repo.
-4. **Central config**: Read `~/.ink/config.json` `sbMapping` (or `agentMapping`, its pre-rename name — both are read).
+4. **Central config**: Read `~/.ink/config.json` `sbMapping`.
 
 For interactive sessions in this repo, `.ink/identity.json` typically resolves to:
 
 ```json
-{ "sbSlug": "wren", "agentId": "wren", "studioId": "<uuid-or-main>", "context": "main" }
+{ "sbSlug": "wren", "studioId": "<uuid-or-main>", "context": "main" }
 ```
 
-For long-running processes (like the Inkwell server), `SB_SLUG` is set via environment variable and takes precedence. Every spawn path also sets `AGENT_ID` to the same value so that processes and hooks predating the rename keep working.
+For long-running processes (like the Inkwell server), `SB_SLUG` is set via environment variable and takes precedence.
 
 ### Step 2: Load User Config
 
@@ -245,20 +245,20 @@ Tools: `get_identity` / `save_identity` (per-agent), `get_team_constitution` / `
 
 Two things name an SB, and they are not interchangeable:
 
-| Name         | What it is                                            | Unique within     |
-| ------------ | ----------------------------------------------------- | ----------------- |
-| **`sbId`**   | The canonical identity UUID (`agent_identities.id`)   | Everywhere        |
-| **`sbSlug`** | The human-readable name (`agent_identities.agent_id`) | **One workspace** |
+| Name         | What it is                  | Unique within     |
+| ------------ | --------------------------- | ----------------- |
+| **`sbId`**   | The canonical identity UUID | Everywhere        |
+| **`sbSlug`** | The human-readable name     | **One workspace** |
 
 When referencing an SB programmatically — in database columns, API schemas, tool parameters, strategy configs — always use `sbId`, never `sbSlug`.
 
-- **A slug is unique only within a workspace.** `UNIQUE (user_id, workspace_id, agent_id)`. Another workspace may have its own `wren`, and that is intended: **an SB's identity boundary is the workspace**. Studios are work areas inside one.
+- **A slug is unique only within a workspace.** Another workspace may have its own `wren`, and that is intended: **an SB's identity boundary is the workspace**. Studios are work areas inside one.
 - **UUIDs are authoritative** — globally unique, no disambiguation needed.
 - **Resolve at the boundary** — when a human-readable slug is needed for routing (e.g., `send_to_inbox`), resolve UUID → slug at the last moment.
 
-`sbId` → `sbSlug` is always safe: a UUID names exactly one row. The reverse needs a workspace, so `resolveIdentityId()` takes one (defaulting to the request's) and **refuses rather than guessing** when a slug is ambiguous and no workspace narrows it.
+`sbId` → `sbSlug` is always safe: a UUID names exactly one row. The reverse needs a workspace, so `resolveSbId()` takes one (defaulting to the request's) and **refuses rather than guessing** when a slug is ambiguous and no workspace narrows it.
 
-> **Naming note.** The column behind `sbSlug` is still `agent_id`, and the table is still `agent_identities`. The code was renamed ahead of the schema; the migration is a separate change. In TypeScript the pair is always `sbId` / `sbSlug`.
+> **One thing you will see in SQL.** The database has not been migrated yet, so raw queries still name the columns `agent_id` (the slug) and `sb_id` (the UUID), in a table called `agent_identities`. That is the _only_ place the old name is correct. Never introduce it into TypeScript, a tool parameter, or a document — there the pair is always `sbId` / `sbSlug`.
 
 ### Memory Attribution
 

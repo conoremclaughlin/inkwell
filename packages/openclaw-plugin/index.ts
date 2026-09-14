@@ -33,6 +33,8 @@ interface PcpConfig {
 interface PcpUserConfig {
   userId?: string;
   email?: string;
+  sbMapping?: Record<string, string>;
+  /** Pre-rename name for sbMapping. ~/.ink/config.json is the user's file; nothing rewrites it. */
   agentMapping?: Record<string, string>;
 }
 
@@ -74,13 +76,14 @@ function readJsonFile<T>(path: string): T | null {
 function resolveSlug(pluginSlug?: string): string | null {
   if (pluginSlug) return pluginSlug;
 
-  // Check ~/.ink/config.json agentMapping
+  // Check ~/.ink/config.json sbMapping (agentMapping is its pre-rename name)
   const config = readJsonFile<PcpUserConfig>(join(homedir(), '.ink', 'config.json'));
-  if (config?.agentMapping?.openclaw) return config.agentMapping.openclaw;
+  const mapping = config?.sbMapping || config?.agentMapping;
+  if (mapping?.openclaw) return mapping.openclaw;
 
   // Fall back to first mapping
-  if (config?.agentMapping) {
-    const ids = Object.values(config.agentMapping);
+  if (mapping) {
+    const ids = Object.values(mapping);
     if (ids.length > 0) return ids[0];
   }
 
@@ -236,7 +239,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
   if (!sbSlug) {
     api.logger.warn(
       'pcp: no agent ID resolved. Set plugins.entries.pcp.config.sbSlug ' +
-        'or add an openclaw entry to ~/.ink/config.json agentMapping. PCP hooks disabled.'
+        'or add an openclaw entry to ~/.ink/config.json sbMapping. PCP hooks disabled.'
     );
     return;
   }

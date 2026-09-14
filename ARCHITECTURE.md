@@ -173,7 +173,7 @@ Six agents share the same infrastructure with distinct identities, backends, and
 | **Benson** | Discord / Slack        | claude      | claude      | Conversational partner                 |
 | **Echo**   | (test only)            | —           | —           | Integration test agent                 |
 
-Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.ink/identity.json` → `~/.ink/config.json`. Identity documents (SOUL, HEARTBEAT, IDENTITY) live in the database (`agent_identities` table), with `~/.ink/` as a fallback cache. Memories are filtered by sbSlug (plus shared memories where `sbSlug` is null).
+Identity is resolved from: system prompt override → `$SB_SLUG` env var → `.ink/identity.json` → `~/.ink/config.json`. Identity documents (SOUL, HEARTBEAT, IDENTITY) live in the database (`agent_identities` table), with `~/.ink/` as a fallback cache. Memories are filtered by sbSlug (plus shared memories where `sbSlug` is null).
 
 ## MCP Tools
 

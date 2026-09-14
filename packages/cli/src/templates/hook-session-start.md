@@ -1,6 +1,6 @@
 ## Session Context (Inkwell)
 
-Agent: **{{AGENT_ID}}**
+Agent: **{{SB_SLUG}}**
 {{WORKSPACE_LINE}}
 {{SESSION_IDENTITY}}
 

@@ -149,7 +149,7 @@ export class ContextBuilder implements IContextBuilder {
     // Fetch all required data in parallel
     // The identity resolves first because it names the workspace whose
     // constitution this session should read. Everything else runs alongside it.
-    const [agentIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
+    const [sbIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
       this.getAgentIdentity(userId, sbSlug, session.sbId),
       this.getUser(userId),
       this.getContacts(userId),
@@ -157,7 +157,7 @@ export class ContextBuilder implements IContextBuilder {
       this.getActiveProjects(userId),
     ]);
 
-    if (!agentIdentity) {
+    if (!sbIdentity) {
       throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
 
@@ -165,7 +165,7 @@ export class ContextBuilder implements IContextBuilder {
       throw new Error(`User not found: ${userId}`);
     }
 
-    const constitution = await this.getConstitution(userId, agentIdentity.workspaceId);
+    const constitution = await this.getConstitution(userId, sbIdentity.workspaceId);
 
     const userContext = mapUserContext(user, contacts);
     const temporal = buildTemporalContext(userContext.timezone);
@@ -173,7 +173,7 @@ export class ContextBuilder implements IContextBuilder {
     const filteredRecentMemories = recentMemories.filter((m) => !isLowValueRecentMemory(m));
 
     const context: InjectedContext = {
-      agent: agentIdentity,
+      agent: sbIdentity,
       user: userContext,
       temporal,
       constitution,
@@ -236,12 +236,12 @@ export class ContextBuilder implements IContextBuilder {
     sbSlug: string,
     session?: Session
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>> {
-    const [agentIdentity, user] = await Promise.all([
+    const [sbIdentity, user] = await Promise.all([
       this.getAgentIdentity(userId, sbSlug, session?.sbId),
       this.getUser(userId),
     ]);
 
-    if (!agentIdentity) {
+    if (!sbIdentity) {
       throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
 
@@ -249,7 +249,7 @@ export class ContextBuilder implements IContextBuilder {
     const temporal = buildTemporalContext(timezone);
 
     return {
-      agent: agentIdentity,
+      agent: sbIdentity,
       temporal,
     };
   }

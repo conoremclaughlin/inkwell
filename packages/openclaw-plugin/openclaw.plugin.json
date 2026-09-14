@@ -13,10 +13,10 @@
       "placeholder": "eyJhbGciOi...",
       "help": "PCP access token (from ~/.ink/auth.json or 'sb login')"
     },
-    "agentId": {
-      "label": "Agent ID",
+    "sbSlug": {
+      "label": "SB Slug",
       "placeholder": "wren",
-      "help": "Your PCP agent identity. If omitted, reads from ~/.ink/config.json agentMapping."
+      "help": "Your SB's slug. If omitted, reads from ~/.ink/config.json sbMapping."
     },
     "autoBootstrap": {
       "label": "Auto-Bootstrap",
@@ -38,7 +38,7 @@
       "accessToken": {
         "type": "string"
       },
-      "agentId": {
+      "sbSlug": {
         "type": "string"
       },
       "autoBootstrap": {

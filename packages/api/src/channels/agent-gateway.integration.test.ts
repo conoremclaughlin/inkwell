@@ -106,7 +106,7 @@ describe('AgentGateway Integration (database-driven)', () => {
       // Set up default handler that validates agent exists
       gateway.setDefaultHandler(async (payload) => {
         // Simulate the server.ts validation logic
-        const { data: agentIdentity } = await dataComposer
+        const { data: sbIdentity } = await dataComposer
           .getClient()
           .from('agent_identities')
           .select('agent_id')
@@ -114,7 +114,7 @@ describe('AgentGateway Integration (database-driven)', () => {
           .limit(1);
 
         const knownAgents = ['myra', 'wren', 'benson'];
-        const existsInDb = agentIdentity && agentIdentity.length > 0;
+        const existsInDb = sbIdentity && sbIdentity.length > 0;
         const isKnownAgent = knownAgents.includes(payload.toSlug);
 
         if (!existsInDb && !isKnownAgent) {
@@ -155,7 +155,7 @@ describe('AgentGateway Integration (database-driven)', () => {
 
     it('should reject trigger for unknown agent', async () => {
       gateway.setDefaultHandler(async (payload) => {
-        const { data: agentIdentity } = await dataComposer
+        const { data: sbIdentity } = await dataComposer
           .getClient()
           .from('agent_identities')
           .select('agent_id')
@@ -163,7 +163,7 @@ describe('AgentGateway Integration (database-driven)', () => {
           .limit(1);
 
         const knownAgents = ['myra', 'wren', 'benson'];
-        const existsInDb = agentIdentity && agentIdentity.length > 0;
+        const existsInDb = sbIdentity && sbIdentity.length > 0;
         const isKnownAgent = knownAgents.includes(payload.toSlug);
 
         if (!existsInDb && !isKnownAgent) {
@@ -188,7 +188,7 @@ describe('AgentGateway Integration (database-driven)', () => {
       let processedSlug: string | null = null;
 
       gateway.setDefaultHandler(async (payload) => {
-        const { data: agentIdentity } = await dataComposer
+        const { data: sbIdentity } = await dataComposer
           .getClient()
           .from('agent_identities')
           .select('agent_id')
@@ -196,7 +196,7 @@ describe('AgentGateway Integration (database-driven)', () => {
           .limit(1);
 
         const knownAgents = ['myra', 'wren', 'benson'];
-        const existsInDb = agentIdentity && agentIdentity.length > 0;
+        const existsInDb = sbIdentity && sbIdentity.length > 0;
         const isKnownAgent = knownAgents.includes(payload.toSlug);
 
         if (!existsInDb && !isKnownAgent) {
