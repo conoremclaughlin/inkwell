@@ -47,6 +47,8 @@ vi.mock('@supabase/supabase-js', () => ({
 // ---------------------------------------------------------------------------
 
 const mockFindById = vi.fn();
+const mockFindByIdWithRole = vi.fn();
+const mockGetMemberRole = vi.fn();
 const mockFindRawById = vi.fn();
 const mockEnsurePersonalWorkspace = vi.fn();
 const mockListTrustedUsers = vi.fn();
@@ -56,6 +58,8 @@ vi.mock('../data/composer', () => ({
     repositories: {
       workspaces: {
         findById: mockFindById,
+        findByIdWithRole: mockFindByIdWithRole,
+        getMemberRole: mockGetMemberRole,
         findRawById: mockFindRawById,
         ensurePersonalWorkspace: mockEnsurePersonalWorkspace,
       },
@@ -195,7 +199,10 @@ function mockSupabaseUserLookup(pcpUser: Record<string, unknown>) {
 /** Standard workspace mock that returns a personal workspace */
 function mockDefaultWorkspace() {
   mockEnsurePersonalWorkspace.mockResolvedValue({ id: 'workspace-1' });
+  // The personal workspace's one membership row: its owner.
+  mockGetMemberRole.mockResolvedValue('owner');
   mockFindById.mockResolvedValue(null);
+  mockFindByIdWithRole.mockResolvedValue(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -689,11 +696,27 @@ describe('adminAuthMiddleware', () => {
 
       expect(mockEnsurePersonalWorkspace).toHaveBeenCalledWith('user-ws');
       expect((req as any).pcpWorkspaceId).toBe('personal-ws');
-      expect((req as any).pcpWorkspaceRole).toBe('member');
+      // The role is the membership row's — the personal workspace's owner.
+      expect(mockGetMemberRole).toHaveBeenCalledWith('personal-ws', 'user-ws');
+      expect((req as any).pcpWorkspaceRole).toBe('owner');
     });
 
-    it('should use requested workspace when user is a member', async () => {
-      mockFindById.mockResolvedValue({ id: 'requested-ws' });
+    it('refuses a personal workspace with no membership row rather than assuming a role', async () => {
+      mockEnsurePersonalWorkspace.mockResolvedValue({ id: 'personal-ws' });
+      mockGetMemberRole.mockResolvedValue(null);
+
+      const req = createMockReq();
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(next).not.toHaveBeenCalled();
+      expect(res._status).toBe(403);
+    });
+
+    it('should use requested workspace when user is a member, with the role the membership row carries', async () => {
+      mockFindByIdWithRole.mockResolvedValue({ workspace: { id: 'requested-ws' }, role: 'viewer' });
 
       const req = createMockReq({
         header: vi.fn((name: string) => {
@@ -707,11 +730,11 @@ describe('adminAuthMiddleware', () => {
       await middleware(req, res, next);
 
       expect((req as any).pcpWorkspaceId).toBe('requested-ws');
-      expect((req as any).pcpWorkspaceRole).toBe('member');
+      expect((req as any).pcpWorkspaceRole).toBe('viewer');
     });
 
     it('should set request context workspaceSource=header when x-ink-workspace-id is used', async () => {
-      mockFindById.mockResolvedValue({ id: 'requested-ws' });
+      mockFindByIdWithRole.mockResolvedValue({ workspace: { id: 'requested-ws' }, role: 'member' });
 
       const req = createMockReq({
         header: vi.fn((name: string) => {
@@ -733,7 +756,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should return 404 when requested workspace does not exist', async () => {
-      mockFindById.mockResolvedValue(null);
+      mockFindByIdWithRole.mockResolvedValue(null);
       mockFindRawById.mockResolvedValue(null);
 
       const req = createMockReq({

@@ -28,6 +28,14 @@ vi.mock('../studio-lease.service.js', async (importOriginal) => {
   };
 });
 
+// The registry and the thread are workspace-scoped (spec inkmail-thread-scope
+// §1b): the workspace comes from the session's identity, else the user's
+// personal one. Fixed here so these tests stay about the resolution.
+vi.mock('../principals.js', () => ({
+  workspaceOfSb: vi.fn().mockResolvedValue('ws-1'),
+  personalWorkspaceOf: vi.fn().mockResolvedValue('ws-1'),
+}));
+
 const typeBehaviorMock = vi.fn();
 vi.mock('../thread-key/thread-key.service.js', () => ({
   ThreadKeyService: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
@@ -160,7 +168,7 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
 
   const resolve = (service: SessionService) =>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (service as any).resolveThreadBehavior('user-1', 'spec:some-design') as Promise<{
+    (service as any).resolveThreadBehavior('user-1', null, 'spec:some-design') as Promise<{
       writeIntent: string;
       studioPolicy: string;
     }>;
@@ -172,7 +180,8 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
       writeIntent: 'presence',
       studioPolicy: 'reuse-only',
     });
-    expect(typeBehaviorMock).toHaveBeenCalledWith('user-1', 'spec');
+    // Resolved in the WORKSPACE, never under the user (§1b).
+    expect(typeBehaviorMock).toHaveBeenCalledWith('ws-1', 'spec');
   });
 
   it('a provision type carries its policy through', async () => {
@@ -191,7 +200,7 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
       writeIntent: 'write',
       studioPolicy: 'reuse-only',
     });
-    expect(typeBehaviorMock).toHaveBeenCalledWith('user-1', null);
+    expect(typeBehaviorMock).toHaveBeenCalledWith('ws-1', null);
   });
 
   it('a thread-row lookup ERROR fails toward write + reuse-only', async () => {

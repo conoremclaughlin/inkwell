@@ -156,12 +156,25 @@ export class WorkspacesRepository {
   }
 
   async findById(id: string, userId: string): Promise<Workspace | null> {
+    return (await this.findByIdWithRole(id, userId))?.workspace ?? null;
+  }
+
+  /**
+   * A workspace the user is a member of, with the role their membership row
+   * carries. The role is what authorization reads, so it travels with the
+   * lookup instead of being discarded on the way and re-invented as
+   * 'member' by the caller (Lumen, #619).
+   */
+  async findByIdWithRole(
+    id: string,
+    userId: string
+  ): Promise<{ workspace: Workspace; role: WorkspaceMemberRole } | null> {
     const membership = await this.findMembership(id, userId);
     if (!membership) {
       return null;
     }
-
-    return this.findRawById(id);
+    const workspace = await this.findRawById(id);
+    return workspace ? { workspace, role: membership.role } : null;
   }
 
   async listMembershipsByUser(

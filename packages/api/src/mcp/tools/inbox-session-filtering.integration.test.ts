@@ -11,15 +11,16 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
-import {
-  ensureEchoIntegrationFixture,
-  INTEGRATION_TEST_USER_ID,
-} from '../../test/integration-fixtures';
+import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 
 describe('Session-scoped thread filtering (integration)', () => {
   let dataComposer: DataComposer;
   let supabase: ReturnType<DataComposer['getClient']>;
   let testUserId: string;
+  let workspaceId: string;
+  // Participant rows are keyed by identity since the cutover (§3); `echo` is
+  // the fixture identity in the fixture workspace.
+  let echoSbId: string;
   let threadId: string;
   const threadKey = `test:session-filter-${Date.now()}`;
   const sessionIdA = '00000000-0000-4000-a000-000000000001';
@@ -30,6 +31,8 @@ describe('Session-scoped thread filtering (integration)', () => {
     supabase = dataComposer.getClient();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
     testUserId = fixture.userId;
+    workspaceId = fixture.workspaceId;
+    echoSbId = fixture.echoSbId;
 
     // Ensure test sessions exist
     for (const sid of [sessionIdA, sessionIdB]) {
@@ -50,8 +53,9 @@ describe('Session-scoped thread filtering (integration)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: threadKey,
-        user_id: testUserId,
-        created_by_agent_id: 'echo',
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         title: 'Session filter test',
       })
       .select('id')
@@ -77,9 +81,12 @@ describe('Session-scoped thread filtering (integration)', () => {
   it('joined_at baseline prevents replay of pre-join messages', async () => {
     // Insert a message BEFORE the participant joins
     const preJoinTime = new Date(Date.now() - 60000).toISOString();
+    // The sender is "somebody else": the system principal is the one
+    // sender that needs no identity row (§3), and a system-KIND row can still
+    // be a deliverable message type.
     await (supabase as any).from('inbox_thread_messages').insert({
       thread_id: threadId,
-      sender_agent_id: 'test-sender',
+      sender_kind: 'system',
       content: 'Message before echo joined',
       message_type: 'message',
       created_at: preJoinTime,
@@ -88,14 +95,15 @@ describe('Session-scoped thread filtering (integration)', () => {
     // Add participant (joined_at = now, which is AFTER the message)
     await (supabase as any).from('inbox_thread_participants').insert({
       thread_id: threadId,
-      agent_id: 'echo',
+      workspace_id: workspaceId,
+      sb_id: echoSbId,
       session_id: sessionIdA,
     });
 
     // Insert a message AFTER the participant joined
     await (supabase as any).from('inbox_thread_messages').insert({
       thread_id: threadId,
-      sender_agent_id: 'test-sender',
+      sender_kind: 'system',
       content: 'Message after echo joined',
       message_type: 'message',
     });
@@ -105,7 +113,7 @@ describe('Session-scoped thread filtering (integration)', () => {
       .from('inbox_thread_participants')
       .select('joined_at')
       .eq('thread_id', threadId)
-      .eq('agent_id', 'echo')
+      .eq('sb_id', echoSbId)
       .single();
 
     // Count messages after joined_at (what the unread logic should do)
@@ -133,7 +141,7 @@ describe('Session-scoped thread filtering (integration)', () => {
     const { data: sessionAParticipants } = await (supabase as any)
       .from('inbox_thread_participants')
       .select('thread_id')
-      .eq('agent_id', 'echo')
+      .eq('sb_id', echoSbId)
       .or(`session_id.eq.${sessionIdA},session_id.is.null`);
 
     expect(sessionAParticipants?.length).toBeGreaterThanOrEqual(1);
@@ -143,7 +151,7 @@ describe('Session-scoped thread filtering (integration)', () => {
     const { data: sessionBParticipants } = await (supabase as any)
       .from('inbox_thread_participants')
       .select('thread_id')
-      .eq('agent_id', 'echo')
+      .eq('sb_id', echoSbId)
       .or(`session_id.eq.${sessionIdB},session_id.is.null`);
 
     const sessionBHasThread = sessionBParticipants?.some((p: any) => p.thread_id === threadId);
@@ -156,8 +164,9 @@ describe('Session-scoped thread filtering (integration)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: `${threadKey}-unassigned`,
-        user_id: testUserId,
-        created_by_agent_id: 'echo',
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         title: 'Unassigned thread',
       })
       .select('id')
@@ -165,7 +174,8 @@ describe('Session-scoped thread filtering (integration)', () => {
 
     await (supabase as any).from('inbox_thread_participants').insert({
       thread_id: thread2.id,
-      agent_id: 'echo',
+      workspace_id: workspaceId,
+      sb_id: echoSbId,
       // no session_id — unassigned
     });
 
@@ -174,7 +184,7 @@ describe('Session-scoped thread filtering (integration)', () => {
       const { data: participants } = await (supabase as any)
         .from('inbox_thread_participants')
         .select('thread_id')
-        .eq('agent_id', 'echo')
+        .eq('sb_id', echoSbId)
         .or(`session_id.eq.${sid},session_id.is.null`);
 
       const hasUnassigned = participants?.some((p: any) => p.thread_id === thread2.id);
@@ -208,7 +218,7 @@ describe('Session-scoped thread filtering (integration)', () => {
       .from('inbox_thread_participants')
       .update({ session_id: newSessionId })
       .eq('thread_id', threadId)
-      .eq('agent_id', 'echo');
+      .eq('sb_id', echoSbId);
 
     expect(updateErr).toBeNull();
 
@@ -217,7 +227,7 @@ describe('Session-scoped thread filtering (integration)', () => {
       .from('inbox_thread_participants')
       .select('session_id')
       .eq('thread_id', threadId)
-      .eq('agent_id', 'echo')
+      .eq('sb_id', echoSbId)
       .single();
 
     expect(updated.session_id).toBe(newSessionId);
@@ -231,6 +241,8 @@ describe('Cross-studio self-message filtering (integration)', () => {
   let dataComposer: DataComposer;
   let supabase: ReturnType<DataComposer['getClient']>;
   let testUserId: string;
+  let workspaceId: string;
+  let echoSbId: string;
   const sessionAlpha = '00000000-0000-4000-b000-000000000001';
   const sessionBeta = '00000000-0000-4000-b000-000000000002';
   let crossStudioThreadId: string;
@@ -241,6 +253,8 @@ describe('Cross-studio self-message filtering (integration)', () => {
     supabase = dataComposer.getClient();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
     testUserId = fixture.userId;
+    workspaceId = fixture.workspaceId;
+    echoSbId = fixture.echoSbId;
 
     for (const sid of [sessionAlpha, sessionBeta]) {
       await (supabase as any).from('sessions').upsert(
@@ -260,8 +274,9 @@ describe('Cross-studio self-message filtering (integration)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: crossStudioThreadKey,
-        user_id: testUserId,
-        created_by_agent_id: 'echo',
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         title: 'Cross-studio self-message test',
       })
       .select('id')
@@ -293,7 +308,8 @@ describe('Cross-studio self-message filtering (integration)', () => {
     // studios see the thread. Simulate by inserting participant without session_id.
     await (supabase as any).from('inbox_thread_participants').insert({
       thread_id: crossStudioThreadId,
-      agent_id: 'echo',
+      workspace_id: workspaceId,
+      sb_id: echoSbId,
       // no session_id — correct for cross-studio self-message
     });
 
@@ -301,7 +317,7 @@ describe('Cross-studio self-message filtering (integration)', () => {
       .from('inbox_thread_participants')
       .select('session_id')
       .eq('thread_id', crossStudioThreadId)
-      .eq('agent_id', 'echo')
+      .eq('sb_id', echoSbId)
       .single();
 
     expect(participant.session_id).toBeNull();
@@ -314,7 +330,7 @@ describe('Cross-studio self-message filtering (integration)', () => {
       const { data: participants } = await (supabase as any)
         .from('inbox_thread_participants')
         .select('thread_id')
-        .eq('agent_id', 'echo')
+        .eq('sb_id', echoSbId)
         .or(`session_id.eq.${sid},session_id.is.null`);
 
       const hasThread = participants?.some((p: any) => p.thread_id === crossStudioThreadId);
@@ -329,13 +345,13 @@ describe('Cross-studio self-message filtering (integration)', () => {
       .from('inbox_thread_participants')
       .update({ session_id: sessionAlpha })
       .eq('thread_id', crossStudioThreadId)
-      .eq('agent_id', 'echo');
+      .eq('sb_id', echoSbId);
 
     // Session Alpha sees it
     const { data: alphaResults } = await (supabase as any)
       .from('inbox_thread_participants')
       .select('thread_id')
-      .eq('agent_id', 'echo')
+      .eq('sb_id', echoSbId)
       .or(`session_id.eq.${sessionAlpha},session_id.is.null`);
 
     expect(alphaResults?.some((p: any) => p.thread_id === crossStudioThreadId)).toBe(true);
@@ -344,7 +360,7 @@ describe('Cross-studio self-message filtering (integration)', () => {
     const { data: betaResults } = await (supabase as any)
       .from('inbox_thread_participants')
       .select('thread_id')
-      .eq('agent_id', 'echo')
+      .eq('sb_id', echoSbId)
       .or(`session_id.eq.${sessionBeta},session_id.is.null`);
 
     expect(betaResults?.some((p: any) => p.thread_id === crossStudioThreadId)).toBe(false);
@@ -354,6 +370,6 @@ describe('Cross-studio self-message filtering (integration)', () => {
       .from('inbox_thread_participants')
       .update({ session_id: null })
       .eq('thread_id', crossStudioThreadId)
-      .eq('agent_id', 'echo');
+      .eq('sb_id', echoSbId);
   });
 });

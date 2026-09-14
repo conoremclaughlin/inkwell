@@ -7,6 +7,7 @@ export type ProjectStatus = 'active' | 'paused' | 'completed' | 'archived';
 export interface Project {
   id: string;
   user_id: string;
+  workspace_id: string;
   name: string;
   description: string | null;
   status: ProjectStatus;
@@ -23,6 +24,8 @@ export interface Project {
 
 export interface ProjectInsert {
   user_id: string;
+  /** The namespace a project lives in (spec inkmail-thread-scope §1b). */
+  workspace_id: string;
   name: string;
   description?: string | null;
   status?: ProjectStatus;
@@ -78,6 +81,25 @@ export class ProjectsRepository extends BaseRepository {
     }
   }
 
+  /** The projects of one workspace — the namespace (spec inkmail-thread-scope §1b). */
+  async findAllByWorkspace(workspaceId: string, status?: ProjectStatus): Promise<Project[]> {
+    try {
+      let query = this.client
+        .from('projects')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .order('updated_at', { ascending: false });
+      if (status) {
+        query = query.eq('status', status);
+      }
+      const { data, error } = await query;
+      if (error) throw error;
+      return (data as Project[]) || [];
+    } catch (error) {
+      this.handleError(error, 'findAllByWorkspace');
+    }
+  }
+
   async findAllByUser(userId: string, status?: ProjectStatus): Promise<Project[]> {
     try {
       let query = this.client
@@ -129,9 +151,30 @@ export class ProjectsRepository extends BaseRepository {
     }
   }
 
+  /**
+   * A project by name inside one workspace. The namespace is the workspace
+   * since the cutover (spec inkmail-thread-scope §1b): the same owner may
+   * keep a project of the same name in two of their workspaces.
+   */
+  async findByWorkspaceAndName(workspaceId: string, name: string): Promise<Project | null> {
+    try {
+      const { data, error } = await this.client
+        .from('projects')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .eq('name', name)
+        .maybeSingle();
+
+      if (error) throw error;
+      return (data as Project | null) ?? null;
+    } catch (error) {
+      this.handleError(error, 'findByWorkspaceAndName');
+    }
+  }
+
   async upsertByName(data: ProjectInsert): Promise<Project> {
     try {
-      const existing = await this.findByUserAndName(data.user_id, data.name);
+      const existing = await this.findByWorkspaceAndName(data.workspace_id, data.name);
 
       if (existing) {
         return await this.update(existing.id, {

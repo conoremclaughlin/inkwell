@@ -336,6 +336,7 @@ const topicsSchema = z
 // Moved to services/memory/knowledge-summary.ts so the ContextBuilder can use
 // the same budgeted renderer. Re-exported here for existing importers.
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
+import { resolveCallerWorkspace } from './caller-principal';
 
 export { buildKnowledgeSummary };
 
@@ -2115,7 +2116,13 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     (params.phase.startsWith('blocked:') || params.phase.startsWith('waiting:'))
   ) {
     try {
-      const projects = await dataComposer.repositories.projects.findAllByUser(user.id, 'active');
+      // The caller's workspace: the bound identity's, else the person's own
+      // (spec inkmail-thread-scope §1b) — a slug is never guessed here.
+      const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+      const projects = await dataComposer.repositories.projects.findAllByWorkspace(
+        workspaceId,
+        'active'
+      );
       if (projects.length > 0) {
         const task = await dataComposer.repositories.tasks.create({
           project_id: projects[0].id,
@@ -2365,7 +2372,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const [projects, focus, activeSessions, dbIdentity, userTimezone, userSkills, siblingIdentities] =
     await Promise.all([
       // Active projects
-      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+      resolveCallerWorkspace(dataComposer.getClient(), user.id).then(({ workspaceId }) =>
+        dataComposer.repositories.projects.findAllByWorkspace(workspaceId, 'active')
+      ),
       // Current focus
       dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
       // All active sessions (filter by agentId if provided) — client picks the right one

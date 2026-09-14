@@ -62,7 +62,16 @@ export interface ThreadsResponse {
 
 export interface ThreadMessage {
   id: string;
-  senderAgentId: string;
+  /** Who wrote it (spec inkmail-thread-scope §3): an SB, a person, or the system. */
+  senderKind: 'sb' | 'user' | 'system';
+  /** The SB's display slug; the kind for a person or the system. */
+  senderAgentId: string | null;
+  senderSbId: string | null;
+  senderUserId: string | null;
+  /** Named on the server: the SB's slug, the person's profile name, or 'system'. */
+  senderName: string;
+  /** The viewer's own message — decided on the server against the PCP user, never here. */
+  isOwn: boolean;
   content: string;
   messageType: string;
   priority: string;
@@ -80,6 +89,8 @@ export interface ThreadMessagesResponse {
     closedAt: string | null;
   } | null;
   messages: ThreadMessage[];
+  /** The PCP user this response was rendered for. */
+  viewerUserId?: string;
   meta?: { fetched: number; total: number; truncated: boolean };
 }
 

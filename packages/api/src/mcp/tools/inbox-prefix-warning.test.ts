@@ -39,6 +39,28 @@ vi.mock('../../auth/resolve-identity', () => ({
   resolveAgentSlug: vi.fn().mockImplementation(async (_s: unknown, _u: unknown, id: string) => id),
 }));
 
+// The sender is a principal in one workspace (spec inkmail-thread-scope §3);
+// the registry is read in THAT workspace (§1b). Resolved at the boundary,
+// mocked here so these tests stay about the handler.
+const WORKSPACE_ID = 'ws-1';
+vi.mock('./caller-principal', () => ({
+  assertWriteRole: (role: string, action: string) => {
+    if (role === 'viewer')
+      throw new Error(`Your role in this workspace (${role}) cannot ${action}`);
+  },
+  resolveCallerSb: vi.fn().mockResolvedValue({
+    kind: 'sb',
+    sbId: 'sb-wren',
+    agentId: 'wren',
+    userId: '11111111-1111-1111-1111-111111111111',
+    workspaceId: 'ws-1',
+    ownerRole: 'member',
+  }),
+  resolveCallerWorkspace: vi
+    .fn()
+    .mockResolvedValue({ workspaceId: 'ws-1', sb: null, role: 'owner' }),
+}));
+
 // findThread decides new-vs-existing, which is exactly the branch under test.
 const findThread = vi.fn();
 vi.mock('./thread-handlers.js', () => ({
@@ -79,6 +101,47 @@ import { handleSendToInbox } from './inbox-handlers';
 function mockSupabase() {
   const thread = { id: 'thread-1', thread_key: 'x' };
   const message = { id: 'msg-1', created_at: '2026-08-26T00:00:00Z' };
+  // The recipient resolves inside the sender's workspace to exactly one
+  // identity; a filtering chain over these rows serves that lookup.
+  const identities = [
+    {
+      id: 'sb-lumen',
+      agent_id: 'lumen',
+      user_id: '11111111-1111-1111-1111-111111111111',
+      workspace_id: WORKSPACE_ID,
+    },
+    {
+      id: 'sb-wren',
+      agent_id: 'wren',
+      user_id: '11111111-1111-1111-1111-111111111111',
+      workspace_id: WORKSPACE_ID,
+    },
+  ];
+  const identityChain = () => {
+    let rows = [...identities];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const c: Record<string, any> = {};
+    c.select = vi.fn().mockReturnValue(c);
+    c.eq = vi.fn((col: string, val: unknown) => {
+      rows = rows.filter((r) => (r as Record<string, unknown>)[col] === val);
+      return c;
+    });
+    c.in = vi.fn((col: string, vals: unknown[]) => {
+      rows = rows.filter((r) => vals.includes((r as Record<string, unknown>)[col]));
+      return c;
+    });
+    c.not = vi.fn((col: string, _op: string, val: unknown) => {
+      if (val === null) rows = rows.filter((r) => (r as Record<string, unknown>)[col] != null);
+      return c;
+    });
+    c.order = vi.fn().mockReturnValue(c);
+    c.limit = vi.fn().mockReturnValue(c);
+    c.maybeSingle = vi.fn(() => Promise.resolve({ data: rows[0] ?? null, error: null }));
+    c.single = vi.fn(() => Promise.resolve({ data: rows[0] ?? null, error: null }));
+    c.then = (resolve: (v: unknown) => unknown) =>
+      Promise.resolve({ data: rows, error: null }).then(resolve);
+    return c;
+  };
 
   const chain = () => {
     const c: Record<string, unknown> = {};
@@ -108,11 +171,11 @@ function mockSupabase() {
   });
 
   return {
-    from: vi
-      .fn()
-      .mockImplementation((table: string) =>
-        table === 'inbox_thread_messages' ? messageChain : chain()
-      ),
+    from: vi.fn().mockImplementation((table: string) => {
+      if (table === 'inbox_thread_messages') return messageChain;
+      if (table === 'agent_identities') return identityChain();
+      return chain();
+    }),
   };
 }
 
@@ -199,7 +262,9 @@ describe('send_to_inbox — unregistered project prefix warning', () => {
   it('still reads the registry when the key has room for a prefix', async () => {
     await send('cnr:issue:7');
 
-    expect(projectSlugLookup).toHaveBeenCalled();
-    expect(knownTypeNames).toHaveBeenCalled();
+    // Read in the sender's WORKSPACE (spec inkmail-thread-scope §1b), never
+    // under the user: one owner may hold different registries per workspace.
+    expect(projectSlugLookup).toHaveBeenCalledWith(WORKSPACE_ID);
+    expect(knownTypeNames).toHaveBeenCalledWith(WORKSPACE_ID);
   });
 });

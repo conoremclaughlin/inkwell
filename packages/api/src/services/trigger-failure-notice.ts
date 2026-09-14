@@ -22,14 +22,26 @@ import { logger } from '../utils/logger';
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 export interface TriggerFailureNotice {
-  /** Owner of the thread / inbox. */
-  userId: string;
+  /**
+   * Owner of the inbox the legacy lane may write to — the sender's. Without
+   * one the notice has only the thread lane.
+   */
+  userId?: string;
   /** Original trigger sender — the agent being notified. */
   fromAgentId: string;
   /** Failed trigger target — named in content; legacy-lane attributed sender. */
   toAgentId: string;
   threadId?: string | null;
   threadKey?: string | null;
+  /** The thread's workspace, when known — the only way a bare key resolves. */
+  workspaceId?: string | null;
+  /**
+   * Whether the legacy agent_inbox lane may be used. `userId` is that lane's
+   * recipient owner, so a caller that cannot name the SENDER's owner must
+   * say false: a person or the system holds no agent inbox, and the
+   * target's owner is the wrong person (Lumen, #618). Default true.
+   */
+  legacyLane?: boolean;
   subject: string;
   content: string;
   metadata: Record<string, unknown>;
@@ -46,13 +58,17 @@ export async function sendTriggerFailureNotice(
 ): Promise<NoticeResult> {
   const { userId, fromAgentId, toAgentId, threadKey, subject, content, metadata } = notice;
 
-  // Resolve the thread: explicit id wins; else look up by (user, threadKey).
+  // Resolve the thread: the explicit id, or the one row (workspace, key)
+  // names when the caller knows the workspace. A bare key is not enough —
+  // workspace-local keys repeat across workspaces on purpose (spec
+  // inkmail-thread-scope §1) — so a keyed notice without a workspace takes
+  // the legacy lane rather than guessing.
   let threadId = notice.threadId || null;
-  if (!threadId && threadKey) {
+  if (!threadId && threadKey && notice.workspaceId) {
     const { data: thread, error: lookupErr } = await client
       .from('inbox_threads')
       .select('id')
-      .eq('user_id', userId)
+      .eq('workspace_id', notice.workspaceId)
       .eq('thread_key', threadKey)
       .maybeSingle();
     if (lookupErr) {
@@ -74,7 +90,11 @@ export async function sendTriggerFailureNotice(
   if (threadId) {
     const { error: insertErr } = await client.from('inbox_thread_messages').insert({
       thread_id: threadId,
-      sender_agent_id: 'system',
+      // The system borrows nobody's identity (spec inkmail-thread-scope §3).
+      sender_kind: 'system',
+      sender_sb_id: null,
+      sender_user_id: null,
+      sender_agent_id: null,
       content,
       message_type: 'notification',
       priority: 'high',
@@ -107,7 +127,17 @@ export async function sendTriggerFailureNotice(
     });
   }
 
-  // Threadless (or thread write failed): legacy agent-scoped inbox.
+  // Threadless (or thread write failed): legacy agent-scoped inbox — only
+  // when the caller established whose inbox that is.
+  if (notice.legacyLane === false || !userId) {
+    logger.warn('[TriggerFailure] No legacy lane for this sender — notice not delivered', {
+      threadId: threadId || null,
+      threadKey: threadKey || null,
+      to: fromAgentId,
+      failedTarget: toAgentId,
+    });
+    return { via: 'legacy', ok: false };
+  }
   const { error: legacyErr } = await client.from('agent_inbox').insert({
     recipient_user_id: userId,
     recipient_agent_id: fromAgentId,

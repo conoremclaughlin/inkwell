@@ -43,6 +43,8 @@ vi.mock('@supabase/supabase-js', () => ({
 
 // Data layer mocks
 const mockFindById = vi.fn();
+const mockFindByIdWithRole = vi.fn();
+const mockGetMemberRole = vi.fn();
 const mockFindRawById = vi.fn();
 const mockEnsurePersonalWorkspace = vi.fn();
 const mockListMembershipsByUser = vi.fn();
@@ -53,6 +55,8 @@ vi.mock('../data/composer', () => ({
     repositories: {
       workspaces: {
         findById: mockFindById,
+        findByIdWithRole: mockFindByIdWithRole,
+        getMemberRole: mockGetMemberRole,
         findRawById: mockFindRawById,
         ensurePersonalWorkspace: mockEnsurePersonalWorkspace,
         listMembershipsByUser: mockListMembershipsByUser,
@@ -259,6 +263,8 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       scope: 'admin',
     });
     mockEnsurePersonalWorkspace.mockResolvedValue({ id: TEST_WORKSPACE_ID });
+    mockGetMemberRole.mockResolvedValue('owner');
+    mockFindByIdWithRole.mockResolvedValue(null);
 
     // Default: all Supabase queries return empty arrays (no error)
     setupDefaultSupabaseMock();

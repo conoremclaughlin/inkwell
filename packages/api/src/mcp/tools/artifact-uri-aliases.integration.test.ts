@@ -49,28 +49,20 @@ describe.skipIf(!canRun)('artifact URI aliases (DB integration)', () => {
   beforeAll(async () => {
     dataComposer = await getDataComposer();
     client = dataComposer.getClient();
-    await ensureEchoIntegrationFixture(dataComposer);
-
-    const { data: workspace, error } = await client
-      .from('workspaces')
-      .insert({
-        user_id: INTEGRATION_TEST_USER_ID,
-        name: `Library integration ${RUN_ID}`,
-        slug: `library-it-${RUN_ID}`,
-      })
-      .select('id')
-      .single();
-    if (error) throw new Error(`workspace fixture failed: ${error.message}`);
-    workspaceId = workspace.id;
+    // Writes scope to the acting agent's workspace before any explicit
+    // argument (resolveWorkspaceScopeForWrite: header → agent-derived →
+    // args). `echo` lives in the fixture user's personal workspace since the
+    // thread-scope cutover, so that is the workspace these artifacts land
+    // in; the RUN_ID-namespaced URIs keep the suite isolated.
+    const fixture = await ensureEchoIntegrationFixture(dataComposer);
+    workspaceId = fixture.workspaceId;
   });
 
   afterAll(async () => {
     if (!client) return;
-    // Aliases and artifacts cascade with the workspace, but delete explicitly
-    // so a mid-suite failure still leaves nothing behind.
+    // Suite-owned rows only: the workspace is the shared fixture's.
     await client.from('artifact_uri_aliases').delete().like('alias_uri', `ink://${NS}/%`);
     await client.from('artifacts').delete().like('uri', `ink://${NS}/%`);
-    if (workspaceId) await client.from('workspaces').delete().eq('id', workspaceId);
   });
 
   it('create → rename → the old URI resolves via alias with the canonical URI reported', async () => {

@@ -105,6 +105,24 @@ describe('mergeThreadSpines', () => {
     expect(spine.lastActivityAt).toBe(at(11));
   });
 
+  it('carries the people on a thread through, without ever adding them to the participants', () => {
+    const people = [
+      { userId: 'user-a', name: 'Conor', isOwn: true },
+      { userId: 'user-b', name: 'second', isOwn: false },
+    ];
+    const spines = mergeThreadSpines({
+      threads: [thread({ people })],
+      sessions: [],
+      studios: [],
+      groups: [],
+      parse: () => null,
+    });
+    expect(spines[0].thread?.people).toEqual(people);
+    // A person is not an agent to wake: the union (sorted) stays SBs only.
+    expect(spines[0].participants).toEqual(['lumen', 'wren']);
+    expect(spines[0].thread?.participants).toEqual(['wren', 'lumen']);
+  });
+
   it('pinned thread identity wins over the parser, even when the pin is all-null', () => {
     let parserCalls = 0;
     const spines = mergeThreadSpines({
