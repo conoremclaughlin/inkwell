@@ -50,7 +50,7 @@
     "@modelcontextprotocol/server": "^2.0.0",
     "@slack/bolt": "^4.6.0",
     "@supabase/supabase-js": "^2.39.3",
-    "@whiskeysockets/baileys": "^7.0.0-rc12",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "bcrypt": "^6.0.0",
     "compression": "^1.7.4",
     "cookie-parser": "^1.4.7",
