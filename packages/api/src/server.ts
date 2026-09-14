@@ -79,19 +79,7 @@ import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
 import { StudioLeaseService } from './services/studio-lease.service';
 import { StudioOverflowService } from './services/studio-overflow.service';
-
-/**
- * The slug this server routes as.
- *
- * SB_SLUG is the documented variable; AGENT_ID is its pre-rename name, still in
- * the environment of anything started before the rename. The banner and the
- * routing configuration MUST read this same function — they drifted once, so
- * the banner printed one SB while the no-channel-route fallback dispatched to
- * another (Lumen, PR #635).
- */
-export function resolveServerSbSlug(): string {
-  return process.env.SB_SLUG || process.env.AGENT_ID || 'myra';
-}
+import { resolveServerSbSlug } from './config/server-identity';
 
 // Server configuration
 interface ServerConfig {

@@ -10,11 +10,16 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import jwt from 'jsonwebtoken';
 
+// Built rather than written out: a 50-character literal here reads as a
+// high-entropy string to secret scanners, and this file added a fresh
+// occurrence of one. jwt only needs >=32 characters, not randomness.
+// (vi.mock factories are hoisted, so this expression must not reference
+// anything outside itself.)
 vi.mock('../config/env', () => ({
   env: {
     SUPABASE_URL: 'http://localhost:54321',
     SUPABASE_SECRET_KEY: 'test-secret-key',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    JWT_SECRET: 'not-a-real-secret-'.padEnd(40, 'x'),
   },
 }));
 vi.mock('../utils/logger', () => ({
@@ -27,7 +32,9 @@ vi.mock('../utils/logger', () => ({
 import { decodeContextToken, encodeContextToken } from '../../../shared/src/runner/mcp-config';
 import { normalizePendingAuth } from '../mcp/auth/pcp-auth-provider';
 import { archivedMetadataSlug } from '../routes/admin';
-import { resolveServerSbSlug } from '../server';
+// NOT from '../server': that module ends in an unconditional startServer(...),
+// so importing it starts a real server from inside the test run.
+import { resolveServerSbSlug } from '../config/server-identity';
 
 const legacyToken = (extra: Record<string, unknown> = {}) =>
   Buffer.from(
@@ -99,7 +106,7 @@ describe('pending-auth JWTs issued before the rename', () => {
           redirectUri: 'r',
           agentId: 'aster',
         },
-        'test-jwt-secret-that-is-at-least-32-characters-long'
+        'not-a-real-secret-'.padEnd(40, 'x')
       )
     ) as never;
 
