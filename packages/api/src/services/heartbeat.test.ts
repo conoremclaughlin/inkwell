@@ -1172,14 +1172,14 @@ describe('Heartbeat Service', () => {
       expect(context.episodeKey).not.toBe('2026-09-09T02:00:00.000Z');
     });
 
-    it('tells the store a failure after a healthy beat starts a new episode', async () => {
+    it('tells the store where the current run of failures begins', async () => {
       // Round seven, finding 1. The store cannot work this out for itself: every
       // record it could consult is one it writes, so the run where its writes
       // were failing is the run where the boundary is invisible to it. What it
       // needs is held here, in `reminder_history` — and only if this caller
-      // actually passes it. A store that honours the flag and a heartbeat that
-      // never sets it is a fix that does nothing, which is why this asserts the
-      // wiring rather than the rule.
+      // actually passes it. A store that honours the boundary and a heartbeat
+      // that never sends one is a fix that does nothing, which is why this
+      // asserts the wiring rather than the rule.
       initHeartbeatService({ enableLocalCron: false });
 
       setQueryResult('scheduled_reminders', [makeDueReminder()]);
@@ -1191,16 +1191,47 @@ describe('Heartbeat Service', () => {
         vi.fn().mockResolvedValue(ALERTED)
       );
 
-      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { startsNewRun: true });
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), {
+        kind: 'healthy-beat',
+        at: '2026-09-09T02:00:00.000Z',
+      });
     });
 
-    it('tells the store a failure mid-outage continues the episode', async () => {
-      // The control for the test above. Same call, same path, one difference in
-      // the history it reads — without this, a hardcoded `true` would pass.
+    it('still names the healthy beat several failures into an outage', async () => {
+      // Round eight. The boundary is not a one-beat fact handed over on the
+      // first failure and then dropped: the store re-reads its open episode on
+      // EVERY beat, so it needs the evidence on every beat. Two failures in, the
+      // run still begins at the same delivered beat — and passing nothing here
+      // (or a bare "this is not a new run") is what let the fourth beat of an
+      // outage be handed a finished episode and go quiet.
       initHeartbeatService({ enableLocalCron: false });
 
       setQueryResult('scheduled_reminders', [makeDueReminder()]);
-      // Already failing, so this beat belongs to the outage already in progress.
+      queueHistory([
+        { status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' },
+        { status: 'failed', triggered_at: '2026-09-09T01:00:00.000Z' },
+        { status: 'delivered', triggered_at: '2026-09-09T00:00:00.000Z' },
+      ]);
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue(ALERTED)
+      );
+
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), {
+        kind: 'healthy-beat',
+        at: '2026-09-09T00:00:00.000Z',
+      });
+    });
+
+    it('reports no boundary when the window holds no healthy beat', async () => {
+      // An outage longer than the history window. There is genuinely nothing to
+      // invalidate the open episode against, and inventing a boundary here would
+      // restart the episode — and re-alert — on every beat for as long as the
+      // outage lasts.
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
       queueHistory([
         { status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' },
         { status: 'failed', triggered_at: '2026-09-09T01:00:00.000Z' },
@@ -1211,7 +1242,28 @@ describe('Heartbeat Service', () => {
         vi.fn().mockResolvedValue(ALERTED)
       );
 
-      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { startsNewRun: false });
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { kind: 'none' });
+    });
+
+    it('reports an unknown boundary when history cannot be read', async () => {
+      // "No healthy beat found" and "we could not look" are the same empty
+      // result and must not be the same answer: the first means the open episode
+      // is still this one, the second means nothing here is verifiable. Reporting
+      // the second as the first would let an unreadable history hand a delivered
+      // notice to a new outage.
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      queryResultQueues.delete('reminder_history');
+      setQueryResult('reminder_history', null, { message: 'history unavailable' });
+      setQueryResult('reminder_history', { id: 'hist-001' });
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue(ALERTED)
+      );
+
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { kind: 'unknown' });
     });
 
     it('asks the store for the episode of the outage it is closing, too', async () => {

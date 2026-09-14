@@ -27,6 +27,14 @@
  * So the key is minted once as a uuid and read back from this table thereafter.
  * `openEpisode` is that lookup. A value we assign and store cannot drift.
  *
+ * WHAT THE LOOKUP CANNOT ANSWER ON ITS OWN.
+ *
+ * Reading back the open episode assumes the bookkeeping that would have closed
+ * the last one survived — and a store outage is exactly when it did not. So
+ * every lookup is checked against `EpisodeBoundary`: the last healthy beat, read
+ * from `reminder_history`, which this module does not write. An open outage
+ * older than that boundary is a finished run, however open it looks here.
+ *
  * AN OWED ALL-CLEAR OUTLIVES THE ROW THAT WOULD HAVE RECORDED IT.
  *
  * If a human was told their monitor is down, they are owed a "it is back". That
@@ -103,6 +111,32 @@ export function backoffForAttempt(attempts: number): number {
 
 export type NoticeKind = 'outage' | 'recovery';
 
+/**
+ * Where the current run of failed beats begins, as `reminder_history` records it.
+ *
+ * This module cannot work the boundary out for itself. Every record it could
+ * consult is one it writes, and the run worth surviving is precisely the one
+ * where those writes were failing — so an episode that ended can still look open
+ * here long after a healthy beat ended it. `reminder_history` is written by the
+ * heartbeat loop, not by this store, so a store outage cannot corrupt it.
+ *
+ * The three cases are kept apart because two of them look identical from here
+ * and must not behave identically:
+ *
+ * - `healthy-beat` — a delivered beat at `at` separates this failure from
+ *   anything before it. An open outage row created before that instant belongs
+ *   to a run that has already ended.
+ * - `none` — history read cleanly and holds no delivered beat in range. There is
+ *   nothing to invalidate against, so an open episode is still this one. This is
+ *   the ordinary state of an outage longer than the history window.
+ * - `unknown` — history could not be read. Nothing here can be verified, so no
+ *   existing episode may be reused. Costs a duplicate alert, never silence.
+ */
+export type EpisodeBoundary =
+  | { kind: 'healthy-beat'; at: string }
+  | { kind: 'none' }
+  | { kind: 'unknown' };
+
 export interface NoticeRecord {
   id: string;
   status: 'pending' | 'delivered';
@@ -142,10 +176,12 @@ export interface HeartbeatNotificationStore {
    * unreadable store costs a duplicate alert instead of attaching this beat to
    * an episode it cannot verify.
    *
-   * `startsNewRun` is the caller's own knowledge that a healthy beat separated
-   * this failure from the previous one — see the note on the implementation.
+   * `boundary` is what the caller knows and this module cannot: where the
+   * current run of failures begins, according to a table this store does not
+   * write. An episode older than that boundary is never reused — see
+   * `EpisodeBoundary`.
    */
-  openEpisode(reminderId: string, options?: { startsNewRun?: boolean }): Promise<string>;
+  openEpisode(reminderId: string, boundary: EpisodeBoundary): Promise<string>;
   /**
    * Whether a notice for this episode should be sent now.
    *
@@ -244,7 +280,25 @@ export function createHeartbeatNotificationStore(
 
   const load = async (key: NoticeKey): Promise<NoticeRow | null> => (await readNotice(key)).row;
 
-  const openEpisode: HeartbeatNotificationStore['openEpisode'] = async (reminderId, options) => {
+  /**
+   * Whether an open outage row belongs to the failure run happening now.
+   *
+   * A row created before the last healthy beat was opened by a run that beat
+   * ended, whatever its own bookkeeping says. A timestamp that will not parse
+   * is not evidence of anything, so it fails the test: the cost of refusing a
+   * current episode is one duplicate alert, and the cost of accepting a
+   * finished one is total silence for the outage in progress.
+   */
+  const belongsToCurrentRun = (createdAt: string | null, boundary: EpisodeBoundary): boolean => {
+    if (boundary.kind === 'unknown') return false;
+    if (boundary.kind === 'none') return true;
+    const created = createdAt ? Date.parse(createdAt) : Number.NaN;
+    const healthyAt = Date.parse(boundary.at);
+    if (!Number.isFinite(created) || !Number.isFinite(healthyAt)) return false;
+    return created > healthyAt;
+  };
+
+  const openEpisode: HeartbeatNotificationStore['openEpisode'] = async (reminderId, boundary) => {
     // A HEALTHY BEAT IS ITSELF AN EPISODE BOUNDARY, AND IT NEEDS NO WRITE TO
     // PROVE IT.
     //
@@ -256,20 +310,27 @@ export function createHeartbeatNotificationStore(
     // recovery SELECT then truthfully reports no row, and the old episode looks
     // like it is still in progress.
     //
-    // The caller already knows better. It read the failure streak before
-    // recording this beat, so a streak of zero means the previous beat was
-    // healthy — a fact held in `reminder_history`, which this module does not
-    // write and a failing notification store therefore cannot corrupt. That is
-    // the boundary, independent of whether any bookkeeping write survived.
+    // The caller knows better, from `reminder_history` — a table this module
+    // does not write, so a failing notification store cannot corrupt it.
+    //
+    // That evidence has to be checked on EVERY lookup, not only on the first
+    // beat of a run. An earlier version took a one-beat boolean ("the previous
+    // beat was healthy") and minted a fresh uuid on the strength of it, which
+    // holds exactly as long as that fresh episode gets written down. When its
+    // INSERT fails too, the next beat has a non-zero streak, asks the plain
+    // question, and is handed the OLD delivered outage — suppressed, for an
+    // outage still in progress, with the store and the channel both healthy
+    // again. The boundary was durable the whole time; the code stopped
+    // consulting it after one beat.
     //
     // The old episode is deliberately left OPEN. Its all-clear may still be
     // owed, and `findOwedRecovery` reads that debt from the open outage row;
     // closing it here to tidy up would discard the obligation.
-    if (options?.startsNewRun) return randomUUID();
+    if (boundary.kind === 'unknown') return randomUUID();
 
     try {
       const { data, error } = await table()
-        .select('episode_key, destination')
+        .select('episode_key, destination, created_at')
         .eq('reminder_id', reminderId)
         .eq('kind', 'outage')
         .is('episode_closed_at', null)
@@ -284,8 +345,22 @@ export function createHeartbeatNotificationStore(
         return randomUUID();
       }
 
-      const existing = (data as { episode_key: string; destination: string | null }[] | null)?.[0];
+      const existing = (
+        data as
+          | { episode_key: string; destination: string | null; created_at: string | null }[]
+          | null
+      )?.[0];
       if (!existing) return randomUUID();
+
+      if (!belongsToCurrentRun(existing.created_at, boundary)) {
+        logger.info('[Heartbeat] Open outage predates the last healthy beat — new episode', {
+          reminderId,
+          staleEpisodeKey: existing.episode_key,
+          openedAt: existing.created_at,
+          lastHealthyBeatAt: boundary.kind === 'healthy-beat' ? boundary.at : null,
+        });
+        return randomUUID();
+      }
 
       // AN EPISODE'S IDENTITY ENDS WHERE ITS ALL-CLEAR IS ATTEMPTED.
       //

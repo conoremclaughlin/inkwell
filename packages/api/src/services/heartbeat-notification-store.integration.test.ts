@@ -28,7 +28,18 @@ import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import { randomUUID } from 'crypto';
 import type { Database } from '../data/supabase/types';
-import { createHeartbeatNotificationStore } from './heartbeat-notification-store';
+import {
+  createHeartbeatNotificationStore,
+  type EpisodeBoundary,
+} from './heartbeat-notification-store';
+
+/**
+ * "History read cleanly and holds no healthy beat" — the boundary an ordinary
+ * mid-outage beat reports, and the one that lets `openEpisode` answer with the
+ * episode already in progress. Named rather than inlined because every lookup
+ * below that is NOT about the boundary rule still has to pass one.
+ */
+const MID_OUTAGE: EpisodeBoundary = { kind: 'none' };
 
 const projectRoot = resolve(__dirname, '../../../../');
 const envLocalPath = resolve(projectRoot, '.env.local');
@@ -211,9 +222,9 @@ d('heartbeat notification store — real schema', () => {
       kind: 'outage',
     });
 
-    const open = await store.openEpisode(isolatedReminder);
+    const open = await store.openEpisode(isolatedReminder, MID_OUTAGE);
     expect(open).toBe(openEpisodeKey);
-    expect(await store.openEpisode(isolatedReminder)).toBe(open);
+    expect(await store.openEpisode(isolatedReminder, MID_OUTAGE)).toBe(open);
 
     await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
   });
@@ -312,7 +323,7 @@ d('heartbeat notification store — real schema', () => {
     expect(await store.findOwedRecovery(reminderId)).toBeNull();
     // And a closed episode is no longer the open one, so the next failure
     // mints a fresh key rather than reopening a settled outage.
-    expect(await store.openEpisode(reminderId)).not.toBe(episodeKey);
+    expect(await store.openEpisode(reminderId, MID_OUTAGE)).not.toBe(episodeKey);
   });
 
   it('writes a backoff gate that the real column accepts', async () => {
@@ -469,7 +480,7 @@ d('heartbeat notification store — real schema', () => {
     expect((stillOpen as { episode_closed_at: string | null }).episode_closed_at).toBeNull();
 
     // The next failing beat must get a FRESH episode, or its outage is silent.
-    expect(await store.openEpisode(isolatedReminder)).not.toBe(recoveredEpisode);
+    expect(await store.openEpisode(isolatedReminder, MID_OUTAGE)).not.toBe(recoveredEpisode);
 
     await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
   });
@@ -571,10 +582,10 @@ d('heartbeat notification store — real schema', () => {
 
     // The control and the case differ in one thing only: whether the recovery
     // read answers. Same table, same rows, same code.
-    expect(await store.openEpisode(isolatedReminder)).toBe(episode);
+    expect(await store.openEpisode(isolatedReminder, MID_OUTAGE)).toBe(episode);
 
     const blindStore = createHeartbeatNotificationStore(withUnreadableRecovery());
-    expect(await blindStore.openEpisode(isolatedReminder)).not.toBe(episode);
+    expect(await blindStore.openEpisode(isolatedReminder, MID_OUTAGE)).not.toBe(episode);
 
     await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
   });
@@ -731,7 +742,7 @@ d('heartbeat notification store — real schema', () => {
       .single();
     expect((outageRow as { episode_closed_at: string | null }).episode_closed_at).toBeNull();
 
-    expect(await store.openEpisode(isolatedReminder)).not.toBe(episode);
+    expect(await store.openEpisode(isolatedReminder, MID_OUTAGE)).not.toBe(episode);
 
     const owed = await store.findOwedRecovery(isolatedReminder);
     expect(owed?.episodeKey).toBe(episode);
@@ -804,10 +815,10 @@ d('heartbeat notification store — real schema', () => {
     // sent, its recovery INSERT and the episode close both fail, and once the
     // store is healthy the recovery read truthfully reports no row at all.
     //
-    // The caller knows anyway, from a table this module does not write: a
-    // failure streak of zero means the previous beat was healthy. The control is
-    // the first assertion — without that knowledge the old episode is still the
-    // right answer, so it is the flag doing the work here and not the fixture.
+    // The caller knows anyway, from a table this module does not write: the
+    // instant of the last delivered beat. The control is the first assertion —
+    // without that knowledge the old episode is still the right answer, so it is
+    // the boundary doing the work here and not the fixture.
     const isolatedReminder = randomUUID();
     const episode = randomUUID();
 
@@ -834,21 +845,106 @@ d('heartbeat notification store — real schema', () => {
 
     const { data: rows } = await client
       .from('heartbeat_notifications' as never)
-      .select('kind, episode_closed_at')
+      .select('kind, episode_closed_at, created_at')
       .eq('reminder_id', isolatedReminder);
     expect(rows).toHaveLength(1);
     expect((rows as { kind: string }[])[0].kind).toBe('outage');
     expect((rows as { episode_closed_at: string | null }[])[0].episode_closed_at).toBeNull();
 
-    // CONTROL: mid-outage, with no healthy beat between, the episode continues.
-    expect(await store.openEpisode(isolatedReminder)).toBe(episode);
+    // Both boundaries are derived from the row's OWN `created_at`, read back
+    // from the database. Using the local clock would compare two clocks and
+    // make the test's verdict depend on skew rather than on the rule.
+    const openedAt = Date.parse((rows as { created_at: string }[])[0].created_at);
+    const before: EpisodeBoundary = {
+      kind: 'healthy-beat',
+      at: new Date(openedAt - 1000).toISOString(),
+    };
+    const after: EpisodeBoundary = {
+      kind: 'healthy-beat',
+      at: new Date(openedAt + 1000).toISOString(),
+    };
 
-    // The fix: a healthy beat happened, so this failure is a new outage.
-    expect(await store.openEpisode(isolatedReminder, { startsNewRun: true })).not.toBe(episode);
+    // CONTROL: mid-outage, with no healthy beat between, the episode continues.
+    expect(await store.openEpisode(isolatedReminder, MID_OUTAGE)).toBe(episode);
+
+    // CONTROL: a healthy beat BEFORE this episode opened does not end it. Without
+    // this, a boundary check that ignored the timestamp entirely would pass.
+    expect(await store.openEpisode(isolatedReminder, before)).toBe(episode);
+
+    // The fix: a healthy beat after it opened, so this failure is a new outage.
+    expect(await store.openEpisode(isolatedReminder, after)).not.toBe(episode);
+
+    // Round eight. The boundary has to be re-checked on every lookup, not spent
+    // on the first one — that is the whole defect. The store is deliberately in
+    // the state left by a beat whose fresh episode could not be persisted: no new
+    // row, the old delivered outage still the newest thing here. Asking again
+    // must still refuse it.
+    expect(await store.openEpisode(isolatedReminder, after)).not.toBe(episode);
 
     // And the old episode's all-clear is still owed — ending it by quietly
     // closing it would trade this silence for the other one.
     expect((await store.findOwedRecovery(isolatedReminder))?.episodeKey).toBe(episode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('keeps a minted episode once its row lands, and refuses the one before it', async () => {
+    // Round eight, the other half. Refusing a finished episode on every beat is
+    // only correct if a LIVE one is still reused on every beat — otherwise the
+    // fix for a permanently silent outage is an outage that alarms forever.
+    //
+    // Two episodes on one reminder, separated by a healthy beat: the old one
+    // delivered and never closed (its all-clear left no trace), the new one
+    // opened after the boundary. Repeated lookups must keep answering with the
+    // new one.
+    const isolatedReminder = randomUUID();
+    const finished = randomUUID();
+    const current = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'a live episode survives repeated boundary checks',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-13',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const base = {
+      reminderId: isolatedReminder,
+      userId,
+      destination: 'sb-test|telegram|chat-13',
+    };
+
+    await store.claimNotice({ ...base, episodeKey: finished, kind: 'outage' });
+    await store.settleNotice(
+      { ...base, episodeKey: finished, kind: 'outage' },
+      { delivered: true }
+    );
+
+    const { data: firstRow } = await client
+      .from('heartbeat_notifications' as never)
+      .select('created_at')
+      .eq('reminder_id', isolatedReminder)
+      .eq('episode_key', finished)
+      .single();
+    const healthyBeat = new Date(
+      Date.parse((firstRow as { created_at: string }).created_at) + 1000
+    ).toISOString();
+
+    // The new outage's row lands this time, dated after the healthy beat.
+    await store.claimNotice({ ...base, episodeKey: current, kind: 'outage' });
+    await client
+      .from('heartbeat_notifications' as never)
+      .update({ created_at: new Date(Date.parse(healthyBeat) + 1000).toISOString() } as never)
+      .eq('reminder_id', isolatedReminder)
+      .eq('episode_key', current);
+
+    const boundary: EpisodeBoundary = { kind: 'healthy-beat', at: healthyBeat };
+    for (let beat = 0; beat < 3; beat++) {
+      expect(await store.openEpisode(isolatedReminder, boundary)).toBe(current);
+    }
 
     await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
   });

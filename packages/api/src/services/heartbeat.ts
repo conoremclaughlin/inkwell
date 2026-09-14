@@ -19,7 +19,10 @@ import { CronExpressionParser } from 'cron-parser';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
-import { createHeartbeatNotificationStore } from './heartbeat-notification-store.js';
+import {
+  createHeartbeatNotificationStore,
+  type EpisodeBoundary,
+} from './heartbeat-notification-store.js';
 import type { Database, Json } from '../data/supabase/types.js';
 
 // DueReminder is the subset of fields we need for processing
@@ -225,16 +228,24 @@ export interface HeartbeatNoticeResult {
 }
 
 /**
- * The current run of consecutive failures.
+ * What `reminder_history` says about the beats leading up to this one.
  *
- * This is a COUNT and nothing more. It once also carried the timestamp the run
- * began, which the escalation path used as the episode identity; that is now
- * minted and stored by `heartbeat-notification-store` instead, because a value
- * recomputed from a bounded history window is not an identity — it changed
- * between the first and second beat of every outage.
+ * The count is NOT an identity. It once carried the timestamp the run began and
+ * the escalation path used that as the episode key; identity is minted and
+ * stored by `heartbeat-notification-store` now, because a value recomputed from
+ * a bounded history window changed between the first and second beat of every
+ * outage.
+ *
+ * The `boundary` is a different thing and is not identity either: it is the
+ * evidence that separates one run from the next. The notification store cannot
+ * derive it, because every record the store could consult is one the store
+ * writes — and the run worth surviving is the one where those writes failed.
+ * `reminder_history` is written here instead, so a failing notification store
+ * cannot corrupt it.
  */
 interface FailureStreak {
   streak: number;
+  boundary: EpisodeBoundary;
 }
 
 export type HeartbeatFailureHook = (
@@ -406,7 +417,9 @@ export async function processHeartbeat(
       // of beats leading up to now. Recording first would make every failure
       // look like at least its own predecessor.
       const history: FailureStreak =
-        outcome.status === 'skipped' ? { streak: 0 } : await consecutiveFailureCount(reminder.id);
+        outcome.status === 'skipped'
+          ? { streak: 0, boundary: { kind: 'unknown' } }
+          : await consecutiveFailureCount(reminder.id);
       const priorFailures = history.streak;
 
       if (outcome.status === 'delivered') {
@@ -419,9 +432,11 @@ export async function processHeartbeat(
             onRecovery,
             destinationAlreadyTold(recoveredThisRun, reminder),
             // The episode that just ended, read back from the store so it is
-            // the same key the outage notice used. Never a new run: this branch
-            // only runs when the streak was non-zero, which is the episode.
-            await resolveEpisodeKey(reminder.id, false),
+            // the same key the outage notice used. The boundary is the healthy
+            // beat BEFORE the outage, because `history` was read before this
+            // beat's own delivered row was written — so it validates the
+            // episode rather than invalidating it.
+            await resolveEpisodeKey(reminder.id, history.boundary),
             alertDestination(reminder)
           );
           if (alerted) markDestinationTold(recoveredThisRun, reminder);
@@ -463,9 +478,9 @@ export async function processHeartbeat(
           onFailure,
           destinationAlreadyTold(alertedThisRun, reminder),
           // The episode in progress, minted on its first failure and reused by
-          // every beat after that. `priorFailures === 0` means the beat before
-          // this one was healthy, so this failure starts a new episode.
-          await resolveEpisodeKey(reminder.id, priorFailures === 0),
+          // every beat after that — but only while it is provably part of THIS
+          // run of failures. See `EpisodeBoundary`.
+          await resolveEpisodeKey(reminder.id, history.boundary),
           alertDestination(reminder)
         );
         if (alerted) markDestinationTold(alertedThisRun, reminder);
@@ -483,7 +498,7 @@ export async function processHeartbeat(
         history.streak + 1,
         onFailure,
         destinationAlreadyTold(alertedThisRun, reminder),
-        await resolveEpisodeKey(reminder.id, history.streak === 0),
+        await resolveEpisodeKey(reminder.id, history.boundary),
         alertDestination(reminder)
       );
       if (alerted) markDestinationTold(alertedThisRun, reminder);
@@ -583,16 +598,15 @@ async function announceRecovery(
  * when there is no database to ask, which fails toward a duplicate alert rather
  * than toward attaching a beat to an episode nobody can verify.
  *
- * `startsNewRun` passes down what only the caller knows: the failure streak read
- * before this beat was recorded. A streak of zero means the previous beat was
- * healthy, so this failure opens a new outage however the last one's bookkeeping
- * ended up. The store cannot work that out for itself — every record it could
- * consult is one it writes, and the run worth surviving is the one where those
- * writes were failing.
+ * `boundary` passes down what only the caller knows: where the current run of
+ * failures begins, read from `reminder_history` before this beat was recorded.
+ * The store cannot work that out for itself — every record it could consult is
+ * one it writes, and the run worth surviving is the one where those writes were
+ * failing.
  */
-async function resolveEpisodeKey(reminderId: string, startsNewRun: boolean): Promise<string> {
+async function resolveEpisodeKey(reminderId: string, boundary: EpisodeBoundary): Promise<string> {
   if (!supabase) return randomUUID();
-  return createHeartbeatNotificationStore(supabase).openEpisode(reminderId, { startsNewRun });
+  return createHeartbeatNotificationStore(supabase).openEpisode(reminderId, boundary);
 }
 
 /**
@@ -660,10 +674,19 @@ async function retryOwedRecovery(
  *
  * `skipped` and `pending` rows are excluded rather than treated as successes:
  * a watchdog that self-cancels mid-outage has not fixed anything, and should
- * not read as a recovery.
+ * not read as a recovery. The same exclusion is why the boundary below is a
+ * DELIVERED beat and not merely a non-failed one.
+ *
+ * The walk also yields the episode boundary, because it is the same walk: the
+ * row it stops on is the most recent beat that succeeded, and that beat is what
+ * separates this run of failures from the one before it. Stopping at the end of
+ * the window instead reports `none` rather than inventing a boundary — during an
+ * outage longer than the window there is no healthy beat in range, and claiming
+ * one would restart the episode (and re-alert) every beat.
  */
 async function consecutiveFailureCount(reminderId: string): Promise<FailureStreak> {
-  if (!supabase) return { streak: 0 };
+  // No database is not "no healthy beat" — it is no evidence at all.
+  if (!supabase) return { streak: 0, boundary: { kind: 'unknown' } };
 
   // Never let the streak lookup take down the beat it is describing, whether
   // it resolves with an error (PostgREST's usual shape) or throws (a transport
@@ -683,26 +706,35 @@ async function consecutiveFailureCount(reminderId: string): Promise<FailureStrea
         reminderId,
         error: error.message,
       });
-      return { streak: 0 };
+      return { streak: 0, boundary: { kind: 'unknown' } };
     }
 
-    if (!Array.isArray(data)) return { streak: 0 };
+    if (!Array.isArray(data)) return { streak: 0, boundary: { kind: 'unknown' } };
 
     // Rows arrive newest first; count back until a success or the end of the
-    // window. The count is all this returns — the episode's identity comes from
-    // the notification store, not from where this walk happens to stop.
+    // window. The count is all this contributes to identity — the episode's key
+    // comes from the notification store, not from where this walk stops.
     let streak = 0;
+    let boundary: EpisodeBoundary = { kind: 'none' };
     for (const row of data as { status: string; triggered_at: string | null }[]) {
-      if (row?.status !== 'failed') break;
+      if (row?.status !== 'failed') {
+        // The run ends here. A delivered row with no timestamp cannot bound
+        // anything, so it reports as unverifiable rather than as absent — the
+        // difference between a duplicate alert and a silent one.
+        boundary = row?.triggered_at
+          ? { kind: 'healthy-beat', at: row.triggered_at }
+          : { kind: 'unknown' };
+        break;
+      }
       streak++;
     }
-    return { streak };
+    return { streak, boundary };
   } catch (err) {
     logger.warn('[Heartbeat] Failure streak lookup threw', {
       reminderId,
       error: err instanceof Error ? err.message : String(err),
     });
-    return { streak: 0 };
+    return { streak: 0, boundary: { kind: 'unknown' } };
   }
 }
 
