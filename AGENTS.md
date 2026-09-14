@@ -789,34 +789,57 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
-- **Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m`, not even for a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in it is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten live credentials into a public repository. The diff stays clean, so review cannot catch it.
 
-  A subject line is **not** the safe exception it looks like. Backticks in a subject are substituted exactly as they are in a body:
+### Commit messages, secrets, and what gets pushed (IRONCLAD)
 
-  ```bash
-  git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
-  ```
+These rules exist because on 2026-09-13 a commit message pasted 151 shell variables, including live credentials, into a public repository, and because two commits in February 2026 did the same on `main` and sat there for seven months. They apply to every SB and every OB, in every repo, with no exceptions and no "quick one".
 
-  That example substitutes `pwd`, not the builtin that caused the incident — the snippet is runnable, and the real one would dump your environment into a commit. Same mechanism, harmless payload.
+1. **Nothing in a commit message is ever evaluated by the shell.** Backticks, `$(...)` and `$VAR` are fine as literal text in a message written through a quoted heredoc (`<<'EOF'`) or the `Write` tool. They are forbidden anywhere the shell would expand them: an `-m` string, an unquoted heredoc, a double-quoted `echo` or `printf` argument. A commit message is literal text you wrote, and only that.
+2. **If you need a value in the message, get it first, look at it, then paste the literal.** Run the command on its own, read its output, and type what you want into the message file by hand. There is no situation where a variable expanding inside a commit message is the right shortcut.
+3. **Write the message to a file and commit with `git commit -F <file>`.** Create the file with a quoted heredoc or the `Write` tool. Never `-m`, not even for a one-line subject. The mechanism and the runnable example are in the reference below.
+4. **Stage by naming paths, and look at what you staged.** `git add <path> [<path>...]` or a directory you have just inspected, then `git diff --cached` before committing. Never `git add -A`, never `git add .`, never `git commit -a` or `-am`. `.` and `-A` sweep in untracked files you never looked at, which is how env files, identity files, and scratch output end up in a commit; `-a` and `-am` commit every modified tracked file and skip the staged-diff review.
+5. **Read every commit message back before you push. All of them, every time, through the guard.** Run `sh scripts/check-push.sh --preview`: it replays `origin/main..HEAD` the way the pre-push hook will, scanning each message first and printing it only if it passes, oldest first, and withholding any that fail with a value-free report. Read the output top to bottom. Do not use a raw `git log` for this from a session whose output is captured: an unscanned message carrying a secret would be written straight into the transcript. "Nobody reads commit messages" is wrong: you do, right before `git push`, because the push is the point of no return. A message you have not read back is a message you have not finished writing.
+6. **The hooks are a backstop, not the safety.** The `commit-msg` guard, the staged-file guard, and the pre-push replay catch the shapes that have already burned us. Passing them means nothing matched. Rules 1 through 5 are what prevent the leak.
+7. **Anything secret-shaped in a commit is an incident before it is anything else.** Do not push. If it was already pushed, do not clean it up quietly: tell Conor, rotate, and follow the purge procedure. A pushed commit is public the moment it lands, and GitHub keeps it reachable by SHA after the branch is gone.
 
-  Single-quoting is not the fix either: an apostrophe in a word like `don't` closes the string, and the remainder of your message is re-parsed as shell.
+In no scenario do we play fast and loose with secrets or with any path that could carry one. A value that might be a secret is treated as one until measured otherwise.
 
-  **How you write the file matters as much as `-F` does.** `-F` reads bytes and never expands them, but the shell still expands whatever you use to _create_ the file:
+#### Reference: why `-F`, how the file gets written, and what the hook does
 
-  ```bash
-  cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
-  cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
-  ```
+**Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m`, not even for a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in it is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten nonempty credential-bearing assignments into a public repository. The diff stays clean, so review cannot catch it.
 
-  Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
+A subject line is **not** the safe exception it looks like. Backticks in a subject are substituted exactly as they are in a body:
 
-  The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, whichever way the credentials got in. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
+```bash
+git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
+```
 
-  **A non-empty `core.hooksPath` does not mean the guard is on.** The hook runs from whichever checkout that path points at, which on a machine with worktrees is one shared directory serving all of them. If that checkout does not carry `.husky/commit-msg`, nothing is checked and nothing says so. To confirm: `ls "$(git config core.hooksPath)"/commit-msg`.
+That example substitutes `pwd`, not the builtin that caused the incident — the snippet is runnable, and the real one would dump your environment into a commit. Same mechanism, harmless payload.
 
-  **Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak.
+Single-quoting is not the fix either: an apostrophe in a word like `don't` closes the string, and the remainder of your message is re-parsed as shell.
 
-  It has one false positive you will meet, and it is deliberate: **any** assignment to a name it knows — `JWT_SECRET=`, `GITHUB_TOKEN=` — is refused, including `=<placeholder>`, `=***` and a bare `=` with nothing after it. Exempting those meant exempting real credentials that happen to start with the same byte, so prose names the variable without assigning to it: "the `JWT_SECRET` value", not `JWT_SECRET=<value>`. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
+**How you write the file matters as much as `-F` does.** `-F` reads bytes and never expands them, but the shell still expands whatever you use to _create_ the file:
+
+```bash
+cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
+cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
+```
+
+Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
+
+The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, whichever way the credentials got in. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
+
+**A non-empty `core.hooksPath` does not mean the guard is on.** The hook runs from whichever checkout that path points at, which on a machine with worktrees is one shared directory serving all of them. If that checkout does not carry `.husky/commit-msg`, nothing is checked and nothing says so. To confirm: `ls "$(git config core.hooksPath)"/commit-msg`.
+
+**Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak.
+
+It has one false positive you will meet, and it is deliberate: **any** assignment to a name it knows — `JWT_SECRET=`, `GITHUB_TOKEN=` — is refused, including `=<placeholder>`, `=***` and a bare `=` with nothing after it. Exempting those meant exempting real credentials that happen to start with the same byte, so prose names the variable without assigning to it: "the `JWT_SECRET` value", not `JWT_SECRET=<value>`. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
+
+## Issues Live in Inkwell, Not GitHub
+
+**SBs file issues as Inkwell tasks, never as GitHub issues.** Use `create_task`, or a task group for anything with more than one piece, with the same specificity you would put in a GitHub issue: what happened, how to reproduce it, what you expected, and where in the code. Link the task from the PR or thread that addresses it.
+
+GitHub issues are an **external feed**: the place for people outside the repo to report problems, and the place we track what they report. All SBs share one GitHub account, so an SB-authored GitHub issue is indistinguishable from Conor filing it, and it puts internal triage on a surface the team does not work from. When an external issue arrives, create the Inkwell task that tracks it, put the GitHub issue number in the task, and reply on GitHub when it is resolved.
 
 ## Architecture Notes
 

@@ -71,7 +71,7 @@ Claude Code, the `Write` tool).
 
 On 2026-09-13 a message containing the phrase ``a `local` flag on the cache entry`` ran the
 zsh `local` builtin, which at top level prints every parameter, and pasted the entire
-environment into the commit. Ten live credentials reached a public repository. Two earlier
+environment into the commit. Ten nonempty credential-bearing assignments reached a public repository. Two earlier
 commits from February 2026 did the same thing and sat on public `main` for seven months.
 Different people, seven months apart, following what the docs said at the time.
 
@@ -131,6 +131,38 @@ exemptions**, a commit already in `main` cannot be made safe by refusing it, and
 fails to complete is a failure whether or not the commit is listed. Adding to it means reading
 the whole message first and saying so in the comment beside the SHA.
 
+#### Staging and pushing: name the paths, read the messages back
+
+Two more rules sit beside `-F`, set on 2026-09-13 after the leak above. The full list, with
+the reasoning, is in [AGENTS.md](./AGENTS.md#commit-messages-secrets-and-what-gets-pushed-ironclad);
+these are the two that change what you type.
+
+**Stage by naming paths.** `git add <path> [<path>...]`, or a directory you have just looked at,
+then `git diff --cached` before committing. Not `git add -A`, not `git add .`, not `git commit -a`
+or `-am`. The first two sweep in untracked files you never inspected — an env file, an identity
+file, scratch output — and the last two commit every modified tracked file without the
+staged-diff review.
+
+**Read every commit message back before you push, every time, through the guard.**
+
+```bash
+sh scripts/check-push.sh --preview
+```
+
+That replays `origin/main..HEAD` the way the `pre-push` hook will: each message is scanned first
+and printed only if it passes, oldest first; one that fails is withheld and only its value-free
+report is shown. Read the output top to bottom. Do not use a raw `git log` for this from a session
+whose output is captured — an unscanned message carrying a secret would be written straight into
+the transcript. The push is the point of no return, and a message you have not read back is a
+message you have not finished writing. The hook runs the same replay and refuses the push on a
+refusal, but it is a backstop: passing it means nothing matched, not that the messages are clean.
+
+Nothing in a commit message is ever evaluated by the shell. Backticks, `$(...)` and `$VAR` are
+fine as literal text written through a quoted heredoc or the Write tool; they are forbidden
+anywhere the shell would expand them — an `-m` string, an unquoted heredoc, a double-quoted `echo`
+or `printf` argument. Need a computed value in the message? Run the command separately, read its
+output, and paste the literal.
+
 ### Branching
 
 We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/): feature branches off `main`, which must always be stable and deployable.
@@ -183,6 +215,16 @@ Examples:
 // ???: unclear why this timeout is needed — removing it breaks auth
 // Simple explanation needs no prefix
 ```
+
+### Filing issues
+
+Contributors from outside the project: GitHub issues are the right place, and they are read.
+
+SBs and core contributors: file issues as Inkwell tasks (`create_task`), not GitHub issues. The
+GitHub account is shared, so an internal issue there is indistinguishable from an external report
+and lands on a surface the team does not triage from. When an external report arrives, open the
+Inkwell task that tracks it, note the issue number in the task, and reply on GitHub when it is
+resolved.
 
 ## Pull Requests
 
