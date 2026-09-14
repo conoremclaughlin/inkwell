@@ -22,13 +22,18 @@
  * Skipped automatically in CI / when credentials are unavailable.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import { randomUUID } from 'crypto';
 import type { Database } from '../data/supabase/types';
-import { FAILURE_STREAK_ORDER_COLUMN } from './heartbeat';
+import {
+  FAILURE_STREAK_ORDER_COLUMN,
+  selectFailureStreakWindow,
+  selectLastDeliveredBeat,
+} from './heartbeat';
 
 const projectRoot = resolve(__dirname, '../../../../');
 const envLocalPath = resolve(projectRoot, '.env.local');
@@ -94,5 +99,83 @@ d('heartbeat failure streak — real schema', () => {
 
     expect(result.error).not.toBeNull();
     expect(result.data).toBeNull();
+  });
+
+  /**
+   * The window that hid the boundary, on the real table.
+   *
+   * Round nine of Lumen's review. The boundary used to be a by-product of the
+   * streak walk, so it inherited that walk's 50-row window — and after fifty
+   * failed beats the healthy beat that separates this outage from the last one
+   * is simply not in the rows that come back. The walk then reports "no healthy
+   * beat", which the store reads as "reuse the open episode", and the episode it
+   * reuses is a finished one whose alert already went out. Every retry from
+   * there is suppressed.
+   *
+   * Both halves are asserted here, against real rows, because each alone would
+   * be comfortable rather than convincing: that the streak window genuinely
+   * truncates (so the bug was real and not a story about LIMIT), and that the
+   * boundary query reaches past it anyway (so the fix is real).
+   */
+  describe('the episode boundary behind a full window of failures', () => {
+    const userId = randomUUID();
+    const reminderId = randomUUID();
+    // Old enough to be pushed out of the window by the failures stacked above.
+    const healthyAt = new Date('2026-09-01T00:00:00.000Z');
+
+    beforeAll(async () => {
+      await client.from('users').insert({
+        id: userId,
+        email: `heartbeat-streak-${reminderId}@example.test`,
+      } as never);
+      await client.from('scheduled_reminders').insert({
+        id: reminderId,
+        user_id: userId,
+        title: 'streak window integration fixture',
+        delivery_channel: 'telegram',
+        delivery_target: 'chat-1',
+        next_run_at: new Date().toISOString(),
+        status: 'active',
+      } as never);
+
+      // One delivered beat, then a full window of failures on top of it. Exactly
+      // FAILURE_STREAK_LOOKBACK failures is the threshold: at 49 the delivered
+      // row still makes it into the window, which is the passing control Lumen
+      // ran. At 50 it does not.
+      await client.from('reminder_history').insert([
+        { reminder_id: reminderId, status: 'delivered', triggered_at: healthyAt.toISOString() },
+        ...Array.from({ length: 50 }, (_, i) => ({
+          reminder_id: reminderId,
+          status: 'failed',
+          error_message: 'backend not authenticated',
+          triggered_at: new Date(healthyAt.getTime() + (i + 1) * 3_600_000).toISOString(),
+        })),
+      ] as never);
+    });
+
+    afterAll(async () => {
+      // ON DELETE CASCADE takes the history rows with it.
+      await client.from('scheduled_reminders').delete().eq('id', reminderId);
+      await client.from('users').delete().eq('id', userId);
+    });
+
+    it('truncates the healthy beat out of the streak window', async () => {
+      const { data, error } = await selectFailureStreakWindow(client, reminderId);
+
+      expect(error).toBeNull();
+      expect(data).toHaveLength(50);
+      // Every row in range is a failure, so a walk over them stops at the end of
+      // the window and has no healthy beat to report. This is the bug's premise,
+      // measured rather than asserted from the LIMIT.
+      expect(data!.every((row) => row.status === 'failed')).toBe(true);
+    });
+
+    it('finds the healthy beat anyway, because the boundary has no window', async () => {
+      const { data, error } = await selectLastDeliveredBeat(client, reminderId);
+
+      expect(error).toBeNull();
+      expect(data).toHaveLength(1);
+      expect(new Date(data![0].triggered_at!).toISOString()).toBe(healthyAt.toISOString());
+    });
   });
 });

@@ -56,6 +56,10 @@ interface HeartbeatConfig {
  * of failures is counted, so this is a ceiling on the reported number, not a
  * window that can hide one: any outage longer than this still reports as
  * "at least this many" and has long since alerted on its first beat.
+ *
+ * It bounds the COUNT and nothing else. The episode boundary is read by its own
+ * query (`lastDeliveredBeat`) precisely so that it cannot be truncated away —
+ * see the note there.
  */
 const FAILURE_STREAK_LOOKBACK = 50;
 
@@ -71,6 +75,40 @@ const FAILURE_STREAK_LOOKBACK = 50;
  * that way on this branch until Myra's report sent me back to the schema.
  */
 export const FAILURE_STREAK_ORDER_COLUMN = 'triggered_at';
+
+/**
+ * The streak's bounded read: the most recent beats, newest first.
+ *
+ * Exported, like the column constant above and for the same reason — so the
+ * integration tier can run the query production runs rather than a copy of it
+ * that has drifted.
+ */
+export function selectFailureStreakWindow(client: SupabaseClient<Database>, reminderId: string) {
+  return client
+    .from('reminder_history')
+    .select('status, triggered_at')
+    .eq('reminder_id', reminderId)
+    .in('status', ['delivered', 'failed'])
+    .order(FAILURE_STREAK_ORDER_COLUMN, { ascending: false })
+    .limit(FAILURE_STREAK_LOOKBACK);
+}
+
+/**
+ * The boundary read: the single most recent DELIVERED beat.
+ *
+ * Deliberately NOT the query above with a filter bolted on. It has no window, so
+ * no number of failed beats stacked on top can push the answer out of range —
+ * which is the entire reason it is a separate query. See `lastDeliveredBeat`.
+ */
+export function selectLastDeliveredBeat(client: SupabaseClient<Database>, reminderId: string) {
+  return client
+    .from('reminder_history')
+    .select('triggered_at')
+    .eq('reminder_id', reminderId)
+    .eq('status', 'delivered')
+    .order(FAILURE_STREAK_ORDER_COLUMN, { ascending: false })
+    .limit(1);
+}
 
 /**
  * Who an outage alert would reach: a given SB, on a given channel, at a given
@@ -419,7 +457,7 @@ export async function processHeartbeat(
       const history: FailureStreak =
         outcome.status === 'skipped'
           ? { streak: 0, boundary: { kind: 'unknown' } }
-          : await consecutiveFailureCount(reminder.id);
+          : await readBeatHistory(reminder.id);
       const priorFailures = history.streak;
 
       if (outcome.status === 'delivered') {
@@ -489,7 +527,7 @@ export async function processHeartbeat(
       logger.error(`Failed to process reminder ${reminder.id}:`, error);
       stats.failed++;
       const reason = error instanceof Error ? error.message : 'Unknown error';
-      const history = await consecutiveFailureCount(reminder.id);
+      const history = await readBeatHistory(reminder.id);
       await recordDeliveryAttempt(reminder.id, 'failed', reason);
       // A throw is exactly as silent as a false return — escalate both.
       const alerted = await escalate(
@@ -674,68 +712,124 @@ async function retryOwedRecovery(
  *
  * `skipped` and `pending` rows are excluded rather than treated as successes:
  * a watchdog that self-cancels mid-outage has not fixed anything, and should
- * not read as a recovery. The same exclusion is why the boundary below is a
- * DELIVERED beat and not merely a non-failed one.
+ * not read as a recovery. The same exclusion is why the boundary is a DELIVERED
+ * beat and not merely a non-failed one.
  *
- * The walk also yields the episode boundary, because it is the same walk: the
- * row it stops on is the most recent beat that succeeded, and that beat is what
- * separates this run of failures from the one before it. Stopping at the end of
- * the window instead reports `none` rather than inventing a boundary — during an
- * outage longer than the window there is no healthy beat in range, and claiming
- * one would restart the episode (and re-alert) every beat.
+ * This reads the COUNT only. The boundary used to come off the same walk — the
+ * row it stopped on — which made the two share a window, and a window is a thing
+ * that can be full. See `lastDeliveredBeat`.
  */
-async function consecutiveFailureCount(reminderId: string): Promise<FailureStreak> {
-  // No database is not "no healthy beat" — it is no evidence at all.
-  if (!supabase) return { streak: 0, boundary: { kind: 'unknown' } };
+async function consecutiveFailureCount(reminderId: string): Promise<number> {
+  if (!supabase) return 0;
 
   // Never let the streak lookup take down the beat it is describing, whether
   // it resolves with an error (PostgREST's usual shape) or throws (a transport
   // failure). An unknown streak reports as zero, which fails toward alerting
   // rather than toward silence — silence is the bug this path exists to fix.
   try {
-    const { data, error } = await supabase
-      .from('reminder_history')
-      .select('status, triggered_at')
-      .eq('reminder_id', reminderId)
-      .in('status', ['delivered', 'failed'])
-      .order(FAILURE_STREAK_ORDER_COLUMN, { ascending: false })
-      .limit(FAILURE_STREAK_LOOKBACK);
+    const { data, error } = await selectFailureStreakWindow(supabase, reminderId);
 
     if (error) {
       logger.warn('[Heartbeat] Could not read failure streak', {
         reminderId,
         error: error.message,
       });
-      return { streak: 0, boundary: { kind: 'unknown' } };
+      return 0;
     }
 
-    if (!Array.isArray(data)) return { streak: 0, boundary: { kind: 'unknown' } };
+    if (!Array.isArray(data)) return 0;
 
     // Rows arrive newest first; count back until a success or the end of the
-    // window. The count is all this contributes to identity — the episode's key
-    // comes from the notification store, not from where this walk stops.
+    // window. Saturating at the window is fine for a count: the number is only
+    // ever reported as "this many beats have failed", and an outage long enough
+    // to fill the window alerted on its first beat, many beats ago.
     let streak = 0;
-    let boundary: EpisodeBoundary = { kind: 'none' };
-    for (const row of data as { status: string; triggered_at: string | null }[]) {
-      if (row?.status !== 'failed') {
-        // The run ends here. A delivered row with no timestamp cannot bound
-        // anything, so it reports as unverifiable rather than as absent — the
-        // difference between a duplicate alert and a silent one.
-        boundary = row?.triggered_at
-          ? { kind: 'healthy-beat', at: row.triggered_at }
-          : { kind: 'unknown' };
-        break;
-      }
+    for (const row of data as { status: string }[]) {
+      if (row?.status !== 'failed') break;
       streak++;
     }
-    return { streak, boundary };
+    return streak;
   } catch (err) {
     logger.warn('[Heartbeat] Failure streak lookup threw', {
       reminderId,
       error: err instanceof Error ? err.message : String(err),
     });
-    return { streak: 0, boundary: { kind: 'unknown' } };
+    return 0;
   }
+}
+
+/**
+ * The most recent DELIVERED beat: where the run of failures happening now began.
+ *
+ * Its own query, and that is the whole point of it. This used to be a by-product
+ * of the streak walk — the row that walk stopped on — which quietly gave the
+ * boundary the same 50-row window the count has. A window bounds a count
+ * harmlessly and bounds a boundary catastrophically: after fifty failed beats
+ * the healthy beat that separates this outage from the last one falls off the
+ * end, the walk reports `none`, and `none` means "reuse the open episode". The
+ * episode it then reuses is a finished one whose alert was already delivered, so
+ * every retry is suppressed — the original silent-outage bug, reached by a
+ * longer road. An outage of exactly the kind that most needs alerting (long) is
+ * the one that would have been silenced.
+ *
+ * A status filter with LIMIT 1 has no such window. It returns the newest
+ * delivered row if one exists, however many failures are stacked on top of it.
+ *
+ * The three answers are kept apart because two of them look alike and must not
+ * behave alike — see `EpisodeBoundary`:
+ *
+ * - a row with a timestamp -> `healthy-beat`, the separator.
+ * - no rows at all         -> `none`. Established absence, not truncation: this
+ *                             reminder has never delivered, so there is no
+ *                             earlier run to be confused with and the open
+ *                             episode is still this one.
+ * - unreadable, or a delivered row with no timestamp -> `unknown`. Nothing
+ *                             verifiable, so nothing may be reused. Costs a
+ *                             duplicate alert, never silence.
+ */
+async function lastDeliveredBeat(reminderId: string): Promise<EpisodeBoundary> {
+  // No database is not "no healthy beat" — it is no evidence at all.
+  if (!supabase) return { kind: 'unknown' };
+
+  try {
+    const { data, error } = await selectLastDeliveredBeat(supabase, reminderId);
+
+    if (error) {
+      logger.warn('[Heartbeat] Could not read the last delivered beat', {
+        reminderId,
+        error: error.message,
+      });
+      return { kind: 'unknown' };
+    }
+
+    if (!Array.isArray(data)) return { kind: 'unknown' };
+    if (data.length === 0) return { kind: 'none' };
+
+    const at = (data[0] as { triggered_at: string | null } | undefined)?.triggered_at;
+    return at ? { kind: 'healthy-beat', at } : { kind: 'unknown' };
+  } catch (err) {
+    logger.warn('[Heartbeat] Last-delivered-beat lookup threw', {
+      reminderId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { kind: 'unknown' };
+  }
+}
+
+/**
+ * What the beats before this one did: how many failed in a row, and where that
+ * run begins.
+ *
+ * Two reads, in this order deliberately. A delivered row landing between them
+ * makes the boundary NEWER than the streak accounts for, which refuses an
+ * episode that is still live and costs one duplicate alert. Reversed, the same
+ * interleaving would hand back a boundary older than reality and accept an
+ * episode that has already ended — which is silence, and silence is the bug.
+ */
+async function readBeatHistory(reminderId: string): Promise<FailureStreak> {
+  const streak = await consecutiveFailureCount(reminderId);
+  const boundary = await lastDeliveredBeat(reminderId);
+  return { streak, boundary };
 }
 
 /**

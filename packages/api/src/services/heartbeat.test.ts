@@ -1030,21 +1030,35 @@ describe('Heartbeat Service', () => {
     const AUTH_ERROR = 'Backend claude is not authenticated (not logged in)';
 
     /**
-     * Queue the two reminder_history round-trips one beat makes: the streak
-     * SELECT, then the attempt INSERT. Clears the blanket default queued in
-     * beforeEach first — it sits at the head of the FIFO and would otherwise
-     * answer the SELECT with a non-array, making every streak read as zero.
+     * Queue the three reminder_history round-trips one beat makes: the streak
+     * SELECT, the boundary SELECT, then the attempt INSERT. Clears the blanket
+     * default queued in beforeEach first — it sits at the head of the FIFO and
+     * would otherwise answer the first SELECT with a non-array, making every
+     * streak read as zero.
+     *
+     * `boundaryRows` defaults to the newest delivered entry in `prior`, which is
+     * what the real table answers whenever the separator lies inside the streak
+     * window. Pass it explicitly to say otherwise: `[]` for a reminder that has
+     * never delivered, or a row that `prior` does NOT contain for the case that
+     * matters most — a delivered beat sitting just outside a window that is full
+     * of failures. The two queries are separate in production precisely so those
+     * two answers can differ, so the fixture has to be able to make them differ.
      */
-    function queueHistory(prior: (string | { status: string; triggered_at: string })[]) {
+    function queueHistory(
+      prior: (string | { status: string; triggered_at: string })[],
+      boundaryRows?: { triggered_at: string | null }[]
+    ) {
       queryResultQueues.delete('reminder_history');
+      // `triggered_at` matters as well as status: it is what dates the start of
+      // an outage, and therefore what separates one run of failures from the
+      // next. Entries may give it explicitly or leave it null.
+      const rows = prior.map((entry) =>
+        typeof entry === 'string' ? { status: entry, triggered_at: null } : entry
+      );
+      setQueryResult('reminder_history', rows);
       setQueryResult(
         'reminder_history',
-        // `triggered_at` matters as well as status: it is what dates the start
-        // of an outage, and therefore what identifies the episode a notice
-        // belongs to. Entries may give it explicitly or leave it null.
-        prior.map((entry) =>
-          typeof entry === 'string' ? { status: entry, triggered_at: null } : entry
-        )
+        boundaryRows ?? rows.filter((row) => row.status === 'delivered').slice(0, 1)
       );
       setQueryResult('reminder_history', { id: 'hist-001' });
     }
@@ -1224,18 +1238,22 @@ describe('Heartbeat Service', () => {
       });
     });
 
-    it('reports no boundary when the window holds no healthy beat', async () => {
-      // An outage longer than the history window. There is genuinely nothing to
-      // invalidate the open episode against, and inventing a boundary here would
-      // restart the episode — and re-alert — on every beat for as long as the
-      // outage lasts.
+    it('reports no boundary when the reminder has never delivered a beat', async () => {
+      // The one case where `none` is the truth: nothing has ever succeeded, so
+      // there is no earlier run for the open episode to be confused with.
+      // Inventing a boundary here would restart the episode — and re-alert — on
+      // every beat for as long as the outage lasts.
       initHeartbeatService({ enableLocalCron: false });
 
       setQueryResult('scheduled_reminders', [makeDueReminder()]);
-      queueHistory([
-        { status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' },
-        { status: 'failed', triggered_at: '2026-09-09T01:00:00.000Z' },
-      ]);
+      queueHistory(
+        [
+          { status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' },
+          { status: 'failed', triggered_at: '2026-09-09T01:00:00.000Z' },
+        ],
+        // The boundary query finds nothing, because there is nothing to find.
+        []
+      );
 
       await processHeartbeat(
         vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
@@ -1243,6 +1261,64 @@ describe('Heartbeat Service', () => {
       );
 
       expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { kind: 'none' });
+    });
+
+    it('names the healthy beat even when the streak window is full of failures', async () => {
+      // Round nine. The boundary used to fall out of the streak walk, which
+      // meant it inherited that walk's 50-row window. Fifty failed beats push
+      // the separator off the end, the walk reports `none`, and `none` tells the
+      // store to REUSE the open episode — a finished one, whose alert was
+      // already delivered, so every retry from here is suppressed. The longer
+      // the outage, the more certain the silence.
+      //
+      // The fixture is the shape that produces: a full window of failures, and a
+      // delivered beat that exists in the table but not in that window.
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      queueHistory(
+        Array.from({ length: 50 }, (_, i) => ({
+          status: 'failed',
+          triggered_at: new Date(Date.UTC(2026, 8, 9, i)).toISOString(),
+        })),
+        [{ triggered_at: '2026-09-08T00:00:00.000Z' }]
+      );
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue(ALERTED)
+      );
+
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), {
+        kind: 'healthy-beat',
+        at: '2026-09-08T00:00:00.000Z',
+      });
+    });
+
+    it('asks for the last delivered beat by status, not by reading back the streak window', async () => {
+      // The wiring under the test above. A boundary query that filtered on
+      // anything but `status = delivered`, or that carried the streak's LIMIT,
+      // would be truncatable again — and would still pass a fixture that simply
+      // hands back the row it was told to. Pin the query instead.
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      queueHistory(
+        [{ status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' }],
+        [{ triggered_at: '2026-09-08T00:00:00.000Z' }]
+      );
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue(ALERTED)
+      );
+
+      const history = tableBuilders.get('reminder_history')!;
+      expect(history.eq).toHaveBeenCalledWith('status', 'delivered');
+      expect(history.limit).toHaveBeenCalledWith(1);
+      // And the streak's own bounded read is still made, unchanged.
+      expect(history.in).toHaveBeenCalledWith('status', ['delivered', 'failed']);
+      expect(history.limit).toHaveBeenCalledWith(50);
     });
 
     it('reports an unknown boundary when history cannot be read', async () => {
@@ -1255,8 +1331,33 @@ describe('Heartbeat Service', () => {
 
       setQueryResult('scheduled_reminders', [makeDueReminder()]);
       queryResultQueues.delete('reminder_history');
+      // A table that cannot be read fails BOTH reads, so queue both — otherwise
+      // the boundary answer comes from whatever the FIFO happens to hold next
+      // and the test passes for a reason it does not state.
+      setQueryResult('reminder_history', null, { message: 'history unavailable' });
       setQueryResult('reminder_history', null, { message: 'history unavailable' });
       setQueryResult('reminder_history', { id: 'hist-001' });
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue(ALERTED)
+      );
+
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { kind: 'unknown' });
+    });
+
+    it('reports an unknown boundary when the last delivered beat cannot be dated', async () => {
+      // A delivered row whose `triggered_at` is null names a beat that succeeded
+      // and cannot say when. Treating that as `none` would reuse the open
+      // episode across a separator we know exists — silence — so it reports as
+      // unverifiable and costs a duplicate alert instead.
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      queueHistory(
+        [{ status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' }],
+        [{ triggered_at: null }]
+      );
 
       await processHeartbeat(
         vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),

@@ -126,11 +126,18 @@ export type NoticeKind = 'outage' | 'recovery';
  * - `healthy-beat` — a delivered beat at `at` separates this failure from
  *   anything before it. An open outage row created before that instant belongs
  *   to a run that has already ended.
- * - `none` — history read cleanly and holds no delivered beat in range. There is
- *   nothing to invalidate against, so an open episode is still this one. This is
- *   the ordinary state of an outage longer than the history window.
- * - `unknown` — history could not be read. Nothing here can be verified, so no
- *   existing episode may be reused. Costs a duplicate alert, never silence.
+ * - `none` — history read cleanly and holds no delivered beat AT ALL. There is
+ *   nothing to invalidate against, so an open episode is still this one.
+ * - `unknown` — history could not be read, or the beat it names cannot be dated.
+ *   Nothing here can be verified, so no existing episode may be reused. Costs a
+ *   duplicate alert, never silence.
+ *
+ * `none` has to mean established absence and not "none I looked at". The caller
+ * reads the boundary with a query that cannot truncate it away for exactly this
+ * reason: a `none` that really meant "the separator fell outside my window"
+ * would reuse a finished, already-alerted episode and suppress every retry of
+ * the outage in progress. Long outages are where that window fills, and long
+ * outages are what this whole module exists to keep loud.
  */
 export type EpisodeBoundary =
   | { kind: 'healthy-beat'; at: string }
