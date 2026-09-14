@@ -42,28 +42,65 @@ function assertRealCalendarDate(date: string, field: string): void {
   }
 }
 
-/** The UTC offset of `timezone` at a given instant, in minutes east of UTC. */
-function zoneOffsetMinutesAt(instant: Date, timezone: string): number {
+/**
+ * The UTC offset of `timezone` at a given instant, in SECONDS east of UTC.
+ *
+ * Seconds, not minutes, because a zone's offset is not always a whole number of
+ * minutes. Before a zone adopted a standard offset it ran on local mean solar
+ * time, and `Intl` reports that faithfully: `GMT-00:44:30` for Monrovia, which
+ * kept its LMT offset until 1972-01-07 — inside the range this file is
+ * routinely asked about. Of the 418 zones Node ships, 276 emit a `GMT±HH:MM:SS`
+ * at some instant.
+ *
+ * This used to parse `GMT±HH:MM` only and return 0 for anything else, so every
+ * one of those offsets read as UTC — a 44½-minute error rendered as a confident
+ * `Z`. Measured over Monrovia's LMT era day by day, the previous version put
+ * every bound 2,670 seconds early on 737 consecutive days, 1970-01-01 to
+ * 1972-01-07. Found by Lumen in review.
+ *
+ * An unrecognised value now throws rather than defaulting. Zero is a real
+ * offset, so returning it for "I could not read this" makes an unreadable zone
+ * indistinguishable from London in January, which is how the above stayed
+ * invisible. Over 1.6M (zone, instant) samples across every zone Node ships,
+ * 1900–2035, the three shapes below are the only ones `longOffset` produces;
+ * the throw is for a future ICU that adds a fourth.
+ *
+ * The parse is a separate exported function because that throw is otherwise
+ * unreachable — no zone Node currently ships can trigger it, so a test could
+ * only assert the fallback it replaced. Exported, the guard can be asserted
+ * directly on the value it guards against.
+ */
+export function parseLongOffsetSeconds(raw: string, timezone: string): number {
+  // "GMT-07:00", "GMT+05:30", "GMT-00:44:30", or a bare "GMT" at zero offset.
+  if (raw === 'GMT') return 0;
+
+  const match = /^GMT([+-])(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(raw);
+  if (!match) {
+    throw new Error(`cannot read the UTC offset of timezone "${timezone}" (got "${raw}")`);
+  }
+
+  const [, sign, hours, minutes, seconds] = match;
+  const magnitude = Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds ?? 0);
+  return sign === '-' ? -magnitude : magnitude;
+}
+
+function zoneOffsetSecondsAt(instant: Date, timezone: string): number {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
     timeZoneName: 'longOffset',
   }).formatToParts(instant);
-  // "GMT-07:00", "GMT+05:30", or a bare "GMT" exactly at zero offset.
-  const raw = parts.find((p) => p.type === 'timeZoneName')?.value ?? 'GMT';
-  const match = /^GMT([+-])(\d{1,2}):(\d{2})$/.exec(raw);
-  if (!match) return 0;
-
-  const [, sign, hours, minutes] = match;
-  const magnitude = Number(hours) * 60 + Number(minutes);
-  return sign === '-' ? -magnitude : magnitude;
+  return parseLongOffsetSeconds(
+    parts.find((p) => p.type === 'timeZoneName')?.value ?? 'GMT',
+    timezone
+  );
 }
 
-function formatUtcOffset(minutes: number): string {
-  const sign = minutes < 0 ? '-' : '+';
-  const absolute = Math.abs(minutes);
-  const hours = String(Math.floor(absolute / 60)).padStart(2, '0');
-  const rest = String(absolute % 60).padStart(2, '0');
-  return `${sign}${hours}:${rest}`;
+function formatUtcOffset(seconds: number): string {
+  const sign = seconds < 0 ? '-' : '+';
+  const absolute = Math.abs(seconds);
+  const hours = String(Math.floor(absolute / 3600)).padStart(2, '0');
+  const minutes = String(Math.floor(absolute / 60) % 60).padStart(2, '0');
+  return `${sign}${hours}:${minutes}`;
 }
 
 /**
@@ -104,9 +141,18 @@ function formatUtcOffset(minutes: number): string {
  * wall clock fell in a gap, where the day begins at the transition itself.
  *
  * Measured against `Intl`-derived ground truth — the earliest instant whose
- * civil date in the zone is `date` — over 73,050 (zone, date) pairs across 25
- * zones and 8 years: exact everywhere. The version this replaces missed 37 of
- * them, in 8 zones (found by Lumen in review, who named 3).
+ * civil date in the zone is `date` — on the days around every offset transition
+ * in every zone Node ships: 0 mismatches on 92,950 (zone, date) pairs, 418
+ * zones, 1970–2030.
+ *
+ * That figure is the CORRECTED one. The sweep behind the previous round shared
+ * this file's offset parser, so it could not see a sub-minute offset as a
+ * transition at all and never put Monrovia's 1972 days in its population — it
+ * reported zero over a range that contained a live defect. A measurement that
+ * inherits the code's misconception measures nothing and says so in a
+ * reassuring number. The docstring here also cited a narrower run (25 zones, 8
+ * years) than the commit message claimed, which is its own small lesson about
+ * numbers written from memory rather than from the run.
  */
 function startOfDayInstant(date: string, timezone: string): number {
   // The requested wall clock, read as if it were UTC. It is not an instant yet
@@ -114,15 +160,15 @@ function startOfDayInstant(date: string, timezone: string): number {
   const wall = Date.parse(`${date}T00:00:00Z`);
 
   // A day either side brackets any single transition near this wall clock.
-  const before = zoneOffsetMinutesAt(new Date(wall - DAY_MS), timezone);
-  const after = zoneOffsetMinutesAt(new Date(wall + DAY_MS), timezone);
+  const before = zoneOffsetSecondsAt(new Date(wall - DAY_MS), timezone);
+  const after = zoneOffsetSecondsAt(new Date(wall + DAY_MS), timezone);
 
   const possible: number[] = [];
   for (const offset of before === after ? [before] : [before, after]) {
-    const instant = wall - offset * 60_000;
+    const instant = wall - offset * 1000;
     // Self-consistency: an offset only names a real instant if it is the offset
     // in force AT that instant. A gap fails both checks; a fold passes both.
-    if (zoneOffsetMinutesAt(new Date(instant), timezone) === offset) possible.push(instant);
+    if (zoneOffsetSecondsAt(new Date(instant), timezone) === offset) possible.push(instant);
   }
 
   // Fold: two real midnights, and the day begins at the first.
@@ -130,21 +176,34 @@ function startOfDayInstant(date: string, timezone: string): number {
 
   // Gap: no midnight at all, so the day begins when the clock jumps — which is
   // the pre-transition offset applied to the absent wall clock.
-  return wall - before * 60_000;
+  return wall - before * 1000;
 }
 
 /**
- * Render an instant as RFC 3339 in `timezone`'s own wall clock.
+ * Render an instant as RFC 3339, in `timezone`'s own wall clock where that zone
+ * is representable and in UTC where it is not.
  *
- * Kept local rather than emitting `...Z` so the timestamp still reads in the
- * zone that was asked about, and so a start-of-day that ISN'T midnight is
- * visible as such in logs and tests (Santiago's `T01:00:00-03:00` is the
- * honest rendering of a day that has no midnight). Parsing it recovers exactly
- * the instant passed in — verified across the same 73,050 pairs.
+ * Local by preference, rather than always emitting `...Z`, so the timestamp
+ * still reads in the zone that was asked about and a start-of-day that ISN'T
+ * midnight is visible as such in logs and tests (Santiago's `T01:00:00-03:00`
+ * is the honest rendering of a day that has no midnight).
+ *
+ * But RFC 3339's offset grammar is `±HH:MM` — there is no seconds field. A zone
+ * running on local mean time has no legal local rendering at all: Monrovia's
+ * `-00:44:30` can only be written by rounding, and a rounded offset names a
+ * DIFFERENT INSTANT than the one being rendered. So those fall back to UTC,
+ * which is exact and which every consumer already accepts. What is never
+ * acceptable is silently dropping the seconds and keeping the local wall clock,
+ * because that is a wrong answer wearing a well-formed shape.
+ *
+ * Whichever branch is taken, parsing the result recovers exactly the instant
+ * passed in — that is the property the tests assert, not the spelling.
  */
 function renderInZone(instant: number, timezone: string): string {
-  const offset = zoneOffsetMinutesAt(new Date(instant), timezone);
-  const wallClock = new Date(instant + offset * 60_000);
+  const offset = zoneOffsetSecondsAt(new Date(instant), timezone);
+  if (offset % 60 !== 0) return new Date(instant).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  const wallClock = new Date(instant + offset * 1000);
   return `${wallClock.toISOString().slice(0, 19)}${formatUtcOffset(offset)}`;
 }
 

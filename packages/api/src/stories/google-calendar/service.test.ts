@@ -17,10 +17,41 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { calendarWindow, inclusiveEndToRfc3339 } from './service';
+import { calendarWindow, inclusiveEndToRfc3339, parseLongOffsetSeconds } from './service';
 
 const LA = 'America/Los_Angeles';
 const BERLIN = 'Europe/Berlin';
+
+/**
+ * An independent oracle: the earliest instant whose civil date in `zone` is
+ * `date`, found by scanning forward a second at a time.
+ *
+ * Deliberately NOT the algorithm under test. That one reasons about offsets and
+ * which of them are self-consistent; this one only ever asks "what day is it
+ * there now", so a shared misconception about offsets cannot make both agree.
+ * ±20h brackets the whole -12:00..+14:00 offset range.
+ *
+ * It scans by the SECOND. An earlier version scanned by the minute and said, in
+ * this comment, that minute granularity was exact "because every tzdb
+ * transition falls on a whole minute". That is false — Monrovia's 1972
+ * transition lands at :30 — and the sentence was doing real damage, because an
+ * oracle that cannot see a boundary is an oracle that reports agreement there
+ * (found by Lumen in review). A coarse scale asserted as exact is worse than a
+ * coarse scale, because it stops anyone looking.
+ */
+function startOfCivilDay(date: string, zone: string): number {
+  const format = new Intl.DateTimeFormat('en-CA', {
+    timeZone: zone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const wallClock = Date.parse(`${date}T00:00:00Z`);
+  for (let t = wallClock - 20 * 3_600_000; t <= wallClock + 20 * 3_600_000; t += 1_000) {
+    if (format.format(new Date(t)) === date) return t;
+  }
+  throw new Error(`no instant in ${zone} falls on ${date}`);
+}
 
 /**
  * Run `body` as though the server were sitting in `hostZone`.
@@ -231,30 +262,6 @@ describe('resolving midnight independently of the host timezone', () => {
  */
 describe('civil days whose midnight is missing or repeated', () => {
   /**
-   * An independent oracle: the earliest instant whose civil date in `zone` is
-   * `date`, found by scanning forward a minute at a time.
-   *
-   * Deliberately NOT the algorithm under test. That one reasons about offsets
-   * and which of them are self-consistent; this one only ever asks "what day is
-   * it there now", so a shared misconception about offsets cannot make both
-   * agree. Minute granularity is exact because every tzdb transition falls on a
-   * whole minute, and ±20h brackets the whole -12:00..+14:00 offset range.
-   */
-  function startOfCivilDay(date: string, zone: string): number {
-    const format = new Intl.DateTimeFormat('en-CA', {
-      timeZone: zone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    });
-    const wallClock = Date.parse(`${date}T00:00:00Z`);
-    for (let t = wallClock - 20 * 3_600_000; t <= wallClock + 20 * 3_600_000; t += 60_000) {
-      if (format.format(new Date(t)) === date) return t;
-    }
-    throw new Error(`no instant in ${zone} falls on ${date}`);
-  }
-
-  /**
    * GAPS. The day after each of these dates has no midnight, so the window
    * around the date itself must end at the instant the clock jumps — an hour
    * later than the offset-pasting version answered, which cut off the last
@@ -404,6 +411,238 @@ describe('civil days whose midnight is missing or repeated', () => {
       });
     }
   );
+});
+
+/**
+ * Zones whose offset is not a whole number of minutes.
+ *
+ * Before a zone adopted a standard offset it ran on local mean solar time, and
+ * `Intl` reports that faithfully: Monrovia was `GMT-00:44:30` until 1972-01-07.
+ * The offset parser matched `GMT±HH:MM` only and returned 0 for anything else,
+ * so every day in that window resolved to UTC midnight — 44½ minutes early, and
+ * rendered as a confident `Z` that gave no sign of being a fallback.
+ *
+ * Two reasons this is the interesting bug of the three rounds rather than the
+ * obscure one:
+ *
+ *   - The sweep that certified the previous round carried the SAME regex. So
+ *     Monrovia's transition was never even detected AS a transition, the day
+ *     never entered the population, and the sweep reported zero mismatches over
+ *     a range that contains this one. A measurement that shares the code's
+ *     misconception measures nothing, and reports a clean number while doing it.
+ *   - The oracle in this file asserted, in a comment, that minute granularity
+ *     was exact "because every tzdb transition falls on a whole minute". Stating
+ *     an assumption as a fact is what stopped it being checked.
+ *
+ * Both found by Lumen in review. In 1970–2030 exactly one zone is affected —
+ * Monrovia, 1970-01-01 to 1972-01-07 — but 276 of the 418 zones Node ships emit
+ * a sub-minute offset at some instant, so the parse itself was wrong generally.
+ */
+describe('zones whose offset is not a whole number of minutes', () => {
+  const MONROVIA = 'Africa/Monrovia';
+
+  /**
+   * The instants, pinned. Ground truth is `Intl` observation at a pinned
+   * instant, not arithmetic on an offset I believe to be in force:
+   * 1972-01-07T00:44:29Z is 23:59:59 on the 6th there, and 00:44:30Z is
+   * 00:44:30 on the 7th.
+   */
+  it('starts a day 44½ minutes after UTC midnight, not at it', () => {
+    withHostZone(LA, () => {
+      const { timeMin, timeMax } = calendarWindow('1972-01-06', '1972-01-06', MONROVIA);
+      expect(Date.parse(timeMin)).toBe(Date.parse('1972-01-06T00:44:30Z'));
+      expect(Date.parse(timeMax)).toBe(Date.parse('1972-01-07T00:44:30Z'));
+    });
+  });
+
+  /**
+   * The user-visible consequence, and the reason the 44½ minutes matter: an
+   * early-morning event inside the dropped window. Under the old parser
+   * `timeMin` was 00:00:00Z, so this 00:20 appointment sat OUTSIDE the day it
+   * belongs to — the original defect of this PR once more, now in a third
+   * disguise.
+   */
+  it('includes an event in the first hour of a local-mean-time day', () => {
+    withHostZone(LA, () => {
+      const { timeMin, timeMax } = calendarWindow('1972-01-06', '1972-01-06', MONROVIA);
+      const event = Date.parse('1972-01-06T01:04:30Z'); // 00:20 local
+      expect(event).toBeGreaterThanOrEqual(Date.parse(timeMin));
+      expect(event).toBeLessThan(Date.parse(timeMax));
+    });
+  });
+
+  /**
+   * The transition day is a GAP of 44½ minutes — the 7th has no midnight, it
+   * begins at 00:44:30 local. The same shape as Santiago above, at a scale no
+   * whole-minute reasoning can express.
+   */
+  it('starts the transition day at the jump, where midnight never happens', () => {
+    withHostZone(LA, () => {
+      const { timeMin } = calendarWindow('1972-01-07', '1972-01-07', MONROVIA);
+      expect(Date.parse(timeMin)).toBe(Date.parse('1972-01-07T00:44:30Z'));
+      // 23:59:59 on the 6th, one second before the jump, is not part of the 7th.
+      expect(Date.parse('1972-01-07T00:44:29Z')).toBeLessThan(Date.parse(timeMin));
+    });
+  });
+
+  /**
+   * RFC 3339 has no seconds field in its offset, so a `-00:44:30` day has no
+   * legal local rendering — and rounding the offset would name a different
+   * instant than the one being rendered. UTC is the exact answer.
+   *
+   * The assertion that matters is the round trip, not the spelling: parsing the
+   * output must recover the instant exactly. Writing `-00:44` with a 00:00:00
+   * wall clock would look plausible and be 30 seconds wrong.
+   */
+  it('renders an unrepresentable offset in UTC rather than rounding it', () => {
+    withHostZone(LA, () => {
+      const { timeMin } = calendarWindow('1972-01-06', '1972-01-06', MONROVIA);
+      expect(timeMin).toBe('1972-01-06T00:44:30Z');
+      expect(Date.parse(timeMin)).toBe(startOfCivilDay('1972-01-06', MONROVIA));
+    });
+  });
+
+  /**
+   * The control for the case above, and the one that stops "render in UTC"
+   * spreading. A zone IS representable at :30 and :45 minutes past the hour,
+   * and those must still render locally — otherwise every half-hour zone in the
+   * world starts answering in UTC and the local rendering that makes a missing
+   * midnight visible is gone.
+   */
+  it.each([
+    ['Asia/Kolkata', '2026-06-15', '2026-06-16T00:00:00+05:30'],
+    ['Asia/Kathmandu', '2026-06-15', '2026-06-16T00:00:00+05:45'],
+    ['Australia/Eucla', '2026-06-15', '2026-06-16T00:00:00+08:45'],
+  ])('still renders %s locally, since its offset is a whole minute', (zone, end, expected) => {
+    withHostZone(LA, () => {
+      expect(inclusiveEndToRfc3339(end, zone)).toBe(expected);
+    });
+  });
+
+  /**
+   * Once the sub-minute offset is gone the zone is ordinary again, so the
+   * fallback must not stick: the 8th is a plain UTC day and renders `+00:00`.
+   * This kills a fix that keys UTC rendering off the zone rather than off the
+   * offset in force at the instant.
+   */
+  it('goes back to a local rendering once the zone adopts a whole offset', () => {
+    withHostZone(LA, () => {
+      const { timeMin } = calendarWindow('1972-01-08', '1972-01-08', MONROVIA);
+      expect(timeMin).toBe('1972-01-08T00:00:00+00:00');
+    });
+  });
+
+  /**
+   * Consecutive days must MEET across the transition too — the invariant that
+   * generalizes, applied to the shape the previous round could not see.
+   */
+  it.each([
+    ['1970-06-15', '1970-06-16'],
+    ['1972-01-05', '1972-01-06'],
+    ['1972-01-06', '1972-01-07'],
+    ['1972-01-07', '1972-01-08'],
+  ])('leaves no gap or overlap between %s and %s in Monrovia', (date, next) => {
+    withHostZone(LA, () => {
+      const { timeMax } = calendarWindow(date, date, MONROVIA);
+      const { timeMin } = calendarWindow(next, next, MONROVIA);
+      expect(Date.parse(timeMax)).toBe(Date.parse(timeMin));
+      expect(Date.parse(timeMin)).toBe(startOfCivilDay(next, MONROVIA));
+    });
+  });
+
+  /**
+   * A fact about the requested zone, not the host — re-checked on this shape.
+   */
+  it.each([LA, 'UTC', 'Africa/Monrovia', 'Pacific/Kiritimati'])(
+    'resolves a sub-minute offset identically with the host in %s',
+    (hostZone) => {
+      withHostZone(hostZone, () => {
+        expect(calendarWindow('1972-01-06', '1972-01-06', MONROVIA).timeMin).toBe(
+          '1972-01-06T00:44:30Z'
+        );
+      });
+    }
+  );
+});
+
+/**
+ * The offset parser, asserted directly on the strings it parses.
+ *
+ * Exported for exactly this reason: through `Intl` the refusal branch is
+ * unreachable — no zone Node ships produces a shape it rejects — so a test
+ * going the long way round could only ever assert the shapes that DO parse, and
+ * the guard would sit there unasserted. That is the trap the previous rounds
+ * kept falling into: the mechanism that matters covered by nothing, while the
+ * suite looks complete.
+ */
+describe('parsing an Intl longOffset', () => {
+  it.each([
+    ['GMT', 0],
+    ['GMT+00:00', 0],
+    ['GMT-07:00', -7 * 3600],
+    ['GMT+05:30', 5 * 3600 + 30 * 60],
+    ['GMT+05:45', 5 * 3600 + 45 * 60],
+    ['GMT-00:44:30', -(44 * 60 + 30)],
+    ['GMT+02:27:16', 2 * 3600 + 27 * 60 + 16],
+    ['GMT-12:00', -12 * 3600],
+    ['GMT+14:00', 14 * 3600],
+  ])('reads %s as %i seconds east of UTC', (raw, expected) => {
+    expect(parseLongOffsetSeconds(raw, 'Africa/Monrovia')).toBe(expected);
+  });
+
+  /**
+   * The guard itself. Zero is a REAL offset, so returning it for "I could not
+   * read this" makes an unreadable zone indistinguishable from London in
+   * January — which is precisely how a 44½-minute error spent a round rendered
+   * as a confident `Z`. Refusing is the only answer that cannot be mistaken for
+   * an answer.
+   */
+  it.each([['GMT+7'], ['GMT-07'], ['UTC-07:00'], ['GMT+07:00:00:00'], [''], ['GMT+aa:bb']])(
+    'refuses %s rather than defaulting to zero',
+    (raw) => {
+      expect(() => parseLongOffsetSeconds(raw, 'Africa/Monrovia')).toThrow(
+        /cannot read the UTC offset/
+      );
+    }
+  );
+
+  it('names the timezone it could not read', () => {
+    expect(() => parseLongOffsetSeconds('GMT+7', 'Mars/Olympus_Mons')).toThrow(
+      /Mars\/Olympus_Mons/
+    );
+  });
+
+  /**
+   * The control: the parser covers reality. Every zone Node ships, sampled
+   * across the range this file is asked about, must parse — otherwise the throw
+   * above stops being a guard and starts being an outage.
+   */
+  it('parses every offset every zone Node ships actually emits', () => {
+    const zones = Intl.supportedValuesOf('timeZone');
+    let sampled = 0;
+    let subMinute = 0;
+    for (const zone of zones) {
+      const format = new Intl.DateTimeFormat('en-US', {
+        timeZone: zone,
+        timeZoneName: 'longOffset',
+      });
+      for (let year = 1970; year <= 2030; year += 5) {
+        for (const month of [0, 6]) {
+          const raw =
+            format
+              .formatToParts(new Date(Date.UTC(year, month, 15)))
+              .find((p) => p.type === 'timeZoneName')?.value ?? 'GMT';
+          const seconds = parseLongOffsetSeconds(raw, zone);
+          sampled += 1;
+          if (seconds % 60 !== 0) subMinute += 1;
+        }
+      }
+    }
+    expect(sampled).toBeGreaterThan(10_000);
+    // And the sample genuinely contains the shape under test, so a regex that
+    // dropped the seconds group could not pass this by parsing nothing awkward.
+    expect(subMinute).toBeGreaterThan(0);
+  });
 });
 
 /**
