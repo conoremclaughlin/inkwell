@@ -456,13 +456,33 @@ describe('zones whose offset is not a whole number of minutes', () => {
   });
 
   /**
-   * The user-visible consequence, and the reason the 44½ minutes matter: an
-   * early-morning event inside the dropped window. Under the old parser
-   * `timeMin` was 00:00:00Z, so this 00:20 appointment sat OUTSIDE the day it
-   * belongs to — the original defect of this PR once more, now in a third
-   * disguise.
+   * The user-visible consequence, and the reason the 44½ minutes matter. The old
+   * parser put BOTH bounds 2,670s early — [00:00:00Z, 00:00:00Z) — so the day
+   * ended at 23:15:30 local and the last 44½ minutes of the evening fell off it.
+   * This 23:30 appointment is the one that went missing: the original defect of
+   * this PR once more, now in a third disguise.
    */
-  it('includes an event in the first hour of a local-mean-time day', () => {
+  it('finds an event in the last 44½ minutes of a local-mean-time day', () => {
+    withHostZone(LA, () => {
+      const { timeMin, timeMax } = calendarWindow('1972-01-06', '1972-01-06', MONROVIA);
+      const event = Date.parse('1972-01-07T00:14:30Z'); // 23:30 local on the 6th
+      expect(event).toBeGreaterThanOrEqual(Date.parse(timeMin));
+      expect(event).toBeLessThan(Date.parse(timeMax));
+    });
+  });
+
+  /**
+   * A CONTROL, labelled as one because its first version was not. An early-
+   * morning event is inside the window under the old parser and the new alike —
+   * 01:04:30Z is already past the old 00:00:00Z start — so it can only show that
+   * moving the day forward broke nothing at the other end of it.
+   *
+   * Its comment used to claim this 00:20 appointment "sat OUTSIDE the day it
+   * belongs to", which is false: the assertion passes against 0458ad07. Wrong in
+   * the direction that flatters the fix, and the third round running that a test
+   * here asserted less than its prose claimed (found by Lumen in review).
+   */
+  it('still includes an event in the first hour of a local-mean-time day', () => {
     withHostZone(LA, () => {
       const { timeMin, timeMax } = calendarWindow('1972-01-06', '1972-01-06', MONROVIA);
       const event = Date.parse('1972-01-06T01:04:30Z'); // 00:20 local
