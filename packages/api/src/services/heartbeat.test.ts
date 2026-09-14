@@ -1172,6 +1172,48 @@ describe('Heartbeat Service', () => {
       expect(context.episodeKey).not.toBe('2026-09-09T02:00:00.000Z');
     });
 
+    it('tells the store a failure after a healthy beat starts a new episode', async () => {
+      // Round seven, finding 1. The store cannot work this out for itself: every
+      // record it could consult is one it writes, so the run where its writes
+      // were failing is the run where the boundary is invisible to it. What it
+      // needs is held here, in `reminder_history` — and only if this caller
+      // actually passes it. A store that honours the flag and a heartbeat that
+      // never sets it is a fix that does nothing, which is why this asserts the
+      // wiring rather than the rule.
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      // The beat before this one was delivered, so the streak is zero.
+      queueHistory([{ status: 'delivered', triggered_at: '2026-09-09T02:00:00.000Z' }]);
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue(ALERTED)
+      );
+
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { startsNewRun: true });
+    });
+
+    it('tells the store a failure mid-outage continues the episode', async () => {
+      // The control for the test above. Same call, same path, one difference in
+      // the history it reads — without this, a hardcoded `true` would pass.
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      // Already failing, so this beat belongs to the outage already in progress.
+      queueHistory([
+        { status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' },
+        { status: 'failed', triggered_at: '2026-09-09T01:00:00.000Z' },
+      ]);
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue(ALERTED)
+      );
+
+      expect(openEpisodeMock).toHaveBeenCalledWith(expect.anything(), { startsNewRun: false });
+    });
+
     it('asks the store for the episode of the outage it is closing, too', async () => {
       initHeartbeatService({ enableLocalCron: false });
 

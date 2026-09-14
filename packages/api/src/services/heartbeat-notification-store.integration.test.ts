@@ -796,6 +796,143 @@ d('heartbeat notification store — real schema', () => {
     await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
   });
 
+  it('ends an episode on a healthy beat even when NO recovery row was writable', async () => {
+    // Round seven, finding 1. Every other boundary test in this file infers the
+    // end of an episode from something this module wrote — a recovery row, a
+    // close timestamp. The run worth surviving is the one where those writes
+    // were failing, and then there is nothing to infer from: the all-clear is
+    // sent, its recovery INSERT and the episode close both fail, and once the
+    // store is healthy the recovery read truthfully reports no row at all.
+    //
+    // The caller knows anyway, from a table this module does not write: a
+    // failure streak of zero means the previous beat was healthy. The control is
+    // the first assertion — without that knowledge the old episode is still the
+    // right answer, so it is the flag doing the work here and not the fixture.
+    const isolatedReminder = randomUUID();
+    const episode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'a healthy beat ends an episode with no recovery row',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-11',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const base = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: episode,
+      destination: 'sb-test|telegram|chat-11',
+    };
+
+    // Announced and heard. The all-clear that followed left no trace at all.
+    await store.claimNotice({ ...base, kind: 'outage' });
+    await store.settleNotice({ ...base, kind: 'outage' }, { delivered: true });
+
+    const { data: rows } = await client
+      .from('heartbeat_notifications' as never)
+      .select('kind, episode_closed_at')
+      .eq('reminder_id', isolatedReminder);
+    expect(rows).toHaveLength(1);
+    expect((rows as { kind: string }[])[0].kind).toBe('outage');
+    expect((rows as { episode_closed_at: string | null }[])[0].episode_closed_at).toBeNull();
+
+    // CONTROL: mid-outage, with no healthy beat between, the episode continues.
+    expect(await store.openEpisode(isolatedReminder)).toBe(episode);
+
+    // The fix: a healthy beat happened, so this failure is a new outage.
+    expect(await store.openEpisode(isolatedReminder, { startsNewRun: true })).not.toBe(episode);
+
+    // And the old episode's all-clear is still owed — ending it by quietly
+    // closing it would trade this silence for the other one.
+    expect((await store.findOwedRecovery(isolatedReminder))?.episodeKey).toBe(episode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('advances the bounded scan past all-clears that are excluded from it forever', async () => {
+    // Round seven, finding 2. The orphan scan applies its limit BEFORE excluding
+    // anchored rows, so a row excluded on every sweep also consumes the window on
+    // every sweep. OWED_SCAN_LIMIT of these — delivered all-clears whose episodes
+    // closed and whose only failed write was their own status UPDATE, an entirely
+    // ordinary path — sit newer than an unanchored debt and hide it permanently,
+    // with every store and channel healthy. The anchored scan cannot help: the
+    // orphan has no anchor. A bigger limit only moves the threshold.
+    const isolatedReminder = randomUUID();
+    const orphanEpisode = randomUUID();
+    const destination = 'sb-test|telegram|chat-12';
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'a bounded scan must keep moving',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-12',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    // The debt: a pending all-clear whose outage row was never written.
+    await store.claimNotice({
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: orphanEpisode,
+      destination,
+      kind: 'recovery',
+    });
+
+    // Ten newer episodes, each fully settled in substance — outage delivered,
+    // all-clear delivered, episode closed — but each with its recovery status
+    // UPDATE lost, so the row stays `pending` and keeps occupying the window.
+    for (let i = 0; i < 10; i++) {
+      const settled = {
+        reminderId: isolatedReminder,
+        userId,
+        episodeKey: randomUUID(),
+        destination,
+      };
+      await store.claimNotice({ ...settled, kind: 'outage' });
+      await store.settleNotice({ ...settled, kind: 'outage' }, { delivered: true });
+      await store.claimNotice({ ...settled, kind: 'recovery' });
+      await store.closeEpisode({ ...settled, kind: 'recovery' });
+    }
+
+    // Order the window deterministically rather than trusting insert timing to
+    // separate eleven rows written inside the same second.
+    await client
+      .from('heartbeat_notifications' as never)
+      .update({
+        created_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+        next_attempt_at: new Date(Date.now() - 1000).toISOString(),
+      } as never)
+      .eq('reminder_id', isolatedReminder)
+      .eq('episode_key', orphanEpisode);
+
+    expect(
+      (
+        await client
+          .from('heartbeat_notifications' as never)
+          .select('id')
+          .eq('reminder_id', isolatedReminder)
+          .eq('kind', 'recovery')
+          .eq('status', 'pending')
+      ).data
+    ).toHaveLength(11);
+
+    // CONTROL: the ten fill the window, so the older debt is invisible — this is
+    // the reported bug, and without it the assertion below proves nothing.
+    expect(await store.findOwedRecovery(isolatedReminder)).toBeNull();
+
+    // The fix: that sweep retired the ten it will never return, so the window
+    // has moved and the debt is reachable. Bounded work, with progress.
+    expect((await store.findOwedRecovery(isolatedReminder))?.episodeKey).toBe(orphanEpisode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
   it('enforces one notice per (reminder, kind, episode)', async () => {
     // The whole design leans on this constraint: without it, two server
     // incarnations racing the same beat would each create a row, each see its

@@ -141,8 +141,11 @@ export interface HeartbeatNotificationStore {
    * Returns a fresh uuid rather than null when the store cannot be read, so an
    * unreadable store costs a duplicate alert instead of attaching this beat to
    * an episode it cannot verify.
+   *
+   * `startsNewRun` is the caller's own knowledge that a healthy beat separated
+   * this failure from the previous one — see the note on the implementation.
    */
-  openEpisode(reminderId: string): Promise<string>;
+  openEpisode(reminderId: string, options?: { startsNewRun?: boolean }): Promise<string>;
   /**
    * Whether a notice for this episode should be sent now.
    *
@@ -241,7 +244,29 @@ export function createHeartbeatNotificationStore(
 
   const load = async (key: NoticeKey): Promise<NoticeRow | null> => (await readNotice(key)).row;
 
-  const openEpisode: HeartbeatNotificationStore['openEpisode'] = async (reminderId) => {
+  const openEpisode: HeartbeatNotificationStore['openEpisode'] = async (reminderId, options) => {
+    // A HEALTHY BEAT IS ITSELF AN EPISODE BOUNDARY, AND IT NEEDS NO WRITE TO
+    // PROVE IT.
+    //
+    // Every test below infers the boundary from bookkeeping: a recovery row
+    // that exists, a close that landed. All of it is written by the same store,
+    // so the run where the store was failing is exactly the run where none of
+    // it is there to find. An all-clear can be SENT while its recovery row and
+    // its episode close both fail to write; once the store is healthy again the
+    // recovery SELECT then truthfully reports no row, and the old episode looks
+    // like it is still in progress.
+    //
+    // The caller already knows better. It read the failure streak before
+    // recording this beat, so a streak of zero means the previous beat was
+    // healthy — a fact held in `reminder_history`, which this module does not
+    // write and a failing notification store therefore cannot corrupt. That is
+    // the boundary, independent of whether any bookkeeping write survived.
+    //
+    // The old episode is deliberately left OPEN. Its all-clear may still be
+    // owed, and `findOwedRecovery` reads that debt from the open outage row;
+    // closing it here to tidy up would discard the obligation.
+    if (options?.startsNewRun) return randomUUID();
+
     try {
       const { data, error } = await table()
         .select('episode_key, destination')
@@ -559,6 +584,47 @@ export function createHeartbeatNotificationStore(
   };
 
   /**
+   * Record the delivery a closed episode already proves, on a row that missed it.
+   *
+   * Pure bookkeeping repair: it settles a row that is excluded from the sweep
+   * either way, so it can never create or cancel an obligation. A failure here
+   * costs one more excluded row in the next window and nothing else, which is
+   * why it only logs — the sweep it runs inside must still reach its orphans.
+   */
+  const reconcileSettledRecovery = async (reminderId: string, row: NoticeRow): Promise<void> => {
+    try {
+      const now = new Date().toISOString();
+      const { error } = await table()
+        .update({
+          status: 'delivered',
+          // The row is pending, so it carries no delivery time to preserve.
+          // This records when we established the delivery, not when it landed.
+          delivered_at: now,
+          last_attempt_at: now,
+          last_error: null,
+          next_attempt_at: null,
+        })
+        .eq('reminder_id', reminderId)
+        .eq('kind', 'recovery')
+        .eq('episode_key', row.episode_key);
+
+      if (error) {
+        logger.warn('[Heartbeat] Could not retire a settled all-clear from the pending window', {
+          reminderId,
+          episodeKey: row.episode_key,
+          error: error.message,
+        });
+      }
+    } catch (err) {
+      logger.warn('[Heartbeat] Retiring a settled all-clear threw', {
+        reminderId,
+        episodeKey: row.episode_key,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  /**
    * Pending all-clears whose outage row is not there to anchor them.
    *
    * The anchored scan below starts from the outage row, which works right up
@@ -601,7 +667,7 @@ export function createHeartbeatNotificationStore(
     // cannot mistake an old episode that scrolled out of a window for one that
     // was never written.
     const { data: anchors, error: anchorError } = await table()
-      .select('episode_key')
+      .select('episode_key, episode_closed_at')
       .eq('reminder_id', reminderId)
       .eq('kind', 'outage')
       .in(
@@ -620,9 +686,32 @@ export function createHeartbeatNotificationStore(
       return pending;
     }
 
-    const anchored = new Set(
-      ((anchors as { episode_key: string }[] | null) ?? []).map((row) => row.episode_key)
+    const anchorRows =
+      (anchors as { episode_key: string; episode_closed_at: string | null }[] | null) ?? [];
+    const anchored = new Set(anchorRows.map((row) => row.episode_key));
+
+    // A BOUNDED WINDOW NEEDS EVENTUAL PROGRESS, NOT JUST A BIGGER LIMIT.
+    //
+    // The limit above is applied before this exclusion, so rows that are
+    // excluded on every sweep still consume the window on every sweep. A row
+    // whose episode's outage row is CLOSED is excluded permanently — and it is
+    // reached by the ordinary path, a delivered all-clear whose own status
+    // UPDATE was the single write that failed. Enough of those newer than an
+    // unanchored debt and the scan never reaches it again, with every store and
+    // channel healthy. Raising OWED_SCAN_LIMIT only moves the threshold.
+    //
+    // So retire them. An outage row is only ever closed once its all-clear was
+    // delivered, which makes `pending` on these rows stale bookkeeping rather
+    // than an obligation: recording the delivery that demonstrably happened is
+    // what the failed UPDATE was trying to do. They leave the pending window for
+    // good, and the window advances.
+    const settled = new Set(
+      anchorRows.filter((row) => row.episode_closed_at !== null).map((row) => row.episode_key)
     );
+    for (const row of pending) {
+      if (settled.has(row.episode_key)) await reconcileSettledRecovery(reminderId, row);
+    }
+
     return pending.filter((row) => !anchored.has(row.episode_key));
   };
 

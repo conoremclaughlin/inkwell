@@ -419,8 +419,9 @@ export async function processHeartbeat(
             onRecovery,
             destinationAlreadyTold(recoveredThisRun, reminder),
             // The episode that just ended, read back from the store so it is
-            // the same key the outage notice used.
-            await resolveEpisodeKey(reminder.id),
+            // the same key the outage notice used. Never a new run: this branch
+            // only runs when the streak was non-zero, which is the episode.
+            await resolveEpisodeKey(reminder.id, false),
             alertDestination(reminder)
           );
           if (alerted) markDestinationTold(recoveredThisRun, reminder);
@@ -462,8 +463,9 @@ export async function processHeartbeat(
           onFailure,
           destinationAlreadyTold(alertedThisRun, reminder),
           // The episode in progress, minted on its first failure and reused by
-          // every beat after that.
-          await resolveEpisodeKey(reminder.id),
+          // every beat after that. `priorFailures === 0` means the beat before
+          // this one was healthy, so this failure starts a new episode.
+          await resolveEpisodeKey(reminder.id, priorFailures === 0),
           alertDestination(reminder)
         );
         if (alerted) markDestinationTold(alertedThisRun, reminder);
@@ -481,7 +483,7 @@ export async function processHeartbeat(
         history.streak + 1,
         onFailure,
         destinationAlreadyTold(alertedThisRun, reminder),
-        await resolveEpisodeKey(reminder.id),
+        await resolveEpisodeKey(reminder.id, history.streak === 0),
         alertDestination(reminder)
       );
       if (alerted) markDestinationTold(alertedThisRun, reminder);
@@ -580,10 +582,17 @@ async function announceRecovery(
  * returns that same uuid on every beat afterwards. Falls back to a fresh uuid
  * when there is no database to ask, which fails toward a duplicate alert rather
  * than toward attaching a beat to an episode nobody can verify.
+ *
+ * `startsNewRun` passes down what only the caller knows: the failure streak read
+ * before this beat was recorded. A streak of zero means the previous beat was
+ * healthy, so this failure opens a new outage however the last one's bookkeeping
+ * ended up. The store cannot work that out for itself — every record it could
+ * consult is one it writes, and the run worth surviving is the one where those
+ * writes were failing.
  */
-async function resolveEpisodeKey(reminderId: string): Promise<string> {
+async function resolveEpisodeKey(reminderId: string, startsNewRun: boolean): Promise<string> {
   if (!supabase) return randomUUID();
-  return createHeartbeatNotificationStore(supabase).openEpisode(reminderId);
+  return createHeartbeatNotificationStore(supabase).openEpisode(reminderId, { startsNewRun });
 }
 
 /**
