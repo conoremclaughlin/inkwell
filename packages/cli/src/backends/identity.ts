@@ -44,6 +44,23 @@ export interface IdentityJson {
 }
 
 /**
+ * Fill sbSlug from the pre-rename agentId key, in place of nothing.
+ *
+ * .ink/identity.json is not rewritten on upgrade, and readIdentityJson is NOT
+ * the only reader: studio, doctor, the studio list and the branch-rename
+ * planner each parse the file themselves. Assuming a single funnel is what let
+ * those four keep reading a key that legacy files do not have (Lumen, PR #635).
+ * Exported so a raw parse can be made safe without being rerouted.
+ */
+export function normalizeIdentityJson<T>(raw: T): T {
+  if (!raw || typeof raw !== 'object') return raw;
+  const r = raw as { sbSlug?: unknown; agentId?: unknown };
+  return r.sbSlug === undefined && typeof r.agentId === 'string'
+    ? ({ ...(raw as object), sbSlug: r.agentId } as T)
+    : raw;
+}
+
+/**
  * Read .ink/identity.json from a directory. Returns null if not found/unparseable.
  */
 export function readIdentityJson(cwd: string): IdentityJson | null {

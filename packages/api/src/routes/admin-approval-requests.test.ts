@@ -345,6 +345,31 @@ describe('POST /approval-requests', () => {
     expect(insertFn).toHaveBeenCalledWith(expect.objectContaining({ requesting_agent_id: 'wren' }));
   });
 
+  it('resolves requestingSlug from a PRE-RENAME x-ink-context header', async () => {
+    installInsertMock({
+      data: { id: 'req-legacy', status: 'pending', expires_at: futureIso() },
+      error: null,
+    });
+
+    // A still-running pre-rename CLI sends agentId. This route decodes the
+    // header itself, so it stored 'unknown' — losing attribution, and
+    // collapsing every legacy requester into one approve-all bucket, since
+    // approval-interceptor scopes by this stored field.
+    const contextToken = Buffer.from(JSON.stringify({ agentId: 'aster' })).toString('base64url');
+    const handler = findRouteHandler('post', '/approval-requests');
+    const req = createAuthenticatedReq({
+      body: { tool: 'Bash', args: 'ls' },
+      headers: { authorization: 'Bearer t', 'x-ink-context': contextToken },
+    });
+    const res = createMockRes();
+    await handler!(req as Request, res as unknown as Response);
+
+    const insertFn = mockSupabaseFrom.mock.results[0].value.insert as ReturnType<typeof vi.fn>;
+    expect(insertFn).toHaveBeenCalledWith(
+      expect.objectContaining({ requesting_agent_id: 'aster' })
+    );
+  });
+
   it('falls back to "unknown" when x-ink-context is malformed', async () => {
     installInsertMock({
       data: { id: 'req-bad', status: 'pending', expires_at: futureIso() },

@@ -9078,7 +9078,16 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     if (contextHeader) {
       try {
         const decoded = JSON.parse(Buffer.from(contextHeader, 'base64url').toString());
-        requestingSlug = decoded.sbSlug || 'unknown';
+        // Read BOTH keys. This route decodes the header itself, so the
+        // normalization inside decodeContextToken never reached it and a
+        // pre-rename CLI stored 'unknown'. That is not only lost attribution —
+        // approval-interceptor scopes approve-all by this stored field, so every
+        // legacy requester collapsed into one bucket (Lumen, PR #635).
+        //
+        // Normalized here rather than delegating to decodeContextToken, because
+        // that decoder also REQUIRES sessionId and this route never did;
+        // delegating would newly reject a slug-only token.
+        requestingSlug = decoded.sbSlug || decoded.agentId || 'unknown';
       } catch {
         // fall through
       }

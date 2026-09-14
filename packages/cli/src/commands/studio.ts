@@ -42,7 +42,7 @@ import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { installHooks, callPcpTool } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
-import { resolveSlug } from '../backends/identity.js';
+import { resolveSlug, normalizeIdentityJson } from '../backends/identity.js';
 import { registerStudioSandboxCommands } from './studio-sandbox.js';
 import { copyBootstrapFiles, syncMcpConfig } from '@inklabs/shared';
 
@@ -192,7 +192,7 @@ function listStudios(gitRoot: string): StudioInfo[] {
         const identityPath = join(wsPath, '.ink', 'identity.json');
         if (existsSync(identityPath)) {
           try {
-            identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
+            identity = normalizeIdentityJson(JSON.parse(readFileSync(identityPath, 'utf-8')));
           } catch {
             // Ignore
           }
@@ -1019,7 +1019,9 @@ async function renameStudio(from: string, to: string): Promise<void> {
     try {
       const identityPath = join(fromPath, '.ink', 'identity.json');
       if (existsSync(identityPath)) {
-        const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as RenameIdentity;
+        const identity = normalizeIdentityJson(
+          JSON.parse(readFileSync(identityPath, 'utf-8'))
+        ) as RenameIdentity;
         studioId = identity.studioId;
         branchRenamePlan = planStudioHomeBranchRename(identity, from, to);
       }
@@ -1281,7 +1283,9 @@ function resolveDefaultCliName(): string {
   const identityPath = join(cwd, '.ink', 'identity.json');
   if (existsSync(identityPath)) {
     try {
-      const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
+      const identity = normalizeIdentityJson(JSON.parse(readFileSync(identityPath, 'utf-8'))) as {
+        sbSlug?: string;
+      };
       if (identity.sbSlug) return `ink-${identity.sbSlug}`;
     } catch {
       // fall through

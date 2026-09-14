@@ -6,6 +6,7 @@ import { stdin as input, stdout as output } from 'process';
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'fs';
 import { basename, dirname, join, parse as parsePath, resolve } from 'path';
 import { homedir } from 'os';
+import { normalizeIdentityJson } from '../backends/identity.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
 
@@ -88,7 +89,9 @@ function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSyn
   const identityPath = join(cwd, '.ink', 'identity.json');
   if (fsOps.existsSync(identityPath)) {
     try {
-      const identity = JSON.parse(fsOps.readFileSync(identityPath, 'utf-8'));
+      const identity = normalizeIdentityJson(
+        JSON.parse(fsOps.readFileSync(identityPath, 'utf-8'))
+      ) as { sbSlug?: string };
       if (identity.sbSlug) return `ink-${identity.sbSlug}`;
     } catch {
       // fall through
