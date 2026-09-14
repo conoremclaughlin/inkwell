@@ -47,14 +47,32 @@ describe('baileys runtime contract (unmocked)', () => {
     expect(useMultiFileAuthState).toBeTypeOf('function');
   });
 
-  it('resolves the libsignal protobuf named exports Baileys imports', async () => {
+  it("resolves the named libsignal export under Node's own ESM loader", async () => {
     // The precise import that broke: Baileys' lib/Signal/libsignal.js does
     // `import { PreKeyWhisperMessage } from 'libsignal/src/protobufs.js'`.
-    // libsignal 2.0.1 does not expose it as a named export; ^6.0.0 does.
-    const protobufs = await import('libsignal/src/protobufs.js');
-    const resolved = (protobufs as Record<string, unknown>).PreKeyWhisperMessage;
+    //
+    // This runs in a subprocess on purpose. Vitest's CJS interop populates the
+    // namespace object more generously than Node's native ESM linker does, so
+    // asserting on `await import(...)` from inside the test passes even with
+    // libsignal 2.0.1 installed — it never reaches the failing path. Production
+    // is plain `node`, so the static named import has to be checked there.
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const run = promisify(execFile);
 
-    expect(resolved).toBeDefined();
+    const { stdout } = await run(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        "import { PreKeyWhisperMessage } from 'libsignal/src/protobufs.js';" +
+          "if (typeof PreKeyWhisperMessage === 'undefined') throw new Error('binding undefined');" +
+          "console.log('NAMED_EXPORT_OK');",
+      ],
+      { cwd: path.resolve(__dirname, '../..') }
+    );
+
+    expect(stdout).toContain('NAMED_EXPORT_OK');
   });
 
   it('initialises real signal auth state against a temp dir', async () => {
