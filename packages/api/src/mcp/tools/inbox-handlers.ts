@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
+import { resolveSbId, resolveSbSlug } from '../../auth/resolve-identity';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
@@ -48,14 +48,14 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
   recipientSlug: z
     .string()
     .optional()
-    .describe('Agent ID to send message to. Required unless recipients[] is provided.'),
+    .describe('SB slug to send message to. Required unless recipients[] is provided.'),
   recipients: z
     .array(z.string().min(1).max(64))
     .min(1)
     .max(16)
     .optional()
-    .describe('Multiple recipient agent IDs for group thread creation. Requires threadKey.'),
-  senderSlug: z.string().optional().describe('Agent ID of sender (optional if from human)'),
+    .describe('Multiple recipient SB slugs for group thread creation. Requires threadKey.'),
+  senderSlug: z.string().optional().describe('SB slug of sender (optional if from human)'),
   subject: z.string().optional().describe('Message subject'),
   content: z.string().describe('Message content'),
   messageType: z
@@ -246,12 +246,12 @@ const getInboxSchema = userIdentifierBaseSchema
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
   messageId: z.string().guid().describe('Message ID to update'),
-  sbSlug: z.string().describe('Agent ID making the update (must be recipient)'),
+  sbSlug: z.string().describe('SB slug making the update (must be recipient)'),
   status: z.enum(['read', 'acknowledged', 'completed']).describe('New status'),
 });
 
 const markInboxReadSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().describe('Agent ID whose inbox to mark as read'),
+  sbSlug: z.string().describe('SB slug whose inbox to mark as read'),
   before: isoDateTime()
     .optional()
     .describe(
@@ -268,7 +268,7 @@ const markInboxReadSchema = userIdentifierBaseSchema.extend({
 });
 
 const getAgentStatusSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().describe('Agent ID to check status for'),
+  sbSlug: z.string().describe('SB slug to check status for'),
 });
 
 const getAgentSummariesSchema = userIdentifierBaseSchema.extend({
@@ -385,7 +385,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (!senderSlug) {
     const reqCtx = getRequestContext() || getSessionContext();
     if (reqCtx?.sbId) {
-      senderSlug = (await resolveAgentSlug(dataComposer.getClient(), reqCtx.sbId)) || reqCtx.sbSlug;
+      senderSlug = (await resolveSbSlug(dataComposer.getClient(), reqCtx.sbId)) || reqCtx.sbSlug;
     } else if (reqCtx?.sbSlug) {
       senderSlug = reqCtx.sbSlug;
     }
@@ -980,10 +980,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   };
 
   // Resolve canonical identity UUIDs for sender and recipient
-  const recipientSbId = await resolveIdentityId(supabase, resolved.user.id, recipientSlug!);
-  const senderSbId = senderSlug
-    ? await resolveIdentityId(supabase, resolved.user.id, senderSlug)
-    : null;
+  const recipientSbId = await resolveSbId(supabase, resolved.user.id, recipientSlug!);
+  const senderSbId = senderSlug ? await resolveSbId(supabase, resolved.user.id, senderSlug) : null;
 
   const { data: message, error } = await supabase
     .from('agent_inbox')

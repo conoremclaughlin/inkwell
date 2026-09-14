@@ -16,7 +16,7 @@ import { getRequestContext, getSessionContext } from '../../utils/request-contex
 import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
 import { isBareDate, resolveDueDate, InvalidDueDateError } from '../../utils/due-date';
 import { logger } from '../../utils/logger';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveSbId } from '../../auth/resolve-identity';
 
 export const DUE_DATE_DESCRIPTION =
   'Deadline. Bare YYYY-MM-DD (e.g. "2026-09-14") resolves to the end of that day in the ' +
@@ -907,7 +907,7 @@ export const addTaskCommentSchema = z.object({
   taskId: z.string().guid().describe('Task ID to comment on'),
   content: z.string().min(1).max(5000).describe('Comment content'),
   parentCommentId: z.string().guid().optional().describe('Parent comment ID for threaded replies'),
-  sbSlug: z.string().optional().describe('Agent ID for identity attribution'),
+  sbSlug: z.string().optional().describe('SB slug for identity attribution'),
 });
 
 /**
@@ -919,14 +919,14 @@ export const addTaskCommentSchema = z.object({
  * workspace it matched workspace_id exactly, so an identity not yet backfilled
  * (workspace_id IS NULL) resolved to nothing and the comment lost its sbId.
  */
-async function resolveIdentityIdForAgent(
+async function resolveSbIdForSlug(
   dataComposer: DataComposer,
   userId: string,
   sbSlug: string | undefined,
   workspaceId: string | undefined
 ): Promise<string | null> {
   if (!sbSlug) return null;
-  return resolveIdentityId(dataComposer.getClient(), userId, sbSlug, workspaceId);
+  return resolveSbId(dataComposer.getClient(), userId, sbSlug, workspaceId);
 }
 
 export async function handleAddTaskComment(
@@ -952,12 +952,7 @@ export async function handleAddTaskComment(
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      sbSlug,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { data: rawComment, error } = await dataComposer
       .getClient()
@@ -1041,7 +1036,7 @@ export const addTaskGroupCommentSchema = z.object({
     .optional()
     .default('comment')
     .describe('Comment type (comment, conclusion, status_change)'),
-  sbSlug: z.string().optional().describe('Agent ID for identity attribution'),
+  sbSlug: z.string().optional().describe('SB slug for identity attribution'),
 });
 
 export async function handleAddTaskGroupComment(
@@ -1069,12 +1064,7 @@ export async function handleAddTaskGroupComment(
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      sbSlug,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { data: rawComment, error } = await dataComposer
       .getClient()
@@ -1239,7 +1229,7 @@ export const closeTaskGroupSchema = z.object({
     .max(5000)
     .optional()
     .describe('Conclusion summary. Auto-generated if not provided.'),
-  sbSlug: z.string().optional().describe('Agent ID for attribution'),
+  sbSlug: z.string().optional().describe('SB slug for attribution'),
 });
 
 export async function handleCloseTaskGroup(
@@ -1311,12 +1301,7 @@ export async function handleCloseTaskGroup(
     const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      sbSlug,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { error: commentError } = await dataComposer
       .getClient()
@@ -1454,7 +1439,7 @@ export async function handleCreateTaskGroup(
         }
       }
     }
-    const sbId = await resolveIdentityIdForAgent(
+    const sbId = await resolveSbIdForSlug(
       dataComposer,
       resolved.user.id,
       sbSlug,

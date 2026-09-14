@@ -128,8 +128,8 @@ describe('RecallFeedbackRepository', () => {
 
       const eqCalls = (mockSupabase._queryBuilder.eq as ReturnType<typeof import('vitest').vi.fn>)
         .mock.calls;
-      const agentIdCalls = eqCalls.filter(([field]: [string]) => field === 'agent_id');
-      expect(agentIdCalls).toHaveLength(0);
+      const sbSlugCalls = eqCalls.filter(([field]: [string]) => field === 'agent_id');
+      expect(sbSlugCalls).toHaveLength(0);
     });
   });
 });

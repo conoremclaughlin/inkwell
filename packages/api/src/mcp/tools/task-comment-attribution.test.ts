@@ -50,7 +50,7 @@ function setup(identities: Row[]) {
 const addComment = (dc: unknown, workspaceId?: string) =>
   runWithRequestContext({ userId: USER, ...(workspaceId ? { workspaceId } : {}) }, () =>
     handleAddTaskComment(
-      { taskId: TASK, content: 'looks good', agentId: 'wren' } as never,
+      { taskId: TASK, content: 'looks good', sbSlug: 'wren' } as never,
       dc as never
     )
   );

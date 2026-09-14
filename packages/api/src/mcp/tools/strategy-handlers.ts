@@ -16,7 +16,7 @@ import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveSbId } from '../../auth/resolve-identity';
 
 const userIdentifierSchema = z.object({
   userId: z
@@ -76,8 +76,8 @@ export const startStrategySchema = z.object({
     .min(1)
     .optional()
     .describe('Post progress check-in every N tasks'),
-  checkInNotify: z.string().optional().describe('Agent ID to notify on check-ins (e.g., "myra")'),
-  approvalNotify: z.string().optional().describe('Agent ID to notify when approval is needed'),
+  checkInNotify: z.string().optional().describe('SB slug to notify on check-ins (e.g., "myra")'),
+  approvalNotify: z.string().optional().describe('SB slug to notify when approval is needed'),
   userNotify: z
     .string()
     .optional()
@@ -163,7 +163,7 @@ export async function handleStartStrategy(
     const sbSlug = getEffectiveSlug();
 
     const sbId = sbSlug
-      ? await resolveIdentityId(dataComposer.getClient(), resolved.user.id, sbSlug)
+      ? await resolveSbId(dataComposer.getClient(), resolved.user.id, sbSlug)
       : null;
     if (!sbId) {
       return mcpResponse(
@@ -379,8 +379,8 @@ export const updateStrategySchema = z.object({
     .min(1)
     .optional()
     .describe('Post progress check-in every N tasks'),
-  checkInNotify: z.string().optional().describe('Agent ID to notify on check-ins'),
-  approvalNotify: z.string().optional().describe('Agent ID to notify when approval is needed'),
+  checkInNotify: z.string().optional().describe('SB slug to notify on check-ins'),
+  approvalNotify: z.string().optional().describe('SB slug to notify when approval is needed'),
   maxIterationsWithoutApproval: z
     .number()
     .int()

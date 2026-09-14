@@ -137,7 +137,7 @@ function createMockSupabase(
     }),
   };
 
-  // For identity resolution (resolveIdentityId calls .select().eq().eq().maybeSingle())
+  // For identity resolution (resolveSbId calls .select().eq().eq().maybeSingle())
   const identityRows = [{ id: 'identity-123', workspace_id: 'workspace-1', updated_at: null }];
   const identityChainable = {
     select: vi.fn().mockReturnValue({
@@ -608,7 +608,7 @@ function createThreadMockSupabase(
     upsert: vi.fn().mockResolvedValue({ data: null, error: null }),
   };
 
-  // identity mock (for resolveIdentityId)
+  // identity mock (for resolveSbId)
   const identityChain = {
     select: vi.fn().mockReturnValue({
       eq: vi.fn().mockReturnValue({

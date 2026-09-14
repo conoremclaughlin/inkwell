@@ -59,7 +59,7 @@ import { sep } from 'path';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
-import { resolveIdentityId } from '../auth/resolve-identity';
+import { resolveSbId } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
 import { grantStudioLease, studioPathConflict, type GrantOutcome } from './lease-grant';
 
@@ -654,7 +654,7 @@ export class StudioLeaseService {
    * authorizes a mutation.
    */
   async acquire(req: AcquireRequest): Promise<AcquireResult> {
-    const sbId = req.sbId !== undefined ? req.sbId : await this.resolveSbId(req.userId, req.sbSlug);
+    const sbId = req.sbId !== undefined ? req.sbId : await this.lookupSbId(req.userId, req.sbSlug);
 
     // Bounded validate→grant ladder. EVERY authoritative read passes through
     // refuseUngrantable() before any grant path runs, and a lost CAS
@@ -2217,10 +2217,11 @@ export class StudioLeaseService {
     return this.casLease(studioId, userId, claim, null);
   }
 
-  private async resolveSbId(userId: string, sbSlug: string): Promise<string | null> {
+  /** Null-safe wrapper around the shared resolver: empty slug and thrown errors both mean "unresolved". */
+  private async lookupSbId(userId: string, sbSlug: string): Promise<string | null> {
     if (!sbSlug) return null;
     try {
-      return await resolveIdentityId(this.supabase, userId, sbSlug);
+      return await resolveSbId(this.supabase, userId, sbSlug);
     } catch {
       return null;
     }
@@ -2244,7 +2245,7 @@ export class StudioLeaseService {
         opts.sbId !== undefined
           ? opts.sbId
           : opts.sbSlug
-            ? await this.resolveSbId(userId, opts.sbSlug)
+            ? await this.lookupSbId(userId, opts.sbSlug)
             : null;
       const { error } = await this.supabase.from('studio_lease_events').insert({
         user_id: userId,

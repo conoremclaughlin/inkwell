@@ -26,7 +26,7 @@ import type {
 } from '../data/repositories/task-groups.repository';
 import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { resolveAgentSlug } from '../auth/resolve-identity';
+import { resolveSbSlug } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
 import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
@@ -208,7 +208,7 @@ export class StrategyService {
 
   private async resolveOwnerSlug(group: TaskGroup): Promise<string | null> {
     if (!group.sb_id) return null;
-    return resolveAgentSlug(this.dataComposer.getClient(), group.sb_id);
+    return resolveSbSlug(this.dataComposer.getClient(), group.sb_id);
   }
 
   /**
@@ -277,7 +277,7 @@ export class StrategyService {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       if (!metadata.studioId) {
         const ownerSlug = input.sbId
-          ? await resolveAgentSlug(this.dataComposer.getClient(), input.sbId)
+          ? await resolveSbSlug(this.dataComposer.getClient(), input.sbId)
           : null;
         if (!ownerSlug) {
           throw new Error('Could not resolve agent slug for persistent studio branch naming');
@@ -503,7 +503,7 @@ export class StrategyService {
 
         // Notify supervisor too if configured
         if (config.supervisorId) {
-          const supervisorSlug = await resolveAgentSlug(
+          const supervisorSlug = await resolveSbSlug(
             this.dataComposer.getClient(),
             config.supervisorId
           );
@@ -638,7 +638,7 @@ export class StrategyService {
 
       // Notify supervisor at check-in points too
       if (config.supervisorId) {
-        const supervisorSlug = await resolveAgentSlug(
+        const supervisorSlug = await resolveSbSlug(
           this.dataComposer.getClient(),
           config.supervisorId
         );
@@ -1824,7 +1824,7 @@ export class StrategyService {
     );
 
     if (config.supervisorId) {
-      const supervisorSlug = await resolveAgentSlug(
+      const supervisorSlug = await resolveSbSlug(
         this.dataComposer.getClient(),
         config.supervisorId
       );

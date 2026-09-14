@@ -54,10 +54,10 @@ export async function resolveAgentFromMention(
 
   // 1. Check mentionedUsernames against identity agent_id and name
   for (const identity of identities) {
-    const agentIdLower = identity.agent_id.toLowerCase();
+    const sbSlugLower = identity.agent_id.toLowerCase();
     const nameLower = identity.name?.toLowerCase();
 
-    if (mentionedLower.includes(agentIdLower)) {
+    if (mentionedLower.includes(sbSlugLower)) {
       logger.debug('[Mention] Matched by mentioned username → agent_id', {
         sbSlug: identity.agent_id,
         sbId: identity.id,

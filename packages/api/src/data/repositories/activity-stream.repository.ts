@@ -8,7 +8,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
 import type { Json } from '../supabase/types';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 
 export type { Json };
@@ -133,7 +133,7 @@ export class ActivityStreamRepository {
   async logActivity(input: LogActivityInput): Promise<Activity> {
     const sbId = input.sbId
       ? input.sbId
-      : await resolveIdentityId(this.supabase, input.userId, input.sbSlug);
+      : await resolveSbId(this.supabase, input.userId, input.sbSlug);
 
     const { data, error } = await this.supabase
       .from('activity_stream')

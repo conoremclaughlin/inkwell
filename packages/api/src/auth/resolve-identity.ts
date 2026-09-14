@@ -32,7 +32,7 @@ interface IdentityCandidate {
  * honoured — writing sb_id: null for those hands the row to the legacy
  * slug-only authorization path, where two same-slug SBs both pass.
  */
-export type IdentityResolution =
+export type SbIdResolution =
   | { ok: true; sbId: string }
   | { ok: false; reason: 'no-identity' | 'ambiguous' | 'not-in-workspace' | 'lookup-failed' };
 
@@ -67,12 +67,12 @@ function ambientActorWorkspace(): string | undefined {
  *   only a workspace the server derived from the caller's own identity is used;
  *   see ambientActorWorkspace.
  */
-export async function resolveIdentityResult(
+export async function resolveSbIdResult(
   supabase: SupabaseClient<Database>,
   userId: string,
   sbSlug: string,
   workspaceId?: string
-): Promise<IdentityResolution> {
+): Promise<SbIdResolution> {
   const scope = workspaceId ?? ambientActorWorkspace();
 
   const { data, error } = await supabase
@@ -97,7 +97,7 @@ export async function resolveIdentityResult(
   // row, which is precisely the legacy ownership path this change exists to
   // stop feeding (Lumen, PR #634 round 2).
   if (!Array.isArray(data)) {
-    logger.warn('Unreadable identity lookup response', { agentId, workspaceId: scope });
+    logger.warn('Unreadable identity lookup response', { sbSlug, workspaceId: scope });
     return { ok: false, reason: 'lookup-failed' };
   }
 
@@ -149,17 +149,17 @@ export async function resolveIdentityResult(
  * Slug -> canonical identity UUID, or null.
  *
  * For callers where attribution is optional and a missing sb_id is harmless.
- * Anything that writes an OWNER should use resolveIdentityResult and fail
+ * Anything that writes an OWNER should use resolveSbIdResult and fail
  * closed instead, so that "nobody claimed this" and "a claim was made and
  * could not be honoured" do not collapse into the same null.
  */
-export async function resolveIdentityId(
+export async function resolveSbId(
   supabase: SupabaseClient<Database>,
   userId: string,
-  agentId: string,
+  sbSlug: string,
   workspaceId?: string
 ): Promise<string | null> {
-  const result = await resolveIdentityResult(supabase, userId, agentId, workspaceId);
+  const result = await resolveSbIdResult(supabase, userId, sbSlug, workspaceId);
   return result.ok ? result.sbId : null;
 }
 
@@ -168,7 +168,7 @@ export async function resolveIdentityId(
  *
  * Unambiguous in the direction that matters — a UUID names exactly one row.
  */
-export async function resolveAgentSlug(
+export async function resolveSbSlug(
   supabase: SupabaseClient<Database>,
   sbId: string
 ): Promise<string | null> {
@@ -199,18 +199,18 @@ export async function resolveAgentSlug(
  * is allowed to be null (Lumen, PR #634).
  */
 export async function resolveOwnerSbId(
-  supabase: Parameters<typeof resolveIdentityResult>[0],
+  supabase: Parameters<typeof resolveSbIdResult>[0],
   userId: string | undefined,
-  agentId: string | undefined,
+  sbSlug: string | undefined,
   known?: string | null
 ): Promise<string | null> {
   if (known) return known;
-  if (!agentId || !userId) return null;
-  const result = await resolveIdentityResult(supabase, userId, agentId);
+  if (!sbSlug || !userId) return null;
+  const result = await resolveSbIdResult(supabase, userId, sbSlug);
   if (result.ok) return result.sbId;
   if (result.reason === 'no-identity') return null;
   throw new Error(
-    `Refusing to write a row owned by "${agentId}": identity unresolved (${result.reason}). ` +
+    `Refusing to write a row owned by "${sbSlug}": identity unresolved (${result.reason}). ` +
       'Pass the canonical sbId, or scope the request to the right workspace.'
   );
 }

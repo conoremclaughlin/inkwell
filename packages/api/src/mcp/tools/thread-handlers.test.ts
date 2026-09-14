@@ -380,7 +380,7 @@ vi.mock('../../auth/enforce-identity', () => ({
 }));
 
 vi.mock('../../auth/resolve-identity', () => ({
-  resolveIdentityId: vi.fn().mockResolvedValue('identity-uuid'),
+  resolveSbId: vi.fn().mockResolvedValue('identity-uuid'),
 }));
 
 vi.mock('../../utils/request-context', () => ({

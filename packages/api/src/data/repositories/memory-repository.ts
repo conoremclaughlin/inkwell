@@ -4,7 +4,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
-import { resolveIdentityId, resolveOwnerSbId } from '../../auth/resolve-identity';
+import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import {
   buildChunkMetadataUpdate,
@@ -377,7 +377,7 @@ export class MemoryRepository {
   async remember(input: MemoryCreateInput): Promise<Memory> {
     const sbId =
       input.sbSlug && input.userId
-        ? await resolveIdentityId(this.supabase, input.userId, input.sbSlug)
+        ? await resolveSbId(this.supabase, input.userId, input.sbSlug)
         : null;
 
     // If topicKey is provided, ensure it's included in topics array

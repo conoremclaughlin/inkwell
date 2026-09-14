@@ -55,7 +55,7 @@ vi.mock('../../auth/enforce-identity', () => ({
 }));
 
 vi.mock('../../auth/resolve-identity', () => ({
-  resolveIdentityId: vi.fn().mockResolvedValue('sb-wren-uuid'),
+  resolveSbId: vi.fn().mockResolvedValue('sb-wren-uuid'),
 }));
 
 vi.mock('../../utils/logger', () => ({

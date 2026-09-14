@@ -92,11 +92,11 @@ const threadKeySchema = z
   .max(200)
   .regex(/^[a-zA-Z][a-zA-Z0-9_-]*:[^\s]+$/, 'threadKey must look like "type:identifier"');
 
-const agentIdSchema = z.string().min(1).max(64);
+const sbSlugSchema = z.string().min(1).max(64);
 
 const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  sbSlug: z.string().describe('Agent ID requesting access (must be a participant)'),
+  sbSlug: z.string().describe('SB slug requesting access (must be a participant)'),
   limit: z.number().int().min(1).max(200).optional().default(50),
   beforeMessageId: z.string().guid().optional().describe('Cursor: get messages before this ID'),
   afterMessageId: z.string().guid().optional().describe('Cursor: get messages after this ID'),
@@ -134,8 +134,8 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
 
 const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  sbSlug: agentIdSchema.describe('Agent ID to add to the thread'),
-  addedBySlug: agentIdSchema.optional(),
+  sbSlug: sbSlugSchema.describe('SB slug to add to the thread'),
+  addedBySlug: sbSlugSchema.optional(),
   reason: z.string().max(500).optional(),
   triggerNewParticipant: z.boolean().optional().default(true),
   metadata: z.record(z.string(), z.unknown()).optional(),
@@ -143,23 +143,23 @@ const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
 
 const closeThreadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  sbSlug: agentIdSchema.describe('Agent ID closing the thread (must be a participant)'),
+  sbSlug: sbSlugSchema.describe('SB slug closing the thread (must be a participant)'),
 });
 
 const reopenThreadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  sbSlug: agentIdSchema.describe('Agent ID reopening the thread (must be a participant)'),
+  sbSlug: sbSlugSchema.describe('SB slug reopening the thread (must be a participant)'),
 });
 
 const listThreadsSchema = userIdentifierBaseSchema.extend({
-  sbSlug: agentIdSchema.describe('Agent ID to list threads for'),
+  sbSlug: sbSlugSchema.describe('SB slug to list threads for'),
   status: z.enum(['open', 'closed', 'all']).optional().default('open'),
   limit: z.number().int().min(1).max(100).optional().default(20),
 });
 
 const markThreadReadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  sbSlug: agentIdSchema.describe('Agent ID marking the thread as read'),
+  sbSlug: sbSlugSchema.describe('SB slug marking the thread as read'),
   throughMessageId: z
     .string()
     .guid()

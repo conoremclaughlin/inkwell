@@ -34,8 +34,8 @@ function mcpResponse(data: object, isError = false): McpResponse {
 // ============================================================================
 
 export const triggerAgentSchema = z.object({
-  toSlug: z.string().describe('Target agent ID to trigger (e.g., "myra", "wren")'),
-  fromSlug: z.string().describe('Your agent ID (e.g., "claude-code", "wren")'),
+  toSlug: z.string().describe('Target SB slug to trigger (e.g., "myra", "wren")'),
+  fromSlug: z.string().describe('Your SB slug (e.g., "claude-code", "wren")'),
   triggerType: z
     .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
     .describe('Type of trigger - helps recipient know how to handle'),

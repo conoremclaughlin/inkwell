@@ -12,7 +12,7 @@ import { getKindleService } from '../../services/kindle/kindle-service';
 import { logger } from '../../utils/logger';
 
 export const createKindleTokenSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().optional().describe('Parent agent ID whose values will seed the new SB'),
+  sbSlug: z.string().optional().describe('Parent SB slug whose values will seed the new SB'),
   expiresInHours: z
     .number()
     .optional()

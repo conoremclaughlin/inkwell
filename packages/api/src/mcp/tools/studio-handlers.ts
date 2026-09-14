@@ -70,7 +70,7 @@ const WORK_TYPE_ABBREV: Record<string, string> = {
 // ============== Schemas ==============
 
 const createStudioSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().describe('Agent ID creating the studio (e.g., "wren")'),
+  sbSlug: z.string().describe('SB slug creating the studio (e.g., "wren")'),
   repoRoot: z.string().describe('Absolute path to the main repository root'),
   slug: z
     .string()
@@ -113,7 +113,7 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
 });
 
 const listStudiosSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().optional().describe('Filter by agent ID'),
+  sbSlug: z.string().optional().describe('Filter by SB slug'),
   status: z
     .enum(['active', 'idle', 'archived', 'cleaned', 'all'])
     .optional()
@@ -133,12 +133,12 @@ const getStudioSchema = userIdentifierBaseSchema.extend({
   sbSlug: z
     .string()
     .optional()
-    .describe('Agent ID to disambiguate when multiple agents share the same branch or path'),
+    .describe('SB slug to disambiguate when multiple SBs share the same branch or path'),
 });
 
 const updateStudioSchema = userIdentifierBaseSchema.extend({
   studioId: z.string().guid().describe('Studio UUID to update'),
-  sbSlug: z.string().describe('Agent ID making the update'),
+  sbSlug: z.string().describe('SB slug making the update'),
   status: z.enum(['active', 'idle', 'archived']).optional().describe('New studio status'),
   purpose: z.string().optional().describe('Updated purpose description'),
   roleTemplate: z.string().optional().describe('Role template name to set'),
@@ -168,7 +168,7 @@ const updateStudioSchema = userIdentifierBaseSchema.extend({
 
 const closeStudioSchema = userIdentifierBaseSchema.extend({
   studioId: z.string().guid().describe('Studio UUID to close'),
-  sbSlug: z.string().describe('Agent ID closing the studio'),
+  sbSlug: z.string().describe('SB slug closing the studio'),
   removeWorktree: z
     .boolean()
     .optional()
@@ -182,7 +182,7 @@ const closeStudioSchema = userIdentifierBaseSchema.extend({
 });
 
 const adoptStudioSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().describe('Agent ID adopting the studio'),
+  sbSlug: z.string().describe('SB slug adopting the studio'),
   sessionId: z.string().guid().describe('Session ID to link to the studio'),
   studioId: z.string().guid().optional().describe('Studio UUID to adopt'),
   branch: z.string().optional().describe('Branch name to look up the studio'),
@@ -1388,7 +1388,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
 }
 
 const registerStudioSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().describe('Agent ID to own the studio'),
+  sbSlug: z.string().describe('SB slug to own the studio'),
   repoRoot: z.string().describe('Absolute path to the repository root'),
 });
 

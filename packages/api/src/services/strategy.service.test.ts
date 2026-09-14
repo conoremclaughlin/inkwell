@@ -40,13 +40,13 @@ vi.mock('./studio-settings', () => ({
 }));
 
 vi.mock('../auth/resolve-identity', () => ({
-  resolveAgentSlug: vi.fn().mockImplementation((_client: unknown, sbId: string) => {
+  resolveSbSlug: vi.fn().mockImplementation((_client: unknown, sbId: string) => {
     if (sbId === 'sb-wren-uuid') return Promise.resolve('wren');
     if (sbId === 'supervisor-uuid-123' || sbId === 'supervisor-uuid-456')
       return Promise.resolve('lumen');
     return Promise.resolve(null);
   }),
-  resolveIdentityId: vi.fn().mockResolvedValue('sb-wren-uuid'),
+  resolveSbId: vi.fn().mockResolvedValue('sb-wren-uuid'),
 }));
 
 // ============================================================================
@@ -928,7 +928,7 @@ describe('StrategyService', () => {
       };
     }
 
-    // Helper: mock from() chain for resolveAgentSlug
+    // Helper: mock from() chain for resolveSbSlug
     function chainResolveSlug(slug: string | null) {
       return {
         select: vi.fn().mockReturnValue({

@@ -35,8 +35,8 @@ vi.mock('../../utils/request-context', async (importOriginal) => {
 });
 
 vi.mock('../../auth/resolve-identity', () => ({
-  resolveIdentityId: vi.fn().mockResolvedValue('identity-123'),
-  resolveAgentSlug: vi.fn().mockImplementation(async (_s: unknown, _u: unknown, id: string) => id),
+  resolveSbId: vi.fn().mockResolvedValue('identity-123'),
+  resolveSbSlug: vi.fn().mockImplementation(async (_s: unknown, _u: unknown, id: string) => id),
 }));
 
 // findThread decides new-vs-existing, which is exactly the branch under test.
