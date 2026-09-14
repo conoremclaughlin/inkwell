@@ -50,7 +50,7 @@
     "@modelcontextprotocol/server": "^2.0.0",
     "@slack/bolt": "^4.6.0",
     "@supabase/supabase-js": "^2.39.3",
-    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "@whiskeysockets/baileys": "^7.0.0-rc12",
     "bcrypt": "^6.0.0",
     "compression": "^1.7.4",
     "cookie-parser": "^1.4.7",
@@ -91,7 +91,7 @@
     "@vitest/coverage-v8": "^4.0.18",
     "eslint": "^8.56.0",
     "pg": "^8.23.0",
-    "tsx": "^4.7.0",
+    "tsx": "^4.23.13",
     "typescript": "^5.3.3",
     "vitest": "^4.0.18"
   },
