@@ -828,6 +828,15 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
 - **Never push directly to main** from a feature branch. Always use PRs. This includes releases, changelog updates, and docs changes.
 - **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
+- **Do not require a re-review solely because a catch-up merge moved the SHA.** Merging `main` into your branch is not a new proposal, and an LGTM does not expire just because the head changed. Behavioural changes you make on top are a different thing and keep the ordinary review boundary.
+
+  This is _not_ because the diff against `main` makes every mistake visible. It does not, and the gap is worth knowing exactly. Resolve a conflict by taking `main` wholesale and you can discard a reviewed branch contribution outright — and a branch-only addition that disappears this way leaves **no trace in either `git diff main HEAD` or `git diff main...HEAD`**, because the merged file now matches `main` exactly. It vanishes as an addition that was never made, rather than as a deletion hunk. Reproduced in a four-commit synthetic repo while reviewing #643, where `git diff <reviewed-sha> HEAD` was the only one of the three that showed the loss.
+
+  So the check sits with the author, who is the one who knows what was reviewed:
+  1. **Diff against the reviewed head, not against `main`.** `git diff <reviewed-sha> HEAD` is the one that can show a reviewed change going missing. Account for what `main` deliberately superseded — an intentional upstream replacement looks identical to an accidental drop, and only you know which it was.
+  2. **Re-run the relevant tests and CI.** A rename on `main` can break your branch with no conflict and no type error. On #539 the branch kept passing `senderAgentId` to `send_to_inbox` after `main` renamed the field to `senderSlug`: different files, so no conflict; `args: unknown` at the handler, so no type error; a non-strict zod schema, so the key was stripped rather than rejected, and every alert would have been sent by `unknown` instead of `system`. Nothing failed anywhere.
+  3. **Disclose behaviour changes on the PR.** "Kept both sides" and "took `main`'s line because ours reinstated a documented footgun" are different events, and only one of them is free.
+
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
 
