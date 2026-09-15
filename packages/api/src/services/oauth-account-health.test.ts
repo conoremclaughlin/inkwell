@@ -25,6 +25,7 @@ vi.mock('../utils/request-context', () => ({
   getSessionContext: () => undefined,
 }));
 
+// This file pins the CLOUD row's semantics on their own: no desktop source in play.
 const { OAuthService } = await import('./oauth');
 
 const USER_ID = '00000000-0000-0000-0000-000000000001';
@@ -70,7 +71,10 @@ describe('inspectAccountHealth — the refresh window', () => {
   it('reports a comfortably valid token as active', async () => {
     accountRows([activeRow()]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('active');
     expect(health.reason).toBeNull();
@@ -81,7 +85,10 @@ describe('inspectAccountHealth — the refresh window', () => {
     // token this method can see is not the token the next call will send.
     accountRows([activeRow({ expires_at: '2026-08-15T17:04:00.000Z' })]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('refresh_required');
     expect(health.reason).toContain('must refresh it first');
@@ -93,7 +100,10 @@ describe('inspectAccountHealth — the refresh window', () => {
     // that the very next call fails to obtain.
     accountRows([activeRow({ expires_at: '2026-08-15T16:00:00.000Z' })]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('refresh_required');
     expect(health.accountStatus).toBe('active');
@@ -106,7 +116,10 @@ describe('inspectAccountHealth — the refresh window', () => {
     // a refresh the real call never attempts.
     accountRows([activeRow({ expires_at: '2026-08-15T17:04:00.000Z', refresh_token: null })]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('active');
     expect(health.reason).toBeNull();
@@ -115,7 +128,10 @@ describe('inspectAccountHealth — the refresh window', () => {
   it('reports an expired token with no refresh token as unusable', async () => {
     accountRows([activeRow({ expires_at: '2026-08-15T16:00:00.000Z', refresh_token: null })]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('unusable');
   });
@@ -125,19 +141,23 @@ describe('inspectAccountHealth — the refresh window', () => {
     const row = activeRow({ expires_at: '2026-08-15T17:01:00.000Z', refresh_token: null });
 
     accountRows([row]);
-    expect((await new OAuthService().inspectAccountHealth(USER_ID, 'google')).state).toBe('active');
+    expect(
+      (await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(USER_ID, 'google')).state
+    ).toBe('active');
 
     vi.setSystemTime(new Date('2026-08-15T17:01:30.000Z'));
     accountRows([row]);
-    expect((await new OAuthService().inspectAccountHealth(USER_ID, 'google')).state).toBe(
-      'unusable'
-    );
+    expect(
+      (await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(USER_ID, 'google')).state
+    ).toBe('unusable');
   });
 
   it('treats a null expiry as no expiry rather than as expired', async () => {
     accountRows([activeRow({ expires_at: null })]);
 
-    expect((await new OAuthService().inspectAccountHealth(USER_ID, 'google')).state).toBe('active');
+    expect(
+      (await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(USER_ID, 'google')).state
+    ).toBe('active');
   });
 });
 
@@ -183,7 +203,10 @@ describe('inspectAccountHealth agrees with getValidAccessToken', () => {
       });
 
       accountRows([row]);
-      const inspected = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+      const inspected = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+        USER_ID,
+        'google'
+      );
 
       // Now run the method it claims to describe, and watch for the token call.
       const fetchMock = vi.fn().mockResolvedValue({
@@ -201,7 +224,12 @@ describe('inspectAccountHealth agrees with getValidAccessToken', () => {
         ],
       });
       from.mockImplementation(mock.from);
-      await new OAuthService().getValidAccessToken(USER_ID, 'google');
+      // An expired row with no refresh token now FAILS here (as the verdict
+      // says it would) instead of handing back a dead token; that is not a
+      // refresh, and the property under test is unchanged.
+      await new OAuthService({ sources: ['cloud'] })
+        .getValidAccessToken(USER_ID, 'google')
+        .catch(() => undefined);
 
       const refreshed = fetchMock.mock.calls.length > 0;
       expect(inspected.state === 'refresh_required').toBe(refreshed);
@@ -214,7 +242,10 @@ describe('inspectAccountHealth — absence versus ignorance', () => {
   it('reports zero rows as missing', async () => {
     accountRows([]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('missing');
     expect(health.reason).toContain('No google account has been connected');
@@ -223,7 +254,10 @@ describe('inspectAccountHealth — absence versus ignorance', () => {
   it('reports a failed lookup as unknown, distinct from missing', async () => {
     accountReadFails('connection reset');
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     // "I could not read the account table" is not a configuration verdict.
     expect(health.state).toBe('unknown');
@@ -243,7 +277,10 @@ describe('inspectAccountHealth — absence versus ignorance', () => {
       },
     ]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('unusable');
     expect(health.reason).toContain('No active google account found');
@@ -256,7 +293,10 @@ describe('inspectAccountHealth — absence versus ignorance', () => {
       activeRow(),
     ]);
 
-    const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+    const health = await new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(
+      USER_ID,
+      'google'
+    );
 
     expect(health.state).toBe('active');
   });
@@ -264,6 +304,8 @@ describe('inspectAccountHealth — absence versus ignorance', () => {
   it('never throws when the account table is unreadable', async () => {
     accountReadFails('permission denied');
 
-    await expect(new OAuthService().inspectAccountHealth(USER_ID, 'google')).resolves.toBeDefined();
+    await expect(
+      new OAuthService({ sources: ['cloud'] }).inspectAccountHealth(USER_ID, 'google')
+    ).resolves.toBeDefined();
   });
 });

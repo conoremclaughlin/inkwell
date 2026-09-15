@@ -22,7 +22,7 @@ export interface Memory {
   source: MemorySource;
   salience: Salience;
   topics: string[];
-  agentId?: string; // Which AI being created this memory (wren, benson, etc). Null = shared memory.
+  sbSlug?: string; // Which AI being created this memory (wren, benson, etc). Null = shared memory.
   contactId?: string; // Per-sender memory scoping. Null = owner/system memory.
   embedding?: number[]; // 1024 dimensions for Voyage AI, nullable for now
   metadata: Record<string, unknown>;
@@ -60,7 +60,7 @@ export interface MemoryCreateInput {
   topics?: string[];
   metadata?: Record<string, unknown>;
   expiresAt?: Date;
-  agentId?: string; // Which AI being created this memory
+  sbSlug?: string; // Which AI being created this memory
   contactId?: string; // Per-sender memory scoping
 }
 
@@ -83,8 +83,8 @@ export interface MemorySearchOptions {
   limit?: number;
   offset?: number;
   includeExpired?: boolean;
-  agentId?: string; // Filter by agent
-  includeShared?: boolean; // Include shared memories (agentId=null) when filtering. Default true.
+  sbSlug?: string; // Filter by agent
+  includeShared?: boolean; // Include shared memories (sbSlug=null) when filtering. Default true.
   contactId?: string; // Filter by contact for per-sender isolation
   semanticChunkTypes?: MemorySearchChunkType[];
   semanticQueryStrategy?: MemorySemanticQueryStrategy;
@@ -102,13 +102,20 @@ export type SessionPhase =
   | 'complete'
   | string;
 
-export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+// Keep aligned with services/sessions/types.ts SessionLifecycle.
+export type SessionLifecycle =
+  | 'running'
+  | 'idle'
+  | 'compacting'
+  | 'interrupted'
+  | 'completed'
+  | 'failed';
 
 export interface Session {
   id: string;
   userId: string;
-  agentId?: string;
-  /** Owning identity UUID (agent_identities.id) — canonical; agentId is the ambiguous slug. */
+  sbSlug?: string;
+  /** Owning identity UUID (agent_identities.id) — canonical; sbSlug is the ambiguous slug. */
   sbId?: string;
   /**
    * Per-sender scope. One SB identity serves many contacts, so identity
@@ -140,7 +147,7 @@ export interface Session {
 export interface SessionCreateInput {
   id?: string;
   userId: string;
-  agentId?: string;
+  sbSlug?: string;
   /**
    * Canonical owning identity. Supply the request's verified identity so the
    * row records who actually created it; without it creation falls back to

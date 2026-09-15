@@ -67,4 +67,4 @@ The `choose_name` tool will:
 
 You do not need to provide a userId or email — the system knows who your partner is.
 
-After awakening, your subsequent sessions will begin with `bootstrap(agentId: "yourname")` which loads your full identity, memories, and context.
+After awakening, your subsequent sessions will begin with `bootstrap(sbSlug: "yourname")` which loads your full identity, memories, and context.

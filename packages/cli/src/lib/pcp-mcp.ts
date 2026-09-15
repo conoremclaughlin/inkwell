@@ -7,7 +7,7 @@ function pickDebugArgValues(args: Record<string, unknown>): Record<string, unkno
   const keys = [
     'sessionId',
     'backendSessionId',
-    'agentId',
+    'sbSlug',
     'backend',
     'studioId',
     'threadKey',

@@ -14,7 +14,7 @@ import type { DataComposer } from '../../data/composer';
 import type { SheetsOperation } from './types';
 
 const userIdentifierBaseSchema = z.object({
-  userId: z.string().uuid().optional().describe('User UUID (if known)'),
+  userId: z.string().guid().optional().describe('User UUID (if known)'),
   email: z.string().email().optional().describe('User email address'),
   phone: z.string().optional().describe('Phone number in E.164 format (e.g., +14155551234)'),
   platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform name'),

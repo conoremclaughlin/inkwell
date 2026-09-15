@@ -18,7 +18,7 @@ export interface StreamActivity {
   id: string;
   userId: string;
   sessionId: string | null;
-  agentId: string;
+  sbSlug: string;
   type: string;
   subtype: string | null;
   content: string;
@@ -36,7 +36,7 @@ export interface StreamActivity {
 export interface EventStreamFilter {
   sessionId?: string;
   taskGroupId?: string;
-  agentId?: string;
+  sbSlug?: string;
   /** ISO timestamp — backfill persisted events from this point on connect */
   since?: string;
 }
@@ -63,7 +63,7 @@ export function useEventStream(
   const onEventRef = useRef(options?.onEvent);
   onEventRef.current = options?.onEvent;
 
-  const { sessionId, taskGroupId, agentId, since } = filter;
+  const { sessionId, taskGroupId, sbSlug, since } = filter;
 
   const clear = useCallback(() => setEvents([]), []);
 
@@ -76,7 +76,7 @@ export function useEventStream(
     const params = new URLSearchParams();
     if (sessionId) params.set('sessionId', sessionId);
     if (taskGroupId) params.set('taskGroupId', taskGroupId);
-    if (agentId) params.set('agentId', agentId);
+    if (sbSlug) params.set('sbSlug', sbSlug);
     if (since) params.set('since', since);
 
     setStatus('connecting');
@@ -114,7 +114,7 @@ export function useEventStream(
       source.close();
       setStatus('idle');
     };
-  }, [enabled, sessionId, taskGroupId, agentId, since]);
+  }, [enabled, sessionId, taskGroupId, sbSlug, since]);
 
   return { events, status, clear };
 }

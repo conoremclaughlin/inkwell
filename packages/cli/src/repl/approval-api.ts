@@ -12,7 +12,7 @@
  */
 
 import { getValidAccessToken } from '../auth/tokens.js';
-import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
+import { resolveSlug, readIdentityJson } from '../backends/identity.js';
 
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const POLL_INTERVAL_MS = 3000;
@@ -25,12 +25,12 @@ function getContextHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
   let contextToken = process.env.INK_CONTEXT?.trim();
   if (!contextToken) {
-    const agentId = resolveAgentId();
-    if (agentId) {
+    const sbSlug = resolveSlug();
+    if (sbSlug) {
       const identity = readIdentityJson(process.cwd());
       contextToken = Buffer.from(
         JSON.stringify({
-          agentId,
+          sbSlug,
           studioId: identity?.studioId || 'main',
           cliAttached: true,
         })

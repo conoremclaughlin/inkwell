@@ -5,7 +5,7 @@
  * What that file cannot see is chat.ts itself asserting an identity *around* the
  * adapter — which it did, in two places Lumen caught on PR #485:
  *
- *   1. buildPromptEnvelope opened with a flat `You are ${agentId}.`, so an
+ *   1. buildPromptEnvelope opened with a flat `You are ${sbSlug}.`, so an
  *      awakening ran the system prompt saying "you have no name yet" straight
  *      into a user envelope saying "You are nascent."
  *   2. The auto-compaction turn was a fourth backend call site and did not
@@ -125,7 +125,12 @@ describe('every backend turn forwards the override', () => {
     return found;
   };
 
-  const sites = [...callSites('startBackendTurn'), ...callSites('runBackendTurn')];
+  const sites = [
+    ...callSites('startBackendTurn'),
+    ...callSites('runBackendTurn'),
+    // Request builders shared by a spawn and the relay-budget measurer.
+    ...callSites('BackendRunRequest => '),
+  ];
 
   it('finds the call sites at all (guards against the scan silently matching nothing)', () => {
     expect(sites.length).toBeGreaterThanOrEqual(4);

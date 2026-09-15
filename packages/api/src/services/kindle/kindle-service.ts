@@ -15,7 +15,7 @@ import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 
 export interface ValueSeed {
-  parentAgentId: string;
+  parentSlug: string;
   parentName: string;
   coreValues: string[];
   philosophicalOrientation: string;
@@ -26,7 +26,7 @@ export interface KindleToken {
   id: string;
   token: string;
   creatorUserId: string;
-  creatorAgentId: string | null;
+  creatorSlug: string | null;
   valueSeed: ValueSeed | Record<string, never>;
   status: string;
   usedByUserId: string | null;
@@ -37,10 +37,10 @@ export interface KindleToken {
 
 export interface KindleLineage {
   id: string;
-  parentAgentId: string | null;
+  parentSlug: string | null;
   parentUserId: string | null;
   facilitatorUserId: string;
-  childAgentId: string;
+  childSlug: string;
   childUserId: string;
   kindleMethod: string;
   valueSeed: ValueSeed | Record<string, never>;
@@ -70,13 +70,13 @@ export class KindleService {
    * Extract inheritable values from a parent SB's identity.
    * Scrubs PII and relationship context — only passes values/soul/philosophy.
    */
-  async extractValueSeed(userId: string, agentId: string): Promise<ValueSeed> {
+  async extractValueSeed(userId: string, sbSlug: string): Promise<ValueSeed> {
     // Get agent identity
     const { data: identity } = await this.supabase
       .from('agent_identities')
       .select('agent_id, name, values, soul, workspace_id')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .single();
 
     let workspaceShared: { shared_values: string | null } | null = null;
@@ -127,8 +127,8 @@ export class KindleService {
     }
 
     return {
-      parentAgentId: identity?.agent_id || agentId,
-      parentName: identity?.name || agentId,
+      parentSlug: identity?.agent_id || sbSlug,
+      parentName: identity?.name || sbSlug,
       coreValues: (identity?.values as string[]) || [],
       philosophicalOrientation,
       sharedValues:
@@ -143,14 +143,14 @@ export class KindleService {
    */
   async createKindleToken(
     creatorUserId: string,
-    creatorAgentId?: string,
+    creatorSlug?: string,
     expiresInHours: number = 168 // 7 days
   ): Promise<KindleToken> {
     let valueSeed: ValueSeed | Record<string, never> = {};
 
-    if (creatorAgentId) {
+    if (creatorSlug) {
       try {
-        valueSeed = await this.extractValueSeed(creatorUserId, creatorAgentId);
+        valueSeed = await this.extractValueSeed(creatorUserId, creatorSlug);
       } catch (error) {
         logger.warn('Failed to extract value seed, creating token without seed', { error });
       }
@@ -162,7 +162,7 @@ export class KindleService {
       .from('kindle_tokens')
       .insert({
         creator_user_id: creatorUserId,
-        creator_agent_id: creatorAgentId || null,
+        creator_agent_id: creatorSlug || null,
         value_seed: valueSeed,
         expires_at: expiresAt,
       })
@@ -357,8 +357,8 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
     soulMd: string | undefined,
     userId: string
   ): Promise<KindleLineage> {
-    // Generate final agent ID from chosen name
-    const finalAgentId = chosenName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    // Generate final SB slug from chosen name
+    const finalSlug = chosenName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
     // Rename + lineage completion in ONE transaction, user-scoped inside the
     // function (Lumen #528 r3 P1-3/P1-4): only the kindled user completes
@@ -370,7 +370,7 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
       p_kindle_id: kindleId,
       p_user_id: userId,
       p_chosen_name: chosenName,
-      p_final_agent_id: finalAgentId,
+      p_final_agent_id: finalSlug,
       p_soul: soulMd ?? null,
     });
 
@@ -378,7 +378,7 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
       throw new Error(`Failed to complete onboarding: ${error?.message ?? 'no lineage row'}`);
     }
 
-    logger.info('Kindle onboarding completed', { kindleId, chosenName, finalAgentId });
+    logger.info('Kindle onboarding completed', { kindleId, chosenName, finalSlug });
     return this.mapLineage(lineage);
   }
 
@@ -422,7 +422,7 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
       id: data.id,
       token: data.token,
       creatorUserId: data.creator_user_id,
-      creatorAgentId: data.creator_agent_id,
+      creatorSlug: data.creator_agent_id,
       valueSeed: data.value_seed || {},
       status: data.status,
       usedByUserId: data.used_by_user_id,
@@ -436,10 +436,10 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
   private mapLineage(data: any): KindleLineage {
     return {
       id: data.id,
-      parentAgentId: data.parent_agent_id,
+      parentSlug: data.parent_agent_id,
       parentUserId: data.parent_user_id,
       facilitatorUserId: data.facilitator_user_id,
-      childAgentId: data.child_agent_id,
+      childSlug: data.child_agent_id,
       childUserId: data.child_user_id,
       kindleMethod: data.kindle_method,
       valueSeed: data.value_seed || {},

@@ -22,6 +22,14 @@
  * default project, and expire. They close when their thread closes or when
  * expires_at passes with no live lease.
  *
+ * Ephemeral worktrees materialize under the canonical root
+ * `~/.ink/studios/<agent>/<project>/<slug>` (see studio-paths.ts and
+ * spec:studio-materialization v8) — never as siblings of the durable
+ * checkouts. The durable D1 parent (ensureParentStudio) keeps the legacy
+ * sibling location: it is a home a human also lives in. Because root paths
+ * do not follow the `<repo>--<slug>` folder convention, the row's slug is
+ * passed to create() explicitly rather than derived from the path.
+ *
  * Overflow ALWAYS hangs off the durable ancestor, never off another
  * ephemeral. Routing hands this service whatever studio the agent's live
  * session happens to occupy — after one overflow, that candidate is itself
@@ -38,26 +46,34 @@
  * that wins first blocks acquires until the worktree is gone or the claim is
  * cleared. Destruction is additionally gated on a verified rescue, and
  * `cleaned` is recorded only after the worktree is confirmed gone from disk.
- * The branch is always kept — that is where the work lives.
+ * Ephemeral checkouts are DETACHED — no branch is minted at creation; rescue
+ * anchors any otherwise-unreachable commits under `ink-rescue/*`. A PR thread
+ * detaches at the PR's own head (fetched from `refs/pull/<n>/head`), so the
+ * reviewer lands on the code under review; every other thread detaches at the
+ * base branch. See `pullRequestDetachTarget`.
  */
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
-import { access } from 'fs/promises';
+import { access, lstat, rm } from 'fs/promises';
 import { bootstrapStudio } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
+import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
 import {
   StudioLeaseService,
   captureWorktreeState,
+  writeCheckoutPin,
   rescueSucceeded,
   parseStudioLease,
+  leaseThreadKeys,
   EPHEMERAL_STUDIO_TTL_MS,
   type StudioLease,
   type WorktreeFinalState,
 } from './studio-lease.service';
 import { logger } from '../utils/logger';
+import { withKeyedLock } from '../utils/keyed-lock';
 
 const execFileAsync = promisify(execFile);
 
@@ -92,10 +108,117 @@ export function overflowSlug(parentStudio: Studio, threadKey: string, variant?: 
   return `${parentSlug}--${tail}`;
 }
 
+/**
+ * Where a PR thread's worktree should be detached: the PR's current head.
+ *
+ * GitHub publishes every PR's head at `refs/pull/<n>/head`, whatever branch it
+ * came from and whoever owns it. We fetch it into a remote-tracking ref — not
+ * a branch, so nothing is minted or littered — and detach the worktree there.
+ * Commits reachable from a remote-tracking ref already live on the remote, so
+ * the teardown rescue (`captureWorktreeState`) leaves them alone.
+ *
+ * Grammar: `pr:<n>` or `<project>:pr:<n>`; only the trailing two segments
+ * matter, so no project-slug lookup is needed here. A mis-detection costs one
+ * failed fetch and falls back to the base branch — never a wrong checkout.
+ */
+export interface PullRequestDetachTarget {
+  number: number;
+  /** `git fetch origin <fetchRefspec>` */
+  fetchRefspec: string;
+  /** The ref to detach at once fetched. */
+  localRef: string;
+  /** Short form recorded on the studio row (`detached:<label>`). */
+  label: string;
+}
+
+export function pullRequestDetachTarget(threadKey: string): PullRequestDetachTarget | null {
+  const segments = threadKey.split(':');
+  if (segments.length < 2 || segments.length > 3) return null;
+  const type = segments[segments.length - 2];
+  const id = segments[segments.length - 1];
+  if (type !== 'pr' || !/^\d+$/.test(id)) return null;
+  const number = Number(id);
+  return {
+    number,
+    fetchRefspec: `+refs/pull/${number}/head:refs/remotes/origin/pr/${number}`,
+    localRef: `refs/remotes/origin/pr/${number}`,
+    label: `origin/pr/${number}`,
+  };
+}
+
+/** What a detached checkout is pinned to — recorded in `studios.metadata.checkout`. */
+export interface DetachedCheckout {
+  mode: 'detached';
+  /** `origin/pr/<n>` or the base branch name. */
+  ref: string;
+  /** The commit HEAD sat on when the worktree was created. */
+  commit: string;
+}
+
+/**
+ * Startup configuration a checkout can ship and a spawn would execute or
+ * trust before any reviewer has looked: MCP server commands, hooks,
+ * environment, per-backend config. Bootstrap seeds these only when absent
+ * and the settings writer merges what it finds, which is right for a durable
+ * studio a person customised and wrong for an unreviewed PR head — there the
+ * PR's copy would win (Lumen, PR #604 round 2). A PR can also ship any of
+ * them as a symlink pointing outside the checkout.
+ */
+export const UNTRUSTED_STARTUP_CONFIG_PATHS = [
+  '.mcp.json',
+  '.env.local',
+  // Gemini CLI loads a trusted workspace's root `.env` at startup (it sets
+  // process.env, NODE_OPTIONS included) unless --ignore-env is passed, and
+  // the runner passes neither (Lumen, PR #604 round 3).
+  '.env',
+  '.claude',
+  '.codex',
+  '.gemini',
+] as const;
+
+/**
+ * Remove every PR-supplied startup-config path from a review checkout, by its
+ * own name and never following links, so bootstrap then seeds trusted copies
+ * from the main root and the settings writer starts from nothing. Returns
+ * what was removed. Throws when a removal fails; the caller fails closed.
+ */
+export async function quarantineUntrustedStartupConfig(worktreePath: string): Promise<string[]> {
+  const removed: string[] = [];
+  for (const rel of UNTRUSTED_STARTUP_CONFIG_PATHS) {
+    const target = path.join(worktreePath, rel);
+    // lstat: a symlink counts as present whether or not its target exists.
+    const entry = await lstat(target).catch(() => null);
+    if (!entry) continue;
+    // rm on a symlink removes the link itself, never what it points at.
+    await rm(target, { recursive: true, force: true });
+    removed.push(rel);
+  }
+  return removed;
+}
+
+interface WorktreeCreation {
+  worktreePath: string;
+  /** Real branch for durable studios; `detached:<ref>` sentinel for ephemerals. */
+  branch: string;
+  checkout?: DetachedCheckout;
+}
+
+/** Studio metadata with the checkout pin merged in (prior keys preserved). */
+function withCheckoutMetadata(
+  prior: Studio['metadata'] | Record<string, unknown> | null | undefined,
+  checkout: DetachedCheckout | undefined
+): Record<string, unknown> {
+  const base =
+    prior && typeof prior === 'object' && !Array.isArray(prior)
+      ? { ...(prior as Record<string, unknown>) }
+      : {};
+  if (checkout) base.checkout = checkout;
+  return base;
+}
+
 /** One slug variant's preflight result for a given (parent, threadKey). */
 interface OverflowVariantState {
   slug: string;
-  branchTail: string;
   existing: Studio | null;
   matches: boolean;
 }
@@ -178,7 +301,6 @@ export class StudioOverflowService {
     const states: OverflowVariantState[] = [];
     for (const variant of variants) {
       const slug = overflowSlug(parentStudio, threadKey, variant);
-      const branchTail = variant ? `${threadSlug(threadKey)}-h${variant}` : threadSlug(threadKey);
       const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
       const matches = existing ? this.matchesOverflow(existing, parentStudio, threadKey) : false;
       if (existing && !matches) {
@@ -189,7 +311,7 @@ export class StudioOverflowService {
           collidingStudioId: existing.id,
         });
       }
-      states.push({ slug, branchTail, existing, matches });
+      states.push({ slug, existing, matches });
     }
     return states;
   }
@@ -263,6 +385,24 @@ export class StudioOverflowService {
   }
 
   /**
+   * Read-only half of the overflow ladder (v18 S3): the live studio this
+   * threadKey WOULD reuse, or null. Never creates, revives, or touches a row
+   * — plan-time routing consults this so a thread whose overflow already
+   * exists keeps scoping to it, while a thread with no overflow defers the
+   * mint to spawn admission (`withStudioLease` → `ensureOverflowStudio`).
+   */
+  async findOverflowStudio(opts: {
+    userId: string;
+    parentStudio: Studio;
+    threadKey: string;
+  }): Promise<Studio | null> {
+    const { userId, threadKey } = opts;
+    const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    const states = await this.loadVariantStates(userId, parentStudio, threadKey);
+    return this.firstLiveMatch(states, threadKey);
+  }
+
+  /**
    * Ladder steps 1–2: find or create the ephemeral studio for this threadKey,
    * anchored on the candidate's durable ancestor. Returns null only when
    * every slug candidate collides with an unrelated studio or fails worktree
@@ -270,13 +410,31 @@ export class StudioOverflowService {
    */
   async ensureOverflowStudio(opts: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     parentStudio: Studio;
     threadKey: string;
   }): Promise<Studio | null> {
-    const { userId, agentId, threadKey } = opts;
+    const { userId, sbSlug, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    // Same-thread ensures in this process take turns END TO END — preflight,
+    // worktree, setup (up to the dependency install), row — so the second
+    // arrival finds the first's row at preflight and reuses it. Racing them
+    // through git and rereading is not enough: the git lock is short and the
+    // row is published only after setup, so an exhausted loser could reread
+    // before the winner existed and hold the message (Lumen, #603). Arrivals
+    // from another process are still arbitrated by the live-ownership unique
+    // index on the insert.
+    return withKeyedLock(`overflow-ensure:${userId}:${parentStudio.id}:${threadKey}`, () =>
+      this.ensureOverflowStudioExclusive(userId, sbSlug, parentStudio, threadKey)
+    );
+  }
 
+  private async ensureOverflowStudioExclusive(
+    userId: string,
+    sbSlug: string,
+    parentStudio: Studio,
+    threadKey: string
+  ): Promise<Studio | null> {
     const states = await this.loadVariantStates(userId, parentStudio, threadKey);
 
     // Step 1 — reuse: a live matching row on ANY variant wins outright.
@@ -288,11 +446,20 @@ export class StudioOverflowService {
     // the next variant (fresh slug AND fresh branch name): the usual cause
     // is the `eph/` branch being checked out by another worktree, e.g. a
     // legacy chained studio from before durable anchoring.
+    // A PR thread's checkout lands on the PR head; anything else on the base.
+    const detachAt = pullRequestDetachTarget(threadKey) ?? undefined;
     for (const s of states) {
       const { existing } = s;
       if (existing && !s.matches) continue;
 
-      const created = await this.createWorktree(parentStudio, s.slug, agentId, s.branchTail);
+      const created = await this.createWorktree(parentStudio, s.slug, {
+        worktreePath: ephemeralWorktreePath({
+          sbSlug,
+          repoRoot: parentStudio.repoRoot,
+          leaf: s.slug,
+        }),
+        detachAt,
+      });
       if (!created) continue;
 
       if (existing) {
@@ -302,6 +469,15 @@ export class StudioOverflowService {
           const revived = await this.studios.update(existing.id, {
             status: 'active',
             worktreePath: created.worktreePath,
+            // The row may carry a legacy `<agent>/eph/*` branch name from
+            // before detached checkouts; the fresh worktree is detached, and
+            // the column must describe THIS checkout, not the old one.
+            branch: created.branch,
+            // Same reason for the pin: it describes THIS checkout.
+            metadata: withCheckoutMetadata(
+              existing.metadata,
+              created.checkout
+            ) as Studio['metadata'],
             purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
             cleanedAt: null,
             // Clearing archived_at is not cosmetic: a row revived from
@@ -314,7 +490,7 @@ export class StudioOverflowService {
           });
           await this.leases.logEvent(userId, revived.id, 'overflow', {
             threadKey,
-            agentId,
+            sbSlug,
             reason: `revived ephemeral studio; parent ${parentStudio.id} leased`,
           });
           return revived;
@@ -338,7 +514,7 @@ export class StudioOverflowService {
       try {
         const studio = await this.studios.create({
           userId,
-          agentId,
+          sbSlug,
           repoRoot: parentStudio.repoRoot,
           worktreePath: created.worktreePath,
           branch: created.branch,
@@ -350,11 +526,17 @@ export class StudioOverflowService {
           parentStudioId: parentStudio.id,
           threadKey,
           expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-          metadata: { overflow: true },
+          metadata: withCheckoutMetadata(
+            { overflow: true },
+            created.checkout
+          ) as Studio['metadata'],
+          // Root-based paths don't encode the slug — pass it explicitly or
+          // the derived fallback is null and reuse-by-slug silently breaks.
+          slug: s.slug,
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
-          agentId,
+          sbSlug,
           reason: `created ephemeral studio; parent ${parentStudio.id} leased`,
         });
         logger.info('[StudioOverflow] Created ephemeral studio', {
@@ -362,6 +544,7 @@ export class StudioOverflowService {
           studioId: studio.id,
           slug: s.slug,
           worktreePath: created.worktreePath,
+          checkout: created.checkout ?? null,
         });
         return studio;
       } catch (err) {
@@ -377,6 +560,29 @@ export class StudioOverflowService {
         }).catch(() => undefined);
         return this.convergeOnRaceWinner(userId, parentStudio, threadKey);
       }
+    }
+
+    // Every candidate failed for THIS call. Same-process rivals never reach
+    // here for that reason (they queue on the ensure lock above), but a rival
+    // in ANOTHER process may have won meanwhile — its worktree took the path
+    // we tried, its git locks failed ours — and published a live row. Hand it
+    // back if it is there: null here is not "no studio", it is a held message
+    // (see convergeOnRaceWinner). This is best effort, not a cross-process
+    // convergence guarantee; genuine exhaustion still yields null.
+    const lateWinner = await this.firstLiveMatch(
+      await this.loadVariantStates(userId, parentStudio, threadKey),
+      threadKey
+    );
+    if (lateWinner) {
+      logger.info(
+        '[StudioOverflow] Every slug candidate failed, but a concurrent ensure won; converged',
+        {
+          threadKey,
+          studioId: lateWinner.id,
+          slug: lateWinner.slug,
+        }
+      );
+      return lateWinner;
     }
 
     logger.error(
@@ -412,13 +618,13 @@ export class StudioOverflowService {
    */
   async ensureParentStudio(opts: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     repoRoot: string;
     /** Canonical identity UUID — authoritative over the display slug. */
     sbId?: string | null;
   }): Promise<Studio | null> {
-    const { userId, agentId, repoRoot, sbId } = opts;
-    const slug = `${path.basename(repoRoot)}--${agentId}`;
+    const { userId, sbSlug, repoRoot, sbId } = opts;
+    const slug = `${path.basename(repoRoot)}--${sbSlug}`;
 
     const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
     if (existing) {
@@ -438,7 +644,7 @@ export class StudioOverflowService {
         !existing.ephemeral &&
         existing.userId === userId &&
         existing.repoRoot === repoRoot &&
-        (sbId ? existing.sbId === sbId : existing.agentId === agentId) &&
+        (sbId ? existing.sbId === sbId : existing.sbSlug === sbSlug) &&
         (existing.status === 'active' || existing.status === 'idle');
 
       if (reusable) {
@@ -456,7 +662,7 @@ export class StudioOverflowService {
       logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
         slug,
         repoRoot,
-        agentId,
+        sbSlug,
         collidingStudioId: existing.id,
       });
       return null;
@@ -470,21 +676,21 @@ export class StudioOverflowService {
       baseBranch: seed?.baseBranch || 'main',
     } as Studio;
 
-    const created = await this.createWorktree(parentLike, slug, agentId, agentId, {
-      branch: `${agentId}/studio/${agentId}`,
+    const created = await this.createWorktree(parentLike, slug, {
+      branch: `${sbSlug}/studio/${sbSlug}`,
     });
     if (!created) return null;
 
     try {
       const studio = await this.studios.create({
         userId,
-        agentId,
+        sbSlug,
         sbId: sbId ?? undefined,
         repoRoot,
         worktreePath: created.worktreePath,
         branch: created.branch,
         baseBranch: parentLike.baseBranch,
-        purpose: `Home studio for ${agentId} on ${path.basename(repoRoot)} (auto-created)`,
+        purpose: `Home studio for ${sbSlug} on ${path.basename(repoRoot)} (auto-created)`,
         ephemeral: false,
         defaultProjectId: seed?.defaultProjectId ?? null,
         metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
@@ -493,7 +699,7 @@ export class StudioOverflowService {
         studioId: studio.id,
         slug: studio.slug,
         repoRoot,
-        agentId,
+        sbSlug,
         worktreePath: created.worktreePath,
       });
       return studio;
@@ -513,52 +719,207 @@ export class StudioOverflowService {
   private async createWorktree(
     parentStudio: Studio,
     slug: string,
-    agentId: string,
-    branchTail: string,
-    opts?: { branch?: string }
-  ): Promise<{ worktreePath: string; branch: string } | null> {
+    opts?: { branch?: string; worktreePath?: string; detachAt?: PullRequestDetachTarget }
+  ): Promise<WorktreeCreation | null> {
     const mainRoot = parentStudio.repoRoot;
-    const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
-    // Parent studios pass an explicit branch: `eph/` names a temporary
-    // worktree, and a durable home studio is not one.
-    const branch = opts?.branch || `${agentId}/eph/${branchTail}`;
+    // Ephemeral callers pass the canonical-root path; the durable D1 parent
+    // omits it and keeps the legacy sibling-of-repo location. `git worktree
+    // add` creates missing parent directories itself (verified empirically).
+    const worktreePath =
+      opts?.worktreePath ??
+      path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
     const baseBranch = parentStudio.baseBranch || 'main';
 
-    try {
-      await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, baseBranch], {
-        cwd: mainRoot,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // Branch may survive a previous teardown (branches are kept on close —
-      // they hold the work). Retry attached to the existing branch.
-      if (message.includes('already exists')) {
-        try {
-          await execFileAsync('git', ['worktree', 'add', worktreePath, branch], {
+    if (opts?.branch) {
+      // Durable studios (the D1 parent, home studios) carry a real branch —
+      // they are working checkouts in their own right.
+      const branch = opts.branch;
+      try {
+        await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+          execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, baseBranch], {
             cwd: mainRoot,
-          });
-        } catch (retryErr) {
-          logger.error('[StudioOverflow] Worktree creation failed (existing-branch retry)', {
+          })
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // The branch may survive a previous teardown. Retry attached to it.
+        if (message.includes('already exists')) {
+          try {
+            await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+              execFileAsync('git', ['worktree', 'add', worktreePath, branch], {
+                cwd: mainRoot,
+              })
+            );
+          } catch (retryErr) {
+            logger.error('[StudioOverflow] Worktree creation failed (existing-branch retry)', {
+              branch,
+              worktreePath,
+              error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+            });
+            return null;
+          }
+        } else {
+          logger.error('[StudioOverflow] Worktree creation failed', {
             branch,
             worktreePath,
-            error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+            error: message,
           });
           return null;
         }
-      } else {
-        logger.error('[StudioOverflow] Worktree creation failed', {
-          branch,
+      }
+      return this.finishWorktreeSetup(mainRoot, worktreePath, branch, undefined, {
+        installDependencies: true,
+      });
+    }
+
+    // Ephemeral studios check out DETACHED (Conor, 2026-09-01): review and
+    // overflow worktrees rarely commit, and every `<agent>/eph/<tail>` branch
+    // they minted outlived its teardown as litter — dozens of dead branches,
+    // plus creation failures whenever a legacy worktree still held the name.
+    // Detached HEAD has no name to collide with. Work is not losable: a dirty
+    // tree is stash-rescued at teardown, and captureWorktreeState mints an
+    // `ink-rescue/` branch when detached commits would otherwise be
+    // unreachable.
+    // Serialized per repository: `git worktree add` takes repository-level
+    // locks, and two concurrent ensures for one thread run this at the same
+    // time (see utils/keyed-lock). Concurrency is still arbitrated where it
+    // belongs — the live-ownership unique index on the row insert.
+    // Where to detach: the PR head for a PR thread, when it can be fetched.
+    // A failed fetch (no `origin`, not GitHub, offline, PR gone) is not fatal
+    // — the review still gets a detached worktree, just at the base branch,
+    // exactly as before; the warning says which. The fetch takes its own
+    // per-repo lock (two fetches of one refspec would fight over the ref
+    // lock) — not the worktree-add lock, so a slow fetch never blocks
+    // unrelated adds (Lumen, PR #604). The add then targets the resolved SHA.
+    let target = baseBranch;
+    let label = baseBranch;
+    let pinRef: string | undefined;
+    if (opts?.detachAt) {
+      const pr = opts.detachAt;
+      try {
+        await withKeyedLock(`git-fetch:${mainRoot}`, () =>
+          execFileAsync('git', ['fetch', '--no-tags', '--quiet', 'origin', pr.fetchRefspec], {
+            cwd: mainRoot,
+            timeout: 60_000,
+          })
+        );
+        const { stdout: sha } = await execFileAsync(
+          'git',
+          ['rev-parse', '--verify', `${pr.localRef}^{commit}`],
+          { cwd: mainRoot }
+        );
+        target = sha.trim();
+        label = pr.label;
+        pinRef = pr.localRef;
+      } catch (err) {
+        logger.warn('[StudioOverflow] PR head fetch failed; detaching at the base branch instead', {
           worktreePath,
-          error: message,
+          fetchRefspec: pr.fetchRefspec,
+          baseBranch,
+          error: err instanceof Error ? err.message : String(err),
         });
-        return null;
       }
     }
 
+    try {
+      await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+        execFileAsync('git', ['worktree', 'add', '--detach', worktreePath, target], {
+          cwd: mainRoot,
+        })
+      );
+    } catch (err) {
+      logger.error('[StudioOverflow] Detached worktree creation failed', {
+        worktreePath,
+        target,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+    // Pin what HEAD sat on: reuse never resets a checkout, so "which commit
+    // did this review start from" has to be recorded, not re-derived. The
+    // pin lives in the worktree's gitdir (see writeCheckoutPin) because every
+    // rescue site captures from the path, and the row copy is for humans.
+    const { stdout: pinned } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+      cwd: worktreePath,
+    });
+    const commit = pinned.trim();
+    await writeCheckoutPin(worktreePath, pinRef ? { commit, ref: pinRef } : { commit }).catch(
+      (err) => {
+        // Over-rescue is the safe failure: without the pin, teardown anchors
+        // the fetched head under ink-rescue/* rather than losing anything.
+        logger.warn('[StudioOverflow] Could not record the checkout pin', {
+          worktreePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    );
+    if (opts?.detachAt) {
+      // Unreviewed code gets no say in how its review session starts. Whatever
+      // the PR shipped under these names is removed before bootstrap seeds
+      // the trusted copies (see UNTRUSTED_STARTUP_CONFIG_PATHS). Fail closed:
+      // a checkout we could not sanitise is torn down, and the message is
+      // held rather than spawned against PR-controlled startup config.
+      let quarantined: string[];
+      try {
+        quarantined = await quarantineUntrustedStartupConfig(worktreePath);
+      } catch (err) {
+        logger.error('[StudioOverflow] Could not quarantine PR-supplied startup config; refusing', {
+          worktreePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await execFileAsync('git', ['worktree', 'remove', '--force', worktreePath], {
+          cwd: mainRoot,
+        }).catch(() => undefined);
+        return null;
+      }
+      if (quarantined.length > 0) {
+        // Said plainly for whoever reads the tree later: this is a sanitized
+        // runtime checkout, not a byte-for-byte working tree of the pinned
+        // commit. The PR's own versions stay inspectable with
+        // `git show <commit>:<path>`. This runs at creation only — a reused
+        // reviewer tree is never reset or edited (Lumen, PR #604).
+        logger.warn(
+          '[StudioOverflow] Sanitized runtime checkout: PR-supplied startup config removed before bootstrap (inspect with `git show <pin>:<path>`)',
+          { worktreePath, pin: commit, removed: quarantined }
+        );
+      }
+    }
+    // The studios row's branch column records what is checked out; this
+    // sentinel says "no branch, cut from <ref>" and can never collide with
+    // branch-based routing lookups.
+    return this.finishWorktreeSetup(
+      mainRoot,
+      worktreePath,
+      `detached:${label}`,
+      { mode: 'detached', ref: label, commit },
+      // A PR thread's checkout is unreviewed code. Installing dependencies
+      // there runs it: Yarn honours a repo-controlled `yarnPath`, so the PR
+      // chooses the binary `yarn install` executes, in this server process,
+      // before any reviewer has looked (Lumen, PR #604 P1 — proven with a
+      // harmless marker). Skipping lifecycle scripts would not help; the
+      // package manager itself is the payload. The reviewer installs
+      // deliberately, or not at all. Applies whether or not the fetch
+      // succeeded: the thread, not the fallback, is what makes it a review.
+      { installDependencies: !opts?.detachAt }
+    );
+  }
+
+  private async finishWorktreeSetup(
+    mainRoot: string,
+    worktreePath: string,
+    branch: string,
+    checkout: DetachedCheckout | undefined,
+    setup: { installDependencies: boolean }
+  ): Promise<WorktreeCreation> {
     const pkgJson = await access(path.join(worktreePath, 'package.json'))
       .then(() => true)
       .catch(() => false);
-    if (pkgJson) {
+    if (pkgJson && !setup.installDependencies) {
+      logger.info(
+        '[StudioOverflow] Dependency install skipped — unreviewed checkout; run it deliberately',
+        { worktreePath }
+      );
+    } else if (pkgJson) {
       await execFileAsync('yarn', ['install'], { cwd: worktreePath, timeout: 120_000 }).catch(
         (err) => {
           logger.warn('[StudioOverflow] yarn install failed (non-fatal)', {
@@ -579,13 +940,14 @@ export class StudioOverflowService {
     }
     await ensureStudioSettings(worktreePath).catch(() => undefined);
 
-    return { worktreePath, branch };
+    return checkout ? { worktreePath, branch, checkout } : { worktreePath, branch };
   }
 
   /**
    * Close an ephemeral studio when its work unit completes: claim the studio
    * against concurrent acquires, rescue anything dirty (safe ref), remove the
-   * worktree, keep the branch, mark cleaned.
+   * worktree, mark cleaned. (Ephemeral worktrees are detached, so there is no
+   * branch to keep; rescue mints `ink-rescue/*` only when commits exist.)
    *
    * SAFETY (PR #492 rounds 1–2):
    *   - Destruction only proceeds after `claimForTeardown` wins an atomic
@@ -654,7 +1016,7 @@ export class StudioOverflowService {
           }
         );
         await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
-          agentId: studio.agentId ?? undefined,
+          sbSlug: studio.sbSlug ?? undefined,
           reason: `teardown-aborted-rescue-failed (${opts.reason})`,
           detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
         });
@@ -695,7 +1057,7 @@ export class StudioOverflowService {
           { studioId: studio.id, worktreePath: studio.worktreePath }
         );
         await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
-          agentId: studio.agentId ?? undefined,
+          sbSlug: studio.sbSlug ?? undefined,
           reason: `teardown-remove-failed (${opts.reason})`,
           detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
         });
@@ -725,7 +1087,7 @@ export class StudioOverflowService {
       return;
     }
     await this.leases.logEvent(studio.userId, studio.id, 'released', {
-      agentId: studio.agentId ?? undefined,
+      sbSlug: studio.sbSlug ?? undefined,
       reason: opts.reason,
       detail: {
         teardown: true,
@@ -769,13 +1131,52 @@ export class StudioOverflowService {
   async teardownEphemeralStudiosForThread(
     userId: string,
     threadKey: string,
-    opts: { reason: string }
+    opts: {
+      reason: string;
+      /**
+       * Studios whose lease this thread actually rode, from releaseByThread
+       * (v18 S2, Lumen r1 P1-2). `studios.thread_key` is the CREATED-FOR
+       * thread and the last live key need not be it — an ephemeral built for
+       * A whose final surviving thread was B is invisible to the created-for
+       * query once its lease is released, and nothing else on the row
+       * remembers B. The close path passes what it just learned instead.
+       */
+      candidateStudioIds?: string[];
+    }
   ): Promise<number> {
-    const studios = await this.studios
+    const byThread = await this.studios
       .listEphemeralByThread(userId, threadKey)
       .catch(() => [] as Studio[]);
+    const seen = new Set(byThread.map((s) => s.id));
+    const studios = [...byThread];
+    for (const id of opts.candidateStudioIds ?? []) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const studio = await this.studios.findById(id).catch(() => null);
+      // Ownership boundary: a candidate id never widens scope past this
+      // user's own ephemerals.
+      if (studio && studio.ephemeral && studio.userId === userId) studios.push(studio);
+    }
     let closed = 0;
     for (const studio of studios) {
+      // The minimal close invariant (v18 S2): `studios.thread_key` selected
+      // this candidate, but a lease still multiplexing OTHER live threads
+      // means the studio is still serving them — skip before the claim, so
+      // the claim-refusal path's expires_at pull (a "retry teardown soon"
+      // signal) never fires against a studio that must keep living.
+      // claimForTeardown re-checks the same condition atomically.
+      const lease = parseStudioLease(studio.lease);
+      if (lease && !lease.quarantined) {
+        const others = leaseThreadKeys(lease).filter((k) => k !== threadKey);
+        if (others.length > 0) {
+          logger.info('[StudioOverflow] Teardown skipped — other threads still multiplex lease', {
+            studioId: studio.id,
+            threadKey,
+            remainingThreadKeys: others,
+          });
+          continue;
+        }
+      }
       await this.teardownEphemeralStudio(studio, {
         reason: opts.reason,
         expectedThreadKey: threadKey,

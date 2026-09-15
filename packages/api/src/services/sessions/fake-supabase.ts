@@ -14,13 +14,18 @@
 export type Row = Record<string, unknown>;
 
 function getCol(row: Row, col: string): unknown {
-  if (col.includes('->>')) {
-    const [base, key] = col.split('->>');
-    const obj = row[base];
-    if (!obj || typeof obj !== 'object') return null;
-    return (obj as Row)[key] ?? null;
+  // Nested JSON paths as PostgREST parses them: base->child->>leaf — any
+  // depth, both arrow forms (the single-level split this replaced silently
+  // resolved `lease->pendingRelease->>requestedAt` to null, which made
+  // exact-state CAS guards match when they must not).
+  const parts = col.split('->');
+  let cur: unknown = row;
+  for (let part of parts) {
+    if (part.startsWith('>')) part = part.slice(1);
+    if (!cur || typeof cur !== 'object') return null;
+    cur = (cur as Record<string, unknown>)[part];
   }
-  return row[col] ?? null;
+  return cur ?? null;
 }
 
 class FakeQuery {
@@ -35,7 +40,20 @@ class FakeQuery {
   ) {}
 
   eq(col: string, val: unknown) {
-    this.filters.push((r) => getCol(r, col) === val);
+    this.filters.push((r) => {
+      const cur = getCol(r, col);
+      // `->` (not `->>`) path filters compare jsonb structurally: PostgREST
+      // casts the filter value to jsonb. Mirror that for object/array values
+      // (the threadKeys exact-set guard) — order-sensitive, like jsonb arrays.
+      if (cur !== null && typeof cur === 'object' && typeof val === 'string') {
+        try {
+          return JSON.stringify(cur) === JSON.stringify(JSON.parse(val));
+        } catch {
+          return false;
+        }
+      }
+      return cur === val;
+    });
     return this;
   }
   is(col: string, val: unknown) {
@@ -206,6 +224,53 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
                 error: null,
               }
             : { data: { conflict: false }, error: null };
+        }
+
+        if (fn === 'reopen_inbox_thread') {
+          // Mirrors migration 20260913083000: the guarded flip and the audit
+          // event happen together or not at all (JS is single-threaded, as
+          // the function is one transaction in Postgres). false = the row
+          // was not closed; nothing written.
+          const kind = args.p_actor_kind;
+          const agent = args.p_actor_agent_id as string | null | undefined;
+          if (kind !== 'sb' && kind !== 'user') {
+            return {
+              data: null,
+              error: { message: `reopen_inbox_thread: actor kind must be sb or user, got ${kind}` },
+            };
+          }
+          if (kind === 'sb' && !agent) {
+            return {
+              data: null,
+              error: { message: 'reopen_inbox_thread: an sb actor needs an agent id' },
+            };
+          }
+          const thread = (tables['inbox_threads'] ?? []).find(
+            (r) => r.id === args.p_thread_id && r.status === 'closed'
+          );
+          if (!thread) return { data: false, error: null };
+          Object.assign(thread, {
+            status: 'open',
+            closed_at: null,
+            closed_by_agent_id: null,
+            updated_at: new Date().toISOString(),
+          });
+          const messages =
+            tables['inbox_thread_messages'] ?? (tables['inbox_thread_messages'] = []);
+          messages.push({
+            thread_id: args.p_thread_id,
+            sender_agent_id: 'system',
+            content:
+              kind === 'sb'
+                ? `Thread reopened by ${agent}`
+                : 'Thread reopened by the workspace owner',
+            message_type: 'system',
+            metadata:
+              kind === 'sb'
+                ? { type: 'thread_reopened', reopenedBy: agent }
+                : { type: 'thread_reopened', reopenedBy: 'user', channel: 'admin-api' },
+          });
+          return { data: true, error: null };
         }
 
         if (fn !== 'grant_studio_lease') {

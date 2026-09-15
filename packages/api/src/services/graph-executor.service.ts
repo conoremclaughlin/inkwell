@@ -25,8 +25,9 @@ import type { DataComposer } from '../data/composer';
 import type { TaskGroup } from '../data/repositories/task-groups.repository';
 import type { Database, Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { resolveAgentSlug } from '../auth/resolve-identity';
+import { resolveSbSlug } from '../auth/resolve-identity';
 import { StudioLeaseService } from './studio-lease.service';
+import { renderGateChecklistBlock } from './graph-templates/types';
 import { logger } from '../utils/logger';
 
 export interface GraphNodeRef {
@@ -84,7 +85,8 @@ export async function releaseGraphClaimsForSession(
   client: SupabaseClient<Database>,
   sessionId: string,
   reason: string,
-  boundaryAt?: string
+  boundaryAt?: string,
+  expectedTurnEpoch?: string
 ): Promise<number> {
   // Turn-generation guard (Lumen round 3 P1): a delayed release from an OLD
   // boundary must never touch a claim the session's NEXT turn acquired.
@@ -93,6 +95,28 @@ export async function releaseGraphClaimsForSession(
   const cutoff = boundaryAt ?? new Date().toISOString();
   let released = 0;
   try {
+    // Epoch scope at the resource (Lumen, PR #563 round 6): checked HERE,
+    // immediately before the claim lookup, not only at the caller — a newer
+    // owner on the row means this boundary's releases are not ours to run.
+    // Combined with the claimed_at cutoff this covers both interleavings: a
+    // parked new turn has no claims yet, and a landed new turn fails this
+    // check. Residual is this read → release window, atop the per-claim
+    // token CAS in release_graph_claim itself.
+    if (expectedTurnEpoch !== undefined) {
+      const { data: sessionRow, error: epochError } = await client
+        .from('sessions')
+        .select('turn_epoch')
+        .eq('id', sessionId)
+        .maybeSingle();
+      if (epochError) {
+        logger.warn(`Graph boundary release: ownership check failed for ${sessionId}:`, epochError);
+        return 0;
+      }
+      if ((sessionRow as { turn_epoch?: string | null } | null)?.turn_epoch !== expectedTurnEpoch) {
+        logger.warn('Graph boundary release skipped; newer turn owns the session', { sessionId });
+        return 0;
+      }
+    }
     const { data: held, error } = await client
       .from('tasks')
       .select('id, user_id, claim_token')
@@ -260,10 +284,14 @@ export class GraphExecutorService {
         }
       }
 
-      const ok = await this.triggerNode(userId, group, node, target.kind);
+      const { ok, recipientIdentityId } = await this.triggerNode(userId, group, node, target.kind);
       if (ok) {
         triggered.push(node.id);
-        await this.stampDispatch(node.id);
+        // The identity triggerNode ACTUALLY reached, which is not always the
+        // node's assignee — an unresolvable assignee falls back to the group
+        // owner. Recomputing it here would record the wrong recipient in
+        // exactly that case.
+        await this.stampDispatch(node.id, recipientIdentityId);
       } else {
         skipped.push(node.id);
       }
@@ -311,6 +339,72 @@ export class GraphExecutorService {
       }
     }
     return { groups: active.length, triggered, reclaimed };
+  }
+
+  /**
+   * One-shot recovery at startup: clear dispatch stamps for turns that are
+   * over, so the next sweep re-dispatches work that is waiting on nobody.
+   *
+   * The sweep suppresses re-dispatch of a stamped node for
+   * REDISPATCH_INTERVAL_MS (30 minutes). Right while a live session is
+   * starting up or working; wrong for a turn killed before it ran, which then
+   * waits out the whole window for a turn that is never coming. On 2026-08-31
+   * four review threads stalled exactly this way and each needed a
+   * hand-written re-trigger.
+   *
+   * An earlier version cleared every unclaimed stamp at startup, reasoning
+   * that a stamp outliving its process must be stale because the sessions we
+   * dispatch to are our own children. That is FALSE (Lumen, PR #559 review):
+   * when a CLI is attached or recently polling, the trigger skips spawning
+   * entirely (shouldSkipSpawn) and an existing CLI session takes the work —
+   * and that session survives our restart holding an unclaimed dispatch. A
+   * second API process on the same database fails the same way. So death is
+   * never inferred from a restart any more.
+   *
+   * All of the deciding happens in the RPC. It clears a stamp only when the
+   * RECIPIENT recorded on it (graphDispatchedTo) has a session on the group's
+   * thread that finished at or after that stamp, and none of that recipient's
+   * sessions still looks alive. Scoped to the recipient because a thread
+   * routinely carries several agents, so another agent's finished session
+   * proves nothing about this dispatch. The key is removed in place rather
+   * than by rewriting the metadata blob. Every uncertainty keeps the stamp,
+   * because keeping one costs the pre-existing 30-minute wait while clearing
+   * one wrongly costs a duplicate dispatch onto live work.
+   *
+   * Three separate things stop this racing a live dispatch, and they are not
+   * interchangeable:
+   *   - ORDERING: called before dispatch intake opens, so in the normal case
+   *     nothing is stamping while it runs.
+   *   - CUTOFF (`staleBefore`): a stamp at or after that instant is too new to
+   *     regard as stale and is not selected, whoever wrote it. It proves
+   *     recency, not provenance — this runs before we open our own intake, so
+   *     such a stamp came from elsewhere, most likely another API process on
+   *     the same database. Covers dispatches already committed when the
+   *     statement takes its snapshot.
+   *   - CAS: the UPDATE re-checks the stamp and recipient against the row as
+   *     it exists when the write lands. Covers the one the cutoff cannot see —
+   *     a dispatch still uncommitted at snapshot time, which commits while the
+   *     statement waits on the row lock.
+   */
+  async reconcileInterruptedDispatches(
+    staleBefore: Date = new Date()
+  ): Promise<{ cleared: number }> {
+    try {
+      const result = await this.dataComposer.repositories.taskGroups.reconcileGraphDispatchStamps({
+        staleBefore: staleBefore.toISOString(),
+      });
+      const cleared = Number(result.cleared ?? 0);
+      if (cleared > 0) {
+        logger.info(
+          `Graph dispatch reconciliation: cleared ${cleared} stale dispatch stamp(s); ` +
+            'those nodes are eligible again on the next sweep'
+        );
+      }
+      return { cleared };
+    } catch (err) {
+      logger.warn('Graph dispatch reconciliation failed (non-fatal):', err);
+      return { cleared: 0 };
+    }
   }
 
   /**
@@ -403,7 +497,7 @@ export class GraphExecutorService {
     await this.logActivity(userId, group, 'graph_group_complete', { ...counts, summary });
 
     const ownerSlug = group.sb_id
-      ? await resolveAgentSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
+      ? await resolveSbSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
       : null;
     if (ownerSlug) {
       await this.sendTrigger(userId, group, ownerSlug, summary, 'graph_group_complete');
@@ -453,7 +547,7 @@ export class GraphExecutorService {
     await this.logActivity(userId, group, 'graph_dependency_failure', { failures, summary });
 
     const ownerSlug = group.sb_id
-      ? await resolveAgentSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
+      ? await resolveSbSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
       : null;
     if (ownerSlug) {
       await this.sendTrigger(userId, group, ownerSlug, summary, 'graph_dependency_failure');
@@ -463,16 +557,26 @@ export class GraphExecutorService {
     });
   }
 
+  /**
+   * Returns WHICH identity the trigger actually went to, not just whether it
+   * went. The two can differ: if the node names an assignee whose slug will
+   * not resolve, dispatch falls back to the group owner. Recovery is scoped to
+   * the recipient recorded on the stamp, so a caller that assumed the node's
+   * assignee would stamp the wrong identity and scope recovery to a session
+   * that was never asked to do anything (Lumen, PR #559 round 4).
+   */
   private async triggerNode(
     userId: string,
     group: TaskGroup,
     node: GraphNodeRef,
     kind: 'work' | 'gate'
-  ): Promise<boolean> {
+  ): Promise<{ ok: boolean; recipientIdentityId: string | null }> {
     const client = this.dataComposer.getClient();
     let slug: string | null = null;
+    let recipientIdentityId: string | null = null;
     if (node.assigneeIdentityId) {
-      slug = await resolveAgentSlug(client, node.assigneeIdentityId).catch(() => null);
+      slug = await resolveSbSlug(client, node.assigneeIdentityId).catch(() => null);
+      if (slug) recipientIdentityId = node.assigneeIdentityId;
     }
     if (!slug && node.assigneeUserId) {
       // Human assignee: no session to trigger. The activity stream and the
@@ -482,14 +586,15 @@ export class GraphExecutorService {
         taskTitle: node.title,
         assigneeUserId: node.assigneeUserId,
       });
-      return false;
+      return { ok: false, recipientIdentityId: null };
     }
     if (!slug && group.sb_id) {
-      slug = await resolveAgentSlug(client, group.sb_id).catch(() => null);
+      slug = await resolveSbSlug(client, group.sb_id).catch(() => null);
+      if (slug) recipientIdentityId = group.sb_id;
     }
     if (!slug) {
       logger.warn(`Graph dispatch: no resolvable assignee for task ${node.id} (${node.title})`);
-      return false;
+      return { ok: false, recipientIdentityId: null };
     }
 
     const content =
@@ -504,9 +609,35 @@ export class GraphExecutorService {
           `You are the assignee: review the upstream work and record a verdict with ` +
           `record_gate_verdict(taskId, verdict: 'passed'|'failed', expectedAttempt, expectedGateVersion, ` +
           `evidence for pass / reason for fail). Read the task first (get_task) for the current attempt/version. ` +
-          `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.`;
+          `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.` +
+          (await this.gateChecklist(node.id));
 
-    return this.sendTrigger(userId, group, slug, content, `graph_${kind}_ready`, node.id);
+    const ok = await this.sendTrigger(userId, group, slug, content, `graph_${kind}_ready`, node.id);
+    return { ok, recipientIdentityId };
+  }
+
+  /**
+   * The gate's checklist, appended to the message that opens it. Rendering
+   * lives in graph-templates (renderGateChecklistBlock); this is only the
+   * lookup. Requirements are free-form by design — checklist, not bouncer —
+   * so nothing here validates them.
+   *
+   * Best-effort: a lookup failure costs the reminder, never the dispatch.
+   */
+  private async gateChecklist(taskId: string): Promise<string> {
+    try {
+      const { data, error } = await this.dataComposer
+        .getClient()
+        .from('tasks')
+        .select('verification')
+        .eq('id', taskId)
+        .maybeSingle();
+      if (error || !data) return '';
+      return renderGateChecklistBlock(data.verification);
+    } catch (err) {
+      logger.debug(`Gate checklist render failed for ${taskId} (non-fatal):`, err);
+      return '';
+    }
   }
 
   private async sendTrigger(
@@ -525,8 +656,8 @@ export class GraphExecutorService {
       await handleSendToInbox(
         {
           userId,
-          recipientAgentId: recipientSlug,
-          senderAgentId: recipientSlug,
+          recipientSlug: recipientSlug,
+          senderSlug: recipientSlug,
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
           content,
@@ -571,14 +702,32 @@ export class GraphExecutorService {
     return stamps;
   }
 
-  private async stampDispatch(taskId: string): Promise<void> {
+  /**
+   * Record that this node was dispatched, and TO WHOM.
+   *
+   * `graphDispatchedTo` is the recipient's canonical identity UUID
+   * (agent_identities.id, which is what sessions.sb_id holds). Recovery needs
+   * it: without a recipient, the only way to judge whether a dispatch is dead
+   * is thread-wide, and on a multi-agent thread any other agent's finished
+   * session would vouch for this one's live dispatch (Lumen, PR #559 round 3).
+   * Stamps written before this field existed simply never qualify for
+   * recovery — the RPC requires it — which fails closed and self-heals on the
+   * next dispatch.
+   */
+  private async stampDispatch(taskId: string, recipientIdentityId: string | null): Promise<void> {
     try {
       const client = this.dataComposer.getClient();
       const { data } = await client.from('tasks').select('metadata').eq('id', taskId).maybeSingle();
       const meta = (data?.metadata || {}) as Record<string, unknown>;
       await client
         .from('tasks')
-        .update({ metadata: { ...meta, graphDispatchedAt: new Date().toISOString() } } as never)
+        .update({
+          metadata: {
+            ...meta,
+            graphDispatchedAt: new Date().toISOString(),
+            ...(recipientIdentityId ? { graphDispatchedTo: recipientIdentityId } : {}),
+          },
+        } as never)
         .eq('id', taskId);
     } catch (err) {
       logger.debug(`Graph dispatch stamp failed for ${taskId} (non-fatal):`, err);
@@ -594,7 +743,7 @@ export class GraphExecutorService {
     try {
       await this.dataComposer.repositories.activityStream.logActivity({
         userId,
-        agentId: 'system',
+        sbSlug: 'system',
         type: 'state_change',
         subtype,
         content:

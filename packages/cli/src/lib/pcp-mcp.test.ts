@@ -76,7 +76,7 @@ describe('pcp-mcp callPcpTool', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool<{ final: boolean }>('bootstrap', { agentId: 'lumen' });
+    const result = await callPcpTool<{ final: boolean }>('bootstrap', { sbSlug: 'lumen' });
     expect(result).toEqual({ final: true });
   });
 
@@ -91,7 +91,7 @@ describe('pcp-mcp callPcpTool', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await callPcpTool('bootstrap', { agentId: 'lumen' });
+    await callPcpTool('bootstrap', { sbSlug: 'lumen' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).toMatchObject({

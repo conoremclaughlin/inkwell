@@ -34,6 +34,7 @@ import { randomUUID } from 'crypto';
 import { INTEGRATION_TEST_USER_ID } from '../test/integration-fixtures';
 import { StudiosRepository, type Studio } from '../data/repositories/studios.repository';
 import { StudioOverflowService } from './studio-overflow.service';
+import * as keyedLock from '../utils/keyed-lock';
 import type { StudioLeaseService } from './studio-lease.service';
 
 const execFileAsync = promisify(execFile);
@@ -60,6 +61,8 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
   let repo: StudiosRepository;
   let parent: Studio;
   let repoRoot: string;
+  let studiosRoot: string;
+  let prevStudiosRoot: string | undefined;
   const studioIds: string[] = [];
 
   beforeAll(async () => {
@@ -67,6 +70,12 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       auth: { autoRefreshToken: false, persistSession: false },
     });
     repo = new StudiosRepository(client as SupabaseClient<never>);
+
+    // Ephemeral mints land under an isolated canonical root, never the real
+    // ~/.ink/studios (spec v8).
+    prevStudiosRoot = process.env.INK_STUDIOS_ROOT;
+    studiosRoot = await mkdtemp(path.join(tmpdir(), `ink-studios-it-${RUN}-`));
+    process.env.INK_STUDIOS_ROOT = studiosRoot;
 
     repoRoot = await mkdtemp(path.join(tmpdir(), `overflow-it-${RUN}-`));
     await execFileAsync('git', ['init', '-b', 'main'], { cwd: repoRoot });
@@ -106,7 +115,8 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     }
     await client.from('studios').delete().eq('id', parent.id);
 
-    // Worktrees the service created live beside the repo as `<repo>--*`.
+    // Legacy-convention leftovers beside the repo (fixture rows use these
+    // paths), plus everything under the isolated canonical root.
     const dir = path.dirname(repoRoot);
     const base = path.basename(repoRoot);
     const { readdir } = await import('fs/promises');
@@ -116,6 +126,9 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       }
     }
     await rm(repoRoot, { recursive: true, force: true });
+    await rm(studiosRoot, { recursive: true, force: true });
+    if (prevStudiosRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+    else process.env.INK_STUDIOS_ROOT = prevStudiosRoot;
   }, 30_000);
 
   it('two racing inserts for one (parent, threadKey) — exactly one wins', async () => {
@@ -242,65 +255,223 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     expect(liveRows).toHaveLength(1);
   });
 
-  it('two concurrent ensureOverflowStudio calls leave exactly one live studio', async () => {
+  it('concurrent worktree creations in one repository all succeed — git locks are serialized', async () => {
+    // Two concurrent `git worktree add` calls in one repository fail each
+    // other on git's own locks (index.lock, .git/worktrees/<name>). Six at
+    // once, all must land: the service serializes the git step per repo.
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(repo, leases);
+    const create = (
+      service as unknown as {
+        createWorktree: (
+          p: Studio,
+          slug: string,
+          o: { worktreePath: string }
+        ) => Promise<{ worktreePath: string } | null>;
+      }
+    ).createWorktree.bind(service);
+    const slugs = Array.from({ length: 6 }, (_, i) => `concurrent-${RUN}-${i}`);
+    const lockSpy = vi.spyOn(keyedLock, 'withKeyedLock');
+    try {
+      const results = await Promise.all(
+        slugs.map((slug) => create(parent, slug, { worktreePath: path.join(studiosRoot, slug) }))
+      );
+      expect(results.filter((r) => r !== null)).toHaveLength(6);
+      // Git's lock collisions are probabilistic — a fast machine can survive
+      // six unserialized adds — so also pin that every add went through the
+      // per-repository lock, which is what makes CI's contention safe.
+      expect(lockSpy).toHaveBeenCalledTimes(6);
+      for (const [key] of lockSpy.mock.calls) {
+        expect(key).toBe(`git-worktree:${parent.repoRoot}`);
+      }
+    } finally {
+      lockSpy.mockRestore();
+    }
+  });
+
+  it('a call whose every worktree creation fails still converges on a live winner', async () => {
+    // CI, 2026-09-11 (#601 attempt 1): the race loser's three `git worktree
+    // add` attempts all failed on the winner's git locks and the winner's
+    // path, and the service returned null — a held message in production.
+    // The exhausted path must re-read for the winner before failing closed.
+    const threadKey = `pr:it-exhausted-${RUN}`;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(repo, leases);
+    const sbSlug = `it-agent-${RUN}`;
+
+    const winner = await service.ensureOverflowStudio({
+      userId: USER,
+      sbSlug,
+      parentStudio: parent,
+      threadKey,
+    });
+    expect(winner).not.toBeNull();
+
+    // A second caller whose stale preflight saw no live studio and whose
+    // every git step then fails (the CI shape) — forced by making creation
+    // fail, and by hiding the winner from its preflight read.
+    const proto = StudioOverflowService.prototype as unknown as {
+      createWorktree: (...args: unknown[]) => Promise<unknown>;
+      firstLiveMatch: (...args: unknown[]) => Promise<unknown>;
+    };
+    const originalFirstLive = proto.firstLiveMatch;
+    let preflightReads = 0;
+    const liveSpy = vi
+      .spyOn(proto, 'firstLiveMatch')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(async function (this: unknown, ...args: any[]) {
+        preflightReads += 1;
+        // First read is the step-1 reuse preflight: pretend the winner is not
+        // there yet (the loser's stale view). Later reads see the truth.
+        if (preflightReads === 1) return null;
+        return originalFirstLive.apply(this, args);
+      });
+    const createSpy = vi.spyOn(proto, 'createWorktree').mockResolvedValue(null);
+    try {
+      const loser = await service.ensureOverflowStudio({
+        userId: USER,
+        sbSlug,
+        parentStudio: parent,
+        threadKey,
+      });
+      expect(createSpy).toHaveBeenCalled();
+      expect(loser?.id).toBe(winner!.id);
+    } finally {
+      createSpy.mockRestore();
+      liveSpy.mockRestore();
+    }
+  });
+
+  it('concurrent ensureOverflowStudio calls converge on one studio — later arrivals wait for the in-flight winner', async () => {
+    // Lumen, #603: the winner publishes its row only AFTER finishWorktreeSetup
+    // (up to the dependency install). A rival that raced it through git and
+    // exhausted its candidates in that window rereads before any row exists
+    // and returns null — a held message. So same-thread ensures are serialized
+    // end to end in-process: the gate holds the winner in setup, the other two
+    // must not settle (nor reach setup) until it is released, and then all
+    // three hand back the one live row.
     const threadKey = `pr:it-ensure-${RUN}`;
     const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
     const service = new StudioOverflowService(repo, leases);
 
-    // Rendezvous seam: both calls must finish the variant preflight (reach
-    // worktree creation) before either is allowed to create — the exact
-    // interleaving of the r2 repro.
     const proto = StudioOverflowService.prototype as unknown as {
-      createWorktree: (...args: unknown[]) => Promise<unknown>;
+      finishWorktreeSetup: (...args: unknown[]) => Promise<unknown>;
     };
-    const original = proto.createWorktree;
-    let arrivals = 0;
+    const originalSetup = proto.finishWorktreeSetup;
+    let setupArrivals = 0;
     let release!: () => void;
-    const barrier = new Promise<void>((resolve) => {
+    const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let setupEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      setupEntered = resolve;
+    });
     const spy = vi
-      .spyOn(proto, 'createWorktree')
+      .spyOn(proto, 'finishWorktreeSetup')
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       .mockImplementation(async function (this: unknown, ...args: any[]) {
-        arrivals += 1;
-        if (arrivals === 2) release();
-        await barrier;
-        return original.apply(this, args);
+        setupArrivals += 1;
+        setupEntered();
+        await gate;
+        return originalSetup.apply(this, args);
       });
 
+    let calls: Array<Promise<Studio | null>> = [];
     try {
       const ensure = () =>
         service.ensureOverflowStudio({
           userId: USER,
-          agentId: `it-agent-${RUN}`,
+          sbSlug: `it-agent-${RUN}`,
           parentStudio: parent,
           threadKey,
         });
-      const results = await Promise.all([ensure(), ensure()]);
+      calls = [ensure(), ensure(), ensure()];
+
+      // Open the negative window only once the winner is actually held in
+      // setup: on a loaded runner its preflight and git step may take longer
+      // than the window, and the check must not pass or fail for that reason.
+      await entered;
+
+      // With the winner held in setup, no call may settle — settling now
+      // means a rival rushed past the winner and answered without its row.
+      const settledEarly = await Promise.race([
+        Promise.race(calls.map((c, i) => c.then(() => `call ${i} settled`))),
+        new Promise<string>((resolve) => setTimeout(() => resolve('none'), 400)),
+      ]);
+      expect(settledEarly).toBe('none');
+      expect(setupArrivals).toBe(1);
+
+      release();
+      const results = await Promise.all(calls);
 
       // Liveness is asked for the way every runtime path asks it (r3).
       const { data: liveRows } = await client
         .from('studios')
-        .select('id, slug')
+        .select('id, slug, worktree_path')
         .eq('parent_studio_id', parent.id)
         .eq('thread_key', threadKey)
         .in('status', ['active', 'idle']);
       expect(liveRows).toHaveLength(1);
+      const winner = (liveRows as Array<{ id: string; slug: string; worktree_path: string }>)[0];
+      expect(winner.worktree_path.startsWith(studiosRoot)).toBe(true);
+      expect(winner.slug).toBeTruthy();
 
-      // r3: BOTH calls get the winner. The loser used to return null, and
-      // since neither divertToOverflow call site retries, that null became
-      // `tier: 'refused'` and a HELD message — the correctness fix silently
-      // reintroducing symptom #3 of the bug this PR fixes. Asserting
-      // "at most one non-null" would pass on that regression; this does not.
+      // r3: EVERY call gets the winner. A null here is `tier: 'refused'` and a
+      // HELD message at both divertToOverflow call sites (neither retries).
       const returned = results.filter((r): r is Studio => r !== null);
-      expect(returned).toHaveLength(2);
-      for (const studio of returned) {
-        expect(studio.id).toBe((liveRows as Array<{ id: string }>)[0].id);
-      }
-      studioIds.push((liveRows as Array<{ id: string }>)[0].id);
+      expect(returned).toHaveLength(3);
+      for (const studio of returned) expect(studio.id).toBe(winner.id);
+      // Only the winner ever built a worktree; the others reused its row.
+      expect(setupArrivals).toBe(1);
+      studioIds.push(winner.id);
     } finally {
+      release();
+      // Drain whatever was started, so a failed assertion leaves no ensure
+      // still running against a restored spy.
+      await Promise.allSettled(calls);
       spy.mockRestore();
     }
+  }, 30_000);
+
+  // spec v8: root paths don't follow the `<repo>--<slug>` folder convention
+  // deriveStudioSlug expects, so create() must be handed the slug explicitly.
+  // If it were derived, this row's slug would be NULL, the second ensure's
+  // preflight would miss it, and a SECOND studio would be minted for the
+  // same thread — the exact class of split this whole arc exists to end.
+  it('a root-minted studio round-trips its slug — the second ensure reuses, not re-mints', async () => {
+    const threadKey = `pr:it-reuse-${RUN}`;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(repo, leases);
+
+    const first = await service.ensureOverflowStudio({
+      userId: USER,
+      sbSlug: `it-agent-${RUN}`,
+      parentStudio: parent,
+      threadKey,
+    });
+    expect(first).not.toBeNull();
+    studioIds.push(first!.id);
+    expect(first!.worktreePath.startsWith(studiosRoot)).toBe(true);
+
+    const row = await repo.findById(first!.id);
+    expect(row?.slug).toBeTruthy();
+    expect(row?.slug?.endsWith(`--pr-it-reuse-${RUN}`)).toBe(true);
+
+    const second = await service.ensureOverflowStudio({
+      userId: USER,
+      sbSlug: `it-agent-${RUN}`,
+      parentStudio: parent,
+      threadKey,
+    });
+    expect(second?.id).toBe(first!.id);
+
+    const { data: liveRows } = await client
+      .from('studios')
+      .select('id')
+      .eq('parent_studio_id', parent.id)
+      .eq('thread_key', threadKey)
+      .in('status', ['active', 'idle']);
+    expect(liveRows).toHaveLength(1);
   }, 30_000);
 });

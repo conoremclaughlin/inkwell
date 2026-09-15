@@ -44,7 +44,7 @@ export interface SystemBlock {
 
 export interface SessionInfo {
   id: string;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   backend: string | null;
   backendSessionId: string | null;
@@ -72,7 +72,7 @@ export interface ConversationResponse {
 
 export interface SessionListItem {
   id: string;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   backend: string | null;

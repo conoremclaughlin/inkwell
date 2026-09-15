@@ -5,7 +5,15 @@
  * MCP config via --mcp-config <path>
  */
 
-import { closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readSync } from 'fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+} from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -155,7 +163,7 @@ export class ClaudeAdapter implements BackendAdapter {
 
   prepare(config: BackendConfig): PreparedBackend {
     const identityPrompt = buildIdentityPrompt(
-      config.agentId,
+      config.sbSlug,
       undefined,
       config.systemPromptOverride
     );
@@ -224,6 +232,11 @@ export class ClaudeAdapter implements BackendAdapter {
     // Model (only if explicitly specified)
     if (config.model) {
       args.push('--model', config.model);
+    }
+    // Effort: per-SB from the identity's runtimeConfig, threaded through
+    // `ink chat --effort`; absent leaves the CLI's own/user-level setting.
+    if (config.effort) {
+      args.push('--effort', config.effort);
     }
 
     // Identity (inline text, no temp file needed)
@@ -301,6 +314,18 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--add-dir', inkFilesDir);
     }
 
+    // Ephemeral-studio root (spec:studio-materialization v8): grant at spawn
+    // so create_studio/overflow worktrees minted mid-session are accessible —
+    // a live session can never be granted a new directory. Created if
+    // missing: Claude Code ignores a nonexistent --add-dir.
+    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    try {
+      mkdirSync(inkStudiosDir, { recursive: true });
+    } catch {
+      // Non-fatal — worst case the grant is a no-op until the dir exists.
+    }
+    args.push('--add-dir', inkStudiosDir);
+
     // PCP channel plugin: enable real-time inbox push notifications.
     // The channel plugin is a stdio MCP server that bridges PCP's HTTP
     // inbox to Claude Code's channel notification system. Keyed off the
@@ -320,7 +345,7 @@ export class ClaudeAdapter implements BackendAdapter {
     const contextToken = encodeContextToken({
       sessionId: config.pcpSessionId || '',
       studioId: config.studioId || '',
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       cliAttached: true,
       runtime: 'claude',
     });
@@ -346,7 +371,8 @@ export class ClaudeAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
-        AGENT_ID: config.agentId,
+        SB_SLUG: config.sbSlug,
+        AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),

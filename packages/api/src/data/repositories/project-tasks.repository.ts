@@ -67,7 +67,7 @@ export interface UpdateProjectTaskInput {
 export interface TaskAssignment {
   sessionId?: string;
   studioId?: string;
-  agentId?: string;
+  sbSlug?: string;
   assignedAt?: string;
 }
 

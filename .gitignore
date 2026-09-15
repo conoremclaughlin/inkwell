@@ -160,8 +160,12 @@ vite.config.ts.timestamp-*
 # until someone's `git add -A` swept them in.
 **/.ink/identity.json
 
-# PCP hook runtime state (transient, per-session)
+# PCP hook runtime state (transient, per-session). The turn-epoch and
+# pending-takeover records are written by the on-prompt hook and the wrapper
+# watcher beside whatever cwd they run in, same as identity.json above.
 **/.ink/runtime/
+**/.ink/cli-turn-epoch.json
+**/.ink/pending-takeover*.json
 
 # Local automation / benchmark artifacts
 .playwright-cli/
@@ -175,3 +179,11 @@ packages/api/output/
 packages/cli/.ink/
 packages/cli/.ink/
 *.png
+
+# Review media (screenshots, recordings) — captured locally, never committed.
+# The dashboard evidence viewer reads this directory at runtime; the files
+# themselves stay out of git history. See CONTRIBUTING.md → Review Media.
+docs/screenshots/
+
+# Studio runtime state (contains identity + operator email — never commit)
+.pcp/

@@ -16,15 +16,14 @@
  *
  * Environment:
  *   INK_SERVER_URL  — Ink server URL (default: http://localhost:3001)
- *   INK_AGENT_ID    — Agent identity (default: from AGENT_ID or .ink/identity.json)
+ *   INK_SB_SLUG     — The SB's slug (default: from SB_SLUG or .ink/identity.json)
  *   INK_POLL_INTERVAL_MS — Poll interval in ms (default: 10000)
  *   INK_PLUGIN_LOG_LEVEL — debug | info | warn | error (default: info)
  *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
  *   INK_PLUGIN_LOG_RETENTION_DAYS — sweep dead processes' logs older than this (default: 7)
  */
-
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { Server } from '@modelcontextprotocol/server';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -64,26 +63,10 @@ function log(level: LogLevel, message: string, data?: Record<string, unknown>): 
 
 // ─── Config ─────────────────────────────────────────────────
 
+import { resolveSlug } from './identity';
+
 const INK_SERVER_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 10);
-
-function resolveAgentId(): string {
-  if (process.env.INK_AGENT_ID) return process.env.INK_AGENT_ID;
-  if (process.env.AGENT_ID) return process.env.AGENT_ID;
-
-  // Try .ink/identity.json in cwd
-  const identityPath = join(process.cwd(), '.ink', 'identity.json');
-  if (existsSync(identityPath)) {
-    try {
-      const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-      if (identity.agentId) return identity.agentId;
-    } catch {
-      // ignore
-    }
-  }
-
-  return 'wren'; // fallback
-}
 
 function resolveEmail(): string | undefined {
   const configPath = join(homedir(), '.ink', 'config.json');
@@ -122,7 +105,7 @@ function resolveAccessToken(): string | undefined {
 
 // ─── PCP Client ─────────────────────────────────────────────
 
-const agentId = resolveAgentId();
+const sbSlug = resolveSlug();
 const email = resolveEmail();
 const accessToken = resolveAccessToken();
 const studioId = process.env.INK_STUDIO_ID || undefined;
@@ -147,7 +130,7 @@ function isLegacyMessageForThisStudio(msg: Record<string, unknown>): boolean {
 }
 
 log('info', 'Channel plugin starting', {
-  agentId,
+  sbSlug,
   email: email || '(none)',
   hasToken: !!accessToken,
   studioId: studioId || '(none)',
@@ -253,6 +236,15 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // Thread cursors, dedup, and cold-start skip accounting live in the drain
 // state (poll-core.ts owns the delivery semantics; unit-tested there).
 const drainState = createThreadDrainState();
+
+// NO takeover claimant here (PR #563 round 26). Pending-takeover markers are
+// written only by backends whose prompt hooks cannot block (codex, gemini) —
+// and those sessions run no channel plugin, while this plugin's own backend
+// (claude-code) blocks the prompt instead of writing a marker. The markers'
+// real consumers are the ink wrapper's takeover watcher and the on-stop
+// hook's adjudication (packages/cli). The round-8 claimant that lived here
+// was unreachable and, being a partial reimplementation of the boundary,
+// drifted from it — it was removed rather than patched again.
 const seenMessageIds = drainState.seenMessageIds; // shared with the legacy loop
 
 async function stampCliPollAt(): Promise<void> {
@@ -322,7 +314,7 @@ async function pollInbox(): Promise<void> {
       // re-serves the same batch next poll.
       const result = await callPcp('get_inbox', {
         email,
-        agentId,
+        sbSlug,
         status: 'unread',
         markRead: false,
         limit: 20,
@@ -352,7 +344,7 @@ async function pollInbox(): Promise<void> {
             });
           },
           log,
-          agentId,
+          sbSlug,
           email,
           studioId,
         },
@@ -381,7 +373,7 @@ async function pollInbox(): Promise<void> {
         // pointer is (user, agent)-global (Lumen #504 r2 P1).
         if (!isLegacyMessageForThisStudio(msg)) return 'foreign' as const;
         // Own messages are skipped unless cross-studio (same as threads).
-        if (msg.senderAgentId === agentId) {
+        if (msg.senderSlug === sbSlug) {
           if (!studioId) return 'skip' as const;
           const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
             | Record<string, unknown>
@@ -401,7 +393,7 @@ async function pollInbox(): Promise<void> {
           });
         },
         log,
-        agentId,
+        sbSlug,
         email,
         studioId,
       };
@@ -432,7 +424,7 @@ async function pollInbox(): Promise<void> {
         }
         const next = await callPcp('get_inbox', {
           email,
-          agentId,
+          sbSlug,
           status: 'unread',
           markRead: false,
           limit: 20,

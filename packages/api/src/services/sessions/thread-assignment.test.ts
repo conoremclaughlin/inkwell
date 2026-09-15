@@ -85,7 +85,7 @@ function mockDb(opts: {
   };
 }
 
-const BASE = { threadId: 't1', agentId: 'wren', source: 'test' };
+const BASE = { threadId: 't1', sbSlug: 'wren', source: 'test' };
 
 describe('assignThreadParticipant', () => {
   it('claims an unstamped participant (CAS win)', async () => {

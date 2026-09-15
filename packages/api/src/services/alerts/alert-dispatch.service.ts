@@ -509,7 +509,7 @@ export class AlertDispatchService {
         handleSendToInbox(
           {
             userId,
-            senderAgentId: 'system',
+            senderSlug: 'system',
             recipients,
             threadKey,
             messageType: event.severity === 'critical' ? 'task_request' : 'notification',
@@ -535,12 +535,12 @@ export class AlertDispatchService {
           this.dataComposer
         )
       );
-      return recipients.map((agentId) => ({ sink: 'agents' as const, target: agentId, ok: true }));
+      return recipients.map((slug) => ({ sink: 'agents' as const, target: slug, ok: true }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      return recipients.map((agentId) => ({
+      return recipients.map((slug) => ({
         sink: 'agents' as const,
-        target: agentId,
+        target: slug,
         ok: false,
         detail,
       }));

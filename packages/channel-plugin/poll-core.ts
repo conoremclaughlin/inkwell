@@ -35,7 +35,7 @@ export interface PollDeps {
     message: string,
     data?: Record<string, unknown>
   ): void;
-  agentId: string;
+  sbSlug: string;
   email?: string;
   studioId?: string;
 }
@@ -103,7 +103,7 @@ function shouldDeliver(
   const msgTs = msg.createdAt as string;
   // Skip own messages UNLESS they came from a different studio
   // (cross-studio self-message).
-  if (msg.senderAgentId === deps.agentId) {
+  if (msg.senderSlug === deps.sbSlug) {
     if (!deps.studioId) return false;
     const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
       | Record<string, unknown>
@@ -152,7 +152,7 @@ export async function drainThreads(
     const requestedLimit = Math.min(PER_THREAD_LIMIT, remaining);
     const threadResult = await deps.callPcp('get_thread_messages', {
       ...(deps.email ? { email: deps.email } : {}),
-      agentId: deps.agentId,
+      sbSlug: deps.sbSlug,
       threadKey,
       // Fetch NEVER consumes (§7): the exact-id ack below is the only
       // consumption, for cold and cursored fetches alike.
@@ -201,7 +201,7 @@ export async function drainThreads(
         continue;
       }
 
-      const sender = (msg.senderAgentId as string) || 'unknown';
+      const sender = (msg.senderSlug as string) || 'unknown';
       const content = (msg.content as string) || '';
       const messageType = (msg.messageType as string) || 'message';
       try {
@@ -238,7 +238,7 @@ export async function drainThreads(
     if (lastProcessedId) {
       const ack = await deps.callPcp('mark_thread_read', {
         ...(deps.email ? { email: deps.email } : {}),
-        agentId: deps.agentId,
+        sbSlug: deps.sbSlug,
         threadKey,
         throughMessageId: lastProcessedId,
       });
@@ -381,7 +381,7 @@ export async function drainLegacyInbox(
       }
       continue;
     }
-    const sender = (msg.senderAgentId as string) || 'unknown';
+    const sender = (msg.senderSlug as string) || 'unknown';
     const content = (msg.content as string) || '';
     const messageType = (msg.messageType as string) || 'message';
     try {
@@ -420,7 +420,7 @@ export async function drainLegacyInbox(
   if (ackThroughId) {
     const ack = await deps.callPcp('mark_inbox_read', {
       ...(deps.email ? { email: deps.email } : {}),
-      agentId: deps.agentId,
+      sbSlug: deps.sbSlug,
       throughMessageId: ackThroughId,
     });
     if (!ack?.success) {

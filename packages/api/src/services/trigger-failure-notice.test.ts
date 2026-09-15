@@ -72,8 +72,8 @@ function createMockClient(opts: MockOpts = {}) {
 
 const BASE = {
   userId: 'user-1',
-  fromAgentId: 'wren',
-  toAgentId: 'aster',
+  fromSlug: 'wren',
+  toSlug: 'aster',
   subject: 'Trigger failed: aster',
   content: 'Trigger to aster failed (timeout): Gemini exited with code 1',
   metadata: { triggerFailure: true },

@@ -9,9 +9,10 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -33,6 +34,54 @@ const threadTable = (supabase: SupabaseClient, table: string) =>
 // with a floor of the newest 10 so quiet threads still surface context. The
 // per-thread ceiling is the caller's `limit` (plugin passes 50).
 const COLD_START_WINDOW_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * Is `candidate` a later INSTANT than `current`?
+ *
+ * These floors used to be compared as strings, which worked only because every
+ * timestamp reaching them was UTC — `Z` from `toISOString()`, `+00:00` from
+ * Postgres — so lexical order of the date-time prefix happened to match
+ * chronological order. That is an accident of spelling, and it stops holding
+ * the moment a caller may send an offset (PR #554, which widened the schemas to
+ * accept the ISO 8601 they always advertised).
+ *
+ * Concretely: with a read floor of `2026-09-01T12:00:00Z`, a `newerThan` of
+ * `2026-09-01T23:00:00+14:00` is 09:00Z — three hours EARLIER — but sorts
+ * later as text, wins the floor, and lowers it. Already-read messages replay.
+ *
+ * An unparseable value never wins; it cannot be shown to be later, so the
+ * existing floor stands. That is the safe direction here: a floor that is too
+ * high under-delivers and is visible, while a floor that is too low silently
+ * replays what the caller already saw.
+ */
+export function isLaterInstant(candidate: string | null, current: string | null): boolean {
+  if (!candidate) return false;
+  if (!current) return true;
+  const a = Date.parse(candidate);
+  const b = Date.parse(current);
+  if (Number.isNaN(a)) return false;
+  if (Number.isNaN(b)) return true;
+  return a > b;
+}
+
+/**
+ * The effective read floor: the latest of the read-state pointer, the
+ * after-cursor, and an explicit `newerThan`.
+ *
+ * Extracted so the comparison can be tested without a database. The bug it
+ * replaced was one character of operator — `>` on two strings — in a line that
+ * read correctly right up until the input format widened underneath it.
+ */
+export function resolveEffectiveFloor(params: {
+  readStateFloor: string | null;
+  afterTs: string | null;
+  newerThan?: string | null;
+}): string | null {
+  let floor = params.readStateFloor;
+  if (isLaterInstant(params.afterTs, floor)) floor = params.afterTs;
+  if (isLaterInstant(params.newerThan ?? null, floor)) floor = params.newerThan ?? null;
+  return floor;
+}
 const COLD_START_MIN_MESSAGES = 10;
 
 // ============== Schemas ==============
@@ -43,14 +92,14 @@ const threadKeySchema = z
   .max(200)
   .regex(/^[a-zA-Z][a-zA-Z0-9_-]*:[^\s]+$/, 'threadKey must look like "type:identifier"');
 
-const agentIdSchema = z.string().min(1).max(64);
+const sbSlugSchema = z.string().min(1).max(64);
 
 const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: z.string().describe('Agent ID requesting access (must be a participant)'),
+  sbSlug: z.string().describe('SB slug requesting access (must be a participant)'),
   limit: z.number().int().min(1).max(200).optional().default(50),
-  beforeMessageId: z.string().uuid().optional().describe('Cursor: get messages before this ID'),
-  afterMessageId: z.string().uuid().optional().describe('Cursor: get messages after this ID'),
+  beforeMessageId: z.string().guid().optional().describe('Cursor: get messages before this ID'),
+  afterMessageId: z.string().guid().optional().describe('Cursor: get messages after this ID'),
   includeSystemEvents: z.boolean().optional().default(true),
   markRead: z.boolean().optional().default(true),
   fullHistory: z
@@ -60,9 +109,7 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
     ),
-  newerThan: z
-    .string()
-    .datetime()
+  newerThan: isoDateTime()
     .optional()
     .describe(
       'Explicit floor: only messages created after this timestamp. Combined with the read-state cursor (the later of the two wins).'
@@ -87,30 +134,35 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
 
 const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: agentIdSchema.describe('Agent ID to add to the thread'),
-  addedByAgentId: agentIdSchema.optional(),
+  sbSlug: sbSlugSchema.describe('SB slug to add to the thread'),
+  addedBySlug: sbSlugSchema.optional(),
   reason: z.string().max(500).optional(),
   triggerNewParticipant: z.boolean().optional().default(true),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 const closeThreadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: agentIdSchema.describe('Agent ID closing the thread (must be a participant)'),
+  sbSlug: sbSlugSchema.describe('SB slug closing the thread (must be a participant)'),
+});
+
+const reopenThreadSchema = userIdentifierBaseSchema.extend({
+  threadKey: threadKeySchema,
+  sbSlug: sbSlugSchema.describe('SB slug reopening the thread (must be a participant)'),
 });
 
 const listThreadsSchema = userIdentifierBaseSchema.extend({
-  agentId: agentIdSchema.describe('Agent ID to list threads for'),
+  sbSlug: sbSlugSchema.describe('SB slug to list threads for'),
   status: z.enum(['open', 'closed', 'all']).optional().default('open'),
   limit: z.number().int().min(1).max(100).optional().default(20),
 });
 
 const markThreadReadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: agentIdSchema.describe('Agent ID marking the thread as read'),
+  sbSlug: sbSlugSchema.describe('SB slug marking the thread as read'),
   throughMessageId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Exact-id acknowledgement (spec inkmail-read-state §1): advance the read pointer through THIS message only — the last one actually delivered — instead of the whole thread. Used by delivery consumers (channel plugin) to ack after successful injection.'
@@ -155,7 +207,7 @@ export async function findThread(
 }
 
 /**
- * Get all participant agent IDs for a thread.
+ * Get all participant SB slugs for a thread.
  */
 export async function getParticipants(
   supabase: ReturnType<DataComposer['getClient']>,
@@ -178,12 +230,12 @@ export async function getParticipants(
 export async function isParticipant(
   supabase: ReturnType<DataComposer['getClient']>,
   threadId: string,
-  agentId: string
+  sbSlug: string
 ): Promise<boolean> {
   const { data } = await threadTable(supabase, 'inbox_thread_participants')
     .select('agent_id')
     .eq('thread_id', threadId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .maybeSingle();
   return !!data;
 }
@@ -203,9 +255,9 @@ export async function isParticipant(
  * different studio (e.g., wren-omega sends a review request to wren-review).
  */
 export function resolveTriggeredAgents(opts: {
-  senderAgentId: string;
+  senderSlug: string;
   participants: string[];
-  creatorAgentId: string;
+  creatorSlug: string;
   triggerAgents?: string[];
   triggerAll?: boolean;
   messageType?: string;
@@ -213,9 +265,9 @@ export function resolveTriggeredAgents(opts: {
   selfStudioTarget?: boolean;
 }): string[] {
   const {
-    senderAgentId,
+    senderSlug,
     participants,
-    creatorAgentId,
+    creatorSlug,
     triggerAgents,
     triggerAll,
     messageType,
@@ -223,7 +275,7 @@ export function resolveTriggeredAgents(opts: {
   } = opts;
 
   // When targeting self in a different studio, don't exclude sender from triggers
-  const excludeSelf = (a: string) => (selfStudioTarget ? true : a !== senderAgentId);
+  const excludeSelf = (a: string) => (selfStudioTarget ? true : a !== senderSlug);
 
   // Precedence 1: explicit triggerAgents (filter to actual participants)
   if (triggerAgents && triggerAgents.length > 0) {
@@ -237,15 +289,15 @@ export function resolveTriggeredAgents(opts: {
   }
 
   // Precedence 3: default rules by thread size
-  const otherParticipants = participants.filter((a) => a !== senderAgentId);
+  const otherParticipants = participants.filter((a) => a !== senderSlug);
 
   // Self-thread (1 participant): trigger if cross-studio OR actionable message type.
   // session_resume / task_request to self are inherently "wake me up" signals
   // (e.g., strategy triggers) and must not be silently dropped.
   if (otherParticipants.length === 0) {
-    if (selfStudioTarget) return [senderAgentId];
+    if (selfStudioTarget) return [senderSlug];
     const selfActionable = new Set(['task_request', 'session_resume']);
-    if (messageType && selfActionable.has(messageType)) return [senderAgentId];
+    if (messageType && selfActionable.has(messageType)) return [senderSlug];
     return [];
   }
 
@@ -273,8 +325,8 @@ export function resolveTriggeredAgents(opts: {
 
   // No explicit recipients — fall back to role-based defaults:
   // Non-creator → trigger creator only; Creator → trigger all others
-  if (senderAgentId !== creatorAgentId) {
-    return [creatorAgentId];
+  if (senderSlug !== creatorSlug) {
+    return [creatorSlug];
   }
   return otherParticipants;
 }
@@ -285,7 +337,7 @@ export function resolveTriggeredAgents(opts: {
 export function dispatchTriggers(
   agentsToTrigger: string[],
   opts: {
-    fromAgentId: string;
+    fromSlug: string;
     threadKey: string;
     summary: string;
     priority: string;
@@ -298,10 +350,10 @@ export function dispatchTriggers(
   if (agentsToTrigger.length === 0) return;
 
   const gateway = getAgentGateway();
-  for (const toAgentId of agentsToTrigger) {
+  for (const toSlug of agentsToTrigger) {
     const payload: AgentTriggerPayload = {
-      fromAgentId: opts.fromAgentId,
-      toAgentId,
+      fromSlug: opts.fromSlug,
+      toSlug,
       threadMessageId: opts.threadMessageId,
       threadId: opts.threadId,
       triggerType: 'message',
@@ -323,7 +375,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   const parsed = getThreadMessagesSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const {
     threadKey,
     limit,
@@ -350,14 +402,14 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   }
 
   // Verify participant membership
-  if (!(await isParticipant(supabase, thread.id, agentId))) {
+  if (!(await isParticipant(supabase, thread.id, sbSlug))) {
     return {
       content: [
         {
           type: 'text' as const,
           text: JSON.stringify({
             success: false,
-            error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+            error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
           }),
         },
       ],
@@ -393,7 +445,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
       .select('last_read_at')
       .eq('thread_id', thread.id)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
     readStateFloor = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
 
@@ -401,16 +453,14 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
         .select('joined_at')
         .eq('thread_id', thread.id)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .maybeSingle();
       readStateFloor = (participant as { joined_at?: string } | null)?.joined_at || null;
     }
   }
 
   // Effective floor: the latest of read-state floor / after-cursor / newerThan.
-  let floorTs: string | null = readStateFloor;
-  if (afterTs && (!floorTs || afterTs > floorTs)) floorTs = afterTs;
-  if (newerThan && (!floorTs || newerThan > floorTs)) floorTs = newerThan;
+  const floorTs = resolveEffectiveFloor({ readStateFloor, afterTs, newerThan });
 
   const buildQuery = (selectArg: string, head = false) => {
     let q = threadTable(supabase, 'inbox_thread_messages')
@@ -453,7 +503,8 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     if (guardActive) {
       const guardFloor = new Date(Date.now() - COLD_START_WINDOW_MS).toISOString();
       // Repeated created_at filters AND together — the later floor wins.
-      if (!floorTs || guardFloor > floorTs) {
+      // By instant, not by spelling: see isLaterInstant.
+      if (isLaterInstant(guardFloor, floorTs)) {
         windowed = windowed.gt('created_at', guardFloor);
       }
     }
@@ -511,7 +562,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           if (newestSkipped?.id) {
             const advanced = await advanceThreadReadPointer(supabase, {
               threadId: thread.id,
-              agentId,
+              sbSlug,
               throughMessageId: newestSkipped.id,
               source: 'get_thread_messages:deliberate_skip',
             });
@@ -521,7 +572,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
               advanceFailed = true;
               logger.error('[GetThreadMessages] deliberate_skip advance failed', {
                 threadKey,
-                agentId,
+                sbSlug,
                 throughMessageId: newestSkipped.id,
               });
             }
@@ -541,7 +592,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       if (maxMessageId) {
         const advanced = await advanceThreadReadPointer(supabase, {
           threadId: thread.id,
-          agentId,
+          sbSlug,
           throughMessageId: maxMessageId,
           source: 'get_thread_messages:markRead',
         });
@@ -549,7 +600,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           advanceFailed = true;
           logger.error('[GetThreadMessages] markRead advance failed', {
             threadKey,
-            agentId,
+            sbSlug,
             throughMessageId: maxMessageId,
           });
         }
@@ -586,7 +637,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
             : {}),
           messages: (messages || []).map((m: Record<string, unknown>) => ({
             id: m.id,
-            senderAgentId: m.sender_agent_id,
+            senderSlug: m.sender_agent_id,
             content: m.content,
             messageType: m.message_type,
             priority: m.priority,
@@ -604,8 +655,8 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   const parsed = addThreadParticipantSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { threadKey, agentId, reason, triggerNewParticipant, metadata } = parsed;
-  const addedByAgentId = getEffectiveAgentId(parsed.addedByAgentId) ?? parsed.addedByAgentId;
+  const { threadKey, sbSlug, reason, triggerNewParticipant, metadata } = parsed;
+  const addedBySlug = getEffectiveSlug(parsed.addedBySlug) ?? parsed.addedBySlug;
 
   // Find thread
   const thread = await findThread(supabase, resolved.user.id, threadKey);
@@ -621,14 +672,14 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   }
 
   // Idempotent: check if already participant
-  if (await isParticipant(supabase, thread.id, agentId)) {
+  if (await isParticipant(supabase, thread.id, sbSlug)) {
     return {
       content: [
         {
           type: 'text' as const,
           text: JSON.stringify({
             success: true,
-            message: `${agentId} is already a participant in thread ${threadKey}`,
+            message: `${sbSlug} is already a participant in thread ${threadKey}`,
             alreadyParticipant: true,
             threadKey,
           }),
@@ -640,7 +691,7 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   // Add participant
   const { error: addError } = await threadTable(supabase, 'inbox_thread_participants').insert({
     thread_id: thread.id,
-    agent_id: agentId,
+    agent_id: sbSlug,
   });
 
   if (addError) {
@@ -648,9 +699,9 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   }
 
   // Add system message for audit trail
-  const systemContent = addedByAgentId
-    ? `${agentId} was added to the thread by ${addedByAgentId}${reason ? `: ${reason}` : ''}`
-    : `${agentId} joined the thread${reason ? `: ${reason}` : ''}`;
+  const systemContent = addedBySlug
+    ? `${sbSlug} was added to the thread by ${addedBySlug}${reason ? `: ${reason}` : ''}`
+    : `${sbSlug} joined the thread${reason ? `: ${reason}` : ''}`;
 
   await threadTable(supabase, 'inbox_thread_messages').insert({
     thread_id: thread.id,
@@ -659,26 +710,26 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
     message_type: 'system',
     metadata: {
       type: 'participant_added',
-      agentId,
-      addedBy: addedByAgentId || null,
+      sbSlug,
+      addedBy: addedBySlug || null,
       reason: reason || null,
       ...(metadata || {}),
     } as Json,
   });
 
-  logger.info('Thread participant added', { threadKey, agentId, addedBy: addedByAgentId });
+  logger.info('Thread participant added', { threadKey, sbSlug, addedBy: addedBySlug });
 
   // Trigger the new participant
   if (triggerNewParticipant) {
-    dispatchTriggers([agentId], {
-      fromAgentId: addedByAgentId || 'system',
+    dispatchTriggers([sbSlug], {
+      fromSlug: addedBySlug || 'system',
       // Without this the option added in round 1 was never passed by ANY
       // caller here, so bridge exclusion stayed dead on this path
       // (Lumen, PR #514 round 2).
       senderIsBridge: await isBridgeIdentity(
         supabase,
         resolved.user.id,
-        addedByAgentId || null,
+        addedBySlug || null,
         senderSbId()
       ),
       threadKey,
@@ -694,9 +745,9 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          message: `${agentId} added to thread ${threadKey}`,
+          message: `${sbSlug} added to thread ${threadKey}`,
           threadKey,
-          agentId,
+          sbSlug,
           triggered: triggerNewParticipant,
         }),
       },
@@ -709,7 +760,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   const parsed = closeThreadSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const { threadKey } = parsed;
 
   // Find thread
@@ -741,14 +792,14 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   }
 
   // Verify participant
-  if (!(await isParticipant(supabase, thread.id, agentId))) {
+  if (!(await isParticipant(supabase, thread.id, sbSlug))) {
     return {
       content: [
         {
           type: 'text' as const,
           text: JSON.stringify({
             success: false,
-            error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+            error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
           }),
         },
       ],
@@ -760,7 +811,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   const { error } = await threadTable(supabase, 'inbox_threads')
     .update({
       status: 'closed',
-      closed_by_agent_id: agentId,
+      closed_by_agent_id: sbSlug,
       closed_at: now,
       updated_at: now,
     })
@@ -774,9 +825,9 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   await threadTable(supabase, 'inbox_thread_messages').insert({
     thread_id: thread.id,
     sender_agent_id: 'system',
-    content: `Thread closed by ${agentId}`,
+    content: `Thread closed by ${sbSlug}`,
     message_type: 'system',
-    metadata: { type: 'thread_closed', closedBy: agentId } as Json,
+    metadata: { type: 'thread_closed', closedBy: sbSlug } as Json,
   });
 
   // Automatic lease release — the work unit completing is what lets studios
@@ -787,18 +838,27 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   // and skips anything still held.
   try {
     const leases = new StudioLeaseService(supabase);
-    const { released, deferred } = await leases.releaseByThread(resolved.user.id, threadKey, {
-      reason: 'thread-closed',
-    });
+    const { released, deferred, removed, studioIds } = await leases.releaseByThread(
+      resolved.user.id,
+      threadKey,
+      {
+        reason: 'thread-closed',
+      }
+    );
     const overflow = new StudioOverflowService(dataComposer.repositories.studios, leases);
     const cleaned = await overflow.teardownEphemeralStudiosForThread(resolved.user.id, threadKey, {
       reason: `thread ${threadKey} closed`,
+      // The studios this thread's lease actually rode — created-for discovery
+      // alone misses an ephemeral whose final surviving thread was not the
+      // one it was built for (v18 S2).
+      candidateStudioIds: studioIds,
     });
-    if (released || deferred || cleaned) {
+    if (released || deferred || removed || cleaned) {
       logger.info('[StudioLease] Thread close released studios', {
         threadKey,
         leasesReleased: released,
         leasesDeferred: deferred,
+        threadKeysRemoved: removed,
         ephemeralCleaned: cleaned,
       });
     }
@@ -809,7 +869,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
     });
   }
 
-  logger.info('Thread closed', { threadKey, closedBy: agentId });
+  logger.info('Thread closed', { threadKey, closedBy: sbSlug });
 
   return {
     content: [
@@ -819,11 +879,122 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
           success: true,
           message: `Thread ${threadKey} closed`,
           threadKey,
-          closedBy: agentId,
+          closedBy: sbSlug,
         }),
       },
     ],
   };
+}
+
+/** Who is reopening: a participant SB, or the owner recovering from the dashboard. */
+export type ReopenActor = { kind: 'sb'; sbSlug: string } | { kind: 'user' };
+
+/**
+ * Flip a closed thread back to open and record it — in ONE transaction, the
+ * `reopen_inbox_thread` SQL function (migration 20260913083000). The UPDATE is
+ * guarded on the row still being closed, so two reopens racing each other (or
+ * a reopen racing a close) cannot both claim to have done it; the audit event
+ * is written in the same transaction, so a rejected event means the row did
+ * not flip either, and a retry does the whole thing. (Lumen, #615 review:
+ * as two PostgREST round trips, a failed audit INSERT left the thread open
+ * with no event, and the retry saw "already open" and skipped it for good.)
+ *
+ * Answers `reopened: false` when the row was not closed at the moment of the
+ * write — nothing is written in that case.
+ *
+ * What a reopen does NOT do (spec inkmail-thread-scope §2, §6):
+ * - wake anyone — a reopen says the work is back on; waking someone is an
+ *   explicit message, and a reply is how the participants hear;
+ * - take back a studio lease — close released them (handleCloseThread), and
+ *   the next message on the thread claims what it needs as usual.
+ *
+ * Shared by the MCP tool (a participant reopens) and the admin route (the
+ * owner recovers), so both write the same row and the same event. The actor
+ * lands in the audit event's metadata for now; the principal columns of
+ * spec §3 give it a real home at the cutover.
+ */
+export async function reopenThreadRow(
+  supabase: SupabaseClient,
+  threadId: string,
+  actor: ReopenActor
+): Promise<{ reopened: boolean }> {
+  const { data, error } = await supabase.rpc('reopen_inbox_thread', {
+    p_thread_id: threadId,
+    p_actor_kind: actor.kind,
+    p_actor_agent_id: actor.kind === 'sb' ? actor.sbSlug : null,
+  });
+  if (error) {
+    throw new Error(`Failed to reopen thread: ${error.message}`);
+  }
+  if (typeof data !== 'boolean') {
+    // The function returns exactly a boolean; anything else means the call
+    // did not reach it (a missing migration, a mocked client).
+    throw new Error(`Failed to reopen thread: unexpected reply ${JSON.stringify(data)}`);
+  }
+  return { reopened: data };
+}
+
+/**
+ * reopen_thread — the explicit counterpart of close_thread.
+ *
+ * A reply to a closed thread never reopens it; this tool is how a participant
+ * says the work is back on. Same authority rule as close (any participant),
+ * and the same shape of audit trail.
+ */
+export async function handleReopenThread(args: unknown, dataComposer: DataComposer) {
+  const supabase = dataComposer.getClient();
+  const parsed = reopenThreadSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
+  const { threadKey } = parsed;
+  const reply = (payload: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
+  });
+
+  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  if (!thread) {
+    return reply({ success: false, error: `Thread not found: ${threadKey}` });
+  }
+
+  // Who is asking comes before what state the thread is in.
+  if (!(await isParticipant(supabase, thread.id, sbSlug))) {
+    return reply({
+      success: false,
+      error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
+    });
+  }
+
+  if (thread.status !== 'closed') {
+    return reply({
+      success: true,
+      message: `Thread ${threadKey} is already open`,
+      threadKey,
+      alreadyOpen: true,
+    });
+  }
+
+  const { reopened } = await reopenThreadRow(supabase, thread.id, { kind: 'sb', sbSlug });
+  if (!reopened) {
+    // Closed when we looked, open by the time we wrote: someone else's
+    // reopen landed first. The state the caller asked for holds, and
+    // nothing was recorded twice.
+    return reply({
+      success: true,
+      message: `Thread ${threadKey} is already open`,
+      threadKey,
+      alreadyOpen: true,
+    });
+  }
+
+  logger.info('Thread reopened', { threadKey, reopenedBy: sbSlug });
+
+  return reply({
+    success: true,
+    message: `Thread ${threadKey} reopened`,
+    threadKey,
+    reopenedBy: sbSlug,
+  });
 }
 
 export async function handleListThreads(args: unknown, dataComposer: DataComposer) {
@@ -831,7 +1002,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
   const parsed = listThreadsSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const { status, limit } = parsed;
 
   // Get thread IDs where this agent is a participant
@@ -840,7 +1011,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
     'inbox_thread_participants'
   )
     .select('thread_id')
-    .eq('agent_id', agentId);
+    .eq('agent_id', sbSlug);
 
   if (pError) {
     throw new Error(`Failed to list threads: ${pError.message}`);
@@ -852,7 +1023,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
       content: [
         {
           type: 'text' as const,
-          text: JSON.stringify({ success: true, agentId, count: 0, threads: [] }),
+          text: JSON.stringify({ success: true, sbSlug, count: 0, threads: [] }),
         },
       ],
     };
@@ -884,7 +1055,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
       const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
         .select('last_read_at')
         .eq('thread_id', t.id)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .maybeSingle();
 
       // Count messages after last read
@@ -933,7 +1104,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          agentId,
+          sbSlug,
           count: threadsWithMeta.length,
           threads: threadsWithMeta,
         }),
@@ -947,7 +1118,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   const parsed = markThreadReadSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const { threadKey } = parsed;
 
   // Find thread
@@ -964,14 +1135,14 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   }
 
   // Verify participant membership
-  if (!(await isParticipant(supabase, thread.id, agentId))) {
+  if (!(await isParticipant(supabase, thread.id, sbSlug))) {
     return {
       content: [
         {
           type: 'text' as const,
           text: JSON.stringify({
             success: false,
-            error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+            error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
           }),
         },
       ],
@@ -1005,7 +1176,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     }
     const advanced = await advanceThreadReadPointer(supabase, {
       threadId: thread.id,
-      agentId,
+      sbSlug,
       throughMessageId: ackMsg.id,
       source: 'mark_thread_read:ack',
     });
@@ -1014,7 +1185,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     }
     logger.info('Thread read acknowledged through message', {
       threadKey,
-      agentId,
+      sbSlug,
       throughMessageId: ackMsg.id,
     });
     return {
@@ -1025,7 +1196,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
             success: true,
             message: `Thread ${threadKey} acknowledged through ${ackMsg.id}`,
             threadKey,
-            agentId,
+            sbSlug,
             throughMessageId: ackMsg.id,
           }),
         },
@@ -1050,7 +1221,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   if (latestMsg?.id) {
     const advanced = await advanceThreadReadPointer(supabase, {
       threadId: thread.id,
-      agentId,
+      sbSlug,
       throughMessageId: latestMsg.id,
       source: 'mark_thread_read',
     });
@@ -1059,7 +1230,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     }
   }
 
-  logger.info('Thread marked as read', { threadKey, agentId });
+  logger.info('Thread marked as read', { threadKey, sbSlug });
 
   return {
     content: [
@@ -1069,7 +1240,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
           success: true,
           message: `Thread ${threadKey} marked as read`,
           threadKey,
-          agentId,
+          sbSlug,
         }),
       },
     ],
@@ -1096,7 +1267,7 @@ export const threadToolDefinitions = [
   {
     name: 'close_thread',
     description:
-      'Close a thread. Closed threads can still be read but new messages are rejected. Any participant can close.',
+      'Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close; reopen_thread puts the work back on.',
     schema: closeThreadSchema,
     handler: handleCloseThread,
   },
@@ -1113,5 +1284,12 @@ export const threadToolDefinitions = [
       'Mark a thread as read without fetching messages. Useful when you see thread activity in get_inbox and want to acknowledge it without reading the full history.',
     schema: markThreadReadSchema,
     handler: handleMarkThreadRead,
+  },
+  {
+    name: 'reopen_thread',
+    description:
+      'Reopen a closed thread to say its work is back on. Explicit by design: a reply to a closed thread never reopens it. Atomic — status returns to open and the closure fields clear together — and audited with a system event. Wakes nobody: send a message to wake the participants. Any participant can reopen.',
+    schema: reopenThreadSchema,
+    handler: handleReopenThread,
   },
 ];

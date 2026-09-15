@@ -1,9 +1,11 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
 import {
+  BOOTSTRAP_REQUIRED_EXIT_MARKER,
+  failIfBootstrapRequired,
   findLastDetectedModel,
   formatTranscriptSize,
   hydrateLedgerFromTranscript,
@@ -37,7 +39,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
           eid: 2,
           type: 'local_tool_call',
           tool: 'send_response',
-          args: { channel: 'telegram', conversationId: '726555973', content: 'heads-up!' },
+          args: { channel: 'telegram', conversationId: '100200300', content: 'heads-up!' },
           status: 'executed',
           result: { success: true, messageId: 'tg-401' },
         },
@@ -75,7 +77,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     // result included (Ctrl+T is the drill-down for the scrollback teaser)
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls[0].tool).toBe('send_response');
-    expect(result.toolCalls[0].args).toContain('726555973');
+    expect(result.toolCalls[0].args).toContain('100200300');
     expect(result.toolCalls[0].result).toContain('tg-401');
   });
 
@@ -95,7 +97,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
           eid: 2,
           type: 'local_tool_call',
           tool: 'get_inbox',
-          args: { agentId: 'myra' },
+          args: { sbSlug: 'myra' },
           status: 'error',
           error: 'ECONNREFUSED 127.0.0.1:3001',
         },
@@ -390,6 +392,202 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
   });
 });
 
+describe('hydrateLedgerFromTranscript — a hash-selected eviction replays as itself (Lumen, PR #582)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-evict-ref-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('REGRESSION: two hydrated entries share an eid; the persisted eid+hash ref evicts only the hashed one', () => {
+    // A compaction's kept tail and a later event can both hydrate with the
+    // same eid. The SB evicted `target` by ref; the hook persisted
+    // { eid, hash }. Replay must not take `neighbour` with it.
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 7, type: 'user', content: 'target' },
+        { eid: 7, type: 'user', content: 'neighbour' },
+        {
+          eid: 8,
+          type: 'context_evict',
+          actor: 'sb',
+          reason: 'by ref',
+          refs: [{ eid: 7, hash: entryRefHash('user', 'target') }],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['neighbour']);
+  });
+});
+
+describe('hydrateLedgerFromTranscript — the provider sample survives a process boundary (Lumen, PR #583 round 2)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-sample-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const write = (events: Array<Record<string, unknown>>) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const sample = {
+    type: 'provider_sample',
+    at: '2026-09-03T20:00:00.000Z',
+    backend: 'claude',
+    model: 'claude-opus-5',
+    backendSessionId: 'sess-1',
+    envelopeShape: 'shape-a',
+    contextTokens: 541_000,
+    inputTokens: 1_000,
+    cacheReadTokens: 500_000,
+    cacheWriteTokens: 40_000,
+  };
+
+  it('replays the last sample under the scope it was taken in', () => {
+    write([
+      { type: 'user', content: 'hi' },
+      sample,
+      { type: 'assistant', content: 'ok', backend: 'claude' },
+    ]);
+    const result = hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath);
+    expect(result.providerSample).toEqual({
+      at: '2026-09-03T20:00:00.000Z',
+      scope: {
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+      },
+      contextTokens: 541_000,
+      inputTokens: 1_000,
+      cacheReadTokens: 500_000,
+      cacheWriteTokens: 40_000,
+    });
+  });
+
+  it.each([
+    ['context_evict', { type: 'context_evict', refs: [] }],
+    ['context_trim', { type: 'context_trim', reason: 'x' }],
+    ['compaction', { type: 'compaction', summary: 's', keptEntries: [] }],
+    ['backend_session_invalidated', { type: 'backend_session_invalidated', id: 'sess-1' }],
+  ])('a %s after the sample drops it — the window it measured is gone', (_t, event) => {
+    write([sample, event]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
+  it('REGRESSION (Lumen, round 3): a newer report with no usable measurement is a tombstone — valid → unknown → nothing', () => {
+    write([
+      sample,
+      {
+        type: 'provider_sample',
+        at: '2026-09-03T20:01:00.000Z',
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+        unknown: true,
+      },
+    ]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
+  it('a later sample replaces an earlier one; a malformed one is ignored', () => {
+    write([sample, { ...sample, contextTokens: 600_000 }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample?.contextTokens
+    ).toBe(600_000);
+    write([{ type: 'provider_sample', backend: 'claude' }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+});
+
+describe('hydrateLedgerFromTranscript — a persisted context note survives reattach (PR #584)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-note-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stays hidden from the replay preview when it rides a compaction kept tail (Lumen, round 3)', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'q' },
+        {
+          eid: 2,
+          type: 'compaction',
+          summary: 'the summary',
+          keptEntries: [
+            {
+              role: 'system',
+              content:
+                '[2 earlier tool results were cleared … write calls that RAN (send_response)]',
+              source: 'auto-evict',
+            },
+            { role: 'assistant', content: 'kept answer', source: 'claude' },
+          ],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    // In the window (the model needs it) …
+    expect(ledger.listEntries().some((e) => e.source === 'auto-evict')).toBe(true);
+    // … but never a visible system message in the scrollback replay — the
+    // same classification a direct replay gets.
+    expect(result.tailPreview.some((p) => p.content.includes('tool results were cleared'))).toBe(
+      false
+    );
+    expect(result.tailPreview.some((p) => p.content.includes('kept answer'))).toBe(true);
+  });
+
+  it('replays the auto-evict tombstone as the system entry it was live', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'hello' },
+        { eid: 2, type: 'assistant', content: 'hi', backend: 'claude' },
+        {
+          eid: 3,
+          type: 'context_note',
+          source: 'auto-evict',
+          content: '[3 earlier tool results were cleared … those calls ALREADY HAPPENED]',
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    const note = ledger.listEntries().find((e) => e.source === 'auto-evict');
+    expect(note?.content).toContain('ALREADY HAPPENED');
+    expect(note?.eid).toBe(3);
+  });
+});
+
 describe('hydrateLedgerFromTranscript — context_evict events', () => {
   let dir: string;
   let transcriptPath: string;
@@ -555,7 +753,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         tool: 'send_response',
         args: {
           channel: 'telegram',
-          conversationId: '726555973',
+          conversationId: '100200300',
           content: 'Post-session catch-up',
         },
         status: 'executed',
@@ -566,7 +764,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-1',
         activityType: 'message_out',
-        agentId: 'myra',
+        sbSlug: 'myra',
         platform: 'telegram',
         createdAt: '2026-08-12T22:03:00Z',
         content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
@@ -599,7 +797,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-2',
         activityType: 'message_in',
-        agentId: 'myra',
+        sbSlug: 'myra',
         platform: 'telegram',
         content: 'Therapy finished 45 minutes ago!',
       },
@@ -618,7 +816,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-3',
         activityType: 'message_out',
-        agentId: 'myra',
+        sbSlug: 'myra',
         content: 'sent before platform was persisted',
       },
     ]);
@@ -634,7 +832,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-4',
         activityType: 'tool_call',
-        agentId: 'myra',
+        sbSlug: 'myra',
         content: 'list_emails',
       },
       {
@@ -642,7 +840,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-5',
         activityType: 'state_change',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         content: 'phase: reviewing',
       },
     ]);
@@ -675,7 +873,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
     type: 'activity',
     activityId: 'act-send',
     activityType: 'message_out',
-    agentId: 'myra',
+    sbSlug: 'myra',
     platform: 'telegram',
     createdAt: '2026-08-12T22:03:00Z',
     content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
@@ -934,5 +1132,46 @@ describe('hydrateLedgerFromTranscript — shadow clone handoff', () => {
     const entries = ledger.listEntries();
     expect(entries.some((e) => e.content.includes('Three entry points.'))).toBe(false);
     expect(entries.some((e) => e.source === 'compaction-history')).toBe(true);
+  });
+});
+
+describe('BOOTSTRAP_REQUIRED_EXIT_MARKER', () => {
+  it('matches the literal the server-side InkRunner greps stderr for', () => {
+    // packages/api InkRunner carries its own copy of this string; the two
+    // processes share no module, so the literal is the whole contract. If this
+    // side is renamed alone, the runner stops recognising the refusal and a
+    // failed turn looks like a crash instead of something recoverable.
+    expect(BOOTSTRAP_REQUIRED_EXIT_MARKER).toBe('INK_BOOTSTRAP_REQUIRED_FAILURE');
+  });
+});
+
+describe('failIfBootstrapRequired', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('stops the run and names itself on stderr when identity context is required', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('exited');
+    }) as never);
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() =>
+      failIfBootstrapRequired({ requireBootstrap: true }, 'bootstrap unavailable')
+    ).toThrow('exited');
+
+    expect(exit).toHaveBeenCalledWith(78);
+    // The runner greps stderr for this; a bare exit code is not enough to tell
+    // a refusal apart from a crash.
+    expect(String(err.mock.calls[0][0])).toContain(BOOTSTRAP_REQUIRED_EXIT_MARKER);
+  });
+
+  it('leaves an interactive run alone, where a human can read the warning', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('exited');
+    }) as never);
+
+    expect(() => failIfBootstrapRequired({}, 'bootstrap unavailable')).not.toThrow();
+    expect(exit).not.toHaveBeenCalled();
   });
 });

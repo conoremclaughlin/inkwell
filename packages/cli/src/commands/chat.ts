@@ -16,7 +16,7 @@ import { isAbsolute, join } from 'path';
 import { randomUUID } from 'crypto';
 import {
   readIdentityJson,
-  resolveAgentId,
+  resolveSlug,
   saveRuntimePreferences,
   type RuntimePreferences,
 } from '../backends/identity.js';
@@ -57,8 +57,28 @@ import {
   runBackendInteractiveLogin,
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
-import { startBackendTurn, runBackendTurn, type BackendRunResult } from '../repl/backend-runner.js';
+import {
+  startBackendTurn,
+  runBackendTurn,
+  type BackendRunResult,
+  type BackendRunRequest,
+} from '../repl/backend-runner.js';
+import {
+  buildCompactionPrompt,
+  runCompaction,
+  type CompactionOutcome,
+} from '../repl/compaction.js';
+import {
+  autoEvictTombstone,
+  selectConsumedToolResults,
+  AUTO_EVICT_KEEP_RECENT_TURNS,
+  AUTO_EVICT_MIN_SHARE,
+  AUTO_EVICT_MIN_TOKENS,
+  AUTO_EVICT_TOMBSTONE_SOURCE,
+} from '../repl/auto-evict.js';
+import { localToolLedgerLine } from '../repl/auto-evict.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
+import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import type { TurnMedia } from '../backends/types.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
@@ -106,15 +126,21 @@ import {
   createSignalSink,
   isClientLocalTool,
   handleClientLocalTool,
+  globalSignalSink,
+  parseCompactContextArgs,
+  type ProviderContextMeasurement,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
 } from '../repl/context-tools.js';
+import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provider-sample.js';
+import { assessContextPressure } from '../repl/context-pressure.js';
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { bareToolName, createLocalToolDispatcher } from '../repl/tool-dispatch.js';
+import { renderLocalToolGroup } from '../repl/local-tool-catalog.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import { requestToolApproval } from '../repl/approval-api.js';
 import {
@@ -159,12 +185,15 @@ import {
 import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
   MAX_TOOL_CALLS_PER_ITERATION,
+  findImitatedToolResults,
+  isPotentialImitationPrefix,
   runAgentLoop,
   stripLocalToolBlocks,
   type AgentLoopResult,
   type BackendTurnOutcome,
   type LocalToolCall,
   type ToolResultRecord,
+  MAX_RELAY_BYTES,
 } from '../repl/agent-loop.js';
 // Re-exported for callers (and tests) that have always imported these from
 // chat.js. The implementations moved to ../repl/agent-loop.js so the turn
@@ -188,6 +217,7 @@ type ChatOptions = {
   agent?: string;
   backend?: string;
   model?: string;
+  effort?: string;
   systemPromptFile?: string;
   toolRouting?: string;
   ui?: string;
@@ -207,6 +237,7 @@ type ChatOptions = {
   messageLabel?: string;
   attachFile?: string[];
   nonInteractive?: boolean;
+  requireBootstrap?: boolean;
   maxTurns?: string;
   backendTimeoutSeconds?: string;
   tailTranscript?: string;
@@ -266,6 +297,8 @@ function readSystemPromptFile(path?: string): string | undefined {
 interface ChatRuntime {
   backend: string;
   model?: string;
+  /** Reasoning effort for every backend spawn (claude: low | medium | high | xhigh | max). */
+  effort?: string;
   /**
    * Replaces the generated identity prompt for every backend turn in this
    * session. Set by --system-prompt-file; see BackendConfig.
@@ -310,7 +343,7 @@ interface ChatRuntime {
 
 interface SessionSummary {
   id: string;
-  agentId?: string;
+  sbSlug?: string;
   studioId?: string;
   studioName?: string;
   status?: string;
@@ -331,13 +364,13 @@ interface ActivitySummary {
   type?: string;
   subtype?: string;
   content?: string;
-  agentId?: string;
+  sbSlug?: string;
   sessionId?: string;
   createdAt?: string;
   /** Originating platform for message activities (telegram, discord, …) */
   platform?: string;
   /** Sender from the inkmail lifecycle payload — tells own sends from inbound mechanics. */
-  fromAgentId?: string;
+  fromSlug?: string;
 }
 
 type BackendToolGateSnapshot = {
@@ -677,10 +710,48 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
 }
 
 // Exported for tests — verifies compaction events rehydrate summary + kept tail
+/** A `provider_sample` transcript event, as the next process replays it. */
+export interface PersistedProviderSample {
+  at: string;
+  scope: ProviderSampleScope;
+  contextTokens: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+export function readProviderSampleEvent(
+  event: Record<string, unknown>
+): PersistedProviderSample | undefined {
+  const str = (k: string): string | undefined =>
+    typeof event[k] === 'string' ? (event[k] as string) : undefined;
+  const n = (k: string): number | undefined =>
+    typeof event[k] === 'number' && Number.isFinite(event[k] as number)
+      ? (event[k] as number)
+      : undefined;
+  const contextTokens = n('contextTokens');
+  const backend = str('backend');
+  const at = str('at');
+  if (contextTokens === undefined || contextTokens <= 0 || !backend || !at) return undefined;
+  return {
+    at,
+    scope: {
+      backend,
+      model: str('model'),
+      backendSessionId: str('backendSessionId'),
+      envelopeShape: str('envelopeShape'),
+    },
+    contextTokens,
+    inputTokens: n('inputTokens'),
+    cacheReadTokens: n('cacheReadTokens'),
+    cacheWriteTokens: n('cacheWriteTokens'),
+  };
+}
+
 export function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
   transcriptPath: string,
-  agentId?: string
+  sbSlug?: string
 ): {
   loaded: number;
   messageCount: number;
@@ -695,12 +766,19 @@ export function hydrateLedgerFromTranscript(
   toolCalls: Array<{ tool: string; status: string; at: string; args?: string; result?: string }>;
   /** Highest event id seen — seeds the append counter so new eids continue */
   maxEid: number;
+  /**
+   * The provider's last measurement, when no context-boundary mutation
+   * followed it — so a new process budgets against it from its first
+   * pre-turn check (Lumen, PR #583 round 2).
+   */
+  providerSample?: PersistedProviderSample;
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
   let messageCount = 0;
   let compactionCollapsed = false;
   let maxEid = 0;
+  let providerSample: PersistedProviderSample | undefined;
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
@@ -734,6 +812,20 @@ export function hydrateLedgerFromTranscript(
     const type = typeof event.type === 'string' ? event.type : '';
     const eid = typeof event.eid === 'number' ? event.eid : undefined;
     if (eid !== undefined && eid > maxEid) maxEid = eid;
+    if (type === 'provider_sample') {
+      providerSample = readProviderSampleEvent(event);
+      continue;
+    }
+    if (
+      type === 'context_evict' ||
+      type === 'context_trim' ||
+      type === 'compaction' ||
+      type === 'context_budget_changed' ||
+      type === 'backend_session_invalidated'
+    ) {
+      // The window it measured is gone — live, the same mutations clear it.
+      providerSample = undefined;
+    }
     if (type === 'context_evict' && Array.isArray(event.refs)) {
       // Apply the eviction exactly as it happened live: remove matching
       // entries that exist at this point in the replay. Entries appended
@@ -921,6 +1013,17 @@ export function hydrateLedgerFromTranscript(
       }
       continue;
     }
+    if (type === 'context_note' && typeof event.content === 'string') {
+      // A runtime notice that belongs in the window — today the auto-evict
+      // tombstone. Replayed as the system entry it was live, so a reattached
+      // process knows why earlier tool results are missing (PR #584).
+      const source = typeof event.source === 'string' ? event.source : 'context-note';
+      const entry = ledger.addEntry('system', event.content, source, eid);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      continue;
+    }
+
     if (type === 'system_turn' && typeof event.content === 'string') {
       // Synthetic turn input (heartbeat trigger, continuation prompt, etc.)
       const label = typeof event.label === 'string' ? event.label : 'system';
@@ -994,7 +1097,7 @@ export function hydrateLedgerFromTranscript(
       const argsPreview = argsJson.length > 100 ? `${argsJson.slice(0, 100)}…` : argsJson;
       pushPreview(
         'event',
-        `🛠 ${agentId ? `${agentId} · ` : ''}${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
+        `🛠 ${sbSlug ? `${sbSlug} · ` : ''}${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
         typeof event.ts === 'string' ? event.ts : undefined,
         undefined,
         eid
@@ -1031,7 +1134,7 @@ export function hydrateLedgerFromTranscript(
       continue;
     }
     if (type === 'activity' && typeof event.content === 'string') {
-      const actor = typeof event.agentId === 'string' ? event.agentId : 'system';
+      const actor = typeof event.sbSlug === 'string' ? event.sbSlug : 'system';
       const activityType = typeof event.activityType === 'string' ? event.activityType : 'activity';
       // Platform messages are real conversation: replay them as the same
       // directional message blocks the live activity poll renders, so a
@@ -1043,11 +1146,11 @@ export function hydrateLedgerFromTranscript(
         {
           type: activityType,
           subtype: typeof event.activitySubtype === 'string' ? event.activitySubtype : undefined,
-          agentId: typeof event.agentId === 'string' ? event.agentId : undefined,
+          sbSlug: typeof event.sbSlug === 'string' ? event.sbSlug : undefined,
           platform: typeof event.platform === 'string' ? event.platform : undefined,
-          fromAgentId: typeof event.fromAgentId === 'string' ? event.fromAgentId : undefined,
+          fromSlug: typeof event.fromSlug === 'string' ? event.fromSlug : undefined,
         },
-        agentId ?? actor
+        sbSlug ?? actor
       );
       const activityTs =
         typeof event.createdAt === 'string'
@@ -1100,6 +1203,7 @@ export function hydrateLedgerFromTranscript(
     evictedEntries,
     toolCalls,
     maxEid,
+    ...(providerSample ? { providerSample } : {}),
   };
 }
 
@@ -1301,6 +1405,12 @@ const INTERNAL_SYSTEM_SOURCES = new Set([
   'auto-run',
   'hook-history',
   'bootstrap',
+  // The auto-evict tombstone (and a context note's fallback source): a
+  // runtime notice for the model, never a visible system message — through
+  // a compaction's kept tail as well as by direct replay (Lumen, PR #584
+  // round 3).
+  AUTO_EVICT_TOMBSTONE_SOURCE,
+  'context-note',
 ]);
 
 function compactForHistoryPreview(
@@ -1398,11 +1508,7 @@ function extractInboxMessages(result: Record<string, unknown> | null | undefined
       return {
         id,
         content: String(msg.content || ''),
-        from: msg.senderAgentId
-          ? String(msg.senderAgentId)
-          : msg.from
-            ? String(msg.from)
-            : undefined,
+        from: msg.senderSlug ? String(msg.senderSlug) : msg.from ? String(msg.from) : undefined,
         subject: msg.subject ? String(msg.subject) : undefined,
         createdAt:
           typeof msg.createdAt === 'string'
@@ -1465,7 +1571,7 @@ function extractSessionSummaries(
       if (typeof id !== 'string') return undefined;
       return {
         id,
-        agentId: typeof row.agentId === 'string' ? row.agentId : undefined,
+        sbSlug: typeof row.sbSlug === 'string' ? row.sbSlug : undefined,
         studioId:
           typeof row.studioId === 'string'
             ? row.studioId
@@ -1610,9 +1716,9 @@ function extractActivitySummaries(
         type: typeof row.type === 'string' ? row.type : undefined,
         subtype: typeof row.subtype === 'string' ? row.subtype : undefined,
         content: typeof row.content === 'string' ? row.content : undefined,
-        agentId:
-          typeof row.agentId === 'string'
-            ? row.agentId
+        sbSlug:
+          typeof row.sbSlug === 'string'
+            ? row.sbSlug
             : typeof row.agent_id === 'string'
               ? row.agent_id
               : undefined,
@@ -1629,11 +1735,9 @@ function extractActivitySummaries(
               ? row.created_at
               : undefined,
         platform: typeof row.platform === 'string' ? row.platform : undefined,
-        fromAgentId: (() => {
+        fromSlug: (() => {
           const payload = row.payload as Record<string, unknown> | undefined;
-          return payload && typeof payload.fromAgentId === 'string'
-            ? payload.fromAgentId
-            : undefined;
+          return payload && typeof payload.fromSlug === 'string' ? payload.fromSlug : undefined;
         })(),
       };
     })
@@ -1978,13 +2082,13 @@ function sessionHistoryLabel(meta: SessionTranscriptMetadata | null): string {
 }
 
 function sessionLatestMessagePreview(
-  session: Pick<SessionSummary, 'agentId'>,
+  session: Pick<SessionSummary, 'sbSlug'>,
   meta: SessionTranscriptMetadata | null
 ): string | null {
   if (!meta?.lastMessagePreview) return null;
   const speaker =
     meta.lastMessageRole === 'assistant'
-      ? session.agentId || 'assistant'
+      ? session.sbSlug || 'assistant'
       : meta.lastMessageRole === 'inbox'
         ? 'inbox'
         : 'you';
@@ -2009,7 +2113,7 @@ function formatSessionsLines(
   for (const session of sessions) {
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const id = session.id.slice(0, 7).padEnd(7);
-    const agent = (session.agentId || '-').slice(0, 6).padEnd(6);
+    const agent = (session.sbSlug || '-').slice(0, 6).padEnd(6);
     const status = (session.currentPhase || session.status || '-').slice(0, 22).padEnd(22);
     const studio = sessionStudioLabel(session, 'short').slice(0, 16).padEnd(16);
     const thread = (session.threadKey || '-').slice(0, 12).padEnd(12);
@@ -2163,7 +2267,7 @@ function inboxMessageMatchesSessionScope(runtime: ChatRuntime, message: InboxMes
 function filterSessionsByPolicy(
   sessions: SessionSummary[],
   runtime: ChatRuntime,
-  agentId: string,
+  sbSlug: string,
   toolPolicy: ToolPolicyState,
   action: 'list' | 'attach'
 ): SessionSummary[] {
@@ -2175,13 +2279,13 @@ function filterSessionsByPolicy(
           sessionId: runtime.sessionId,
           threadKey: runtime.threadKey,
           studioId: runtime.studioId,
-          agentId,
+          sbSlug,
         },
         target: {
           sessionId: session.id,
           threadKey: session.threadKey,
           studioId: session.studioId,
-          agentId: session.agentId,
+          sbSlug: session.sbSlug,
         },
       }).allowed
   );
@@ -2204,7 +2308,7 @@ function buildAutoRunPromptFromInbox(runtime: ChatRuntime, message: InboxMessage
 
 function matchesAttachQuery(session: SessionSummary, query?: string): boolean {
   if (!query) return true;
-  const haystack = `${session.id} ${session.agentId || ''} ${session.threadKey || ''} ${
+  const haystack = `${session.id} ${session.sbSlug || ''} ${session.threadKey || ''} ${
     session.currentPhase || session.status || ''
   } ${session.backend || ''} ${session.model || ''} ${session.backendSessionId || session.claudeSessionId || ''} ${
     session.studioId || ''
@@ -2436,6 +2540,12 @@ async function promptForToolApproval(
  * variant omits the write tools and `spawn_agent` — not as enforcement (the
  * executor refuses them regardless; a text-protocol model can name any tool)
  * but so the clone spends its turns on work it can actually do.
+ *
+ * The three local blocks are RENDERED from `LOCAL_TOOL_CATALOG` rather than
+ * written here, because this text and `describe_tool` are two answers to the
+ * same question and they had already diverged: this said `bash` and
+ * `signal_status` exist, discovery said they did not, and the agent believed
+ * discovery. One source means the next tool added shows up in both or neither.
  */
 export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }): string {
   const forClone = opts.audience === 'clone';
@@ -2449,42 +2559,17 @@ export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }
     '',
     'Do NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling — those will not work in this runtime. Only the fenced block format above will execute tools. You can emit multiple ink-tool blocks in one response.',
     '',
+    'After emitting your ink-tool block(s), END your response and wait. The ink runtime executes the calls and sends the real results back in a following message that begins "[Tool results from previous turn]". NEVER write that section yourself: only the runtime writes tool results, anything you write after your fences is discarded unread, and results you compose are not real, however plausible they look.',
+    '',
   ].join('\n');
 
   const inkwell = forClone
     ? 'Inkwell tools (server round-trip, read-only for you): recall, get_artifact, list_artifacts, search_artifacts, list_tasks, list_projects, get_session, list_sessions, get_activity, search_links, bootstrap, etc. Write-side tools (remember, send_to_inbox, create_task, …) are unavailable — report findings instead.'
     : 'Inkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.';
 
-  const codingTools = [
-    'Coding tools (in-process, scoped to working directory):',
-    '- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).',
-    ...(forClone
-      ? []
-      : [
-          '- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).',
-          '- write: Create or overwrite a file. Args: path (string), content (string).',
-          '- bash: Execute a shell command. Args: command (string), timeout (number, optional).',
-        ]),
-    '- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).',
-    '- find: Find files by name/pattern. Args: pattern (string), path (string, optional).',
-    '- ls: List directory contents. Args: path (string, optional).',
-  ].join('\n');
-
-  const clientLocal = [
-    'Client-local tools (no server round-trip):',
-    '- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.',
-    '- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).',
-    '- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.',
-  ].join('\n');
-
-  const spawn = [
-    'Delegation:',
-    `- ${SPAWN_AGENT_TOOL}: Fork yourself into up to ${MAX_CLONES_PER_SPAWN} shadow clones for bounded, independent work. Args: tasks (array of {label, prompt}), wait (boolean, optional, default true).`,
-    '  Each clone is you with a blank slate and read-only tools. It works alone and hands back one summary; its intermediate steps never enter your context. That is the point — use it when the reading would cost you more context than the answer is worth, or when two lines of enquiry are independent.',
-    `  ${SPAWN_AGENT_TOOL} must be the ONLY tool call in its turn — a turn mixing it with other calls is refused whole and nothing runs.`,
-    '  With wait:false the clones keep running in the background and you continue immediately; collect them later with collect_agents.',
-    '- collect_agents: Read back what clones produced. Args: ids (string[], optional — omit for all), wait (boolean, optional, default true — block until the requested clones finish).',
-  ].join('\n');
+  const codingTools = renderLocalToolGroup('coding', opts.audience);
+  const clientLocal = renderLocalToolGroup('client-local', opts.audience);
+  const spawn = renderLocalToolGroup('delegation', opts.audience);
 
   return [header, inkwell, '', codingTools, '', clientLocal, ...(forClone ? [] : ['', spawn])].join(
     '\n'
@@ -2506,7 +2591,37 @@ function renderActiveSkills(skills: SkillInstruction[]): string {
  * This is the primary mechanism for the backend to know who it is, who it's talking to,
  * and what it cares about.
  */
-function formatBootstrapContext(result: Record<string, unknown>, agentId: string): string {
+/**
+ * Marker the server-side InkRunner matches on. Kept as a literal string on both
+ * sides of the process boundary — there is no shared module between the CLI and
+ * the runner, so this is the contract.
+ */
+export const BOOTSTRAP_REQUIRED_EXIT_MARKER = 'INK_BOOTSTRAP_REQUIRED_FAILURE';
+
+/**
+ * Under `--require-bootstrap`, refuse to answer rather than answer as a
+ * stranger.
+ *
+ * A server-spawned run gets no constitution in its prompt — the runner omits it
+ * precisely because this process loads its own. If that load fails and we
+ * continue anyway, the agent replies to a real person with no soul, no values,
+ * no user document and no memory, and the runner sees a successful turn it
+ * cannot correct. For a messaging bridge a visible failed turn is far better
+ * than a confident reply from someone who is not Myra.
+ *
+ * Interactive runs never pass the flag and keep the old warn-and-continue
+ * behaviour, which is right for a human who can see the warning.
+ */
+export function failIfBootstrapRequired(
+  options: Pick<ChatOptions, 'requireBootstrap'>,
+  reason: string
+): never | void {
+  if (!options.requireBootstrap) return;
+  console.error(chalk.red(`${BOOTSTRAP_REQUIRED_EXIT_MARKER}: ${reason}`));
+  process.exit(78); // EX_CONFIG — the environment is wrong, not the request
+}
+
+function formatBootstrapContext(result: Record<string, unknown>, sbSlug: string): string {
   const sections: string[] = [];
 
   // Identity files — the core of who the agent is
@@ -2618,13 +2733,16 @@ export function findLastBackendSession(
       event.type === 'compaction' ||
       event.type === 'context_evict' ||
       event.type === 'context_trim' ||
-      event.type === 'context_budget_changed'
+      event.type === 'context_budget_changed' ||
+      event.type === 'backend_session_invalidated'
     ) {
       // A context-boundary mutation rolled the provider session — including a
       // PACKING-WIDTH change from model detection: a session seeded at the
       // old budget holds only that slice of history and must not be resumed
-      // at the new one (Lumen, PR #477 round 3). Abandon any prior id — a
-      // backend_session marker after this point re-establishes it.
+      // at the new one (Lumen, PR #477 round 3). So did an explicit
+      // invalidation (a native session left holding uncorrected fabricated
+      // tool results, #569). Abandon any prior id — a backend_session marker
+      // after this point re-establishes it.
       found = undefined;
     }
   }
@@ -2754,8 +2872,314 @@ function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
   }
 }
 
+/** Share of the remaining window one relay may spend; the rest is the model's reply and the next turn. */
+export const RELAY_HEADROOM_SHARE = 0.5;
+/**
+ * Bytes per token to assume when converting headroom into a relay budget —
+ * and the reason budgets are in UTF-8 BYTES at all. No text tokenizes to
+ * more tokens than its UTF-8 bytes (byte-level BPE bottoms out at one token
+ * per byte), so 1 byte/token is a bound for any script; a chars-per-token
+ * heuristic is not — the incident's JSON measured ~1.9 chars/token, and the
+ * half-headroom promise failed below 0.75 UTF-16 chars/token (Lumen, PR #576
+ * rounds 3–4). For ASCII JSON this is about twice as conservative as needed;
+ * the payloads are in the transcript, and safety is the point.
+ */
+export const RELAY_BYTES_PER_TOKEN = 1;
+/**
+ * The floor a relay gets when the window has no headroom left: enough for a
+ * stub per result that still names the tool and status, so the model is never
+ * blind to what ran — at most 4K tokens, at the byte bound.
+ */
+export const MIN_RELAY_BUDGET_BYTES = 4_000;
+
+const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
+
+/**
+ * What the provider's session holds after a reply, by its own accounting:
+ * the prompt it was handed (input + cache parts for Anthropic, whose cache
+ * fields are disjoint from input; input alone for OpenAI/Gemini, whose input
+ * already includes the cache) plus the reply it produced — including hidden
+ * thinking, which no byte count of the visible text could see (Lumen, PR
+ * #576 round 5). Undefined when the backend reported nothing usable.
+ */
+export function occupancyTokens(
+  backend: string,
+  usage:
+    | Pick<
+        BackendTokenUsage,
+        | 'inputTokens'
+        | 'cacheReadTokens'
+        | 'cacheWriteTokens'
+        | 'outputTokens'
+        | 'totalTokens'
+        | 'reasoningTokens'
+      >
+    | undefined
+): number | undefined {
+  if (!usage) return undefined;
+  const name = backend.toLowerCase();
+  if (name === 'claude' || name === 'anthropic') {
+    // Anthropic's cache fields are disjoint from input; its total is input +
+    // output only, so the parts are summed here.
+    const prompt = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    if (prompt.length === 0) return undefined;
+    return prompt.reduce((a, b) => a + b, 0) + (usage.outputTokens ?? 0);
+  }
+  // OpenAI and Gemini: the reported total already includes the cached prompt
+  // and hidden reasoning (Gemini's thoughtsTokenCount is part of
+  // totalTokenCount); without a total, prompt + output + reasoning (Lumen,
+  // PR #576 round 6).
+  if (usage.totalTokens !== undefined) return usage.totalTokens;
+  if (usage.inputTokens === undefined) return undefined;
+  return usage.inputTokens + (usage.outputTokens ?? 0) + (usage.reasoningTokens ?? 0);
+}
+
+/**
+ * The PROMPT part of a report — what the provider counted as handed to the
+ * model, discovered instruction files, tool schemas and media included — per
+ * backend accounting: input + cache parts for Anthropic, input alone for
+ * OpenAI/Gemini (whose input already includes the cache). A stateless
+ * parent's next envelope is this plus what the ledger grew since; the reply
+ * is not re-sent and is not counted (Lumen, PR #576 rounds 5–10).
+ */
+export function promptTokensOf(
+  backend: string,
+  usage: Pick<BackendTokenUsage, 'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'> | undefined
+): number | undefined {
+  if (!usage) return undefined;
+  const name = backend.toLowerCase();
+  if (name === 'claude' || name === 'anthropic') {
+    const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    return parts.length ? parts.reduce((a, b) => a + b, 0) : undefined;
+  }
+  return usage.inputTokens;
+}
+
+/**
+ * The bytes a ledger entry costs once rendered into a stateless envelope —
+ * its content, role and source in UTF-8, plus a per-entry allowance for the
+ * framing the envelope adds around them. An over-approximation on purpose:
+ * a tokens × 4 estimate charged 500 for a 1,483-byte Han entry and omitted
+ * the framing entirely (Lumen, PR #576 round 11).
+ */
+export const LEDGER_ENTRY_FRAME_BYTES = 64;
+export function ledgerEntryPromptBytes(entry: {
+  role: string;
+  content: string;
+  source?: string;
+}): number {
+  return (
+    utf8Bytes(entry.content) +
+    utf8Bytes(entry.role) +
+    utf8Bytes(entry.source ?? '') +
+    LEDGER_ENTRY_FRAME_BYTES
+  );
+}
+
+/** What a stateless clone joins its history with; two ride along every new turn. */
+export const CLONE_HISTORY_SEPARATOR = '\n\n---\n\n';
+
+/**
+ * Local tools after which a stateless provider's next fresh spawn may see a
+ * DIFFERENT discovered context: a write or edit can change AGENTS.md, a shell
+ * can change anything. The previous report's prompt count then no longer
+ * describes the next envelope, so the stateless count is dropped to unknown
+ * (the floor) until the next report (Lumen, PR #576 round 12).
+ */
+export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set([
+  'write',
+  'edit',
+  'multi_edit',
+  'apply_patch',
+  'bash',
+]);
+
+/**
+ * How many UTF-8 bytes the next relay message may be, from the window's live
+ * headroom: the window minus what it holds, times RELAY_HEADROOM_SHARE, at
+ * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
+ * MAX_RELAY_BYTES.
+ *
+ * What it holds is `occupancyTokens`, which the host supplies: for a native
+ * session the provider's own count after the last reply — and NOTHING once a
+ * later spawn reported no usage, because hidden thinking that was never
+ * reported cannot be recovered from visible text (Lumen, PR #576 round 7);
+ * for a stateless parent the previous request's PROMPT tokens as the provider
+ * counted them (system prompt, discovered instruction files, tool schemas and
+ * media included — nothing ink could measure from outside bounds those; Lumen,
+ * PR #576 rounds 7–10) plus the exact rendered bytes of every ledger entry
+ * added after that report and still present (by entry id — an eviction of
+ * older entries can never net an addition away); the previous body is inside
+ * the count and is not re-sent, which is slack in the safe direction. With no
+ * occupancy the relay gets the floor.
+ *
+ * The one named assumption for a stateless parent: what the provider
+ * discovers on its own (instruction files, tool schemas) is the same on the
+ * next spawn as on the reported one. Ink drops the count to unknown whenever
+ * the session-wide context generation moved since the report — any parent or
+ * clone call of CONTEXT_MUTATING_TOOLS bumps it before running and again when
+ * it settles, and no count is trusted while one is in flight, so an error after
+ * a side effect and a spawn overlapping the mutation both count; drift caused
+ * OUTSIDE this process — another
+ * process editing AGENTS.md between spawns — is not detected and is accepted
+ * as the limit of what the runtime can know (Lumen, PR #576 rounds 12–13).
+ *
+ * The bound is exact for the relay string. The floor is the one deliberate
+ * exception: at exhausted headroom the model still receives a
+ * MIN_RELAY_BUDGET_BYTES receipt of what ran, because a silent loop is worse
+ * than a small overrun; the pre-turn compaction threshold is what keeps
+ * headroom from reaching zero (Lumen, PR #576 rounds 2–7).
+ */
+export function relayBudgetBytes(
+  runtime: Pick<ChatRuntime, 'maxContextTokens'>,
+  occupancyTokens?: number
+): number {
+  const occupied =
+    occupancyTokens !== undefined ? Math.max(0, occupancyTokens) : runtime.maxContextTokens;
+  const remainingTokens = Math.max(0, runtime.maxContextTokens - occupied);
+  const bytes = Math.floor(remainingTokens * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
+  return Math.min(MAX_RELAY_BYTES, Math.max(MIN_RELAY_BUDGET_BYTES, bytes));
+}
+
+/**
+ * How a tool-loop continuation reaches the provider.
+ *
+ * `resume`: the live native session holds the history — send the delta only.
+ * `seed`: the session was rolled MID-TURN (an eviction, a trim, a budget
+ * change, an uncorrected protocol break) — mint a fresh id, send the full
+ * envelope, and persist the id so later continuations and the next turn
+ * resume it. Before this existed the rolled continuation spawned UNSEEDED:
+ * every further continuation re-packed the whole window into yet another
+ * unresumable session — five fresh provider sessions in seven minutes,
+ * 280–520K cache-creation tokens each (Myra, 2026-09-02; #572).
+ * `stateless`: the backend cannot resume at all — full envelope every time.
+ *
+ * Pure, and called by runTurnForLoop itself, so the test pins the decision
+ * the runtime makes rather than a mirror of it.
+ */
+export function decideContinuationSession(
+  canReuse: boolean,
+  activeId: string | undefined,
+  mint: () => string
+): { mode: 'resume'; id: string } | { mode: 'seed'; id: string } | { mode: 'stateless' } {
+  if (!canReuse) return { mode: 'stateless' };
+  if (activeId !== undefined) return { mode: 'resume', id: activeId };
+  return { mode: 'seed', id: mint() };
+}
+
+/** Ceiling on the transient dialogue carried into a mid-turn reseed. */
+export const MID_TURN_RESEED_MAX_CHARS = 30_000;
+
+/**
+ * One side of the transient dialogue a mid-turn reseed replays: what the
+ * model said, or what the runtime said back.
+ */
+export interface ReseedDialogueEntry {
+  role: 'assistant' | 'runtime';
+  text: string;
+}
+
+/**
+ * The latest-message body for a mid-turn reseed: this turn's dialogue so far,
+ * in order, ending with the continuation the model was about to receive.
+ *
+ * A rebuilt envelope carries the ledger — the user's message, tool-result
+ * previews — but not the turn in progress. Assistant text alone was not
+ * enough either (Lumen, PR #577): ordinary tool results survive in the ledger
+ * only as 500-char previews placed BEFORE the requests that earned them, and
+ * client-local results (list_context, evict_context) are deliberately not in
+ * the ledger at all — so a two-iteration turn lost the first iteration's
+ * results while the note claimed they followed. Replaying the ordered
+ * dialogue is what keeps the reseeded session from re-issuing calls that
+ * already ran (#572). Imitated frames are already cut by the host.
+ */
+/** The provider-session argument a continuation spawn carries, plus whether media is (re)delivered. */
+export interface ContinuationSpawnArgs {
+  sessionArgs: { backendSessionId?: string; backendSessionSeedId?: string };
+  deliverMedia: boolean;
+}
+
+/**
+ * What the continuation spawn must say about its session, from the decision:
+ * a resume carries `backendSessionId`; a mid-turn SEED carries
+ * `backendSessionSeedId` and re-delivers the turn's media (the fresh native
+ * session has never seen it); a stateless spawn carries neither. Kept apart
+ * from the request builder so the call path can be tested — the builder once
+ * derived the argument from the live id and sent a freshly minted seed as a
+ * resume of a session that did not exist (Lumen, PR #577 final pass).
+ */
+export function continuationSpawnArgs(
+  decision: ReturnType<typeof decideContinuationSession>,
+  hasMedia: boolean
+): ContinuationSpawnArgs {
+  if (decision.mode === 'resume')
+    return { sessionArgs: { backendSessionId: decision.id }, deliverMedia: false };
+  if (decision.mode === 'seed')
+    return { sessionArgs: { backendSessionSeedId: decision.id }, deliverMedia: hasMedia };
+  return { sessionArgs: {}, deliverMedia: false };
+}
+
+export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[]): string {
+  const rendered = dialogue
+    .map((entry) => {
+      const text = entry.text.trim();
+      if (!text) return '';
+      return entry.role === 'assistant' ? `YOU:\n${text}` : `INK RUNTIME:\n${text}`;
+    })
+    .filter(Boolean);
+  if (rendered.length === 0) return '';
+  // The LAST entry is the continuation the model is about to receive — the
+  // real tool results of the iteration that just ran. It is never cut: a
+  // budget applied to the joined text sliced through it and silently dropped
+  // results and role framing (Lumen, PR #577 round 2). The budget applies to
+  // the dialogue BEFORE it, whole entries from the most recent backwards;
+  // what does not fit is elided, and the elision says how much.
+  const last = rendered[rendered.length - 1]!;
+  const earlier = rendered.slice(0, -1);
+  let budget = MID_TURN_RESEED_MAX_CHARS - last.length;
+  const kept: string[] = [];
+  for (let i = earlier.length - 1; i >= 0; i -= 1) {
+    const entry = earlier[i]!;
+    if (entry.length + 2 > budget) break;
+    kept.unshift(entry);
+    budget -= entry.length + 2;
+  }
+  const elided = earlier.length - kept.length;
+  const shown = [
+    ...(elided > 0
+      ? [`…[earlier turn dialogue elided: ${elided} ${elided === 1 ? 'entry' : 'entries'}]`]
+      : []),
+    ...kept,
+    last,
+  ].join('\n\n');
+  return [
+    '[This turn so far]',
+    'The provider session was re-seeded mid-turn after a context change on the ink side. This is the turn up to this point: what you wrote, and what the ink runtime sent back. The ink-tool blocks in your own output were already executed and their results appear below in order — do not repeat those calls. Continue from the end of it.',
+    '---',
+    shown,
+    '---',
+  ].join('\n');
+}
+
+/**
+ * What this spawn has said, as the reseed dialogue records it: everything up
+ * to the frame the guard found, or everything so far. Called on every block
+ * with the spawn's UNCUT text, so a frame confirmed in block N retracts what
+ * block N-1 had recorded (`Looking.\nuser` becomes `Looking.\n`).
+ */
+export function spawnDialogueText(
+  spawnSaid: string,
+  guarded: { imitationDiscarded: boolean; frameIndex?: number }
+): string {
+  return guarded.imitationDiscarded ? spawnSaid.slice(0, guarded.frameIndex ?? 0) : spawnSaid;
+}
+
 export function buildPromptEnvelope(
-  agentId: string,
+  sbSlug: string,
   runtime: ChatRuntime,
   ledger: ContextLedger,
   userMessage: string
@@ -2783,7 +3207,7 @@ export function buildPromptEnvelope(
     // this is. `ink awaken` runs under the placeholder agent id `nascent`;
     // asserting "You are nascent." here would contradict the system prompt
     // that is, at that moment, telling them they do not have a name yet.
-    runtime.systemPromptOverride ? '' : `You are ${agentId}.`,
+    runtime.systemPromptOverride ? '' : `You are ${sbSlug}.`,
     'You are running inside ink chat (first-class Ink REPL).',
     'Answer in plain text. Be concise but complete.',
     `Current backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}.`,
@@ -2842,7 +3266,7 @@ export function envelopeShapeKey(runtime: ChatRuntime): string {
     runtime.threadKey ?? '',
     runtime.activeSkills.map((s) => s.name).join(','),
     runtime.bootstrapContext ?? '',
-    // Gates the "You are <agentId>." line. Fixed for the session's lifetime
+    // Gates the "You are <sbSlug>." line. Fixed for the session's lifetime
     // (set from --system-prompt-file at startup, never mutated), so it cannot
     // actually drift — included to keep this in sync with every static field
     // buildPromptEnvelope renders, as the contract above requires.
@@ -2883,11 +3307,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     divertConsoleLogToStderr();
   }
 
-  const resolvedAgentId = resolveAgentId(options.agent);
-  if (!resolvedAgentId) {
+  const resolvedSlug = resolveSlug(options.agent);
+  if (!resolvedSlug) {
     throw new Error('Could not resolve agent identity. Run `ink init` or pass `--agent <id>`.');
   }
-  const agentId: string = resolvedAgentId;
+  const sbSlug: string = resolvedSlug;
   const identity = readIdentityJson(process.cwd());
   // x-ink-context on every ink-routed tool call: the server validates the
   // named session against the authenticated user and enriches request
@@ -2905,7 +3329,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       encodeContextToken({
         sessionId: currentPcpSessionId() || '',
         studioId: currentPcpStudioId() || 'main',
-        agentId,
+        sbSlug,
         cliAttached: !options.nonInteractive && !options.message,
         runtime: 'ink',
       }),
@@ -2947,6 +3371,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const runtime: ChatRuntime = {
     backend: initialBackend,
     model: options.model,
+    effort: options.effort,
     verbose: options.verbose ?? false,
     toolMode:
       options.tools === 'off' ? 'off' : options.tools === 'privileged' ? 'privileged' : 'backend',
@@ -3075,7 +3500,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     policyPathFromEnv ? { policyPath: policyPathFromEnv } : undefined
   );
   toolPolicy.setContext({
-    agentId,
+    sbSlug,
     studioId: runtime.studioId,
   });
   if (runtime.studioId) {
@@ -3108,16 +3533,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // invocation exits instead of blocking on stdin forever.
   if (options.sessionCandidates || options.sessionCandidatesJson) {
     const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
+      sbSlug,
       backend: 'ink',
       limit: 50,
     });
     const attachable = extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary);
-    const sessions = filterSessionsByPolicy(attachable, runtime, agentId, toolPolicy, 'attach');
+    const sessions = filterSessionsByPolicy(attachable, runtime, sbSlug, toolPolicy, 'attach');
     const candidates = sessions.map((session) => ({
       type: 'pcp' as const,
       id: session.id,
-      agentId: session.agentId || null,
+      sbSlug: session.sbSlug || null,
       backend: session.backend || 'ink',
       phase: session.currentPhase || session.status || null,
       lifecycle: session.lifecycle || null,
@@ -3131,7 +3556,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         JSON.stringify(
           {
             backend: 'ink',
-            agentId,
+            sbSlug,
             pcpAvailable: sessionsResult !== null,
             counts: { pcp: candidates.length },
             candidates: [{ type: 'new' as const }, ...candidates],
@@ -3141,12 +3566,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         )
       );
     } else {
-      console.log(chalk.bold(`\nInk session candidates for ${agentId}:`));
+      console.log(chalk.bold(`\nInk session candidates for ${sbSlug}:`));
       console.log(chalk.dim('  new — start a new session'));
       for (const candidate of candidates) {
         const bits = [
           candidate.id.slice(0, 8),
-          candidate.agentId || '-',
+          candidate.sbSlug || '-',
           candidate.phase || '-',
           candidate.threadKey || '-',
           candidate.studioName || '-',
@@ -3247,7 +3672,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // and removes from promptTools at all scopes so the tool stops prompting.
           const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
           const scopeId =
-            grantScope === 'studio' ? target.getContext()?.studioId : target.getContext()?.agentId;
+            grantScope === 'studio' ? target.getContext()?.studioId : target.getContext()?.sbSlug;
           if (scopeId) {
             target.persistentGrant(tool, { scope: grantScope, id: scopeId });
             printLine(
@@ -3403,9 +3828,65 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // dedupes against the streamed message so nothing prints twice. Local tool
   // routing: ```ink-tool blocks arrive as one held unit and are stripped
   // before display. All state lives in StreamedTurnRenderer (unit-tested).
-  const streamRenderer = new StreamedTurnRenderer((text) =>
-    runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text
+  const streamRenderer = new StreamedTurnRenderer(
+    (text) => (runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text),
+    {
+      // Same detector the loop cuts with, applied live — otherwise the
+      // fabricated frame is on screen (and in the observer feed) before the
+      // loop ever sees the finished text (#569; Lumen, PR #575 round 1).
+      guard: (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
+    }
   );
+
+  // The observer-facing preview is guarded like the screen: cut at an
+  // imitated frame judged over the whole spawn, with a trailing line that
+  // could still become one held across blocks (preview-guard.ts).
+  const previewGuard = new ImitationPreviewGuard(
+    (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
+    (line) => runtime.toolRouting === 'local' && isPotentialImitationPrefix(line)
+  );
+  // The model's own output this turn, spawn by spawn, imitated frames cut —
+  // what a mid-turn reseed hands back so the rebuilt session remembers its
+  // own half of the turn (buildMidTurnReseedBody, #572). Reset per turn;
+  // muted from an imitated frame to the next spawn, like the renderer.
+  // This turn's dialogue with the runtime, in order: what the model said, and
+  // each continuation the runtime sent back. A mid-turn reseed replays it so
+  // the rebuilt session remembers its own half of the turn — assistant text
+  // alone was not enough (Lumen, PR #577): ordinary tool results survive in
+  // the ledger only as 500-char previews placed BEFORE the requests that
+  // earned them, and client-local results (list_context, evict_context) are
+  // deliberately not in the ledger at all, so a two-iteration turn lost the
+  // first iteration's results while the note claimed they followed.
+  let turnDialogue: ReseedDialogueEntry[] = [];
+  let turnDialogueMuted = false;
+  // This spawn's assistant text, UNCUT, and the dialogue entry it is written
+  // to. One entry per spawn, rewritten as blocks arrive: a line kept from an
+  // earlier block (`Looking.\nuser`) is retracted when a later block reveals
+  // it was the start of a frame — a per-block cut could not take back what
+  // it had already recorded (Lumen, PR #577 round 2).
+  let spawnSaid = '';
+  let spawnEntryIndex = -1;
+  const beginSpawn = (): void => {
+    streamRenderer.beginSpawn();
+    previewGuard.beginSpawn();
+    turnDialogueMuted = false;
+    spawnSaid = '';
+    spawnEntryIndex = -1;
+  };
+  /**
+   * The spawn's stream ended: render whatever the renderer was holding, and
+   * publish a preview line the guard held that never became a frame.
+   */
+  const endSpawn = (): void => {
+    renderStreamedLines(streamRenderer.endSpawn());
+    const held = previewGuard.endSpawn();
+    if (held.trim()) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_text',
+        preview: compactForLedger(held, 200),
+      });
+    }
+  };
 
   const renderStreamedLines = (lines: StreamedLine[]): void => {
     if (!inkRepl) return; // legacy readline path keeps the buffered final render
@@ -3413,7 +3894,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       inkRepl.addMessage(
         'assistant',
         line.text,
-        line.continuation ? { continuation: true } : { label: agentId }
+        line.continuation ? { continuation: true } : { label: sbSlug }
       );
     }
   };
@@ -3506,7 +3987,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (evt.kind === 'tool-use') {
       // Surface the call in the live feed as the agent's own — one dim line,
       // same shape as the replay's 🛠 rows.
-      printEvent(chalk.dim(`🛠 ${agentId} · ${evt.name} …`));
+      printEvent(chalk.dim(`🛠 ${sbSlug} · ${evt.name} …`));
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_tool',
         name: evt.name,
@@ -3531,11 +4012,37 @@ export async function runChat(options: ChatOptions): Promise<void> {
     } else if (evt.kind === 'text-delta') {
       renderStreamedLines(streamRenderer.pushDelta(evt.text));
     } else if (evt.kind === 'text' && evt.text.trim()) {
-      appendTranscript(runtime.transcriptPath, {
-        type: 'backend_text',
-        preview: compactForLedger(evt.text, 200),
-      });
-      renderStreamedLines(streamRenderer.completeMessage(evt.text));
+      // This preview is mirrored live to observers. Under local routing the
+      // loop discards everything from an imitated results frame on; so does
+      // the preview — judged against the whole spawn so far, not this block
+      // alone, and holding back a trailing line that could still become a
+      // header (a frame split across blocks; Lumen, PR #575 round 2). The
+      // full text is in the protocol_violation entry the loop records —
+      // nothing is lost, only not republished.
+      const guarded = previewGuard.onBlock(evt.text);
+      if (guarded.publish.trim() || guarded.imitationDiscarded) {
+        appendTranscript(runtime.transcriptPath, {
+          type: 'backend_text',
+          preview: compactForLedger(guarded.publish, 200),
+          ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
+        });
+      }
+      if (!turnDialogueMuted) {
+        spawnSaid += evt.text;
+        const said = spawnDialogueText(spawnSaid, guarded);
+        if (spawnEntryIndex === -1) {
+          if (said.trim()) {
+            turnDialogue.push({ role: 'assistant', text: said });
+            spawnEntryIndex = turnDialogue.length - 1;
+          }
+        } else {
+          turnDialogue[spawnEntryIndex] = { role: 'assistant', text: said };
+        }
+        if (guarded.imitationDiscarded) turnDialogueMuted = true;
+      }
+      renderStreamedLines(
+        streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
+      );
     } else if (evt.kind === 'model') {
       // Recorded unconditionally: an event that merely CONFIRMS the requested
       // model is still this run's evidence of what served it, even though the
@@ -3584,7 +4091,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       try {
         const result = await pcp.callTool('recall', {
           query,
-          agentId,
+          sbSlug,
           includeShared: true,
           limit,
           recallMode: 'hybrid',
@@ -3613,7 +4120,55 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let sessionsCache: SessionSummary[] = [];
   let sessionsCacheAt = 0;
   let activitySince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  let lastBackendUsage: BackendTokenUsage | undefined;
+  /**
+   * The provider's own measurement of the last request, scoped to the native
+   * session / model / envelope it measured (Lumen, PR #583 finding 4) and
+   * taken where each spawn's result lands — before the loop runs that turn's
+   * tools, so a list_context in the same turn already sees it (finding 1).
+   */
+  const providerSample = new ProviderSampleTracker();
+  const providerScope = (): ProviderSampleScope => ({
+    backend: runtime.backend,
+    model: runtime.detectedModel || runtime.model,
+    backendSessionId: activeBackendSessionId,
+    // The LIVE envelope, not the session's adopted baseline: a stateless
+    // provider never has a baseline, so its samples outlived every envelope
+    // change (Lumen, PR #583 round 2).
+    envelopeShape: envelopeShapeKey(runtime),
+  });
+  const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
+    if (!usage) return;
+    const scope = providerScope();
+    const at = new Date().toISOString();
+    providerSample.record(usage, scope, at);
+    // Persisted so the NEXT process — a one-turn Myra run exits right after
+    // this — budgets against it on its first pre-turn check instead of
+    // flying blind until its own spawn reports (Lumen, PR #583 round 2).
+    // A report with no usable measurement is persisted too, as a tombstone:
+    // live it hides the previous sample, and replay must not resurrect it
+    // (Lumen, round 3).
+    const parts = usage.contextParts;
+    appendTranscript(
+      runtime.transcriptPath,
+      usage.contextTokens !== undefined && usage.contextTokens > 0
+        ? {
+            type: 'provider_sample',
+            at,
+            ...scope,
+            contextTokens: usage.contextTokens,
+            ...(parts?.inputTokens !== undefined ? { inputTokens: parts.inputTokens } : {}),
+            ...(parts?.cacheReadTokens !== undefined
+              ? { cacheReadTokens: parts.cacheReadTokens }
+              : {}),
+            ...(parts?.cacheWriteTokens !== undefined
+              ? { cacheWriteTokens: parts.cacheWriteTokens }
+              : {}),
+          }
+        : { type: 'provider_sample', at, ...scope, unknown: true }
+    );
+  };
+  const providerContextMeasurement = (): ProviderContextMeasurement | undefined =>
+    providerSample.measurement(providerScope());
   let lastDelegation: DelegationState | undefined;
   let forceQuitAfterTurn = false;
   let readyForAutoRun = false;
@@ -3631,7 +4186,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const bootstrapResult = identitySuppliedByCaller
     ? ({} as Record<string, unknown>)
     : ((await pcp
-        .callTool('bootstrap', { agentId })
+        .callTool('bootstrap', { sbSlug })
         .catch((error) => ({ error: String(error) }))) as Record<string, unknown>);
 
   if (identitySuppliedByCaller) {
@@ -3642,6 +4197,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
     }
   } else if (bootstrapResult.error) {
+    failIfBootstrapRequired(options, `bootstrap unavailable: ${String(bootstrapResult.error)}`);
     console.log(chalk.yellow(`bootstrap unavailable: ${String(bootstrapResult.error)}`));
   } else {
     const suggestion = (bootstrapResult.reflectionStatus as Record<string, unknown> | undefined)
@@ -3654,7 +4210,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // Format and inject the full bootstrap context into the prompt envelope.
     // This is what gives the backend its identity, values, and memories.
-    const ctx = formatBootstrapContext(bootstrapResult, agentId);
+    const ctx = formatBootstrapContext(bootstrapResult, sbSlug);
+    if (!ctx) {
+      // Bootstrap answered, but with nothing to render. Same outcome as a
+      // failed call for our purposes: this session has no identity context.
+      failIfBootstrapRequired(options, 'bootstrap returned no identity context');
+    }
     if (ctx) {
       runtime.bootstrapContext = ctx;
       const ctxTokens = estimateTokens(ctx);
@@ -3680,7 +4241,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     ledger.addEntry(
       'system',
-      `Bootstrapped as ${agentId}${timezone ? ` (${String(timezone)})` : ''}${
+      `Bootstrapped as ${sbSlug}${timezone ? ` (${String(timezone)})` : ''}${
         suggestion ? `. ${String(suggestion)}` : ''
       }`,
       'bootstrap'
@@ -3694,7 +4255,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const attachLatestQuery =
       typeof options.attachLatest === 'string' ? options.attachLatest.trim() : undefined;
     const query = attachLatestQuery || attachQuery;
-    const listed = await listAttachableSessions(pcp, { agentId, limit: 50 });
+    const listed = await listAttachableSessions(pcp, { sbSlug, limit: 50 });
     const sessionsResult: Record<string, unknown> = listed ?? {
       error: 'could not fetch attachable sessions',
     };
@@ -3712,7 +4273,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const sessions = filterSessionsByPolicy(
         extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
         runtime,
-        agentId,
+        sbSlug,
         toolPolicy,
         'attach'
       );
@@ -3734,7 +4295,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         runtime.threadKey = selected.threadKey;
       }
       toolPolicy.setContext({
-        agentId,
+        sbSlug,
         studioId: runtime.studioId,
       });
       const currentScope = toolPolicy.getMutationScope();
@@ -3753,14 +4314,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !runtime.threadKey
   ) {
     const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
+      sbSlug,
       backend: 'ink',
       limit: 50,
     });
     const sessions = filterSessionsByPolicy(
       extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
       runtime,
-      agentId,
+      sbSlug,
       toolPolicy,
       'attach'
     );
@@ -3818,7 +4379,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (!runtime.threadKey && selected.threadKey) {
             runtime.threadKey = selected.threadKey;
           }
-          toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+          toolPolicy.setContext({ sbSlug, studioId: runtime.studioId });
           const currentScope = toolPolicy.getMutationScope();
           if (currentScope.scope !== 'global') {
             toolPolicy.setMutationScope(currentScope.scope);
@@ -3840,7 +4401,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runtime.threadKey = selected.threadKey;
         }
         autoAttachedLatest = true;
-        toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+        toolPolicy.setContext({ sbSlug, studioId: runtime.studioId });
         const currentScope = toolPolicy.getMutationScope();
         if (currentScope.scope !== 'global') {
           toolPolicy.setMutationScope(currentScope.scope);
@@ -3853,7 +4414,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const attachedToExistingSession = Boolean(runtime.sessionId);
   if (!runtime.sessionId) {
     const startArgs: Record<string, unknown> = {
-      agentId,
+      sbSlug,
       backend: 'ink',
       metadata: { provider: runtime.backend },
     };
@@ -3871,7 +4432,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   if (attachedToExistingSession && runtime.sessionId && !attachedSessionSummary) {
     const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, status: 'active', limit: 80 })
+      .callTool('list_sessions', { sbSlug, status: 'active', limit: 80 })
       .catch(() => null)) as Record<string, unknown> | null;
     attachedSessionSummary = extractSessionSummaries(sessionsResult).find(
       (session) => session.id === runtime.sessionId
@@ -3915,10 +4476,80 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // resumed native session would be stale, so runUserTurn invalidates and
   // reseeds. Subsumes the backend check (backend is part of the shape).
   let activeBackendSessionShape: string | undefined;
+  // The stateless parent budget state, per turn (reset at turn start): the
+  // last report's prompt count and the ledger high-water id it was taken
+  // against. Held here, not in the turn, because the local-tool executor
+  // that invalidates it is declared before the turn (PR #576 round 12).
+  let statelessPromptTokens: number | undefined;
+  let ledgerMaxIdAtReport = -1;
+  /**
+   * The session-wide CONTEXT GENERATION: bumped before any local tool that can
+   * change what a stateless provider discovers on its next fresh spawn runs —
+   * by the parent or by any clone, and before execution so an error after a
+   * side effect still counts. A stateless count is trusted only while the
+   * generation it was reported in is the current one (Lumen, PR #576 round 13).
+   */
+  let contextGeneration = 0;
+  let statelessGenerationAtReport = 0;
+  /**
+   * Mutations still running. A stateless spawn that starts and returns while
+   * one is in flight would record the post-start generation and trust it after
+   * the mutation lands, so occupancy is rejected while any is in flight and the
+   * generation advances AGAIN on settlement (Lumen, PR #576 round 14).
+   */
+  let mutationsInFlight = 0;
+  /** Returns the settle callback the caller must run in `finally`. */
+  const beginContextMutationFor = (calls: ReadonlyArray<{ tool: string }>): (() => void) => {
+    if (!calls.some((c) => CONTEXT_MUTATING_TOOLS.has(bareToolName(c.tool)))) return () => {};
+    contextGeneration += 1;
+    mutationsInFlight += 1;
+    return () => {
+      mutationsInFlight -= 1;
+      contextGeneration += 1;
+    };
+  };
+  /**
+   * Drop the native session so the next spawn seeds a fresh one from the
+   * ledger. The marker keeps a later process from recovering the dropped id
+   * (findLastBackendSession); the provider sample goes with it — it measured
+   * a window that no longer exists.
+   */
+  const rollProviderSession = (reason: string, note: string): void => {
+    if (activeBackendSessionId !== undefined) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_session_invalidated',
+        id: activeBackendSessionId,
+        reason,
+      });
+    }
+    activeBackendSessionId = undefined;
+    activeBackendSessionShape = undefined;
+    providerSample.clear();
+    printEvent(chalk.yellow(`  ⛁ provider session rolled — ${note}`));
+  };
 
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
-    const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, agentId);
+    const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, sbSlug);
+    if (hydrated.providerSample) {
+      // Replayed under the scope it was taken in; measurement() decides
+      // whether that is still the live window.
+      const s = hydrated.providerSample;
+      providerSample.record(
+        {
+          backend: s.scope.backend,
+          source: 'json',
+          contextTokens: s.contextTokens,
+          contextParts: {
+            ...(s.inputTokens !== undefined ? { inputTokens: s.inputTokens } : {}),
+            ...(s.cacheReadTokens !== undefined ? { cacheReadTokens: s.cacheReadTokens } : {}),
+            ...(s.cacheWriteTokens !== undefined ? { cacheWriteTokens: s.cacheWriteTokens } : {}),
+          },
+        },
+        s.scope,
+        s.at
+      );
+    }
     // Recover the provider-reported model persisted by the prior process
     // BEFORE any budget enforcement runs: a reattached large transcript must
     // be judged against the session's REAL window, not the conservative
@@ -3997,7 +4628,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   appendTranscript(runtime.transcriptPath, {
     type: attachedToExistingSession ? 'session_attach' : 'session_start',
-    agentId,
+    sbSlug,
     backend: runtime.backend,
     model: runtime.model || null,
     threadKey: runtime.threadKey || null,
@@ -4011,7 +4642,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
       .callTool('update_session_state', {
-        agentId,
+        sbSlug,
         sessionId: runtime.sessionId,
         phase: 'investigating',
         status: 'active',
@@ -4242,7 +4873,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     attachedSessionSummary?.studioName ||
     (identity?.studioId ? formatStudioForDisplay(identity.studioId, 'short') : undefined);
   const bannerParts = [
-    chip('inkling', agentId, chalk.cyan),
+    chip('inkling', sbSlug, chalk.cyan),
     chip('backend', 'ink', chalk.yellow),
     chip('provider', runtime.backend, chalk.yellow),
     studioSlug ? chip('studio', studioSlug, chalk.cyan) : null,
@@ -4281,7 +4912,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     sessionsCache = filterSessionsByPolicy(
       extractSessionSummaries(result),
       runtime,
-      agentId,
+      sbSlug,
       toolPolicy,
       'list'
     );
@@ -4339,6 +4970,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // recovery on the matching markers.
     activeBackendSessionId = undefined;
     activeBackendSessionShape = undefined;
+    // A stateless provider re-packs the ledger on every spawn, so a reading
+    // taken before the eviction describes a window that no longer exists —
+    // and its scope (no session id) would otherwise still match (Lumen, PR
+    // #583 round 2). Trims route through here too.
+    providerSample.clear();
   };
 
   const trimContextToPercent = async (
@@ -4390,19 +5026,104 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // fails, fall back to a hard trim so the turn can still proceed.
   let compactionInFlight = false;
 
-  const buildCompactionPrompt = (chunk: string): string =>
-    [
-      'You are compacting a conversation transcript into a dense continuation brief.',
-      'Summarize the conversation below, preserving: decisions and their rationale,',
-      'completed and in-progress work, key facts and constraints, open questions,',
-      'commitments made, and any identifiers (PR numbers, session IDs, file paths, URLs).',
-      'Write compact bullet points. Output ONLY the summary — no preamble.',
-      '',
-      '<conversation>',
-      chunk,
-      '</conversation>',
-    ].join('\n');
+  /**
+   * Compact the ledger NOW: replace everything but the most recent entries
+   * with a summary, write the `compaction` event, roll the provider session.
+   *
+   * Two callers. Auto-compaction (below) reaches it over the budget threshold
+   * with the runtime summarizing. An agent reaches it through the
+   * `compact_context` tool, usually with its OWN summary — the one thing a
+   * long-lived SB could not do for itself (task 609b1833). The policy is
+   * `runCompaction` (repl/compaction.ts); this binds the summarizer spawn, the
+   * transcript, the usage counters and the session roll to it.
+   */
+  const compactContextNow = async (opts: {
+    reason: string;
+    actor: 'system' | 'sb';
+    summaryText?: string;
+    keepRecent?: number;
+    /** The turn's cancellation — aborts a running summarizer spawn. */
+    signal?: AbortSignal;
+  }): Promise<CompactionOutcome> => {
+    if (compactionInFlight) return { ok: false, error: 'a compaction is already in progress' };
+    compactionInFlight = true;
+    try {
+      const outcome = await runCompaction(opts, {
+        ledger,
+        keepRecentDefault: AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+        summarize: async (chunk, signal) => {
+          // A handle, not a bare promise: the turn's Ctrl+C reaches this
+          // spawn (it used to run on to its idle timeout).
+          const summarizer = startBackendTurn({
+            backend: runtime.backend,
+            sbSlug,
+            model: runtime.model,
+            effort: runtime.effort,
+            prompt: buildCompactionPrompt(chunk),
+            // Compaction is a backend turn like any other, so it goes through
+            // adapter.prepare() and would otherwise regenerate the default
+            // identity prompt — handing a nascent SB "You are nascent, call
+            // bootstrap" the moment its first conversation grew long enough to
+            // compact (Lumen, PR #485 — finding 2).
+            systemPromptOverride: runtime.systemPromptOverride,
+            // Summarization is governed like any other turn: token-flow (idle)
+            // is the reaper, with the 4h runaway backstop. An explicit
+            // --backend-timeout-seconds still caps it, floored at 5 min —
+            // summarizing a large chunk outlives short overrides.
+            timeoutMs: runtime.backendTurnTimeoutMs
+              ? Math.max(runtime.backendTurnTimeoutMs, 5 * 60 * 1000)
+              : undefined,
+            idleTimeoutMs: runtime.backendIdleTimeoutMs,
+            stream: true,
+          });
+          const onAbort = (): void => summarizer.abort();
+          signal?.addEventListener('abort', onAbort, { once: true });
+          let turn: BackendRunResult;
+          try {
+            turn = await summarizer.result;
+          } finally {
+            signal?.removeEventListener('abort', onAbort);
+          }
+          return {
+            text: turn.success ? (turn.responseText ?? turn.stdout) : '',
+            usage: turn.usage,
+            error: turn.success
+              ? undefined
+              : turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`,
+          };
+        },
+        persist: (event) => appendTranscript(runtime.transcriptPath, event),
+        recordUsage: recordRunUsage,
+        hardTrim: (reason) => trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, reason),
+        log: (line) => printEvent(chalk.yellow(`  ⛁ ${line}`)),
+      });
+      if (outcome.ok) {
+        // Cutoff divider: everything above this line in the scrollback is
+        // now out of the context window (replaced by the summary).
+        printEvent(
+          renderContextCutoff(
+            // Live pre-mutation total, as the result reports it — the
+            // wrapper's own pre-await snapshot showed "10K → 11K (freed 1K)"
+            // when entries arrived during summarization (Lumen, PR #578 round 4).
+            `compacted ${outcome.removed} entries · ${formatTokenCount(outcome.before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`
+          )
+        );
+        // ink just rolled the ledger — roll the provider session too so the
+        // next spawn seeds a fresh native session with the summary (we compact
+        // before the provider ever would). Mid-turn, the next continuation
+        // re-seeds (decideContinuationSession). Only when the ledger actually
+        // changed: a refusal or a failed marker leaves the session alone.
+        activeBackendSessionId = undefined;
+        activeBackendSessionShape = undefined;
+        providerSample.clear();
+      }
+      return outcome;
+    } finally {
+      compactionInFlight = false;
+    }
+  };
 
+  // ── Token-budget auto-compaction ──
   const maybeCompactContext = async (reason: string): Promise<void> => {
     if (compactionInFlight) return;
     const bootstrapReserve = runtime.bootstrapContext
@@ -4410,7 +5131,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : 0;
     const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
     const threshold = Math.floor(effectiveBudget * AUTO_COMPACT_THRESHOLD_PCT);
-    if (ledger.totalTokens() <= threshold) return;
+    // Two yardsticks (Lumen, PR #583 finding 3): ink's estimate covers the
+    // ledger and is judged against its allowance; the provider's count covers
+    // the whole request and is judged against the full window. A 300K
+    // estimate over a 541K window never compacted (Myra, 2026-09-03; task
+    // 9cf538a2).
+    const pressure = assessContextPressure({
+      ledgerTokens: ledger.totalTokens(),
+      ledgerThreshold: threshold,
+      providerTokens: providerContextMeasurement()?.contextTokens,
+      providerThreshold: Math.floor(runtime.maxContextTokens * AUTO_COMPACT_THRESHOLD_PCT),
+      hasProviderSession: activeBackendSessionId !== undefined,
+      format: formatTokenCount,
+    });
+    if (pressure.action === 'none') return;
+    if (pressure.action === 'reseed') {
+      // The ledger is within its allowance; the excess is what the native
+      // session accumulated and the ledger no longer holds. Compacting would
+      // destroy history that is not the problem — roll the session instead.
+      rollProviderSession('provider-context-over-budget', pressure.reason);
+      return;
+    }
 
     // Claude reports its model on the first turn's init event, which may
     // RAISE the budget (1M-window models). Until that arrives — legacy
@@ -4429,90 +5170,57 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return;
     }
 
-    const entries = ledger.listEntries();
-    const cutoff = Math.max(0, entries.length - AUTO_COMPACT_KEEP_RECENT_ENTRIES);
-    if (cutoff === 0) return; // only the protected tail remains — nothing to compact
-
-    compactionInFlight = true;
-    try {
-      const oldest = entries.slice(0, cutoff);
-      const chunk = oldest
-        .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
-        .join('\n\n');
-      const before = ledger.totalTokens();
-      printEvent(
-        chalk.yellow(
-          `  ⛁ Context at ${formatTokenCount(before)} tok (> ${formatTokenCount(threshold)} threshold) — compacting (${reason})`
-        )
+    const outcome = await compactContextNow({
+      reason: `${reason}; ${pressure.reason}`,
+      actor: 'system',
+    });
+    // A compaction that could not shrink the ledger (a protected tail, a
+    // summarizer failure) must still roll a native session the provider says
+    // is over the window, or the next spawn resumes the same oversize session.
+    if (!outcome.ok && pressure.providerOver && activeBackendSessionId !== undefined) {
+      rollProviderSession(
+        'provider-context-over-budget',
+        `compaction did not shrink the ledger; ${pressure.reason}`
       );
-
-      try {
-        const turn = await runBackendTurn({
-          backend: runtime.backend,
-          agentId,
-          model: runtime.model,
-          prompt: buildCompactionPrompt(chunk),
-          // Compaction is a backend turn like any other, so it goes through
-          // adapter.prepare() and would otherwise regenerate the default
-          // identity prompt — handing a nascent SB "You are nascent, call
-          // bootstrap" the moment its first conversation grew long enough to
-          // compact (Lumen, PR #485 — finding 2).
-          systemPromptOverride: runtime.systemPromptOverride,
-          // Summarization is governed like any other turn: token-flow (idle)
-          // is the reaper, with the 4h runaway backstop. An explicit
-          // --backend-timeout-seconds still caps it, floored at 5 min —
-          // summarizing a large chunk outlives short overrides.
-          timeoutMs: runtime.backendTurnTimeoutMs
-            ? Math.max(runtime.backendTurnTimeoutMs, 5 * 60 * 1000)
-            : undefined,
-          idleTimeoutMs: runtime.backendIdleTimeoutMs,
-          stream: true,
-        });
-        const summaryText = turn.success ? (turn.responseText ?? turn.stdout).trim() : '';
-        if (!summaryText) {
-          throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
-        }
-
-        const summary = `[Conversation summary — compacted ${oldest.length} earlier entries]\n${summaryText}`;
-        const result = ledger.compactToSummary(summary, AUTO_COMPACT_KEEP_RECENT_ENTRIES);
-        // The compaction event is the COMPLETE new start state: summary plus
-        // the verbatim recent tail. The tail's original events precede this
-        // marker in the file, so hydration must get the tail from here —
-        // otherwise reattach would keep only the summary and lose the
-        // protected recent entries the live session still has.
-        const keptEntries = keptEntriesForCompaction(ledger);
-        appendTranscript(runtime.transcriptPath, {
-          type: 'compaction',
-          reason,
-          summary,
-          keptEntries,
-          removedCount: result.removedEntries.length,
-          removedTokens: result.removedTokens,
-          summaryTokens: result.summaryTokens,
-          totalAfter: result.totalAfter,
-        });
-        // Cutoff divider: everything above this line in the scrollback is
-        // now out of the context window (replaced by the summary).
-        printEvent(
-          renderContextCutoff(
-            `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
-          )
-        );
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
-        await trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, `${reason} (compaction fallback)`);
-      }
-    } finally {
-      compactionInFlight = false;
-      // ink just rolled the ledger — roll the provider session too so the next
-      // turn seeds a fresh native session with the summary (we compact before
-      // the provider ever would). No-op when nothing was compacted: the early
-      // returns above never reach this block. Unconditional: for non-claude
-      // these are already undefined.
-      activeBackendSessionId = undefined;
-      activeBackendSessionShape = undefined;
     }
+  };
+
+  /**
+   * `compact_context` — the agent compacting its own window.
+   *
+   * Runs inside a tool iteration: the ledger rolls here, the continuation the
+   * loop sends next re-seeds the provider session from the compacted ledger
+   * (with the real tool results and the agent's own output so far), and the
+   * agent carries on from its summary. Its result is client-local, so it is
+   * never persisted back into the ledger it just compacted.
+   */
+  const runSbCompaction = async (
+    args: Record<string, unknown>,
+    ctx?: { signal?: AbortSignal }
+  ): Promise<PcpToolCallResult> => {
+    const asResult = (payload: Record<string, unknown>, isError = false): PcpToolCallResult => ({
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      ...(isError ? { isError: true } : {}),
+    });
+    const parsed = parseCompactContextArgs(args);
+    if ('error' in parsed) return asResult({ success: false, error: parsed.error }, true);
+    const outcome = await compactContextNow({
+      reason: parsed.summary ? 'agent: own summary' : 'agent: runtime summary',
+      actor: 'sb',
+      summaryText: parsed.summary,
+      keepRecent: parsed.keepRecent,
+      signal: ctx?.signal,
+    });
+    if (!outcome.ok) return asResult({ success: false, error: outcome.error }, true);
+    return asResult({
+      success: true,
+      compacted: outcome.removed,
+      tokensFreed: outcome.freedTokens,
+      summaryTokens: outcome.summaryTokens,
+      totalAfter: outcome.totalAfter,
+      keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+      note: 'Your context now starts from the summary; the provider session is re-seeded from it on the next spawn. Continue from here.',
+    });
   };
 
   // Poll gates (PR #385): interval ticks skip while a poll is in flight;
@@ -4528,7 +5236,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     force: boolean
   ): Promise<{ freshCount: number; autoRunMessages: InboxMessage[] }> => {
     const inboxResult = (await pcp
-      .callTool('get_inbox', { agentId, status: 'unread', limit: 10 })
+      .callTool('get_inbox', { sbSlug, status: 'unread', limit: 10 })
       .catch(() => null)) as Record<string, unknown> | null;
     const messages = extractInboxMessages(inboxResult);
     const fresh = messages
@@ -4542,13 +5250,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              agentId,
+              sbSlug,
             },
             target: {
               sessionId: msg.relatedSessionId,
               threadKey: msg.threadKey,
               studioId: msg.recipientStudioId,
-              agentId,
+              sbSlug,
             },
           }).allowed
       )
@@ -4680,7 +5388,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           delegationLabel = ' [delegation:unverified:no-secret]';
         } else {
           const verified = verifyDelegationToken(msg.delegationToken, secret, {
-            expectedDelegateeAgentId: agentId,
+            expectedDelegateeSlug: sbSlug,
             expectedThreadKey: runtime.threadKey ?? undefined,
           });
           if (verified.valid && verified.payload) {
@@ -4725,7 +5433,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         runtime.autoRunInbox &&
         readyForAutoRun &&
         enqueueAutoRunFromInbox &&
-        (msg.from || '').toLowerCase() !== agentId.toLowerCase() &&
+        (msg.from || '').toLowerCase() !== sbSlug.toLowerCase() &&
         msg.messageType !== 'notification' &&
         msg.content.trim().length > 0;
 
@@ -4772,7 +5480,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const collectActivity = async (force: boolean): Promise<number> => {
     const activityResult = (await pcp
       .callTool('get_activity', {
-        agentId,
+        sbSlug,
         limit: 40,
         since: activitySince,
       })
@@ -4793,13 +5501,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              agentId,
+              sbSlug,
             },
             target: {
               sessionId: activity.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              agentId: activity.agentId,
+              sbSlug: activity.sbSlug,
             },
           }).allowed
       )
@@ -4827,7 +5535,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         inkmail_fail: 'mail failed',
       };
       const type = ACTIVITY_LABELS[rawType] || rawType;
-      const actor = activity.agentId || 'system';
+      const actor = activity.sbSlug || 'system';
       const preview = (activity.content || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
       const rendered = `⚡ ${actor} ${type}${preview ? ` — ${preview}` : ''}`;
 
@@ -4835,13 +5543,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // proper message blocks; the agent's own mechanics (tools, state,
       // backend turn lifecycle) are dim event lines; everything else stays
       // a ⚡ activity block.
-      const plan = classifyActivity(activity, agentId);
+      const plan = classifyActivity(activity, sbSlug);
       const activityEid = appendTranscript(runtime.transcriptPath, {
         type: 'activity',
         activityId: activity.id,
         activityType: activity.type || null,
         activitySubtype: activity.subtype || null,
-        agentId: activity.agentId || null,
+        sbSlug: activity.sbSlug || null,
         sessionId: activity.sessionId || null,
         createdAt: activity.createdAt || null,
         content: activity.content || null,
@@ -4849,7 +5557,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // directional message label (📤 myra → telegram) and to tell own
         // inkmail sends from inbound delivery mechanics.
         platform: activity.platform || null,
-        fromAgentId: activity.fromAgentId || null,
+        fromSlug: activity.fromSlug || null,
       });
       // Platform messages carry replay metadata so their message-block
       // rendering survives compaction (the kept tail serializes ledger
@@ -4993,6 +5701,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const cloneBackend = runtime.backend;
     const cloneModel = runtime.model;
     const cloneRouting = runtime.toolRouting;
+    // Frozen with the rest of the clone's shape: its budget must describe
+    // the window IT was spawned into, not whatever the parent switches to
+    // while it runs (Lumen, PR #576 round 4).
+    const cloneMaxContextTokens = runtime.maxContextTokens;
     /**
      * Only Claude actually honours a seeded provider session — the parent host
      * gates on exactly this (`canReuseBackendSession`). Codex and Gemini ignore
@@ -5020,6 +5732,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
     let cloneToolCalls = 0;
     // This clone's own signal state — never the parent's global.
     const cloneSignal = createSignalSink();
+    /** What the clone's window holds beyond its ledger — see relayBudgetBytes. */
+    let cloneOccupancyTokens: number | undefined;
+    let cloneGenerationAtReport = 0;
+    /** The clone spawn's request; the budget measures the same shape. */
+    const cloneRequest = (
+      prompt: string,
+      sessionArgs: Record<string, string> = {}
+    ): BackendRunRequest => ({
+      backend: cloneBackend,
+      sbSlug,
+      model: cloneModel,
+      effort: runtime.effort,
+      prompt,
+      verbose: false,
+      passthroughArgs: clonePassthrough,
+      systemPromptOverride: runtime.systemPromptOverride,
+      timeoutMs: runtime.backendTurnTimeoutMs,
+      idleTimeoutMs: runtime.backendIdleTimeoutMs,
+      stream: true,
+      toolRouting: cloneRouting,
+      ...sessionArgs,
+    });
 
     const cloneRunTurn = async (
       body: string,
@@ -5039,23 +5773,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const prompt =
         cloneCanReuseSession || !turnCtx.isContinuation
           ? body
-          : [...cloneHistory, body].join('\n\n---\n\n');
+          : [...cloneHistory, body].join(CLONE_HISTORY_SEPARATOR);
       if (!cloneCanReuseSession) cloneHistory.push(body);
 
-      const turn = startBackendTurn({
-        backend: cloneBackend,
-        agentId,
-        model: cloneModel,
-        prompt,
-        verbose: false,
-        passthroughArgs: clonePassthrough,
-        systemPromptOverride: runtime.systemPromptOverride,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        toolRouting: cloneRouting,
-        ...sessionArgs,
-      });
+      const generationBeforeSpawn = contextGeneration;
+      const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));
 
       // Ctrl+C on the parent turn kills the clone's child too, not just the
       // parent's — otherwise a cancelled turn leaves backends running.
@@ -5066,6 +5788,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ctx.signal?.removeEventListener('abort', onAbort)
       );
       const text = result.responseText ?? result.stdout;
+      // A native session accumulates every body and reply; a stateless one
+      // re-packs its history into each prompt, so the latest prompt IS the
+      // window. Either way this is what the next relay must fit beside.
+      // A native clone session: the report covers everything so far; a spawn
+      // that reported nothing leaves it unknown (the floor) until the next
+      // report. A stateless clone re-packs its history: the report's prompt
+      // covered the history and body sent, and the reply now joins the
+      // history, so it is added at the byte bound.
+      cloneOccupancyTokens = cloneCanReuseSession
+        ? occupancyTokens(cloneBackend, result.usage)
+        : (() => {
+            const prompt = promptTokensOf(cloneBackend, result.usage);
+            // The reply joins the history with a separator on each side of
+            // the next body (Lumen, PR #576 round 11).
+            return prompt === undefined
+              ? undefined
+              : prompt + utf8Bytes(text) + 2 * utf8Bytes(CLONE_HISTORY_SEPARATOR);
+          })();
+      cloneGenerationAtReport = generationBeforeSpawn;
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
@@ -5078,6 +5819,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
         responseText: text,
         ...(result.stderr?.trim() ? { stderr: result.stderr.slice(0, 4000) } : {}),
       });
+      // Cost is the session's; the WINDOW is the clone's own. Its usage never
+      // becomes the parent's provider sample.
       if (result.usage) recordRunUsage(result.usage);
       return {
         success: result.success,
@@ -5112,6 +5855,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // Nobody is watching a clone's scrollback, so a refusal it is not told
           // about becomes silent abandonment of the task.
           continueOnBlocked: true,
+          // The clone's window is its own: the same model window, its identity
+          // prompt in place of the parent's bootstrap, its own ledger of
+          // local-tool summaries, and what its session (or re-packed history)
+          // holds. Without this it took the static 200K default (Lumen, PR
+          // #576 round 3).
+          relayBudgetBytes: () =>
+            relayBudgetBytes(
+              { maxContextTokens: cloneMaxContextTokens },
+              // A stateless clone's count is trusted only within the generation
+              // it was reported in — its own mutators and a concurrent parent's
+              // both bump it (Lumen, PR #576 round 13).
+              cloneCanReuseSession ||
+                (mutationsInFlight === 0 && cloneGenerationAtReport === contextGeneration)
+                ? cloneOccupancyTokens
+                : undefined
+            ),
         },
         {
           ui: {
@@ -5200,7 +5959,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!record || !runtime.sessionId) return;
     void pcp
       .callTool('log_activity', {
-        agentId,
+        sbSlug,
         type: status === 'completed' ? 'agent_complete' : 'error',
         subtype: 'shadow_clone',
         content: `🌀 ${record.id} (${record.label}) — ${status}`,
@@ -5238,87 +5997,108 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   ): Promise<ToolResultRecord[]> => {
     const results: ToolResultRecord[] = [];
-    await executeToolCalls(calls, {
-      policy: opts.policy,
-      sessionId: runtime.sessionId,
-      signal: opts.signal,
-      callTool: createLocalToolDispatcher({
-        cwd: process.cwd(),
-        callPi: callPiTool,
-        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
-        resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
-        head: (tool, args) => {
-          // Non-nesting is enforced HERE, not by omitting spawn_agent from the
-          // clone's prompt: tool calls travel as text, so a model can name any
-          // tool it likes regardless of what it was told.
-          if (isForbiddenInClone(tool)) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
-                },
-              ],
-              isError: true,
-            } as PcpToolCallResult;
-          }
-          if (isClientLocalTool(tool)) {
-            // A throwaway ledger AND a private signal sink. The sink is the
-            // load-bearing half: `signal_status` otherwise writes the module
-            // global that runChat reads to decide whether the whole
-            // non-interactive run completed — and every clone is instructed to
-            // signal when it finishes. A clone would end its parent's run, and
-            // concurrent clones would race for the same slot.
-            return handleClientLocalTool(
+    const settleContextMutation = beginContextMutationFor(calls);
+    try {
+      await executeToolCalls(calls, {
+        policy: opts.policy,
+        sessionId: runtime.sessionId,
+        signal: opts.signal,
+        callTool: createLocalToolDispatcher({
+          cwd: process.cwd(),
+          callPi: callPiTool,
+          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
+          // A clone asking what it can call gets its own narrower surface —
+          // the same one its prompt described, not the parent's.
+          audience: 'clone',
+          // And what its OWN policy will refuse, which is not the same thing:
+          // a derived clone policy inherits the parent's denials on top of the
+          // clone's, so a parent that denies `read` yields a clone that cannot
+          // read. inspectPcpTool, never canCallPcpTool — asking what exists must
+          // not spend the parent's one-use grants.
+          isHardDenied: (tool) => {
+            const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            return !decision.allowed && !decision.promptable;
+          },
+          head: (tool, args) => {
+            // Non-nesting is enforced HERE, not by omitting spawn_agent from the
+            // clone's prompt: tool calls travel as text, so a model can name any
+            // tool it likes regardless of what it was told.
+            if (isForbiddenInClone(tool)) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
+                  },
+                ],
+                isError: true,
+              } as PcpToolCallResult;
+            }
+            if (isClientLocalTool(tool)) {
+              // A throwaway ledger AND a private signal sink. The sink is the
+              // load-bearing half: `signal_status` otherwise writes the module
+              // global that runChat reads to decide whether the whole
+              // non-interactive run completed — and every clone is instructed to
+              // signal when it finishes. A clone would end its parent's run, and
+              // concurrent clones would race for the same slot.
+              return handleClientLocalTool(
+                tool,
+                args,
+                cloneLedgerFor(opts.transcriptPath),
+                opts.signalSink
+              );
+            }
+            return null;
+          },
+        }),
+        promptForApproval: (tool, reason, args) =>
+          approvalCoordinator
+            .request({
               tool,
-              args,
-              cloneLedgerFor(opts.transcriptPath),
-              opts.signalSink
-            );
-          }
-          return null;
+              args: args ?? {},
+              reason,
+              sessionId: runtime.sessionId,
+              origin: opts.origin,
+              signal: opts.signal,
+              // The clone's own policy: what gets re-checked, and what a grant
+              // applies to. The parent stays untouched.
+              policy: opts.policy,
+            })
+            .then((outcome) => outcome.approved),
+        onResult: (result) => {
+          // WHOLE, not a 20K slice: a truncated relay tells the agent the full
+          // payload survives in this session's transcript, and for a clone this
+          // file IS that transcript (Lumen, PR #576). A promise about durable
+          // detail has to hold for the caller reading it, not just the parent.
+          const resultJson =
+            result.result === undefined ? undefined : JSON.stringify(result.result);
+          appendTranscript(opts.transcriptPath, {
+            type: 'clone_tool_call',
+            tool: result.tool,
+            args: result.args,
+            status: result.status,
+            reason: result.reason,
+            error: result.error,
+            // The payload, not just the verdict. /clones <id> and the truncation
+            // note both promise the working detail survives on disk.
+            result: resultJson,
+          });
+          results.push({
+            tool: result.tool,
+            // A thrown tool reports through `error`, a refused one through
+            // `reason` — they are different fields. Reading only `reason` feeds
+            // the clone `Tool read (error): undefined`, which tells it nothing
+            // about what went wrong and invites a blind retry.
+            result: describeCloneToolResult(result),
+            status: result.status,
+            args: result.args,
+          });
         },
-      }),
-      promptForApproval: (tool, reason, args) =>
-        approvalCoordinator
-          .request({
-            tool,
-            args: args ?? {},
-            reason,
-            sessionId: runtime.sessionId,
-            origin: opts.origin,
-            signal: opts.signal,
-            // The clone's own policy: what gets re-checked, and what a grant
-            // applies to. The parent stays untouched.
-            policy: opts.policy,
-          })
-          .then((outcome) => outcome.approved),
-      onResult: (result) => {
-        const resultJson =
-          result.result === undefined ? undefined : JSON.stringify(result.result).slice(0, 20_000);
-        appendTranscript(opts.transcriptPath, {
-          type: 'clone_tool_call',
-          tool: result.tool,
-          args: result.args,
-          status: result.status,
-          reason: result.reason,
-          error: result.error,
-          // The payload, not just the verdict. /clones <id> and the truncation
-          // note both promise the working detail survives on disk.
-          result: resultJson,
-        });
-        results.push({
-          tool: result.tool,
-          // A thrown tool reports through `error`, a refused one through
-          // `reason` — they are different fields. Reading only `reason` feeds
-          // the clone `Tool read (error): undefined`, which tells it nothing
-          // about what went wrong and invites a blind retry.
-          result: describeCloneToolResult(result),
-          status: result.status,
-          args: result.args,
-        });
-      },
-    });
+      });
+    } finally {
+      settleContextMutation();
+    }
     return results;
   };
 
@@ -5589,221 +6369,236 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const approvalOrigin: ApprovalOriginInfo = ctx?.origin ?? { origin: 'parent' };
     const abortSignal = ctx?.signal;
     const iterationResults: ToolResultRecord[] = [];
-    await executeToolCalls(calls, {
-      policy: toolPolicy,
-      signal: abortSignal,
-      callTool: createLocalToolDispatcher({
-        cwd: process.cwd(),
-        callPi: callPiTool,
-        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
-        // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
-        // emits references; actual values are injected at the execution layer
-        // so credentials never enter transcripts or context.
-        resolveCredentials: (args) => {
-          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
-            args,
-            buildResolverEnv()
-          );
-          if (resolutions.length > 0 && runtime.verbose) {
-            const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
-            printLine(
-              chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+    const settleContextMutation = beginContextMutationFor(calls);
+    try {
+      await executeToolCalls(calls, {
+        policy: toolPolicy,
+        signal: abortSignal,
+        callTool: createLocalToolDispatcher({
+          cwd: process.cwd(),
+          callPi: callPiTool,
+          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
+          // emits references; actual values are injected at the execution layer
+          // so credentials never enter transcripts or context.
+          resolveCredentials: (args) => {
+            const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+              args,
+              buildResolverEnv()
             );
-          }
-          return resolvedArgs;
-        },
-        head: (tool, args) => {
-          // spawn_agent is NOT a client-local policy bypass. Unlike ledger
-          // tools it costs backend time and fans out authority, so it reaches
-          // here only after executeToolCalls has cleared it through policy.
-          if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
-            return runSpawnAgent(args, { signal: abortSignal });
-          }
-          if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
-            return runCollectAgents(args);
-          }
-          // Client-local tools (context management) are handled in-process
-          if (isClientLocalTool(tool)) {
-            return handleClientLocalTool(tool, args, ledger);
-          }
-          return null;
-        },
-      }),
-      sessionId: runtime.sessionId,
-      promptForApproval: (tool, reason, args) =>
-        approvalCoordinator
-          .request({
-            tool,
-            args: args ?? {},
-            reason,
-            sessionId: runtime.sessionId,
-            origin: approvalOrigin,
-            signal: abortSignal,
-          })
-          .then((outcome) => outcome.approved),
-      onResult: (result: ToolCallResult) => {
-        if (result.status === 'blocked' || result.status === 'denied') {
-          const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
-          printEvent(
-            chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
-          );
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: result.status,
-            reason: result.reason,
-          });
-          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-          iterationResults.push({
-            tool: result.tool,
-            result: result.reason,
-            status: result.status,
-          });
-        } else if (result.status === 'executed' || result.status === 'approved') {
-          const resultJson = JSON.stringify(result.result);
-
-          // Format context-management and signal tools with friendly output
-          if (result.tool === 'evict_context') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              printEvent(
-                chalk.dim(
-                  `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
-                )
+            if (resolutions.length > 0 && runtime.verbose) {
+              const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+              printLine(
+                chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
               );
-              // Persist the eviction so it survives reattach — without this,
-              // hydration replays the raw events and evicted entries resurrect
-              if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
-                const refs = parsed.evictRefs as Array<Record<string, unknown>>;
-                recordEviction(
-                  'sb',
-                  compactForLedger(JSON.stringify(result.args ?? {}), 200),
-                  typeof parsed.tokensFreed === 'number' ? parsed.tokensFreed : 0,
-                  refs
-                    .filter((ref) => typeof ref.hash === 'string')
-                    .map((ref) => ({
-                      ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
-                      hash: ref.hash as string,
-                      role: (ref.role as LedgerRole) || 'system',
-                      source: typeof ref.source === 'string' ? ref.source : undefined,
-                      preview: typeof ref.preview === 'string' ? ref.preview : '',
-                    }))
+            }
+            return resolvedArgs;
+          },
+          audience: 'parent',
+          isHardDenied: (tool) => {
+            const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            return !decision.allowed && !decision.promptable;
+          },
+          head: (tool, args, ctx) => {
+            // spawn_agent is NOT a client-local policy bypass. Unlike ledger
+            // tools it costs backend time and fans out authority, so it reaches
+            // here only after executeToolCalls has cleared it through policy.
+            if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
+              return runSpawnAgent(args, { signal: abortSignal });
+            }
+            if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
+              return runCollectAgents(args);
+            }
+            // The agent compacting its own window needs the host (summarizer
+            // turn, transcript event, provider-session roll) — answered here,
+            // before the generic client-local handler refuses it.
+            if (bareToolName(tool) === 'compact_context') {
+              return runSbCompaction(args, ctx);
+            }
+            // Client-local tools (context management) are handled in-process.
+            // An eviction's persistent refs arrive on the hook, not in the
+            // result the model reads — see EvictionHooks (#571).
+            if (isClientLocalTool(tool)) {
+              return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+                providerUsage: () => providerContextMeasurement(),
+                onEvict: (eviction) =>
+                  recordEviction(
+                    'sb',
+                    compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
+                    eviction.tokensFreed,
+                    eviction.refs
+                  ),
+              });
+            }
+            return null;
+          },
+        }),
+        sessionId: runtime.sessionId,
+        promptForApproval: (tool, reason, args) =>
+          approvalCoordinator
+            .request({
+              tool,
+              args: args ?? {},
+              reason,
+              sessionId: runtime.sessionId,
+              origin: approvalOrigin,
+              signal: abortSignal,
+            })
+            .then((outcome) => outcome.approved),
+        onResult: (result: ToolCallResult) => {
+          if (result.status === 'blocked' || result.status === 'denied') {
+            const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
+            printEvent(
+              chalk.yellow(`🛠 ${sbSlug} · ${result.tool} (${result.status}) — ${result.reason}`)
+            );
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              reason: result.reason,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+            iterationResults.push({
+              tool: result.tool,
+              result: result.reason,
+              status: result.status,
+            });
+          } else if (result.status === 'executed' || result.status === 'approved') {
+            const resultJson = JSON.stringify(result.result);
+
+            // Format context-management and signal tools with friendly output
+            if (result.tool === 'evict_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                // The eviction itself was persisted from the onEvict hook at
+                // execution time (recordEviction); this is display only.
+                printEvent(
+                  chalk.dim(
+                    `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
+                  )
                 );
               }
-            }
-          } else if (result.tool === 'list_context') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              const sources = parsed.bySource
-                ? Object.entries(
-                    parsed.bySource as Record<string, { count: number; tokens: number }>
+            } else if (result.tool === 'list_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const sources = parsed.bySource
+                  ? Object.entries(
+                      parsed.bySource as Record<string, { count: number; tokens: number }>
+                    )
+                      .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                      .join(' ')
+                  : '';
+                printEvent(
+                  chalk.dim(
+                    `📋 ${sbSlug} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
+                      sources ? ` · ${sources}` : ''
+                    }`
                   )
-                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
-                    .join(' ')
-                : '';
+                );
+              }
+            } else if (result.tool === 'signal_status') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const signal = parsed.signal as { status: string; reason?: string } | undefined;
+                if (signal) {
+                  const icon =
+                    signal.status === 'completed'
+                      ? '✅'
+                      : signal.status === 'blocked'
+                        ? '🚫'
+                        : '➡️';
+                  printEvent(
+                    chalk.dim(
+                      `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
+                    )
+                  );
+                }
+              }
+            } else {
+              // One dim line, attributed to the agent, result truncated —
+              // the Ctrl+T inspector holds a 2KB result slice per call and
+              // the transcript keeps the complete payload.
+              const resultPreview = compactForLedger(resultJson, 160);
               printEvent(
                 chalk.dim(
-                  `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
-                    sources ? ` · ${sources}` : ''
+                  `🛠 ${sbSlug} · ${result.tool} (${result.status})${
+                    resultPreview ? ` — ${resultPreview}` : ''
                   }`
                 )
               );
             }
-          } else if (result.tool === 'signal_status') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              const signal = parsed.signal as { status: string; reason?: string } | undefined;
-              if (signal) {
-                const icon =
-                  signal.status === 'completed' ? '✅' : signal.status === 'blocked' ? '🚫' : '➡️';
-                printEvent(
-                  chalk.dim(
-                    `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
-                  )
-                );
-              }
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              result: result.result,
+            });
+            // Context-management tools (list_context, evict_context) must NOT
+            // persist their results back into the ledger — doing so pollutes the
+            // context they're managing and reintroduces evicted content.
+            //
+            // spawn_agent and collect_agents are excluded for the same reason
+            // from the other direction: they write their OWN dedicated handoff
+            // entry, so the generic append would duplicate every clone summary
+            // and undo the one-entry-per-fan-out guarantee that justifies clones
+            // at all.
+            if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
+              ledger.addEntry(
+                'system',
+                // A resolved failure is recorded as one (Lumen, PR #584 round 4).
+                compactForLedger(localToolLedgerLine(result.tool, result.result, resultJson), 500),
+                'local-tool'
+              );
             }
-          } else {
-            // One dim line, attributed to the agent, result truncated —
-            // the Ctrl+T inspector holds a 2KB result slice per call and
-            // the transcript keeps the complete payload.
-            const resultPreview = compactForLedger(resultJson, 160);
+            iterationResults.push({
+              tool: result.tool,
+              result: result.result,
+              status: result.status,
+              args: result.args,
+            });
+          } else if (result.status === 'error') {
+            const msg = `Local tool error (${result.tool}): ${result.error}`;
             printEvent(
-              chalk.dim(
-                `🛠 ${agentId} · ${result.tool} (${result.status})${
-                  resultPreview ? ` — ${resultPreview}` : ''
-                }`
+              chalk.red(
+                `🛠 ${sbSlug} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
               )
             );
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: 'error',
+              error: result.error,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+            iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
           }
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: result.status,
-            result: result.result,
-          });
-          // Context-management tools (list_context, evict_context) must NOT
-          // persist their results back into the ledger — doing so pollutes the
-          // context they're managing and reintroduces evicted content.
-          //
-          // spawn_agent and collect_agents are excluded for the same reason
-          // from the other direction: they write their OWN dedicated handoff
-          // entry, so the generic append would duplicate every clone summary
-          // and undo the one-entry-per-fan-out guarantee that justifies clones
-          // at all.
-          if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
-            ledger.addEntry(
-              'system',
-              compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
-              'local-tool'
-            );
-          }
-          iterationResults.push({
-            tool: result.tool,
-            result: result.result,
-            status: result.status,
-            args: result.args,
-          });
-        } else if (result.status === 'error') {
-          const msg = `Local tool error (${result.tool}): ${result.error}`;
-          printEvent(
-            chalk.red(
-              `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
-            )
-          );
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: 'error',
-            error: result.error,
-          });
-          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-          iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
-        }
 
-        // Headless liveness + progress: one compact NDJSON line per tool as
-        // it completes. Input is capped and results are omitted (can be large
-        // or sensitive). send_response is intentionally NOT streamed here —
-        // that tool already routes server-side, so re-emitting it as a
-        // response line would risk double delivery.
-        const streamArgs = result.args ? JSON.stringify(result.args) : '';
-        emitStreamEvent({
-          type: 'tool_call',
-          toolName: result.tool,
-          status: result.status,
-          ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
-        });
-      },
-    });
+          // Headless liveness + progress: one compact NDJSON line per tool as
+          // it completes. Input is capped and results are omitted (can be large
+          // or sensitive). send_response is intentionally NOT streamed here —
+          // that tool already routes server-side, so re-emitting it as a
+          // response line would risk double delivery.
+          const streamArgs = result.args ? JSON.stringify(result.args) : '';
+          emitStreamEvent({
+            type: 'tool_call',
+            toolName: result.tool,
+            status: result.status,
+            ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
+          });
+        },
+      });
+    } finally {
+      settleContextMutation();
+    }
     return iterationResults;
   };
 
@@ -5814,6 +6609,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   ) => {
     if (!raw.trim()) return;
     streamRenderer.reset();
+    turnDialogue = [];
+    turnDialogueMuted = false;
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them. The media
     // list rides the same turn (injected as prompt content by adapters that
@@ -5846,7 +6643,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (runtime.sessionId && !options.nonInteractive) {
       await pcp
         .callTool('update_session_state', {
-          agentId,
+          sbSlug,
           sessionId: runtime.sessionId,
           phase: 'implementing',
           status: 'active',
@@ -5871,7 +6668,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ledger,
       runtime: {
         sessionId: runtime.sessionId,
-        agentId,
+        sbSlug,
         backend: runtime.backend,
         budgetUtilization: ledger.totalTokens() / effectiveBudget,
         turnCount: hookTurnCount,
@@ -6003,7 +6800,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .join('\n\n');
       prompt = recallDelta ? `${recallDelta}\n\n${raw}` : raw;
     } else {
-      prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
+      prompt = buildPromptEnvelope(sbSlug, runtime, ledger, raw);
     }
 
     const turnStartedAt = Date.now();
@@ -6124,16 +6921,109 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // flags, SIGINT/abort wiring, debug + activity logging. A shadow clone
     // supplies a far simpler runTurn and shares the loop unchanged.
     let lastRunResult!: BackendRunResult;
+    // What this turn's loop has already put in the provider's context that the
+    // ledger cannot see yet: every continuation body sent and every reply
+    // received. The relay budget shrinks by it, or each iteration re-grants
+    // the same allowance while the window fills (Lumen, PR #576 round 3).
+    let loopOccupancyTokens: number | undefined;
+    // A stateless parent: the last report's prompt tokens and the highest
+    // ledger entry id at that moment, so every entry added since is charged at
+    // its rendered bytes — by id, never as a net total an eviction could hide.
+    statelessPromptTokens = undefined;
+    ledgerMaxIdAtReport = -1;
+    const maxLedgerId = (): number => ledger.listEntries().reduce((m, e) => Math.max(m, e.id), -1);
+    const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
+    /**
+     * After each spawn. NATIVE session: the provider's own occupancy when it
+     * reported one — everything sent and received so far, hidden thinking
+     * included — else UNKNOWN until the next report (what an unreported spawn
+     * added cannot be recovered from visible text). STATELESS parent: the
+     * report's prompt tokens — the provider's own count of the envelope, with
+     * discovered files, tool schemas and media inside it — and the ledger
+     * size at that moment; the reply is not re-sent and is not counted
+     * (Lumen, PR #576 rounds 5–10).
+     */
+    const noteSpawn = (
+      result: BackendRunResult,
+      ledgerIdBeforeSpawn: number,
+      generationBeforeSpawn: number
+    ): void => {
+      if (nativeSession()) {
+        loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
+        return;
+      }
+      statelessPromptTokens = promptTokensOf(runtime.backend, result.usage);
+      // The high-water id from BEFORE the spawn: an entry polled in while the
+      // backend ran (inbox, activity) is absent from the reported prompt and
+      // must be charged, not marked covered (Lumen, PR #576 round 12).
+      ledgerMaxIdAtReport = ledgerIdBeforeSpawn;
+      statelessGenerationAtReport = generationBeforeSpawn;
+    };
+    /** The continuation spawn's request; the budget measures the same shape. */
+    const continuationRequest = (
+      prompt: string,
+      spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false }
+    ): BackendRunRequest => ({
+      backend: runtime.backend,
+      sbSlug,
+      model: runtime.model,
+      effort: runtime.effort,
+      prompt,
+      verbose: runtime.verbose,
+      passthroughArgs,
+      systemPromptOverride: runtime.systemPromptOverride,
+      timeoutMs: runtime.backendTurnTimeoutMs,
+      idleTimeoutMs: runtime.backendIdleTimeoutMs,
+      stream: true,
+      onEvent: handleBackendEvent,
+      attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      toolRouting: runtime.toolRouting,
+      // Same logical turn — media rides along so the adapter's boundary
+      // disposition (--tools gate) cannot flap between the delivery spawn and
+      // tool-loop continuations. A RESUME never re-delivers it (the session
+      // holds it); a mid-turn SEED must (the fresh session has never seen it);
+      // stateless adapters re-attach from `media` regardless.
+      media: turnMedia.length > 0 ? turnMedia : undefined,
+      ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
+      // The session argument is the DECISION's, never derived from the live id:
+      // a seed assigns the minted id before spawning, and deriving from it sent
+      // a resume of a session that did not exist yet (Lumen, PR #577).
+      ...spawn.sessionArgs,
+    });
+    /**
+     * What the window holds for the next relay — see relayBudgetBytes. A
+     * stateless parent's next envelope is the last report's prompt plus the
+     * rendered bytes of every entry added to the ledger since (by id).
+     */
+    const relayOccupancy = (): number | undefined => {
+      if (nativeSession()) return loopOccupancyTokens;
+      if (statelessPromptTokens === undefined) return undefined;
+      // A mutator ran since the report, or is still running (parent or
+      // clone): the next fresh spawn may discover a different context —
+      // unknown, the floor.
+      if (mutationsInFlight > 0 || statelessGenerationAtReport !== contextGeneration) {
+        return undefined;
+      }
+      const addedBytes = ledger
+        .listEntries()
+        .filter((e) => e.id > ledgerMaxIdAtReport)
+        .reduce((n, e) => n + ledgerEntryPromptBytes(e), 0);
+      return statelessPromptTokens + addedBytes;
+    };
 
     const runTurnForLoop = async (
       body: string,
       ctx: { isContinuation: boolean }
     ): Promise<BackendTurnOutcome> => {
       if (!ctx.isContinuation) {
+        const ledgerIdBeforeSpawn = maxLedgerId();
+        const generationBeforeSpawn = contextGeneration;
+        beginSpawn();
         const turn = startBackendTurn({
           backend: runtime.backend,
-          agentId,
+          sbSlug,
           model: runtime.model,
+          effort: runtime.effort,
           prompt: body,
           verbose: runtime.verbose,
           passthroughArgs,
@@ -6163,11 +7053,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
           turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
           stopWaiting();
         });
+        endSpawn();
         // Recorded here, not after the reseed branch: a failed resume that
         // reported usage still spent those tokens, and the retry below
         // REASSIGNS runResult — recording once at the end would silently drop
         // the first attempt (Lumen, PR #494 round 3).
         recordRunUsage(runResult.usage);
+        sampleProviderContext(runResult.usage);
 
         // If a resumed turn failed because the provider session vanished (jsonl
         // cleaned up / different machine), drop the live id so the NEXT turn seeds
@@ -6196,11 +7088,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '  ⛁ provider session not found on resume — re-seeding a fresh native session'
             )
           );
+          beginSpawn();
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
-            agentId,
+            sbSlug,
             model: runtime.model,
-            prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
+            effort: runtime.effort,
+            prompt: buildPromptEnvelope(sbSlug, runtime, ledger, raw),
             verbose: runtime.verbose,
             passthroughArgs,
             systemPromptOverride: runtime.systemPromptOverride,
@@ -6220,7 +7114,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runResult = await reseedTurn.result.finally(() => {
             currentTurnAbort = null;
           });
+          endSpawn();
           recordRunUsage(runResult.usage);
+          sampleProviderContext(runResult.usage);
         }
 
         sbDebugLog(
@@ -6261,7 +7157,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const runnerLabel = 'ink';
           pcp
             .callTool('log_activity', {
-              agentId,
+              sbSlug,
               type: runResult.success ? 'agent_complete' : 'error',
               subtype: `backend_cli:${runnerLabel}`,
               content: runResult.success
@@ -6289,58 +7185,88 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
+        noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
         return runResult;
       }
 
       // ── Continuation ──
       // When resuming the same Claude session the model already holds the full
       // transcript + tool instructions from the seeded turn, so send ONLY the
-      // delta. Otherwise (stateless backends) re-pack the full envelope so the
-      // fresh spawn has the context it needs.
-      const continuationPrompt =
-        canReuseBackendSession && activeBackendSessionId
-          ? body
-          : buildPromptEnvelope(agentId, runtime, ledger, body);
+      // delta. When the session was rolled mid-turn, SEED a fresh one now —
+      // full envelope, the model's own output so far, and a persisted id so
+      // the rest of this turn and the next resume it (#572). Stateless
+      // backends re-pack the full envelope every time.
+      const decision = decideContinuationSession(
+        canReuseBackendSession,
+        activeBackendSessionId,
+        randomUUID
+      );
+      let continuationPrompt: string;
+      if (decision.mode === 'resume') {
+        continuationPrompt = body;
+      } else if (decision.mode === 'seed') {
+        activeBackendSessionId = decision.id;
+        // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
+        // model init may have changed the budget (applyDetectedModel), and
+        // the envelope built below uses the new one. Recording the stale
+        // shape made the NEXT turn roll this session again — the very
+        // fragmentation this fix exists to stop (Lumen, PR #577).
+        activeBackendSessionShape = envelopeShapeKey(runtime);
+        appendTranscript(runtime.transcriptPath, {
+          type: 'backend_session',
+          id: decision.id,
+          routing: runtime.toolRouting,
+          reason: 'mid-turn-roll',
+        });
+        printEvent(
+          chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
+        );
+        continuationPrompt = buildPromptEnvelope(
+          sbSlug,
+          runtime,
+          ledger,
+          buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
+        );
+      } else {
+        continuationPrompt = buildPromptEnvelope(sbSlug, runtime, ledger, body);
+      }
 
-      const contTurn = startBackendTurn({
-        backend: runtime.backend,
-        agentId,
-        model: runtime.model,
-        prompt: continuationPrompt,
-        verbose: runtime.verbose,
-        passthroughArgs,
-        systemPromptOverride: runtime.systemPromptOverride,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        onEvent: handleBackendEvent,
-        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-        toolRouting: runtime.toolRouting,
-        // Same logical turn — media rides along (WITHOUT deliverMedia) so the
-        // adapter's boundary disposition (--tools gate) cannot flap between the
-        // delivery spawn and tool-loop continuations, while the resumed provider
-        // session is never re-fed images it already holds. Stateless adapters
-        // re-attach from `media` regardless.
-        media: turnMedia.length > 0 ? turnMedia : undefined,
-        // Resume the live provider session so this round-trip appends to the
-        // same Claude thread instead of re-piping the whole window.
-        ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
-      });
+      // Recorded for a later reseed in this same turn; the seed above already
+      // rendered this body itself.
+      turnDialogue.push({ role: 'runtime', text: body });
+
+      beginSpawn();
+      const ledgerIdBeforeSpawn = maxLedgerId();
+      const generationBeforeSpawn = contextGeneration;
+      const contTurn = startBackendTurn(
+        continuationRequest(
+          continuationPrompt,
+          continuationSpawnArgs(decision, turnMedia.length > 0)
+        )
+      );
       currentTurnAbort = contTurn.abort;
 
       const contResult = await contTurn.result.finally(() => {
         currentTurnAbort = null;
       });
+      endSpawn();
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
+      sampleProviderContext(contResult.usage);
+      noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
       return contResult;
     };
 
     let loopResult: AgentLoopResult;
     try {
       loopResult = await runAgentLoop(
-        { prompt, toolRouting: runtime.toolRouting, signal: turnAbort.signal },
+        {
+          prompt,
+          toolRouting: runtime.toolRouting,
+          signal: turnAbort.signal,
+          relayBudgetBytes: () => relayBudgetBytes(runtime, relayOccupancy()),
+        },
         {
           ui: {
             printLine: (text) => printLine(chalk.dim(text)),
@@ -6400,6 +7326,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 recentToolCalls.splice(0, recentToolCalls.length - 100);
               }
             },
+            // The discarded text is persisted WHOLE. A backend_text preview
+            // (200 chars) was enough to detect the 2026-09-02 fabrication after
+            // the fact, and not enough to reconstruct what the agent had acted
+            // on without the provider's transcript (#569).
+            recordProtocolViolation: (violation) => {
+              appendTranscript(runtime.transcriptPath, {
+                type: 'protocol_violation',
+                kind: violation.kind,
+                phase: violation.phase,
+                iteration: violation.iteration,
+                header: violation.header,
+                discardedChars: violation.discarded.length,
+                discarded: violation.discarded,
+              });
+            },
           },
         }
       );
@@ -6413,6 +7354,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const allToolResults = loopResult.toolResults;
     const isAbortedTurn = loopResult.stopReason === 'aborted';
     const assistantDisplayText = loopResult.assistantDisplayText;
+
+    // The loop tells the model when it has written fake results; when it
+    // could not (the correction itself came back imitated, or the backend
+    // failed before one could be sent), the native session still holds the
+    // fabrication unremarked. Resuming it would hand the next turn fake
+    // evidence as history. Roll it — the next turn reseeds from the ledger,
+    // which only ever held the sanitized text. The marker keeps a later
+    // process from recovering the poisoned id (findLastBackendSession).
+    if (loopResult.protocolViolations.some((v) => !v.corrected) && activeBackendSessionId) {
+      rollProviderSession(
+        'uncorrected-protocol-violation',
+        'an imitated results frame went uncorrected'
+      );
+    }
 
     if (isAbortedTurn) {
       appendTranscript(runtime.transcriptPath, {
@@ -6443,7 +7398,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
         usage: runResult.usage || null,
       });
     }
-    lastBackendUsage = runResult.usage;
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
     hookTurnCount++;
@@ -6452,12 +7406,67 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : 0;
     const turnEndEffectiveBudget = Math.max(1, runtime.maxContextTokens - turnEndBootstrapReserve);
 
+    // ── Automatic clearing of consumed tool results (task 2cef5780) ──
+    // A tool result is read once, in the continuation that follows the call;
+    // afterwards it is a 500-char bookkeeping line that stays for the whole
+    // session. Results older than the protected recent turns are cleared at
+    // the turn boundary once they outgrow the threshold — the same persistent
+    // eviction every actor uses, so replay reproduces it, plus one tombstone.
+    // Thresholded because every eviction rolls the provider session; a small
+    // sweep is not worth a reseed. Never during a compaction, never on an
+    // aborted turn.
+    if (!isAbortedTurn && !compactionInFlight) {
+      const sweep = selectConsumedToolResults(ledger.listEntries(), {
+        keepRecentTurns: AUTO_EVICT_KEEP_RECENT_TURNS,
+        minTokens: Math.max(
+          AUTO_EVICT_MIN_TOKENS,
+          Math.floor(turnEndEffectiveBudget * AUTO_EVICT_MIN_SHARE)
+        ),
+      });
+      if (sweep) {
+        const removed = ledger.evictEntries(sweep.ids);
+        recordEviction(
+          'system',
+          `auto: ${sweep.ids.length} consumed tool results older than ${AUTO_EVICT_KEEP_RECENT_TURNS} turns`,
+          removed.removedTokens,
+          removed.removedEntries.map((e) => ({
+            ...(e.eid !== undefined ? { eid: e.eid } : {}),
+            hash: entryRefHash(e.role, e.content),
+            role: e.role,
+            source: e.source,
+            preview: e.content.slice(0, 100),
+          }))
+        );
+        // The tombstone is persisted as its own event so a reattached process
+        // gets the notice too — tool results are not reconstructed into the
+        // ledger on replay, and without this the gap had no explanation
+        // (Lumen, PR #584).
+        const tombstone = autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS);
+        const noteEid = appendTranscript(runtime.transcriptPath, {
+          type: 'context_note',
+          source: AUTO_EVICT_TOMBSTONE_SOURCE,
+          content: tombstone,
+        });
+        ledger.addEntry(
+          'system',
+          tombstone,
+          AUTO_EVICT_TOMBSTONE_SOURCE,
+          typeof noteEid === 'number' ? noteEid : undefined
+        );
+        printEvent(
+          chalk.dim(
+            `  🗑 auto-cleared ${sweep.ids.length} consumed tool results (${formatTokenCount(removed.removedTokens)} tok) — ${sweep.tools.join(', ')}`
+          )
+        );
+      }
+    }
+
     hookRegistry
       .fire('turn_end', {
         ledger,
         runtime: {
           sessionId: runtime.sessionId,
-          agentId,
+          sbSlug,
           backend: runtime.backend,
           budgetUtilization: ledger.totalTokens() / turnEndEffectiveBudget,
           turnCount: hookTurnCount,
@@ -6535,10 +7544,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // completed assistant MESSAGE, modulo local-tool stripping), don't
         // print the body twice — close the turn with a compact meta line.
         if (streamRenderer.shouldSkipFinal(assistantDisplayText)) {
-          inkRepl.printEvent(`✔ ${agentId} · ${trailingParts}`);
+          inkRepl.printEvent(`✔ ${sbSlug} · ${trailingParts}`);
         } else {
           inkRepl.addMessage('assistant', assistantDisplayText, {
-            label: agentId,
+            label: sbSlug,
             trailingMeta: trailingParts,
           });
         }
@@ -6547,7 +7556,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       printLine('');
       printLine(
         renderMessageLine('assistant', assistantDisplayText, {
-          label: agentId,
+          label: sbSlug,
           timezone: runtime.userTimezone,
           trailingMeta: `${turnDurationSeconds}s`,
         })
@@ -6597,7 +7606,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const turnSignal = createTurnSignal({
     getSessionId: () => runtime.sessionId,
     getStudioId: () => currentPcpStudioId(),
-    agentId,
+    sbSlug,
     getServerUrl: async () => (await import('../lib/pcp-mcp.js')).getPcpServerUrl(),
     getToken: async (serverUrl) =>
       (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),
@@ -6735,7 +7744,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const toolName = String(payload.toolName ?? payload.name ?? 'tool');
             // The agent's own tool call — a dim event line in the message
             // flow, not a labeled activity block.
-            const line = `🛠 ${agentId} · ${toolName}`;
+            const line = `🛠 ${sbSlug} · ${toolName}`;
             if (inkRepl)
               inkRepl.addMessage('event', line, {
                 time: formatHumanTime(at, runtime.userTimezone),
@@ -6861,7 +7870,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (runtime.sessionId) {
       await pcp
         .callTool('update_session_state', {
-          agentId,
+          sbSlug,
           sessionId: runtime.sessionId,
           phase,
         })
@@ -6922,7 +7931,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     if (isBackendFailure) {
       console.log(chalk.red(`\nSession aborted: backend returned consecutive failures.`));
-      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${sbSlug}\n`));
       process.exitCode = 1;
     } else if (finalSignal?.status === 'blocked') {
       console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
@@ -6932,7 +7941,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(chalk.dim(`\nSession paused (${turnsCompleted} turn(s) completed).`));
     }
     if (!isBackendFailure) {
-      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${sbSlug}\n`));
     }
 
     // Clean up handles that would keep the process alive. Without this,
@@ -6969,7 +7978,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let lastCtrlCAt = 0;
   let lastSigintAt = 0;
   let exitAfterTurnNoticeShown = false;
-  let activePromptLabel = `${agentId}> `;
+  let activePromptLabel = `${sbSlug}> `;
 
   // Helper: build context view lines from current state
   const buildContextViewLines = (): string[] => {
@@ -7006,7 +8015,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (useInk) {
     // ── Ink path ──
     inkRepl = renderInkChat({
-      agentId,
+      sbSlug,
       timezone: runtime.userTimezone,
       infoItems: initialInfoItems,
       fullscreen: !!options.fullscreen,
@@ -7072,7 +8081,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           entry.role === 'user'
             ? entry.label || 'you'
             : entry.role === 'assistant'
-              ? entry.label || agentId
+              ? entry.label || sbSlug
               : entry.role === 'system'
                 ? entry.label || 'system'
                 : '📬 inbox';
@@ -7149,7 +8158,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Legacy readline
       statusLane.setPromptActive(true);
       try {
-        const promptLabel = pendingTurns > 0 ? `${agentId}+${pendingTurns}> ` : `${agentId}> `;
+        const promptLabel = pendingTurns > 0 ? `${sbSlug}+${pendingTurns}> ` : `${sbSlug}> `;
         activePromptLabel = promptLabel;
         const renderedPrompt = statusLane.buildPromptLabel(promptLabel);
         raw = (await rl.question(chalk.green(renderedPrompt))).trim();
@@ -7284,7 +8293,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (slash.args[0] === 'full' && inkRepl) {
             // Show all inbox messages fully expanded (re-fetch and display)
             const fullResult = (await pcp
-              .callTool('get_inbox', { agentId, status: 'unread', limit: 20 })
+              .callTool('get_inbox', { sbSlug, status: 'unread', limit: 20 })
               .catch(() => null)) as Record<string, unknown> | null;
             const allInbox = extractInboxMessages(fullResult).sort(
               (a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt)
@@ -7308,12 +8317,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'refresh': {
           showInPanel(['Refreshing identity context from Inkwell...']);
           const refreshResult = (await pcp
-            .callTool('bootstrap', { agentId })
+            .callTool('bootstrap', { sbSlug })
             .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
           if (refreshResult.error) {
             showInPanel([`Refresh failed: ${String(refreshResult.error)}`]);
           } else {
-            const ctx = formatBootstrapContext(refreshResult, agentId);
+            const ctx = formatBootstrapContext(refreshResult, sbSlug);
             if (ctx) {
               runtime.bootstrapContext = ctx;
               const ctxTokens = estimateTokens(ctx);
@@ -7641,8 +8650,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           const grantResult = await pcp
             .callTool('send_to_inbox', {
-              recipientAgentId: targetAgent,
-              senderAgentId: agentId,
+              recipientSlug: targetAgent,
+              senderSlug: sbSlug,
               messageType: 'permission_grant',
               content: `Permission ${action}: ${toolSpec}`,
               trigger: true,
@@ -7781,9 +8790,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               try {
                 pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
               } catch {
-                showInPanel([
-                  'Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}',
-                ]);
+                showInPanel(['Invalid JSON args. Example: /mcp call get_inbox {"sbSlug":"lumen"}']);
                 break;
               }
             }
@@ -7901,7 +8908,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             try {
               pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
             } catch {
-              showInPanel(['Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}']);
+              showInPanel(['Invalid JSON args. Example: /pcp get_inbox {"sbSlug":"lumen"}']);
               break;
             }
           }
@@ -8094,8 +9101,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           const token = mintDelegationToken(
             {
-              issuerAgentId: agentId,
-              delegateeAgentId: toAgent,
+              issuerSlug: sbSlug,
+              delegateeSlug: toAgent,
               scopes,
               ttlSeconds: Number.isFinite(ttlMinutes) ? Math.max(1, ttlMinutes) * 60 : 15 * 60,
               sessionId: runtime.sessionId,
@@ -8173,8 +9180,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
           const token = mintDelegationToken(
             {
-              issuerAgentId: agentId,
-              delegateeAgentId: toAgent,
+              issuerSlug: sbSlug,
+              delegateeSlug: toAgent,
               scopes,
               ttlSeconds: 15 * 60,
               sessionId: runtime.sessionId,
@@ -8207,10 +9214,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
 
           const inboxArgs: Record<string, unknown> = {
-            recipientAgentId: toAgent,
-            senderAgentId: agentId,
+            recipientSlug: toAgent,
+            senderSlug: sbSlug,
             messageType: 'task_request',
-            subject: `Delegated task from ${agentId}`,
+            subject: `Delegated task from ${sbSlug}`,
             content: message,
             trigger: true,
             ...(runtime.threadKey ? { threadKey: runtime.threadKey } : {}),
@@ -8321,7 +9328,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (summary) {
             await pcp
               .callTool('remember', {
-                agentId,
+                sbSlug,
                 ...(runtime.sessionId ? { sessionId: runtime.sessionId } : {}),
                 content: `Context ejection at ${result.bookmark.id} (${result.bookmark.label}).\n${summary}`,
                 topics: 'repl,context-ejection',
@@ -8456,7 +9463,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ledger,
             runtime.maxContextTokens,
             lastUsageTotal,
-            lastBackendUsage,
+            providerSample.latest()?.usage,
             runtime.backendTokenWindow
           );
           lastUsageTotal = usage.total;
@@ -8502,7 +9509,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const summary = summarizeForSessionEnd(ledger);
   if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
-      .callTool('end_session', { agentId, sessionId: runtime.sessionId, summary })
+      .callTool('end_session', { sbSlug, sessionId: runtime.sessionId, summary })
       .catch(() => undefined);
   }
   appendTranscript(runtime.transcriptPath, {
@@ -8512,7 +9519,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   });
 
   if (runtime.sessionId) {
-    console.log(chalk.dim(`Reattach: ink chat -a ${agentId} --attach ${runtime.sessionId}`));
+    console.log(chalk.dim(`Reattach: ink chat -a ${sbSlug} --attach ${runtime.sessionId}`));
   }
   console.log(chalk.dim('\nChat ended.\n'));
 }
@@ -8525,6 +9532,10 @@ export function registerChatCommand(program: Command): void {
       .option('-a, --agent <id>', 'Agent identity to use')
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
+      .option(
+        '--effort <level>',
+        'Reasoning effort for the backend (claude: low | medium | high | xhigh | max)'
+      )
       .option(
         '--system-prompt-file <path>',
         'Replace the generated identity prompt with this file (used by `ink awaken`)'
@@ -8575,6 +9586,10 @@ export function registerChatCommand(program: Command): void {
         'Render the --message as a system message with this label (e.g., heartbeat, telegram). Used by server spawns.'
       )
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
+      .option(
+        '--require-bootstrap',
+        'Exit non-zero if identity context cannot be loaded, instead of answering without it'
+      )
       .option('--max-turns <n>', 'Run up to N conversational turns then exit (requires --message)')
       .option(
         '--backend-timeout-seconds <n>',

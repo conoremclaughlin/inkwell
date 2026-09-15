@@ -64,6 +64,27 @@ describe('buildAgyArgs', () => {
     expect(args[args.indexOf('-p') + 1]).toBe('hello world');
   });
 
+  // spec:studio-materialization v8 (PR #544 r3) — agy's workspace grant.
+  // --dangerously-skip-permissions approves prompts but does NOT add a
+  // workspace directory; without --add-dir an agy session can have the host
+  // MCP mint a studio it cannot edit, build, or test.
+  it('grants --add-dir for the ephemeral-studio root on fresh and resume shapes', () => {
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = '/tmp/ink-studios-agy-test';
+    try {
+      for (const conversationId of [undefined, 'conv-abc-123']) {
+        const args = buildAgyArgs('hi', baseConfig(), conversationId);
+        const granted = args
+          .map((arg, i) => (arg === '--add-dir' ? args[i + 1] : null))
+          .filter(Boolean);
+        expect(granted).toContain('/tmp/ink-studios-agy-test');
+      }
+    } finally {
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
+  });
+
   it('resumes with --conversation, not -r', () => {
     const args = buildAgyArgs('hi', baseConfig(), 'conv-abc-123');
     expect(args[args.indexOf('--conversation') + 1]).toBe('conv-abc-123');

@@ -29,8 +29,8 @@ describe('handleTriggerAgent — authenticated-user stamping (PR #487)', () => {
     resolveUserMock.mockResolvedValue({ user: { id: 'user-123' }, resolvedBy: 'token' });
     await handleTriggerAgent(
       {
-        toAgentId: 'aster',
-        fromAgentId: 'wren',
+        toSlug: 'aster',
+        fromSlug: 'wren',
         triggerType: 'message',
         threadKey: 'spec:artifact-graph-lifecycle',
         priority: 'normal',
@@ -39,7 +39,7 @@ describe('handleTriggerAgent — authenticated-user stamping (PR #487)', () => {
     );
     expect(dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'aster',
+        toSlug: 'aster',
         threadKey: 'spec:artifact-graph-lifecycle',
         recipientUserId: 'user-123',
       })
@@ -51,8 +51,8 @@ describe('handleTriggerAgent — authenticated-user stamping (PR #487)', () => {
     resolveUserMock.mockRejectedValue(new Error('no token'));
     await handleTriggerAgent(
       {
-        toAgentId: 'aster',
-        fromAgentId: 'wren',
+        toSlug: 'aster',
+        fromSlug: 'wren',
         triggerType: 'message',
         priority: 'normal',
       } as never,

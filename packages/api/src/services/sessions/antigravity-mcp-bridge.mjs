@@ -69,7 +69,8 @@ function outboundHeaders() {
   // Legacy individual headers — fallbacks for when the context token is absent.
   if (process.env.INK_SESSION_ID) headers['x-ink-session-id'] = process.env.INK_SESSION_ID;
   if (process.env.INK_STUDIO_ID) headers['x-ink-studio-id'] = process.env.INK_STUDIO_ID;
-  if (process.env.AGENT_ID) headers['x-ink-agent-id'] = process.env.AGENT_ID;
+  const sbSlug = process.env.SB_SLUG || process.env.AGENT_ID;
+  if (sbSlug) headers['x-ink-agent-id'] = sbSlug;
   if (mcpSessionId) headers['mcp-session-id'] = mcpSessionId;
   return headers;
 }

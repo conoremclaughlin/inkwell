@@ -73,11 +73,11 @@ export default function KindleLandingPage() {
 
     setRedeeming(true);
     try {
-      const result = await apiPost<{ kindleId: string; agentId: string }>('/api/kindle/redeem', {
+      const result = await apiPost<{ kindleId: string; sbSlug: string }>('/api/kindle/redeem', {
         token,
       });
       // Redirect to onboarding chat
-      router.push(`/kindle/onboarding?kindleId=${result.kindleId}&agentId=${result.agentId}`);
+      router.push(`/kindle/onboarding?kindleId=${result.kindleId}&sbSlug=${result.sbSlug}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to redeem invite');
       setRedeeming(false);

@@ -3,7 +3,7 @@ import { validateTelegramChatId } from './telegram-chat-id.js';
 
 describe('validateTelegramChatId', () => {
   it('accepts numeric DM chat ids', () => {
-    expect(validateTelegramChatId('726555973')).toBeNull();
+    expect(validateTelegramChatId('100200300')).toBeNull();
   });
 
   it('accepts negative group/channel ids', () => {

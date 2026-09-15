@@ -52,12 +52,27 @@ let TEST_SB_ID: string | undefined;
 // reasons. LIVE suites (*.live.*, gated on INK_LIVE_TESTS=1) consume real
 // LLM tokens and are DELIBERATELY excluded from CI; that is a cost
 // decision, not an oversight — please don't "fix" it.
-// CI-DEFERRED (Lumen, PR #439 round 2): this suite assumes a developer
-// environment — resolvable repoRoot/worktrees and strategy lifecycle state —
-// and fails deterministically on Actions (18 failures on run 31656039026,
-// beyond the known group-number collision). It runs locally; making it
-// CI-hermetic is follow-up work. task-handlers is the CI-enabled suite.
-const canRun = !!SUPABASE_URL && !!SUPABASE_KEY && !process.env.CI;
+// This suite was CI-deferred on 2026-08-12 as "assumes a developer
+// environment — resolvable repoRoot/worktrees". That diagnosis was wrong, and
+// the skip cost ten weeks of signal. startStrategy began requiring a
+// resolvable repoRoot on 2026-06-23 (02f2b58f); these fixtures never supplied
+// one, so the suite failed on Actions AND locally, identically, for the same
+// single reason. Skipping CI hid the breakage instead of working around it —
+// "it runs locally" was never true after June. One fixture field (see
+// FIXTURE_GROUP_METADATA) makes it hermetic, so it runs everywhere again.
+const canRun = !!SUPABASE_URL && !!SUPABASE_KEY;
+
+/**
+ * startStrategy refuses spawn mode without a resolvable repoRoot, and resolves
+ * it from group metadata → project.repo_root → request context (02f2b58f). A
+ * vitest process has no request context and these fixtures have no project, so
+ * metadata is the ONLY branch that can fire. Without it every test here dies in
+ * its first startStrategy call and the rest cascade.
+ *
+ * Pointing it at the real checkout keeps this hermetic: the path exists
+ * wherever the suite runs, CI included.
+ */
+const FIXTURE_GROUP_METADATA = { repoRoot: projectRoot };
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue(undefined),
@@ -88,6 +103,7 @@ async function createTestGroup(
     description: 'Integration test — safe to delete',
     priority: 'low',
     tags: ['__test'],
+    metadata: FIXTURE_GROUP_METADATA,
   });
 
   const taskIds: string[] = [];
@@ -293,6 +309,7 @@ describe.skipIf(!canRun)(
         description: 'Integration test — safe to delete',
         priority: 'low',
         tags: ['__test'],
+        metadata: FIXTURE_GROUP_METADATA,
       });
       groupId = group.id;
 
@@ -402,6 +419,7 @@ describe.skipIf(!canRun)('Strategy Both Gates on Final Task (integration)', () =
       description: 'Integration test — safe to delete',
       priority: 'low',
       tags: ['__test'],
+      metadata: FIXTURE_GROUP_METADATA,
     });
     groupId = group.id;
 

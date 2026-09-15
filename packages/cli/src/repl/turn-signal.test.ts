@@ -17,7 +17,7 @@ function makeDeps(overrides: Partial<TurnSignalDeps> = {}) {
   );
   const deps: TurnSignalDeps = {
     getSessionId: () => 'sess-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     getServerUrl: () => 'http://localhost:3001/',
     getToken: async () => 'tok-abc',
     workingDir: '/work/tree',
@@ -47,7 +47,7 @@ describe('createTurnSignal', () => {
       sessionId: 'sess-1',
       lifecycle: 'running',
       event: 'prompt',
-      agentId: 'wren',
+      sbSlug: 'wren',
       workingDir: '/work/tree',
     });
   });
@@ -66,7 +66,7 @@ describe('createTurnSignal', () => {
     await expect(createTurnSignal(deps).detach()).resolves.toBe(true);
 
     const body = bodyOf(fetchImpl);
-    expect(body).toEqual({ sessionId: 'sess-1', cliAttached: false, agentId: 'wren' });
+    expect(body).toEqual({ sessionId: 'sess-1', cliAttached: false, sbSlug: 'wren' });
   });
 
   it('reports UNACKNOWLEDGED with no PCP session — a failed start_session must not slip the gate', async () => {
@@ -234,5 +234,81 @@ describe('turnGateDecision — the exact predicate chain the turn queue evaluate
 
   it('keeps studioless runs best-effort — no lease to endanger', () => {
     expect(turnGateDecision(undefined, false, undefined)).toEqual({ allow: true });
+  });
+});
+
+/**
+ * Round 11 (Lumen, PR #563): the stop identifies the epoch it is ending.
+ * The REPL is one long-lived process, so the claimed epoch lives in closure
+ * memory (immune to the disk failures the hook sidecar defends against);
+ * a close whose open never acknowledged admits `turnEpochMissing` so the
+ * server fails closed instead of treating the REPL as a legacy sender.
+ */
+describe('turn-epoch round-trip (round 11)', () => {
+  it('close() sends the epoch the acknowledged open claimed', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => ({ success: true, turnEpoch: 'epoch-r' }),
+        }) as Response
+    );
+    const { deps } = makeDeps({ fetchImpl });
+    const signal = createTurnSignal(deps);
+
+    await expect(signal.open()).resolves.toBe(true);
+    await expect(signal.close()).resolves.toBe(true);
+
+    const closeBody = bodyOf(fetchImpl, 1);
+    expect(closeBody.event).toBe('stop');
+    expect(closeBody.turnEpoch).toBe('epoch-r');
+    expect('turnEpochMissing' in closeBody).toBe(false);
+
+    // The epoch is consumed by its stop — a second close cannot replay it.
+    await signal.close();
+    expect(bodyOf(fetchImpl, 2).turnEpochMissing).toBe(true);
+  });
+
+  it('a close with NO acknowledged open admits turnEpochMissing (fail closed)', async () => {
+    const { deps, fetchImpl } = makeDeps();
+    const signal = createTurnSignal(deps);
+
+    await signal.close();
+
+    const body = bodyOf(fetchImpl);
+    expect(body.event).toBe('stop');
+    expect(body.turnEpochMissing).toBe(true);
+    expect('turnEpoch' in body).toBe(false);
+  });
+
+  it('a failed open resets the epoch — the next close does not reuse a stale one', async () => {
+    let promptCount = 0;
+    const fetchImpl = vi.fn(async (_url: unknown, init: unknown) => {
+      const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+      if (body.event === 'prompt') {
+        promptCount += 1;
+        return promptCount === 1
+          ? ({
+              ok: true,
+              status: 200,
+              json: async () => ({ success: true, turnEpoch: 'epoch-old' }),
+            } as Response)
+          : ({ ok: false, status: 500, json: async () => ({}) } as Response);
+      }
+      return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+    });
+    const { deps } = makeDeps({ fetchImpl });
+    const signal = createTurnSignal(deps);
+
+    await expect(signal.open()).resolves.toBe(true); // claims epoch-old
+    await signal.close(); // consumes it
+    await expect(signal.open()).resolves.toBe(false); // unacknowledged
+    await signal.close();
+
+    const lastBody = bodyOf(fetchImpl, fetchImpl.mock.calls.length - 1);
+    expect(lastBody.event).toBe('stop');
+    expect(lastBody.turnEpochMissing).toBe(true);
+    expect('turnEpoch' in lastBody).toBe(false);
   });
 });

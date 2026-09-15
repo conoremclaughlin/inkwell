@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
+  ClaudeRunner,
   parseClaudeUsage,
   parseAssistantContextTokens,
   parseModelUsage,
@@ -282,5 +283,128 @@ describe('createLineReader', () => {
     reader.flush();
 
     expect(lines).toEqual([]);
+  });
+});
+
+// ============================================================================
+// A resumed prompt must stay lean, even though the runner is handed context
+// ============================================================================
+
+describe('ClaudeRunner — resume does not re-inject context', () => {
+  const ctx = {
+    agent: {
+      sbSlug: 'wren',
+      name: 'Wren',
+      role: 'dev',
+      soul: 'SOUL-BODY',
+      values: [],
+      capabilities: [],
+      relationships: {},
+    },
+    user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+    temporal: {
+      currentTime: '9:00 AM',
+      currentDate: 'Monday, August 24, 2026',
+      dayOfWeek: 'Monday',
+      timezone: 'UTC',
+      greeting: 'Good morning',
+    },
+    constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+    knowledgeSummary: 'DIGEST-BODY',
+    recentMemories: [],
+    activeProjects: [],
+  } as never;
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    sbSlug: 'wren',
+  } as never;
+
+  it('injects on a fresh turn', async () => {
+    const runner = new ClaudeRunner();
+    let sent = '';
+    (runner as any).spawnProcess = vi.fn(async (_a: string[], message: string) => {
+      sent = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', { injectedContext: ctx, config: cfg } as never);
+
+    expect(sent).toContain('VALUES-BODY');
+  });
+
+  it('does not inject on resume, now that session-service passes context regardless', async () => {
+    // session-service hands over injectedContext on every turn so InkRunner can
+    // recover from a failed child bootstrap. That makes this guard the only
+    // thing keeping a resumed Claude prompt from re-sending the constitution.
+    const runner = new ClaudeRunner();
+    let sent = '';
+    (runner as any).spawnProcess = vi.fn(async (_a: string[], message: string) => {
+      sent = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx,
+      config: cfg,
+    } as never);
+
+    expect(sent).toBe('hello');
+    expect(sent).not.toContain('VALUES-BODY');
+  });
+
+  // spec:studio-materialization v8 — the ephemeral-studio root is granted at
+  // spawn, unconditionally: a live session can never be granted a new
+  // directory, so every worktree minted mid-session must land somewhere
+  // already in scope. This grant IS the mechanism that makes the canonical
+  // root work; lose it and create_studio/overflow succeed on disk while the
+  // session cannot touch the result.
+  it('grants --add-dir for the ephemeral-studio root at spawn', async () => {
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const { rmSync } = await import('fs');
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-runner-${process.pid}`);
+    try {
+      const runner = new ClaudeRunner();
+      let capturedArgs: string[] = [];
+      (runner as any).spawnProcess = vi.fn(async (a: string[]) => {
+        capturedArgs = a;
+        return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+      });
+
+      await runner.run('hello', { injectedContext: ctx, config: cfg } as never);
+
+      const granted = capturedArgs
+        .map((arg, i) => (arg === '--add-dir' ? capturedArgs[i + 1] : null))
+        .filter(Boolean);
+      expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
+    } finally {
+      rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
+  });
+});
+
+describe('ClaudeRunner.buildArgs — effort (task 7ea6cdf7)', () => {
+  it('forwards --effort to the claude CLI when configured, and never otherwise', () => {
+    const runner = new ClaudeRunner();
+    const withEffort = (runner as any).buildArgs('session-eff', false, {
+      workingDirectory: '/tmp',
+      mcpConfigPath: '/tmp/.mcp.json',
+      effort: 'xhigh',
+    });
+    const idx = withEffort.indexOf('--effort');
+    expect(idx).toBeGreaterThan(-1);
+    expect(withEffort[idx + 1]).toBe('xhigh');
+
+    const without = (runner as any).buildArgs('session-eff2', false, {
+      workingDirectory: '/tmp',
+      mcpConfigPath: '/tmp/.mcp.json',
+    });
+    expect(without).not.toContain('--effort');
   });
 });

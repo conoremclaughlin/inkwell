@@ -7,9 +7,10 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import type {
   ActivityType,
@@ -22,7 +23,7 @@ import type {
 const userIdentifierFields = {
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -64,24 +65,24 @@ const activityStatusSchema = z.enum(['pending', 'running', 'completed', 'failed'
 
 export const logActivitySchema = z.object({
   ...userIdentifierFields,
-  agentId: z.string().describe('Agent identifier (e.g., "wren", "myra", "benson")'),
+  sbSlug: z.string().describe('Agent identifier (e.g., "wren", "myra", "benson")'),
   type: activityTypeSchema.describe('Type of activity'),
   content: z.string().describe('Human-readable content/description of the activity'),
-  sessionId: z.string().uuid().optional().describe('Session ID if within a session'),
+  sessionId: z.string().guid().optional().describe('Session ID if within a session'),
   subtype: z.string().optional().describe('Optional subtype (e.g., tool name for tool_call)'),
   payload: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .optional()
     .describe('Structured data specific to the activity type'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Contact ID if activity involves another person'),
-  parentId: z.string().uuid().optional().describe('Parent activity ID for hierarchical tracking'),
+  parentId: z.string().guid().optional().describe('Parent activity ID for hierarchical tracking'),
   correlationId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Correlation ID for grouping related activities'),
   platform: z
@@ -94,62 +95,62 @@ export const logActivitySchema = z.object({
     .describe('Platform-specific message ID for deduplication'),
   platformChatId: z.string().optional().describe('Platform-specific chat/conversation ID'),
   isDm: z.boolean().optional().describe('Whether this is a direct message (default: true)'),
-  artifactId: z.string().uuid().optional().describe('Associated artifact ID'),
-  childSessionId: z.string().uuid().optional().describe('Child session ID for agent_spawn'),
+  artifactId: z.string().guid().optional().describe('Associated artifact ID'),
+  childSessionId: z.string().guid().optional().describe('Child session ID for agent_spawn'),
   status: activityStatusSchema.optional().describe('Activity status (default: completed)'),
 });
 
 export const logMessageSchema = z.object({
   ...userIdentifierFields,
-  agentId: z.string().describe('Agent identifier'),
+  sbSlug: z.string().describe('Agent identifier'),
   direction: z.enum(['in', 'out']).describe('Message direction: "in" for received, "out" for sent'),
   content: z.string().describe('Message content'),
-  sessionId: z.string().uuid().optional().describe('Session ID'),
-  contactId: z.string().uuid().optional().describe('Contact ID of the other party'),
+  sessionId: z.string().guid().optional().describe('Session ID'),
+  contactId: z.string().guid().optional().describe('Contact ID of the other party'),
   platform: z.string().optional().describe('Activity platform (telegram, discord, etc.)'),
   platformMessageId: z.string().optional().describe('Platform message ID'),
   platformChatId: z.string().optional().describe('Platform chat ID'),
   isDm: z.boolean().optional().describe('Is direct message (default: true)'),
-  payload: z.record(z.unknown()).optional().describe('Additional message metadata'),
+  payload: z.record(z.string(), z.unknown()).optional().describe('Additional message metadata'),
 });
 
 export const getActivitySchema = z.object({
   ...userIdentifierFields,
-  sessionId: z.string().uuid().optional().describe('Filter by session'),
-  agentId: z.string().optional().describe('Filter by agent'),
+  sessionId: z.string().guid().optional().describe('Filter by session'),
+  sbSlug: z.string().optional().describe('Filter by agent'),
   types: z.array(activityTypeSchema).optional().describe('Filter by activity types'),
-  contactId: z.string().uuid().optional().describe('Filter by contact'),
+  contactId: z.string().guid().optional().describe('Filter by contact'),
   platform: z.string().optional().describe('Filter by activity platform'),
   platformChatId: z.string().optional().describe('Filter by platform chat'),
-  correlationId: z.string().uuid().optional().describe('Filter by correlation ID'),
-  parentId: z.string().uuid().optional().describe('Filter by parent activity'),
+  correlationId: z.string().guid().optional().describe('Filter by correlation ID'),
+  parentId: z.string().guid().optional().describe('Filter by parent activity'),
   taskGroupId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Filter by task group — returns the full timeline for a mission'),
-  since: z.string().datetime().optional().describe('Activities after this time (ISO 8601)'),
-  until: z.string().datetime().optional().describe('Activities before this time (ISO 8601)'),
+  since: isoDateTime().optional().describe('Activities after this time (ISO 8601)'),
+  until: isoDateTime().optional().describe('Activities before this time (ISO 8601)'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 50)'),
   offset: z.number().min(0).optional().describe('Offset for pagination'),
 });
 
 export const getConversationHistorySchema = z.object({
   ...userIdentifierFields,
-  contactId: z.string().uuid().optional().describe('Filter by contact'),
+  contactId: z.string().guid().optional().describe('Filter by contact'),
   platform: z.string().optional().describe('Filter by activity platform'),
   platformChatId: z.string().optional().describe('Filter by platform chat'),
   isDm: z.boolean().optional().describe('Filter by DM status'),
   limit: z.number().min(1).max(100).optional().describe('Max messages (default: 50)'),
   offset: z.number().min(0).optional().describe('Offset for pagination'),
-  since: z.string().datetime().optional().describe('Messages after this time'),
-  until: z.string().datetime().optional().describe('Messages before this time'),
+  since: isoDateTime().optional().describe('Messages after this time'),
+  until: isoDateTime().optional().describe('Messages before this time'),
 });
 
 export const getSessionContextSchema = z.object({
   ...userIdentifierFields,
-  sessionId: z.string().uuid().optional().describe('Session to get context for'),
-  contactId: z.string().uuid().optional().describe('Contact for conversation context'),
+  sessionId: z.string().guid().optional().describe('Session to get context for'),
+  contactId: z.string().guid().optional().describe('Contact for conversation context'),
   platform: z.string().optional().describe('Activity platform for chat context'),
   platformChatId: z.string().optional().describe('Platform chat for context'),
   limit: z.number().min(1).max(50).optional().describe('Max activities (default: 20)'),
@@ -185,7 +186,7 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
 
   const activity = await dataComposer.repositories.activityStream.logActivity({
     userId: user.id,
-    agentId: getEffectiveAgentId(params.agentId) ?? params.agentId,
+    sbSlug: getEffectiveSlug(params.sbSlug) ?? params.sbSlug,
     type: params.type as ActivityType,
     content: params.content,
     sessionId: params.sessionId,
@@ -206,7 +207,7 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
   logger.info(`Activity logged for user ${user.id}`, {
     activityId: activity.id,
     type: activity.type,
-    agentId: activity.agentId,
+    sbSlug: activity.sbSlug,
   });
 
   return {
@@ -221,7 +222,7 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
             activity: {
               id: activity.id,
               type: activity.type,
-              agentId: activity.agentId,
+              sbSlug: activity.sbSlug,
               createdAt: activity.createdAt.toISOString(),
             },
           },
@@ -242,7 +243,7 @@ export async function handleLogMessage(args: unknown, dataComposer: DataComposer
 
   const activity = await dataComposer.repositories.activityStream.logMessage({
     userId: user.id,
-    agentId: getEffectiveAgentId(params.agentId) ?? params.agentId,
+    sbSlug: getEffectiveSlug(params.sbSlug) ?? params.sbSlug,
     direction: params.direction,
     content: params.content,
     sessionId: params.sessionId,
@@ -293,7 +294,7 @@ export async function handleGetActivity(args: unknown, dataComposer: DataCompose
 
   const activities = await dataComposer.repositories.activityStream.getActivity(user.id, {
     sessionId: params.sessionId,
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     types: params.types as ActivityType[],
     contactId: params.contactId,
     platform: params.platform,
@@ -322,7 +323,7 @@ export async function handleGetActivity(args: unknown, dataComposer: DataCompose
               id: a.id,
               type: a.type,
               subtype: a.subtype,
-              agentId: a.agentId,
+              sbSlug: a.sbSlug,
               content: a.content,
               platform: a.platform,
               contactId: a.contactId,
@@ -377,7 +378,7 @@ export async function handleGetConversationHistory(args: unknown, dataComposer: 
               type: m.type,
               direction: m.type === 'message_in' ? 'in' : 'out',
               content: m.content,
-              agentId: m.agentId,
+              sbSlug: m.sbSlug,
               platform: m.platform,
               platformMessageId: m.platformMessageId,
               contactId: m.contactId,
@@ -429,7 +430,7 @@ export async function handleGetSessionContext(args: unknown, dataComposer: DataC
               id: a.id,
               type: a.type,
               subtype: a.subtype,
-              agentId: a.agentId,
+              sbSlug: a.sbSlug,
               content: a.content,
               platform: a.platform,
               contactId: a.contactId,

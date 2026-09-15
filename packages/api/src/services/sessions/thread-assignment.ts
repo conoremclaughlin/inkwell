@@ -30,7 +30,7 @@ export type BoundVia =
 
 export interface AssignParams {
   threadId: string;
-  agentId: string;
+  sbSlug: string;
   /** The session the router resolved for this delivery. */
   candidateSessionId: string;
   /** Caller passed recipientSessionId/sessionAlias — authorized overwrite. */
@@ -95,12 +95,12 @@ async function recoverFromWriteFailure(
   params: AssignParams,
   failedVia: BoundVia
 ): Promise<AssignResult> {
-  const { threadId, agentId, candidateSessionId } = params;
+  const { threadId, sbSlug, candidateSessionId } = params;
   const { data: after } = await supabase
     .from('inbox_thread_participants')
     .select('session_id')
     .eq('thread_id', threadId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .maybeSingle();
   const stamp: string | null = after?.session_id ?? null;
   if (stamp && stamp !== candidateSessionId) {
@@ -120,13 +120,13 @@ export async function assignThreadParticipant(
   supabase: any,
   params: AssignParams
 ): Promise<AssignResult> {
-  const { threadId, agentId, candidateSessionId, explicitAnchor, source } = params;
+  const { threadId, sbSlug, candidateSessionId, explicitAnchor, source } = params;
 
   const { data: existing } = await supabase
     .from('inbox_thread_participants')
     .select('session_id')
     .eq('thread_id', threadId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .maybeSingle();
 
   const currentStamp: string | null = existing?.session_id ?? null;
@@ -150,12 +150,12 @@ export async function assignThreadParticipant(
       .from('inbox_thread_participants')
       .update({ session_id: candidateSessionId })
       .eq('thread_id', threadId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .select('session_id');
     if (error) {
       logger.error('[Assign] Anchor stamp failed', {
         threadId,
-        agentId,
+        sbSlug,
         candidateSessionId,
         source,
         error: error.message,
@@ -165,7 +165,7 @@ export async function assignThreadParticipant(
     if (!anchored || anchored.length === 0) {
       logger.error('[Assign] Anchor stamp affected no rows — participant row missing', {
         threadId,
-        agentId,
+        sbSlug,
         candidateSessionId,
         source,
       });
@@ -173,7 +173,7 @@ export async function assignThreadParticipant(
     }
     logger.info('[Assign] Thread participant bound', {
       threadId,
-      agentId,
+      sbSlug,
       sessionId: candidateSessionId,
       previousSessionId: currentStamp,
       boundVia,
@@ -196,7 +196,7 @@ export async function assignThreadParticipant(
     if (!dead) {
       logger.info('[Assign] Existing live stamp wins — rerouting delivery', {
         threadId,
-        agentId,
+        sbSlug,
         stampedSessionId: currentStamp,
         candidateSessionId,
         boundVia: 'continuity',
@@ -215,13 +215,13 @@ export async function assignThreadParticipant(
       .from('inbox_thread_participants')
       .update({ session_id: candidateSessionId })
       .eq('thread_id', threadId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .eq('session_id', currentStamp)
       .select('session_id');
     if (rebindErr) {
       logger.error('[Assign] Dead-session rebind failed', {
         threadId,
-        agentId,
+        sbSlug,
         deadSessionId: currentStamp,
         candidateSessionId,
         source,
@@ -235,13 +235,13 @@ export async function assignThreadParticipant(
         .from('inbox_thread_participants')
         .select('session_id')
         .eq('thread_id', threadId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .maybeSingle();
       const winner: string | null = after?.session_id ?? null;
       if (winner && winner !== candidateSessionId) {
         logger.info('[Assign] Lost rebind race — rerouting to winner', {
           threadId,
-          agentId,
+          sbSlug,
           winnerSessionId: winner,
           candidateSessionId,
           source,
@@ -259,7 +259,7 @@ export async function assignThreadParticipant(
     }
     logger.info('[Assign] Thread participant bound', {
       threadId,
-      agentId,
+      sbSlug,
       sessionId: candidateSessionId,
       previousSessionId: currentStamp,
       boundVia: 'rebind-dead-session',
@@ -278,13 +278,13 @@ export async function assignThreadParticipant(
     .from('inbox_thread_participants')
     .update({ session_id: candidateSessionId })
     .eq('thread_id', threadId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .is('session_id', null)
     .select('session_id');
   if (claimErr) {
     logger.error('[Assign] Claim failed', {
       threadId,
-      agentId,
+      sbSlug,
       candidateSessionId,
       source,
       error: claimErr.message,
@@ -294,7 +294,7 @@ export async function assignThreadParticipant(
   if (claimed && claimed.length > 0) {
     logger.info('[Assign] Thread participant bound', {
       threadId,
-      agentId,
+      sbSlug,
       sessionId: candidateSessionId,
       previousSessionId: null,
       boundVia: 'claim',
@@ -313,13 +313,13 @@ export async function assignThreadParticipant(
     .from('inbox_thread_participants')
     .select('session_id')
     .eq('thread_id', threadId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .maybeSingle();
   const winner: string | null = after?.session_id ?? null;
   if (winner) {
     logger.info('[Assign] Lost claim race — rerouting to winner', {
       threadId,
-      agentId,
+      sbSlug,
       winnerSessionId: winner,
       candidateSessionId,
       source,
@@ -331,7 +331,7 @@ export async function assignThreadParticipant(
   // defensive fallback, not an expected state.
   logger.warn('[Assign] No participant row to stamp', {
     threadId,
-    agentId,
+    sbSlug,
     candidateSessionId,
     source,
   });

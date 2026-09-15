@@ -1,3 +1,15 @@
+#!/bin/sh
+# Staged-file credential guard runs first: it refuses on filename before
+# anything opens the file, and it must run before lint-staged rewrites the
+# index. Resolved relative to THIS file, not the worktree being committed from
+# (see scripts/check-commit-msg.sh for why that matters with worktrees).
+guard="$(dirname "$0")/../scripts/check-staged-files.sh"
+if [ ! -f "$guard" ] || [ ! -r "$guard" ]; then
+  printf '%s\n' 'Commit blocked: the checkout providing pre-commit is missing its readable staged-file guard.' 'Update or repair the checkout owning core.hooksPath; no commit was created.' >&2
+  exit 2
+fi
+sh "$guard" || exit $?
+
 # Ensure yarn.lock is in sync with package.json changes.
 # --mode=update-lockfile refreshes the lockfile without downloading packages.
 if git diff --cached --name-only | grep -q 'package\.json'; then

@@ -14,7 +14,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../../utils/logger';
 
 export interface ResolvedRoute {
-  agentId: string;
+  sbSlug: string;
   sbId: string;
   routeId: string;
   studioHint: string | null;
@@ -28,7 +28,7 @@ export interface ResolvedRoute {
  * specific match in application code. This keeps the SQL simple and the
  * resolution logic testable.
  */
-export async function resolveRouteAgentId(
+export async function resolveRouteSlug(
   supabase: SupabaseClient,
   userId: string,
   platform: string,
@@ -103,9 +103,9 @@ export async function resolveRouteAgentId(
 
   // Extract agent_id from the joined agent_identities
   const identityData = bestMatch.agent_identities as unknown as { agent_id: string };
-  const agentId = identityData?.agent_id;
+  const sbSlug = identityData?.agent_id;
 
-  if (!agentId) {
+  if (!sbSlug) {
     logger.warn('[Route] Matched route but could not resolve agent_id from identity', {
       routeId: bestMatch.id,
       sbId: bestMatch.sb_id,
@@ -114,7 +114,7 @@ export async function resolveRouteAgentId(
   }
 
   return {
-    agentId,
+    sbSlug,
     sbId: bestMatch.sb_id,
     routeId: bestMatch.id,
     studioHint: (bestMatch as unknown as { studio_hint: string | null }).studio_hint ?? null,

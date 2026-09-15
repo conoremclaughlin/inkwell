@@ -282,7 +282,7 @@ describe('listSessions status filtering', () => {
   it('still applies agent, studio and backend filters alongside status', async () => {
     const otherAgent = session({ id: 'other-agent', agent_id: 'lumen' });
     const sessions = await repoOver([LIVE, otherAgent, ENDED_BY_HOOK]).listSessions(USER, {
-      agentId: 'wren',
+      sbSlug: 'wren',
       status: 'active',
     });
     expect(sessions.map((s) => s.id)).toEqual(['live']);

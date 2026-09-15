@@ -26,7 +26,7 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue({ content: [] }),
 }));
 vi.mock('../auth/resolve-identity', () => ({
-  resolveAgentSlug: vi.fn().mockResolvedValue('wren'),
+  resolveSbSlug: vi.fn().mockResolvedValue('wren'),
 }));
 
 // The #506 boundary primitive: tests drive it directly. Defaults to

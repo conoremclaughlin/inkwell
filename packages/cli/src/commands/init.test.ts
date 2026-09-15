@@ -41,13 +41,13 @@ describe('init: .ink/ directory', () => {
   it('should be idempotent if .ink/ already exists', () => {
     const inkDir = join(TEST_DIR, '.ink');
     mkdirSync(inkDir, { recursive: true });
-    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify({ agentId: 'wren' }));
+    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify({ sbSlug: 'wren' }));
 
     // Creating again should not clobber
     mkdirSync(inkDir, { recursive: true });
     expect(existsSync(join(inkDir, 'identity.json'))).toBe(true);
     const identity = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
-    expect(identity.agentId).toBe('wren');
+    expect(identity.sbSlug).toBe('wren');
   });
 });
 

@@ -36,7 +36,7 @@ type DbContact = Database['public']['Tables']['contacts']['Row'];
  */
 function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
   return {
-    agentId: row.agent_id,
+    sbSlug: row.agent_id,
     name: row.name,
     role: row.role,
     description: row.description || undefined,
@@ -145,27 +145,27 @@ export class ContextBuilder implements IContextBuilder {
     this.memories = new MemoryRepository(supabase);
   }
 
-  async buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext> {
+  async buildContext(userId: string, sbSlug: string, session: Session): Promise<InjectedContext> {
     // Fetch all required data in parallel
     // The identity resolves first because it names the workspace whose
     // constitution this session should read. Everything else runs alongside it.
-    const [agentIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
-      this.getAgentIdentity(userId, agentId, session.sbId),
+    const [sbIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
+      this.getAgentIdentity(userId, sbSlug, session.sbId),
       this.getUser(userId),
       this.getContacts(userId),
-      this.getKnowledgeMemories(userId, agentId, session),
+      this.getKnowledgeMemories(userId, sbSlug, session),
       this.getActiveProjects(userId),
     ]);
 
-    if (!agentIdentity) {
-      throw new Error(`Agent identity not found: ${agentId} for user ${userId}`);
+    if (!sbIdentity) {
+      throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
 
     if (!user) {
       throw new Error(`User not found: ${userId}`);
     }
 
-    const constitution = await this.getConstitution(userId, agentIdentity.workspaceId);
+    const constitution = await this.getConstitution(userId, sbIdentity.workspaceId);
 
     const userContext = mapUserContext(user, contacts);
     const temporal = buildTemporalContext(userContext.timezone);
@@ -173,7 +173,7 @@ export class ContextBuilder implements IContextBuilder {
     const filteredRecentMemories = recentMemories.filter((m) => !isLowValueRecentMemory(m));
 
     const context: InjectedContext = {
-      agent: agentIdentity,
+      agent: sbIdentity,
       user: userContext,
       temporal,
       constitution,
@@ -233,41 +233,41 @@ export class ContextBuilder implements IContextBuilder {
 
   async buildMinimalContext(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     session?: Session
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>> {
-    const [agentIdentity, user] = await Promise.all([
-      this.getAgentIdentity(userId, agentId, session?.sbId),
+    const [sbIdentity, user] = await Promise.all([
+      this.getAgentIdentity(userId, sbSlug, session?.sbId),
       this.getUser(userId),
     ]);
 
-    if (!agentIdentity) {
-      throw new Error(`Agent identity not found: ${agentId} for user ${userId}`);
+    if (!sbIdentity) {
+      throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
 
     const timezone = user?.timezone || 'UTC';
     const temporal = buildTemporalContext(timezone);
 
     return {
-      agent: agentIdentity,
+      agent: sbIdentity,
       temporal,
     };
   }
 
   async getAgentBackend(
     userId: string,
-    agentId: string
+    sbSlug: string
   ): Promise<{ backend: string | null; provider: string | null }> {
     const { data, error } = await this.supabase
       .from('agent_identities')
       .select('backend, provider')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .single();
 
     if (error) {
       if (error.code === 'PGRST116') return { backend: null, provider: null };
-      logger.error('Error fetching agent backend', { userId, agentId, error });
+      logger.error('Error fetching agent backend', { userId, sbSlug, error });
       return { backend: null, provider: null };
     }
 
@@ -279,7 +279,7 @@ export class ContextBuilder implements IContextBuilder {
 
   private async getAgentIdentity(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     sbId?: string
   ): Promise<AgentIdentity | null> {
     if (sbId) {
@@ -288,13 +288,13 @@ export class ContextBuilder implements IContextBuilder {
         .select('*')
         .eq('id', sbId)
         .eq('user_id', userId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .maybeSingle();
 
       if (byIdError) {
         logger.error('Error fetching agent identity by sbId', {
           userId,
-          agentId,
+          sbSlug,
           sbId,
           error: byIdError,
         });
@@ -307,7 +307,7 @@ export class ContextBuilder implements IContextBuilder {
 
       logger.warn('Session sbId did not resolve; falling back to slug lookup', {
         userId,
-        agentId,
+        sbSlug,
         sbId,
       });
     }
@@ -316,16 +316,16 @@ export class ContextBuilder implements IContextBuilder {
       .from('agent_identities')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .order('updated_at', { ascending: false });
 
     if (error) {
-      logger.error('Error fetching agent identity', { userId, agentId, error });
+      logger.error('Error fetching agent identity', { userId, sbSlug, error });
       throw error;
     }
 
     if (!data || data.length === 0) {
-      logger.warn('Agent identity not found', { userId, agentId });
+      logger.warn('Agent identity not found', { userId, sbSlug });
       return null;
     }
 
@@ -337,7 +337,7 @@ export class ContextBuilder implements IContextBuilder {
       }
       logger.warn('Multiple agent identities found; choosing deterministic row', {
         userId,
-        agentId,
+        sbSlug,
         chosenIdentityId: chosen.id,
         candidateCount: data.length,
       });
@@ -386,20 +386,20 @@ export class ContextBuilder implements IContextBuilder {
    */
   private async getKnowledgeMemories(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     session: Session
   ): Promise<Memory[]> {
     try {
       return await this.memories.getKnowledgeMemories(
         userId,
-        agentId,
+        sbSlug,
         HIGH_MEMORY_LIMIT,
         HIGH_MEMORY_WINDOW_DAYS,
         { threadKey: session.threadKey, focusText: session.taskDescription },
         session.contactId
       );
     } catch (error) {
-      logger.error('Error fetching knowledge memories', { userId, agentId, error });
+      logger.error('Error fetching knowledge memories', { userId, sbSlug, error });
       return [];
     }
   }
@@ -526,17 +526,46 @@ export class ContextBuilder implements IContextBuilder {
 /**
  * Format injected context as a string for inclusion in messages.
  */
-export function formatInjectedContext(context: InjectedContext): string {
+export interface FormatContextOptions {
+  /**
+   * True when the spawned child calls `bootstrap` itself and renders the
+   * result into its own prompt — `ink chat` does this via
+   * `formatBootstrapContext`. Those sections are then omitted here, because
+   * emitting them too ships the same ~50KB twice.
+   *
+   * Runners whose child does NOT self-hydrate leave this false; for them this
+   * block is the only delivery of the constitution.
+   */
+  childCallsBootstrap?: boolean;
+  /**
+   * Render soul into the block.
+   *
+   * Off by default because `buildIdentityPrompt` carries it in
+   * `appendSystemPrompt`, where it survives compaction and is re-sent on
+   * resume. Only a caller with no such path — InkRunner, whose child normally
+   * loads soul through its own bootstrap — needs this, and only when that path
+   * has failed and this block is soul's sole delivery.
+   */
+  includeSoul?: boolean;
+}
+
+export function formatInjectedContext(
+  context: InjectedContext,
+  options: FormatContextOptions = {}
+): string {
   const sections: string[] = [];
+  // Everything bootstrap also returns is the child's to render when it calls
+  // bootstrap itself. What stays below is what only the server knows: which
+  // session this is, who is on the other end, and what time it is there.
+  const includeBootstrapDerived = !options.childCallsBootstrap;
 
   // Agent identity section
   sections.push(`## Agent Identity
-You are **${context.agent.name}** (agent ID: \`${context.agent.agentId}\`).
+You are **${context.agent.name}** (SB slug: \`${context.agent.sbSlug}\`).
 Role: ${context.agent.role}
 ${context.agent.description ? `\n${context.agent.description}` : ''}`);
 
-  // Add soul if present
-  if (context.agent.soul) {
+  if (options.includeSoul && context.agent.soul) {
     sections.push(`### Soul
 ${context.agent.soul}`);
   }
@@ -548,15 +577,15 @@ ${context.agent.soul}`);
   // Heartbeat is deliberately absent: buildIdentityPrompt already carries it in
   // appendSystemPrompt, where it survives compaction. Repeating it here would
   // duplicate the whole document.
-  if (context.constitution?.values) {
+  if (includeBootstrapDerived && context.constitution?.values) {
     sections.push(`## Values
 ${context.constitution.values}`);
   }
-  if (context.constitution?.process) {
+  if (includeBootstrapDerived && context.constitution?.process) {
     sections.push(`## Process
 ${context.constitution.process}`);
   }
-  if (context.constitution?.user) {
+  if (includeBootstrapDerived && context.constitution?.user) {
     sections.push(`## About Your Human
 ${context.constitution.user}`);
   }
@@ -580,10 +609,10 @@ This is a contact-scoped session — memories and conversation history are priva
 
   // What the agent knows. Prefer the budgeted digest; fall back to a raw list
   // only when a caller built the context without one.
-  if (context.knowledgeSummary) {
+  if (includeBootstrapDerived && context.knowledgeSummary) {
     sections.push(`## What You Know
 ${context.knowledgeSummary}`);
-  } else if (context.recentMemories.length > 0) {
+  } else if (includeBootstrapDerived && context.recentMemories.length > 0) {
     const memoryList = context.recentMemories
       .map((m) => `- [${m.salience}] ${m.content}`)
       .join('\n');
@@ -592,7 +621,7 @@ ${memoryList}`);
   }
 
   // Active projects (if any)
-  if (context.activeProjects.length > 0) {
+  if (includeBootstrapDerived && context.activeProjects.length > 0) {
     const projectList = context.activeProjects.map((p) => `- ${p.name} (${p.status})`).join('\n');
     sections.push(`## Active Projects
 ${projectList}`);

@@ -69,6 +69,16 @@ export class ThreadKeyService {
   }
 
   /**
+   * The thread-key types this user actually has, as a set of names. Used to
+   * tell an unregistered project prefix apart from an ordinary typed key whose
+   * id contains a colon.
+   */
+  async knownTypeNames(userId: string): Promise<Set<string>> {
+    const effective = await this.registry.listEffective(userId);
+    return new Set(effective.map((t) => t.type));
+  }
+
+  /**
    * Behavior for a STORED key type (inbox_threads.key_type). This is the
    * single entry point Phase 6b consumes. An untyped thread (key_type NULL)
    * gets the conservative unknown default — write.

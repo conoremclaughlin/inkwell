@@ -56,7 +56,7 @@ export interface ApprovalInterceptResult {
   intercepted: boolean;
   action?: string;
   requestId?: string;
-  resolvedRequests?: Array<{ id: string; tool: string; action: string; agentId?: string }>;
+  resolvedRequests?: Array<{ id: string; tool: string; action: string; sbSlug?: string }>;
 }
 
 // ─── Notification Debounce Buffer ────────────────────────────────
@@ -65,7 +65,7 @@ export interface ApprovalInterceptResult {
 /**
  * Which shadow clone raised a request, when one did.
  *
- * A clone carries its parent's identity, so `requestingAgentId` alone reads as
+ * A clone carries its parent's identity, so `requestingSlug` alone reads as
  * the parent asking. Away-mode means approving a call whose context the user
  * cannot see — "which of my three clones wants this" is the difference between
  * an informed yes and a blind one.
@@ -82,7 +82,7 @@ export interface BufferedRequest {
   tool: string;
   args?: string | null;
   reason?: string | null;
-  requestingAgentId: string;
+  requestingSlug: string;
   origin?: ApprovalOrigin | null;
   studioId?: string | null;
   sessionId?: string | null;
@@ -265,8 +265,7 @@ export async function checkApprovalResponse(
 
   // Resolve all targeted requests
   const status = action === 'deny' ? 'denied' : 'granted';
-  const resolvedRequests: Array<{ id: string; tool: string; action: string; agentId?: string }> =
-    [];
+  const resolvedRequests: Array<{ id: string; tool: string; action: string; sbSlug?: string }> = [];
 
   for (const req of targetRequests) {
     const grantedTools = action !== 'deny' ? [req.tool + (req.args ? `(${req.args})` : '')] : null;
@@ -295,7 +294,7 @@ export async function checkApprovalResponse(
       id: req.id,
       tool: req.tool,
       action,
-      agentId: req.requesting_agent_id,
+      sbSlug: req.requesting_agent_id,
     });
   }
 
@@ -331,7 +330,7 @@ export function formatApprovalConfirmation(result: ApprovalInterceptResult): str
   const emoji = isDeny ? '\u{1F6AB}' : '\u{2705}';
   const tools = result.resolvedRequests.map((r) => r.tool);
   const uniqueTools = [...new Set(tools)];
-  const agents = [...new Set(result.resolvedRequests.map((r) => r.agentId).filter(Boolean))];
+  const agents = [...new Set(result.resolvedRequests.map((r) => r.sbSlug).filter(Boolean))];
 
   let scopeLabel = '';
   if (result.action === 'grant-session') scopeLabel = ' (session scope)';
@@ -365,7 +364,7 @@ export async function notifyPlatformOfApprovalRequest(request: {
   tool: string;
   args?: string | null;
   reason?: string | null;
-  requestingAgentId: string;
+  requestingSlug: string;
   origin?: ApprovalOrigin | null;
   studioId?: string | null;
   sessionId?: string | null;
@@ -380,7 +379,7 @@ export async function notifyPlatformOfApprovalRequest(request: {
     tool: request.tool,
     args: request.args,
     reason: request.reason,
-    requestingAgentId: request.requestingAgentId,
+    requestingSlug: request.requestingSlug,
     origin: request.origin ?? null,
     studioId: request.studioId,
     sessionId: request.sessionId,
@@ -462,9 +461,9 @@ export function formatSingleNotification(req: BufferedRequest): string {
  * hides the one piece of context an away-mode approver has to judge on.
  */
 function formatRequester(req: BufferedRequest): string {
-  if (req.origin?.origin !== 'clone') return req.requestingAgentId;
+  if (req.origin?.origin !== 'clone') return req.requestingSlug;
   const label = req.origin.cloneLabel || req.origin.cloneId || 'clone';
-  return `${req.requestingAgentId} \u{1F300} ${label}`;
+  return `${req.requestingSlug} \u{1F300} ${label}`;
 }
 
 export function formatBatchNotification(requests: BufferedRequest[]): string {

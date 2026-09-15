@@ -20,7 +20,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: yarn
 
       # Rewrite git+ssh:// to git+https:// so transitive deps
@@ -33,6 +33,27 @@ jobs:
 
       - run: yarn test
 
+      # Shell, so it is not collected by vitest and would never run otherwise.
+      # Covers the commit-message credential guard and the hook that invokes it.
+      - name: Commit-message credential guard
+        run: sh scripts/check-commit-msg.test.sh
+
+      # The staged-file guard (pre-commit) and the pre-push replay, plus the
+      # parity check that keeps their vendor patterns identical to the
+      # commit-message guard's.
+      - name: Staged-file credential guard
+        run: sh scripts/check-staged-files.test.sh
+
+      - name: Pre-push commit replay
+        run: sh scripts/check-push.test.sh
+
+      # Every tracked file at HEAD, through the same guard the hooks run: no
+      # credential-shaped file, no vendor token, no email address off the
+      # fixture-domain list. The private-marker arm is the owner's machine's
+      # concern, so CI opts out of it explicitly with an empty list.
+      - name: Tree-wide personal-data and credential check
+        run: INK_PRIVATE_MARKERS=/dev/null sh scripts/check-staged-files.sh --tree HEAD
+
   integration-db-local:
     name: Integration DB Tests (Local Supabase)
     runs-on: ubuntu-latest
@@ -42,7 +63,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: yarn
 
       # Rewrite git+ssh:// to git+https:// so transitive deps
@@ -74,7 +95,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: yarn
 
       # Rewrite git+ssh:// to git+https:// so transitive deps

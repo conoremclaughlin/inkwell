@@ -15,8 +15,10 @@ export const DEFAULT_TURN_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
 export interface BackendRunRequest {
   backend: string;
-  agentId: string;
+  sbSlug: string;
   model?: string;
+  /** Reasoning effort for the spawn (claude: low | medium | high | xhigh | max). */
+  effort?: string;
   prompt: string;
   verbose?: boolean;
   passthroughArgs?: string[];
@@ -107,8 +109,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const parser = streaming ? adapter.createStreamParser!() : null;
 
   const prepared = adapter.prepare({
-    agentId: request.agentId,
+    sbSlug: request.sbSlug,
     model: request.model,
+    effort: request.effort,
     prompt: request.prompt,
     promptParts,
     passthroughArgs: request.passthroughArgs || [],
@@ -197,6 +200,13 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   };
 }
 
+/**
+ * The UTF-8 bytes of exactly what a spawn would hand the backend — every
+ * argv element plus stdin — prepared through the adapter and cleaned up
+ * without spawning. This is what a stateless parent's next request costs at
+ * the byte bound: envelope, system prompt, tool instructions and media alike
+ * (Lumen, PR #576 round 7).
+ */
 export async function runBackendTurn(request: BackendRunRequest): Promise<BackendRunResult> {
   return startBackendTurn(request).result;
 }

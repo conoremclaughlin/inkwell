@@ -1,3 +1,9 @@
+export interface ContextParts {
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
 export interface BackendTokenUsage {
   backend: string;
   inputTokens?: number;
@@ -6,6 +12,20 @@ export interface BackendTokenUsage {
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   reasoningTokens?: number;
+  /**
+   * The context this request was handed, normalized per backend at the
+   * adapter boundary. Anthropic bills input, cache reads and cache writes as
+   * three disjoint parts of one prompt, so they sum; OpenAI's input_tokens and
+   * Gemini's promptTokenCount already include their cached portion, so adding
+   * cacheReadTokens there would double-count (Lumen, PR #583 finding 2).
+   */
+  contextTokens?: number;
+  /**
+   * The parts `contextTokens` was computed from — the FINAL request's own
+   * input / cache read / cache write. Kept apart from the top-level fields,
+   * which for an agent run are the run's aggregate (Lumen, PR #583 round 3).
+   */
+  contextParts?: ContextParts;
   source: 'json' | 'text';
   /**
    * Per-model breakdown as the backend reported it, keyed exactly as reported.
@@ -72,7 +92,11 @@ function pick(...values: Array<unknown>): number | undefined {
 function normalizeUsageObject(
   obj: Record<string, unknown>
 ): Omit<BackendTokenUsage, 'backend' | 'source'> | null {
-  const usageCandidate = (obj.usage as Record<string, unknown> | undefined) || obj;
+  // Gemini nests its counts under usageMetadata (Lumen, PR #576 round 7).
+  const usageCandidate =
+    (obj.usage as Record<string, unknown> | undefined) ||
+    (obj.usageMetadata as Record<string, unknown> | undefined) ||
+    obj;
 
   const inputTokens = pick(
     usageCandidate.input_tokens,
@@ -94,7 +118,12 @@ function normalizeUsageObject(
     (usageCandidate.completion as Record<string, unknown> | undefined)?.tokens
   );
 
-  const totalTokens = pick(usageCandidate.total_tokens, usageCandidate.totalTokens);
+  // Gemini reports totalTokenCount (prompt + candidates + thoughts).
+  const totalTokens = pick(
+    usageCandidate.total_tokens,
+    usageCandidate.totalTokens,
+    usageCandidate.totalTokenCount
+  );
 
   const cacheReadTokens = pick(
     usageCandidate.cache_read_tokens,
@@ -111,9 +140,14 @@ function normalizeUsageObject(
     (usageCandidate.cache as Record<string, unknown> | undefined)?.write_tokens
   );
 
+  // Gemini counts thoughts APART from candidates; OpenAI's reasoning_tokens
+  // are already inside output_tokens. Only the former adds to a synthesized
+  // total (Lumen, PR #576 round 8).
+  const separateThoughts = toNumber(usageCandidate.thoughtsTokenCount);
   const reasoningTokens = pick(
     usageCandidate.reasoning_tokens,
     usageCandidate.reasoningTokens,
+    usageCandidate.thoughtsTokenCount,
     (usageCandidate.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens
   );
 
@@ -131,11 +165,13 @@ function normalizeUsageObject(
   return {
     inputTokens,
     outputTokens,
+    // A synthesized total keeps hidden reasoning — dropping it under-counts
+    // the window by exactly the part the model does not show.
     totalTokens:
       totalTokens !== undefined
         ? totalTokens
         : inputTokens !== undefined && outputTokens !== undefined
-          ? inputTokens + outputTokens
+          ? inputTokens + outputTokens + (separateThoughts ?? 0)
           : undefined,
     cacheReadTokens,
     cacheWriteTokens,
@@ -183,13 +219,16 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
     /(?:cache\s*write\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
   );
   const reasoningMatch = text.match(/(?:reasoning\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
+  // Gemini's text summaries label thoughts apart from candidates; they add.
+  const thoughtsMatch = text.match(/(?:thoughts?\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
 
   const inputTokens = pick(inputMatch?.[1]);
   const outputTokens = pick(outputMatch?.[1]);
   const totalTokens = pick(totalMatch?.[1]);
   const cacheReadTokens = pick(cacheReadMatch?.[1]);
   const cacheWriteTokens = pick(cacheWriteMatch?.[1]);
-  const reasoningTokens = pick(reasoningMatch?.[1]);
+  const reasoningTokens = pick(reasoningMatch?.[1], thoughtsMatch?.[1]);
+  const separateThoughts = pick(thoughtsMatch?.[1]);
 
   if (
     inputTokens === undefined &&
@@ -209,12 +248,33 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
       totalTokens !== undefined
         ? totalTokens
         : inputTokens !== undefined && outputTokens !== undefined
-          ? inputTokens + outputTokens
+          ? inputTokens + outputTokens + (separateThoughts ?? 0)
           : undefined,
     cacheReadTokens,
     cacheWriteTokens,
     reasoningTokens,
   };
+}
+
+/** Backends whose prompt caching is reported as parts DISJOINT from input. */
+const SUMMED_CACHE_BACKENDS = new Set(['claude', 'anthropic']);
+
+/**
+ * The context a request was handed, per that backend's own accounting.
+ * Anthropic: input + cache read + cache write (disjoint parts of one prompt).
+ * Everyone else (OpenAI, Gemini): input already includes the cached portion.
+ */
+export function providerContextTokens(
+  backend: string,
+  usage: Pick<BackendTokenUsage, 'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>
+): number | undefined {
+  if (SUMMED_CACHE_BACKENDS.has(backend.toLowerCase())) {
+    const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    return parts.length > 0 ? parts.reduce((a, b) => a + b, 0) : undefined;
+  }
+  return usage.inputTokens;
 }
 
 export function extractBackendTokenUsage(
@@ -226,24 +286,22 @@ export function extractBackendTokenUsage(
   if (!combined) return undefined;
 
   const jsonUsage = parseJsonUsage(combined);
-  if (jsonUsage) {
-    return {
-      backend,
-      source: 'json',
-      ...jsonUsage,
-    };
-  }
+  const parsed: BackendTokenUsage | undefined = jsonUsage
+    ? { backend, source: 'json', ...jsonUsage }
+    : (() => {
+        const textUsage = parseTextUsage(combined);
+        return textUsage ? { backend, source: 'text', ...textUsage } : undefined;
+      })();
+  if (!parsed) return undefined;
 
-  const textUsage = parseTextUsage(combined);
-  if (textUsage) {
-    return {
-      backend,
-      source: 'text',
-      ...textUsage,
-    };
-  }
-
-  return undefined;
+  // A buffered report is one usage object, so its parts are the request's.
+  const parts: ContextParts = {
+    ...(parsed.inputTokens !== undefined ? { inputTokens: parsed.inputTokens } : {}),
+    ...(parsed.cacheReadTokens !== undefined ? { cacheReadTokens: parsed.cacheReadTokens } : {}),
+    ...(parsed.cacheWriteTokens !== undefined ? { cacheWriteTokens: parsed.cacheWriteTokens } : {}),
+  };
+  const contextTokens = providerContextTokens(backend, parts);
+  return contextTokens === undefined ? parsed : { ...parsed, contextTokens, contextParts: parts };
 }
 
 export function formatBackendTokenUsage(usage: BackendTokenUsage): string {

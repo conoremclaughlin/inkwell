@@ -6,10 +6,10 @@
  * net before Claude Code spawn.
  */
 
-import { mkdir, readFile, writeFile, rm } from 'fs/promises';
-import { existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { mkdir, readFile, writeFile, rm, lstat } from 'fs/promises';
+import { join } from 'path';
 import { logger } from '../utils/logger';
+import { resolveInkCli, inkCliCommand } from './ink-cli';
 
 const CLAUDE_SETTINGS_REL = '.claude/settings.local.json';
 
@@ -57,35 +57,32 @@ interface ClaudeSettings {
 }
 
 /**
- * Resolve the `ink` CLI binary path for hook commands.
- * Checks well-known locations; falls back to bare `ink` (relies on PATH).
+ * The command prefix generated hooks use to reach `ink`: this checkout's own
+ * CLI build (or INK_CLI_PATH), never the global `~/.ink/bin/ink` link, which
+ * points at whichever checkout the OB last chose. A checkout with no build
+ * falls back to bare `ink`, resolved on the PATH of whoever runs the hook.
  */
-function resolveInkBinaryPath(worktreePath: string): string {
-  // 1. Global install location (symlinked by `yarn workspace @personal-context/cli install:cli`)
-  const globalPath = join(process.env.HOME || '~', '.local', 'bin', 'ink');
-  if (existsSync(globalPath)) return globalPath;
-
-  // 2. Main worktree node_modules (for PM2/server environments)
-  //    The main worktree is typically the parent dir without the `--slug` suffix
-  const base = dirname(worktreePath);
-  const mainName = worktreePath
-    .split('/')
-    .pop()
-    ?.replace(/--[^/]+$/, '');
-  if (mainName) {
-    const mainBin = join(base, mainName, 'node_modules', '.bin', 'ink');
-    if (existsSync(mainBin)) return mainBin;
-  }
-
-  // 3. Bare fallback
-  return 'ink';
+function inkHookCommand(): string {
+  const cli = resolveInkCli();
+  return cli ? inkCliCommand(cli) : 'ink';
 }
+
+/**
+ * Trailing shell comment that tells `ink hooks install` a hook line is ours.
+ * The CLI recognizes its own lines by the launcher's shape, but the launcher
+ * here may be an arbitrary INK_CLI_PATH, so every line the server writes
+ * carries the marker. Must match MANAGED_HOOK_MARKER in
+ * packages/cli/src/commands/hooks.ts; studio-settings-cli-install.test.ts
+ * runs the real installer on this generator's output to pin the two.
+ */
+const MANAGED_HOOK_MARKER = '# ink-managed';
 
 /**
  * Build Claude Code lifecycle hooks that mirror `ink hooks install --claude-code`.
  */
-function buildHooks(inkPath: string): Record<string, unknown> {
-  const cmd = (hookName: string) => `${inkPath} hooks ${hookName} --backend claude-code`;
+function buildHooks(inkCommand: string): Record<string, unknown> {
+  const cmd = (hookName: string) =>
+    `${inkCommand} hooks ${hookName} --backend claude-code ${MANAGED_HOOK_MARKER}`;
 
   return {
     PreCompact: [{ hooks: [{ type: 'command', command: cmd('pre-compact') }] }],
@@ -108,6 +105,20 @@ function buildHooks(inkPath: string): Record<string, unknown> {
 export async function ensureStudioSettings(worktreePath: string): Promise<boolean> {
   const settingsPath = join(worktreePath, CLAUDE_SETTINGS_REL);
 
+  // Never write through a link. A checkout can ship `.claude`, or the settings
+  // file itself, as a symlink to anywhere; merging and writing would then land
+  // outside the worktree (Lumen, PR #604). lstat sees the link, not its target.
+  for (const candidate of [join(worktreePath, '.claude'), settingsPath]) {
+    const entry = await lstat(candidate).catch(() => null);
+    if (entry?.isSymbolicLink()) {
+      logger.warn('Refusing to write studio settings through a symlink', {
+        worktreePath,
+        path: candidate,
+      });
+      return false;
+    }
+  }
+
   let existing: ClaudeSettings = {};
   try {
     const raw = await readFile(settingsPath, 'utf-8');
@@ -125,7 +136,7 @@ export async function ensureStudioSettings(worktreePath: string): Promise<boolea
     return false;
   }
 
-  const inkPath = resolveInkBinaryPath(worktreePath);
+  const inkCommand = inkHookCommand();
 
   const settings: ClaudeSettings = {
     ...existing,
@@ -133,7 +144,7 @@ export async function ensureStudioSettings(worktreePath: string): Promise<boolea
       allow: DEFAULT_ALLOW_RULES,
       deny: DEFAULT_DENY_RULES,
     },
-    hooks: existing.hooks || buildHooks(inkPath),
+    hooks: existing.hooks || buildHooks(inkCommand),
     enableAllProjectMcpServers: existing.enableAllProjectMcpServers ?? true,
   };
 

@@ -960,6 +960,52 @@ export type Database = {
           },
         ];
       };
+      artifact_uri_aliases: {
+        Row: {
+          alias_uri: string;
+          artifact_id: string;
+          created_at: string;
+          id: string;
+          user_id: string;
+          workspace_id: string | null;
+        };
+        Insert: {
+          alias_uri: string;
+          artifact_id: string;
+          created_at?: string;
+          id?: string;
+          user_id: string;
+          workspace_id?: string | null;
+        };
+        Update: {
+          alias_uri?: string;
+          artifact_id?: string;
+          created_at?: string;
+          id?: string;
+          user_id?: string;
+          workspace_id?: string | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'artifact_uri_aliases_artifact_id_fkey';
+            columns: ['artifact_id'];
+            referencedRelation: 'artifacts';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'artifact_uri_aliases_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'artifact_uri_aliases_workspace_id_fkey';
+            columns: ['workspace_id'];
+            referencedRelation: 'workspaces';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       artifacts: {
         Row: {
           artifact_type: string;
@@ -1377,98 +1423,6 @@ export type Database = {
           },
         ];
       };
-      context_history: {
-        Row: {
-          archived_at: string | null;
-          change_type: string;
-          context_id: string;
-          context_key: string | null;
-          context_type: string;
-          created_at: string;
-          id: string;
-          metadata: Json | null;
-          summary: string;
-          user_id: string;
-          version: number;
-        };
-        Insert: {
-          archived_at?: string | null;
-          change_type?: string;
-          context_id: string;
-          context_key?: string | null;
-          context_type: string;
-          created_at: string;
-          id?: string;
-          metadata?: Json | null;
-          summary: string;
-          user_id: string;
-          version: number;
-        };
-        Update: {
-          archived_at?: string | null;
-          change_type?: string;
-          context_id?: string;
-          context_key?: string | null;
-          context_type?: string;
-          created_at?: string;
-          id?: string;
-          metadata?: Json | null;
-          summary?: string;
-          user_id?: string;
-          version?: number;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'context_history_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
-      context_summaries: {
-        Row: {
-          context_key: string | null;
-          context_type: string;
-          created_at: string | null;
-          id: string;
-          metadata: Json | null;
-          summary: string;
-          updated_at: string | null;
-          user_id: string;
-          version: number | null;
-        };
-        Insert: {
-          context_key?: string | null;
-          context_type: string;
-          created_at?: string | null;
-          id?: string;
-          metadata?: Json | null;
-          summary: string;
-          updated_at?: string | null;
-          user_id: string;
-          version?: number | null;
-        };
-        Update: {
-          context_key?: string | null;
-          context_type?: string;
-          created_at?: string | null;
-          id?: string;
-          metadata?: Json | null;
-          summary?: string;
-          updated_at?: string | null;
-          user_id?: string;
-          version?: number | null;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'context_summaries_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
       conversations: {
         Row: {
           created_at: string | null;
@@ -1554,6 +1508,70 @@ export type Database = {
             foreignKeyName: 'group_challenge_codes_workspace_id_fkey';
             columns: ['workspace_id'];
             referencedRelation: 'workspaces';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      heartbeat_notifications: {
+        Row: {
+          attempts: number;
+          created_at: string;
+          delivered_at: string | null;
+          destination: string | null;
+          episode_closed_at: string | null;
+          episode_key: string;
+          failed_beats: number;
+          id: string;
+          kind: string;
+          last_attempt_at: string | null;
+          last_error: string | null;
+          next_attempt_at: string | null;
+          reminder_id: string;
+          status: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key: string;
+          failed_beats?: number;
+          id?: string;
+          kind: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id: string;
+          status?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key?: string;
+          failed_beats?: number;
+          id?: string;
+          kind?: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id?: string;
+          status?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'heartbeat_notifications_reminder_id_fkey';
+            columns: ['reminder_id'];
+            referencedRelation: 'scheduled_reminders';
             referencedColumns: ['id'];
           },
         ];
@@ -3153,6 +3171,12 @@ export type Database = {
           cli_attached: boolean | null;
           cli_poll_at: string | null;
           cli_turn_at: string | null;
+          cli_turn_stopped_at: string | null;
+          cli_turn_fence_generation: string | null;
+          cli_turn_fenced_attempts: Json;
+          cli_turn_attempt_claims: Json;
+          cli_turn_missing_stop_at: string | null;
+          turn_epoch: string | null;
           compacting_since: string | null;
           contact_id: string | null;
           context: string | null;
@@ -3185,6 +3209,12 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_stopped_at?: string | null;
+          cli_turn_fence_generation?: string | null;
+          cli_turn_fenced_attempts?: Json;
+          cli_turn_attempt_claims?: Json;
+          cli_turn_missing_stop_at?: string | null;
+          turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -3217,6 +3247,12 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_stopped_at?: string | null;
+          cli_turn_fence_generation?: string | null;
+          cli_turn_fenced_attempts?: Json;
+          cli_turn_attempt_claims?: Json;
+          cli_turn_missing_stop_at?: string | null;
+          turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -4711,6 +4747,62 @@ export type Database = {
           p_row_severity: string;
         };
         Returns: boolean;
+      };
+      reopen_inbox_thread: {
+        Args: {
+          p_thread_id: string;
+          p_actor_kind: string;
+          p_actor_agent_id?: string | null;
+        };
+        Returns: boolean;
+      };
+      add_graph_nodes: {
+        Args: {
+          p_user_id: string;
+          p_task_group_id: string;
+          p_expected_version: number;
+          p_nodes: Json;
+          p_edges: Json;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_system_actor?: boolean;
+          p_constructor?: string | null;
+          p_constructor_version?: string | null;
+          p_config_hash?: string | null;
+        };
+        Returns: Json;
+      };
+      reconcile_graph_dispatch_stamps: {
+        Args: {
+          p_stale_before: string;
+          p_live_window_ms?: number;
+        };
+        Returns: Json;
+      };
+      claim_turn_epoch: {
+        Args: {
+          p_session_id: string;
+          p_set_running?: boolean;
+          p_not_stopped_after?: string;
+          p_studio_id?: string;
+          p_regrant?: Json;
+          p_attempt?: string;
+        };
+        Returns: Json;
+      };
+      fence_turn_attempts: {
+        Args: {
+          p_session_id: string;
+          p_attempts: Json;
+        };
+        Returns: string;
+      };
+      repoint_sessions_off_ephemeral: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+        };
+        Returns: number;
       };
       apply_task_graph: {
         Args: {

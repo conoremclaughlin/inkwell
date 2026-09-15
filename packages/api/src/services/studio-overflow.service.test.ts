@@ -6,8 +6,8 @@
  * gated on winning the teardown claim.
  */
 
-import { describe, it, expect, vi } from 'vitest';
-import { mkdtemp, rm } from 'fs/promises';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { mkdtemp, mkdir, rm, writeFile, access, symlink, readFile, lstat } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { tmpdir } from 'os';
@@ -31,15 +31,34 @@ import {
   slugHash,
   overflowSlug,
   StudioOverflowService,
+  pullRequestDetachTarget,
 } from './studio-overflow.service';
 import type { Studio, StudiosRepository } from '../data/repositories/studios.repository';
 import type { StudioLeaseService, StudioLease } from './studio-lease.service';
+import { readCheckoutPin } from './studio-lease.service';
+import { ephemeralWorktreePath } from './studio-paths';
+
+// Every ephemeral mint in this file materializes under an isolated root —
+// never the real ~/.ink/studios. Restored so parallel-worker siblings that
+// share this process env are unaffected after the file completes.
+let studiosRootOverride: string;
+let prevStudiosRoot: string | undefined;
+beforeAll(async () => {
+  prevStudiosRoot = process.env.INK_STUDIOS_ROOT;
+  studiosRootOverride = await mkdtemp(path.join(tmpdir(), 'ink-studios-root-'));
+  process.env.INK_STUDIOS_ROOT = studiosRootOverride;
+});
+afterAll(async () => {
+  if (prevStudiosRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+  else process.env.INK_STUDIOS_ROOT = prevStudiosRoot;
+  await rm(studiosRootOverride, { recursive: true, force: true });
+});
 
 function makeStudio(overrides: Partial<Studio> = {}): Studio {
   return {
     id: 'parent-1',
     userId: 'user-1',
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     sessionId: null,
     repoRoot: '/ws/pcp/inkwell',
     worktreePath: '/ws/pcp/inkwell--lumen-review',
@@ -70,7 +89,7 @@ function makeTeardownClaim(): StudioLease {
   return {
     sessionId: '00000000-0000-0000-0000-000000000000',
     threadKey: '__quarantine__',
-    agentId: 'system',
+    sbSlug: 'system',
     acquiredAt: now,
     heartbeatAt: now,
     quarantined: true,
@@ -140,7 +159,7 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio(),
         threadKey: 'pr:476',
       });
@@ -164,7 +183,8 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     const findBySlug = vi
       .fn()
       .mockResolvedValueOnce(collider) // primary slug → unrelated studio
-      .mockResolvedValueOnce(null); // hash variant → free
+      .mockResolvedValueOnce(null) // hash variant → free
+      .mockResolvedValue(null); // the exhausted reread asks again; still free
     const studios = {
       findBySlug,
       create: vi.fn(),
@@ -178,13 +198,15 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     // NOT revived.
     const result = await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: makeStudio({ repoRoot: '/nonexistent/repo' }),
       threadKey: 'pr:476',
     });
 
     expect(result).toBeNull();
-    expect(findBySlug).toHaveBeenCalledTimes(2);
+    // Two reads for the candidate walk, two more for the exhausted reread
+    // that looks for a rival's published row before failing closed.
+    expect(findBySlug).toHaveBeenCalledTimes(4);
     expect(studios.update).not.toHaveBeenCalled();
   });
 
@@ -197,7 +219,11 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
       threadKey: 'pr:9999',
       metadata: { overflow: true },
     });
-    const findBySlug = vi.fn().mockResolvedValueOnce(otherThreads).mockResolvedValueOnce(null);
+    const findBySlug = vi
+      .fn()
+      .mockResolvedValueOnce(otherThreads)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(null); // the exhausted reread asks again; still free
     const studios = {
       findBySlug,
       create: vi.fn(),
@@ -208,13 +234,98 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     const service = new StudioOverflowService(studios, leases);
     const result = await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: makeStudio({ repoRoot: '/nonexistent/repo' }),
       threadKey: 'pr:476',
     });
 
     expect(result).toBeNull();
     expect(studios.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('StudioOverflowService.findOverflowStudio — read-only half of the ladder (v18 S3)', () => {
+  it('returns the live matching overflow without creating, reviving, or updating anything', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-find-'));
+    try {
+      const existing = makeStudio({
+        id: 'eph-1',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const studios = {
+        findBySlug: vi.fn().mockResolvedValue(existing),
+        create: vi.fn(),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.findOverflowStudio({
+        userId: 'user-1',
+        parentStudio: makeStudio(),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-1');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).not.toHaveBeenCalled();
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  it('returns null when no overflow exists — plan-time lookups never mint', async () => {
+    const studios = {
+      findBySlug: vi.fn().mockResolvedValue(null),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    const result = await service.findOverflowStudio({
+      userId: 'user-1',
+      parentStudio: makeStudio(),
+      threadKey: 'pr:476',
+    });
+
+    expect(result).toBeNull();
+    expect(studios.create).not.toHaveBeenCalled();
+    expect(studios.update).not.toHaveBeenCalled();
+  });
+
+  it('skips a matching row whose worktree is gone — finds, never revives (ensure would)', async () => {
+    const existing = makeStudio({
+      id: 'eph-cleaned',
+      slug: 'lumen-review--pr-476',
+      ephemeral: true,
+      parentStudioId: 'parent-1',
+      threadKey: 'pr:476',
+      metadata: { overflow: true },
+      worktreePath: '/nonexistent/worktree/path',
+    });
+    const studios = {
+      findBySlug: vi.fn().mockResolvedValueOnce(existing).mockResolvedValueOnce(null),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    const result = await service.findOverflowStudio({
+      userId: 'user-1',
+      parentStudio: makeStudio(),
+      threadKey: 'pr:476',
+    });
+
+    expect(result).toBeNull();
+    expect(studios.update).not.toHaveBeenCalled();
+    expect(studios.create).not.toHaveBeenCalled();
   });
 });
 
@@ -261,7 +372,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     // decides its name.
     await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: chainEnd,
       threadKey: 'pr:474',
     });
@@ -301,7 +412,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: own,
         threadKey: 'pr:476',
       });
@@ -314,20 +425,20 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     }
   });
 
-  // Transition hazard: legacy chained worktrees keep flat `eph/` branches
-  // checked out, so a post-fix flat mint fails `git worktree add` on
-  // `already used by worktree`. Creation failure must fall through to the
-  // hash variant (fresh slug AND fresh branch), not give up. Real repo so
-  // the primary genuinely fails on the branch and the variant genuinely
-  // succeeds.
-  it('a branch held by a legacy worktree falls through to the hash variant', async () => {
+  // Ephemeral worktrees check out DETACHED (Conor, 2026-09-01): no
+  // `<agent>/eph/*` branch is minted, so a legacy worktree still holding the
+  // old flat branch name is no obstacle at all — the primary variant
+  // succeeds where it used to fail with `already used by worktree` and force
+  // the hash fallback. Real repo so the detached add genuinely runs.
+  it('a legacy eph-branch holder no longer blocks the primary variant — detached checkout', async () => {
     const repoRoot = await makeGitRepo();
     const blocker = path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--legacy-chain`);
-    const hashSlug = `lumen-review--pr-476-h${slugHash('pr:476')}`;
-    const hashWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--${hashSlug}`
-    );
+    const primarySlug = 'lumen-review--pr-476';
+    const primaryWorktree = ephemeralWorktreePath({
+      sbSlug: 'lumen',
+      repoRoot,
+      leaf: primarySlug,
+    });
     try {
       // The legacy chained studio still has the flat eph/ branch checked out.
       await execFileAsync('git', ['worktree', 'add', '-b', 'lumen/eph/pr-476', blocker, 'main'], {
@@ -339,7 +450,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
         findBySlug: vi.fn().mockResolvedValue(null),
         create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
           createdInputs.push(input);
-          return Promise.resolve(makeStudio({ id: 'new-hash', ...(input as Partial<Studio>) }));
+          return Promise.resolve(makeStudio({ id: 'new-primary', ...(input as Partial<Studio>) }));
         }),
         update: vi.fn(),
       } as unknown as StudiosRepository;
@@ -348,17 +459,30 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
 
-      expect(result?.id).toBe('new-hash');
+      expect(result?.id).toBe('new-primary');
       expect(createdInputs).toHaveLength(1);
-      expect(createdInputs[0].branch).toBe(`lumen/eph/pr-476-h${slugHash('pr:476')}`);
-      expect(String(createdInputs[0].worktreePath)).toContain(hashSlug);
+      // The sentinel, not a branch name: the row records "no branch, cut from main".
+      expect(createdInputs[0].branch).toBe('detached:main');
+      expect(createdInputs[0].slug).toBe(primarySlug);
+      expect(String(createdInputs[0].worktreePath)).toContain(primarySlug);
+
+      // The checkout really is detached, and no new eph branch exists.
+      const { stdout: head } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: primaryWorktree,
+      });
+      expect(head.trim()).toBe('HEAD');
+      const { stdout: branches } = await execFileAsync('git', ['branch', '--list', 'lumen/eph/*'], {
+        cwd: repoRoot,
+      });
+      // Only the legacy blocker's branch — nothing newly minted.
+      expect(branches.trim().split('\n').filter(Boolean)).toHaveLength(1);
     } finally {
-      await execFileAsync('git', ['worktree', 'remove', '--force', hashWorktree], {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
         cwd: repoRoot,
       }).catch(() => undefined);
       await execFileAsync('git', ['worktree', 'remove', '--force', blocker], {
@@ -376,10 +500,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   it('an existing hash-variant studio is reused before the primary is reminted', async () => {
     const repoRoot = await makeGitRepo();
     const hashWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-hash-'));
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      sbSlug: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const root = makeStudio({ repoRoot, worktreePath: repoRoot });
       const hashRow = makeStudio({
@@ -406,7 +531,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: root,
         threadKey: 'pr:476',
       });
@@ -434,10 +559,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   // still fails closed with null.
   it('a revive loss with no live winner fails the call and removes the created worktree', async () => {
     const repoRoot = await makeGitRepo();
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      sbSlug: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const cleanedRow = makeStudio({
         id: 'eph-cleaned',
@@ -464,7 +590,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -489,10 +615,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   it('an insert loss converges on the concurrent winner instead of failing', async () => {
     const repoRoot = await makeGitRepo();
     const winnerWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-winner-'));
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      sbSlug: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const winnerRow = makeStudio({
         id: 'eph-winner',
@@ -529,7 +656,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -554,10 +681,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   // disagree about whether it is live.
   it('reviving an archived studio clears archived_at as well as cleaned_at', async () => {
     const repoRoot = await makeGitRepo();
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      sbSlug: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const archivedRow = makeStudio({
         id: 'eph-archived',
@@ -588,7 +716,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -636,13 +764,122 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     const service = new StudioOverflowService(studios, leases);
     const result = await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: ephA,
       threadKey: 'pr:476',
     });
 
     expect(result).toBeNull();
     expect(findById).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
+  // The whole point of the root: paths are `<root>/<agent>/<project>/<slug>`,
+  // flat by construction, and the row slug travels explicitly because the
+  // path no longer encodes it. The expectation is hand-built — using the
+  // helper here would let a helper bug self-certify.
+  it('ephemeral mints materialize under the root with an explicit slug', async () => {
+    // A canonical repo basename, so the hand-built expectation needs no
+    // digest arithmetic (mkdtemp basenames are mixed-case → digest-suffixed).
+    const holder = await mkdtemp(path.join(tmpdir(), 'overflow-canon-'));
+    const repoRoot = path.join(holder, 'inkwell-fixture');
+    await mkdir(repoRoot);
+    await execFileAsync('git', ['init', '-b', 'main'], { cwd: repoRoot });
+    await execFileAsync(
+      'git',
+      [
+        '-c',
+        'user.email=test@test',
+        '-c',
+        'user.name=test',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'init',
+      ],
+      { cwd: repoRoot }
+    );
+    const expected = path.join(
+      studiosRootOverride,
+      'lumen',
+      'inkwell-fixture',
+      'lumen-review--pr-476'
+    );
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'new-root', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('new-root');
+      expect(createdInputs[0].worktreePath).toBe(expected);
+      expect(createdInputs[0].slug).toBe('lumen-review--pr-476');
+      // The worktree genuinely exists at the canonical location.
+      const { access: fsAccess } = await import('fs/promises');
+      await expect(fsAccess(expected)).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', expected], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(holder, { recursive: true, force: true });
+    }
+  });
+
+  // Scope boundary: durable homes are checkouts a human also lives in. Only
+  // the EPHEMERAL mints move; the D1 parent stays a sibling of the repo.
+  it('the durable D1 parent studio stays a sibling of the repo, not under the root', async () => {
+    const repoRoot = await makeGitRepo();
+    const createdInputs: Array<Record<string, unknown>> = [];
+    try {
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        findByRepoRoot: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'parent-new', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureParentStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        repoRoot,
+      });
+
+      expect(result?.id).toBe('parent-new');
+      const worktreePath = String(createdInputs[0].worktreePath);
+      expect(path.dirname(worktreePath)).toBe(path.dirname(repoRoot));
+      expect(worktreePath.startsWith(studiosRootOverride)).toBe(false);
+    } finally {
+      if (createdInputs[0]?.worktreePath) {
+        await execFileAsync(
+          'git',
+          ['worktree', 'remove', '--force', String(createdInputs[0].worktreePath)],
+          { cwd: repoRoot }
+        ).catch(() => undefined);
+      }
+      await rm(repoRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -714,6 +951,726 @@ describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
       expect(conflictCall?.[3]?.reason).toContain('teardown-aborted-rescue-failed');
     } finally {
       await rm(nonRepoDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+});
+
+describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', () => {
+  function multiplexedStudio(threadKeys: string[]): Studio {
+    const now = new Date().toISOString();
+    return makeStudio({
+      ephemeral: true,
+      threadKey: 'pr:A',
+      lease: {
+        sessionId: 'session-b',
+        threadKey: 'pr:A',
+        threadKeys,
+        sbSlug: 'wren',
+        acquiredAt: now,
+        heartbeatAt: now,
+      } as unknown as Studio['lease'],
+    });
+  }
+
+  it('skips teardown — and the expires_at pull — while another live key rides the lease', async () => {
+    // The spec-mandated case: ephemeral created for pr:A, session appended
+    // pr:B, pr:A closes. The studio and lease must survive holding pr:B, and
+    // the claim-refusal path's "retry teardown soon" expires_at pull must
+    // never fire against a studio that has to keep living.
+    const update = vi.fn();
+    const studios = {
+      markCleaned: vi.fn(),
+      update,
+      listEphemeralByThread: vi.fn().mockResolvedValue([multiplexedStudio(['pr:A', 'pr:B'])]),
+    } as unknown as StudiosRepository;
+    const claimForTeardown = vi.fn();
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:A', {
+      reason: 'thread pr:A closed',
+    });
+
+    expect(closed).toBe(0);
+    expect(claimForTeardown).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('proceeds to the fenced teardown when the closing key is the created-for thread', async () => {
+    // The pre-multiplex lifecycle: built for pr:B, only ever served pr:B —
+    // the created-for query legitimately finds it.
+    const update = vi.fn().mockResolvedValue(makeStudio());
+    const created = makeStudio({ ephemeral: true, threadKey: 'pr:B', lease: null });
+    const studios = {
+      markCleaned: vi.fn(),
+      update,
+      listEphemeralByThread: vi
+        .fn()
+        .mockImplementation(async (_userId: string, threadKey: string) =>
+          threadKey === 'pr:B' ? [created] : []
+        ),
+    } as unknown as StudiosRepository;
+    // Claim refused (live holder) — the point is only that the fenced path
+    // WAS attempted for the survivor key; its own gates still apply.
+    const claimForTeardown = vi.fn().mockResolvedValue(null);
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+    });
+
+    expect(closed).toBe(1);
+    expect(claimForTeardown).toHaveBeenCalledWith('parent-1', 'user-1', {
+      expectedThreadKey: 'pr:B',
+      reason: 'teardown-claim (thread pr:B closed)',
+    });
+  });
+
+  it('a created-for-A ephemeral is found through the close candidates when B closes last (Lumen r1 P1-2)', async () => {
+    // Production shape: studios.thread_key = 'pr:A' (created-for), lease
+    // already released by releaseByThread — the created-for query for pr:B
+    // returns NOTHING, and nothing on the row remembers pr:B. Discovery has
+    // to come from the close path handing over the studios whose lease the
+    // thread actually rode.
+    const createdForA = makeStudio({ ephemeral: true, threadKey: 'pr:A', lease: null });
+    const listEphemeralByThread = vi
+      .fn()
+      .mockImplementation(async (_userId: string, threadKey: string) =>
+        threadKey === 'pr:A' ? [createdForA] : []
+      );
+    const findById = vi
+      .fn()
+      .mockImplementation(async (id: string) => (id === 'parent-1' ? createdForA : null));
+    const studios = {
+      markCleaned: vi.fn(),
+      update: vi.fn().mockResolvedValue(createdForA),
+      listEphemeralByThread,
+      findById,
+    } as unknown as StudiosRepository;
+    const claimForTeardown = vi.fn().mockResolvedValue(null);
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    // Without candidates: invisible — this IS the P1-2 gap, pinned.
+    const withoutCandidates = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+    });
+    expect(withoutCandidates).toBe(0);
+    expect(claimForTeardown).not.toHaveBeenCalled();
+
+    // With the close path's candidates: discovered and fenced-torn-down.
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+      candidateStudioIds: ['parent-1'],
+    });
+    expect(closed).toBe(1);
+    expect(claimForTeardown).toHaveBeenCalledWith('parent-1', 'user-1', {
+      expectedThreadKey: 'pr:B',
+      reason: 'teardown-claim (thread pr:B closed)',
+    });
+  });
+
+  it('candidate ids never widen scope: foreign or durable studios are ignored', async () => {
+    const foreign = makeStudio({ id: 'foreign-1', ephemeral: true, userId: 'user-2', lease: null });
+    const durable = makeStudio({ id: 'durable-1', ephemeral: false, lease: null });
+    const findById = vi
+      .fn()
+      .mockImplementation(async (id: string) =>
+        id === 'foreign-1' ? foreign : id === 'durable-1' ? durable : null
+      );
+    const studios = {
+      markCleaned: vi.fn(),
+      update: vi.fn(),
+      listEphemeralByThread: vi.fn().mockResolvedValue([]),
+      findById,
+    } as unknown as StudiosRepository;
+    const claimForTeardown = vi.fn();
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+      candidateStudioIds: ['foreign-1', 'durable-1', 'missing-1'],
+    });
+    expect(closed).toBe(0);
+    expect(claimForTeardown).not.toHaveBeenCalled();
+  });
+});
+
+// ── PR threads detach at the PR head (studio-model, piece 2) ──
+
+/**
+ * A repo whose `origin` is a bare clone holding a PR head that NO local branch
+ * reaches — the shape of reviewing someone else's PR. The PR commit is made on
+ * a throwaway branch, published to origin as `refs/pull/<n>/head` (GitHub's
+ * convention), and the branch is deleted locally.
+ */
+async function makeGitRepoWithPullRef(
+  prNumber: number,
+  opts: { yarnTrap?: boolean; startupTrap?: boolean; symlinkTrap?: string } = {}
+): Promise<{ repoRoot: string; origin: string; prHead: string; mainHead: string }> {
+  const repoRoot = await makeGitRepo();
+  const origin = await mkdtemp(path.join(tmpdir(), 'overflow-origin-'));
+  const git = (args: string[], cwd = repoRoot) => execFileAsync('git', args, { cwd });
+  if (opts.yarnTrap) {
+    // Lumen's PR #604 probe: the repo's own Yarn config decides which binary
+    // `yarn install` runs. The trap "binary" only writes a marker into the
+    // worktree, so a test can SEE whether the package manager executed.
+    await writeFile(path.join(repoRoot, 'package.json'), '{"name":"trap","private":true}\n');
+    await writeFile(path.join(repoRoot, '.yarnrc.yml'), 'yarnPath: ./fake-yarn.cjs\n');
+    await writeFile(
+      path.join(repoRoot, 'fake-yarn.cjs'),
+      "require('fs').writeFileSync(require('path').join(process.cwd(), 'PR-CODE-RAN.marker'), 'ran');\n"
+    );
+    await git(['add', '.']);
+    await git(['-c', 'user.email=test@test', '-c', 'user.name=test', 'commit', '-m', 'yarn trap']);
+  }
+  await git(['init', '--bare', '-b', 'main'], origin);
+  await git(['remote', 'add', 'origin', origin]);
+  await git(['push', '-q', 'origin', 'main']);
+  const { stdout: mainSha } = await git(['rev-parse', 'HEAD']);
+  await git(['checkout', '-q', '-b', 'pr-source']);
+  if (opts.startupTrap) {
+    // Lumen's PR #604 round-2 probe: the PR TRACKS the startup config a
+    // review session would execute or trust — an MCP server, a SessionStart
+    // hook, per-backend config. Bootstrap seeds only when absent, so without
+    // quarantine these copies win.
+    await writeFile(
+      path.join(repoRoot, '.mcp.json'),
+      JSON.stringify({ mcpServers: { 'pr-trap': { command: '/bin/false' } } })
+    );
+    await mkdir(path.join(repoRoot, '.claude'), { recursive: true });
+    await writeFile(
+      path.join(repoRoot, '.claude', 'settings.local.json'),
+      JSON.stringify({
+        hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'touch PR-HOOK-RAN' }] }] },
+      })
+    );
+    await mkdir(path.join(repoRoot, '.codex'), { recursive: true });
+    await writeFile(
+      path.join(repoRoot, '.codex', 'config.toml'),
+      '[mcp_servers.pr-trap]\ncommand = "/bin/false"\n'
+    );
+    await writeFile(
+      path.join(repoRoot, '.env'),
+      'NODE_OPTIONS=--trace-warnings\nPR_ENV_MARKER=1\n'
+    );
+    await mkdir(path.join(repoRoot, '.gemini'), { recursive: true });
+    await writeFile(
+      path.join(repoRoot, '.gemini', 'settings.json'),
+      JSON.stringify({ mcpServers: { 'pr-trap': {} } })
+    );
+    await git(['add', '.']);
+  }
+  if (opts.symlinkTrap) {
+    // The PR ships `.claude` as a link to a directory OUTSIDE the checkout.
+    await symlink(opts.symlinkTrap, path.join(repoRoot, '.claude'));
+    await git(['add', '.claude']);
+  }
+  await git([
+    '-c',
+    'user.email=test@test',
+    '-c',
+    'user.name=test',
+    'commit',
+    '--allow-empty',
+    '-m',
+    `pr ${prNumber} head`,
+  ]);
+  const { stdout: prSha } = await git(['rev-parse', 'HEAD']);
+  await git(['push', '-q', 'origin', `HEAD:refs/pull/${prNumber}/head`]);
+  await git(['checkout', '-q', 'main']);
+  await git(['branch', '-D', 'pr-source']);
+  if (opts.startupTrap) {
+    // The TRUSTED copy bootstrap seeds from: the main root's own, untracked
+    // `.mcp.json` (written after the PR commit so it never enters git).
+    await writeFile(
+      path.join(repoRoot, '.mcp.json'),
+      JSON.stringify({ mcpServers: { trusted: { command: '/bin/true' } } })
+    );
+  }
+  return { repoRoot, origin, prHead: prSha.trim(), mainHead: mainSha.trim() };
+}
+
+describe('pullRequestDetachTarget', () => {
+  it('names the GitHub pull ref for a pr thread, with or without a project prefix', () => {
+    expect(pullRequestDetachTarget('pr:591')).toEqual({
+      number: 591,
+      fetchRefspec: '+refs/pull/591/head:refs/remotes/origin/pr/591',
+      localRef: 'refs/remotes/origin/pr/591',
+      label: 'origin/pr/591',
+    });
+    expect(pullRequestDetachTarget('inktrade:pr:42')?.localRef).toBe('refs/remotes/origin/pr/42');
+  });
+
+  it('is null for every other thread shape — those detach at the base branch', () => {
+    for (const key of [
+      'task:abc',
+      'branch:wren/feat/x',
+      'spec:studio-model',
+      'pr:abc',
+      'pr:',
+      'pr',
+    ]) {
+      expect(pullRequestDetachTarget(key)).toBeNull();
+    }
+  });
+});
+
+describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at the PR head', () => {
+  function capturingRepo(createdInputs: Array<Record<string, unknown>>) {
+    return {
+      findById: vi.fn(),
+      findBySlug: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+        createdInputs.push(input);
+        return Promise.resolve(makeStudio({ id: 'new-primary', ...(input as Partial<Studio>) }));
+      }),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+  }
+
+  it('checks out the PR head, pins the commit on the row, and mints no branch', async () => {
+    const { repoRoot, origin, prHead } = await makeGitRepoWithPullRef(7);
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+
+      expect(result?.id).toBe('new-primary');
+      expect(createdInputs).toHaveLength(1);
+      expect(createdInputs[0].branch).toBe('detached:origin/pr/7');
+      expect(createdInputs[0].metadata).toEqual({
+        overflow: true,
+        checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
+      });
+
+      // The worktree really sits on the PR's commit, detached.
+      const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+      expect(head.trim()).toBe(prHead);
+      const { stdout: abbrev } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: worktree,
+      });
+      expect(abbrev.trim()).toBe('HEAD');
+      // No branch was created anywhere — only main exists.
+      const { stdout: branches } = await execFileAsync('git', ['branch', '--list'], {
+        cwd: repoRoot,
+      });
+      expect(
+        branches
+          .split('\n')
+          .map((line) => line.replace(/^\*?\s*/, '').trim())
+          .filter(Boolean)
+      ).toEqual(['main']);
+      // The fetched head lives under a remote-tracking ref, not a branch.
+      const { stdout: tracking } = await execFileAsync(
+        'git',
+        ['rev-parse', 'refs/remotes/origin/pr/7'],
+        { cwd: repoRoot }
+      );
+      expect(tracking.trim()).toBe(prHead);
+      // The checkout pin travels with the worktree, in its own gitdir.
+      await expect(readCheckoutPin(worktree)).resolves.toEqual({
+        commit: prHead,
+        ref: 'refs/remotes/origin/pr/7',
+      });
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the base branch when the PR ref cannot be fetched — still detached, still no branch', async () => {
+    const { repoRoot, origin, mainHead } = await makeGitRepoWithPullRef(7);
+    const slug = 'lumen-review--pr-404';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+
+      // origin exists, but no PR 404 does.
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:404',
+      });
+
+      expect(result?.id).toBe('new-primary');
+      expect(createdInputs[0].branch).toBe('detached:main');
+      expect(createdInputs[0].metadata).toEqual({
+        overflow: true,
+        checkout: { mode: 'detached', ref: 'main', commit: mainHead },
+      });
+      const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+      expect(head.trim()).toBe(mainHead);
+      const { stdout: branches } = await execFileAsync('git', ['branch', '--list'], {
+        cwd: repoRoot,
+      });
+      expect(branches.split('\n').filter((l) => l.trim()).length).toBe(1);
+      // Pinned to what it actually checked out — no ref, since none was fetched.
+      await expect(readCheckoutPin(worktree)).resolves.toEqual({ commit: mainHead });
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('a revived row gets the fresh checkout pin merged into its existing metadata', async () => {
+    const { repoRoot, origin, prHead } = await makeGitRepoWithPullRef(7);
+    const parent = makeStudio({ repoRoot, worktreePath: repoRoot });
+    const slug = overflowSlug(parent, 'pr:7');
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    try {
+      // A cleaned row for this exact (parent, thread): its worktree is gone,
+      // so the ensure revives it rather than inserting beside it.
+      const stale = makeStudio({
+        id: 'stale-row',
+        slug,
+        threadKey: 'pr:7',
+        parentStudioId: parent.id,
+        ephemeral: true,
+        status: 'cleaned' as Studio['status'],
+        cleanedAt: '2026-09-01T00:00:00.000Z',
+        worktreePath: path.join(repoRoot, 'gone'),
+        branch: 'lumen/eph/pr-7',
+        metadata: { overflow: true, note: 'keep me' },
+      });
+      const updates: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, s: string) =>
+            Promise.resolve(s === slug ? stale : null)
+          ),
+        create: vi.fn(),
+        update: vi.fn().mockImplementation((id: string, input: Record<string, unknown>) => {
+          updates.push(input);
+          return Promise.resolve(makeStudio({ ...stale, ...(input as Partial<Studio>), id }));
+        }),
+      } as unknown as StudiosRepository;
+      const service = new StudioOverflowService(studios, {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+
+      const revived = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: parent,
+        threadKey: 'pr:7',
+      });
+
+      expect(revived?.id).toBe('stale-row');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(updates).toHaveLength(1);
+      expect(updates[0].branch).toBe('detached:origin/pr/7');
+      expect(updates[0].metadata).toEqual({
+        overflow: true,
+        note: 'keep me',
+        checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
+      });
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('never runs the package manager on an unreviewed PR head — the PR chooses the binary via yarnPath (Lumen, PR #604 P1)', async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { yarnTrap: true });
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+      expect(result?.id).toBe('new-primary');
+      const present = (p: string) =>
+        access(p)
+          .then(() => true)
+          .catch(() => false);
+      expect(await present(path.join(worktree, 'package.json'))).toBe(true);
+      expect(await present(path.join(worktree, 'PR-CODE-RAN.marker'))).toBe(false);
+      expect(await present(path.join(worktree, 'node_modules'))).toBe(false);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('control: the same trap fires for a non-PR ephemeral at the base, so the test can see execution', async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { yarnTrap: true });
+    const slug = 'lumen-review--task-abc';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'task:abc',
+      });
+      expect(result?.id).toBe('new-primary');
+      await expect(access(path.join(worktree, 'PR-CODE-RAN.marker'))).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('teardown rescues only what the reviewer added on top of the fetched head', async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7);
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    const parent = makeStudio({ repoRoot, worktreePath: repoRoot });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'new-primary', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+        markCleaned: vi.fn().mockResolvedValue(undefined),
+      } as unknown as StudiosRepository;
+      const leases = {
+        logEvent: vi.fn(),
+        claimForTeardown: vi.fn().mockResolvedValue(makeTeardownClaim()),
+        verifyClaim: vi.fn().mockResolvedValue(true),
+        clearTeardownClaim: vi.fn().mockResolvedValue(true),
+        finalizeTeardown: vi.fn().mockResolvedValue(true),
+      } as unknown as StudioLeaseService;
+      const service = new StudioOverflowService(studios, leases);
+      const ensure = () =>
+        service.ensureOverflowStudio({
+          userId: 'user-1',
+          sbSlug: 'lumen',
+          parentStudio: parent,
+          threadKey: 'pr:7',
+        });
+      const rescues = async () => {
+        const { stdout } = await execFileAsync('git', ['branch', '--list', 'ink-rescue/*'], {
+          cwd: repoRoot,
+        });
+        return stdout
+          .split('\n')
+          .map((l) => l.replace(/^\*?\s*/, '').trim())
+          .filter(Boolean);
+      };
+
+      // Pass 1: an untouched review — teardown removes the worktree and mints nothing.
+      const first = await ensure();
+      await service.teardownEphemeralStudio(first!, { reason: 'thread pr:7 closed' });
+      expect(
+        await access(worktree)
+          .then(() => true)
+          .catch(() => false)
+      ).toBe(false);
+      expect(await rescues()).toEqual([]);
+
+      // Pass 2: the reviewer commits on top — teardown anchors exactly that.
+      const second = await ensure();
+      await execFileAsync(
+        'git',
+        [
+          '-c',
+          'user.email=test@test',
+          '-c',
+          'user.name=test',
+          'commit',
+          '--allow-empty',
+          '-m',
+          'review fixup',
+        ],
+        { cwd: worktree }
+      );
+      const { stdout: fixup } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+        cwd: worktree,
+      });
+      await service.teardownEphemeralStudio(second!, { reason: 'thread pr:7 closed' });
+      const names = await rescues();
+      expect(names).toHaveLength(1);
+      const { stdout: anchored } = await execFileAsync('git', ['rev-parse', names[0]], {
+        cwd: repoRoot,
+      });
+      expect(anchored.trim()).toBe(fixup.trim());
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it("quarantines PR-supplied startup config before bootstrap — the checkout ends with the main root's copies (Lumen, PR #604 r2)", async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { startupTrap: true });
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+      expect(result?.id).toBe('new-primary');
+
+      // The PR's MCP server is gone; the main root's trusted copy is in place.
+      const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
+      expect(Object.keys(mcp.mcpServers)).toEqual(['trusted']);
+      // The PR's hook is gone; our generated settings stand alone.
+      const settings = JSON.parse(
+        await readFile(path.join(worktree, '.claude', 'settings.local.json'), 'utf8')
+      );
+      expect(JSON.stringify(settings)).not.toContain('PR-HOOK-RAN');
+      expect(settings.permissions?.allow?.length).toBeGreaterThan(0);
+      // Per-backend configs were regenerated from the trusted copy, not the PR's.
+      const codex = await readFile(path.join(worktree, '.codex', 'config.toml'), 'utf8');
+      expect(codex).not.toContain('pr-trap');
+      const gemini = await readFile(path.join(worktree, '.gemini', 'settings.json'), 'utf8');
+      expect(gemini).not.toContain('pr-trap');
+      // The PR's root .env is gone too: Gemini would have loaded it at startup.
+      await expect(access(path.join(worktree, '.env'))).rejects.toBeDefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('a PR that ships .claude as a symlink cannot make settings land outside the checkout', async () => {
+    // The link points at a sibling directory inside the isolated studios root,
+    // which is where the worktree materializes: `<root>/lumen/<repo>/<slug>`,
+    // so `../outside-<n>` is `<root>/lumen/<repo>/outside-<n>`. Disposable.
+    const outsideName = `outside-${Date.now()}`;
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, {
+      symlinkTrap: path.join('..', outsideName),
+    });
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    const outside = path.join(path.dirname(worktree), outsideName);
+    try {
+      await mkdir(outside, { recursive: true });
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+      expect(result?.id).toBe('new-primary');
+      // Nothing was written where the link pointed.
+      await expect(access(path.join(outside, 'settings.local.json'))).rejects.toBeDefined();
+      // The checkout's .claude is a real directory of ours, not the PR's link.
+      const entry = await lstat(path.join(worktree, '.claude'));
+      expect(entry.isSymbolicLink()).toBe(false);
+      expect(entry.isDirectory()).toBe(true);
+      await expect(
+        access(path.join(worktree, '.claude', 'settings.local.json'))
+      ).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(outside, { recursive: true, force: true }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('control: a base-branch ephemeral is not quarantined — trusted code keeps its own config', async () => {
+    // Same trap files, but tracked on the BASE (trusted) commit, and a task
+    // thread that checks out the base. Quarantine is a review-only measure.
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7);
+    const git = (args: string[]) => execFileAsync('git', args, { cwd: repoRoot });
+    await writeFile(
+      path.join(repoRoot, '.mcp.json'),
+      JSON.stringify({ mcpServers: { 'base-own': { command: '/bin/true' } } })
+    );
+    await writeFile(path.join(repoRoot, '.env'), 'BASE_OWN=1\n');
+    await git(['add', '.mcp.json', '.env']);
+    await git([
+      '-c',
+      'user.email=test@test',
+      '-c',
+      'user.name=test',
+      'commit',
+      '-m',
+      'base config',
+    ]);
+    const slug = 'lumen-review--task-abc';
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'task:abc',
+      });
+      expect(result?.id).toBe('new-primary');
+      const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
+      expect(Object.keys(mcp.mcpServers)).toEqual(['base-own']);
+      expect(await readFile(path.join(worktree, '.env'), 'utf8')).toBe('BASE_OWN=1\n');
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
     }
   });
 });

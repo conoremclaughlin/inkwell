@@ -194,7 +194,7 @@ describe('Studio Commands', () => {
       mkdirSync(pcpDir, { recursive: true });
 
       const identity = {
-        agentId: 'wren',
+        sbSlug: 'wren',
         context: 'studio-test',
         description: 'Test studio',
         studio: 'test',
@@ -208,12 +208,12 @@ describe('Studio Commands', () => {
       expect(existsSync(join(pcpDir, 'identity.json'))).toBe(true);
 
       const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
-      expect(savedIdentity.agentId).toBe('wren');
+      expect(savedIdentity.sbSlug).toBe('wren');
       expect(savedIdentity.studio).toBe('test');
       expect(savedIdentity.branch).toBe('wren/studio/test');
     });
 
-    it('should support custom agent ID', () => {
+    it('should support custom SB slug', () => {
       const worktreePath = join(TEST_DIR, 'test-repo--myra');
       git(`worktree add -b myra/studio/myra "${worktreePath}"`, TEST_REPO);
 
@@ -221,7 +221,7 @@ describe('Studio Commands', () => {
       mkdirSync(pcpDir, { recursive: true });
 
       const identity = {
-        agentId: 'myra',
+        sbSlug: 'myra',
         context: 'studio-myra',
         description: 'Myra studio',
         studio: 'myra',
@@ -232,7 +232,7 @@ describe('Studio Commands', () => {
       writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
       const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
-      expect(savedIdentity.agentId).toBe('myra');
+      expect(savedIdentity.sbSlug).toBe('myra');
     });
 
     it('should read legacy identity.json with workspace field', () => {
@@ -244,7 +244,7 @@ describe('Studio Commands', () => {
 
       // Old format with workspace field
       const identity = {
-        agentId: 'wren',
+        sbSlug: 'wren',
         context: 'workspace-legacy',
         description: 'Legacy workspace',
         workspace: 'legacy',
@@ -255,7 +255,7 @@ describe('Studio Commands', () => {
       writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
       const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
-      expect(savedIdentity.agentId).toBe('wren');
+      expect(savedIdentity.sbSlug).toBe('wren');
       expect(savedIdentity.workspace).toBe('legacy');
     });
   });
@@ -270,7 +270,7 @@ describe('Studio Commands', () => {
       expect(existsSync(expectedPath)).toBe(true);
     });
 
-    it('should use agentId/studio/ prefix for branches', () => {
+    it('should use sbSlug/studio/ prefix for branches', () => {
       const studioName = 'bugfix-y';
       const branchName = `wren/studio/${studioName}`;
       const worktreePath = join(TEST_DIR, `test-repo--${studioName}`);
@@ -586,7 +586,7 @@ describe('updateIdentityForStudioRename', () => {
       join(wsPath, '.ink', 'identity.json'),
       JSON.stringify(
         {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           studio: 'old',
           context: 'studio-old',
           description: 'Studio: old',
@@ -614,7 +614,7 @@ describe('updateIdentityForStudioRename', () => {
 describe('planStudioHomeBranchRename', () => {
   it('plans a rename when current branch is old per-studio default', () => {
     const plan = planStudioHomeBranchRename(
-      { agentId: 'lumen', branch: 'lumen/studio/main-old-name' },
+      { sbSlug: 'lumen', branch: 'lumen/studio/main-old-name' },
       'old-name',
       'new-name'
     );
@@ -626,7 +626,7 @@ describe('planStudioHomeBranchRename', () => {
 
   it('plans a rename when current branch is legacy default', () => {
     const plan = planStudioHomeBranchRename(
-      { agentId: 'lumen', branch: 'lumen/studio/main' },
+      { sbSlug: 'lumen', branch: 'lumen/studio/main' },
       'old-name',
       'new-name'
     );
@@ -638,7 +638,7 @@ describe('planStudioHomeBranchRename', () => {
 
   it('does not plan rename for custom feature branches', () => {
     const plan = planStudioHomeBranchRename(
-      { agentId: 'lumen', branch: 'lumen/feat/my-work' },
+      { sbSlug: 'lumen', branch: 'lumen/feat/my-work' },
       'old-name',
       'new-name'
     );

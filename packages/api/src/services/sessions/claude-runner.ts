@@ -28,6 +28,7 @@ import {
 } from '@inklabs/shared';
 import { homedir } from 'os';
 import { join } from 'path';
+import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
@@ -258,6 +259,11 @@ export class ClaudeRunner implements IRunner {
       runConfig = { ...config, constitutionInjected: true };
     }
 
+    // The grant below requires the directory to exist; async so the server's
+    // event loop is never blocked (PR #544 r1 P2 — buildArgs ran mkdirSync
+    // per turn/retry).
+    await ensureInkStudiosRoot();
+
     // Build Claude Code arguments
     let args = this.buildArgs(sessionId, isResume, config);
 
@@ -340,6 +346,9 @@ export class ClaudeRunner implements IRunner {
     if (config.model) {
       args.push('--model', config.model);
     }
+    if (config.effort) {
+      args.push('--effort', config.effort);
+    }
 
     // MCP config — use --strict-mcp-config so the injected temp file
     // (with auth headers) takes exclusive precedence over the workspace
@@ -357,6 +366,13 @@ export class ClaudeRunner implements IRunner {
     // Allow access to ~/.ink/files (Telegram/Discord/Slack media downloads, Gmail attachments)
     const inkFilesDir = join(homedir(), '.ink', 'files');
     args.push('--add-dir', inkFilesDir);
+
+    // Allow access to the ephemeral-studio root (spec:studio-materialization
+    // v8): granting it at spawn is the whole point of a static root — a live
+    // session can never be granted a new directory, so every future
+    // create_studio/overflow worktree must land somewhere already in scope.
+    // run() ensures the directory exists (async) before args are built.
+    args.push('--add-dir', inkStudiosRoot());
 
     return args;
   }
@@ -382,7 +398,7 @@ export class ClaudeRunner implements IRunner {
       writeRuntimeSessionHint(
         config.workingDirectory,
         config.pcpSessionId,
-        config.agentId || 'unknown',
+        config.sbSlug || 'unknown',
         'claude',
         runtimeLinkId,
         config.studioId
@@ -455,7 +471,7 @@ export class ClaudeRunner implements IRunner {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(claudeBin),
         // Agent identity — hooks resolve identity from $AGENT_ID.
-        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
         // Tells the session-start hook the constitution is already in the
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
@@ -465,7 +481,7 @@ export class ClaudeRunner implements IRunner {
           runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
           accessToken: config.pcpAccessToken,
-          agentId: config.agentId,
+          sbSlug: config.sbSlug,
           runtime: 'claude',
           repoRoot: config.repoRoot,
         }),
@@ -751,7 +767,7 @@ export class ClaudeRunner implements IRunner {
  * This survives context compaction.
  */
 export function buildIdentityPrompt(
-  agentId: string,
+  sbSlug: string,
   agentName: string,
   soul?: string,
   timezone?: string,
@@ -760,12 +776,12 @@ export function buildIdentityPrompt(
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
-**You are ${agentName}. Your agent ID is \`${agentId}\`.**
+**You are ${agentName}. Your slug is \`${sbSlug}\`.**
 
-When calling PCP tools (bootstrap, remember, recall, start_session, etc.), use \`agentId: "${agentId}"\`.
+When calling PCP tools (bootstrap, remember, recall, start_session, etc.), use \`sbSlug: "${sbSlug}"\`.
 
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
-Do NOT run \`echo $AGENT_ID\` — you are running headlessly without shell access.`;
+Do NOT run \`echo $SB_SLUG\` — you are running headlessly without shell access.`;
 
   // Session identity — always in context for debugging and routing verification
   if (sessionIds?.pcpSessionId) {
@@ -780,7 +796,7 @@ Do NOT run \`echo $AGENT_ID\` — you are running headlessly without shell acces
   }
 
   if (heartbeat) {
-    prompt += `\n\n### Heartbeat Instructions\nFollow these instructions on every heartbeat wake-up. If this document is not immediately available, fetch it via \`get_identity(agentId: "${agentId}", file: "heartbeat")\`.\n\n${heartbeat}`;
+    prompt += `\n\n### Heartbeat Instructions\nFollow these instructions on every heartbeat wake-up. If this document is not immediately available, fetch it via \`get_identity(sbSlug: "${sbSlug}", file: "heartbeat")\`.\n\n${heartbeat}`;
   }
 
   // Add timezone handling guidance if timezone is provided
