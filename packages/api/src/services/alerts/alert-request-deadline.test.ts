@@ -119,6 +119,12 @@ async function harness(): Promise<Harness> {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  // restoreAllMocks restores spies; it does not clear the call history of a
+  // vi.fn() created by vi.hoisted. Without this the "was never called"
+  // assertions below inherit sends made by earlier tests in this file and fail
+  // for a reason that has nothing to do with the code under test.
+  sendResponse.mockReset();
+  sendToInbox.mockReset();
 });
 
 /** Did ingest settle — either way — before the client would have given up? */
@@ -204,27 +210,31 @@ describe('ingest finishes inside the poster’s deadline', () => {
     expect(await settlesWithinClientDeadline(() => h.service.ingest(USER, alert))).toBe(true);
   });
 
-  it('settles promptly when nothing stalls (control)', async () => {
+  it('delivers and marks notified when nothing stalls (control)', async () => {
     vi.useFakeTimers();
     const h = await harness();
     vi.spyOn(h.service, 'fanOut' as never).mockResolvedValue([
       { sink: 'user', target: 'telegram', ok: true },
     ] as never);
 
-    // The control matters: every assertion above would also pass for an ingest
-    // that gave up instantly and never delivered anything. This one pins that
-    // the budget is a ceiling rather than the normal path.
-    let settled = false;
-    void h.service.ingest(USER, alert).then(
-      () => {
-        settled = true;
-      },
-      () => {
-        settled = true;
-      }
-    );
-    await vi.advanceTimersByTimeAsync(50);
-    expect(settled).toBe(true);
+    // The control carries the weight for every case above, so it asserts the
+    // OUTCOME rather than merely that a promise settled. "Settled either way"
+    // is satisfied by an ingest that instantly refuses everything — which is
+    // exactly the shape a badly-placed budget guard would produce, and would
+    // have let a dispatcher that never delivers anything pass this file
+    // (PR #539 r5, Lumen).
+    const result = (await h.service.ingest(USER, alert)) as {
+      status: string;
+      notified: boolean;
+      deliveries: Array<{ ok: boolean }>;
+    };
+
+    expect(result.status).toBe('raised');
+    expect(result.notified).toBe(true);
+    expect(result.deliveries.some((d) => d.ok)).toBe(true);
+    // Delivered means the claim is settled as delivered, not released.
+    expect(h.rpc.mock.calls.filter((c) => c[0] === 'mark_alert_notified')).toHaveLength(1);
+    expect(h.rpc.mock.calls.filter((c) => c[0] === 'release_alert_claim')).toHaveLength(0);
   });
 });
 
@@ -288,6 +298,114 @@ describe('a sink that ran out of time is uncertain, not failed', () => {
     ]);
 
     expect(h.rpc.mock.calls.filter((c) => c[0] === 'release_alert_claim')).toHaveLength(1);
+  });
+});
+
+describe('no new send is STARTED after the budget is gone', () => {
+  // Distinct from the uncertainty rule. An already-started send that times out
+  // is uncertain and keeps its claim. This is about work that had not begun:
+  // a continuation suspended on a lookup or an import, resuming after ingest
+  // has already returned, and then sending. The checker has given up by then
+  // and sent its own fallback, so the late send is the double-notify that this
+  // PR exists to remove (PR #539 r5, Lumen).
+
+  it('abandons the user send when the lookup resumes past the deadline', async () => {
+    vi.useFakeTimers();
+    const h = await harness();
+
+    // The user lookup hangs long enough that the outer race gives up first.
+    let releaseLookup!: () => void;
+    const held = new Promise<void>((r) => {
+      releaseLookup = r;
+    });
+    const from = h.service.supabase.from.bind(h.service.supabase);
+    h.service.supabase.from = (table: string) => {
+      const builder = from(table);
+      if (table === 'users') {
+        builder.maybeSingle = async () => {
+          await held;
+          return { data: { telegram_id: '555000123' }, error: null };
+        };
+        builder.single = builder.maybeSingle;
+      }
+      return builder;
+    };
+
+    void h.service.ingest(USER, alert).catch(() => {});
+    await vi.advanceTimersByTimeAsync(20_001);
+
+    // Now the lookup finally comes back, long after the request ended.
+    releaseLookup();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(sendResponse).not.toHaveBeenCalled();
+  });
+
+  it('refuses a zero-budget fan-out before any sink runs', async () => {
+    const { AlertDispatchService, RequestBudget } = await import('./alert-dispatch.service');
+    const h = await harness();
+    const service = new AlertDispatchService(
+      { getClient: () => (h.service as unknown as { supabase: unknown }).supabase } as never,
+      (h.service as unknown as { supabase: unknown }).supabase as never
+    ) as unknown as {
+      fanOut: (u: string, e: unknown, ms: number, b: unknown) => Promise<Array<{ ok: boolean }>>;
+    };
+
+    // Already expired when the call is made. withTimeout races a timer against
+    // work that has begun, and a zero-length timer cannot win that race, so a
+    // guard placed only there lets every sink run to its first await — which
+    // for these sinks is far enough to send.
+    const spent = new RequestBudget(0);
+    const deliveries = await service.fanOut(
+      USER,
+      {
+        severity: 'critical',
+        source: 'synthetic-monitor',
+        title: 'x',
+        occurrenceCount: 1,
+        notifyAgents: ['echo'],
+        kind: 'raised',
+      },
+      0,
+      spent
+    );
+
+    expect(sendResponse).not.toHaveBeenCalled();
+    expect(sendToInbox).not.toHaveBeenCalled();
+    // Nothing attempted is uncertain, so the claim must not be released.
+    expect(deliveries.every((d) => !d.ok)).toBe(true);
+    expect(deliveries.some((d) => (d as { timedOut?: boolean }).timedOut)).toBe(true);
+  });
+
+  it('still sends when the budget has room (control)', async () => {
+    const { AlertDispatchService, RequestBudget } = await import('./alert-dispatch.service');
+    sendResponse.mockResolvedValue(undefined);
+    sendToInbox.mockResolvedValue({ content: [{ type: 'text', text: '{}' }] });
+    const h = await harness();
+    const service = new AlertDispatchService(
+      { getClient: () => (h.service as unknown as { supabase: unknown }).supabase } as never,
+      (h.service as unknown as { supabase: unknown }).supabase as never
+    ) as unknown as {
+      fanOut: (u: string, e: unknown, ms: number, b: unknown) => Promise<Array<{ ok: boolean }>>;
+    };
+
+    // Without this, both assertions above are satisfied by a fan-out that
+    // never sends anything under any circumstances.
+    await service.fanOut(
+      USER,
+      {
+        severity: 'critical',
+        source: 'synthetic-monitor',
+        title: 'x',
+        occurrenceCount: 1,
+        notifyAgents: ['echo'],
+        kind: 'raised',
+      },
+      5_000,
+      new RequestBudget(18_000)
+    );
+
+    expect(sendResponse).toHaveBeenCalled();
   });
 });
 

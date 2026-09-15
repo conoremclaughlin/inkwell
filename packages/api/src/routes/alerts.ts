@@ -14,7 +14,7 @@
  *   GET  /api/alerts/sources  monitor liveness + staleness verdicts (bearer only)
  */
 
-import { Router, type Request, type Response } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { ZodError } from 'zod';
 import type { DataComposer } from '../data/composer';
 import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
@@ -67,13 +67,39 @@ const ALERT_READ_WINDOW_MS = 60 * 1000;
 const ALERT_READS_PER_MINUTE = 60;
 const readLimiter = new FixedWindowLimiter(ALERT_READ_WINDOW_MS);
 
-function readRateLimited(userId: string, ip: string): boolean {
-  return readLimiter.hit(`alertread:${userId}|${ip}`, ALERT_READS_PER_MINUTE);
+/**
+ * Applied as route middleware rather than checked inside each handler.
+ *
+ * Two reasons, and the second is the one that made this worth changing. It
+ * runs before the handler body, so a new query route cannot be added that
+ * forgets to call it partway down. And CodeQL's missing-rate-limiting query
+ * recognises a limiter attached to the route, not an `if` in the handler — the
+ * in-handler form left the finding open on a route that really was throttled
+ * (PR #539 r5, Lumen, who checked the analysis head_sha rather than the branch
+ * UI and found the annotation on the post-guard commit).
+ *
+ * Keyed per (user, ip) so one noisy client cannot spend another's budget.
+ */
+function makeReadThrottle(authProvider: PcpAuthProvider) {
+  return function throttleReads(req: Request, res: Response, next: NextFunction): void {
+    const userData = authProvider.verifyAccessToken(req.headers.authorization);
+    // Unauthenticated callers are charged by address alone; the handler still
+    // does its own 401, this only decides whether to keep reading.
+    const key = userData
+      ? `alertread:${userData.userId}|${req.ip ?? 'unknown'}`
+      : `alertread:anon|${req.ip ?? 'unknown'}`;
+    if (readLimiter.hit(key, ALERT_READS_PER_MINUTE)) {
+      res.status(429).json({ success: false, error: 'Too many requests' });
+      return;
+    }
+    next();
+  };
 }
 
 export function createAlertsRouter(dataComposer: DataComposer): Router {
   const router = Router();
   const authProvider = new PcpAuthProvider();
+  const throttleReads = makeReadThrottle(authProvider);
   const dispatch = new AlertDispatchService(dataComposer);
 
   router.post('/', async (req: Request, res: Response) => {
@@ -149,15 +175,10 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
     }
   });
 
-  router.get('/', async (req: Request, res: Response) => {
+  router.get('/', throttleReads, async (req: Request, res: Response) => {
     const userData = authProvider.verifyAccessToken(req.headers.authorization);
     if (!userData) {
       res.status(401).json({ success: false, error: 'Authentication required' });
-      return;
-    }
-
-    if (readRateLimited(userData.userId, req.ip ?? 'unknown')) {
-      res.status(429).json({ success: false, error: 'Too many requests' });
       return;
     }
 
@@ -183,15 +204,10 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
     res.json({ success: true, events: data ?? [] });
   });
 
-  router.get('/sources', async (req: Request, res: Response) => {
+  router.get('/sources', throttleReads, async (req: Request, res: Response) => {
     const userData = authProvider.verifyAccessToken(req.headers.authorization);
     if (!userData) {
       res.status(401).json({ success: false, error: 'Authentication required' });
-      return;
-    }
-
-    if (readRateLimited(userData.userId, req.ip ?? 'unknown')) {
-      res.status(429).json({ success: false, error: 'Too many requests' });
       return;
     }
 

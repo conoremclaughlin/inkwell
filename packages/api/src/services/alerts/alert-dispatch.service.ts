@@ -76,6 +76,24 @@ const DELIVERY_RECORD_TIMEOUT_MS = 3_000;
 const DB_CALL_TIMEOUT_MS = 5_000;
 
 /**
+ * The sink result for a send that was abandoned at the door.
+ *
+ * The distinction this preserves is the one the whole claim machinery rests
+ * on: nothing was attempted, so the claim must ride to TTL rather than be
+ * released to a second dispatcher. Same rule as a timed-out send, different
+ * reason.
+ */
+function abandonedAtDeadline(sink: 'user' | 'agents', target: string): SinkResult {
+  return {
+    sink,
+    target,
+    ok: false,
+    detail: 'request budget expired before send',
+    timedOut: true,
+  };
+}
+
+/**
  * The whole request's budget, shared by every stage.
  *
  * The per-sink and per-write ceilings above bound individual operations, and
@@ -305,7 +323,8 @@ export class AlertDispatchService {
             notifyUser: alert.notifyUser,
             kind: 'raised',
           },
-          budget.cap(SINK_TOTAL_TIMEOUT_MS)
+          budget.cap(SINK_TOTAL_TIMEOUT_MS),
+          budget
         );
 
     await this.recordDelivery(eventId, deliveries, budget);
@@ -474,7 +493,8 @@ export class AlertDispatchService {
         notifyUser: alert.notifyUser,
         kind: 'resolved',
       },
-      budget.cap(SINK_TOTAL_TIMEOUT_MS)
+      budget.cap(SINK_TOTAL_TIMEOUT_MS),
+      budget
     );
 
     await this.recordDelivery(row.event_id, deliveries, budget);
@@ -506,7 +526,8 @@ export class AlertDispatchService {
       notifyUser?: boolean;
       kind: 'raised' | 'resolved';
     },
-    budgetMs: number = SINK_TOTAL_TIMEOUT_MS
+    budgetMs: number = SINK_TOTAL_TIMEOUT_MS,
+    budget: RequestBudget = new RequestBudget()
   ): Promise<SinkResult[]> {
     // Sinks run concurrently and are settled independently — one sink's
     // failure must never cancel another's delivery. Each is bounded as a
@@ -514,6 +535,28 @@ export class AlertDispatchService {
     // bookkeeping are part of what can hang, and an unbounded one holds the
     // checker's request open for as long as it likes.
     //
+    // Refused BEFORE any sink is invoked. withTimeout races a timer against
+    // work that has already started, and a zero-length timer cannot win that
+    // race: the sinks run to their first await regardless, which for the user
+    // and agents sinks is far enough to send. A budget of zero has to mean
+    // "do not begin", not "begin and lose a race" (PR #539 r5, Lumen).
+    if (budgetMs <= 0 || budget.expired()) {
+      logger.warn('[Alerts] Fan-out refused: request budget exhausted before any sink started', {
+        source: event.source,
+      });
+      return [
+        {
+          sink: 'user',
+          target: 'none',
+          ok: false,
+          detail: 'request budget exhausted before fan-out',
+          // Nothing was attempted, so the claim rides to TTL rather than
+          // being released to a second dispatcher.
+          timedOut: true,
+        },
+      ];
+    }
+
     // The deadline is also an abort signal, not just a race. Cancellable work
     // (the webhook POSTs) is actually cancelled when it fires, so a written-off
     // send cannot quietly deliver afterwards.
@@ -526,8 +569,8 @@ export class AlertDispatchService {
     let results: PromiseSettledResult<SinkResult[]>[];
     try {
       results = await Promise.allSettled([
-        withTimeout('user sink', this.notifyUserChannel(userId, event), budgetMs),
-        withTimeout('agents sink', this.notifyAgents(userId, event), budgetMs),
+        withTimeout('user sink', this.notifyUserChannel(userId, event, budget), budgetMs),
+        withTimeout('agents sink', this.notifyAgents(userId, event, budget), budgetMs),
         withTimeout('webhook sink', this.notifyWebhooks(userId, event, deadline.signal), budgetMs),
       ]);
     } finally {
@@ -553,7 +596,8 @@ export class AlertDispatchService {
       occurrenceCount: number;
       notifyUser?: boolean;
       kind: 'raised' | 'resolved';
-    }
+    },
+    budget: RequestBudget = new RequestBudget()
   ): Promise<SinkResult[]> {
     const quietHours = await this.getQuietHours(userId);
     const decision = shouldNotifyUser({
@@ -589,6 +633,20 @@ export class AlertDispatchService {
 
     try {
       const { getChannelGateway } = await import('../../channels/gateway.js');
+
+      // Checked HERE, after the user lookup and the dynamic import, rather
+      // than only at the top. Those are awaits: the outer race can time out
+      // and ingest can return while this continuation is still suspended, and
+      // when the lookup finally resolves the send would go out against a
+      // request that ended long ago — arriving next to the fallback the
+      // checker already sent because it gave up (PR #539 r5, Lumen).
+      if (budget.expired()) {
+        logger.warn('[Alerts] Abandoning user send: request budget expired during lookup', {
+          source: event.source,
+        });
+        return [abandonedAtDeadline('user', channel)];
+      }
+
       await withTimeout(
         'user channel',
         Promise.resolve(
@@ -631,7 +689,8 @@ export class AlertDispatchService {
       occurrenceCount: number;
       notifyAgents?: string[];
       kind: 'raised' | 'resolved';
-    }
+    },
+    budget: RequestBudget = new RequestBudget()
   ): Promise<SinkResult[]> {
     const recipients = event.notifyAgents ?? [];
     if (recipients.length === 0) return [];
@@ -642,6 +701,16 @@ export class AlertDispatchService {
 
     try {
       const { handleSendToInbox } = await import('../../mcp/tools/inbox-handlers.js');
+
+      // Same reasoning as the user sink: the import is an await, so this can
+      // resume after the request it belongs to has already returned.
+      if (budget.expired()) {
+        logger.warn('[Alerts] Abandoning agent sends: request budget expired during import', {
+          source: event.source,
+        });
+        return recipients.map((slug) => abandonedAtDeadline('agents', slug));
+      }
+
       await withTimeout(
         'agent inbox',
         handleSendToInbox(
@@ -971,7 +1040,8 @@ export class AlertDispatchService {
           notifyAgents: ['myra'],
           kind: 'resolved',
         },
-        budget.cap(RECOVERY_FANOUT_TIMEOUT_MS)
+        budget.cap(RECOVERY_FANOUT_TIMEOUT_MS),
+        budget
       );
       await this.recordDelivery(row.event_id, deliveries, budget);
     } catch (error) {

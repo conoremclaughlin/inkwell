@@ -89,9 +89,11 @@ describe('alert read throttle', () => {
 
     expect(src).toContain(`const ALERT_READ_WINDOW_MS = 60 * 1000;`);
     expect(src).toContain(`const ALERT_READS_PER_MINUTE = ${ALERT_READS_PER_MINUTE};`);
-    expect(src).toContain('alertread:${userId}|${ip}');
-    // Both GET routes, not just the first one.
-    expect(src.match(/readRateLimited\(userData\.userId/g) ?? []).toHaveLength(2);
-    expect(src.match(/res\.status\(429\)/g) ?? []).toHaveLength(2);
+    expect(src).toContain("alertread:${userData.userId}|${req.ip ?? 'unknown'}");
+    // Attached as route middleware, not checked inside the handler body: it
+    // has to run before the handler, and CodeQL only recognises the attached
+    // form. Both GET routes, not just the first one.
+    expect(src.match(/router\.get\('[^']*',\s*throttleReads,/g) ?? []).toHaveLength(2);
+    expect(src).not.toMatch(/readRateLimited\(/);
   });
 });
