@@ -164,14 +164,19 @@ export function effectiveContextTokens(
  *                       `runtime.bootstrapContext` on every seed — it is marked
  *                       "always included" there — so no context tool reclaims a
  *                       byte of it. It is occupancy to budget around, not spend.
- *   providerOnlyTokens  what the provider reported beyond what ink packed. ANY
- *                       provider reseed drops it, and every eviction is one:
- *                       `recordEviction` clears `activeBackendSessionId` and the
- *                       `providerSample`, so the next turn re-seeds from the
- *                       post-eviction ledger. `assessContextPressure` has a
- *                       `reseed` action that rolls the session for exactly this
- *                       case without destroying history — compaction is the
- *                       remedy this bucket least needs.
+ *   unaccountedTokens   the measurement minus what ink can account for. It is a
+ *                       RESIDUAL, not an inventory, and that is the whole reason
+ *                       it does not name a remedy. Some of it is native-session
+ *                       history, which any provider reseed drops — every
+ *                       eviction is one, since `recordEviction` clears
+ *                       `activeBackendSessionId` and the `providerSample`, and
+ *                       `assessContextPressure` has a `reseed` action for
+ *                       exactly this case. The rest is fixed provider overhead
+ *                       and this estimator's own drift (characters ÷ 4), which
+ *                       a reseed does NOT clear: the re-packed window is
+ *                       estimated by the same arithmetic that was wrong before.
+ *                       Naming a tool for this bucket would promise a reclaim
+ *                       nobody can compute (Lumen, PR #639).
  *
  * The ledger/provider gap is not a rounding error and it is not invisible — it
  * is mis-sized. A tool result enters the ledger as a stub of at most
@@ -192,8 +197,12 @@ export interface ContextOccupancy {
   ledgerTokens: number;
   /** The identity envelope, re-rendered on every seed. No context tool reclaims it. */
   fixedTokens: number;
-  /** Occupancy the provider reported beyond what ink packed. Any reseed drops it. */
-  providerOnlyTokens: number;
+  /**
+   * Measured minus accountable: a residual, not an inventory. Part native-session
+   * history (a reseed drops it), part provider overhead and estimator drift (a
+   * reseed does not). Deliberately names no remedy — see the note above.
+   */
+  unaccountedTokens: number;
   /** The number to budget against — the larger of the estimate and the measurement. */
   effectiveTokens: number;
   limit: number;
@@ -227,7 +236,7 @@ export function computeContextOccupancy(
   return {
     ledgerTokens: ledger,
     fixedTokens: fixed,
-    providerOnlyTokens: Math.max(0, effectiveTokens - accountable),
+    unaccountedTokens: Math.max(0, effectiveTokens - accountable),
     effectiveTokens,
     limit: safeLimit,
     utilization: effectiveTokens / safeLimit,
@@ -253,11 +262,16 @@ export function formatContextStamp(occ: ContextOccupancy): string {
   }
   // All three buckets, always, even at zero. A stamp whose shape changes per
   // turn is one the reader has to re-parse per turn, and a zero is itself a
-  // reading ("nothing is provider-side") rather than an absence.
+  // reading ("nothing unaccounted for") rather than an absence.
+  //
+  // Only the first two name a tool. The third names its composition instead,
+  // because it is a residual: saying what it is made of is a claim we can
+  // support, and saying what reclaims it is not.
   return (
-    `${head} — ${n(occ.ledgerTokens)} in the ledger (evict_context/compact_context), ` +
-    `${n(occ.fixedTokens)} identity envelope (fixed, re-sent every seed), ` +
-    `${n(occ.providerOnlyTokens)} provider-side (any reseed clears it).`
+    `${head} — ledger ${n(occ.ledgerTokens)} (evict_context/compact_context), ` +
+    `identity envelope ${n(occ.fixedTokens)} (fixed, re-sent every seed), ` +
+    `unaccounted ${n(occ.unaccountedTokens)} (native history + estimate drift; ` +
+    `a reseed clears the history, not the drift).`
   );
 }
 

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { buildPromptEnvelope, buildDeltaPrompt, turnContextOccupancy } from './chat';
+import {
+  buildPromptEnvelope,
+  buildDeltaPrompt,
+  buildContinuationPrompt,
+  turnContextOccupancy,
+} from './chat';
 import { ContextLedger } from '../repl/context-ledger';
 import { formatContextStamp } from '../repl/context-tools';
 import type { ChatRuntime } from './chat';
@@ -116,5 +121,61 @@ describe('the stamp reaches BOTH turn paths (acceptance 1)', () => {
     const prompt = buildPromptEnvelope('wren', makeRuntime(), ledgerOf(10), 'hello');
     expect(prompt).not.toContain('[context]');
     expect(prompt).toContain('Latest user message:');
+  });
+});
+
+/**
+ * Lumen, PR #639 round 2, finding 3. The stamp reached the OUTER runUserTurn
+ * opening only: `resume` sent the bare tool result, `seed` and `stateless` both
+ * called buildPromptEnvelope without its fifth argument.
+ *
+ * This is the seat where the stamp matters most, not least. A turn's provider
+ * measurement is sampled from each spawn's usage AFTER the spawn returns, so a
+ * fresh run's opening stamp has no measurement to report at all — the first
+ * reading backed by one is the first continuation. A headless run doing all its
+ * work inside a single turn's tool loop could finish having never seen one.
+ */
+describe('the stamp reaches every tool-loop continuation (Lumen #639 finding 3)', () => {
+  const STAMP = '[context] 900 / 1,000 (90%) — ledger 100 (evict_context/compact_context)';
+  const envelope = (promptBody: string, stamp: string | undefined) =>
+    buildPromptEnvelope('wren', makeRuntime(), ledgerOf(10), promptBody, stamp);
+  const reseedBody = () => 'MID-TURN RESEED BODY';
+
+  it.each(['resume', 'seed', 'stateless'] as const)(
+    'REGRESSION: delivers the stamp on a %s continuation',
+    (mode) => {
+      const prompt = buildContinuationPrompt(mode, STAMP, 'tool result', envelope, reseedBody);
+      // All three failed against fd068a65 — resume sent `body` alone, the other
+      // two omitted the envelope's stamp argument.
+      expect(prompt).toContain('[context]');
+      expect(prompt).toContain(STAMP);
+    }
+  );
+
+  it('still carries the payload each mode is responsible for', () => {
+    expect(buildContinuationPrompt('resume', STAMP, 'tool result', envelope, reseedBody)).toContain(
+      'tool result'
+    );
+    // A seed replays the transient dialogue, not the bare body.
+    expect(buildContinuationPrompt('seed', STAMP, 'tool result', envelope, reseedBody)).toContain(
+      'MID-TURN RESEED BODY'
+    );
+    expect(
+      buildContinuationPrompt('stateless', STAMP, 'tool result', envelope, reseedBody)
+    ).toContain('tool result');
+  });
+
+  it('a resumed continuation sends the delta, NOT the whole envelope', () => {
+    // The distinction that makes resume worth having: the live session already
+    // holds the transcript, so re-sending it would defeat the mode.
+    const prompt = buildContinuationPrompt('resume', STAMP, 'tool result', envelope, reseedBody);
+    expect(prompt).not.toContain('Conversation transcript:');
+    expect(prompt).toBe(`${STAMP}\n\ntool result`);
+  });
+
+  it('omits the stamp cleanly when there is none, rather than a blank line', () => {
+    expect(buildContinuationPrompt('resume', undefined, 'tool result', envelope, reseedBody)).toBe(
+      'tool result'
+    );
   });
 });

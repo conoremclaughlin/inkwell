@@ -3228,6 +3228,44 @@ export function buildDeltaPrompt(
   return [contextStamp, recallDelta, userMessage].filter(Boolean).join('\n\n');
 }
 
+/**
+ * The body of a TOOL-LOOP CONTINUATION, for each of the three ways one reaches
+ * the provider.
+ *
+ * All three carried no stamp at all until Lumen's #639 review: `resume` sent
+ * the bare tool result, and `seed`/`stateless` called buildPromptEnvelope
+ * without its stamp argument. That left the stamp on the outer opening only —
+ * which is the one request per turn where it is LEAST informative. The provider
+ * measurement for a turn is sampled from each spawn's usage AFTER that spawn
+ * returns, so a fresh run's opening stamp has no measurement to report
+ * (`splitKnown: false`); by the first continuation there is one. A headless run
+ * that does all its work inside one turn's tool loop could therefore finish
+ * without ever seeing a provider-backed reading of its own window.
+ *
+ * So the caller regenerates the stamp per continuation rather than threading
+ * the opening's down: a stamp recomputed after the last spawn is the point of
+ * the thing, and a stale one is what the envelope path already taught us to
+ * avoid.
+ *
+ * Extracted and pure for the same reason buildDeltaPrompt is — the wiring is
+ * the part that was wrong, and a test of the selection logic has to be able to
+ * reach it without standing up a backend.
+ */
+export function buildContinuationPrompt(
+  mode: 'resume' | 'seed' | 'stateless',
+  contextStamp: string | undefined,
+  body: string,
+  renderEnvelope: (promptBody: string, stamp: string | undefined) => string,
+  renderReseedBody: () => string
+): string {
+  if (mode === 'resume') {
+    // The live session already holds the transcript; the stamp is the only
+    // thing it cannot have, since it describes the window as of right now.
+    return buildDeltaPrompt(contextStamp, '', body);
+  }
+  return renderEnvelope(mode === 'seed' ? renderReseedBody() : body, contextStamp);
+}
+
 export function buildPromptEnvelope(
   sbSlug: string,
   runtime: ChatRuntime,
@@ -6795,8 +6833,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // used to recompute it from the ledger estimate, so the human at the
         // terminal could read a different percentage than the agent was given.
         const util = Math.round(turnOccupancy.utilization * 100);
+        // Same three buckets the stamp names, same words. The human reading this
+        // line and the agent reading the stamp must not be given different
+        // accounts of the same turn — and "evictable" here once covered the
+        // identity envelope, which nothing evicts (Lumen, PR #639).
         const split = turnOccupancy.splitKnown
-          ? `${turnOccupancy.ledgerTokens.toLocaleString()} evictable + ${turnOccupancy.providerOnlyTokens.toLocaleString()} provider-only`
+          ? `${turnOccupancy.ledgerTokens.toLocaleString()} ledger + ` +
+            `${turnOccupancy.fixedTokens.toLocaleString()} envelope + ` +
+            `${turnOccupancy.unaccountedTokens.toLocaleString()} unaccounted`
           : 'ledger estimate only — provider has not reported';
         printEvent(
           chalk.yellow(
@@ -7270,10 +7314,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         activeBackendSessionId,
         randomUUID
       );
-      let continuationPrompt: string;
-      if (decision.mode === 'resume') {
-        continuationPrompt = body;
-      } else if (decision.mode === 'seed') {
+      if (decision.mode === 'seed') {
         activeBackendSessionId = decision.id;
         // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
         // model init may have changed the budget (applyDetectedModel), and
@@ -7290,15 +7331,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         printEvent(
           chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
         );
-        continuationPrompt = buildPromptEnvelope(
-          sbSlug,
-          runtime,
-          ledger,
-          buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
-        );
-      } else {
-        continuationPrompt = buildPromptEnvelope(sbSlug, runtime, ledger, body);
       }
+      // Regenerated per continuation, never the opening's stamp reused: the
+      // preceding spawn's usage has since been sampled, so THIS is the first
+      // reading of the turn backed by a provider measurement. A run whose whole
+      // job happens inside the tool loop would otherwise never see one.
+      const continuationStamp = formatContextStamp(
+        turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+      );
+      const continuationPrompt = buildContinuationPrompt(
+        decision.mode,
+        continuationStamp,
+        body,
+        (promptBody, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, promptBody, stamp),
+        () => buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
+      );
 
       // Recorded for a later reseed in this same turn; the seed above already
       // rendered this body itself.

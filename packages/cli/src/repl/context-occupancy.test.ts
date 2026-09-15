@@ -37,8 +37,8 @@ describe('computeContextOccupancy', () => {
     });
 
     expect(occ.ledgerTokens).toBe(MYRA_LEDGER);
-    expect(occ.providerOnlyTokens).toBe(MYRA_PROVIDER - MYRA_LEDGER); // 251,975
-    expect(occ.fixedTokens + occ.ledgerTokens + occ.providerOnlyTokens).toBe(occ.effectiveTokens);
+    expect(occ.unaccountedTokens).toBe(MYRA_PROVIDER - MYRA_LEDGER); // 251,975
+    expect(occ.fixedTokens + occ.ledgerTokens + occ.unaccountedTokens).toBe(occ.effectiveTokens);
     expect(occ.splitKnown).toBe(true);
   });
 
@@ -53,7 +53,7 @@ describe('computeContextOccupancy', () => {
     expect(occ.fixedTokens).toBe(50_000);
     // Still counted: dropping it from the numerator would under-report the window.
     expect(occ.effectiveTokens).toBe(200_000);
-    expect(occ.providerOnlyTokens).toBe(50_000);
+    expect(occ.unaccountedTokens).toBe(50_000);
   });
 
   it('REGRESSION: the three buckets account for every effective token', () => {
@@ -67,7 +67,7 @@ describe('computeContextOccupancy', () => {
       [7, 11, 13],
     ] as const) {
       const occ = computeContextOccupancy(ledger, fixed, LIMIT, { contextTokens: measured });
-      expect(occ.fixedTokens + occ.ledgerTokens + occ.providerOnlyTokens).toBe(occ.effectiveTokens);
+      expect(occ.fixedTokens + occ.ledgerTokens + occ.unaccountedTokens).toBe(occ.effectiveTokens);
     }
   });
 
@@ -93,7 +93,7 @@ describe('computeContextOccupancy', () => {
   it('keeps the estimate when the provider reports SMALLER (a fresh sample lags the ledger)', () => {
     const occ = computeContextOccupancy(MYRA_LEDGER, 0, LIMIT, { contextTokens: 10 });
     expect(occ.effectiveTokens).toBe(MYRA_LEDGER);
-    expect(occ.providerOnlyTokens).toBe(0);
+    expect(occ.unaccountedTokens).toBe(0);
     // Still "known" — we have a measurement, it is just not the larger one.
     expect(occ.splitKnown).toBe(true);
   });
@@ -124,8 +124,8 @@ describe('formatContextStamp', () => {
     expect(stamp).toContain('383,046');
     expect(stamp).toContain('1,000,000');
     expect(stamp).toContain('38%');
-    expect(stamp).toContain('131,071 in the ledger (evict_context/compact_context)');
-    expect(stamp).toContain('251,975 provider-side (any reseed clears it)');
+    expect(stamp).toContain('ledger 131,071 (evict_context/compact_context)');
+    expect(stamp).toContain('unaccounted 251,975 (native history + estimate drift');
   });
 
   it('REGRESSION: never tells the agent the provider-side excess needs compaction', () => {
@@ -139,14 +139,27 @@ describe('formatContextStamp', () => {
     expect(stamp).not.toContain('only by compact_context');
   });
 
+  it('REGRESSION: promises no remedy at all for the unaccounted residual', () => {
+    // Lumen, PR #639 round 2: the residual is part native-session history (a
+    // reseed drops it) and part provider overhead + estimator drift (a reseed
+    // does not). "any reseed clears it" was still an over-claim — exact
+    // reclaimability cannot be inferred from a subtraction.
+    const stamp = formatContextStamp(
+      computeContextOccupancy(MYRA_LEDGER, 0, LIMIT, { contextTokens: MYRA_PROVIDER })
+    );
+    expect(stamp).not.toContain('any reseed clears it');
+    // Says what it is MADE OF, which is a claim the subtraction supports.
+    expect(stamp).toContain('estimate drift');
+  });
+
   it('REGRESSION: never bills the identity envelope as evictable', () => {
     const stamp = formatContextStamp(
       computeContextOccupancy(100_000, 50_000, LIMIT, { contextTokens: 200_000 })
     );
     // Against fd068a65: "150,000 reclaimable by evict_context".
     expect(stamp).not.toContain('150,000');
-    expect(stamp).toContain('100,000 in the ledger');
-    expect(stamp).toContain('50,000 identity envelope (fixed, re-sent every seed)');
+    expect(stamp).toContain('ledger 100,000');
+    expect(stamp).toContain('identity envelope 50,000 (fixed, re-sent every seed)');
   });
 
   it('leads with the number the agent must budget against', () => {
