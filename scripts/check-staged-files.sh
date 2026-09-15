@@ -158,8 +158,13 @@ trap 'rm -f "$raw" "$list" "$blob" "$markers_raw" "$markers"' EXIT INT TERM
 # The private-marker list. Resolved before anything is listed, so a machine
 # that is not configured finds out on its first commit rather than on the one
 # that happens to carry the data.
+# Readable and not a directory is the test, NOT -f: the documented opt-out
+# for CI is INK_PRIVATE_MARKERS=/dev/null, and /dev/null is a character
+# device, which -f rejects. The first version of this check did exactly that
+# and the exact command written into ci.yml exited 2 before scanning anything
+# (Lumen, PR #636 r1). The harness now runs that command verbatim.
 markers_src=${INK_PRIVATE_MARKERS:-${HOME:-}/.ink/private-markers}
-if [ ! -f "$markers_src" ] || [ ! -r "$markers_src" ]; then
+if [ -d "$markers_src" ] || [ ! -r "$markers_src" ]; then
   echo "" >&2
   echo "Blocked: the private-marker list is missing or unreadable at" >&2
   echo "   $markers_src" >&2

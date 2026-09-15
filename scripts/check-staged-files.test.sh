@@ -489,6 +489,27 @@ out=$(cd "$r" && sh "$guard" --tree HEAD~1 2>&1); rc=$?
 out=$(cd "$r" && sh "$guard" --tree no-such-rev 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "--tree with an unknown revision fails closed (exit 2)" || bad "--tree with an unknown revision fails closed (exit 2)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
+# The CI opt-out, VERBATIM. /dev/null is a character device, not a regular
+# file; a -f test refused it and the documented command exited 2 before
+# scanning (Lumen, r1). The marker arm must be off and the other arms on.
+r=$(new_repo scan-ci-optout "$nohooks")
+stage "$r" src/ok.ts 'export {};'
+stage "$r" src/mentions.md 'this file says canaryperson and is fine without a list'
+git -C "$r" commit -q --no-verify -m 'fixture: clean tree with a marker word' 2>/dev/null
+out=$(cd "$r" && INK_PRIVATE_MARKERS=/dev/null sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "INK_PRIVATE_MARKERS=/dev/null --tree HEAD (the exact CI command) scans and passes" || bad "INK_PRIVATE_MARKERS=/dev/null --tree HEAD (the exact CI command) scans and passes" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+stage "$r" src/people.ts "const p = 'person@$realdom';"
+git -C "$r" commit -q --no-verify -m 'fixture: carries an address' 2>/dev/null
+out=$(cd "$r" && INK_PRIVATE_MARKERS=/dev/null sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "with the marker arm opted out, the address arm still refuses" || bad "with the marker arm opted out, the address arm still refuses" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# A directory at the marker path is not a list.
+mkdir -p "$work/markers-dir"
+r=$(new_repo scan-marker-dir "$nohooks")
+stage "$r" src/x.ts 'clean'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/markers-dir" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "a directory at the marker path refuses with exit 2" || bad "a directory at the marker path refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
 # Fail closed: the credential library is present but the domain list is not.
 mkdir -p "$work/nodomains/lib"
 cp "$guard" "$work/nodomains/check-staged-files.sh"
