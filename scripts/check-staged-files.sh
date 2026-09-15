@@ -309,20 +309,15 @@ email_re='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 
 # The reserved names, and only those (RFC 2606 section 2, RFC 6761):
 # example.com, example.net and example.org with their subdomains, and anything
-# under the .test, .example, .invalid and .localhost top-level names. An
-# `example` label anywhere else — example.co, sub.example.io — is a registrable
-# name and is NOT reserved. The first version of this rule accepted any such
-# label; Lumen (r1) called it correctly as broader than the RFCs.
-reserved_second_level() { # domain, already lower-cased and hyphen-trimmed
+# under the .test, .example, .invalid and .localhost top-level names. Nothing
+# is inferred from an `example` label elsewhere, and nothing is allowed one
+# label past a reserved name: example.co, sub.example.io and example.com.au
+# are registrable hosts. Two earlier versions of this rule accepted the first
+# two shapes and then the third; Lumen (r1, r2) called both correctly.
+reserved_domain() { # domain, already lower-cased and hyphen-trimmed
   case "$1" in
     example.com | example.net | example.org) return 0 ;;
     *.example.com | *.example.net | *.example.org) return 0 ;;
-  esac
-  return 1
-}
-reserved_domain() { # domain, already lower-cased and hyphen-trimmed
-  reserved_second_level "$1" && return 0
-  case "$1" in
     *.test | *.example | *.invalid | *.localhost) return 0 ;;
   esac
   return 1
@@ -330,7 +325,11 @@ reserved_domain() { # domain, already lower-cased and hyphen-trimmed
 
 # The caller has already folded case. Hyphens are trimmed from each label so a
 # fixture that tests REJECTION of `a@-example.com` still reads as the example
-# it is.
+# it is. A file named after an address (the address with .json appended)
+# reads as a host under .json and is refused; fixtures compose such names
+# from the address and the extension separately, which keeps this
+# classifier a plain whitelist. (Spelling that filename out in this very
+# comment was refused by the guard, twice, which is the point of the guard.)
 domain_allowed() { # domain
   d=$1
   case "$d" in *.) d=${d%.} ;; esac
@@ -348,13 +347,6 @@ domain_allowed() { # domain
   done
   d=$trimmed
   reserved_domain "$d" && return 0
-  # A reserved SECOND-LEVEL name with exactly ONE label after it: a file
-  # named after an address, me@example.com.json, which the address shape
-  # cannot tell from a host. One label, not any suffix, so
-  # example.com.anything.else is refused — and second-level only, because
-  # granting the same to the reserved TLDs would let sub.example.io through
-  # as "sub.example" plus one label, which is the hole Lumen's finding names.
-  case "$d" in *.*) reserved_second_level "${d%.*}" && return 0 ;; esac
   for allowed in $fixture_domains_legacy $fixture_domains_infra; do
     [ "$d" = "$allowed" ] && return 0
     case "$d" in *".$allowed") return 0 ;; esac

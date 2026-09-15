@@ -406,7 +406,7 @@ realdom=gmail.com
 lookalike=northside-clinic.com
 
 r=$(new_repo scan-addr-reserved "$nohooks")
-stage "$r" src/fixture.ts "const a = 'ada@example.com'; const b = 'x@clinic.example'; const c = 'y@host.test'; const d = 'z@nope.invalid'; const e = 'q@sub.mail.example.org'; const f = 'me@example.com.json'; const g = 'a@-example.com'; const h = 'a@example..test';"
+stage "$r" src/fixture.ts "const a = 'ada@example.com'; const b = 'x@clinic.example'; const c = 'y@host.test'; const d = 'z@nope.invalid'; const e = 'q@sub.mail.example.org'; const g = 'a@-example.com'; const h = 'a@example..test';"
 out=$(run_index "$r"); rc=$?
 [ "$rc" -eq 0 ] && ok "reserved-domain addresses are allowed (example.*, .test, .invalid, .example, odd example forms)" || bad "reserved-domain addresses are allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
@@ -540,14 +540,27 @@ out=$(run_index "$r"); rc=$?
 c=$(echo "$out" | grep -c -E '^\s+[abcd]\.txt: line\(s\) 1$')
 [ "$c" -eq 4 ] && ok "all four example-label forms are listed, sub.example.<tld> included" || bad "all four example-label forms are listed" "listed $c of 4: $(echo "$out" | tr '\n' ' ')"
 
-r=$(new_repo scan-addr-one-label "$nohooks")
-stage "$r" ok.ts "const f = 'me@example.com.json'; const g = 'a_b@sub.example.net.bak';"
+# No label may follow a reserved name (Lumen r2): example.com.au is a
+# registrable host, and a file named after an address is composed in the
+# fixture rather than blessed here. Suffixes assembled at runtime.
+ext=json
+autld=au
+r=$(new_repo scan-addr-trailing-label "$nohooks")
+stage "$r" a.ts "const f = 'me@example.com.$ext';"
+stage "$r" b.ts "const g = 'x@example.com.$autld';"
+stage "$r" c.ts "const h = 'y@sub.example.org.$autld';"
 out=$(run_index "$r"); rc=$?
-[ "$rc" -eq 0 ] && ok "a reserved name with one trailing label (a file named after an address) is allowed" || bad "a reserved name with one trailing label is allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
-stage "$r" bad.ts "const h = 'x@example.com.$realdom';"
+[ "$rc" -eq 1 ] && ok "a reserved name followed by one label is refused (example.com.au, .json)" || bad "a reserved name followed by one label is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -E '^\s+[abc]\.ts: line\(s\) 1$')
+[ "$c" -eq 3 ] && ok "all three one-label forms are listed" || bad "all three one-label forms are listed" "listed $c of 3: $(echo "$out" | tr '\n' ' ')"
+r=$(new_repo scan-addr-two-labels "$nohooks")
+stage "$r" d.ts "const i = 'z@example.com.$realdom';"
 out=$(run_index "$r"); rc=$?
-[ "$rc" -eq 1 ] && ok "a reserved name followed by more than one label is refused" || bad "a reserved name followed by more than one label is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
-echo "$out" | grep -q 'bad.ts: line(s) 1' && ok "only the offending file is listed" || bad "only the offending file is listed" "$(echo "$out" | tr '\n' ' ')"
+[ "$rc" -eq 1 ] && ok "a reserved name followed by two labels is refused" || bad "a reserved name followed by two labels is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+r=$(new_repo scan-addr-composed "$nohooks")
+stage "$r" ok.ts "const composed = 'me@example.com' + '.$ext';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "a filename composed from a reserved address and an extension is allowed" || bad "a filename composed from a reserved address and an extension is allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 # Working directory (Lumen r1 #3): --tree from a subdirectory listed
 # cwd-relative paths and then read the root's file of the same name.

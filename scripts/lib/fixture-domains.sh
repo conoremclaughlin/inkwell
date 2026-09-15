@@ -5,11 +5,15 @@
 #
 # The guard applies these rules, in order, to every address it finds:
 #
-#   1. A reserved name is always allowed: a domain with `example` as one of
-#      its labels (example.com, example.net, example.org, their subdomains,
-#      example.<anything>) or whose last label is test, invalid, example or
-#      localhost. RFC 2606 and RFC 6761 set these aside so that nothing real
-#      can ever live there, which is exactly the property a fixture needs.
+#   1. A reserved name is always allowed: example.com, example.net and
+#      example.org with their subdomains, or a name whose last label is test,
+#      invalid, example or localhost. RFC 2606 and RFC 6761 set exactly these
+#      aside so that nothing real can ever live there, which is the property a
+#      fixture needs. Nothing else with `example` in it is reserved —
+#      example.co, sub.example.io, example.com.au are registrable — and a
+#      file named after an address (the address with .json appended) is
+#      composed in the fixture from the address and the extension separately,
+#      so it never reads as a host.
 #   2. Otherwise the domain must appear below, exactly or as a parent: an
 #      entry `github.com` also allows `noreply.github.com`.
 #   3. Anything else is refused. The report gives the path and line numbers
