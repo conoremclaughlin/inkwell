@@ -11,7 +11,7 @@
  * Run via: yarn workspace @inklabs/api test:integration
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import jwt from 'jsonwebtoken';
 import { getDataComposer, type DataComposer } from '../data/composer';
 import {
@@ -19,6 +19,7 @@ import {
   verifyPcpAccessToken,
   createRefreshToken,
   exchangeRefreshToken,
+  REFRESH_IDLE_DAYS,
 } from './pcp-tokens';
 import { env } from '../config/env';
 import { ensureEchoIntegrationFixture } from '../test/integration-fixtures';
@@ -190,8 +191,15 @@ describe('PCP Tokens Integration', () => {
 
   describe('exchangeRefreshToken (DB read)', () => {
     let validRefreshToken: string;
+    /** The grant's row id. After an exchange the token VALUE has rotated, so
+     *  this is the only stable handle on the row. */
+    let validTokenRowId: string | undefined;
 
-    beforeAll(async () => {
+    // beforeEach, not beforeAll: a grant is now SINGLE USE. One shared fixture
+    // would be consumed by the first exchange, leaving every later test to
+    // present a dead token — and the ones that assert null would pass for the
+    // wrong reason.
+    beforeEach(async () => {
       // Create a fresh refresh token to use for exchange tests
       const supabase = dataComposer.getClient();
       const result = await createRefreshToken(
@@ -210,6 +218,7 @@ describe('PCP Tokens Integration', () => {
         .eq('refresh_token', validRefreshToken)
         .single();
       if (dbToken) createdTokenIds.push(dbToken.id);
+      validTokenRowId = dbToken?.id;
     });
 
     it('should exchange a valid refresh token for a new access JWT', async () => {
@@ -268,12 +277,12 @@ describe('PCP Tokens Integration', () => {
       expect(decoded!.scope).toBe('admin');
     });
 
-    it('should update last_used_at on successful exchange', async () => {
+    it('should rotate the secret, slide the expiry and stamp last_used_at', async () => {
       const supabase = dataComposer.getClient();
 
       const before = new Date();
 
-      await exchangeRefreshToken(
+      const result = await exchangeRefreshToken(
         supabase,
         validRefreshToken,
         'integration-test',
@@ -281,17 +290,40 @@ describe('PCP Tokens Integration', () => {
         3600
       );
 
+      expect(result).not.toBeNull();
+      expect(result!.refreshToken).not.toBe(validRefreshToken);
+
+      // Look the row up by ID: the token VALUE it was created with no longer
+      // exists, which is the rotation working.
       const { data: dbToken } = await supabase
         .from('mcp_tokens')
-        .select('last_used_at')
-        .eq('refresh_token', validRefreshToken)
+        .select('refresh_token, last_used_at, expires_at')
+        .eq('id', validTokenRowId!)
         .single();
 
       expect(dbToken).not.toBeNull();
+      expect(dbToken!.refresh_token).toBe(result!.refreshToken);
       expect(dbToken!.last_used_at).not.toBeNull();
       expect(new Date(dbToken!.last_used_at!).getTime()).toBeGreaterThanOrEqual(
         before.getTime() - 1000
       );
+
+      // The grant was created with a 90-day lifetime; sliding pulls it in to
+      // one idle window.
+      const slidDays =
+        (new Date(dbToken!.expires_at).getTime() - Date.now()) / (24 * 60 * 60 * 1000);
+      expect(slidDays).toBeGreaterThan(REFRESH_IDLE_DAYS - 1);
+      expect(slidDays).toBeLessThan(REFRESH_IDLE_DAYS + 1);
+
+      // The presented secret is dead — a real end-to-end replay check.
+      const replay = await exchangeRefreshToken(
+        supabase,
+        validRefreshToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+      expect(replay).toBeNull();
     });
 
     it('should return null for nonexistent refresh token', async () => {

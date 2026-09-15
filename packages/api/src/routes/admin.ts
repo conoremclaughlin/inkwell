@@ -13,6 +13,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
+import { REFRESH_IDLE_DAYS } from '../auth/refresh-policy';
 import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
@@ -113,7 +114,9 @@ type ChannelRouteRow = {
 };
 
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
-const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
+// A grant's INITIAL idle window. It slides forward on every use, and the
+// absolute ceiling is enforced centrally from created_at (see refresh-policy).
+const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = REFRESH_IDLE_DAYS;
 const ADMIN_CLIENT_ID = 'dashboard';
 /** Refresh-token client_id for the native app (packages/mobile). */
 const MOBILE_CLIENT_ID = 'mobile';
@@ -1046,13 +1049,22 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         if (result) {
           pcpUserId = result.userId;
           userEmail = result.email;
-          // Set new access token cookie (refresh token stays the same)
           res.cookie('pcp-admin-token', result.accessToken, {
             httpOnly: true,
             secure: env.NODE_ENV === 'production',
             sameSite: 'lax',
             path: '/api/admin',
             maxAge: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS * 1000,
+          });
+          // The grant rotated and slid forward, so the refresh cookie has to be
+          // rewritten too. Leaving the old one in place would log the browser
+          // out at its next hourly refresh.
+          res.cookie('pcp-admin-refresh', result.refreshToken, {
+            httpOnly: true,
+            secure: env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            path: '/api/admin',
+            expires: result.refreshTokenExpiresAt,
           });
         }
       }
@@ -1665,8 +1677,10 @@ router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/auth/mobile-refresh
- * Body: { refreshToken } → { accessToken, expiresIn, userId, email }
- * The refresh token itself is long-lived (90 days) and stays unchanged.
+ * Body: { refreshToken } → { accessToken, refreshToken, expiresIn, userId, email }
+ *
+ * The grant ROTATES on every exchange, so the response carries a new
+ * refreshToken and the client must persist it. The presented one is dead.
  */
 router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
   try {
@@ -1693,6 +1707,7 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 
     res.json({
       accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
       expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
       userId: result.userId,
       email: result.email,

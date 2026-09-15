@@ -11,6 +11,24 @@ import jwt from 'jsonwebtoken';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
+import {
+  DAY_MS,
+  REFRESH_ABSOLUTE_DAYS,
+  assertRefreshWindowIsReachable,
+  slidingExpiry,
+} from './refresh-policy';
+
+// Re-exported so callers and tests have one import site for the token module's
+// own surface. Modules that only need the policy (admin routes, the OAuth
+// provider) import './refresh-policy' directly — many suites mock this module
+// wholesale, and every export added here becomes a broken mock in one of them.
+export {
+  DAY_MS,
+  REFRESH_ABSOLUTE_DAYS,
+  REFRESH_IDLE_DAYS,
+  assertRefreshWindowIsReachable,
+  slidingExpiry,
+} from './refresh-policy';
 import type { Database } from '../data/supabase/types';
 
 // ============================================================================
@@ -135,6 +153,30 @@ export function verifyPcpAccessToken(
 // ============================================================================
 // Refresh Tokens (DB-backed)
 // ============================================================================
+//
+// A grant has TWO deadlines, and both are enforced on every exchange:
+//
+//   IDLE      — `expires_at`, pushed forward to now + REFRESH_IDLE_DAYS each
+//               time the grant is used. A client that stops calling loses the
+//               grant a week later instead of keeping it for three months.
+//   ABSOLUTE  — `created_at` + REFRESH_ABSOLUTE_DAYS, which sliding can never
+//               push past. Re-authentication is required eventually no matter
+//               how active the client is.
+//
+// The grant also ROTATES: each exchange issues a new secret and invalidates the
+// one presented, so a captured refresh token is useful only until its owner
+// next refreshes. The update is conditional on the presented value, so exactly
+// one caller can win a race; the loser is refused rather than handed a second
+// live token.
+//
+// INVARIANT, asserted below: the idle window must be comfortably longer than
+// the access-token lifetime. A client only refreshes when its access token
+// runs out, so an idle window shorter than that lifetime would expire every
+// grant before it was ever used — silently logging everyone out on a schedule.
+
+function newRefreshTokenValue(): string {
+  return `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
+}
 
 /**
  * Create a refresh token in the mcp_tokens table.
@@ -149,7 +191,7 @@ export async function createRefreshToken(
   sbSlug?: string,
   sbId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
-  const refreshToken = `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
+  const refreshToken = newRefreshTokenValue();
   const expiresAt = new Date(Date.now() + lifetimeDays * 24 * 60 * 60 * 1000);
 
   const { error } = await supabase.from('mcp_tokens').insert({
@@ -172,10 +214,14 @@ export async function createRefreshToken(
 }
 
 /**
- * Exchange a refresh token for a new access JWT.
- * Looks up the token in mcp_tokens, verifies expiry, signs a fresh JWT.
+ * Exchange a refresh token for a new access JWT, rotating the grant.
  *
- * @returns  Access token + user info on success, null on failure
+ * The presented token is invalidated and a new one returned: callers MUST hand
+ * `refreshToken` back to the client (OAuth response body, cookie) or the client
+ * is locked out at its next refresh. Both deadlines are enforced, and the grant
+ * slides one idle window forward on success.
+ *
+ * @returns  Access token, the ROTATED refresh token and user info, or null
  */
 export async function exchangeRefreshToken(
   supabase: SupabaseClient<Database>,
@@ -185,11 +231,16 @@ export async function exchangeRefreshToken(
   accessTokenLifetimeSeconds: number
 ): Promise<{
   accessToken: string;
+  /** ROTATED — the presented token is now dead. Return this to the client. */
+  refreshToken: string;
+  refreshTokenExpiresAt: Date;
   userId: string;
   email: string;
   sbSlug?: string;
   identityId?: string;
 } | null> {
+  assertRefreshWindowIsReachable(accessTokenLifetimeSeconds, `exchangeRefreshToken(${clientId})`);
+
   const { data: tokenRecord, error: lookupError } = await supabase
     .from('mcp_tokens')
     .select('*, users(email)')
@@ -209,8 +260,24 @@ export async function exchangeRefreshToken(
     return null;
   }
 
-  if (new Date(tokenRecord.expires_at) < new Date()) {
-    logger.warn('Refresh token expired', { userId: tokenRecord.user_id });
+  const now = new Date();
+
+  if (new Date(tokenRecord.expires_at) < now) {
+    logger.warn('Refresh token expired', { userId: tokenRecord.user_id, clientId });
+    await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
+    return null;
+  }
+
+  // The absolute ceiling is checked on its own. A grant that has been slid
+  // forward every week for three months is still finished, and its stored
+  // expires_at is not where that shows up.
+  const createdAt = (tokenRecord as Record<string, unknown>).created_at as string | null;
+  if (createdAt && new Date(createdAt).getTime() + REFRESH_ABSOLUTE_DAYS * DAY_MS < now.getTime()) {
+    logger.warn('Refresh token past its absolute lifetime', {
+      userId: tokenRecord.user_id,
+      clientId,
+      createdAt,
+    });
     await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
     return null;
   }
@@ -234,14 +301,54 @@ export async function exchangeRefreshToken(
     accessTokenLifetimeSeconds
   );
 
-  // Update last_used_at
-  await supabase
+  // Rotate, slide, and stamp — one write, conditional on the value presented.
+  // Matching on refresh_token as well as id is what makes a concurrent second
+  // exchange lose: it updates zero rows rather than handing out a second live
+  // token for the same grant.
+  const rotated = newRefreshTokenValue();
+  const { expiresAt, atAbsoluteCeiling } = slidingExpiry({
+    now,
+    createdAt,
+    currentExpiresAt: tokenRecord.expires_at,
+  });
+
+  const { data: updated, error: rotateError } = await supabase
     .from('mcp_tokens')
-    .update({ last_used_at: new Date().toISOString() })
-    .eq('id', tokenRecord.id);
+    .update({
+      refresh_token: rotated,
+      expires_at: expiresAt.toISOString(),
+      last_used_at: now.toISOString(),
+    })
+    .eq('id', tokenRecord.id)
+    .eq('refresh_token', refreshToken)
+    .select('id');
+
+  if (rotateError) {
+    logger.error('Failed to rotate refresh token', { error: rotateError, clientId });
+    return null;
+  }
+  if (!updated || updated.length === 0) {
+    // Someone else rotated this grant between our read and our write. Refusing
+    // is the safe direction: the winner holds the live token.
+    logger.warn('Refresh token was rotated concurrently; refusing this exchange', {
+      userId: tokenRecord.user_id,
+      clientId,
+    });
+    return null;
+  }
+
+  if (atAbsoluteCeiling) {
+    logger.info('Refresh grant is at its absolute ceiling; re-authentication due', {
+      userId: tokenRecord.user_id,
+      clientId,
+      expiresAt: expiresAt.toISOString(),
+    });
+  }
 
   return {
     accessToken,
+    refreshToken: rotated,
+    refreshTokenExpiresAt: expiresAt,
     userId: tokenRecord.user_id,
     email: userEmail,
     ...(sbSlug ? { sbSlug } : {}),
