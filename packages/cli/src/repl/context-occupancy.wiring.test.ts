@@ -8,6 +8,7 @@ import {
   turnContextOccupancy,
 } from '../commands/chat';
 import { ContextLedger } from './context-ledger';
+import { ProviderSampleTracker } from './provider-sample';
 import {
   computeContextOccupancy,
   formatContextStamp,
@@ -167,5 +168,164 @@ describe('the production continuation block wires a regenerated stamp', () => {
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     expect(end - start).toBeGreaterThan(200);
+  });
+});
+
+/**
+ * The FOURTH parent request, and the last one Lumen's sweep turned up: when a
+ * resume fails because the provider session vanished, the turn mints a fresh
+ * native id and retries with the full envelope. Against 9f9d00e7 that retry
+ * called buildPromptEnvelope with four arguments and shipped no stamp.
+ *
+ * It is not a request that gets skipped: the stamped resume died before any
+ * model read it, so this seed is the first thing the turn sends that anything
+ * answers — and on the server heartbeat path it may be the only one.
+ *
+ * The block is sliced and executed for the same reason as the continuation
+ * block above. What a source-text assertion could not check is the ORDERING:
+ * the stamp has to be built AFTER activeBackendSessionId moves to the reseed
+ * id, because providerScope() keys on that id and the dead session's
+ * measurement must stop matching. So the probe declares the id and
+ * providerContextMeasurement inside the executed scope, over a real
+ * ProviderSampleTracker holding a sample recorded under the OLD id.
+ */
+describe('PR 639 resume-not-found recovery seed', () => {
+  const STALE_SESSION = 'stale-native-session';
+  const RESEED_SESSION = 'reseeded-native-session';
+  const MEASURED_TOKENS = 1500;
+
+  const sliceRecoveryBlock = (): string => {
+    const source = readFileSync(new URL('../commands/chat.ts', import.meta.url), 'utf8');
+    const start = source.indexOf(
+      '          // Mint a fresh native session, re-send the FULL envelope (the ledger'
+    );
+    const end = source.indexOf('          currentTurnAbort = reseedTurn.abort;', start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    return source.slice(start, end);
+  };
+
+  /**
+   * Runs the production recovery block with everything outside it stubbed.
+   * `mintedId` is what randomUUID hands the block — passing STALE_SESSION back
+   * is the control: the scope then still matches and the same code path is
+   * proven able to report the measurement.
+   */
+  const runRecoveryBlock = (mintedId: string) => {
+    const providerSample = new ProviderSampleTracker();
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'synthetic user input', 'repl');
+    const runtime = {
+      backend: 'claude',
+      model: 'synthetic-model',
+      effort: 'medium',
+      verbose: false,
+      systemPromptOverride: undefined,
+      backendTurnTimeoutMs: 1000,
+      backendIdleTimeoutMs: 1000,
+      transcriptPath: '/dev/null/synthetic',
+      maxContextTokens: 2000,
+      // Nonzero deliberately: a zeroed bootstrap leaves the fixed bucket empty,
+      // and an empty bucket cannot disagree with anything.
+      bootstrapContext: 'x'.repeat(400),
+      toolMode: 'off',
+      toolRouting: 'local',
+      strictTools: false,
+      activeSkills: [],
+    };
+    let captured: { prompt: string } | undefined;
+    const dependencies = {
+      providerSample,
+      staleSession: STALE_SESSION,
+      measuredTokens: MEASURED_TOKENS,
+      randomUUID: () => mintedId,
+      currentEnvelopeShape: 'synthetic-shape',
+      runtime,
+      ledger,
+      raw: 'synthetic user input',
+      sbSlug: 'review-fixture',
+      passthroughArgs: [] as string[],
+      handleBackendEvent: () => {},
+      sessionAttachmentDirs: [] as string[],
+      turnMedia: [] as unknown[],
+      appendTranscript: () => {},
+      printEvent: () => {},
+      chalk: { yellow: (s: string) => s },
+      beginSpawn: () => {},
+      buildPromptEnvelope,
+      formatContextStamp,
+      turnContextOccupancy,
+      startBackendTurn: (request: { prompt: string }) => {
+        captured = request;
+        return { abort: () => {}, result: Promise.resolve({}) };
+      },
+    };
+    // The prelude reproduces the two things the block reads from its enclosing
+    // scope and mutates: the live native id, and a measurement lookup scoped to
+    // it. The sample is recorded under the STALE id — the session that just
+    // failed to resume.
+    const prelude = `
+      let activeBackendSessionId = staleSession;
+      let activeBackendSessionShape = 'synthetic-shape';
+      const providerScope = () => ({
+        backend: runtime.backend,
+        model: runtime.model,
+        backendSessionId: activeBackendSessionId,
+        envelopeShape: 'synthetic-shape',
+      });
+      providerSample.record({ contextTokens: measuredTokens }, {
+        backend: runtime.backend,
+        model: runtime.model,
+        backendSessionId: staleSession,
+        envelopeShape: 'synthetic-shape',
+      });
+      const providerContextMeasurement = () => providerSample.measurement(providerScope());
+    `;
+    const js = ts.transpileModule(prelude + sliceRecoveryBlock() + '\nreturn reseedStamp;', {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const reseedStamp = new Function(...Object.keys(dependencies), js)(
+      ...Object.values(dependencies)
+    ) as string | undefined;
+    return { reseedStamp, captured };
+  };
+
+  it('stamps the recovery retry envelope', () => {
+    const { reseedStamp, captured } = runRecoveryBlock(RESEED_SESSION);
+    expect(captured).toBeDefined();
+    expect(reseedStamp).toContain('[context]');
+    expect(captured!.prompt).toContain(reseedStamp!);
+  });
+
+  it('builds that stamp after the new native id lands, so the dead session is not quoted', () => {
+    const { reseedStamp } = runRecoveryBlock(RESEED_SESSION);
+    // The failed session's 1,500-token reading describes a window that no
+    // longer exists. Reading it before the reassignment would put it here.
+    expect(reseedStamp).not.toContain('1,500');
+    expect(reseedStamp).toContain('the provider has not reported this session');
+  });
+
+  it('control: the same block DOES report a measurement whose scope still matches', () => {
+    // Without this, the assertion above passes for any reason at all — a stamp
+    // that is empty, a tracker that never recorded, a scope typo. Handing the
+    // block back the id it was already on keeps the scope matching, and the
+    // measurement appears.
+    const { reseedStamp } = runRecoveryBlock(STALE_SESSION);
+    expect(reseedStamp).toContain('1,500');
+    expect(reseedStamp).not.toContain('the provider has not reported this session');
+    // And the fixed bucket is populated, so the three-bucket line is exercised
+    // rather than skipped past a zero.
+    expect(reseedStamp).toContain('identity envelope 100');
+  });
+
+  it('control: the marker comments this test slices on still delimit a real block', () => {
+    const block = sliceRecoveryBlock();
+    expect(block.length).toBeGreaterThan(200);
+    expect(block).toContain('const reseedId = randomUUID();');
+    expect(block).toContain('activeBackendSessionId = reseedId;');
+    // Ordering, pinned in the text as well as executed above.
+    expect(block.indexOf('activeBackendSessionId = reseedId;')).toBeLessThan(
+      block.indexOf('const reseedStamp = formatContextStamp(')
+    );
   });
 });

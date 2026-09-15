@@ -7201,13 +7201,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '  ⛁ provider session not found on resume — re-seeding a fresh native session'
             )
           );
+          // Regenerated HERE, after the new id is assigned, and never the
+          // opening's contextStamp reused. The stamped resume died before a
+          // model read it; THIS seed is the first request of the turn anything
+          // answers. The reassignment above is what makes the reading honest:
+          // providerScope() keys on activeBackendSessionId, so the failed
+          // session's measurement no longer matches and the stamp falls back to
+          // the estimate instead of describing a window that no longer exists.
+          const reseedStamp = formatContextStamp(
+            turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+          );
           beginSpawn();
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
             sbSlug,
             model: runtime.model,
             effort: runtime.effort,
-            prompt: buildPromptEnvelope(sbSlug, runtime, ledger, raw),
+            prompt: buildPromptEnvelope(sbSlug, runtime, ledger, raw, reseedStamp),
             verbose: runtime.verbose,
             passthroughArgs,
             systemPromptOverride: runtime.systemPromptOverride,
