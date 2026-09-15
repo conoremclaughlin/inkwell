@@ -1535,8 +1535,13 @@ export type Database = {
           key_type: string | null;
           metadata: Json | null;
           status: string;
+          summary: string | null;
+          summary_updated_at: string | null;
+          summary_updated_by_sb_id: string | null;
           thread_key: string;
           title: string | null;
+          title_updated_at: string | null;
+          title_updated_by_sb_id: string | null;
           updated_at: string | null;
           user_id: string;
         };
@@ -1551,8 +1556,13 @@ export type Database = {
           key_type?: string | null;
           metadata?: Json | null;
           status?: string;
+          summary?: string | null;
+          summary_updated_at?: string | null;
+          summary_updated_by_sb_id?: string | null;
           thread_key: string;
           title?: string | null;
+          title_updated_at?: string | null;
+          title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
           user_id: string;
         };
@@ -1567,12 +1577,29 @@ export type Database = {
           key_type?: string | null;
           metadata?: Json | null;
           status?: string;
+          summary?: string | null;
+          summary_updated_at?: string | null;
+          summary_updated_by_sb_id?: string | null;
           thread_key?: string;
           title?: string | null;
+          title_updated_at?: string | null;
+          title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
           user_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'inbox_threads_summary_updated_by_sb_id_fkey';
+            columns: ['summary_updated_by_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'inbox_threads_title_updated_by_sb_id_fkey';
+            columns: ['title_updated_by_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'inbox_threads_user_id_fkey';
             columns: ['user_id'];

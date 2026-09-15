@@ -13,6 +13,7 @@ import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { resolveSbId } from '../../auth/resolve-identity';
 import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -151,6 +152,43 @@ const reopenThreadSchema = userIdentifierBaseSchema.extend({
   sbSlug: sbSlugSchema.describe('SB slug reopening the thread (must be a participant)'),
 });
 
+/**
+ * Brevity bounds, mirrored from the CHECK constraints on inbox_threads. Kept in
+ * both places deliberately: the schema gives a caller a usable error, the
+ * constraint is what actually holds — including for writers that never pass
+ * through this tool.
+ */
+export const THREAD_TITLE_MAX = 200;
+export const THREAD_SUMMARY_MAX = 280;
+
+const updateThreadSchema = userIdentifierBaseSchema
+  .extend({
+    threadKey: threadKeySchema,
+    sbSlug: sbSlugSchema.describe('SB slug making the change (must be a participant)'),
+    title: z
+      .string()
+      .max(THREAD_TITLE_MAX)
+      .nullable()
+      .optional()
+      .describe(
+        `Short label for the thread, max ${THREAD_TITLE_MAX} chars. The threadKey identifies the thread; this describes it. Pass null to clear.`
+      ),
+    summary: z
+      .string()
+      .max(THREAD_SUMMARY_MAX)
+      .nullable()
+      .optional()
+      .describe(
+        `Brief, concise description of what the thread is about NOW, max ${THREAD_SUMMARY_MAX} chars. Rewrite it as the discussion moves on. Pass null to clear.`
+      ),
+  })
+  // Distinguishing "not provided" from "explicitly cleared" is the whole point
+  // of allowing null, so a call that provides neither is a caller error rather
+  // than a silent no-op that reports success.
+  .refine((v) => v.title !== undefined || v.summary !== undefined, {
+    message: 'Provide at least one of title or summary',
+  });
+
 const listThreadsSchema = userIdentifierBaseSchema.extend({
   sbSlug: sbSlugSchema.describe('SB slug to list threads for'),
   status: z.enum(['open', 'closed', 'all']).optional().default('open'),
@@ -177,6 +215,16 @@ interface ThreadRow {
   user_id: string;
   created_by_agent_id: string;
   title: string | null;
+  summary: string | null;
+  /**
+   * NULL means the field still holds its creation-time value. That is the
+   * signal a reader needs: it distinguishes a description someone has kept
+   * current from one that has never been touched since the thread opened.
+   */
+  title_updated_at: string | null;
+  title_updated_by_sb_id: string | null;
+  summary_updated_at: string | null;
+  summary_updated_by_sb_id: string | null;
   status: string;
   metadata: Json;
   created_at: string;
@@ -617,6 +665,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           threadKey,
           threadId: thread.id,
           title: thread.title,
+          summary: thread.summary ?? null,
+          titleUpdatedAt: thread.title_updated_at ?? null,
+          summaryUpdatedAt: thread.summary_updated_at ?? null,
           status: thread.status,
           createdBy: thread.created_by_agent_id,
           participants,
@@ -997,6 +1048,134 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
   });
 }
 
+/**
+ * Set or update a thread's title and summary.
+ *
+ * The threadKey is a stable identifier by design, and that stability is what
+ * makes it useless as a description: one thread routinely spans several PRs,
+ * specs and incidents. So the descriptive layer is mutable precisely because
+ * the key is not.
+ *
+ * Any participant may edit. A thread is collaborative — restricting edits to
+ * the creator would mean a thread Myra opened can never be retitled by the SB
+ * actually doing the work, which is the common case.
+ *
+ * Each field carries its own editor and timestamp. The timestamp is the load
+ * bearing part: a summary without one is read as current no matter how old it
+ * is, which is the failure this feature exists to fix rather than reproduce.
+ */
+export async function handleUpdateThread(args: unknown, dataComposer: DataComposer) {
+  const supabase = dataComposer.getClient();
+  const parsed = updateThreadSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
+  const { threadKey, title, summary } = parsed;
+
+  const reply = (payload: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
+  });
+
+  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  if (!thread) {
+    return reply({ success: false, error: `Thread not found: ${threadKey}` });
+  }
+
+  // Closed threads stay editable. Closed is a work-state signal, not a lock
+  // (spec inkmail-thread-scope §2), and a finished thread is exactly the one
+  // whose summary is most worth correcting for whoever reads it later.
+  if (!(await isParticipant(supabase, thread.id, sbSlug))) {
+    return reply({
+      success: false,
+      error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
+    });
+  }
+
+  // Attribution by canonical UUID. Prefer the server-side request context over
+  // anything derived from the slug: a slug is unique only per workspace, so
+  // re-deriving it can name a different SB of the same name — and that is not
+  // hypothetical here, the fixture user carries two `echo` identities, one of
+  // them workspace-less, which makes the slug lookup correctly return nothing.
+  //
+  // A provenance field is not an authorization field, so this does NOT fail
+  // closed the way resolveOwnerSbId does: refusing a title edit because of a
+  // duplicate identity row elsewhere would cost the description and buy no
+  // safety. Instead the edit lands and the response says which it got, so a
+  // caller can tell "attributed to an identity" from "attributed to a slug
+  // only" rather than reading null as either.
+  const editorSbId =
+    senderSbId() ?? (await resolveSbId(supabase, resolved.user.id, sbSlug)) ?? null;
+  const attributedBy = editorSbId ? 'identity' : 'slug-only';
+
+  const now = new Date().toISOString();
+  const update: Record<string, unknown> = { updated_at: now };
+  const changed: string[] = [];
+
+  // `undefined` means "not provided" and `null` means "explicitly cleared" —
+  // never collapse them, or a caller editing only the summary silently wipes
+  // the title.
+  if (title !== undefined) {
+    update.title = title;
+    update.title_updated_by_sb_id = editorSbId;
+    update.title_updated_at = now;
+    changed.push('title');
+  }
+  if (summary !== undefined) {
+    update.summary = summary;
+    update.summary_updated_by_sb_id = editorSbId;
+    update.summary_updated_at = now;
+    changed.push('summary');
+  }
+
+  const { error } = await threadTable(supabase, 'inbox_threads').update(update).eq('id', thread.id);
+
+  if (error) {
+    throw new Error(`Failed to update thread: ${error.message}`);
+  }
+
+  // A system message in the timeline, matching close/reopen. This is the
+  // version trail: an edit that silently replaced its predecessor would leave a
+  // record no one can tell has changed.
+  await threadTable(supabase, 'inbox_thread_messages').insert({
+    thread_id: thread.id,
+    sender_agent_id: 'system',
+    content: `Thread ${changed.join(' and ')} updated by ${sbSlug}`,
+    message_type: 'system',
+    metadata: {
+      type: 'thread_metadata_updated',
+      updatedBy: sbSlug,
+      updatedBySbId: editorSbId,
+      attributedBy,
+      updatedFields: changed,
+      ...(title !== undefined ? { title } : {}),
+      ...(summary !== undefined ? { summary } : {}),
+    } as Json,
+  });
+
+  logger.info('[Thread] Title/summary updated', {
+    threadKey,
+    sbSlug,
+    fields: changed,
+    attributedBy,
+  });
+
+  return reply({
+    success: true,
+    message: `Thread ${threadKey} ${changed.join(' and ')} updated`,
+    threadKey,
+    updatedBy: sbSlug,
+    // 'identity' = a canonical UUID was recorded. 'slug-only' = the slug could
+    // not be resolved to one identity, so the column is null and the timeline
+    // message carries the slug. Stated rather than left to be inferred from a
+    // null column, which cannot distinguish "unresolvable" from "never tried".
+    attributedBy,
+    updatedFields: changed,
+    ...(title !== undefined ? { title } : {}),
+    ...(summary !== undefined ? { summary } : {}),
+    updatedAt: now,
+  });
+}
+
 export async function handleListThreads(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = listThreadsSchema.parse(args);
@@ -1081,6 +1260,12 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
       return {
         threadKey: t.thread_key,
         title: t.title,
+        summary: t.summary ?? null,
+        // Ages travel with the text. A summary shown without one is read as
+        // current however old it is — the exact misread this feature exists to
+        // prevent, so omitting these would reproduce it on a new surface.
+        titleUpdatedAt: t.title_updated_at ?? null,
+        summaryUpdatedAt: t.summary_updated_at ?? null,
         status: t.status,
         createdBy: t.created_by_agent_id,
         participants,
@@ -1292,4 +1477,30 @@ export const threadToolDefinitions = [
     schema: reopenThreadSchema,
     handler: handleReopenThread,
   },
+  {
+    name: 'update_thread',
+    description:
+      "Set or update a thread's title and brief summary, so it is clear what the thread is actually about now. The threadKey is a stable identifier, not a description — one thread routinely covers several PRs, specs and incidents, and 'pr:632' says none of it. Keep the summary BRIEF AND CONCISE (bounded at 280 chars) and rewrite it as the discussion moves on; a summary that grows without bound is the thing this replaces. Any participant may edit, including on a closed thread. Each field records who changed it and when, and the age is shown wherever the summary is, so a reader can tell a current description from an old one.",
+    schema: updateThreadSchema,
+    handler: handleUpdateThread,
+  },
 ];
+
+/**
+ * Look up a thread tool definition by name.
+ *
+ * Registration used to index this array positionally (`threadToolDefinitions[3]`),
+ * which silently rebinds every later tool to the wrong schema the moment
+ * anything is inserted rather than appended — a trap that fired immediately
+ * when `update_thread` was first added in the middle. Names do not shift.
+ */
+export function threadTool(name: string): (typeof threadToolDefinitions)[number] {
+  const found = threadToolDefinitions.find((t) => t.name === name);
+  if (!found) {
+    // Throwing beats returning undefined: a missing tool is a programming error
+    // at startup, and a silently unregistered tool is invisible until a caller
+    // needs it.
+    throw new Error(`Unknown thread tool: ${name}`);
+  }
+  return found;
+}
