@@ -55,6 +55,7 @@ import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gate
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteSlug } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
+import { resolveReplyAuthorship } from './services/routing/resolve-reply-authorship';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
@@ -202,9 +203,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       return;
     }
 
-    // Resolve agent: mention → channel_routes → AGENT_ID env fallback
+    // Resolve agent: mention → reply authorship → channel_routes → AGENT_ID env fallback
     let routedSlug = sbSlug;
     let routedIdentityId: string | undefined;
+    let replyRouting: { resolved: boolean; reason?: string } | undefined;
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
     // For group chats, try mention-based routing first
@@ -228,7 +230,46 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // If mention didn't match, try channel_routes specificity cascade
+    // If no mention matched, route by what the user replied to. All SBs share
+    // one bot, so a reply is the only way Conor can address a specific SB in a
+    // DM — without this tier it lands on whoever owns the channel, silently.
+    // Runs after @mention because a mention is a deliberate address written in
+    // the new message, where a reply points at an older one.
+    if (routedSlug === sbSlug) {
+      const authorship = await resolveReplyAuthorship(
+        dataComposer!.getClient(),
+        userId,
+        channel,
+        metadata?.replyToMessageId
+      );
+
+      if (authorship.resolved) {
+        routedSlug = authorship.sbSlug;
+        routedIdentityId = authorship.sbId ?? undefined;
+        replyRouting = { resolved: true };
+        logger.info(`[Route] Resolved agent from reply authorship`, {
+          platform: channel,
+          sbSlug: authorship.sbSlug,
+          sbId: authorship.sbId,
+          replyToMessageId: metadata?.replyToMessageId,
+        });
+      } else {
+        replyRouting = { resolved: false, reason: authorship.reason };
+        // Only noteworthy when the user actually replied to something. A
+        // non-reply message failing to resolve is not a failure, and logging it
+        // would bury the cases that are.
+        if (authorship.reason !== 'no_reply_id') {
+          logger.warn(`[Route] Reply could not be attributed — falling through to channel_routes`, {
+            platform: channel,
+            conversationId,
+            replyToMessageId: metadata?.replyToMessageId,
+            reason: authorship.reason,
+          });
+        }
+      }
+    }
+
+    // If neither mention nor reply matched, try channel_routes specificity cascade
     let routeStudioHint: string | null = null;
     let resolvedRouteId: string | null = null;
     if (routedSlug === sbSlug) {
@@ -338,6 +379,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         triggerType: 'message',
         ...(routeStudioHint ? { studioHint: routeStudioHint } : {}),
         ...(contactId ? { contactId } : {}),
+        // Carried so a misroute is diagnosable after the fact. Without it, a
+        // reply that fell through to the channel owner is indistinguishable
+        // from one that was never a reply at all.
+        ...(replyRouting && replyRouting.reason !== 'no_reply_id' ? { replyRouting } : {}),
       },
     };
 
