@@ -14,7 +14,7 @@
  *   GET  /api/alerts/sources  monitor liveness + staleness verdicts (bearer only)
  */
 
-import { Router, type NextFunction, type Request, type Response } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { ZodError } from 'zod';
 import type { DataComposer } from '../data/composer';
 import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
@@ -22,7 +22,7 @@ import { AlertDispatchService } from '../services/alerts/alert-dispatch.service'
 import { parseAlertPayload, secretsMatch, sourceStaleness } from '../services/alerts/alert-policy';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
-import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
+import rateLimit from 'express-rate-limit';
 
 /**
  * Resolve the acting user from either credential.
@@ -53,47 +53,44 @@ function resolveAlertUser(
 /**
  * Read throttle for the alert query routes.
  *
- * Both GETs are authenticated, so this is not an anti-guessing measure like
- * the credential limiter in admin.ts. It bounds cost: each one runs an
- * unbounded-fanout query against alert_events / alert_sources on behalf of
- * whoever holds a valid token, and a token that leaks or a client stuck in a
- * retry loop can turn the alerting tables into the thing taking the database
- * down — the alerting path becoming the outage again.
+ * Both GETs are authenticated, so this is not the anti-guessing throttle that
+ * guards the credential routes. It bounds cost: each request runs a query
+ * against alert_events / alert_sources for whoever holds a valid token, so a
+ * leaked token or a client stuck in a retry loop could otherwise make the
+ * alerting tables the thing that takes the database down — the alerting path
+ * becoming the outage it exists to report.
  *
- * Per (user, ip) so one noisy client cannot exhaust another's budget, using
- * the same bounded limiter as admin.ts: amortised pruning and a hard cap.
- */
-const ALERT_READ_WINDOW_MS = 60 * 1000;
-const ALERT_READS_PER_MINUTE = 60;
-const readLimiter = new FixedWindowLimiter(ALERT_READ_WINDOW_MS);
-
-/**
- * Applied as route middleware rather than checked inside each handler.
- *
- * Two reasons, and the second is the one that made this worth changing. It
- * runs before the handler body, so a new query route cannot be added that
- * forgets to call it partway down. And CodeQL's missing-rate-limiting query
- * recognises a limiter attached to the route, not an `if` in the handler — the
- * in-handler form left the finding open on a route that really was throttled
- * (PR #539 r5, Lumen, who checked the analysis head_sha rather than the branch
- * UI and found the annotation on the post-guard commit).
+ * express-rate-limit rather than the in-house FixedWindowLimiter, for a reason
+ * worth recording. A hand-rolled limiter is not merely unrecognised by
+ * CodeQL's js/missing-rate-limiting when written inside the handler; it is
+ * unrecognised wherever it is put, because the query models known limiter
+ * packages rather than the shape of the check. Moving the same custom code
+ * into middleware changed nothing, which is what the r5 attempt established
+ * the slow way. The dependency was already declared and unused, so this costs
+ * no new supply-chain surface.
  *
  * Keyed per (user, ip) so one noisy client cannot spend another's budget.
  */
+const ALERT_READ_WINDOW_MS = 60 * 1000;
+const ALERT_READS_PER_MINUTE = 60;
+
 function makeReadThrottle(authProvider: PcpAuthProvider) {
-  return function throttleReads(req: Request, res: Response, next: NextFunction): void {
-    const userData = authProvider.verifyAccessToken(req.headers.authorization);
-    // Unauthenticated callers are charged by address alone; the handler still
-    // does its own 401, this only decides whether to keep reading.
-    const key = userData
-      ? `alertread:${userData.userId}|${req.ip ?? 'unknown'}`
-      : `alertread:anon|${req.ip ?? 'unknown'}`;
-    if (readLimiter.hit(key, ALERT_READS_PER_MINUTE)) {
+  return rateLimit({
+    windowMs: ALERT_READ_WINDOW_MS,
+    limit: ALERT_READS_PER_MINUTE,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    keyGenerator: (req: Request): string => {
+      const userData = authProvider.verifyAccessToken(req.headers.authorization);
+      // Unauthenticated callers are charged by address alone. The handler
+      // still does its own 401; this only decides whether to keep reading.
+      const ip = req.ip ?? 'unknown';
+      return userData ? `alertread:${userData.userId}|${ip}` : `alertread:anon|${ip}`;
+    },
+    handler: (_req: Request, res: Response): void => {
       res.status(429).json({ success: false, error: 'Too many requests' });
-      return;
-    }
-    next();
-  };
+    },
+  });
 }
 
 export function createAlertsRouter(dataComposer: DataComposer): Router {

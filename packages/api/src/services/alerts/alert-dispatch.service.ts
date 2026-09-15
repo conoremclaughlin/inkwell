@@ -557,6 +557,21 @@ export class AlertDispatchService {
       ];
     }
 
+    // The sinks get a CHILD budget, not the request's.
+    //
+    // The parent is the whole request (18s); this fan-out abandons its sinks
+    // at budgetMs — 12s for the main one, 5s for a recovery notice. A
+    // continuation that resumes between those two, say at 13s, would find the
+    // parent budget unexpired and send, even though the fan-out it belongs to
+    // gave up a second earlier and ingest has already reported its result.
+    // Checking against the parent answers "is the request over", when the
+    // question at the send is "is the fan-out I was started by still waiting
+    // for me" (PR #539 r6, Lumen).
+    //
+    // Capped by the parent as well as by budgetMs, so a fan-out started late
+    // in the request cannot outlive it either.
+    const sinkBudget = new RequestBudget(budget.cap(budgetMs));
+
     // The deadline is also an abort signal, not just a race. Cancellable work
     // (the webhook POSTs) is actually cancelled when it fires, so a written-off
     // send cannot quietly deliver afterwards.
@@ -569,8 +584,8 @@ export class AlertDispatchService {
     let results: PromiseSettledResult<SinkResult[]>[];
     try {
       results = await Promise.allSettled([
-        withTimeout('user sink', this.notifyUserChannel(userId, event, budget), budgetMs),
-        withTimeout('agents sink', this.notifyAgents(userId, event, budget), budgetMs),
+        withTimeout('user sink', this.notifyUserChannel(userId, event, sinkBudget), budgetMs),
+        withTimeout('agents sink', this.notifyAgents(userId, event, sinkBudget), budgetMs),
         withTimeout('webhook sink', this.notifyWebhooks(userId, event, deadline.signal), budgetMs),
       ]);
     } finally {

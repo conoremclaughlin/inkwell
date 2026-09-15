@@ -409,6 +409,59 @@ describe('no new send is STARTED after the budget is gone', () => {
   });
 });
 
+describe('a sink is bound by its own fan-out, not by the whole request', () => {
+  // The gap this closes is narrow and was invisible from either end alone. The
+  // request budget is 18s; a fan-out abandons its sinks at 12s, or 5s for a
+  // recovery notice. A continuation resuming at 13s finds the REQUEST
+  // unexpired and sends — even though the fan-out it belongs to gave up a
+  // second earlier and ingest has already reported its result.
+  //
+  // "Is the request over" is the wrong question at the send. The right one is
+  // "is the fan-out that started me still waiting for me" (PR #539 r6, Lumen).
+
+  it('abandons a user send that resumes after its fan-out gave up but before the request ceiling', async () => {
+    vi.useFakeTimers();
+    const h = await harness();
+
+    let releaseLookup!: () => void;
+    const held = new Promise<void>((r) => {
+      releaseLookup = r;
+    });
+    const from = h.service.supabase.from.bind(h.service.supabase);
+    h.service.supabase.from = (table: string) => {
+      const builder = from(table);
+      if (table === 'users') {
+        builder.maybeSingle = async () => {
+          await held;
+          return { data: { telegram_id: '555000123' }, error: null };
+        };
+        builder.single = builder.maybeSingle;
+      }
+      return builder;
+    };
+
+    void h.service.ingest(USER, alert).catch(() => {});
+    // Past the 12s fan-out window, comfortably inside the 18s request budget.
+    await vi.advanceTimersByTimeAsync(13_000);
+    releaseLookup();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(sendResponse).not.toHaveBeenCalled();
+  });
+
+  it('caps the child budget by the parent when the parent is the smaller of the two', async () => {
+    const { RequestBudget } = await import('./alert-dispatch.service');
+    const t0 = 5_000_000;
+    const parent = new RequestBudget(18_000, t0);
+
+    // Early: the fan-out's own window is the binding constraint.
+    expect(parent.cap(12_000, t0)).toBe(12_000);
+    // Late: the request is. A fan-out started at 17s cannot be handed 12s, or
+    // its sinks would outlive the request that started them.
+    expect(parent.cap(12_000, t0 + 17_000)).toBe(1_000);
+  });
+});
+
 describe('RequestBudget', () => {
   it('hands each stage the smaller of its ceiling and what is left', async () => {
     const { RequestBudget } = await import('./alert-dispatch.service');

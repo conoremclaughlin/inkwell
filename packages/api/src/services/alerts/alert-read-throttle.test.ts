@@ -1,99 +1,109 @@
 /**
- * The alert query routes are throttled (CodeQL, PR #539 r3).
+ * The alert query routes are throttled (CodeQL js/missing-rate-limiting).
  *
  * Both GETs are authenticated, so this is not the anti-guessing throttle that
  * guards the credential routes. It bounds cost: each request runs a query
- * against alert_events / alert_sources for whoever holds a valid token, and a
- * leaked token or a client stuck in a retry loop would otherwise let the
- * alerting tables become the thing taking the database down — the alerting
- * path turning into the outage, which is the failure this whole PR exists to
- * avoid.
+ * against alert_events / alert_sources for whoever holds a valid token, so a
+ * leaked token or a client stuck in a retry loop could otherwise make the
+ * alerting tables the thing that takes the database down — the alerting path
+ * becoming the outage it exists to report.
  *
- * Exercised against the real FixedWindowLimiter rather than a stub, because
- * the thing being pinned is the budget arithmetic and the per-key isolation,
- * and a stub would only restate what this file already believes.
+ * Exercised over real HTTP against the real router, which is the point. Two
+ * earlier versions of this throttle were "present" by inspection and still not
+ * rate limiting anything an analyzer could see, and the test agreed with the
+ * code both times because it read the source for the same shape the code was
+ * written from. Sending 61 requests and counting refusals does not care how
+ * the limiter is spelled.
  */
 
-import { describe, it, expect } from 'vitest';
-import { FixedWindowLimiter } from '../../utils/fixed-window-limiter';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import express from 'express';
+import type { Server } from 'http';
+import type { DataComposer } from '../../data/composer';
 
-// Mirrors routes/alerts.ts. Kept in step by the budget assertion below, which
-// fails if the route's numbers drift away from these.
-const ALERT_READ_WINDOW_MS = 60 * 1000;
+vi.mock('../../utils/logger', () => ({
+  logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
+
+// Authenticated callers are keyed per user; the token itself is irrelevant to
+// the throttle, so the provider is stubbed to a fixed identity per bearer.
+vi.mock('../../mcp/auth/pcp-auth-provider', () => ({
+  PcpAuthProvider: class {
+    verifyAccessToken(header?: string) {
+      if (!header) return null;
+      return { userId: header.replace('Bearer ', '') };
+    }
+  },
+}));
+
 const ALERT_READS_PER_MINUTE = 60;
 
-function makeReadLimiter() {
-  const limiter = new FixedWindowLimiter(ALERT_READ_WINDOW_MS);
-  return (userId: string, ip: string, now?: number) =>
-    limiter.hit(`alertread:${userId}|${ip}`, ALERT_READS_PER_MINUTE, now);
+let server: Server;
+let baseUrl: string;
+
+beforeAll(async () => {
+  const { createAlertsRouter } = await import('../../routes/alerts');
+  const dataComposer = {
+    getClient: () => ({
+      from: () => {
+        const b: Record<string, unknown> = {};
+        for (const m of ['select', 'eq', 'order', 'limit', 'is']) b[m] = () => b;
+        b.then = (resolve: (v: unknown) => unknown) => resolve({ data: [], error: null });
+        return b;
+      },
+    }),
+  } as unknown as DataComposer;
+
+  const app = express();
+  app.set('trust proxy', true);
+  app.use('/api/alerts', createAlertsRouter(dataComposer));
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, resolve);
+  });
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  baseUrl = `http://127.0.0.1:${port}`;
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+async function get(path: string, user: string): Promise<number> {
+  const resp = await fetch(`${baseUrl}/api/alerts${path}`, {
+    headers: { authorization: `Bearer ${user}` },
+  });
+  return resp.status;
 }
 
 describe('alert read throttle', () => {
-  it('allows a normal polling rate and refuses a runaway loop', async () => {
-    const limited = makeReadLimiter();
-    const t0 = 1_000_000;
+  it('serves a normal polling rate then refuses the runaway', async () => {
+    const user = `burst-${Date.now()}`;
+    const statuses: number[] = [];
+    for (let i = 0; i < ALERT_READS_PER_MINUTE; i += 1) statuses.push(await get('/', user));
 
-    const allowed: number[] = [];
-    for (let i = 0; i < ALERT_READS_PER_MINUTE; i += 1) {
-      if (!limited('user-1', '10.0.0.1', t0)) allowed.push(i);
-    }
+    // The control, and the reason this is not merely "eventually 429": the
+    // budget is spent rather than refused from the first call. A throttle that
+    // said no to everything would silence a monitor permanently after one
+    // burst, which is the same outcome as the bug it guards against.
+    expect(statuses.filter((s) => s === 429)).toHaveLength(0);
 
-    // The control: the budget is spent, not refused from the first call. A
-    // limiter that said no to everything would also pass a bare "eventually
-    // returns true" assertion, and would be a differently broken route.
-    expect(allowed).toHaveLength(ALERT_READS_PER_MINUTE);
+    expect(await get('/', user)).toBe(429);
+  });
 
-    expect(limited('user-1', '10.0.0.1', t0)).toBe(true);
+  it('throttles /sources too, not just the first route added', async () => {
+    const user = `sources-${Date.now()}`;
+    for (let i = 0; i < ALERT_READS_PER_MINUTE; i += 1) await get('/sources', user);
+    expect(await get('/sources', user)).toBe(429);
   });
 
   it('gives each user their own budget', async () => {
-    const limited = makeReadLimiter();
-    const t0 = 2_000_000;
-
-    for (let i = 0; i < ALERT_READS_PER_MINUTE + 5; i += 1) limited('noisy', '10.0.0.1', t0);
+    const noisy = `noisy-${Date.now()}`;
+    const quiet = `quiet-${Date.now()}`;
+    for (let i = 0; i < ALERT_READS_PER_MINUTE + 2; i += 1) await get('/', noisy);
 
     // One client exhausting itself must not deny everyone else their alerts.
-    expect(limited('noisy', '10.0.0.1', t0)).toBe(true);
-    expect(limited('quiet', '10.0.0.1', t0)).toBe(false);
-  });
-
-  it('separates the same user arriving from different addresses', async () => {
-    const limited = makeReadLimiter();
-    const t0 = 3_000_000;
-
-    for (let i = 0; i < ALERT_READS_PER_MINUTE + 5; i += 1) limited('user-1', '10.0.0.1', t0);
-
-    expect(limited('user-1', '10.0.0.1', t0)).toBe(true);
-    expect(limited('user-1', '10.0.0.2', t0)).toBe(false);
-  });
-
-  it('refills once the window rolls over', async () => {
-    const limited = makeReadLimiter();
-    const t0 = 4_000_000;
-
-    for (let i = 0; i < ALERT_READS_PER_MINUTE + 5; i += 1) limited('user-1', '10.0.0.1', t0);
-    expect(limited('user-1', '10.0.0.1', t0)).toBe(true);
-
-    // A throttle that never recovers would silence a monitor permanently after
-    // one burst, which is the same outcome as the bug it guards against.
-    expect(limited('user-1', '10.0.0.1', t0 + ALERT_READ_WINDOW_MS + 1)).toBe(false);
-  });
-
-  it('keeps the route wired to these budgets', async () => {
-    // Reading the route source is deliberate. The limiter above is a faithful
-    // copy of the route's key and budget, and a copy silently stops matching:
-    // this fails when the route's numbers move without this file moving.
-    const { readFileSync } = await import('fs');
-    const { resolve } = await import('path');
-    const src = readFileSync(resolve(__dirname, '../../routes/alerts.ts'), 'utf8');
-
-    expect(src).toContain(`const ALERT_READ_WINDOW_MS = 60 * 1000;`);
-    expect(src).toContain(`const ALERT_READS_PER_MINUTE = ${ALERT_READS_PER_MINUTE};`);
-    expect(src).toContain("alertread:${userData.userId}|${req.ip ?? 'unknown'}");
-    // Attached as route middleware, not checked inside the handler body: it
-    // has to run before the handler, and CodeQL only recognises the attached
-    // form. Both GET routes, not just the first one.
-    expect(src.match(/router\.get\('[^']*',\s*throttleReads,/g) ?? []).toHaveLength(2);
-    expect(src).not.toMatch(/readRateLimited\(/);
+    expect(await get('/', noisy)).toBe(429);
+    expect(await get('/', quiet)).not.toBe(429);
   });
 });
