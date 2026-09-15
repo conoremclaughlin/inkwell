@@ -23,14 +23,17 @@
 # A remote sha of all zeros means the ref is new on the remote; a local sha of
 # all zeros means a delete, which pushes nothing and is not checked.
 #
-# For a ref that is new on the remote, "what leaves the machine" is measured
-# against THAT remote's PUSH endpoint (argument 2, the pushurl when one is
-# configured): its heads and tags are listed at push time and only commits it
-# already has are excluded. Remote-tracking refs are not used for
-# this — they include other remotes (a commit already pushed to a private
-# mirror is still leaving for the public one) and they go stale. If the
-# destination cannot be listed, nothing is excluded and every reachable commit
-# is replayed: slower, never quieter.
+# "What leaves the machine" is measured against THAT remote's PUSH endpoint
+# (argument 2, the pushurl when one is configured): its heads and tags are
+# listed at push time and only commits it already has are excluded. This holds
+# for every ref, new or existing. An existing ref additionally excludes its own
+# old head, but that alone is not the measure: a commit the destination already
+# holds on another ref is not leaving the machine because the branch being
+# pushed happens to be behind it. Remote-tracking refs are not used for this —
+# they include other remotes (a commit already pushed to a private mirror is
+# still leaving for the public one) and they go stale. If the destination
+# cannot be listed, nothing is excluded and every reachable commit is replayed:
+# slower, never quieter.
 #
 # Usage, by hand:  scripts/check-push.sh --preview [<base>]
 # Replays <base>..HEAD (default origin/main) exactly as the hook would, without
@@ -145,27 +148,42 @@ else
     [ -z "${local_sha:-}" ] && continue
     [ "$local_sha" = "$zeros" ] && continue   # delete: nothing leaves the machine
 
+    # What the DESTINATION already has, measured now against the endpoint this
+    # push is going to: argument 2 is the push URL, which is
+    # remote.<name>.pushurl when one is configured. A remote NAME would resolve
+    # to the fetch URL, and the two can differ. Exclude nothing if the endpoint
+    # cannot be listed.
+    #
+    # This applies to an existing ref as much as to a new one. A commit the
+    # destination already holds on SOME ref is not leaving the machine just
+    # because the ref being pushed is behind it — and `remote_sha..local_sha`
+    # alone says it is. Merge an up-to-date main into a branch whose remote head
+    # is months old and every commit of main replays, including any that a
+    # guard would refuse today. Those commits are already public; re-scanning
+    # them blocks the merge without protecting anything.
+    exclude=''
+    if [ -n "$remote_url" ] && git ls-remote --quiet --heads --tags "$remote_url" > "$have" 2>/dev/null; then
+      while read -r sha _; do
+        [ -n "$sha" ] || continue
+        git cat-file -e "$sha" 2>/dev/null && exclude="$exclude ^$sha"
+      done < "$have"
+    else
+      echo "   (could not list the refs of $(describe_remote); replaying every commit not already excluded by $remote_ref)"
+    fi
+
+    # $exclude is unquoted on purpose: it is a space-separated list of ^<sha>.
     if [ "$remote_sha" = "$zeros" ]; then
-      # New ref on the destination. Exclude only what the DESTINATION has,
-      # measured now against the endpoint this push is going to: argument 2 is
-      # the push URL, which is remote.<name>.pushurl when one is configured. A
-      # remote NAME would resolve to the fetch URL, and the two can differ.
-      # Exclude nothing if the endpoint cannot be listed.
-      exclude=''
-      if [ -n "$remote_url" ] && git ls-remote --quiet --heads --tags "$remote_url" > "$have" 2>/dev/null; then
-        while read -r sha _; do
-          [ -n "$sha" ] || continue
-          git cat-file -e "$sha" 2>/dev/null && exclude="$exclude ^$sha"
-        done < "$have"
-      else
-        echo "   (could not list the refs of $(describe_remote); replaying every commit reachable from $local_ref)"
-      fi
-      # $exclude is unquoted on purpose: it is a space-separated list of ^<sha>.
+      # New ref: everything reachable from it that the destination lacks.
       # shellcheck disable=SC2086
       range=$(git rev-list --reverse "$local_sha" $exclude 2>/dev/null)
       rc=$?
     else
-      range=$(git rev-list --reverse "$remote_sha..$local_sha" 2>/dev/null)
+      # Existing ref: its own old head is excluded too. Keeping that exclusion
+      # explicit matters when the listing fails — then $exclude is empty and
+      # this is exactly the old `remote_sha..local_sha`, which is the safe
+      # direction to degrade in: more replayed, never less.
+      # shellcheck disable=SC2086
+      range=$(git rev-list --reverse "$local_sha" "^$remote_sha" $exclude 2>/dev/null)
       rc=$?
     fi
     if [ "$rc" -ne 0 ]; then
