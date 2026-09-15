@@ -22,7 +22,8 @@ vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import router from './admin';
+import router, { generatePairingCode } from './admin';
+import crypto from 'crypto';
 
 function handler(path: string) {
   const stack = (
@@ -131,6 +132,21 @@ describe('OAuth callback trust boundary', () => {
       expect(oauth.exchangeCode).not.toHaveBeenCalled();
     } finally {
       clock.mockRestore();
+    }
+  });
+});
+
+describe('pairing code entropy', () => {
+  it('uses an unbiased crypto index for every symbol', () => {
+    const draw = vi.spyOn(crypto, 'randomInt').mockImplementation((max) => Number(max) - 1);
+    try {
+      const code = generatePairingCode();
+      expect(code).toMatch(/^9+$/);
+      expect(draw).toHaveBeenCalledTimes(code.length);
+      expect(code).toHaveLength(12);
+      expect(draw).toHaveBeenCalledWith(32);
+    } finally {
+      draw.mockRestore();
     }
   });
 });

@@ -45,6 +45,7 @@ import path from 'path';
 import QRCode from 'qrcode';
 import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
+import { isPlausibleEmailAddress, stripTrailingSlashes } from '../utils/input-text';
 import {
   signPcpAccessToken,
   verifyPcpAccessToken,
@@ -1497,7 +1498,7 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'email and password are required' });
       return;
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (!isPlausibleEmailAddress(email)) {
       res.status(400).json({ error: 'A valid email address is required' });
       return;
     }
@@ -1557,12 +1558,11 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
 
 // ─── Pairing codes ───
 
-function generatePairingCode(): string {
-  // 32 symbols divide 256 evenly, so a byte mod 32 is unbiased.
-  const bytes = crypto.randomBytes(MOBILE_PAIR_CODE_LENGTH);
+export function generatePairingCode(): string {
+  // randomInt uses rejection sampling, remaining unbiased if the alphabet changes.
   let code = '';
   for (let i = 0; i < MOBILE_PAIR_CODE_LENGTH; i += 1) {
-    code += MOBILE_PAIR_CODE_ALPHABET[bytes[i] % MOBILE_PAIR_CODE_ALPHABET.length];
+    code += MOBILE_PAIR_CODE_ALPHABET[crypto.randomInt(MOBILE_PAIR_CODE_ALPHABET.length)];
   }
   return code;
 }
@@ -1745,7 +1745,7 @@ function candidateServerUrls(req: Request): { urls: string[]; insecureTransport:
 
   const urls: string[] = [];
   for (const candidate of candidates) {
-    const normalized = candidate.replace(/\/+$/, '');
+    const normalized = stripTrailingSlashes(candidate);
     if (!isHttps(normalized) && !dev) continue;
     if (!urls.includes(normalized)) urls.push(normalized);
   }
