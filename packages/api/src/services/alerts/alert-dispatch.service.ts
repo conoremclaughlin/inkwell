@@ -72,6 +72,57 @@ export const RECOVERY_FANOUT_TIMEOUT_MS = 5_000;
  */
 const DELIVERY_RECORD_TIMEOUT_MS = 3_000;
 
+/** Per-operation ceiling for a single database call (RPC or PostgREST). */
+const DB_CALL_TIMEOUT_MS = 5_000;
+
+/**
+ * The whole request's budget, shared by every stage.
+ *
+ * The per-sink and per-write ceilings above bound individual operations, and
+ * that was never the same thing as bounding the request. Round three named the
+ * gap as the database awaits generally — source touch, liveness resolution,
+ * the ingest RPC, persistence and settlement — and round four showed that
+ * bounding persistence alone left the other four able to hang the response
+ * past the poster's deadline on their own. Stage ceilings cannot add up to a
+ * guarantee: five 3s ceilings are still 15s, and a sum is not a deadline.
+ *
+ * ink-disk-monitor.sh gives the POST `--max-time 20`, so the server must be
+ * finished before that or the checker gives up, declares the pipeline blind
+ * and fires a direct Telegram for an alert this process is still delivering.
+ * 18s leaves margin for the HTTP round trip inside the client's 20.
+ */
+export const REQUEST_TOTAL_TIMEOUT_MS = 18_000;
+
+/**
+ * What is left of the request's budget.
+ *
+ * Every stage takes min(its own ceiling, what remains) rather than its ceiling
+ * outright, so a slow-but-not-hung earlier stage shortens the later ones
+ * instead of pushing them past the end. Work is not STARTED once the budget is
+ * gone — particularly a fan-out, which would otherwise send an alert after the
+ * checker has already given up and sent its own.
+ */
+export class RequestBudget {
+  private readonly expiresAt: number;
+
+  constructor(budgetMs: number = REQUEST_TOTAL_TIMEOUT_MS, now: number = Date.now()) {
+    this.expiresAt = now + budgetMs;
+  }
+
+  remaining(now: number = Date.now()): number {
+    return Math.max(0, this.expiresAt - now);
+  }
+
+  expired(now: number = Date.now()): boolean {
+    return this.remaining(now) <= 0;
+  }
+
+  /** A stage ceiling, clamped to what the request has left. */
+  cap(stageMs: number, now: number = Date.now()): number {
+    return Math.min(stageMs, this.remaining(now));
+  }
+}
+
 /**
  * A sink that ran out of time, as distinct from one that failed.
  *
@@ -170,25 +221,37 @@ export class AlertDispatchService {
    * Ingest one alert post. `status: 'ok'` resolves an open incident; anything
    * else raises or re-raises it.
    */
-  async ingest(userId: string, alert: ParsedAlert): Promise<AlertDispatchResult> {
-    await this.touchSource(userId, alert);
+  async ingest(
+    userId: string,
+    alert: ParsedAlert,
+    budget: RequestBudget = new RequestBudget()
+  ): Promise<AlertDispatchResult> {
+    await this.touchSource(userId, alert, budget);
 
     if (alert.status === 'ok') {
-      return this.resolve(userId, alert);
+      return this.resolve(userId, alert, budget);
     }
 
-    const { data, error } = await this.supabase.rpc('ingest_alert_event', {
-      p_user_id: userId,
-      p_source: alert.source,
-      p_severity: alert.severity,
-      p_title: alert.title,
-      p_dedupe_key: alert.dedupeKey,
-      p_cooldown_seconds: alert.cooldownSeconds,
-      // Omitted when absent so the SQL default applies, rather than passing an
-      // explicit null the generated arg types (correctly) refuse.
-      ...(alert.detail === undefined ? {} : { p_detail: alert.detail }),
-      ...(alert.metrics === undefined ? {} : { p_metrics: alert.metrics as Json }),
-    });
+    const { data, error } = await withTimeout(
+      'ingest rpc',
+      // Promise.resolve because a PostgREST builder is a thenable, not a
+      // Promise, and Promise.race needs something it can actually race.
+      Promise.resolve(
+        this.supabase.rpc('ingest_alert_event', {
+          p_user_id: userId,
+          p_source: alert.source,
+          p_severity: alert.severity,
+          p_title: alert.title,
+          p_dedupe_key: alert.dedupeKey,
+          p_cooldown_seconds: alert.cooldownSeconds,
+          // Omitted when absent so the SQL default applies, rather than passing an
+          // explicit null the generated arg types (correctly) refuse.
+          ...(alert.detail === undefined ? {} : { p_detail: alert.detail }),
+          ...(alert.metrics === undefined ? {} : { p_metrics: alert.metrics as Json }),
+        })
+      ),
+      budget.cap(DB_CALL_TIMEOUT_MS)
+    );
 
     if (error) throw new Error(`Failed to record alert: ${error.message}`);
 
@@ -213,21 +276,46 @@ export class AlertDispatchService {
       };
     }
 
-    const deliveries = await this.fanOut(userId, {
-      severity: alert.severity,
-      source: alert.source,
-      title: alert.title,
-      detail: alert.detail,
-      dedupeKey: alert.dedupeKey,
-      metrics: alert.metrics,
-      occurrenceCount,
-      notifyAgents: alert.notifyAgents,
-      notifyUser: alert.notifyUser,
-      kind: 'raised',
-    });
+    // Not merely bounded — not STARTED once the budget is gone. A fan-out
+    // begun after the checker has given up delivers an alert it already sent
+    // itself, which is the double-notify this round exists to remove.
+    const deliveries = budget.expired()
+      ? [
+          {
+            sink: 'user' as const,
+            target: 'none',
+            ok: false,
+            detail: 'request budget exhausted before fan-out',
+            // Uncertain, not failed: nothing was attempted, so the claim must
+            // ride to TTL rather than be released to a second dispatcher.
+            timedOut: true,
+          },
+        ]
+      : await this.fanOut(
+          userId,
+          {
+            severity: alert.severity,
+            source: alert.source,
+            title: alert.title,
+            detail: alert.detail,
+            dedupeKey: alert.dedupeKey,
+            metrics: alert.metrics,
+            occurrenceCount,
+            notifyAgents: alert.notifyAgents,
+            notifyUser: alert.notifyUser,
+            kind: 'raised',
+          },
+          budget.cap(SINK_TOTAL_TIMEOUT_MS)
+        );
 
-    await this.recordDelivery(eventId, deliveries);
-    const notified = await this.settleClaim(eventId, claimToken, alert.severity, deliveries);
+    await this.recordDelivery(eventId, deliveries, budget);
+    const notified = await this.settleClaim(
+      eventId,
+      claimToken,
+      alert.severity,
+      deliveries,
+      budget
+    );
 
     return {
       accepted: true,
@@ -265,7 +353,8 @@ export class AlertDispatchService {
     eventId: string,
     claimToken: string | null,
     severity: AlertSeverity,
-    deliveries: SinkResult[]
+    deliveries: SinkResult[],
+    budget: RequestBudget = new RequestBudget()
   ): Promise<boolean> {
     const delivered = deliveries.some((d) => d.ok);
     const uncertain = !delivered && deliveries.some((d) => d.timedOut);
@@ -278,12 +367,31 @@ export class AlertDispatchService {
       return false;
     }
 
-    const { error } = await this.supabase.rpc(
-      delivered ? 'mark_alert_notified' : 'release_alert_claim',
-      delivered
-        ? { p_event_id: eventId, p_claim_token: claimToken, p_severity: severity }
-        : { p_event_id: eventId, p_claim_token: claimToken }
-    );
+    // A settle that cannot finish inside the budget is reported, not waited
+    // on. The claim then expires by TTL, which is the same outcome as the
+    // uncertain branch above and strictly better than holding the response.
+    let error: { message: string } | null = null;
+    try {
+      ({ error } = await withTimeout(
+        'settle claim',
+        Promise.resolve(
+          this.supabase.rpc(
+            delivered ? 'mark_alert_notified' : 'release_alert_claim',
+            delivered
+              ? { p_event_id: eventId, p_claim_token: claimToken, p_severity: severity }
+              : { p_event_id: eventId, p_claim_token: claimToken }
+          )
+        ),
+        budget.cap(DB_CALL_TIMEOUT_MS)
+      ));
+    } catch (timeoutError) {
+      logger.error('[Alerts] Claim settlement did not finish inside the request budget', {
+        eventId,
+        delivered,
+        error: timeoutError instanceof Error ? timeoutError.message : String(timeoutError),
+      });
+      return delivered;
+    }
 
     if (error) {
       // Never throw: the alert itself is recorded and the fan-out already
@@ -299,11 +407,21 @@ export class AlertDispatchService {
     return delivered;
   }
 
-  private async resolve(userId: string, alert: ParsedAlert): Promise<AlertDispatchResult> {
-    const { data, error } = await this.supabase.rpc('resolve_alert_event', {
-      p_user_id: userId,
-      p_dedupe_key: alert.dedupeKey,
-    });
+  private async resolve(
+    userId: string,
+    alert: ParsedAlert,
+    budget: RequestBudget = new RequestBudget()
+  ): Promise<AlertDispatchResult> {
+    const { data, error } = await withTimeout(
+      'resolve rpc',
+      Promise.resolve(
+        this.supabase.rpc('resolve_alert_event', {
+          p_user_id: userId,
+          p_dedupe_key: alert.dedupeKey,
+        })
+      ),
+      budget.cap(DB_CALL_TIMEOUT_MS)
+    );
 
     if (error) throw new Error(`Failed to resolve alert: ${error.message}`);
 
@@ -342,20 +460,24 @@ export class AlertDispatchService {
       Math.round((Date.now() - new Date(row.first_seen_at).getTime()) / 60000)
     );
 
-    const deliveries = await this.fanOut(userId, {
-      severity: 'info',
-      source: alert.source,
-      title: `Recovered: ${row.title}`,
-      detail: `Cleared after ${minutes} min and ${row.occurrence_count} check(s).`,
-      dedupeKey: alert.dedupeKey,
-      metrics: alert.metrics,
-      occurrenceCount: row.occurrence_count ?? 0,
-      notifyAgents: alert.notifyAgents,
-      notifyUser: alert.notifyUser,
-      kind: 'resolved',
-    });
+    const deliveries = await this.fanOut(
+      userId,
+      {
+        severity: 'info',
+        source: alert.source,
+        title: `Recovered: ${row.title}`,
+        detail: `Cleared after ${minutes} min and ${row.occurrence_count} check(s).`,
+        dedupeKey: alert.dedupeKey,
+        metrics: alert.metrics,
+        occurrenceCount: row.occurrence_count ?? 0,
+        notifyAgents: alert.notifyAgents,
+        notifyUser: alert.notifyUser,
+        kind: 'resolved',
+      },
+      budget.cap(SINK_TOTAL_TIMEOUT_MS)
+    );
 
-    await this.recordDelivery(row.event_id, deliveries);
+    await this.recordDelivery(row.event_id, deliveries, budget);
 
     return {
       accepted: true,
@@ -732,24 +854,34 @@ export class AlertDispatchService {
   // ── Liveness ────────────────────────────────────────────────────────────
 
   /** Record that this source is alive, whatever it is reporting. */
-  private async touchSource(userId: string, alert: ParsedAlert): Promise<void> {
+  private async touchSource(
+    userId: string,
+    alert: ParsedAlert,
+    budget: RequestBudget = new RequestBudget()
+  ): Promise<void> {
     try {
       // PostgREST reports failures in the returned { error }, not by throwing.
       // The try/catch alone therefore caught nothing, and a failed liveness
       // stamp passed as success — on the one table whose whole purpose is
       // noticing that something stopped reporting.
-      const { error } = await this.supabase.from('alert_sources').upsert(
-        {
-          user_id: userId,
-          source: alert.source,
-          last_seen_at: new Date().toISOString(),
-          last_status: alert.status === 'ok' ? 'ok' : 'alerting',
-          last_detail: alert.detail ?? alert.title,
-          // Seeing the source again ends the current silence, so the next
-          // disappearance is allowed to alarm afresh.
-          stale_alerted_at: null,
-        },
-        { onConflict: 'user_id,source' }
+      const { error } = await withTimeout(
+        'source touch',
+        Promise.resolve(
+          this.supabase.from('alert_sources').upsert(
+            {
+              user_id: userId,
+              source: alert.source,
+              last_seen_at: new Date().toISOString(),
+              last_status: alert.status === 'ok' ? 'ok' : 'alerting',
+              last_detail: alert.detail ?? alert.title,
+              // Seeing the source again ends the current silence, so the next
+              // disappearance is allowed to alarm afresh.
+              stale_alerted_at: null,
+            },
+            { onConflict: 'user_id,source' }
+          )
+        ),
+        budget.cap(DB_CALL_TIMEOUT_MS)
       );
       if (error) {
         logger.error('Failed to touch alert source', {
@@ -761,7 +893,7 @@ export class AlertDispatchService {
       logger.error('Failed to touch alert source', { source: alert.source, error });
     }
 
-    await this.resolveLiveness(userId, alert.source);
+    await this.resolveLiveness(userId, alert.source, budget);
   }
 
   /**
@@ -779,17 +911,27 @@ export class AlertDispatchService {
    * Never throws: liveness bookkeeping must not fail the alert or check-in
    * that triggered it.
    */
-  private async resolveLiveness(userId: string, source: string): Promise<void> {
+  private async resolveLiveness(
+    userId: string,
+    source: string,
+    budget: RequestBudget = new RequestBudget()
+  ): Promise<void> {
     // The liveness sweep posts under its own source name; it cannot be its own
     // aliveness evidence, and letting it resolve `alert-liveness:alert-liveness`
     // would be meaningless besides.
     if (source === 'alert-liveness') return;
 
     try {
-      const { data, error } = await this.supabase.rpc('resolve_alert_event', {
-        p_user_id: userId,
-        p_dedupe_key: `alert-liveness:${source}`,
-      });
+      const { data, error } = await withTimeout(
+        'liveness resolve rpc',
+        Promise.resolve(
+          this.supabase.rpc('resolve_alert_event', {
+            p_user_id: userId,
+            p_dedupe_key: `alert-liveness:${source}`,
+          })
+        ),
+        budget.cap(DB_CALL_TIMEOUT_MS)
+      );
       if (error) {
         logger.error('Failed to resolve liveness incident', { source, error: error.message });
         return;
@@ -802,6 +944,15 @@ export class AlertDispatchService {
 
       // Recovering from an alarm nobody heard is not news.
       if (!row.was_notified) return;
+
+      // Nor is a recovery notice worth starting once the request is out of
+      // time. This is the pre-send continuation that must not spawn a fan-out
+      // after expiry: the checker has already given up by then, and the notice
+      // would arrive alongside the fallback it triggered.
+      if (budget.expired()) {
+        logger.warn('Skipping liveness recovery notice: request budget exhausted', { source });
+        return;
+      }
 
       const minutes = Math.max(
         1,
@@ -820,9 +971,9 @@ export class AlertDispatchService {
           notifyAgents: ['myra'],
           kind: 'resolved',
         },
-        RECOVERY_FANOUT_TIMEOUT_MS
+        budget.cap(RECOVERY_FANOUT_TIMEOUT_MS)
       );
-      await this.recordDelivery(row.event_id, deliveries);
+      await this.recordDelivery(row.event_id, deliveries, budget);
     } catch (error) {
       logger.error('Failed to resolve liveness incident', { source, error });
     }
@@ -1049,12 +1200,16 @@ export class AlertDispatchService {
    * Bounded here rather than at the call sites because all three of them —
    * raise, resolve and recovery — had the same unbounded await.
    */
-  private async recordDelivery(eventId: string, deliveries: SinkResult[]): Promise<void> {
+  private async recordDelivery(
+    eventId: string,
+    deliveries: SinkResult[],
+    budget: RequestBudget = new RequestBudget()
+  ): Promise<void> {
     try {
       await withTimeout(
         'delivery record',
         this.persistDelivery(eventId, deliveries),
-        DELIVERY_RECORD_TIMEOUT_MS
+        budget.cap(DELIVERY_RECORD_TIMEOUT_MS)
       );
     } catch (error) {
       // Losing the diagnostic is survivable; losing the settlement is not.
