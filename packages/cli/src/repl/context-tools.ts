@@ -152,31 +152,47 @@ export function effectiveContextTokens(
 /**
  * Where the window actually sits, split by WHAT CAN REACH IT.
  *
- * One total is not enough, because the two halves answer to different tools.
- * `evict_context` edits ink's ledger; the provider session keeps every original
- * message, so eviction cannot reclaim a token the ledger never held. Only
- * compaction re-seeds the provider side.
+ * One total is not enough, because the parts answer to different remedies — and
+ * they are not the parts an earlier draft of this comment named. It claimed the
+ * ledger half was the evictable half and that only compaction re-seeded the
+ * provider side. Both halves of that are wrong against this head (Lumen, PR #639):
  *
- * The gap is not a rounding error and it is not invisible — it is mis-sized.
- * A tool result enters the ledger as a <=500-char stub (chat.ts compactForLedger)
- * while the provider reads the whole payload. Measured 2026-09-15: one
- * `list_tasks` reply put 125 tokens in the ledger and ~145,000 in the window.
- * An agent that evicts the stub is told `tokensFreed: 125` and has every reason
- * to believe it acted on the big item. It acted on the receipt, not the parcel.
+ *   ledgerTokens        transcript entries. The only bucket a tool selects
+ *                       entries from, and both `evict_context` and
+ *                       `compact_context` select from it.
+ *   fixedTokens         the identity envelope. `buildPromptEnvelope` re-renders
+ *                       `runtime.bootstrapContext` on every seed — it is marked
+ *                       "always included" there — so no context tool reclaims a
+ *                       byte of it. It is occupancy to budget around, not spend.
+ *   providerOnlyTokens  what the provider reported beyond what ink packed. ANY
+ *                       provider reseed drops it, and every eviction is one:
+ *                       `recordEviction` clears `activeBackendSessionId` and the
+ *                       `providerSample`, so the next turn re-seeds from the
+ *                       post-eviction ledger. `assessContextPressure` has a
+ *                       `reseed` action that rolls the session for exactly this
+ *                       case without destroying history — compaction is the
+ *                       remedy this bucket least needs.
  *
- * So callers get three numbers and a flag, never one number:
- *   ledgerTokens        reclaimable by evict_context
- *   providerOnlyTokens  reclaimable only by compact_context
- *   effectiveTokens     what to budget against
+ * The ledger/provider gap is not a rounding error and it is not invisible — it
+ * is mis-sized. A tool result enters the ledger as a stub of at most
+ * LEDGER_COMPACT_CHARS (chat.ts) while the provider reads the whole payload.
+ * Measured 2026-09-15: one `list_tasks` reply put 125 tokens in the ledger and
+ * ~145,000 in the window. An agent that evicts that stub is told
+ * `tokensFreed: 125` — but the reseed the eviction just triggered also dropped
+ * the ~145,000. The reported figure is still wrong; it UNDERSTATES, which is
+ * the opposite of what this comment used to say, and the opposite direction of
+ * error from the one that makes an agent complacent.
  *
  * `splitKnown` is false when the provider has not reported yet. Then the split
  * is genuinely unknown and the renderer must say so — reporting the estimate
  * alone implies all of it is actionable, which is the failure this guards.
  */
 export interface ContextOccupancy {
-  /** ink's estimate of what it packed: transcript plus the identity envelope it reserves. */
+  /** Transcript entries — what evict_context and compact_context actually edit. */
   ledgerTokens: number;
-  /** Occupancy the provider reported that the ledger cannot account for. */
+  /** The identity envelope, re-rendered on every seed. No context tool reclaims it. */
+  fixedTokens: number;
+  /** Occupancy the provider reported beyond what ink packed. Any reseed drops it. */
   providerOnlyTokens: number;
   /** The number to budget against — the larger of the estimate and the measurement. */
   effectiveTokens: number;
@@ -193,6 +209,9 @@ export interface ContextOccupancy {
  * identity envelope, so comparing it against a transcript-only estimate over a
  * reduced limit compares two different quantities. Both sides are whole-window
  * here, which is what makes max() meaningful.
+ *
+ * It lands in the numerator but in its OWN bucket: counting it is right,
+ * calling it reclaimable is not.
  */
 export function computeContextOccupancy(
   ledgerTokens: number,
@@ -200,11 +219,14 @@ export function computeContextOccupancy(
   limit: number,
   measured: ProviderContextMeasurement | undefined
 ): ContextOccupancy {
-  const accountable = Math.max(0, ledgerTokens) + Math.max(0, bootstrapTokens);
+  const ledger = Math.max(0, ledgerTokens);
+  const fixed = Math.max(0, bootstrapTokens);
+  const accountable = ledger + fixed;
   const effectiveTokens = effectiveContextTokens(accountable, measured);
   const safeLimit = limit > 0 ? limit : 1;
   return {
-    ledgerTokens: accountable,
+    ledgerTokens: ledger,
+    fixedTokens: fixed,
     providerOnlyTokens: Math.max(0, effectiveTokens - accountable),
     effectiveTokens,
     limit: safeLimit,
@@ -229,9 +251,13 @@ export function formatContextStamp(occ: ContextOccupancy): string {
       `so how much of this is reclaimable is unknown.`
     );
   }
+  // All three buckets, always, even at zero. A stamp whose shape changes per
+  // turn is one the reader has to re-parse per turn, and a zero is itself a
+  // reading ("nothing is provider-side") rather than an absence.
   return (
-    `${head} — ${n(occ.ledgerTokens)} reclaimable by evict_context, ` +
-    `${n(occ.providerOnlyTokens)} only by compact_context.`
+    `${head} — ${n(occ.ledgerTokens)} in the ledger (evict_context/compact_context), ` +
+    `${n(occ.fixedTokens)} identity envelope (fixed, re-sent every seed), ` +
+    `${n(occ.providerOnlyTokens)} provider-side (any reseed clears it).`
   );
 }
 

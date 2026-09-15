@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildPromptEnvelope, buildDeltaPrompt, turnContextOccupancy } from './chat';
 import { ContextLedger } from '../repl/context-ledger';
+import { formatContextStamp } from '../repl/context-tools';
 import type { ChatRuntime } from './chat';
 
 /**
@@ -56,7 +57,7 @@ describe('turnContextOccupancy — the number the turn hooks gate on', () => {
     expect(occ.utilization).toBeGreaterThan(0.8);
   });
 
-  it('counts the identity envelope, which the ledger never holds', () => {
+  it('counts the identity envelope, which the ledger never holds, in its own bucket', () => {
     const ledger = ledgerOf(1_000);
     const withBootstrap = turnContextOccupancy(
       ledger,
@@ -64,7 +65,11 @@ describe('turnContextOccupancy — the number the turn hooks gate on', () => {
       undefined
     );
     // 40,000 chars ÷ 4 = 10,000 tokens of envelope on top of the 1,000 ledger.
-    expect(withBootstrap.ledgerTokens).toBeGreaterThan(10_000);
+    // It counts toward the window (effectiveTokens) but is not evictable, so it
+    // must not land in ledgerTokens — that is what the stamp bills as reclaimable.
+    expect(withBootstrap.fixedTokens).toBe(10_000);
+    expect(withBootstrap.ledgerTokens).toBe(1_000);
+    expect(withBootstrap.effectiveTokens).toBe(11_000);
     expect(withBootstrap.splitKnown).toBe(false);
   });
 
@@ -76,7 +81,11 @@ describe('turnContextOccupancy — the number the turn hooks gate on', () => {
 });
 
 describe('the stamp reaches BOTH turn paths (acceptance 1)', () => {
-  const stamp = '[context] 383,046 / 1,000,000 (38%) — 131,071 reclaimable by evict_context.';
+  // Built by the real formatter, not hand-written. A literal fixture here went
+  // on asserting a format the formatter had stopped producing.
+  const stamp = formatContextStamp(
+    turnContextOccupancy(ledgerOf(131_071), makeRuntime(), { contextTokens: 383_046 })
+  );
 
   it('rides the delta on a RESUMED session — the bridge seat', () => {
     // This is the path that matters: a resumed native session never re-reads
