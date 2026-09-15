@@ -828,6 +828,12 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
 - **Never push directly to main** from a feature branch. Always use PRs. This includes releases, changelog updates, and docs changes.
 - **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
+- **Merging `main` into your branch does not invalidate an LGTM.** Review is against the branch's diff with `main`, and catching the branch up does not change that diff. A botched conflict resolution _does_ appear in it, which is what makes this safe rather than merely convenient — so do not ask for a re-review of a merge commit, and do not treat your own approval as expired because the head moved.
+
+  Two things stay with the author, though, because the diff only shows what changed and not what stopped being true:
+  1. **Re-run the tests after the merge.** A rename on `main` can break your branch with no conflict and no type error. On #539 the branch kept passing `senderAgentId` to `send_to_inbox` after `main` renamed the field to `senderSlug`; the two edits were in different files, the handler takes `args: unknown`, and the zod schema is not strict — so the key was silently stripped and every alert would have been sent by `unknown` instead of `system`. Nothing failed anywhere.
+  2. **Say so on the PR if the resolution changed behaviour** rather than just reconciling text. "Kept both sides" and "picked `main`'s line because ours reinstated a documented footgun" are different events, and only one of them is free.
+
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
 
