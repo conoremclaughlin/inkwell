@@ -54,8 +54,7 @@ import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/respon
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteSlug } from './services/routing/resolve-route';
-import { resolveAgentFromMention } from './services/routing/resolve-mention';
-import { resolveReplyAuthorship } from './services/routing/resolve-reply-authorship';
+import { resolveInboundAgent } from './services/routing/resolve-inbound-agent';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
@@ -203,102 +202,31 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       return;
     }
 
-    // Resolve agent: mention → reply authorship → channel_routes → AGENT_ID env fallback
-    let routedSlug = sbSlug;
-    let routedIdentityId: string | undefined;
-    let replyRouting: { resolved: boolean; reason?: string } | undefined;
+    // Resolve agent: mention → reply authorship → channel_routes → AGENT_ID env
+    // fallback. The cascade lives in its own module so each tier knows whether
+    // an earlier one MATCHED, rather than inferring it from the selected slug —
+    // a mention of, or a reply to, the default SB is a match, and treating it
+    // as "nothing matched" handed the message to the next tier.
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
-    // For group chats, try mention-based routing first
-    // Always call for group chats — text matching works even without platform mentions
-    // (e.g., WhatsApp has no native @mentions, Slack bot mention excluded from users array)
-    if (isGroupChat) {
-      const mentionMatch = await resolveAgentFromMention(
-        dataComposer!.getClient(),
-        userId,
-        content,
-        metadata?.mentions?.users ?? []
-      );
-      if (mentionMatch) {
-        routedSlug = mentionMatch.sbSlug;
-        routedIdentityId = mentionMatch.sbId;
-        logger.debug(`[Route] Resolved agent from @mention`, {
-          platform: channel,
-          sbSlug: mentionMatch.sbSlug,
-          sbId: mentionMatch.sbId,
-        });
-      }
-    }
+    const resolution = await resolveInboundAgent({
+      supabase: dataComposer!.getClient(),
+      userId,
+      defaultSlug: sbSlug,
+      platform: channel,
+      conversationId,
+      content,
+      isGroupChat,
+      mentionedUserIds: metadata?.mentions?.users ?? [],
+      platformAccountId: metadata?.platformAccountId,
+      replyToMessageId: metadata?.replyToMessageId,
+    });
 
-    // If no mention matched, route by what the user replied to. All SBs share
-    // one bot, so a reply is the only way Conor can address a specific SB in a
-    // DM — without this tier it lands on whoever owns the channel, silently.
-    // Runs after @mention because a mention is a deliberate address written in
-    // the new message, where a reply points at an older one.
-    if (routedSlug === sbSlug) {
-      const authorship = await resolveReplyAuthorship(
-        dataComposer!.getClient(),
-        userId,
-        channel,
-        metadata?.replyToMessageId
-      );
-
-      if (authorship.resolved) {
-        routedSlug = authorship.sbSlug;
-        routedIdentityId = authorship.sbId ?? undefined;
-        replyRouting = { resolved: true };
-        logger.info(`[Route] Resolved agent from reply authorship`, {
-          platform: channel,
-          sbSlug: authorship.sbSlug,
-          sbId: authorship.sbId,
-          replyToMessageId: metadata?.replyToMessageId,
-        });
-      } else {
-        replyRouting = { resolved: false, reason: authorship.reason };
-        // Only noteworthy when the user actually replied to something. A
-        // non-reply message failing to resolve is not a failure, and logging it
-        // would bury the cases that are.
-        if (authorship.reason !== 'no_reply_id') {
-          logger.warn(`[Route] Reply could not be attributed — falling through to channel_routes`, {
-            platform: channel,
-            conversationId,
-            replyToMessageId: metadata?.replyToMessageId,
-            reason: authorship.reason,
-          });
-        }
-      }
-    }
-
-    // If neither mention nor reply matched, try channel_routes specificity cascade
-    let routeStudioHint: string | null = null;
-    let resolvedRouteId: string | null = null;
-    if (routedSlug === sbSlug) {
-      const route = await resolveRouteSlug(
-        dataComposer!.getClient(),
-        userId,
-        channel,
-        metadata?.platformAccountId,
-        conversationId
-      );
-      if (route) {
-        routedSlug = route.sbSlug;
-        routedIdentityId = route.sbId;
-        routeStudioHint = route.studioHint;
-        resolvedRouteId = route.routeId;
-        logger.debug(`[Route] Resolved agent from channel_routes`, {
-          platform: channel,
-          sbSlug: route.sbSlug,
-          sbId: route.sbId,
-          routeId: route.routeId,
-          studioHint: route.studioHint,
-        });
-      } else {
-        logger.warn(
-          `[Route] No channel_route found for ${channel}, falling back to AGENT_ID=${sbSlug}`,
-          { userId, platform: channel, conversationId }
-        );
-      }
-    }
+    const routedSlug = resolution.sbSlug;
+    const routedIdentityId = resolution.sbId;
+    const routeStudioHint = resolution.studioHint;
+    const resolvedRouteId = resolution.routeId;
+    const replyRouting = resolution.replyRouting;
 
     // Resolve contact for per-sender session isolation (only when agent has session_scope: 'per_sender')
     let contactId: string | undefined;
@@ -381,8 +309,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         ...(contactId ? { contactId } : {}),
         // Carried so a misroute is diagnosable after the fact. Without it, a
         // reply that fell through to the channel owner is indistinguishable
-        // from one that was never a reply at all.
-        ...(replyRouting && replyRouting.reason !== 'no_reply_id' ? { replyRouting } : {}),
+        // from one that was never a reply at all. The cascade withholds this
+        // for a message that was never a reply, so its presence means one was.
+        ...(replyRouting ? { replyRouting } : {}),
       },
     };
 
