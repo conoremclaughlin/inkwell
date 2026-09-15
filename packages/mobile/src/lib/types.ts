@@ -9,7 +9,7 @@
 
 export interface SpineSession {
   id: string;
-  agentId: string | null;
+  sbSlug: string | null;
   lifecycle: string | null;
   status: string | null;
   phase: string | null;
@@ -22,9 +22,9 @@ export interface SpineStudio {
   id: string;
   slug: string | null;
   branch: string;
-  agentId: string;
+  sbSlug: string;
   relation: 'affinity' | 'lease' | 'both';
-  leaseAgentId: string | null;
+  leaseSlug: string | null;
   updatedAt: string;
 }
 
@@ -42,7 +42,7 @@ export interface ThreadSpine {
   thread: {
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     participants: string[];
     closedAt: string | null;
   } | null;
@@ -62,7 +62,7 @@ export interface ThreadsResponse {
 
 export interface ThreadMessage {
   id: string;
-  senderAgentId: string;
+  senderSlug: string;
   content: string;
   messageType: string;
   priority: string;
@@ -75,7 +75,7 @@ export interface ThreadMessagesResponse {
     threadKey: string;
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     createdAt: string;
     closedAt: string | null;
   } | null;
@@ -105,7 +105,7 @@ export interface ReplyResponse {
 
 export interface FleetSession {
   id: string;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string;
   lifecycle: string;
   status: string | null;
@@ -180,7 +180,7 @@ export interface WorkspacesResponse {
 
 export interface SessionInfo {
   id: string;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   backend: string | null;
   backendSessionId: string | null;
@@ -214,7 +214,7 @@ export interface SessionLogItem {
 export interface SessionLogsResponse {
   session: {
     id: string;
-    agentId: string | null;
+    sbSlug: string | null;
     status: string | null;
     currentPhase: string | null;
     backend: string | null;
@@ -231,7 +231,7 @@ export interface SessionLogsResponse {
 
 export interface Individual {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string | null;
   backend: string | null;

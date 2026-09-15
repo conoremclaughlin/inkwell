@@ -462,7 +462,7 @@ describe('callPcpTool: auth header', () => {
   it('should send Authorization header when CLI token is available', async () => {
     mockedGetValidAccessToken.mockResolvedValue('test-jwt-token');
 
-    await callPcpTool('bootstrap', { agentId: 'wren' });
+    await callPcpTool('bootstrap', { sbSlug: 'wren' });
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [, options] = fetchSpy.mock.calls[0];
@@ -473,7 +473,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidDelegatedAccessToken.mockReturnValue('delegated-jwt-token');
     mockedGetValidAccessToken.mockResolvedValue('fallback-token');
 
-    await callPcpTool('bootstrap', { agentId: 'wren' });
+    await callPcpTool('bootstrap', { sbSlug: 'wren' });
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [, options] = fetchSpy.mock.calls[0];
@@ -485,7 +485,7 @@ describe('callPcpTool: auth header', () => {
   it('should omit Authorization header when no token is available', async () => {
     mockedGetValidAccessToken.mockResolvedValue(null);
 
-    await callPcpTool('bootstrap', { agentId: 'wren' });
+    await callPcpTool('bootstrap', { sbSlug: 'wren' });
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [, options] = fetchSpy.mock.calls[0];
@@ -495,14 +495,14 @@ describe('callPcpTool: auth header', () => {
   it('should send correct JSON-RPC payload', async () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
 
-    await callPcpTool('get_inbox', { agentId: 'wren', status: 'unread' });
+    await callPcpTool('get_inbox', { sbSlug: 'wren', status: 'unread' });
 
     const [url, options] = fetchSpy.mock.calls[0];
     expect(url).toContain('/mcp');
     const body = JSON.parse(options.body);
     expect(body.method).toBe('tools/call');
     expect(body.params.name).toBe('get_inbox');
-    expect(body.params.arguments).toEqual({ agentId: 'wren', status: 'unread' });
+    expect(body.params.arguments).toEqual({ sbSlug: 'wren', status: 'unread' });
   });
 
   // ── INK_SESSION_ID propagation through callPcpTool ──
@@ -525,7 +525,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
     delete process.env.INK_SESSION_ID;
 
-    await callPcpTool('bootstrap', { agentId: 'wren' });
+    await callPcpTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).not.toHaveProperty('x-ink-session-id');
@@ -535,7 +535,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
     process.env.INK_SESSION_ID = '  session-with-spaces  ';
 
-    await callPcpTool('bootstrap', { agentId: 'wren' });
+    await callPcpTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).toHaveProperty('x-ink-session-id', 'session-with-spaces');
@@ -547,7 +547,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
     process.env.INK_SESSION_ID = '   ';
 
-    await callPcpTool('bootstrap', { agentId: 'wren' });
+    await callPcpTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).not.toHaveProperty('x-ink-session-id');
@@ -558,7 +558,7 @@ describe('callPcpTool: auth header', () => {
   it('should send spec-compliant Accept header (both JSON and SSE)', async () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
 
-    await callPcpTool('bootstrap', { agentId: 'wren' });
+    await callPcpTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers.Accept).toBe('application/json, text/event-stream');
@@ -589,7 +589,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     fetchSpy = vi.fn().mockResolvedValue(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
   });
 
@@ -597,7 +597,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     fetchSpy = vi.fn().mockResolvedValue(mockSseResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
   });
 
@@ -617,7 +617,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ final: true });
   });
 
@@ -629,7 +629,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
+    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell SSE response contained no data lines'
     );
   });
@@ -643,7 +643,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
+    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell call failed (406)'
     );
   });
@@ -658,7 +658,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
+    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell tool error (-32001): Authentication required'
     );
   });
@@ -673,7 +673,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
+    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell tool error (-32602): Invalid params'
     );
   });
@@ -691,7 +691,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('start_session', { agentId: 'wren' })).rejects.toThrow(
+    await expect(callPcpTool('start_session', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell tool error: start_session unavailable'
     );
   });
@@ -705,7 +705,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
   });
 
@@ -719,7 +719,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ text: 'plain text result' });
   });
 
@@ -742,7 +742,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
 
@@ -776,7 +776,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
 
@@ -809,7 +809,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
@@ -824,7 +824,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
+    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell call failed (401)'
     );
     expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -1164,7 +1164,7 @@ describe('isHeadlessSession', () => {
   it('returns true when INK_CONTEXT has cliAttached=false (headless spawn)', () => {
     const token = {
       sessionId: 's1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       studioId: 'x',
       cliAttached: false,
       runtime: 'claude',
@@ -1176,7 +1176,7 @@ describe('isHeadlessSession', () => {
   it('returns false when INK_CONTEXT has cliAttached=true', () => {
     const token = {
       sessionId: 's1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       studioId: 'x',
       cliAttached: true,
       runtime: 'claude',
@@ -1196,7 +1196,7 @@ describe('isHeadlessSession', () => {
   });
 
   it('returns false when cliAttached is missing from token', () => {
-    const token = { sessionId: 's1', agentId: 'wren', studioId: 'x', runtime: 'claude' };
+    const token = { sessionId: 's1', sbSlug: 'wren', studioId: 'x', runtime: 'claude' };
     process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
     expect(isHeadlessSession()).toBe(false);
   });
@@ -1322,7 +1322,7 @@ describe('handleFailedTakeover (PR #590: the prompt is never refused)', () => {
       expect(backend).not.toHaveProperty('blocksOnFailedTakeover');
       for (const reason of REASONS) {
         const writePendingTakeover = vi.fn();
-        handleFailedTakeover(backend, { agentId: 'wren', writePendingTakeover, reason });
+        handleFailedTakeover(backend, { sbSlug: 'wren', writePendingTakeover, reason });
         expect(writePendingTakeover).toHaveBeenCalledTimes(1);
       }
     }
@@ -1333,7 +1333,7 @@ describe('handleFailedTakeover (PR #590: the prompt is never refused)', () => {
     const backend = getBackendByName('claude-code');
     const warn = (reason?: TakeoverFailureReason) => {
       chunks = [];
-      handleFailedTakeover(backend, { agentId: 'wren', writePendingTakeover: vi.fn(), reason });
+      handleFailedTakeover(backend, { sbSlug: 'wren', writePendingTakeover: vi.fn(), reason });
       expect(chunks).toHaveLength(1);
       expect(chunks[0]).toContain('<ink-warning>');
       expect(chunks[0]).toContain('confirm that this session should take over the studio');
@@ -1361,13 +1361,13 @@ describe('handleFailedTakeover (PR #590: the prompt is never refused)', () => {
   it('promises a background retry ONLY when an ink wrapper generation owns this backend', () => {
     const backend = getBackendByName('claude-code');
     handleFailedTakeover(backend, {
-      agentId: 'wren',
+      sbSlug: 'wren',
       writePendingTakeover: vi.fn(),
       reason: 'lease-not-held',
       wrapperGeneration: 'gen-1',
     });
     handleFailedTakeover(backend, {
-      agentId: 'wren',
+      sbSlug: 'wren',
       writePendingTakeover: vi.fn(),
       reason: 'lease-not-held',
     });
@@ -1385,7 +1385,7 @@ describe('handleFailedTakeover (PR #590: the prompt is never refused)', () => {
   it('a marker write failure is swallowed — the prompt itself must not break', () => {
     expect(() =>
       handleFailedTakeover(getBackendByName('gemini'), {
-        agentId: 'wren',
+        sbSlug: 'wren',
         writePendingTakeover: () => {
           throw new Error('disk full');
         },

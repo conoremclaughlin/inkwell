@@ -51,7 +51,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
         sub: INTEGRATION_TEST_USER_ID,
         email: INTEGRATION_TEST_USER_EMAIL,
         scope: 'mcp:tools',
-        agentId: INTEGRATION_TEST_AGENT_ID,
+        sbSlug: INTEGRATION_TEST_AGENT_ID,
       },
       60 * 60 // 1 hour
     );
@@ -309,8 +309,8 @@ describe('Session Identity Chain — HTTP Integration', () => {
       'send_to_inbox',
       {
         userId: INTEGRATION_TEST_USER_ID,
-        recipientAgentId: 'echo', // send to self for testing
-        senderAgentId: INTEGRATION_TEST_AGENT_ID,
+        recipientSlug: 'echo', // send to self for testing
+        senderSlug: INTEGRATION_TEST_AGENT_ID,
         threadKey,
         content: 'HTTP integration test — sender identity chain',
         messageType: 'message',
@@ -354,7 +354,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
     // The sender metadata should have been enriched with session context
     // from the x-ink-session-id header → request context → send_to_inbox handler
     expect(sender).toBeDefined();
-    expect(sender.agentId).toBe(INTEGRATION_TEST_AGENT_ID);
+    expect(sender.sbSlug).toBe(INTEGRATION_TEST_AGENT_ID);
     expect(sender.sessionId).toBe(sessionId);
     expect(sender.studioId).toBe(studioId);
   });
@@ -403,8 +403,8 @@ describe('Session Identity Chain — HTTP Integration', () => {
       'send_to_inbox',
       {
         userId: INTEGRATION_TEST_USER_ID,
-        recipientAgentId: 'echo',
-        senderAgentId: INTEGRATION_TEST_AGENT_ID,
+        recipientSlug: 'echo',
+        senderSlug: INTEGRATION_TEST_AGENT_ID,
         threadKey,
         content: 'Codex env_http_headers integration test',
         messageType: 'message',
@@ -448,7 +448,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
 
     // Prove the full chain: HTTP headers → request context → sender metadata
     expect(sender).toBeDefined();
-    expect(sender.agentId).toBe(INTEGRATION_TEST_AGENT_ID);
+    expect(sender.sbSlug).toBe(INTEGRATION_TEST_AGENT_ID);
     expect(sender.sessionId).toBe(sessionId);
     expect(sender.studioId).toBe(studioId);
   });
@@ -465,8 +465,8 @@ describe('Session Identity Chain — HTTP Integration', () => {
       'send_to_inbox',
       {
         userId: INTEGRATION_TEST_USER_ID,
-        recipientAgentId: 'echo',
-        senderAgentId: INTEGRATION_TEST_AGENT_ID,
+        recipientSlug: 'echo',
+        senderSlug: INTEGRATION_TEST_AGENT_ID,
         threadKey,
         content: 'Codex session-only header test',
         messageType: 'message',

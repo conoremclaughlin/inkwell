@@ -120,7 +120,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
     if (!fixtureWasPreExisting) {
       const result = await orchestrator.spinUp({
         userId: 'live-test-user',
-        agentId: 'live-test-agent',
+        sbSlug: 'live-test-agent',
         studioId: 'studio-live-fixture',
         studioSlug: 'live',
         worktreePath: testDir,

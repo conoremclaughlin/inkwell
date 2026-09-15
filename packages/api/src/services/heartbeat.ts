@@ -1034,7 +1034,7 @@ export async function createReminder(params: {
 export async function ensureDefaultReminders(params: {
   userId: string;
   sbId: string;
-  agentId: string;
+  sbSlug: string;
   deliveryChannel?: string;
   deliveryTarget?: string;
 }): Promise<void> {
@@ -1070,7 +1070,7 @@ export async function ensureDefaultReminders(params: {
       } else {
         logger.warn('ensureDefaultReminders: no delivery channel available, skipping', {
           userId: params.userId,
-          agentId: params.agentId,
+          sbSlug: params.sbSlug,
         });
         return;
       }
@@ -1090,12 +1090,12 @@ export async function ensureDefaultReminders(params: {
       .from('agent_identities')
       .select('id, workspace_id')
       .eq('user_id', params.userId)
-      .eq('agent_id', params.agentId);
+      .eq('agent_id', params.sbSlug);
     if (identityError) {
       // Fail closed: without the candidate set we cannot prove there is no
       // check-in, and a duplicate reports to no one (Lumen, PR #595).
       logger.warn('ensureDefaultReminders: identity lookup failed, skipping seed', {
-        agentId: params.agentId,
+        sbSlug: params.sbSlug,
         sbId: params.sbId,
         error: identityError.message,
       });
@@ -1117,7 +1117,7 @@ export async function ensureDefaultReminders(params: {
       // or suppress a real check-in, so skip and say so.
       logger.warn(
         'ensureDefaultReminders: unscoped identity with several scoped siblings — ambiguous, skipping seed',
-        { agentId: params.agentId, sbId: params.sbId, scopedRows: scopedRows.length }
+        { sbSlug: params.sbSlug, sbId: params.sbId, scopedRows: scopedRows.length }
       );
       return;
     } else {
@@ -1139,7 +1139,7 @@ export async function ensureDefaultReminders(params: {
         'ensureDefaultReminders: daily-checkin already exists for this agent, skipping',
         {
           sbId: params.sbId,
-          agentId: params.agentId,
+          sbSlug: params.sbSlug,
           existingReminderId: existing[0].id,
           boundTo: existing[0].sb_id,
         }
@@ -1150,7 +1150,7 @@ export async function ensureDefaultReminders(params: {
     const result = await createReminder({
       userId: params.userId,
       title: 'Daily check-in',
-      description: `Good morning! Time for your daily check-in with ${params.agentId}.`,
+      description: `Good morning! Time for your daily check-in with ${params.sbSlug}.`,
       deliveryChannel,
       deliveryTarget,
       cronExpression: '0 9 * * *',
@@ -1162,7 +1162,7 @@ export async function ensureDefaultReminders(params: {
       logger.info('ensureDefaultReminders: created daily check-in', {
         reminderId: result.id,
         sbId: params.sbId,
-        agentId: params.agentId,
+        sbSlug: params.sbSlug,
       });
     }
   } catch (error) {

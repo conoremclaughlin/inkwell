@@ -34,11 +34,11 @@ export const colors = {
 } as const;
 
 /** Stable color for an agent slug — same slug, same hue, every screen. */
-export function agentColor(agentId: string | null | undefined): string {
-  if (!agentId) return colors.textMuted;
+export function agentColor(sbSlug: string | null | undefined): string {
+  if (!sbSlug) return colors.textMuted;
   let hash = 0;
-  for (let i = 0; i < agentId.length; i += 1) {
-    hash = (hash * 31 + agentId.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < sbSlug.length; i += 1) {
+    hash = (hash * 31 + sbSlug.charCodeAt(i)) >>> 0;
   }
   return colors.agentHues[hash % colors.agentHues.length];
 }

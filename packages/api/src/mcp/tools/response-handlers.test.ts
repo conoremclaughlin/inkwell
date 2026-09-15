@@ -284,23 +284,23 @@ describe('handleSendResponse — sender session attribution', () => {
   const contactSession = '0a731a19-2c4e-4b7d-8f3a-9e6d5c4b3a21';
   const sbId = 'sb-myra';
   const rows: Record<string, object> = {
-    [ownSession]: { id: ownSession, userId: 'owner', agentId: 'myra', sbId },
+    [ownSession]: { id: ownSession, userId: 'owner', sbSlug: 'myra', sbId },
     [foreignUserSession]: {
       id: foreignUserSession,
       userId: 'someone-else',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-wren',
     },
     [peerIdentitySession]: {
       id: peerIdentitySession,
       userId: 'owner',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-wren',
     },
     [contactSession]: {
       id: contactSession,
       userId: 'owner',
-      agentId: 'myra',
+      sbSlug: 'myra',
       sbId,
       contactId: 'contact-b',
     },
@@ -313,10 +313,10 @@ describe('handleSendResponse — sender session attribution', () => {
   /** An SB's own token: signed identity, no signed session claim. */
   const boundMyra = {
     userId: 'owner',
-    agentId: 'myra',
+    sbSlug: 'myra',
     sbId,
     agentTokenBound: true,
-    tokenAgentId: 'myra',
+    tokenSlug: 'myra',
     tokenSbId: sbId,
   };
 
@@ -363,7 +363,7 @@ describe('handleSendResponse — sender session attribution', () => {
   });
 
   it("stamps a header-asserted session for a user token when it is the same user's", async () => {
-    await sendIn({ userId: 'owner', agentId: 'myra', sbId, sessionId: ownSession });
+    await sendIn({ userId: 'owner', sbSlug: 'myra', sbId, sessionId: ownSession });
     expect(captured?.sessionId).toBe(ownSession);
   });
 
@@ -438,7 +438,7 @@ describe('handleSendResponse — sender session attribution', () => {
       // Lumen's probe: an external-process send_response with a signed session
       // claim. This branch exists for exactly that caller, and it used to
       // rebuild the payload from args and drop the session.
-      await sendIn({ userId: 'owner', agentId: 'myra', tokenSessionId: ownSession });
+      await sendIn({ userId: 'owner', sbSlug: 'myra', tokenSessionId: ownSession });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(body()).toEqual({
         channel: 'telegram',

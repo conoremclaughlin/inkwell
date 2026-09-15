@@ -8,7 +8,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
 import type { Json } from '../supabase/types';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 
 export type { Json };
@@ -34,7 +34,7 @@ export interface Activity {
   id: string;
   userId: string;
   sessionId: string | null;
-  agentId: string;
+  sbSlug: string;
   type: ActivityType;
   subtype: string | null;
   content: string;
@@ -57,7 +57,7 @@ export interface Activity {
 
 export interface LogActivityInput {
   userId: string;
-  agentId: string;
+  sbSlug: string;
   sbId?: string;
   type: ActivityType;
   content: string;
@@ -80,7 +80,7 @@ export interface LogActivityInput {
 
 export interface LogMessageInput {
   userId: string;
-  agentId: string;
+  sbSlug: string;
   direction: 'in' | 'out';
   content: string;
   sessionId?: string;
@@ -96,7 +96,7 @@ export interface LogMessageInput {
 
 export interface GetActivityOptions {
   sessionId?: string;
-  agentId?: string;
+  sbSlug?: string;
   types?: ActivityType[];
   contactId?: string;
   platform?: string;
@@ -133,13 +133,13 @@ export class ActivityStreamRepository {
   async logActivity(input: LogActivityInput): Promise<Activity> {
     const sbId = input.sbId
       ? input.sbId
-      : await resolveIdentityId(this.supabase, input.userId, input.agentId);
+      : await resolveSbId(this.supabase, input.userId, input.sbSlug);
 
     const { data, error } = await this.supabase
       .from('activity_stream')
       .insert({
         user_id: input.userId,
-        agent_id: input.agentId,
+        agent_id: input.sbSlug,
         sb_id: sbId,
         type: input.type,
         content: input.content,
@@ -185,7 +185,7 @@ export class ActivityStreamRepository {
   async logMessage(input: LogMessageInput): Promise<Activity> {
     return this.logActivity({
       userId: input.userId,
-      agentId: input.agentId,
+      sbSlug: input.sbSlug,
       type: input.direction === 'in' ? 'message_in' : 'message_out',
       content: input.content,
       sessionId: input.sessionId,
@@ -309,8 +309,8 @@ export class ActivityStreamRepository {
     if (options.sessionId) {
       query = query.eq('session_id', options.sessionId);
     }
-    if (options.agentId) {
-      query = query.eq('agent_id', options.agentId);
+    if (options.sbSlug) {
+      query = query.eq('agent_id', options.sbSlug);
     }
     if (options.types && options.types.length > 0) {
       query = query.in('type', options.types);
@@ -463,8 +463,8 @@ export class ActivityStreamRepository {
     if (options.sessionId) {
       query = query.eq('session_id', options.sessionId);
     }
-    if (options.agentId) {
-      query = query.eq('agent_id', options.agentId);
+    if (options.sbSlug) {
+      query = query.eq('agent_id', options.sbSlug);
     }
     if (options.types && options.types.length > 0) {
       query = query.in('type', options.types);
@@ -487,7 +487,7 @@ export class ActivityStreamRepository {
       id: row.id,
       userId: row.user_id,
       sessionId: row.session_id,
-      agentId: row.agent_id,
+      sbSlug: row.agent_id,
       type: row.type as ActivityType,
       subtype: row.subtype,
       content: row.content,

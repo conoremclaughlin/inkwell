@@ -56,7 +56,7 @@ describe('create_reminder accepts the time Myra actually sent', () => {
     const parsed = createReminderSchema.safeParse({
       title: 'Eat before 9 AM',
       runAt: '2026-09-02T07:30:00-07:00',
-      agentId: 'myra',
+      sbSlug: 'myra',
     });
 
     expect(parsed.success).toBe(true);

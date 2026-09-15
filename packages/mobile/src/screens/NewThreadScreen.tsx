@@ -43,11 +43,11 @@ export function NewThreadScreen({ navigation }: Props) {
     [individuals.data]
   );
 
-  const toggle = (agentId: string) => {
+  const toggle = (sbSlug: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(agentId)) next.delete(agentId);
-      else next.add(agentId);
+      if (next.has(sbSlug)) next.delete(sbSlug);
+      else next.add(sbSlug);
       return next;
     });
   };
@@ -108,12 +108,12 @@ export function NewThreadScreen({ navigation }: Props) {
         ) : (
           <View style={styles.chips}>
             {agents.map((agent) => {
-              const on = selected.has(agent.agentId);
-              const hue = agentColor(agent.agentId);
+              const on = selected.has(agent.sbSlug);
+              const hue = agentColor(agent.sbSlug);
               return (
                 <Pressable
                   key={agent.id}
-                  onPress={() => toggle(agent.agentId)}
+                  onPress={() => toggle(agent.sbSlug)}
                   style={[
                     styles.agentChip,
                     on && { borderColor: hue, backgroundColor: colors.surfaceOverlay },

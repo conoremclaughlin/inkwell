@@ -15,15 +15,13 @@ vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
+    ...(await import('../test/fake-env')).fakeEnv,
     TELEGRAM_BOT_TOKEN: 'test-token',
     LOG_LEVEL: 'info',
     // Transitive: TelegramListener pulls in AuthorizationService, which
     // constructs a Supabase client at module init
-    SUPABASE_URL: 'https://test.supabase.co',
-    SUPABASE_SECRET_KEY: 'test-secret-key',
-    SUPABASE_PUBLISHABLE_KEY: 'test-pub-key',
   },
 }));
 

@@ -19,11 +19,11 @@ export interface ReplyResponse {
  * from a genuinely unattributed sender.
  */
 export function senderLabel(m: {
-  senderAgentId: string;
+  senderSlug: string;
   metadata?: Record<string, unknown> | null;
 }): string {
   const sentBy = m.metadata ? (m.metadata as { sentBy?: unknown }).sentBy : undefined;
-  return sentBy === 'user' ? 'You' : m.senderAgentId;
+  return sentBy === 'user' ? 'You' : m.senderSlug;
 }
 
 /**

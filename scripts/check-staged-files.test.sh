@@ -192,7 +192,7 @@ out=$(run_index "$r"); rc=$?
 [ "$rc" -eq 0 ] && ok "id_rsa.pub is allowed" || bad "id_rsa.pub is allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 r=$(new_repo scan-ink "$nohooks")
-stage "$r" .ink/identity.json '{"agentId":"wren"}'
+stage "$r" .ink/identity.json '{"sbSlug":"wren"}'
 out=$(run_index "$r"); rc=$?
 [ "$rc" -eq 1 ] && ok ".ink/identity.json is refused" || bad ".ink/identity.json is refused" "exit $rc"
 

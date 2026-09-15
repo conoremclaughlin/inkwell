@@ -42,13 +42,13 @@ export function messageTime(iso: string, nowMs: number = Date.now()): string {
  * sender, so it is checked first.
  */
 export function senderName(
-  senderAgentId: string,
+  senderSlug: string,
   metadata: Record<string, unknown> | null | undefined
 ): { name: string; isUser: boolean } {
   if (metadata && (metadata as { sentBy?: unknown }).sentBy === 'user') {
     return { name: 'You', isUser: true };
   }
-  return { name: senderAgentId, isUser: false };
+  return { name: senderSlug, isUser: false };
 }
 
 /** "runtime:idle" → "idle"; "active:implementing" → "implementing". */

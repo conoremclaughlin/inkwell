@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
-  resolveIdentityId,
-  resolveIdentityResult,
+  resolveSbId,
+  resolveSbIdResult,
   resolveOwnerSbId,
-  resolveAgentSlug,
+  resolveSbSlug,
 } from './resolve-identity';
 import { runWithRequestContext } from '../utils/request-context';
 
@@ -57,15 +57,15 @@ const rows = (...items: Row[]) => ({ data: items });
 
 beforeEach(() => vi.clearAllMocks());
 
-describe('resolveIdentityId', () => {
+describe('resolveSbId', () => {
   it('returns null when the slug has no identity at all', async () => {
     const f = fakeSupabase(rows());
-    expect(await resolveIdentityId(f.client, USER, 'nobody')).toBeNull();
+    expect(await resolveSbId(f.client, USER, 'nobody')).toBeNull();
   });
 
   it('resolves a lone identity when no workspace is in play', async () => {
     const f = fakeSupabase(rows({ id: SB_IN_A, workspace_id: WS_A }));
-    expect(await resolveIdentityId(f.client, USER, 'wren')).toBe(SB_IN_A);
+    expect(await resolveSbId(f.client, USER, 'wren')).toBe(SB_IN_A);
     expect(f.tables).toEqual(['agent_identities']);
     expect(f.filters).toEqual([
       ['user_id', USER],
@@ -75,8 +75,8 @@ describe('resolveIdentityId', () => {
 
   it('picks the identity belonging to the given workspace when a slug is shared', async () => {
     const shared = rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B });
-    expect(await resolveIdentityId(fakeSupabase(shared).client, USER, 'wren', WS_A)).toBe(SB_IN_A);
-    expect(await resolveIdentityId(fakeSupabase(shared).client, USER, 'wren', WS_B)).toBe(SB_IN_B);
+    expect(await resolveSbId(fakeSupabase(shared).client, USER, 'wren', WS_A)).toBe(SB_IN_A);
+    expect(await resolveSbId(fakeSupabase(shared).client, USER, 'wren', WS_B)).toBe(SB_IN_B);
   });
 
   it('refuses a shared slug when there is no workspace to resolve inside', async () => {
@@ -84,7 +84,7 @@ describe('resolveIdentityId', () => {
       rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B })
     );
 
-    const resolved = await resolveIdentityId(f.client, USER, 'wren');
+    const resolved = await resolveSbId(f.client, USER, 'wren');
 
     // The point of the refusal: it returns neither candidate, rather than the
     // first/newest row. Assert against both so a "pick one" regression fails.
@@ -93,14 +93,14 @@ describe('resolveIdentityId', () => {
     expect(resolved).not.toBe(SB_IN_B);
     expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining('ambiguous'),
-      expect.objectContaining({ agentId: 'wren', candidateCount: 2 })
+      expect.objectContaining({ sbSlug: 'wren', candidateCount: 2 })
     );
   });
 
   it('does not resolve a slug that exists only in another workspace', async () => {
     const f = fakeSupabase(rows({ id: SB_IN_B, workspace_id: WS_B }));
 
-    const resolved = await resolveIdentityId(f.client, USER, 'wren', WS_A);
+    const resolved = await resolveSbId(f.client, USER, 'wren', WS_A);
 
     expect(resolved).toBeNull();
     expect(resolved).not.toBe(SB_IN_B);
@@ -109,7 +109,7 @@ describe('resolveIdentityId', () => {
   it('falls back to a legacy identity that has no workspace yet', async () => {
     const f = fakeSupabase(rows({ id: SB_LEGACY, workspace_id: null }));
 
-    expect(await resolveIdentityId(f.client, USER, 'echo', WS_A)).toBe(SB_LEGACY);
+    expect(await resolveSbId(f.client, USER, 'echo', WS_A)).toBe(SB_LEGACY);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('legacy identity'),
       expect.objectContaining({ identityId: SB_LEGACY })
@@ -121,7 +121,7 @@ describe('resolveIdentityId', () => {
       rows({ id: SB_LEGACY, workspace_id: null }, { id: SB_IN_A, workspace_id: WS_A })
     );
 
-    const resolved = await resolveIdentityId(f.client, USER, 'echo', WS_A);
+    const resolved = await resolveSbId(f.client, USER, 'echo', WS_A);
 
     expect(resolved).toBe(SB_IN_A);
     expect(resolved).not.toBe(SB_LEGACY);
@@ -133,13 +133,13 @@ describe('resolveIdentityId', () => {
 
     const inB = await runWithRequestContext(
       { userId: USER, workspaceId: WS_B, workspaceSource: 'derived' },
-      () => resolveIdentityId(shared().client, USER, 'wren')
+      () => resolveSbId(shared().client, USER, 'wren')
     );
 
     expect(inB).toBe(SB_IN_B);
 
     // Control: the same call outside a request context cannot narrow, and refuses.
-    expect(await resolveIdentityId(shared().client, USER, 'wren')).toBeNull();
+    expect(await resolveSbId(shared().client, USER, 'wren')).toBeNull();
   });
 
   it('does NOT let a header-selected workspace rename the authenticated writer', async () => {
@@ -150,7 +150,7 @@ describe('resolveIdentityId', () => {
     // USER has access. Honouring it here stamped B's UUID on A's writes.
     const viaHeader = await runWithRequestContext(
       { userId: USER, workspaceId: WS_B, workspaceSource: 'header' },
-      () => resolveIdentityId(shared().client, USER, 'wren')
+      () => resolveSbId(shared().client, USER, 'wren')
     );
 
     expect(viaHeader).toBeNull();
@@ -166,7 +166,7 @@ describe('resolveIdentityId', () => {
 
       const resolved = await runWithRequestContext(
         { userId: USER, workspaceId: WS_B, workspaceSource: source },
-        () => resolveIdentityId(f.client, USER, 'wren')
+        () => resolveSbId(f.client, USER, 'wren')
       );
 
       expect(resolved).toBeNull();
@@ -177,7 +177,7 @@ describe('resolveIdentityId', () => {
     const f = fakeSupabase(rows({ id: SB_IN_A, workspace_id: WS_A }));
 
     // Postgres returns uuids lower-cased; a header does not have to be.
-    const resolved = await resolveIdentityId(f.client, USER, 'wren', WS_A.toUpperCase());
+    const resolved = await resolveSbId(f.client, USER, 'wren', WS_A.toUpperCase());
 
     expect(resolved).toBe(SB_IN_A);
   });
@@ -187,7 +187,7 @@ describe('resolveIdentityId', () => {
       rows({ id: SB_LEGACY, workspace_id: null }, { id: SB_IN_A, workspace_id: WS_A })
     );
 
-    const resolved = await resolveIdentityId(f.client, USER, 'wren', WS_A.toUpperCase());
+    const resolved = await resolveSbId(f.client, USER, 'wren', WS_A.toUpperCase());
 
     expect(resolved).toBe(SB_IN_A);
     expect(resolved).not.toBe(SB_LEGACY);
@@ -199,7 +199,7 @@ describe('resolveIdentityId', () => {
     );
 
     const resolved = await runWithRequestContext({ userId: USER, workspaceId: WS_B }, () =>
-      resolveIdentityId(f.client, USER, 'wren', WS_A)
+      resolveSbId(f.client, USER, 'wren', WS_A)
     );
 
     expect(resolved).toBe(SB_IN_A);
@@ -207,7 +207,7 @@ describe('resolveIdentityId', () => {
 
   it('returns null when the query fails', async () => {
     const f = fakeSupabase({ error: { message: 'connection reset' } });
-    expect(await resolveIdentityId(f.client, USER, 'wren', WS_A)).toBeNull();
+    expect(await resolveSbId(f.client, USER, 'wren', WS_A)).toBeNull();
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('Failed to resolve'),
       expect.objectContaining({ error: 'connection reset' })
@@ -215,10 +215,10 @@ describe('resolveIdentityId', () => {
   });
 });
 
-describe('resolveIdentityResult — why it failed', () => {
+describe('resolveSbIdResult — why it failed', () => {
   it('reports no-identity when the slug names nobody', async () => {
     const f = fakeSupabase(rows());
-    expect(await resolveIdentityResult(f.client, USER, 'nobody')).toEqual({
+    expect(await resolveSbIdResult(f.client, USER, 'nobody')).toEqual({
       ok: false,
       reason: 'no-identity',
     });
@@ -228,7 +228,7 @@ describe('resolveIdentityResult — why it failed', () => {
     const f = fakeSupabase(
       rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B })
     );
-    expect(await resolveIdentityResult(f.client, USER, 'wren')).toEqual({
+    expect(await resolveSbIdResult(f.client, USER, 'wren')).toEqual({
       ok: false,
       reason: 'ambiguous',
     });
@@ -236,7 +236,7 @@ describe('resolveIdentityResult — why it failed', () => {
 
   it('reports not-in-workspace when the slug lives somewhere else', async () => {
     const f = fakeSupabase(rows({ id: SB_IN_B, workspace_id: WS_B }));
-    expect(await resolveIdentityResult(f.client, USER, 'wren', WS_A)).toEqual({
+    expect(await resolveSbIdResult(f.client, USER, 'wren', WS_A)).toEqual({
       ok: false,
       reason: 'not-in-workspace',
     });
@@ -250,11 +250,11 @@ describe('resolveIdentityResult — why it failed', () => {
 
     // Both are null through the legacy helper; only the result type tells them
     // apart, and that difference is what owner-bearing writes key off.
-    expect(await resolveIdentityId(nobody.client, USER, 'nobody')).toBeNull();
-    expect(await resolveIdentityId(ambiguous.client, USER, 'wren')).toBeNull();
+    expect(await resolveSbId(nobody.client, USER, 'nobody')).toBeNull();
+    expect(await resolveSbId(ambiguous.client, USER, 'wren')).toBeNull();
 
-    const a = await resolveIdentityResult(nobody.client, USER, 'nobody');
-    const b = await resolveIdentityResult(ambiguous.client, USER, 'wren');
+    const a = await resolveSbIdResult(nobody.client, USER, 'nobody');
+    const b = await resolveSbIdResult(ambiguous.client, USER, 'wren');
     expect(a.ok).toBe(false);
     expect(b.ok).toBe(false);
     expect((a as { reason: string }).reason).not.toBe((b as { reason: string }).reason);
@@ -306,7 +306,7 @@ describe('resolveOwnerSbId — owner-bearing writes fail closed', () => {
 
     // Control: the permissive helper returns null for the same input. The
     // difference between the two is the entire fix.
-    expect(await resolveIdentityId(f.client, USER, 'wren')).toBeNull();
+    expect(await resolveSbId(f.client, USER, 'wren')).toBeNull();
     await expect(
       resolveOwnerSbId(
         fakeSupabase(rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B }))
@@ -330,7 +330,7 @@ describe('an unreadable lookup response is not an empty one', () => {
 
   for (const [label, payload] of Object.entries(unreadable)) {
     it(`classifies ${label} as lookup-failed, not no-identity`, async () => {
-      const result = await resolveIdentityResult(fakeSupabase(payload).client, USER, 'wren');
+      const result = await resolveSbIdResult(fakeSupabase(payload).client, USER, 'wren');
 
       expect(result).toEqual({ ok: false, reason: 'lookup-failed' });
       expect(result).not.toEqual({ ok: false, reason: 'no-identity' });
@@ -348,7 +348,7 @@ describe('an unreadable lookup response is not an empty one', () => {
     // are still possible and this did not just become fail-closed for everything.
     const f = fakeSupabase({ data: [] });
 
-    expect(await resolveIdentityResult(f.client, USER, 'nobody')).toEqual({
+    expect(await resolveSbIdResult(f.client, USER, 'nobody')).toEqual({
       ok: false,
       reason: 'no-identity',
     });
@@ -358,15 +358,15 @@ describe('an unreadable lookup response is not an empty one', () => {
   });
 });
 
-describe('resolveAgentSlug', () => {
+describe('resolveSbSlug', () => {
   it('resolves a slug from a canonical UUID', async () => {
     const f = fakeSupabase({ data: { agent_id: 'wren' } });
-    expect(await resolveAgentSlug(f.client, SB_IN_A)).toBe('wren');
+    expect(await resolveSbSlug(f.client, SB_IN_A)).toBe('wren');
     expect(f.filters).toEqual([['id', SB_IN_A]]);
   });
 
   it('returns null when the UUID names no identity', async () => {
     const f = fakeSupabase({ error: { message: 'no rows' } });
-    expect(await resolveAgentSlug(f.client, SB_IN_A)).toBeNull();
+    expect(await resolveSbSlug(f.client, SB_IN_A)).toBeNull();
   });
 });

@@ -48,7 +48,7 @@ function makeFakeChild(): FakeChild {
   return child;
 }
 
-const baseConfig = { workingDirectory: '/tmp', agentId: 'myra', pcpSessionId: 'sess-1' };
+const baseConfig = { workingDirectory: '/tmp', sbSlug: 'myra', pcpSessionId: 'sess-1' };
 const CLI = '/srv/checkout/packages/cli/dist/cli.js';
 
 /** Run one turn to the point of spawn, close the child cleanly, and return the spawn call. */

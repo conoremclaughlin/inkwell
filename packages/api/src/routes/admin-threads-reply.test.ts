@@ -9,7 +9,7 @@
  *  - recipients are the thread's OWN participants, and triggerAll wakes them —
  *    a reply nobody is woken for may never be seen;
  *  - metadata.sentBy = 'user' rides along, because the admin context has no
- *    agentId and 'unknown' alone can't be told apart from a real unknown.
+ *    sbSlug and 'unknown' alone can't be told apart from a real unknown.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -44,12 +44,9 @@ vi.mock('../data/composer', () => ({
 vi.mock('../services/authorization', () => ({ getAuthorizationService: vi.fn(() => ({})) }));
 vi.mock('../services/oauth', () => ({ getOAuthService: vi.fn(() => ({})) }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    SUPABASE_PUBLISHABLE_KEY: 'test-publishable',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -183,9 +180,9 @@ describe('POST /threads/reply', () => {
       triggerAll: true,
       priority: 'high',
     });
-    // No senderAgentId: the human IS the sender; the handler's non-agent
+    // No senderSlug: the human IS the sender; the handler's non-agent
     // path depends on this being absent.
-    expect(args.senderAgentId).toBeUndefined();
+    expect(args.senderSlug).toBeUndefined();
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
   });
 

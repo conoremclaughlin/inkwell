@@ -37,8 +37,8 @@ export function resolveBackendName(name: string): Backend | undefined {
 export const IDENTITY_CONTEXTS = {
   /** Main repo root (not a studio worktree) */
   MAIN: 'main',
-  /** Studio worktree — format: workspace-{agentId} */
-  workspace: (agentId: string) => `workspace-${agentId}` as const,
+  /** Studio worktree — format: workspace-{sbSlug} */
+  workspace: (sbSlug: string) => `workspace-${sbSlug}` as const,
 } as const;
 
 // ── MCP Server Key ────────────────────────────────────────────────
@@ -53,7 +53,7 @@ export const MCP_SERVER_KEY = 'inkwell';
 
 /** Environment variable names used across CLI, hooks, and runners. */
 export const ENV = {
-  /** Agent ID override */
+  /** SB slug override */
   AGENT_ID: 'AGENT_ID',
   /** Inkwell server URL */
   SERVER_URL: 'INK_SERVER_URL',

@@ -91,7 +91,7 @@ describe('MemoryRepository', () => {
         metadata: {},
       });
 
-      await repo.startSession({ userId: 'user-1', agentId: 'myra', sbId: 'sb-myra' });
+      await repo.startSession({ userId: 'user-1', sbSlug: 'myra', sbId: 'sb-myra' });
 
       const insert = (
         mockSupabase._queryBuilder.insert as unknown as { mock: { calls: unknown[][] } }
@@ -208,7 +208,7 @@ describe('MemoryRepository', () => {
         salience: 'high',
         topics: ['self-awareness', 'growth'],
         embedding: null,
-        metadata: { agentId: 'wren', reflectionType: 'periodic' },
+        metadata: { sbSlug: 'wren', reflectionType: 'periodic' },
         version: 1,
         created_at: '2026-01-26T12:00:00Z',
         expires_at: null,
@@ -222,12 +222,12 @@ describe('MemoryRepository', () => {
         source: 'reflection',
         salience: 'high',
         topics: ['self-awareness', 'growth'],
-        metadata: { agentId: 'wren', reflectionType: 'periodic' },
+        metadata: { sbSlug: 'wren', reflectionType: 'periodic' },
       });
 
       expect(result.source).toBe('reflection');
       expect(result.topics).toContain('self-awareness');
-      expect(result.metadata).toHaveProperty('agentId', 'wren');
+      expect(result.metadata).toHaveProperty('sbSlug', 'wren');
     });
 
     it('should throw on database error', async () => {
@@ -564,12 +564,12 @@ describe('MemoryRepository', () => {
 
         const result = await repo.startSession({
           userId: 'user-456',
-          agentId: 'claude-code',
+          sbSlug: 'claude-code',
         });
 
         expect(result.id).toBe('session-123');
         expect(result.userId).toBe('user-456');
-        expect(result.agentId).toBe('claude-code');
+        expect(result.sbSlug).toBe('claude-code');
         expect(result.studioId).toBeUndefined();
         expect(result.studioId).toBeUndefined();
         expect(result.endedAt).toBeUndefined();
@@ -592,7 +592,7 @@ describe('MemoryRepository', () => {
 
         const result = await repo.startSession({
           userId: 'user-456',
-          agentId: 'wren',
+          sbSlug: 'wren',
           studioId: 'ws-abc-123',
         });
 
@@ -625,7 +625,7 @@ describe('MemoryRepository', () => {
 
         await repo.startSession({
           userId: 'user-456',
-          agentId: 'wren',
+          sbSlug: 'wren',
           studioId: 'studio-abc',
         });
 
@@ -653,7 +653,7 @@ describe('MemoryRepository', () => {
 
         await repo.startSession({
           userId: 'user-456',
-          agentId: 'wren',
+          sbSlug: 'wren',
         });
 
         const insertCall = mockSupabase._queryBuilder.insert.mock.calls[0][0];
@@ -851,7 +851,7 @@ describe('MemoryRepository', () => {
       it('should not filter by studio when studioId is omitted', async () => {
         mockSupabase._setArrayData([]);
 
-        await repo.listSessions('user-456', { agentId: 'wren' });
+        await repo.listSessions('user-456', { sbSlug: 'wren' });
 
         const eqCalls = mockSupabase._queryBuilder.eq.mock.calls;
         const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'studio_id');
@@ -1407,7 +1407,7 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         content: 'A'.repeat(1800),
         summary: 'Chunked summary',
         topicKey: 'project:pcp/memory',
@@ -1547,7 +1547,7 @@ describe('MemoryRepository', () => {
       expect(results[0].topicKey).toBe('decision:auth');
     });
 
-    it('should filter by agentId when provided', async () => {
+    it('should filter by sbSlug when provided', async () => {
       mockSupabase._setArrayData([]);
 
       await repo.getKnowledgeMemories('user-456', 'wren');
@@ -1557,7 +1557,7 @@ describe('MemoryRepository', () => {
       );
     });
 
-    it('should not filter by agentId when not provided', async () => {
+    it('should not filter by sbSlug when not provided', async () => {
       mockSupabase._setArrayData([]);
 
       await repo.getKnowledgeMemories('user-456');
@@ -1652,7 +1652,7 @@ describe('MemoryRepository', () => {
       expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('agent_id', '__shared__');
     });
 
-    it('should use provided agentId for cache key', async () => {
+    it('should use provided sbSlug for cache key', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 
       await repo.getCachedSummary('user-456', 'wren');
@@ -1679,7 +1679,7 @@ describe('MemoryRepository', () => {
       );
     });
 
-    it('should use __shared__ when agentId is undefined', async () => {
+    it('should use __shared__ when sbSlug is undefined', async () => {
       mockSupabase._setReturnData(null);
 
       await repo.setCachedSummary('user-456', undefined, 'Shared summary', 10);

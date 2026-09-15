@@ -38,7 +38,7 @@ try {
 // ─── Helpers ────────────────────────────────────────────────────
 
 const TEST_CONTEXT_TOKEN = Buffer.from(
-  JSON.stringify({ agentId: 'test:2fa-integration', studioId: 'main', cliAttached: false })
+  JSON.stringify({ sbSlug: 'test:2fa-integration', studioId: 'main', cliAttached: false })
 ).toString('base64url');
 
 async function getAuthHeaders(): Promise<Record<string, string>> {
@@ -77,7 +77,7 @@ describe('2FA Flow Phase 1: Policy Gate', () => {
     const { applyProfile } = await import('./tool-profiles.js');
 
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.setContext({ agentId: 'myra', studioId: 'main' });
+    policy.setContext({ sbSlug: 'myra', studioId: 'main' });
     policy.setMutationScope('studio');
     applyProfile(policy, 'safe');
 
@@ -108,7 +108,7 @@ describe('2FA Flow Phase 2: executeToolCalls prompts for blocked tools', () => {
     const { executeToolCalls } = await import('./tool-call-executor.js');
 
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.setContext({ agentId: 'myra', studioId: 'main' });
+    policy.setContext({ sbSlug: 'myra', studioId: 'main' });
     policy.setMutationScope('studio');
     applyProfile(policy, 'safe');
 
@@ -116,7 +116,7 @@ describe('2FA Flow Phase 2: executeToolCalls prompts for blocked tools', () => {
     const executedTools: string[] = [];
 
     const calls = [
-      { tool: 'bootstrap', args: { agentId: 'myra' }, raw: '' },
+      { tool: 'bootstrap', args: { sbSlug: 'myra' }, raw: '' },
       { tool: 'write', args: { path: '/tmp/test.txt', content: 'hello' }, raw: '' },
       { tool: 'send_response', args: { content: 'test' }, raw: '' },
     ];
@@ -329,7 +329,7 @@ describe('2FA Flow Phase 4: requestToolApproval client', () => {
 
       // We need the userId. Bootstrap via PCP client to get it.
       const pcp = await createPcpClient();
-      const bootstrapResult = (await pcp.callTool('bootstrap', { agentId: 'test' })) as {
+      const bootstrapResult = (await pcp.callTool('bootstrap', { sbSlug: 'test' })) as {
         user?: { id: string };
       };
       const userId = bootstrapResult?.user?.id;
@@ -474,7 +474,7 @@ describe('2FA Flow Phase 5: Confirmation formatting', () => {
       intercepted: true,
       action: 'grant-agent',
       requestId: 'abc123',
-      resolvedRequests: [{ id: 'abc123', tool: 'bash', action: 'grant-agent', agentId: 'myra' }],
+      resolvedRequests: [{ id: 'abc123', tool: 'bash', action: 'grant-agent', sbSlug: 'myra' }],
     });
 
     expect(result).toContain('for myra');
@@ -491,8 +491,8 @@ describe('2FA Flow Phase 5: Confirmation formatting', () => {
       action: 'grant',
       requestId: 'abc123',
       resolvedRequests: [
-        { id: 'abc123', tool: 'write', action: 'grant', agentId: 'myra' },
-        { id: 'def456', tool: 'bash', action: 'grant', agentId: 'lumen' },
+        { id: 'abc123', tool: 'write', action: 'grant', sbSlug: 'myra' },
+        { id: 'def456', tool: 'bash', action: 'grant', sbSlug: 'lumen' },
       ],
     });
 
@@ -509,7 +509,7 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
     const { applyProfile } = await import('./tool-profiles.js');
 
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.setContext({ agentId: 'myra', studioId: 'test-studio' });
+    policy.setContext({ sbSlug: 'myra', studioId: 'test-studio' });
     policy.setMutationScope('studio');
     applyProfile(policy, 'safe');
 
@@ -534,7 +534,7 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
     const { applyProfile } = await import('./tool-profiles.js');
 
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.setContext({ agentId: 'myra', studioId: 'test-studio' });
+    policy.setContext({ sbSlug: 'myra', studioId: 'test-studio' });
     policy.setMutationScope('studio');
     applyProfile(policy, 'safe');
 
@@ -581,7 +581,7 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
         await import('../../../api/dist/channels/approval-interceptor.js');
 
       const pcp = await createPcpClient();
-      const bootstrapResult = (await pcp.callTool('bootstrap', { agentId: 'test' })) as {
+      const bootstrapResult = (await pcp.callTool('bootstrap', { sbSlug: 'test' })) as {
         user?: { id: string };
       };
       const userId = bootstrapResult?.user?.id;

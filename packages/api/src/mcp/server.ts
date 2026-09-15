@@ -95,12 +95,12 @@ export class MCPServer {
    * Validate a context token by verifying the sessionId against the database.
    * The session was created via an authenticated start_session call, so a
    * matching active session proves the caller owns the identity. We also
-   * verify the agentId matches to prevent session-id reuse across agents.
+   * verify the sbSlug matches to prevent session-id reuse across agents.
    */
   private async resolveUserFromContextSession(
     sessionId: string,
-    agentId: string
-  ): Promise<{ userId: string; email: string; agentId: string; sbId: string } | null> {
+    sbSlug: string
+  ): Promise<{ userId: string; email: string; sbSlug: string; sbId: string } | null> {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!UUID_RE.test(sessionId)) {
       logger.debug('Context-based auth: malformed sessionId', { sessionId });
@@ -127,11 +127,11 @@ export class MCPServer {
       return null;
     }
 
-    if (session.agentId !== agentId) {
-      logger.warn('Context-based auth: agentId mismatch', {
+    if (session.sbSlug !== sbSlug) {
+      logger.warn('Context-based auth: sbSlug mismatch', {
         sessionId,
-        sessionAgentId: session.agentId,
-        contextAgentId: agentId,
+        sessionSlug: session.sbSlug,
+        contextSlug: sbSlug,
       });
       return null;
     }
@@ -158,32 +158,32 @@ export class MCPServer {
         });
         return null;
       }
-      if (data.user_id !== session.userId || data.agent_id !== agentId) {
+      if (data.user_id !== session.userId || data.agent_id !== sbSlug) {
         logger.warn('Context-based auth: session sb_id does not match session user/agent', {
           sessionId,
           sbId: session.sbId,
           identityUserId: data.user_id,
           sessionUserId: session.userId,
-          identityAgentId: data.agent_id,
-          contextAgentId: agentId,
+          identitySlug: data.agent_id,
+          contextSlug: sbSlug,
         });
         return null;
       }
       const email = (data.users as unknown as { email: string })?.email ?? '';
-      return { userId: session.userId, email, agentId, sbId: data.id };
+      return { userId: session.userId, email, sbSlug, sbId: data.id };
     }
 
     const { data, error } = await this.dataComposer
       .getClient()
       .from('agent_identities')
       .select('id, user_id, users!inner(email)')
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .eq('user_id', session.userId)
       .single();
 
     if (error || !data) {
       logger.debug('Context-based auth: no identity found for session user+agent', {
-        agentId,
+        sbSlug,
         userId: session.userId,
       });
       return null;
@@ -193,7 +193,7 @@ export class MCPServer {
     return {
       userId: session.userId,
       email,
-      agentId,
+      sbSlug,
       sbId: data.id,
     };
   }
@@ -232,15 +232,15 @@ export class MCPServer {
    * create_artifact fails wanting workspace scope (found live by Myra).
    */
   private async enrichIdentityFromContextSession(
-    userData: { userId: string; email: string; agentId?: string; sbId?: string } | null,
-    contextToken: { sessionId?: string; agentId?: string } | null
-  ): Promise<{ userId: string; email: string; agentId?: string; sbId?: string } | null> {
+    userData: { userId: string; email: string; sbSlug?: string; sbId?: string } | null,
+    contextToken: { sessionId?: string; sbSlug?: string } | null
+  ): Promise<{ userId: string; email: string; sbSlug?: string; sbId?: string } | null> {
     if (!userData) return userData;
-    if (userData.agentId || !contextToken?.sessionId || !contextToken?.agentId) return userData;
+    if (userData.sbSlug || !contextToken?.sessionId || !contextToken?.sbSlug) return userData;
 
     const sessionIdentity = await this.resolveUserFromContextSession(
       contextToken.sessionId,
-      contextToken.agentId
+      contextToken.sbSlug
     );
     if (!sessionIdentity) return userData;
     if (sessionIdentity.userId !== userData.userId) {
@@ -254,17 +254,14 @@ export class MCPServer {
 
     logger.debug('Context session enrichment: agent identity attached to user-token request', {
       sessionId: contextToken.sessionId,
-      agentId: sessionIdentity.agentId,
+      sbSlug: sessionIdentity.sbSlug,
       sbId: sessionIdentity.sbId,
       userId: userData.userId,
     });
-    return { ...userData, agentId: sessionIdentity.agentId, sbId: sessionIdentity.sbId };
+    return { ...userData, sbSlug: sessionIdentity.sbSlug, sbId: sessionIdentity.sbId };
   }
 
-  private async deriveWorkspaceIdFromAgent(
-    userId: string,
-    agentId: string
-  ): Promise<string | null> {
+  private async deriveWorkspaceIdFromAgent(userId: string, sbSlug: string): Promise<string | null> {
     // TODO(lumen): Deduplicate this with the artifact-handler variant in a
     // shared helper that can choose ambiguous-workspace behavior (warn/throw).
     const { data, error } = await this.dataComposer
@@ -272,12 +269,12 @@ export class MCPServer {
       .from('agent_identities')
       .select('workspace_id')
       .eq('user_id', userId)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
 
     if (error) {
       logger.warn('Failed to derive workspace from agent identity in MCP request context', {
         userId,
-        agentId,
+        sbSlug,
         error: error.message,
       });
       return null;
@@ -296,7 +293,7 @@ export class MCPServer {
     if (workspaceIds.length > 1) {
       logger.warn('Ambiguous workspace mapping for agent identity in MCP request context', {
         userId,
-        agentId,
+        sbSlug,
         workspaceCount: workspaceIds.length,
       });
     }
@@ -306,7 +303,7 @@ export class MCPServer {
 
   private async resolveWorkspaceContextForMcpRequest(
     req: express.Request,
-    userData: { userId: string; email: string; agentId?: string; sbId?: string }
+    userData: { userId: string; email: string; sbSlug?: string; sbId?: string }
   ): Promise<{ workspaceId?: string; workspaceSource?: 'header' | 'derived' }> {
     const requestedWorkspaceId = req.header('x-ink-workspace-id')?.trim();
 
@@ -325,8 +322,8 @@ export class MCPServer {
       // the same agent_id exists in multiple workspaces.
       deriveWorkspaceIdFromAgent: userData.sbId
         ? () => this.deriveWorkspaceIdFromSbId(userData.sbId!)
-        : userData.agentId
-          ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
+        : userData.sbSlug
+          ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.sbSlug!)
           : undefined,
     });
 
@@ -451,22 +448,22 @@ export class MCPServer {
       }
 
       // Session-validated context auth: when NO Authorization header is present
-      // but the request carries an x-ink-context with a sessionId + agentId,
+      // but the request carries an x-ink-context with a sessionId + sbSlug,
       // verify the session exists and is active in the database. The session was
       // created through an authenticated start_session call, so a matching
       // active session proves the caller owns the identity.
       //
       // This is NOT attempted when an Authorization header IS present but
       // invalid — that's a hard auth failure, not a fallback scenario.
-      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.agentId) {
+      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.sbSlug) {
         userData = await this.resolveUserFromContextSession(
           contextToken.sessionId,
-          contextToken.agentId
+          contextToken.sbSlug
         );
         if (userData) {
           logger.debug('Context-based auth: resolved identity from verified session', {
             sessionId: contextToken.sessionId,
-            agentId: contextToken.agentId,
+            sbSlug: contextToken.sbSlug,
             userId: userData.userId,
           });
         }
@@ -511,7 +508,7 @@ export class MCPServer {
         ? {
             userId: userData.userId,
             email: userData.email,
-            agentId: userData.agentId,
+            sbSlug: userData.sbSlug,
             sbId: userData.sbId,
           }
         : {};
@@ -529,7 +526,7 @@ export class MCPServer {
       const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
       if (effectiveIdentity && effectiveIdentity !== userData) {
         Object.assign(ctx, {
-          agentId: effectiveIdentity.agentId,
+          sbSlug: effectiveIdentity.sbSlug,
           sbId: effectiveIdentity.sbId,
         });
       }
@@ -588,7 +585,7 @@ export class MCPServer {
         } catch (error) {
           logger.warn('Rejected MCP request due to invalid workspace scope', {
             userId: effectiveIdentity.userId,
-            agentId: effectiveIdentity.agentId,
+            sbSlug: effectiveIdentity.sbSlug,
             error: error instanceof Error ? error.message : String(error),
           });
           res.status(403).json({
@@ -752,7 +749,7 @@ export class MCPServer {
         codeChallenge: code_challenge as string,
         redirectUri: redirect_uri as string,
         state: state as string,
-        agentId: agent_id as string | undefined,
+        sbSlug: agent_id as string | undefined,
       });
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';
@@ -869,12 +866,12 @@ export class MCPServer {
         return;
       }
 
-      const requestedAgentId =
-        typeof req.body?.agentId === 'string' ? req.body.agentId.trim().toLowerCase() : '';
-      if (!requestedAgentId) {
+      const requestedSlug =
+        typeof req.body?.sbSlug === 'string' ? req.body.sbSlug.trim().toLowerCase() : '';
+      if (!requestedSlug) {
         res.status(400).json({
           error: 'invalid_request',
-          error_description: 'Missing required field: agentId',
+          error_description: 'Missing required field: sbSlug',
         });
         return;
       }
@@ -884,13 +881,13 @@ export class MCPServer {
         .from('agent_identities')
         .select('id, agent_id')
         .eq('user_id', userData.userId)
-        .eq('agent_id', requestedAgentId)
+        .eq('agent_id', requestedSlug)
         .maybeSingle();
 
       if (identityError) {
         logger.error('Failed to resolve agent identity for delegated token', {
           userId: userData.userId,
-          requestedAgentId,
+          requestedSlug,
           error: identityError.message,
         });
         res.status(500).json({
@@ -914,7 +911,7 @@ export class MCPServer {
           sub: userData.userId,
           email: userData.email,
           scope: 'mcp:tools',
-          agentId: identity.agent_id,
+          sbSlug: identity.agent_id,
           identityId: identity.id,
         },
         DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS

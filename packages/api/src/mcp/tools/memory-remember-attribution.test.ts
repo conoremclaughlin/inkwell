@@ -25,12 +25,12 @@ const newerSession = '22222222-2222-4222-8222-222222222222';
 const foreignUserSession = '66666666-6666-4666-8666-666666666666';
 const sbId = '33333333-3333-4333-8333-333333333333';
 
-type RememberInput = { agentId?: string; metadata?: { sessionId?: string } };
+type RememberInput = { sbSlug?: string; metadata?: { sessionId?: string } };
 
 function fixture(opts: { owned?: object[]; throws?: boolean } = {}) {
-  const live = { id: ownSession, userId: 'owner', agentId: 'myra', sbId };
-  const newer = { id: newerSession, userId: 'owner', agentId: 'myra', sbId, studioId: 'elsewhere' };
-  const foreign = { id: foreignUserSession, userId: 'someone-else', agentId: 'myra', sbId };
+  const live = { id: ownSession, userId: 'owner', sbSlug: 'myra', sbId };
+  const newer = { id: newerSession, userId: 'owner', sbSlug: 'myra', sbId, studioId: 'elsewhere' };
+  const foreign = { id: foreignUserSession, userId: 'someone-else', sbSlug: 'myra', sbId };
   const rows: Record<string, object> = {
     [ownSession]: live,
     [newerSession]: newer,
@@ -68,10 +68,10 @@ describe('handleRemember — session attribution', () => {
     await runWithRequestContext(
       {
         userId: 'owner',
-        agentId: 'myra',
+        sbSlug: 'myra',
         sbId,
         agentTokenBound: true,
-        tokenAgentId: 'myra',
+        tokenSlug: 'myra',
         tokenSbId: sbId,
         tokenSessionId: ownSession,
         sessionId: newerSession,
@@ -83,17 +83,17 @@ describe('handleRemember — session attribution', () => {
     expect(f.findOwnedActiveSessions).not.toHaveBeenCalled();
   });
 
-  it('keeps attribution on the enriched user-token call that omits agentId', async () => {
-    // Lumen's #596 probe. The normal local auth shape: a user bearer, ctx.agentId
-    // enriched from the ambient session, the call passing no agentId. The
+  it('keeps attribution on the enriched user-token call that omits sbSlug', async () => {
+    // Lumen's #596 probe. The normal local auth shape: a user bearer, ctx.sbSlug
+    // enriched from the ambient session, the call passing no sbSlug. The
     // effective identity is still 'myra' — the memory is attributed to it, and
     // the resolver must be handed the same identity rather than `undefined`.
     const f = fixture();
     await runWithRequestContext(
-      { userId: 'owner', agentId: 'myra', sbId, sessionId: ownSession },
+      { userId: 'owner', sbSlug: 'myra', sbId, sessionId: ownSession },
       () => handleRemember({ content: 'probe' }, f.composer)
     );
-    expect(saved(f).agentId).toBe('myra');
+    expect(saved(f).sbSlug).toBe('myra');
     expect(saved(f).metadata?.sessionId).toBe(ownSession);
     expect(f.getActiveSession).not.toHaveBeenCalled();
   });
@@ -105,7 +105,7 @@ describe('handleRemember — session attribution', () => {
     // guess either. The memory is saved regardless.
     const f = fixture();
     await runWithRequestContext(
-      { userId: 'owner', agentId: 'myra', sbId, sessionId: foreignUserSession },
+      { userId: 'owner', sbSlug: 'myra', sbId, sessionId: foreignUserSession },
       () => handleRemember({ content: 'probe' }, f.composer)
     );
     expect(f.remember).toHaveBeenCalledTimes(1);
@@ -113,16 +113,16 @@ describe('handleRemember — session attribution', () => {
   });
 
   it('falls through to the one owned session in scope when the header is unusable', async () => {
-    const f = fixture({ owned: [{ id: ownSession, userId: 'owner', agentId: 'myra', sbId }] });
+    const f = fixture({ owned: [{ id: ownSession, userId: 'owner', sbSlug: 'myra', sbId }] });
     await runWithRequestContext(
-      { userId: 'owner', agentId: 'myra', sbId, sessionId: foreignUserSession },
+      { userId: 'owner', sbSlug: 'myra', sbId, sessionId: foreignUserSession },
       () => handleRemember({ content: 'probe' }, f.composer)
     );
     expect(saved(f).metadata?.sessionId).toBe(ownSession);
   });
 
   it('saves the memory without a session when nothing identifies the caller', async () => {
-    // No pinned identity, no explicit agentId: the resolver reports
+    // No pinned identity, no explicit sbSlug: the resolver reports
     // no-agent-identity and the peers fail closed. remember does not.
     const f = fixture();
     await runWithRequestContext({ userId: 'owner', sessionId: ownSession }, () =>
@@ -136,7 +136,7 @@ describe('handleRemember — session attribution', () => {
   it('saves the memory without a session when resolution throws', async () => {
     const f = fixture({ throws: true });
     await runWithRequestContext(
-      { userId: 'owner', agentId: 'myra', sbId, sessionId: ownSession },
+      { userId: 'owner', sbSlug: 'myra', sbId, sessionId: ownSession },
       () => handleRemember({ content: 'must survive' }, f.composer)
     );
     expect(f.remember).toHaveBeenCalledTimes(1);
@@ -146,7 +146,7 @@ describe('handleRemember — session attribution', () => {
   it('lets an explicit sessionId from the caller win outright', async () => {
     const f = fixture();
     await runWithRequestContext(
-      { userId: 'owner', agentId: 'myra', sbId, sessionId: newerSession },
+      { userId: 'owner', sbSlug: 'myra', sbId, sessionId: newerSession },
       () => handleRemember({ content: 'probe', sessionId: ownSession }, f.composer)
     );
     expect(saved(f).metadata?.sessionId).toBe(ownSession);

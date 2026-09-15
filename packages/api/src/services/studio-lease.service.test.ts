@@ -331,7 +331,7 @@ function freshLease(overrides: Partial<StudioLease> = {}): StudioLease {
   return {
     sessionId: 'session-a',
     threadKey: 'pr:100',
-    agentId: 'wren',
+    sbSlug: 'wren',
     acquiredAt: now,
     heartbeatAt: now,
     ...overrides,
@@ -391,7 +391,7 @@ describe('StudioLeaseService.acquire', () => {
     studioId: 'studio-1',
     sessionId: 'session-b',
     threadKey: 'pr:200',
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: 'user-1',
     reason: 'route-pattern',
   };
@@ -775,7 +775,7 @@ describe('StudioLeaseService.acquire', () => {
       sessionId: '44444444-4444-4444-4444-444444444444',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:5',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: new Date().toISOString(),
       heartbeatAt: new Date().toISOString(),
       quarantined: true,
@@ -818,7 +818,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-live',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -881,7 +881,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-old',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -975,7 +975,7 @@ describe('StudioLeaseService.acquire', () => {
       studioId: 'studio-1',
       sessionId: 'session-b',
       threadKey: 'pr:200',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'user-1',
     });
     expect(result.acquired).toBe(false);
@@ -1127,7 +1127,7 @@ describe('StudioLeaseService.acquire', () => {
       sessionId: 'session-dead',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:999',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       acquiredAt: staleQuarantineHeartbeat,
       heartbeatAt: staleQuarantineHeartbeat,
       quarantined: true,
@@ -1144,7 +1144,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-live',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1176,7 +1176,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-running',
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1270,7 +1270,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1372,7 +1372,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1427,7 +1427,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1482,7 +1482,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
     registerActiveRun({
       sessionId: 'sess-3',
       userId: 'u',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1535,7 +1535,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
         studioId: 's-bad',
         sessionId: 'sess-new',
         threadKey: 'pr:7',
-        agentId: 'wren',
+        sbSlug: 'wren',
         userId: 'u',
       });
       expect(acq.acquired).toBe(false);
@@ -1556,7 +1556,7 @@ describe('sweep worktree-absent reconciliation (round 6)', () => {
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:33',
       holderSessionId: 'sess-orig',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: staleIso,
       heartbeatAt: staleIso,
       quarantined: true,
@@ -1765,7 +1765,7 @@ describe('sweep pendingRelease backstop', () => {
     registerActiveRun({
       sessionId: 'sess-p',
       userId: 'u',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -2047,7 +2047,7 @@ describe('claimForTeardown ownership (round 3)', () => {
       sessionId: '11111111-1111-1111-1111-111111111111',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:5',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: staleIso,
       heartbeatAt: staleIso,
       quarantined: true,
@@ -2686,7 +2686,7 @@ describe('S1 r1: release/repoint gap regressions (PR #550, Lumen r1)', () => {
       studioId: 's-eph',
       sessionId: 'sess-new',
       threadKey: 'pr:11',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'u',
     });
 
@@ -2737,7 +2737,7 @@ describe('S2: thread multiplexing on the lease (spec v18)', () => {
     studioId: 'studio-1',
     sessionId,
     threadKey,
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: 'user-1',
     reason: 'route-pattern',
   });
@@ -2894,7 +2894,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     registerActiveRun({
       sessionId: 'session-b',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -3075,7 +3075,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
       studioId: 'studio-1',
       sessionId: 'session-b',
       threadKey: 'pr:B',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'user-1',
       reason: 'route-pattern',
     });
@@ -3216,7 +3216,7 @@ describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
     studioId: 'studio-1',
     sessionId: 'session-b',
     threadKey: 'pr:100',
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: 'user-1',
     reason: 'route-pattern',
     ...overrides,

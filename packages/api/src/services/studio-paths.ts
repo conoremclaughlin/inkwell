@@ -101,13 +101,13 @@ export async function ensureInkStudiosRoot(): Promise<string> {
 
 /** `<root>/<agent>/<project>/<leaf>` — where an ephemeral studio materializes. */
 export function ephemeralWorktreePath(opts: {
-  agentId?: string | null;
+  sbSlug?: string | null;
   repoRoot: string;
   leaf: string;
 }): string {
   return path.join(
     inkStudiosRoot(),
-    studioPathSegment(opts.agentId, 'agent'),
+    studioPathSegment(opts.sbSlug, 'agent'),
     studioPathSegment(path.basename(opts.repoRoot), 'project'),
     studioPathSegment(opts.leaf, 'studio')
   );

@@ -35,7 +35,7 @@ prompt_for_backend() {
   cat <<EOF
 Emit exactly one fenced ink-tool block and nothing else:
 \`\`\`ink-tool
-{"tool":"get_inbox","args":{"agentId":"${agent}","status":"unread","limit":1}}
+{"tool":"get_inbox","args":{"sbSlug":"${agent}","status":"unread","limit":1}}
 \`\`\`
 EOF
 }

@@ -41,7 +41,7 @@ export interface JwtPayload {
   sub: string; // userId
   email: string;
   scope: string;
-  agentId?: string;
+  sbSlug?: string;
   identityId?: string;
   exp: number;
   iat: number;
@@ -65,15 +65,15 @@ function delegatedAuthDirPath(): string {
   return join(homedir(), '.ink', 'auth', 'agents');
 }
 
-function sanitizeAgentId(agentId: string): string {
-  return agentId
+function sanitizeSlug(sbSlug: string): string {
+  return sbSlug
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, '_');
 }
 
-function delegatedAuthFilePath(agentId: string): string {
-  return join(delegatedAuthDirPath(), `${sanitizeAgentId(agentId)}.json`);
+function delegatedAuthFilePath(sbSlug: string): string {
+  return join(delegatedAuthDirPath(), `${sanitizeSlug(sbSlug)}.json`);
 }
 
 // ============================================================================
@@ -115,8 +115,8 @@ export function clearAuth(): void {
   }
 }
 
-export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
-  const path = delegatedAuthFilePath(agentId);
+export function loadDelegatedAuth(sbSlug: string): StoredDelegatedAuth | null {
+  const path = delegatedAuthFilePath(sbSlug);
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(readFileSync(path, 'utf-8'));
@@ -125,7 +125,7 @@ export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
   }
 }
 
-export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): void {
+export function saveDelegatedAuth(sbSlug: string, auth: StoredDelegatedAuth): void {
   const dir = delegatedAuthDirPath();
   mkdirSync(dir, { recursive: true });
   try {
@@ -134,13 +134,13 @@ export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): v
     // Best-effort only; some environments may not support chmod.
   }
 
-  const path = delegatedAuthFilePath(agentId);
+  const path = delegatedAuthFilePath(sbSlug);
   writeFileSync(path, JSON.stringify(auth, null, 2) + '\n');
   chmodSync(path, 0o600);
 }
 
-export function clearDelegatedAuth(agentId: string): void {
-  const path = delegatedAuthFilePath(agentId);
+export function clearDelegatedAuth(sbSlug: string): void {
+  const path = delegatedAuthFilePath(sbSlug);
   if (existsSync(path)) {
     unlinkSync(path);
   }
@@ -265,10 +265,10 @@ export async function getValidAccessToken(
 }
 
 export function getValidDelegatedAccessToken(
-  agentId: string,
+  sbSlug: string,
   options?: { bufferSeconds?: number }
 ): string | null {
-  const auth = loadDelegatedAuth(agentId);
+  const auth = loadDelegatedAuth(sbSlug);
   if (!auth) return null;
   if (isTokenExpired(auth, options?.bufferSeconds ?? 300)) return null;
   return auth.access_token;

@@ -19,7 +19,7 @@ const thread = (over: Partial<SpineThreadRow> = {}): SpineThreadRow => ({
   keyId: '531',
   title: 'Command center viz',
   status: 'open',
-  createdByAgentId: 'wren',
+  createdBySlug: 'wren',
   updatedAt: at(10),
   closedAt: null,
   participants: ['wren', 'lumen'],
@@ -28,7 +28,7 @@ const thread = (over: Partial<SpineThreadRow> = {}): SpineThreadRow => ({
 
 const session = (over: Partial<SpineSessionRow> = {}): SpineSessionRow => ({
   id: 's1',
-  agentId: 'wren',
+  sbSlug: 'wren',
   lifecycle: 'running',
   status: 'active',
   currentPhase: 'implementing',
@@ -43,10 +43,10 @@ const studio = (over: Partial<SpineStudioRow> = {}): SpineStudioRow => ({
   id: 'st1',
   slug: 'wren-omega',
   branch: 'wren/feat/x',
-  agentId: 'wren',
+  sbSlug: 'wren',
   threadKey: null,
   leaseThreadKey: null,
-  leaseAgentId: null,
+  leaseSlug: null,
   updatedAt: at(8),
   ...over,
 });
@@ -88,7 +88,7 @@ describe('mergeThreadSpines', () => {
     const spines = mergeThreadSpines({
       threads: [thread()],
       sessions: [session({ threadKey: 'pr:531', activeThreadKey: 'pr:531', updatedAt: at(11) })],
-      studios: [studio({ leaseThreadKey: 'pr:531', leaseAgentId: 'lumen', updatedAt: at(6) })],
+      studios: [studio({ leaseThreadKey: 'pr:531', leaseSlug: 'lumen', updatedAt: at(6) })],
       groups: [group()],
       parse: noParse,
     });
@@ -154,9 +154,7 @@ describe('mergeThreadSpines', () => {
     const spines = mergeThreadSpines({
       threads: [],
       sessions: [],
-      studios: [
-        studio({ threadKey: 'spec:fleet', leaseThreadKey: 'pr:540', leaseAgentId: 'wren' }),
-      ],
+      studios: [studio({ threadKey: 'spec:fleet', leaseThreadKey: 'pr:540', leaseSlug: 'wren' })],
       groups: [],
       parse: noParse,
     });
@@ -164,10 +162,10 @@ describe('mergeThreadSpines', () => {
     const byKey = new Map(spines.map((s) => [s.key, s]));
     expect(byKey.get('spec:fleet')?.studios[0].relation).toBe('affinity');
     // Affinity alone says nothing about who is present.
-    expect(byKey.get('spec:fleet')?.studios[0].leaseAgentId).toBeNull();
+    expect(byKey.get('spec:fleet')?.studios[0].leaseSlug).toBeNull();
     expect(byKey.get('spec:fleet')?.participants).toEqual([]);
     expect(byKey.get('pr:540')?.studios[0].relation).toBe('lease');
-    expect(byKey.get('pr:540')?.studios[0].leaseAgentId).toBe('wren');
+    expect(byKey.get('pr:540')?.studios[0].leaseSlug).toBe('wren');
     expect(byKey.get('pr:540')?.participants).toEqual(['wren']);
   });
 
@@ -194,7 +192,7 @@ describe('lastActivityAt vs studio heartbeats', () => {
       threads: [thread({ updatedAt: at(1) })],
       sessions: [session({ threadKey: 'pr:531', updatedAt: at(2) })],
       // Studio row touched moments ago by the lease heartbeat.
-      studios: [studio({ leaseThreadKey: 'pr:531', leaseAgentId: 'wren', updatedAt: at(12) })],
+      studios: [studio({ leaseThreadKey: 'pr:531', leaseSlug: 'wren', updatedAt: at(12) })],
       groups: [],
       parse: noParse,
     });
@@ -219,7 +217,7 @@ describe('lastActivityAt vs studio heartbeats', () => {
 describe('aggregateStudioHistory', () => {
   const ev = (over: Partial<StudioLeaseEventRow>): StudioLeaseEventRow => ({
     studioId: 'st-a',
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     event: 'acquired',
     createdAt: at(5),
     ...over,
@@ -249,9 +247,9 @@ describe('aggregateStudioHistory', () => {
 
   it('aggregates agents and orders studios by most recent occupancy, input order irrelevant', () => {
     const entries = aggregateStudioHistory([
-      ev({ studioId: 'st-a', agentId: 'wren', event: 'acquired', createdAt: at(1) }),
+      ev({ studioId: 'st-a', sbSlug: 'wren', event: 'acquired', createdAt: at(1) }),
       ev({ studioId: 'st-b', event: 'expired', createdAt: at(9) }),
-      ev({ studioId: 'st-a', agentId: 'lumen', event: 'released', createdAt: at(3) }),
+      ev({ studioId: 'st-a', sbSlug: 'lumen', event: 'released', createdAt: at(3) }),
     ]);
 
     expect(entries.map((e) => e.studioId)).toEqual(['st-b', 'st-a']);

@@ -17,10 +17,9 @@ vi.mock('node-cron', () => ({
 }));
 
 // ─── Mock: env ───
-vi.mock('../config/env.js', () => ({
+vi.mock('../config/env.js', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret-key',
+    ...(await import('../test/fake-env')).fakeEnv,
   },
 }));
 
@@ -439,7 +438,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-001',
-        agentId: 'wren',
+        sbSlug: 'wren',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
       });
@@ -464,7 +463,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-001',
-        agentId: 'wren',
+        sbSlug: 'wren',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
       });
@@ -484,7 +483,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-twin',
-        agentId: 'myra',
+        sbSlug: 'myra',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
       });
@@ -512,7 +511,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-b',
-        agentId: 'myra',
+        sbSlug: 'myra',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
       });
@@ -539,7 +538,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-b',
-        agentId: 'myra',
+        sbSlug: 'myra',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
       });
@@ -561,7 +560,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-twin',
-        agentId: 'myra',
+        sbSlug: 'myra',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
       });
@@ -583,7 +582,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-002',
-        agentId: 'myra',
+        sbSlug: 'myra',
         // No deliveryChannel/deliveryTarget — should resolve from user
       });
 
@@ -603,7 +602,7 @@ describe('Heartbeat Service', () => {
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
         sbId: 'identity-003',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
 
       // No scheduled_reminders queries should happen at all
@@ -619,7 +618,7 @@ describe('Heartbeat Service', () => {
         ensureDefaultReminders({
           userId: TEST_USER_ID,
           sbId: 'identity-004',
-          agentId: 'wren',
+          sbSlug: 'wren',
         })
       ).resolves.toBeUndefined();
     });

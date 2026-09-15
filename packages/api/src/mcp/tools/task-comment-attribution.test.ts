@@ -10,11 +10,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
-vi.mock('../../config/env', () => ({
+vi.mock('../../config/env', async () => ({
   env: {
+    ...(await import('../../test/fake-env')).fakeEnv,
     ENFORCE_IDENTITY_PINNING: 'false',
-    SUPABASE_URL: 'http://localhost',
-    JWT_SECRET: 'x'.repeat(40),
   },
 }));
 vi.mock('../../services/user-resolver', async (importOriginal) => ({
@@ -50,7 +49,7 @@ function setup(identities: Row[]) {
 const addComment = (dc: unknown, workspaceId?: string) =>
   runWithRequestContext({ userId: USER, ...(workspaceId ? { workspaceId } : {}) }, () =>
     handleAddTaskComment(
-      { taskId: TASK, content: 'looks good', agentId: 'wren' } as never,
+      { taskId: TASK, content: 'looks good', sbSlug: 'wren' } as never,
       dc as never
     )
   );

@@ -4,7 +4,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
-import { resolveIdentityId, resolveOwnerSbId } from '../../auth/resolve-identity';
+import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import {
   buildChunkMetadataUpdate,
@@ -376,8 +376,8 @@ export class MemoryRepository {
    */
   async remember(input: MemoryCreateInput): Promise<Memory> {
     const sbId =
-      input.agentId && input.userId
-        ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
+      input.sbSlug && input.userId
+        ? await resolveSbId(this.supabase, input.userId, input.sbSlug)
         : null;
 
     // If topicKey is provided, ensure it's included in topics array
@@ -398,7 +398,7 @@ export class MemoryRepository {
         topics,
         metadata: input.metadata || {},
         expires_at: input.expiresAt?.toISOString(),
-        agent_id: input.agentId || null,
+        agent_id: input.sbSlug || null,
         contact_id: input.contactId || null,
         sb_id: sbId,
       })
@@ -777,14 +777,14 @@ export class MemoryRepository {
     }
 
     // Filter by agent
-    if (options.agentId) {
+    if (options.sbSlug) {
       const includeShared = options.includeShared !== false; // default true
       if (includeShared) {
         // Include both agent-specific and shared (null) memories
-        queryBuilder = queryBuilder.or(`agent_id.eq.${options.agentId},agent_id.is.null`);
+        queryBuilder = queryBuilder.or(`agent_id.eq.${options.sbSlug},agent_id.is.null`);
       } else {
         // Only agent-specific memories
-        queryBuilder = queryBuilder.eq('agent_id', options.agentId);
+        queryBuilder = queryBuilder.eq('agent_id', options.sbSlug);
       }
     }
 
@@ -872,7 +872,7 @@ export class MemoryRepository {
       p_source: options.source,
       p_salience: options.salience,
       p_topics: options.topics && options.topics.length > 0 ? options.topics : undefined,
-      p_agent_id: options.agentId,
+      p_agent_id: options.sbSlug,
       p_include_shared: options.includeShared !== false,
       p_include_expired: options.includeExpired === true,
       p_chunk_types: chunkTypes && chunkTypes.length > 0 ? chunkTypes : undefined,
@@ -971,7 +971,7 @@ export class MemoryRepository {
       p_source: options.source,
       p_salience: options.salience,
       p_topics: options.topics && options.topics.length > 0 ? options.topics : undefined,
-      p_agent_id: options.agentId,
+      p_agent_id: options.sbSlug,
       p_include_shared: options.includeShared !== false,
       p_include_expired: options.includeExpired === true,
     };
@@ -1183,7 +1183,7 @@ export class MemoryRepository {
    */
   async getKnowledgeMemories(
     userId: string,
-    agentId?: string,
+    sbSlug?: string,
     highLimit: number = 10,
     highWindowDays: number = 7,
     context: KnowledgeMemoryContext = {},
@@ -1199,8 +1199,8 @@ export class MemoryRepository {
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (agentId) {
-        q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+      if (sbSlug) {
+        q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
       }
       if (contactId) {
         q = q.eq('contact_id', contactId);
@@ -1220,8 +1220,8 @@ export class MemoryRepository {
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (agentId) {
-        q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+      if (sbSlug) {
+        q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
       }
       if (contactId) {
         q = q.eq('contact_id', contactId);
@@ -1296,7 +1296,7 @@ export class MemoryRepository {
    * Used after compaction to restore context continuity — the agent
    * likely just saved these via `remember` before compaction hit.
    */
-  async getRecentMemories(userId: string, agentId?: string, limit: number = 10): Promise<Memory[]> {
+  async getRecentMemories(userId: string, sbSlug?: string, limit: number = 10): Promise<Memory[]> {
     let q = this.supabase
       .from('memories')
       .select('*')
@@ -1305,8 +1305,8 @@ export class MemoryRepository {
       .order('created_at', { ascending: false })
       .limit(limit);
 
-    if (agentId) {
-      q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+    if (sbSlug) {
+      q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
     }
 
     const { data, error } = await q;
@@ -1324,9 +1324,9 @@ export class MemoryRepository {
    */
   async getCachedSummary(
     userId: string,
-    agentId?: string
+    sbSlug?: string
   ): Promise<{ summaryText: string; computedAt: Date; memoryCount: number } | null> {
-    const cacheKey = agentId || '__shared__';
+    const cacheKey = sbSlug || '__shared__';
     const { data, error } = await this.supabase
       .from('memory_summary_cache')
       .select('*')
@@ -1343,8 +1343,8 @@ export class MemoryRepository {
       .eq('user_id', userId)
       .gt('created_at', data.computed_at);
 
-    if (agentId) {
-      freshnessQuery = freshnessQuery.or(`agent_id.eq.${agentId},agent_id.is.null`);
+    if (sbSlug) {
+      freshnessQuery = freshnessQuery.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
     }
 
     const { count } = await freshnessQuery;
@@ -1362,11 +1362,11 @@ export class MemoryRepository {
    */
   async setCachedSummary(
     userId: string,
-    agentId: string | undefined,
+    sbSlug: string | undefined,
     summaryText: string,
     memoryCount: number
   ): Promise<void> {
-    const cacheKey = agentId || '__shared__';
+    const cacheKey = sbSlug || '__shared__';
     const { error } = await this.supabase.from('memory_summary_cache').upsert(
       {
         user_id: userId,
@@ -1485,12 +1485,12 @@ export class MemoryRepository {
     // slug is a fallback for callers that have none: `agent_id` is unique only
     // per (user_id, workspace_id), so the lookup can land on a same-named
     // identity in another workspace and stamp the row with the wrong owner.
-    const sbId = await resolveOwnerSbId(this.supabase, input.userId, input.agentId, input.sbId);
+    const sbId = await resolveOwnerSbId(this.supabase, input.userId, input.sbSlug, input.sbId);
 
     const insertData: Record<string, unknown> = {
       ...(input.id ? { id: input.id } : {}),
       user_id: input.userId,
-      agent_id: input.agentId,
+      agent_id: input.sbSlug,
       sb_id: sbId,
       metadata: input.metadata || {},
     };
@@ -1651,7 +1651,7 @@ export class MemoryRepository {
    * session (see resolveImplicitSession).
    *
    * Ownership is scoped by user_id plus a canonical `sbId` when the caller has
-   * one. `agentId` is a fallback for rows predating sb_id: the slug is unique
+   * one. `sbSlug` is a fallback for rows predating sb_id: the slug is unique
    * only per (user_id, workspace_id), so two identities in different workspaces
    * share it and it cannot be an ownership predicate on its own.
    *
@@ -1661,12 +1661,12 @@ export class MemoryRepository {
   async findOwnedActiveSessions(params: {
     userId: string;
     sbId?: string;
-    agentId?: string;
+    sbSlug?: string;
     studioId?: string | null;
     contactId?: string;
     limit?: number;
   }): Promise<Session[]> {
-    const { userId, sbId, agentId, studioId, contactId, limit = 5 } = params;
+    const { userId, sbId, sbSlug, studioId, contactId, limit = 5 } = params;
 
     let query = this.supabase
       .from('sessions')
@@ -1680,8 +1680,8 @@ export class MemoryRepository {
     // Prefer the canonical identity; only fall back to the ambiguous slug.
     if (sbId) {
       query = query.eq('sb_id', sbId);
-    } else if (agentId) {
-      query = query.eq('agent_id', agentId);
+    } else if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
     }
 
     if (studioId !== undefined) {
@@ -1712,7 +1712,7 @@ export class MemoryRepository {
    */
   async getActiveSession(
     userId: string,
-    agentId?: string,
+    sbSlug?: string,
     studioId?: string | null,
     contactId?: string,
     /**
@@ -1735,8 +1735,8 @@ export class MemoryRepository {
     // have no canonical identity.
     if (sbId) {
       query = query.eq('sb_id', sbId);
-    } else if (agentId) {
-      query = query.eq('agent_id', agentId);
+    } else if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
     }
 
     if (studioId !== undefined) {
@@ -1772,7 +1772,7 @@ export class MemoryRepository {
    */
   async getActiveSessionByThreadKey(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     threadKey: string,
     studioId?: string | null,
     contactId?: string,
@@ -1791,7 +1791,7 @@ export class MemoryRepository {
 
     // Prefer the canonical owner; the slug is the fallback for callers that
     // have no canonical identity.
-    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', agentId);
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
     if (studioId !== undefined) {
       if (studioId === null) {
@@ -1825,7 +1825,7 @@ export class MemoryRepository {
    * Used by bootstrap to return active sessions so the client can pick the right one.
    * Capped to avoid bloating bootstrap response with zombie sessions.
    */
-  async getActiveSessions(userId: string, agentId?: string, limit = 10): Promise<Session[]> {
+  async getActiveSessions(userId: string, sbSlug?: string, limit = 10): Promise<Session[]> {
     let query = this.supabase
       .from('sessions')
       .select('*')
@@ -1835,8 +1835,8 @@ export class MemoryRepository {
       .order('started_at', { ascending: false })
       .limit(limit);
 
-    if (agentId) {
-      query = query.eq('agent_id', agentId);
+    if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
     }
 
     const { data, error } = await query;
@@ -1857,7 +1857,7 @@ export class MemoryRepository {
     options: {
       limit?: number;
       offset?: number;
-      agentId?: string;
+      sbSlug?: string;
       studioId?: string;
       filterNullStudio?: boolean;
       backend?: string;
@@ -1870,8 +1870,8 @@ export class MemoryRepository {
       .eq('user_id', userId)
       .order('started_at', { ascending: false });
 
-    if (options.agentId) {
-      query = query.eq('agent_id', options.agentId);
+    if (options.sbSlug) {
+      query = query.eq('agent_id', options.sbSlug);
     }
 
     if (options.filterNullStudio) {
@@ -2223,7 +2223,7 @@ export class MemoryRepository {
       source: row.source,
       salience: row.salience,
       topics: row.topics,
-      agentId: row.agent_id || undefined,
+      sbSlug: row.agent_id || undefined,
       contactId: (row as MemoryRow).contact_id || undefined,
       embedding: parseEmbeddingValue(row.embedding),
       metadata: row.metadata,
@@ -2257,7 +2257,7 @@ export class MemoryRepository {
     return {
       id: row.id,
       userId: row.user_id,
-      agentId: row.agent_id || undefined,
+      sbSlug: row.agent_id || undefined,
       sbId: row.sb_id || undefined,
       contactId: row.contact_id || undefined,
       studioId,

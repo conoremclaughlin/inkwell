@@ -142,7 +142,7 @@ describe('Cross-agent session isolation', () => {
     const result = await handleUpdateSessionState(
       {
         userId: testUserId,
-        agentId: 'iso-test-caller',
+        sbSlug: 'iso-test-caller',
         context: 'caller updated context',
       },
       dataComposer
@@ -187,7 +187,7 @@ describe('Cross-agent session isolation', () => {
 
   it('get_session scopes to the named agent rather than the newest session', async () => {
     const result = await handleGetSession(
-      { userId: testUserId, agentId: 'iso-test-caller' },
+      { userId: testUserId, sbSlug: 'iso-test-caller' },
       dataComposer
     );
     const parsed = JSON.parse(result.content[0].text);
@@ -221,7 +221,7 @@ describe('Cross-agent session isolation', () => {
   it('compact_session scoped to an identity does not touch the peer session', async () => {
     const supabase = dataComposer.getClient();
     const result = await handleCompactSession(
-      { userId: testUserId, agentId: 'iso-test-caller' },
+      { userId: testUserId, sbSlug: 'iso-test-caller' },
       dataComposer
     );
 

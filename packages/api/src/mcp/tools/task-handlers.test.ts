@@ -40,7 +40,7 @@ vi.mock('../../services/user-resolver', async (importOriginal) => {
 
 // Mock enforce-identity
 vi.mock('../../auth/enforce-identity', () => ({
-  getEffectiveAgentId: vi.fn().mockReturnValue('wren'),
+  getEffectiveSlug: vi.fn().mockReturnValue('wren'),
 }));
 
 // Mock logger
@@ -57,7 +57,7 @@ vi.mock('../../utils/logger', () => ({
 vi.mock('../../utils/request-context', () => ({
   setSessionContext: vi.fn(),
   pinSessionAgent: vi.fn(),
-  getPinnedAgentId: vi.fn().mockReturnValue(null),
+  getPinnedSlug: vi.fn().mockReturnValue(null),
   getRequestContext: vi.fn().mockReturnValue(undefined),
 }));
 
@@ -999,7 +999,7 @@ describe('handleCompleteTask', () => {
       source: 'session',
       salience: 'high', // critical priority maps to 'high'
       topics: ['task:task-1', 'backend', 'api', 'project:proj-1'],
-      agentId: 'wren',
+      sbSlug: 'wren',
       metadata: { taskId: 'task-1', autoCreated: true },
     });
   });

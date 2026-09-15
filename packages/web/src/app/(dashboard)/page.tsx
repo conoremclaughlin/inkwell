@@ -31,7 +31,7 @@ interface AgentLatestSession {
 }
 
 interface AgentWithStudios {
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   backend: string | null;
@@ -206,7 +206,7 @@ export default function DashboardPage() {
         ) : (
           <div className="space-y-4">
             {agents.map((agent) => {
-              const gradient = getAgentGradient(agent.agentId);
+              const gradient = getAgentGradient(agent.sbSlug);
               const status = getAgentStatusBadge(
                 agent.latestSession?.lifecycle ?? null,
                 agent.latestSession?.currentPhase ?? null
@@ -214,7 +214,7 @@ export default function DashboardPage() {
               const backendLabel = formatBackend(agent.backend);
 
               return (
-                <Card key={agent.agentId} className="overflow-hidden">
+                <Card key={agent.sbSlug} className="overflow-hidden">
                   {/* Agent header */}
                   <div className="flex items-center gap-4 px-5 py-4 border-b bg-muted/40">
                     <div
@@ -228,7 +228,7 @@ export default function DashboardPage() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <h3 className="font-semibold text-foreground">{agent.agentName}</h3>
-                        <span className="text-xs text-muted-foreground/80">@{agent.agentId}</span>
+                        <span className="text-xs text-muted-foreground/80">@{agent.sbSlug}</span>
                         {status && (
                           <Badge className={clsx('text-[11px]', status.badgeClass)}>
                             {status.label}
@@ -253,7 +253,7 @@ export default function DashboardPage() {
                         </span>
                       )}
                       <Link
-                        href={`/routing/${agent.agentId}`}
+                        href={`/routing/${agent.sbSlug}`}
                         className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-muted-foreground bg-card border border-border rounded-md hover:bg-muted/50 hover:text-foreground transition-colors"
                       >
                         <Settings className="h-3 w-3" />

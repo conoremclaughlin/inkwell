@@ -293,7 +293,7 @@ describe('createLineReader', () => {
 describe('ClaudeRunner — resume does not re-inject context', () => {
   const ctx = {
     agent: {
-      agentId: 'wren',
+      sbSlug: 'wren',
       name: 'Wren',
       role: 'dev',
       soul: 'SOUL-BODY',
@@ -318,7 +318,7 @@ describe('ClaudeRunner — resume does not re-inject context', () => {
   const cfg = {
     workingDirectory: '/tmp',
     mcpConfigPath: '/tmp/.mcp.json',
-    agentId: 'wren',
+    sbSlug: 'wren',
   } as never;
 
   it('injects on a fresh turn', async () => {

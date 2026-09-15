@@ -75,7 +75,7 @@ describe.skipIf(!LIVE)('live: full InkRunner media chain', () => {
       'What is the dominant color of the attached image? Reply with a single lowercase word (the color name) and nothing else. Do not call send_response — just answer.',
       {
         config: {
-          agentId: 'wren',
+          sbSlug: 'wren',
           // Vitest runs from the repo root — ink chat expects a workspace-like cwd
           workingDirectory: process.cwd(),
           mcpConfigPath: join(process.cwd(), '.mcp.json'),

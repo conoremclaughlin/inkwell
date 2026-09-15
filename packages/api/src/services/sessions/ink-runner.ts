@@ -297,8 +297,8 @@ export class InkRunner implements IRunner {
       args.push('--require-bootstrap');
     }
 
-    if (config.agentId) {
-      args.push('--agent', config.agentId);
+    if (config.sbSlug) {
+      args.push('--agent', config.sbSlug);
     }
 
     args.push('--session-id', sessionId);
@@ -381,7 +381,7 @@ export class InkRunner implements IRunner {
       writeRuntimeSessionHint(
         config.workingDirectory,
         config.pcpSessionId,
-        config.agentId || 'unknown',
+        config.sbSlug || 'unknown',
         'ink',
         randomUUID(),
         config.studioId
@@ -405,14 +405,15 @@ export class InkRunner implements IRunner {
     const sessionEnv = buildSessionEnv({
       pcpSessionId: config.pcpSessionId,
       studioId: config.studioId,
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
     });
 
     const env: Record<string, string> = {
       ...process.env,
       ...sessionEnv,
       PATH: spawnPath,
-      AGENT_ID: config.agentId || '',
+      SB_SLUG: config.sbSlug || '',
+      AGENT_ID: config.sbSlug || '',
       // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
       NODE_ENV: 'production',
       // Server-minted access token so the ink CLI's PcpClient can call /mcp

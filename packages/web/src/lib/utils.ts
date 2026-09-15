@@ -7,7 +7,7 @@ export function cn(...inputs: ClassValue[]) {
 
 /**
  * Deterministic gradient color for SB avatars.
- * Always key on agentId (the stable handle) for consistency across pages.
+ * Always key on sbSlug (the stable handle) for consistency across pages.
  */
 const SB_GRADIENTS = [
   'from-rose-500 to-pink-600',
@@ -20,10 +20,10 @@ const SB_GRADIENTS = [
   'from-fuchsia-500 to-pink-600',
 ];
 
-export function getAgentGradient(agentId: string): string {
+export function getAgentGradient(sbSlug: string): string {
   let hash = 0;
-  for (let i = 0; i < agentId.length; i++) {
-    hash = agentId.charCodeAt(i) + ((hash << 5) - hash);
+  for (let i = 0; i < sbSlug.length; i++) {
+    hash = sbSlug.charCodeAt(i) + ((hash << 5) - hash);
   }
   return SB_GRADIENTS[Math.abs(hash) % SB_GRADIENTS.length];
 }

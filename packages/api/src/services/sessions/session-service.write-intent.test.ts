@@ -92,7 +92,7 @@ function serviceWith(threadRow: { data?: unknown; error?: { message: string } | 
 const SESSION: Session = {
   id: 'sess-1',
   userId: 'user-1',
-  agentId: 'wren',
+  sbSlug: 'wren',
   studioId: 'studio-1',
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 } as any;
@@ -109,7 +109,7 @@ async function runLease(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (service as any).withStudioLease(SESSION, ROUTING, {
     userId: 'user-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     threadKey: 'spec:some-design',
     writeIntent,
   });
@@ -221,7 +221,7 @@ describe('Phase 6b — occupancy gate is intent-aware (blocker 5)', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const decision = await (service as any).gateOccupancy('studio-1', 'route-pattern', {
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       threadKey: 'spec:some-design',
       writeIntent: 'presence',
     });

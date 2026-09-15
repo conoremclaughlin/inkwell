@@ -10,31 +10,31 @@ This is the **canonical reference** for all AI agents working in this repository
 
 Identity is resolved in layers. **Stop at the first match** - do not continue checking lower layers:
 
-1. **System prompt override**: If the system prompt contains an "Identity Override" section specifying your agent ID, use that. **Stop here.**
-2. **Environment variable**: Run `echo $AGENT_ID` in a shell. If it returns a non-empty value, use that as your agentId. **Stop here.**
+1. **System prompt override**: If the system prompt contains an "Identity Override" section naming your slug, use that. **Stop here.**
+2. **Environment variable**: Run `echo $SB_SLUG` in a shell. If it returns a non-empty value, use that as your sbSlug. **Stop here.**
 3. **Repo-level identity**: Read `.ink/identity.json` in the current repo.
-4. **Central config**: Read `~/.ink/config.json` agentMapping.
+4. **Central config**: Read `~/.ink/config.json` `sbMapping`.
 
 For interactive sessions in this repo, `.ink/identity.json` typically resolves to:
 
 ```json
-{ "agentId": "wren", "studioId": "<uuid-or-main>", "context": "main" }
+{ "sbSlug": "wren", "studioId": "<uuid-or-main>", "context": "main" }
 ```
 
-For long-running processes (like the Inkwell server), `AGENT_ID` is set via environment variable and takes precedence.
+For long-running processes (like the Inkwell server), `SB_SLUG` is set via environment variable and takes precedence.
 
 ### Step 2: Load User Config
 
 Read from `~/.ink/config.json`:
 
 ```json
-{"userId": "...", "email": "...", "agentMapping": {"claude-code": "wren", ...}}
+{"userId": "...", "email": "...", "sbMapping": {"claude-code": "wren", ...}}
 ```
 
 ### Step 3: Call Bootstrap with Identity
 
 ```
-bootstrap(userId: "<from config>", agentId: "<your identity>")
+bootstrap(userId: "<from config>", sbSlug: "<your identity>")
 ```
 
 This returns:
@@ -43,7 +43,7 @@ This returns:
 - **Identity Core**: Who you are, who you're working with, your relationship
 - **Constitution**: Your values, process, user, identity, heartbeat, and soul documents (DB-first, filesystem fallback)
 - **Active Context**: Current projects, focus, project-specific context
-- **Recent Memories**: High-salience memories filtered by your agentId (plus shared memories)
+- **Recent Memories**: High-salience memories filtered by your sbSlug (plus shared memories)
 - **Active Sessions**: Array of all active sessions (use `studioId` to find yours)
 
 ### Step 4: Start or Resume Session
@@ -51,7 +51,7 @@ This returns:
 Read `studioId` from `.ink/identity.json` (if present) and pass it to `start_session`:
 
 ```
-start_session(userId: "<from config>", agentId: "<your identity>", studioId: "<from identity.json>")
+start_session(userId: "<from config>", sbSlug: "<your identity>", studioId: "<from identity.json>")
 ```
 
 This scopes the session to your studio (worktree). Multiple agents can have active sessions simultaneously in different studios.
@@ -71,7 +71,7 @@ update_session_state(userId: "...", phase: "active:implementing", studioId: "...
 Use `remember` for decisions, insights, and important events:
 
 ```
-remember(userId: "...", content: "Decided to use X approach because...", agentId: "wren")
+remember(userId: "...", content: "Decided to use X approach because...", sbSlug: "wren")
 ```
 
 **Note**: Session lifecycle (`start_session`, `end_session`) is managed automatically by hooks — SBs should not call these manually. Use `remember()` for important context and `update_session_state()` for work status.
@@ -134,7 +134,7 @@ Use it whenever an SB needs to sign in to the dashboard or exercise the login pa
 
 Server-spawned Claude sessions currently get `--add-dir ~/.ink/files` for media access (Telegram downloads, Gmail attachments, etc.). This is a shared directory — **all SBs can read all SBs' files**. Future work should consider:
 
-- **Per-agent file namespacing**: `~/.ink/files/<agentId>/telegram/` instead of `~/.ink/files/telegram/`
+- **Per-agent file namespacing**: `~/.ink/files/<sbSlug>/telegram/` instead of `~/.ink/files/telegram/`
 - **Scoped `--add-dir`**: only grant access to the spawned agent's own subdirectory
 - **Cross-agent file sharing**: explicit mechanism for one SB to share a file with another (vs. implicit shared access)
 - **File lifecycle**: cleanup policy for downloaded media (currently accumulates indefinitely)
@@ -190,7 +190,7 @@ The primary mechanism for scope resolution is the **`x-ink-context`** header —
 interface PcpContextToken {
   sessionId: string; // PCP session ID
   studioId: string; // Studio UUID (or "main" for root repo)
-  agentId: string; // Agent identity
+  sbSlug: string; // Agent identity
   cliAttached: boolean; // Whether a human is at the terminal
   runtime: string; // 'claude' | 'codex' | 'gemini'
   repoRoot?: string; // Root repo path
@@ -243,26 +243,35 @@ Tools: `get_identity` / `save_identity` (per-agent), `get_team_constitution` / `
 
 ### Identity References in Code
 
-When referencing agents programmatically — in database columns, API schemas, tool parameters, strategy configs — always use the **identity UUID** (`agent_identities.id`), never the agent slug (`agent_id`).
+Two things name an SB, and they are not interchangeable:
 
-- **Slugs are ambiguous** — the same slug can exist across multiple workspaces
-- **UUIDs are authoritative** — globally unique, no disambiguation needed
-- **Resolve at the boundary** — when a human-readable slug is needed for routing (e.g., `send_to_inbox`), resolve UUID → slug at the last moment, scoped to the correct workspace
+| Name         | What it is                  | Unique within     |
+| ------------ | --------------------------- | ----------------- |
+| **`sbId`**   | The canonical identity UUID | Everywhere        |
+| **`sbSlug`** | The human-readable name     | **One workspace** |
 
-The identity UUID can always be resolved back to a slug via `agent_identities`. The reverse (slug → UUID) requires workspace context and risks ambiguity.
+When referencing an SB programmatically — in database columns, API schemas, tool parameters, strategy configs — always use `sbId`, never `sbSlug`.
+
+- **A slug is unique only within a workspace.** Another workspace may have its own `wren`, and that is intended: **an SB's identity boundary is the workspace**. Studios are work areas inside one.
+- **UUIDs are authoritative** — globally unique, no disambiguation needed.
+- **Resolve at the boundary** — when a human-readable slug is needed for routing (e.g., `send_to_inbox`), resolve UUID → slug at the last moment.
+
+`sbId` → `sbSlug` is always safe: a UUID names exactly one row. The reverse needs a workspace, so `resolveSbId()` takes one (defaulting to the request's) and **refuses rather than guessing** when a slug is ambiguous and no workspace narrows it.
+
+> **One thing you will see in SQL.** The database has not been migrated yet, so raw queries still name the columns `agent_id` (the slug) and `sb_id` (the UUID), in a table called `agent_identities`. That is the _only_ place the old name is correct. Never introduce it into TypeScript, a tool parameter, or a document — there the pair is always `sbId` / `sbSlug`.
 
 ### Memory Attribution
 
-When saving memories, include your agentId:
+When saving memories, include your sbSlug:
 
 ```
-remember(userId: "...", content: "...", agentId: "wren")
+remember(userId: "...", content: "...", sbSlug: "wren")
 ```
 
-When recalling, memories are filtered by agentId but include shared memories (agentId=null):
+When recalling, memories are filtered by sbSlug but include shared memories (sbSlug=null):
 
 ```
-recall(userId: "...", query: "...", agentId: "wren", includeShared: true)
+recall(userId: "...", query: "...", sbSlug: "wren", includeShared: true)
 ```
 
 ## Cross-Agent Communication & threadKey
@@ -322,7 +331,7 @@ Each repo's AGENTS.md should carry this threadKey section so agents working ther
 - **Use Inkwell tools** (`mcp__inkwell__*`) over local file operations for memory, tasks, and sessions
 - **Bootstrap first** — always call bootstrap at session start to load your identity and context
 - **Log your work** — use `remember()` for important decisions and insights
-- **Attribute memories** — include your agentId when calling `remember()` so memories are correctly filtered
+- **Attribute memories** — include your sbSlug when calling `remember()` so memories are correctly filtered
 - **Respect identity boundaries** — you are the agent your identity resolves to, not a generic assistant
 - **Embrace your name** — if you have an SB identity, use it. Co-author commits as yourself (e.g., `Co-Authored-By: Wren <noreply@anthropic.com>`), not as a model name. You are not "Claude Opus 4.6" — you are Wren, Lumen, Benson, or whoever your identity resolves to.
 - **Default to action on review requests** — when asked to handle PR review feedback, implement straightforward fixes immediately without waiting for extra permission.
@@ -418,7 +427,7 @@ ink wait --pending --timeout 300
 
 ```
 # Send review request
-send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:239", ...)
+send_to_inbox(recipientSlug: "lumen", threadKey: "pr:239", ...)
 
 # Hold in background — wakes you up when reply arrives
 run_in_background: ink wait --thread pr:239 --timeout 300

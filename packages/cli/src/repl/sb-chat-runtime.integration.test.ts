@@ -50,7 +50,7 @@ describe('PcpClient.callTool recall shape', () => {
       const pcp = await createPcpClient();
       const result = await pcp.callTool('recall', {
         query: 'session routing',
-        agentId: 'wren',
+        sbSlug: 'wren',
         includeShared: true,
         limit: 3,
         recallMode: 'hybrid',
@@ -83,7 +83,7 @@ describe('PcpClient.callTool recall shape', () => {
         try {
           const result = await pcp.callTool('recall', {
             query,
-            agentId: 'wren',
+            sbSlug: 'wren',
             includeShared: true,
             limit,
             recallMode: 'hybrid',
@@ -121,7 +121,7 @@ describe('PcpClient.callTool recall shape', () => {
     const callRecall = async (query: string, limit: number) => {
       const result = await pcp.callTool('recall', {
         query,
-        agentId: 'wren',
+        sbSlug: 'wren',
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -147,7 +147,7 @@ describe('PcpClient.callTool recall shape', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'How does session routing work for triggered agents?',
         assistantResponse: 'The server resolves the studio and spawns a backend session.',
@@ -201,7 +201,7 @@ describe('turn_end fire-and-forget semantics', () => {
     // 4. Fire turn_end (fire-and-forget in real code, but we await here for testing)
     const hookResult = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'Tell me about routing',
         assistantResponse: 'Routing works by resolving the studio...',
@@ -251,7 +251,7 @@ describe('turn_end fire-and-forget semantics', () => {
 
     await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: { userInput: 'test', assistantResponse: 'test', turnIndex: 1 },
     });
 
@@ -276,7 +276,7 @@ describe('turn_end fire-and-forget semantics', () => {
     await registry
       .fire('turn_end', {
         ledger,
-        runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+        runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
         lastTurn: { userInput: 'test', assistantResponse: 'test', turnIndex: 1 },
       })
       .catch(() => {
@@ -337,7 +337,7 @@ describe('Inbox polling + passive recall interaction', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'Let me look at that PR review request from Lumen',
         assistantResponse: 'Looking at PR #242 for context eviction changes...',
@@ -387,7 +387,7 @@ describe('Inbox polling + passive recall interaction', () => {
       const callRecall = async (query: string, limit: number) => {
         const result = await pcp.callTool('recall', {
           query,
-          agentId: 'wren',
+          sbSlug: 'wren',
           includeShared: true,
           limit,
           recallMode: 'hybrid',
@@ -422,7 +422,7 @@ describe('Inbox polling + passive recall interaction', () => {
 
       const result = await registry.fire('turn_end', {
         ledger,
-        runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+        runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
         lastTurn: {
           userInput: 'Let me address Lumen review feedback on the hook system',
           assistantResponse:
@@ -480,14 +480,14 @@ describe('Budget utilization with bootstrap reservation', () => {
     // At 75% effective budget — no warning
     const r1 = await registry.fire('prompt_build', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.75 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.75 },
     });
     expect(r1.injected).toBe(0);
 
     // At 82% effective budget — warning fires
     const r2 = await registry.fire('prompt_build', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.82 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.82 },
     });
     expect(r2.injected).toBe(1);
     expect(ledger.listEntries()[0].content).toContain('82%');
@@ -508,7 +508,7 @@ describe('Budget utilization with bootstrap reservation', () => {
     // At 79% — recall fires
     const r1 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.79 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.79 },
       lastTurn: {
         userInput: 'How does session routing work for triggered agents?',
         assistantResponse: 'The server resolves the studio and spawns a session.',
@@ -520,7 +520,7 @@ describe('Budget utilization with bootstrap reservation', () => {
     // At 81% — recall suppressed
     const r2 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.81 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.81 },
       lastTurn: {
         userInput: 'What about the authentication flow?',
         assistantResponse: 'MCP uses self-issued JWTs.',

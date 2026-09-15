@@ -19,8 +19,8 @@ export type WorkType = 'feature' | 'bugfix' | 'refactor' | 'chore' | 'experiment
 export interface Studio {
   id: string;
   userId: string;
-  agentId: string | null;
-  /** Canonical identity UUID — authoritative; agentId is a display slug. */
+  sbSlug: string | null;
+  /** Canonical identity UUID — authoritative; sbSlug is a display slug. */
   sbId: string | null;
   sessionId: string | null;
   repoRoot: string;
@@ -49,7 +49,7 @@ export interface Studio {
 
 export interface CreateStudioInput {
   userId: string;
-  agentId?: string;
+  sbSlug?: string;
   sbId?: string;
   sessionId?: string;
   repoRoot: string;
@@ -114,7 +114,7 @@ export class StudiosRepository {
     return {
       id: row.id as string,
       userId: row.user_id as string,
-      agentId: (row.agent_id as string) || null,
+      sbSlug: (row.agent_id as string) || null,
       sbId: (row.sb_id as string) || null,
       sessionId: (row.session_id as string) || null,
       repoRoot: row.repo_root as string,
@@ -141,11 +141,11 @@ export class StudiosRepository {
   }
 
   async create(input: CreateStudioInput): Promise<Studio> {
-    const sbId = await resolveOwnerSbId(this.client, input.userId, input.agentId, input.sbId);
+    const sbId = await resolveOwnerSbId(this.client, input.userId, input.sbSlug, input.sbId);
 
     const insertData: StudiosTable['Insert'] = {
       user_id: input.userId,
-      agent_id: input.agentId,
+      agent_id: input.sbSlug,
       sb_id: sbId,
       session_id: input.sessionId,
       repo_root: input.repoRoot,
@@ -190,11 +190,11 @@ export class StudiosRepository {
 
   async findByBranch(
     branch: string,
-    scope?: { userId?: string; agentId?: string }
+    scope?: { userId?: string; sbSlug?: string }
   ): Promise<Studio | null> {
     let q = this.client.from('studios').select('*').eq('branch', branch);
     if (scope?.userId) q = q.eq('user_id', scope.userId);
-    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    if (scope?.sbSlug) q = q.eq('agent_id', scope.sbSlug);
     q = q.order('updated_at', { ascending: false }).limit(1);
 
     const { data, error } = await q.maybeSingle();
@@ -208,11 +208,11 @@ export class StudiosRepository {
 
   async findByPath(
     worktreePath: string,
-    scope?: { userId?: string; agentId?: string }
+    scope?: { userId?: string; sbSlug?: string }
   ): Promise<Studio | null> {
     let q = this.client.from('studios').select('*').eq('worktree_path', worktreePath);
     if (scope?.userId) q = q.eq('user_id', scope.userId);
-    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    if (scope?.sbSlug) q = q.eq('agent_id', scope.sbSlug);
     q = q.order('updated_at', { ascending: false }).limit(1);
 
     const { data, error } = await q.maybeSingle();
@@ -269,7 +269,7 @@ export class StudiosRepository {
 
   async listByUser(
     userId: string,
-    opts?: { status?: StudioStatus; agentId?: string }
+    opts?: { status?: StudioStatus; sbSlug?: string }
   ): Promise<Studio[]> {
     let query = this.client
       .from('studios')
@@ -281,8 +281,8 @@ export class StudiosRepository {
       query = query.eq('status', opts.status);
     }
 
-    if (opts?.agentId) {
-      query = query.eq('agent_id', opts.agentId);
+    if (opts?.sbSlug) {
+      query = query.eq('agent_id', opts.sbSlug);
     }
 
     const { data, error } = await query;

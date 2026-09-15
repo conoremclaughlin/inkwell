@@ -40,13 +40,13 @@ vi.mock('./studio-settings', () => ({
 }));
 
 vi.mock('../auth/resolve-identity', () => ({
-  resolveAgentSlug: vi.fn().mockImplementation((_client: unknown, sbId: string) => {
+  resolveSbSlug: vi.fn().mockImplementation((_client: unknown, sbId: string) => {
     if (sbId === 'sb-wren-uuid') return Promise.resolve('wren');
     if (sbId === 'supervisor-uuid-123' || sbId === 'supervisor-uuid-456')
       return Promise.resolve('lumen');
     return Promise.resolve(null);
   }),
-  resolveIdentityId: vi.fn().mockResolvedValue('sb-wren-uuid'),
+  resolveSbId: vi.fn().mockResolvedValue('sb-wren-uuid'),
 }));
 
 // ============================================================================
@@ -160,7 +160,7 @@ function createMockDataComposer() {
         create: vi.fn().mockResolvedValue({
           id: 'studio-ephemeral-1',
           userId: 'user-123',
-          agentId: 'wren',
+          sbSlug: 'wren',
           repoRoot: '/repo',
           worktreePath: '/repo--ephemeral-test',
           branch: 'wren/sandbox/ephemeral-test',
@@ -928,7 +928,7 @@ describe('StrategyService', () => {
       };
     }
 
-    // Helper: mock from() chain for resolveAgentSlug
+    // Helper: mock from() chain for resolveSbSlug
     function chainResolveSlug(slug: string | null) {
       return {
         select: vi.fn().mockReturnValue({
@@ -1092,11 +1092,11 @@ describe('StrategyService', () => {
       // handleSendToInbox called twice: once for checkInNotify, once for supervisor
       expect(sendMock).toHaveBeenCalledTimes(2);
       expect(sendMock).toHaveBeenCalledWith(
-        expect.objectContaining({ recipientAgentId: 'myra' }),
+        expect.objectContaining({ recipientSlug: 'myra' }),
         expect.anything()
       );
       expect(sendMock).toHaveBeenCalledWith(
-        expect.objectContaining({ recipientAgentId: 'lumen' }),
+        expect.objectContaining({ recipientSlug: 'lumen' }),
         expect.anything()
       );
     });
@@ -1131,8 +1131,8 @@ describe('StrategyService', () => {
       // as sender — never 'system'.
       expect(sendMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          recipientAgentId: 'myra',
-          senderAgentId: 'wren',
+          recipientSlug: 'myra',
+          senderSlug: 'wren',
           recipientStudioSlug: 'main',
         }),
         expect.anything()
@@ -1322,12 +1322,12 @@ describe('StrategyService', () => {
 
       // Should notify both dispatcher (myra) and supervisor (lumen)
       expect(sendMock).toHaveBeenCalledWith(
-        expect.objectContaining({ recipientAgentId: 'myra' }),
+        expect.objectContaining({ recipientSlug: 'myra' }),
         expect.anything()
       );
       expect(sendMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          recipientAgentId: 'lumen',
+          recipientSlug: 'lumen',
           content: expect.stringContaining('Supervisor audit'),
         }),
         expect.anything()
@@ -1634,7 +1634,7 @@ describe('StrategyService', () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
       expect(sendMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          recipientAgentId: 'wren',
+          recipientSlug: 'wren',
           trigger: true,
           metadata: expect.objectContaining({
             reason: 'manual_resume',
@@ -2052,8 +2052,8 @@ describe('StrategyService', () => {
       expect(sendMock).toHaveBeenCalledTimes(1);
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
-      expect(payload.recipientAgentId).toBe('wren');
-      expect(payload.senderAgentId).toBe('wren');
+      expect(payload.recipientSlug).toBe('wren');
+      expect(payload.senderSlug).toBe('wren');
       expect(payload.messageType).toBe('session_resume');
       expect(payload.trigger).toBe(true);
       expect(payload.recipientStudioId).toBe('studio-uuid-omega');
@@ -2217,7 +2217,7 @@ describe('StrategyService', () => {
       expect(sendMock).toHaveBeenCalledTimes(1);
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
-      expect(payload.recipientAgentId).toBe('wren');
+      expect(payload.recipientSlug).toBe('wren');
       expect(payload.messageType).toBe('session_resume');
       expect(payload.content).toContain('Current work');
       expect((payload.metadata as Record<string, unknown>).reason).toBe('watchdog');
@@ -2390,7 +2390,7 @@ describe('StrategyService', () => {
       dc.repositories.studios.findById.mockResolvedValue({
         id: 'studio-abc',
         userId: 'user-123',
-        agentId: 'wren',
+        sbSlug: 'wren',
         worktreePath: '/tmp/test-studio',
         repoRoot: '/tmp/test-repo',
         branch: 'wren/feat/test',
@@ -2426,7 +2426,7 @@ describe('StrategyService', () => {
 
       expect(mockOrchestrator.spinUp).toHaveBeenCalledWith(
         expect.objectContaining({
-          agentId: 'wren',
+          sbSlug: 'wren',
           studioId: 'studio-abc',
           worktreePath: '/tmp/test-studio',
           taskGroupId: 'group-1',
@@ -2463,7 +2463,7 @@ describe('StrategyService', () => {
       dc.repositories.studios.findById.mockResolvedValue({
         id: 'studio-abc',
         userId: 'user-123',
-        agentId: 'wren',
+        sbSlug: 'wren',
         worktreePath: '/tmp/test-studio',
         repoRoot: '/tmp/test-repo',
         branch: 'wren/feat/test',
@@ -2530,7 +2530,7 @@ describe('StrategyService', () => {
       dc.repositories.studios.findById.mockResolvedValue({
         id: 'studio-abc',
         userId: 'user-123',
-        agentId: 'wren',
+        sbSlug: 'wren',
         worktreePath: '/tmp/test-studio',
         repoRoot: '/tmp/test-repo',
         branch: 'wren/feat/test',
@@ -2685,7 +2685,7 @@ describe('StrategyService', () => {
       dc.repositories.studios.findById.mockResolvedValue({
         id: 'studio-ephemeral-1',
         userId: 'user-123',
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot: '/repo',
         worktreePath: '/repo--ephemeral-test-strategy-group',
         branch: 'wren/sandbox/ephemeral-test-strategy-group',
@@ -2707,7 +2707,7 @@ describe('StrategyService', () => {
       expect(dc.repositories.studios.create).toHaveBeenCalled();
       const createCall = dc.repositories.studios.create.mock.calls[0][0];
       expect(createCall.userId).toBe('user-123');
-      expect(createCall.agentId).toBe('wren');
+      expect(createCall.sbSlug).toBe('wren');
       expect(createCall.metadata).toEqual(
         expect.objectContaining({ ephemeral: true, taskGroupId: 'group-1' })
       );
@@ -3096,7 +3096,7 @@ describe('StrategyService', () => {
       });
 
       const createCall = dc.repositories.studios.create.mock.calls[0][0];
-      expect(createCall.agentId).toBe('wren');
+      expect(createCall.sbSlug).toBe('wren');
       expect(createCall.branch).toBe('wren/auth-refactor');
     });
 

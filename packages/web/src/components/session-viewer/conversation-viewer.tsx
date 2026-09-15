@@ -17,7 +17,7 @@ interface TranscriptPayload {
 interface ConversationResponse {
   session: {
     id: string;
-    agentId: string;
+    sbSlug: string;
     agentName: string;
     backend: string | null;
     backendSessionId: string | null;
@@ -37,7 +37,7 @@ interface ConversationResponse {
 interface SessionLogsResponse {
   session: {
     id: string;
-    agentId: string;
+    sbSlug: string;
     status: string;
     currentPhase: string | null;
     backend: string | null;
@@ -153,7 +153,7 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
         totalEvents: logsData.pagination.total,
         session: {
           ...logsData.session,
-          agentName: logsData.session.agentId,
+          agentName: logsData.session.sbSlug,
           lifecycle: logsData.session.status,
           activeThreadKey: null,
         },
@@ -240,7 +240,7 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
 
   if (!session) return null;
 
-  const agentName = session.agentName || session.agentId;
+  const agentName = session.agentName || session.sbSlug;
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden">
@@ -250,7 +250,7 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="font-semibold text-gray-900">{agentName}</h2>
             <Badge variant="outline" className="text-xs font-mono">
-              {session.agentId}
+              {session.sbSlug}
             </Badge>
             <Badge className={`text-xs ${phaseColor(session.currentPhase, session.lifecycle)}`}>
               {phaseLabel(session.currentPhase, session.lifecycle)}

@@ -113,7 +113,7 @@ const DEFAULT_CONFIG: SessionServiceConfig = {
 export interface IActivityStream {
   logMessage(params: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     direction: 'in' | 'out';
     content: string;
     platform?: string;
@@ -125,7 +125,7 @@ export interface IActivityStream {
 
   logActivity(params: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     type: string;
     subtype?: string;
     content: string;
@@ -376,10 +376,10 @@ export class UnresolvedStudioError extends Error {
 
   constructor(
     readonly studioHint: string,
-    readonly agentId: string
+    readonly sbSlug: string
   ) {
     super(
-      `Studio "${studioHint}" does not exist for agent "${agentId}". ` +
+      `Studio "${studioHint}" does not exist for agent "${sbSlug}". ` +
         `Refusing to route elsewhere — check the slug, or omit it to let routing choose.`
     );
     this.name = 'UnresolvedStudioError';
@@ -401,7 +401,7 @@ export class RoutingRefusedError extends Error {
 
   constructor(
     readonly threadKey: string,
-    readonly agentId: string,
+    readonly sbSlug: string,
     readonly detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
@@ -417,13 +417,13 @@ export class RoutingRefusedError extends Error {
       policy?: 'reuse-only';
     }
   ) {
-    super(RoutingRefusedError.describe(threadKey, agentId, detail));
+    super(RoutingRefusedError.describe(threadKey, sbSlug, detail));
     this.name = 'RoutingRefusedError';
   }
 
   private static describe(
     threadKey: string,
-    agentId: string,
+    sbSlug: string,
     detail: RoutingRefusedError['detail']
   ): string {
     // Ambiguity refuses BEFORE any tier runs, so the generic message below —
@@ -443,17 +443,17 @@ export class RoutingRefusedError extends Error {
         : `several identity rows share this agent slug, so every studio lookup ` +
           `below would be scoped by an ambiguous identity`;
       return (
-        `Refusing to route "${threadKey}" for agent "${agentId}": ${anchorClause}. ` +
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": ${anchorClause}. ` +
         `Route patterns were NOT consulted — this is not a routing-configuration ` +
         `problem. Message held. De-duplicate the agent's rows in agent_identities; ` +
         `nothing the sender can pass works around it — naming a studio or session ` +
-        `hits this same check, and recipientAgentId resolves slugs only, so a ` +
+        `hits this same check, and recipientSlug resolves slugs only, so a ` +
         `recipient's identity UUID resolves to no agent at all.`
       );
     }
     if (detail.reason === 'occupied' && detail.policy === 'reuse-only') {
       return (
-        `Refusing to route "${threadKey}" for agent "${agentId}": studio ` +
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": studio ` +
         `${detail.occupied?.studioId ?? 'unknown'} is leased by ` +
         `"${detail.occupied?.holderThreadKey ?? 'another thread'}" and this thread ` +
         `type's policy is reuse-only, so no worktree is provisioned for it. ` +
@@ -463,7 +463,7 @@ export class RoutingRefusedError extends Error {
     }
     if (detail.reason === 'occupied') {
       return (
-        `Refusing to route "${threadKey}" for agent "${agentId}": studio ` +
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": studio ` +
         `${detail.occupied?.studioId ?? 'unknown'} is leased by ` +
         `"${detail.occupied?.holderThreadKey ?? 'another thread'}" and an overflow ` +
         `studio could not be provisioned. Message held. Retry once the holder ` +
@@ -472,7 +472,7 @@ export class RoutingRefusedError extends Error {
     }
     if (detail.policy === 'reuse-only' && detail.callerRepoRoot) {
       return (
-        `Refusing to route "${threadKey}" for agent "${agentId}": the caller repo ` +
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": the caller repo ` +
         `${detail.callerRepoRoot} has no studio for this agent, and this thread ` +
         `type's policy is reuse-only, so routing will not create one automatically. ` +
         `Message held. Create a studio for the repo explicitly, or register the ` +
@@ -480,7 +480,7 @@ export class RoutingRefusedError extends Error {
       );
     }
     return (
-      `Refusing to route "${threadKey}" for agent "${agentId}": no route pattern, ` +
+      `Refusing to route "${threadKey}" for agent "${sbSlug}": no route pattern, ` +
       `no project affinity, and no usable caller repo. Message held. ` +
       `Add a route pattern to a studio, pass a studioHint, or send from a ` +
       `session bound to the target repo.`
@@ -505,7 +505,7 @@ export class SessionService implements ISessionService {
 
   /**
    * Processing lock per agent session.
-   * Key: `${agentId}:${sessionId}` - prevents concurrent Claude Code processes on the same session.
+   * Key: `${sbSlug}:${sessionId}` - prevents concurrent Claude Code processes on the same session.
    * This is critical because multiple channels (telegram, heartbeat, agent triggers) can
    * target the same Claude session, and concurrent `--resume` calls cause race conditions.
    */
@@ -513,7 +513,7 @@ export class SessionService implements ISessionService {
 
   /**
    * Queue for messages that arrive while a session is being processed.
-   * Key: `${agentId}:${sessionId}` - matches processing lock key.
+   * Key: `${sbSlug}:${sessionId}` - matches processing lock key.
    */
   private pendingQueues: Map<string, PendingMessage[]> = new Map();
 
@@ -585,7 +585,7 @@ export class SessionService implements ISessionService {
     tier: StudioRoutingDecision['tier'],
     ctx: {
       userId: string;
-      agentId: string;
+      sbSlug: string;
       threadKey?: string;
       writeIntent?: WriteIntent;
       studioPolicy?: StudioPolicy;
@@ -658,7 +658,7 @@ export class SessionService implements ISessionService {
       });
       await leases.logEvent(ctx.userId, candidateStudioId, 'conflict', {
         threadKey: ctx.threadKey,
-        agentId: ctx.agentId,
+        sbSlug: ctx.sbSlug,
         reason: `occupied by ${holder.threadKey}; type policy is reuse-only, holding instead of provisioning`,
       });
       return {
@@ -752,7 +752,7 @@ export class SessionService implements ISessionService {
     });
     await leases.logEvent(ctx.userId, candidateStudioId, 'conflict', {
       threadKey: ctx.threadKey,
-      agentId: ctx.agentId,
+      sbSlug: ctx.sbSlug,
       reason: `occupied by ${holder.threadKey} and overflow creation failed; holding the message`,
     });
     return {
@@ -792,10 +792,10 @@ export class SessionService implements ISessionService {
    *    session's leftover lease must divert, not absorb new threads.
    */
   private async holderIsThreadHome(
-    holder: { sessionId: string; sbId?: string | null; agentId: string },
+    holder: { sessionId: string; sbId?: string | null; sbSlug: string },
     ctx: {
       userId: string;
-      agentId: string;
+      sbSlug: string;
       threadKey?: string;
       sbId?: string | null;
       identityAbsent?: boolean;
@@ -806,7 +806,7 @@ export class SessionService implements ISessionService {
     if (ctx.sbId) {
       if (holder.sbId !== ctx.sbId) return false;
     } else if (ctx.identityAbsent === true) {
-      if (holder.agentId !== ctx.agentId) return false;
+      if (holder.sbSlug !== ctx.sbSlug) return false;
     } else {
       // Identity neither resolved nor positively absent (ambiguous or
       // unresolved) — nothing to match on. Fail closed.
@@ -826,7 +826,7 @@ export class SessionService implements ISessionService {
         .from('inbox_thread_participants')
         .select('session_id')
         .eq('thread_id', thread.id)
-        .eq('agent_id', ctx.agentId)
+        .eq('agent_id', ctx.sbSlug)
         .maybeSingle();
       if (partErr || participant?.session_id !== holder.sessionId) return false;
 
@@ -880,7 +880,7 @@ export class SessionService implements ISessionService {
    */
   private async findExistingOverflow(
     parentStudioId: string,
-    ctx: { userId: string; agentId: string; threadKey?: string }
+    ctx: { userId: string; sbSlug: string; threadKey?: string }
   ): Promise<Studio | null> {
     const overflowService = this.getOverflowService();
     const studios = this.getStudiosRepo();
@@ -896,7 +896,7 @@ export class SessionService implements ISessionService {
 
   private async divertToOverflow(
     parentStudioId: string,
-    ctx: { userId: string; agentId: string; threadKey?: string }
+    ctx: { userId: string; sbSlug: string; threadKey?: string }
   ): Promise<Studio | null> {
     const overflowService = this.getOverflowService();
     const studios = this.getStudiosRepo();
@@ -916,7 +916,7 @@ export class SessionService implements ISessionService {
     }
     return overflowService.ensureOverflowStudio({
       userId: ctx.userId,
-      agentId: ctx.agentId,
+      sbSlug: ctx.sbSlug,
       parentStudio: parent,
       threadKey: ctx.threadKey,
     });
@@ -939,7 +939,7 @@ export class SessionService implements ISessionService {
     routing: StudioRoutingDecision,
     ctx: {
       userId: string;
-      agentId: string;
+      sbSlug: string;
       threadKey?: string;
       writeIntent?: WriteIntent;
       studioPolicy?: StudioPolicy;
@@ -994,7 +994,7 @@ export class SessionService implements ISessionService {
         studioId: boundStudioId,
         sessionId: session.id,
         threadKey: ctx.threadKey,
-        agentId: ctx.agentId,
+        sbSlug: ctx.sbSlug,
         userId: ctx.userId,
         reason: routing.tier,
         turnEpoch: ctx.turnEpochCandidate,
@@ -1017,7 +1017,7 @@ export class SessionService implements ISessionService {
         await leases.logEvent(ctx.userId, boundStudioId, 'conflict', {
           sessionId: session.id,
           threadKey: ctx.threadKey,
-          agentId: ctx.agentId,
+          sbSlug: ctx.sbSlug,
           reason: policyHold
             ? `tier ${routing.tier} resolved a studio held by ${result.holder.threadKey}; type policy is reuse-only, holding instead of provisioning`
             : `tier ${routing.tier} resolved a studio held by ${result.holder.threadKey}; diverting`,
@@ -1045,7 +1045,7 @@ export class SessionService implements ISessionService {
           studioId: overflow.id,
           sessionId: session.id,
           threadKey: ctx.threadKey,
-          agentId: ctx.agentId,
+          sbSlug: ctx.sbSlug,
           userId: ctx.userId,
           reason: `overflow:${routing.tier}`,
           turnEpoch: ctx.turnEpochCandidate,
@@ -1088,7 +1088,7 @@ export class SessionService implements ISessionService {
             holderThreadKey: result.holder.threadKey,
           }
         );
-        throw new RoutingRefusedError(ctx.threadKey, ctx.agentId, {
+        throw new RoutingRefusedError(ctx.threadKey, ctx.sbSlug, {
           triedCallerRepo: false,
           reason: 'occupied',
           occupied: {
@@ -1161,11 +1161,11 @@ export class SessionService implements ISessionService {
   }
 
   async handleMessage(request: SessionRequest): Promise<SessionResult> {
-    const { userId, agentId, content, metadata } = request;
+    const { userId, sbSlug, content, metadata } = request;
 
     logger.info('Handling message', {
       userId,
-      agentId,
+      sbSlug,
       channel: request.channel,
       conversationId: request.conversationId,
       contentLength: content.length,
@@ -1183,7 +1183,7 @@ export class SessionService implements ISessionService {
     try {
       const logged = await this.activityStream.logMessage({
         userId,
-        agentId,
+        sbSlug,
         direction: 'in',
         content,
         platform: request.channel,
@@ -1231,7 +1231,7 @@ export class SessionService implements ISessionService {
 
     try {
       // 1. Get or create session (needed to determine lock key)
-      const session = await this.getOrCreateSession(userId, agentId, {
+      const session = await this.getOrCreateSession(userId, sbSlug, {
         type: metadata?.sessionType || 'primary',
         taskDescription: metadata?.taskDescription,
         parentSessionId: metadata?.parentSessionId,
@@ -1276,7 +1276,7 @@ export class SessionService implements ISessionService {
           pcpSessionId: session.id,
           backendSessionId: session.backendSessionId || null,
           studioId: session.studioId || null,
-          agentId,
+          sbSlug,
           threadKey: session.threadKey || null,
           lifecycle: session.lifecycle,
           messageCount: session.messageCount,
@@ -1284,7 +1284,7 @@ export class SessionService implements ISessionService {
       }
 
       // 3. Build lock key - must be per agent + session to support sub-agents
-      const lockKey = `${agentId}:${session.id}`;
+      const lockKey = `${sbSlug}:${session.id}`;
 
       // 4. Check if session is already being processed
       if (this.processingLocks.has(lockKey)) {
@@ -1337,7 +1337,7 @@ export class SessionService implements ISessionService {
 
       logger.error('Error handling message', {
         userId,
-        agentId,
+        sbSlug,
         error: errorText,
       });
 
@@ -1452,7 +1452,7 @@ export class SessionService implements ISessionService {
         // Get session again (may have changed)
         const session = await this.getOrCreateSession(
           pending.request.userId,
-          pending.request.agentId,
+          pending.request.sbSlug,
           {
             type: pending.request.metadata?.sessionType || 'primary',
             taskDescription: pending.request.metadata?.taskDescription,
@@ -1517,7 +1517,7 @@ export class SessionService implements ISessionService {
         this.activityStream
           .logActivity({
             userId: firstQueued.request.userId,
-            agentId: firstQueued.request.agentId,
+            sbSlug: firstQueued.request.sbSlug,
             type: 'error',
             subtype: 'queue_flush',
             content: `Flushed ${flushedCount} queued message${flushedCount === 1 ? '' : 's'}: ${errorClass.category} — ${errorClass.summary}`,
@@ -1550,10 +1550,10 @@ export class SessionService implements ISessionService {
     session: Session,
     turnEpochCandidate?: string
   ): Promise<SessionResult> {
-    const { userId, agentId, metadata } = request;
+    const { userId, sbSlug, metadata } = request;
 
     // 1. Build context for the agent
-    const injectedContext = await this.contextBuilder.buildContext(userId, agentId, session);
+    const injectedContext = await this.contextBuilder.buildContext(userId, sbSlug, session);
 
     // 2. Format the incoming message with sender info + current timestamp
     const formattedMessage = this.formatMessage(request, injectedContext.user.timezone);
@@ -1561,14 +1561,14 @@ export class SessionService implements ISessionService {
     // Resolve working directory from studio when available.
     const resolvedWorkingDirectory = await this.resolveWorkingDirectory(
       userId,
-      agentId,
+      sbSlug,
       session.studioId
     );
 
     // 3. Build runner config
     const pcpAccessToken = this.createRunnerAccessToken(
       userId,
-      agentId,
+      sbSlug,
       injectedContext.user.email,
       session
     );
@@ -1614,7 +1614,7 @@ export class SessionService implements ISessionService {
       runtimeEffort = parsed.effort;
       if (parsed.effortRejected !== undefined) {
         logger.warn('[RuntimeConfig] Ignoring invalid effort — the provider default applies', {
-          agentId: session.agentId,
+          sbSlug: session.sbSlug,
           sbId: session.sbId,
           effort: parsed.effortRejected,
           accepted: RUNTIME_EFFORT_LEVELS,
@@ -1661,7 +1661,7 @@ export class SessionService implements ISessionService {
       mcpConfigPath: this.config.mcpConfigPath,
       ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(
-        agentId,
+        sbSlug,
         injectedContext.agent.name,
         injectedContext.agent.soul,
         injectedContext.user.timezone,
@@ -1676,7 +1676,7 @@ export class SessionService implements ISessionService {
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
       ...(pcpAccessToken ? { pcpAccessToken } : {}),
       pcpSessionId: session.id,
-      agentId,
+      sbSlug,
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
@@ -1743,7 +1743,7 @@ export class SessionService implements ISessionService {
     this.activityStream
       .logActivity({
         userId,
-        agentId,
+        sbSlug,
         type: 'agent_spawn',
         subtype: `backend_cli:${resolvedBackend}`,
         content: `Backend turn started (${resolvedBackend})`,
@@ -1789,10 +1789,10 @@ export class SessionService implements ISessionService {
     const admitted = registerActiveRun({
       sessionId: session.id,
       userId,
-      agentId,
+      sbSlug,
       backend: resolvedBackend,
       threadKey: metadata?.threadKey as string | undefined,
-      senderAgentId: request.sender?.id,
+      senderSlug: request.sender?.id,
       startedAt: turnRegisteredAt,
       turnEpoch,
     });
@@ -2010,7 +2010,7 @@ export class SessionService implements ISessionService {
       this.activityStream
         .logActivity({
           userId,
-          agentId,
+          sbSlug,
           type: 'error',
           subtype: `backend_crash:${resolvedBackend}`,
           content:
@@ -2050,7 +2050,7 @@ export class SessionService implements ISessionService {
     this.activityStream
       .logActivity({
         userId,
-        agentId,
+        sbSlug,
         type: result.success ? 'agent_complete' : 'error',
         subtype: `backend_cli:${resolvedBackend}`,
         content: result.success
@@ -2084,7 +2084,7 @@ export class SessionService implements ISessionService {
 
     // 6. Log tool calls to activity stream (fire-and-forget, don't block response)
     if (result.toolCalls && result.toolCalls.length > 0) {
-      this.logToolCalls(userId, agentId, session.id, result.toolCalls, request).catch((err) => {
+      this.logToolCalls(userId, sbSlug, session.id, result.toolCalls, request).catch((err) => {
         logger.warn('Failed to log tool calls to activity stream', { error: err });
       });
     }
@@ -2128,7 +2128,7 @@ export class SessionService implements ISessionService {
     // Run-boundary steps. Invoked ONLY after the terminal write durably
     // persisted — inline on the fast path (invokedInline=true, while this
     // turn still holds the processing lock), from the retry loop otherwise.
-    const boundaryLockKey = `${agentId}:${session.id}`;
+    const boundaryLockKey = `${sbSlug}:${session.id}`;
     const onTurnFinalized = (invokedInline: boolean) => {
       // Cleared ONLY once a terminal state actually persisted. Clearing after
       // a refused or failed write would delete this run from the registry
@@ -2220,7 +2220,7 @@ export class SessionService implements ISessionService {
           backendSessionId: result.backendSessionId,
           previousBackendSessionId: session.backendSessionId || null,
           backend: resolvedBackend,
-          agentId: session.agentId,
+          sbSlug: session.sbSlug,
         });
       }
       try {
@@ -2389,14 +2389,14 @@ export class SessionService implements ISessionService {
    */
   private createRunnerAccessToken(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     email: string | undefined,
     session: { id: string; sbId?: string; contactId?: string }
   ): string | undefined {
     if (!email) {
       logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
         userId,
-        agentId,
+        sbSlug,
       });
       return undefined;
     }
@@ -2404,7 +2404,7 @@ export class SessionService implements ISessionService {
     if (!process.env.JWT_SECRET) {
       logger.warn('Cannot inject PCP access token for backend runner: JWT_SECRET missing', {
         userId,
-        agentId,
+        sbSlug,
       });
       return undefined;
     }
@@ -2412,7 +2412,7 @@ export class SessionService implements ISessionService {
     return signRunnerAccessToken({
       userId,
       email,
-      agentId,
+      sbSlug,
       sbId: session.sbId,
       sessionId: session.id,
       contactId: session.contactId,
@@ -2421,7 +2421,7 @@ export class SessionService implements ISessionService {
 
   async getOrCreateSession(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: {
       type?: SessionType;
       taskDescription?: string;
@@ -2475,7 +2475,7 @@ export class SessionService implements ISessionService {
   ): Promise<Session> {
     const type = options?.type || 'primary';
 
-    const { backend } = await this.resolveAgentBackend(userId, agentId);
+    const { backend } = await this.resolveAgentBackend(userId, sbSlug);
 
     // Identity and authorization are settled ONCE, here, before anything
     // consumes them (Lumen, PR #514 round 6). Previously the scope was
@@ -2490,7 +2490,7 @@ export class SessionService implements ISessionService {
     // so a supplied UUID silently re-enabled the very fallback it was meant
     // to replace. The supplied UUID still wins as the identity; the query
     // only tells us whether a slug comparison is permissible at all.
-    const discovered = await this.resolveIdentityScope(userId, agentId);
+    const discovered = await this.resolveIdentityScope(userId, sbSlug);
     const identity = {
       id: options?.sbId ?? discovered.id,
       absent: discovered.absent === true,
@@ -2507,7 +2507,7 @@ export class SessionService implements ISessionService {
     const anchorBelongsToTarget = (row: {
       userId?: string;
       sbId?: string | null;
-      agentId?: string | null;
+      sbSlug?: string | null;
     }): boolean => {
       if (row.userId !== userId) return false;
       // A row that CARRIES an identity must match it canonically — always
@@ -2517,7 +2517,7 @@ export class SessionService implements ISessionService {
       if (row.sbId) return identitySbId ? row.sbId === identitySbId : false;
       // Only a NULL-sb row may fall back to the slug, and only on a positive
       // `absent` — nothing exists that the slug could be confused with.
-      if (identity.absent) return row.agentId === agentId;
+      if (identity.absent) return row.sbSlug === sbSlug;
       return false;
     };
 
@@ -2548,9 +2548,9 @@ export class SessionService implements ISessionService {
           logger.warn('[SessionRouting] Refusing recipientSessionId — not this user/identity', {
             recipientSessionId: options.recipientSessionId,
             sessionUserId: candidate.userId,
-            sessionAgentId: candidate.agentId,
+            sessionSlug: candidate.sbSlug,
             sessionSbId: candidate.sbId ?? null,
-            requestedAgentId: agentId,
+            requestedSlug: sbSlug,
             requestedSbId: identitySbId,
           });
         }
@@ -2560,7 +2560,7 @@ export class SessionService implements ISessionService {
 
     // An unreadable anchor must not degrade into "route it somewhere else".
     if (anchorLookupFailed) {
-      throw new RoutingRefusedError(options?.threadKey || '(unthreaded)', agentId, {
+      throw new RoutingRefusedError(options?.threadKey || '(unthreaded)', sbSlug, {
         triedCallerRepo: false,
       });
     }
@@ -2578,7 +2578,7 @@ export class SessionService implements ISessionService {
       ? await this.resolveThreadBehavior(userId, options.threadKey)
       : ({ writeIntent: 'write', studioPolicy: 'provision' } as const);
 
-    let routing = await this.resolveStudioId(userId, agentId, {
+    let routing = await this.resolveStudioId(userId, sbSlug, {
       threadKey: options?.threadKey,
       writeIntent,
       studioPolicy,
@@ -2608,12 +2608,12 @@ export class SessionService implements ISessionService {
     // absent, never for "main" on an agent that has no root studio, which is
     // an ordinary state that must keep degrading rather than throwing.
     if (routing.unresolvedNamedStudio) {
-      throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
+      throw new UnresolvedStudioError(routing.unresolvedNamedStudio, sbSlug);
     }
 
     const leaseCtx = {
       userId,
-      agentId,
+      sbSlug,
       threadKey: options?.threadKey,
       writeIntent,
       studioPolicy,
@@ -2629,7 +2629,7 @@ export class SessionService implements ISessionService {
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
-    const defaultSessionId = await this.resolveDefaultSessionId(userId, agentId, identitySbId);
+    const defaultSessionId = await this.resolveDefaultSessionId(userId, sbSlug, identitySbId);
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
@@ -2688,7 +2688,7 @@ export class SessionService implements ISessionService {
 
         const aliasMatch = await aliasRepo.findByAlias(
           userId,
-          agentId,
+          sbSlug,
           options.alias,
           aliasStudioScope,
           // Identity by UUID: a same-slug session from another identity must
@@ -2707,7 +2707,7 @@ export class SessionService implements ISessionService {
         }
         logger.debug('No session found for alias', {
           alias: options.alias,
-          agentId,
+          sbSlug,
           aliasStudioScope: aliasStudioScope ?? null,
         });
       }
@@ -2726,7 +2726,7 @@ export class SessionService implements ISessionService {
         };
         const threadMatch = await threadRepo.findByThreadKey(
           userId,
-          agentId,
+          sbSlug,
           options.threadKey,
           resolvedStudioId,
           options?.contactId,
@@ -2762,13 +2762,13 @@ export class SessionService implements ISessionService {
           }
           logger.debug('default_session_id is set but session is ended/missing; creating new', {
             defaultSessionId,
-            agentId,
+            sbSlug,
             inheritedStudioId: defaultSession?.studioId || null,
           });
         } else {
           logger.debug('No thread match; creating new thread-scoped session', {
             userId,
-            agentId,
+            sbSlug,
             threadKey: options.threadKey,
             studioId: resolvedStudioId || null,
           });
@@ -2776,7 +2776,7 @@ export class SessionService implements ISessionService {
       } else if (options?.threadKey) {
         logger.debug('Repository lacks threadKey lookup support; creating a new thread session', {
           userId,
-          agentId,
+          sbSlug,
           threadKey: options.threadKey,
           studioId: resolvedStudioId || null,
         });
@@ -2791,7 +2791,7 @@ export class SessionService implements ISessionService {
         // silently attached to another identity's session either.
         const canReuseGenerally = !!identitySbId || identity.absent;
         const existing = canReuseGenerally
-          ? await this.repository.findByUserAndAgent(userId, agentId, {
+          ? await this.repository.findByUserAndAgent(userId, sbSlug, {
               type: 'primary',
               ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
               contactId: options?.contactId,
@@ -2858,7 +2858,7 @@ export class SessionService implements ISessionService {
           '[StudioResolve] Caller repo has no studio; presence thread proceeds studioless',
           {
             threadKey: options?.threadKey,
-            agentId,
+            sbSlug,
             repoRoot: routing.deferredCreate.repoRoot,
           }
         );
@@ -2866,7 +2866,7 @@ export class SessionService implements ISessionService {
       } else {
         logger.info('[StudioResolve] Caller repo has no studio and type is reuse-only; holding', {
           threadKey: options?.threadKey,
-          agentId,
+          sbSlug,
           repoRoot: routing.deferredCreate.repoRoot,
         });
         routing = {
@@ -2885,7 +2885,7 @@ export class SessionService implements ISessionService {
     } else if (routing.deferredCreate && !resolvedStudioId) {
       const createdStudioId = await this.createParentStudio(
         userId,
-        agentId,
+        sbSlug,
         routing.deferredCreate.repoRoot,
         routing.deferredCreate.sbId ?? identitySbId
       );
@@ -2909,7 +2909,7 @@ export class SessionService implements ISessionService {
     }
 
     if (routing.tier === 'refused' && routing.refusal && !defaultSessionId) {
-      throw new RoutingRefusedError(routing.refusal.threadKey, agentId, {
+      throw new RoutingRefusedError(routing.refusal.threadKey, sbSlug, {
         triedCallerRepo: routing.refusal.triedCallerRepo,
         reason: routing.refusal.reason,
         ...(routing.refusal.callerRepoRoot
@@ -2923,7 +2923,7 @@ export class SessionService implements ISessionService {
     // Create new session
     const session = await this.repository.create({
       userId,
-      agentId,
+      sbSlug,
       sbId,
       backendSessionId: null,
       type,
@@ -2967,7 +2967,7 @@ export class SessionService implements ISessionService {
     logger.info('Created new session', {
       sessionId: session.id,
       userId,
-      agentId,
+      sbSlug,
       type,
       alias: options?.alias || null,
       studioId: resolvedStudioId || null,
@@ -2980,7 +2980,7 @@ export class SessionService implements ISessionService {
 
   private async resolveStudioId(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options: {
       threadKey?: string;
       /** Pre-resolved BEFORE routing (r3 P0-1) — gates must never re-resolve. */
@@ -3013,7 +3013,7 @@ export class SessionService implements ISessionService {
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = {
       userId,
-      agentId,
+      sbSlug,
       threadKey: options.threadKey,
       writeIntent: options.writeIntent,
       studioPolicy: options.studioPolicy,
@@ -3057,14 +3057,14 @@ export class SessionService implements ISessionService {
       const eq = (q as { eq: (c: string, v: unknown) => unknown }).eq.bind(q);
       // Ambiguity already refused above, so reaching the slug here means the
       // identity is genuinely absent — nothing to confuse it with.
-      return (scopedSbId ? eq('sb_id', scopedSbId) : eq('agent_id', agentId)) as T;
+      return (scopedSbId ? eq('sb_id', scopedSbId) : eq('agent_id', sbSlug)) as T;
     };
 
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
       if (isMainStudio(options.explicitStudioId)) {
         return {
-          studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId, scopedSbId),
+          studioId: await this.resolveMainStudioId(userId, options.repoRoot, sbSlug, scopedSbId),
           tier: 'explicit',
           occupancyChecked: false,
         };
@@ -3081,7 +3081,7 @@ export class SessionService implements ISessionService {
       if (this.supabase) {
         const authorized = await this.authorizeStudioAnchor(
           userId,
-          agentId,
+          sbSlug,
           options.explicitStudioId,
           { sbId: options.sbId ?? null, identityAbsent: options.identityAbsent === true }
         );
@@ -3099,7 +3099,7 @@ export class SessionService implements ISessionService {
           // route pattern, no project affinity, and no usable caller repo" —
           // three claims that were never checked, ending in advice to pass the
           // studioHint the caller had just passed.
-          throw new RoutingRefusedError(options.threadKey || '(unthreaded)', agentId, {
+          throw new RoutingRefusedError(options.threadKey || '(unthreaded)', sbSlug, {
             triedCallerRepo: false,
             ...(options.identityAmbiguous
               ? { reason: 'ambiguous-identity' as const, anchor: 'studio' as const }
@@ -3130,13 +3130,13 @@ export class SessionService implements ISessionService {
     // duplicate slug cannot reach them.
     if (!scopedSbId && identityScope.ambiguous && options.threadKey) {
       logger.warn('[StudioResolve] Ambiguous identity — refusing to route', {
-        agentId,
+        sbSlug,
         threadKey: options.threadKey,
       });
       // Also fatal: the reuse rungs below would fall back to the slug and
       // match a sibling identity's session before the create boundary is
       // reached (Lumen, #514 r8).
-      throw new RoutingRefusedError(options.threadKey, agentId, {
+      throw new RoutingRefusedError(options.threadKey, sbSlug, {
         triedCallerRepo: false,
         reason: 'ambiguous-identity',
       });
@@ -3145,7 +3145,7 @@ export class SessionService implements ISessionService {
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
     if (isMainStudio(options.studioHint)) {
       return {
-        studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId, scopedSbId),
+        studioId: await this.resolveMainStudioId(userId, options.repoRoot, sbSlug, scopedSbId),
         tier: 'studio-hint',
         occupancyChecked: false,
       };
@@ -3168,7 +3168,7 @@ export class SessionService implements ISessionService {
       // studioHint was explicit — don't silently fall through to unrelated studios
       logger.warn('[StudioResolve] Studio hint did not match any studio, skipping fallback', {
         userId,
-        agentId,
+        sbSlug,
         studioHint: options.studioHint,
       });
       return {
@@ -3273,7 +3273,7 @@ export class SessionService implements ISessionService {
         if (matches.length > 1) {
           logger.warn('[StudioResolve] Ambiguous route pattern match, falling through', {
             threadKey: options.threadKey,
-            agentId,
+            sbSlug,
             matchCount: matches.length,
           });
         } else {
@@ -3283,7 +3283,7 @@ export class SessionService implements ISessionService {
           // traceable (see thread:pcp-to-ink-rename 2026-04-17 post-mortem).
           logger.warn('[StudioResolve] No studio pattern matched threadKey, falling through', {
             threadKey: options.threadKey,
-            agentId,
+            sbSlug,
             candidateStudios: patternStudios.map((s) => ({
               id: s.id,
               patterns: s.route_patterns,
@@ -3293,7 +3293,7 @@ export class SessionService implements ISessionService {
       } else {
         logger.debug('[StudioResolve] No studios with route_patterns for agent', {
           threadKey: options.threadKey,
-          agentId,
+          sbSlug,
         });
       }
     }
@@ -3306,13 +3306,13 @@ export class SessionService implements ISessionService {
       const repoRootStudioId = await this.resolveMainStudioId(
         userId,
         options.repoRoot,
-        agentId,
+        sbSlug,
         scopedSbId
       );
       if (repoRootStudioId) {
         logger.debug('[StudioResolve] Resolved studio via repoRoot', {
           repoRoot: options.repoRoot,
-          agentId,
+          sbSlug,
           studioId: repoRootStudioId,
         });
         return this.gateOccupancy(repoRootStudioId, 'repo-root-main', leaseCtx);
@@ -3342,7 +3342,7 @@ export class SessionService implements ISessionService {
     if (callerRepoRoot) {
       const byRepo = await this.resolveStudioForRepo(
         userId,
-        agentId,
+        sbSlug,
         callerRepoRoot,
         leaseCtx,
         scopedSbId
@@ -3365,7 +3365,7 @@ export class SessionService implements ISessionService {
     if (options.threadKey) {
       logger.warn('[StudioResolve] Refusing to route — no tier could place this thread', {
         threadKey: options.threadKey,
-        agentId,
+        sbSlug,
         triedCallerRepo: !!callerRepoRoot,
         callerRepoRoot: callerRepoRoot || null,
       });
@@ -3388,7 +3388,7 @@ export class SessionService implements ISessionService {
         'No studio resolved for codex-cli request; falling back to default working directory',
         {
           userId,
-          agentId,
+          sbSlug,
           defaultWorkingDirectory: this.config.defaultWorkingDirectory,
         }
       );
@@ -3505,11 +3505,11 @@ export class SessionService implements ISessionService {
    */
   private async resolveStudioForRepo(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     repoRoot: string,
     leaseCtx: {
       userId: string;
-      agentId: string;
+      sbSlug: string;
       threadKey?: string;
       writeIntent?: WriteIntent;
       studioPolicy?: StudioPolicy;
@@ -3535,13 +3535,13 @@ export class SessionService implements ISessionService {
       .in('status', ['active', 'idle'])
       .order('created_at', { ascending: true })
       .limit(1);
-    reuseQuery = sbId ? reuseQuery.eq('sb_id', sbId) : reuseQuery.eq('agent_id', agentId);
+    reuseQuery = sbId ? reuseQuery.eq('sb_id', sbId) : reuseQuery.eq('agent_id', sbSlug);
     const { data: existing, error } = await reuseQuery.maybeSingle();
 
     if (error) {
       logger.warn('[StudioResolve] Caller-repo studio lookup failed', {
         repoRoot,
-        agentId,
+        sbSlug,
         error: error.message,
       });
       return null;
@@ -3550,7 +3550,7 @@ export class SessionService implements ISessionService {
     if (existing?.id) {
       logger.debug('[StudioResolve] Reused studio for caller repo', {
         repoRoot,
-        agentId,
+        sbSlug,
         studioId: existing.id,
       });
       return this.gateOccupancy(existing.id, 'caller-repo-reuse', leaseCtx);
@@ -3560,11 +3560,11 @@ export class SessionService implements ISessionService {
     // only runs against a repo we resolved, never the server's ambient cwd.
     // Scoped by the canonical identity too — this rung dropped it and looked
     // up by slug (Lumen, PR #514 round 3).
-    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, agentId, sbId);
+    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, sbSlug, sbId);
     if (mainStudioId) {
       logger.debug('[StudioResolve] Resolved repo-scoped main studio for caller repo', {
         repoRoot,
-        agentId,
+        sbSlug,
         studioId: mainStudioId,
       });
       return this.gateOccupancy(mainStudioId, 'main-fallback', leaseCtx);
@@ -3610,7 +3610,7 @@ export class SessionService implements ISessionService {
    */
   private async resolveIdentityScope(
     userId: string,
-    agentId: string
+    sbSlug: string
   ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean }> {
     if (!this.supabase) return { absent: true };
     try {
@@ -3618,7 +3618,7 @@ export class SessionService implements ISessionService {
         .from('agent_identities')
         .select('id')
         .eq('user_id', userId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .limit(2);
 
       // PostgREST failures RESOLVE as { data: null, error } — they do not
@@ -3629,19 +3629,19 @@ export class SessionService implements ISessionService {
       // is ambiguous, never absent.
       if (error) {
         logger.warn('[StudioResolve] Identity lookup failed; treating slug as unusable', {
-          agentId,
+          sbSlug,
           error: error.message,
         });
         return { ambiguous: true };
       }
 
       if (!data?.length) {
-        logger.debug('[StudioResolve] No identity row; slug scoping is unambiguous', { agentId });
+        logger.debug('[StudioResolve] No identity row; slug scoping is unambiguous', { sbSlug });
         return { absent: true };
       }
       if (data.length > 1) {
         logger.warn('[StudioResolve] Ambiguous identity slug; refusing caller-repo resolution', {
-          agentId,
+          sbSlug,
         });
         return { ambiguous: true };
       }
@@ -3654,7 +3654,7 @@ export class SessionService implements ISessionService {
   }
 
   /** Canonical identity UUID for an agent slug, or null when unresolvable. */
-  private async resolveSbId(userId: string, agentId: string): Promise<string | null> {
+  private async resolveSbId(userId: string, sbSlug: string): Promise<string | null> {
     if (!this.supabase) return null;
     try {
       // limit(2), not maybeSingle(): the same slug can exist in more than one
@@ -3665,10 +3665,10 @@ export class SessionService implements ISessionService {
         .from('agent_identities')
         .select('id')
         .eq('user_id', userId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .limit(2);
       if (!data?.length) {
-        logger.debug('[StudioResolve] No identity row; falling back to slug scoping', { agentId });
+        logger.debug('[StudioResolve] No identity row; falling back to slug scoping', { sbSlug });
         return null;
       }
       if (data.length > 1) {
@@ -3676,7 +3676,7 @@ export class SessionService implements ISessionService {
         // identity on every real path; getting here means we genuinely cannot
         // tell which agent this is, and guessing is what 3b removes.
         logger.warn('[StudioResolve] Ambiguous identity slug; no caller-repo resolution', {
-          agentId,
+          sbSlug,
         });
         return null;
       }
@@ -3688,7 +3688,7 @@ export class SessionService implements ISessionService {
 
   private async createParentStudio(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     repoRoot: string,
     knownSbId?: string | null
   ): Promise<string | undefined> {
@@ -3698,22 +3698,22 @@ export class SessionService implements ISessionService {
     try {
       const parent = await overflowService.ensureParentStudio({
         userId,
-        agentId,
+        sbSlug,
         repoRoot,
-        sbId: knownSbId ?? (await this.resolveSbId(userId, agentId)),
+        sbId: knownSbId ?? (await this.resolveSbId(userId, sbSlug)),
       });
       if (!parent) return undefined;
       logger.info('[StudioResolve] Created parent studio for caller repo (D1)', {
         studioId: parent.id,
         slug: parent.slug,
         repoRoot,
-        agentId,
+        sbSlug,
       });
       return parent.id;
     } catch (err) {
       logger.warn('[StudioResolve] Parent studio creation failed', {
         repoRoot,
-        agentId,
+        sbSlug,
         error: err instanceof Error ? err.message : String(err),
       });
       return undefined;
@@ -3732,7 +3732,7 @@ export class SessionService implements ISessionService {
    */
   private async authorizeStudioAnchor(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     studioId: string,
     identity: { sbId: string | null; identityAbsent: boolean }
   ): Promise<boolean> {
@@ -3762,13 +3762,13 @@ export class SessionService implements ISessionService {
     // and only on a positive `absent` (Lumen, #514 r8).
     const identityOk = sbIdRow
       ? !!identity.sbId && sbIdRow === identity.sbId
-      : identity.identityAbsent && data.agent_id === agentId;
+      : identity.identityAbsent && data.agent_id === sbSlug;
     if (!identityOk) {
       logger.warn('[StudioResolve] Refusing explicit studio — belongs to another identity', {
         studioId,
-        studioAgentId: data.agent_id,
+        studioSlug: data.agent_id,
         studioSbId: sbIdRow,
-        requestedAgentId: agentId,
+        requestedSlug: sbSlug,
         requestedSbId: identity.sbId,
       });
       return false;
@@ -3787,7 +3787,7 @@ export class SessionService implements ISessionService {
   private async resolveMainStudioId(
     userId: string,
     repoRoot?: string,
-    agentId?: string,
+    sbSlug?: string,
     sbId?: string | null
   ): Promise<string | undefined> {
     if (!this.supabase) return undefined;
@@ -3795,14 +3795,14 @@ export class SessionService implements ISessionService {
       this.supabase,
       userId,
       repoRoot || this.config.defaultWorkingDirectory,
-      agentId,
+      sbSlug,
       { sbId: sbId ?? undefined }
     );
   }
 
   private async resolveWorkingDirectory(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     studioId?: string
   ): Promise<string> {
     if (!studioId || !this.supabase) {
@@ -3825,7 +3825,7 @@ export class SessionService implements ISessionService {
       }
       logger.warn('Studio worktree path does not exist; falling back to default', {
         userId,
-        agentId,
+        sbSlug,
         studioId,
         worktreePath: studio.worktree_path,
         defaultWorkingDirectory: this.config.defaultWorkingDirectory,
@@ -3835,7 +3835,7 @@ export class SessionService implements ISessionService {
 
     logger.warn('Studio not found for session; using default working directory', {
       userId,
-      agentId,
+      sbSlug,
       studioId,
       defaultWorkingDirectory: this.config.defaultWorkingDirectory,
     });
@@ -3850,7 +3850,7 @@ export class SessionService implements ISessionService {
   async listSessions(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -3900,26 +3900,26 @@ This session will continue with a fresh context after compaction. Your identity,
 
       const context = await this.contextBuilder.buildMinimalContext(
         session.userId,
-        session.agentId,
+        session.sbSlug,
         session
       );
 
       // Fetch user timezone for identity prompt
       const fullContext = await this.contextBuilder.buildContext(
         session.userId,
-        session.agentId,
+        session.sbSlug,
         session
       );
 
       const compactionWorkingDirectory = await this.resolveWorkingDirectory(
         session.userId,
-        session.agentId,
+        session.sbSlug,
         session.studioId
       );
 
       const compactionToken = this.createRunnerAccessToken(
         session.userId,
-        session.agentId,
+        session.sbSlug,
         fullContext.user.email,
         session
       );
@@ -3943,7 +3943,7 @@ This session will continue with a fresh context after compaction. Your identity,
         mcpConfigPath: this.config.mcpConfigPath,
         ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
-          session.agentId,
+          session.sbSlug,
           context.agent.name,
           context.agent.soul,
           fullContext.user.timezone,
@@ -4024,7 +4024,7 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private async resolveDefaultSessionId(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     sbId?: string | null
   ): Promise<string | null> {
     if (!this.supabase) return null;
@@ -4038,7 +4038,7 @@ This session will continue with a fresh context after compaction. Your identity,
       // Canonical identity when known: reading the default session by slug
       // could hand identity A the session identity B configured
       // (Lumen, PR #514 round 5).
-      q = sbId ? q.eq('id', sbId) : q.eq('agent_id', agentId).not('workspace_id', 'is', null);
+      q = sbId ? q.eq('id', sbId) : q.eq('agent_id', sbSlug).not('workspace_id', 'is', null);
       const { data } = (await q.limit(1).maybeSingle()) as {
         data: { default_session_id: string | null } | null;
       };
@@ -4053,13 +4053,13 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private async resolveAgentBackend(
     userId: string,
-    agentId: string
+    sbSlug: string
   ): Promise<{
     backend: 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink';
     provider: 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink' | null;
   }> {
     try {
-      const { backend, provider } = await this.contextBuilder.getAgentBackend(userId, agentId);
+      const { backend, provider } = await this.contextBuilder.getAgentBackend(userId, sbSlug);
       return {
         backend: this.normalizeBackend(backend),
         provider: provider ? this.normalizeBackend(provider) : null,
@@ -4067,7 +4067,7 @@ This session will continue with a fresh context after compaction. Your identity,
     } catch (error) {
       logger.warn('Failed to resolve agent backend, falling back to claude-code', {
         userId,
-        agentId,
+        sbSlug,
         error: error instanceof Error ? error.message : String(error),
       });
       return { backend: 'claude-code', provider: null };
@@ -4219,7 +4219,7 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private async logToolCalls(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     sessionId: string,
     toolCalls: ToolCall[],
     request: SessionRequest
@@ -4244,7 +4244,7 @@ This session will continue with a fresh context after compaction. Your identity,
 
       await this.activityStream.logActivity({
         userId,
-        agentId,
+        sbSlug,
         type: 'tool_call',
         subtype: toolCall.toolName,
         content: `${toolCall.toolName}(${argsSummary})`,
@@ -4392,7 +4392,7 @@ This session will continue with a fresh context after compaction. Your identity,
  * target project. When no repoRoot is provided, falls back to process.cwd()
  * (the server's working directory).
  *
- * When `autoCreate` is true and both `agentId` and `repoRoot` are provided,
+ * When `autoCreate` is true and both `sbSlug` and `repoRoot` are provided,
  * auto-creates a studio row so every root-repo session gets a real
  * studio_id instead of NULL.  Falls back to undefined when the caller
  * didn't supply enough info to safely auto-create.
@@ -4401,7 +4401,7 @@ export async function resolveMainStudio(
   supabase: SupabaseClient<Database>,
   userId: string,
   repoRoot?: string,
-  agentId?: string,
+  sbSlug?: string,
   options?: { autoCreate?: boolean; sbId?: string }
 ): Promise<string | undefined> {
   const targetRoot = repoRoot || process.cwd();
@@ -4419,23 +4419,23 @@ export async function resolveMainStudio(
     // Canonical identity when we have it — a slug can name different
     // identities in different workspaces (Lumen, PR #514 round 3).
     if (options?.sbId) q = q.eq('sb_id', options.sbId);
-    else if (agentId) q = q.eq('agent_id', agentId);
+    else if (sbSlug) q = q.eq('agent_id', sbSlug);
     return q;
   };
 
   const { data: match } = await lookupQuery().maybeSingle();
   if (match?.id) return match.id;
 
-  // Auto-create only when explicitly opted in AND both agentId and repoRoot
+  // Auto-create only when explicitly opted in AND both sbSlug and repoRoot
   // are provided — avoids creating spurious studios from fallback paths.
-  if (!options?.autoCreate || !agentId || !repoRoot) return undefined;
+  if (!options?.autoCreate || !sbSlug || !repoRoot) return undefined;
 
   const slug = path.basename(targetRoot);
   const { data: created, error } = await supabase
     .from('studios')
     .insert({
       user_id: userId,
-      agent_id: agentId,
+      agent_id: sbSlug,
       ...(options?.sbId ? { sb_id: options.sbId } : {}),
       repo_root: targetRoot,
       worktree_path: targetRoot,
@@ -4454,14 +4454,14 @@ export async function resolveMainStudio(
       const { data: retry } = await lookupQuery().maybeSingle();
       return retry?.id || undefined;
     }
-    logger.warn('Failed to auto-create main studio', { error, userId, agentId, repoRoot });
+    logger.warn('Failed to auto-create main studio', { error, userId, sbSlug, repoRoot });
     return undefined;
   }
 
   logger.info('Auto-created main studio for root repo', {
     studioId: created.id,
     userId,
-    agentId,
+    sbSlug,
     repoRoot: targetRoot,
     slug,
   });
@@ -4485,11 +4485,11 @@ export async function resolveStudioHint(
   supabase: SupabaseClient<Database>,
   userId: string,
   hint: string,
-  agentId?: string,
+  sbSlug?: string,
   repoRoot?: string
 ): Promise<string | undefined> {
   if (isMainStudio(hint)) {
-    return resolveMainStudio(supabase, userId, repoRoot, agentId);
+    return resolveMainStudio(supabase, userId, repoRoot, sbSlug);
   }
 
   // Named hint: match by slug
@@ -4500,7 +4500,7 @@ export async function resolveStudioHint(
     .eq('slug', hint)
     .in('status', ['active', 'idle'])
     .limit(1);
-  if (agentId) query = query.eq('agent_id', agentId);
+  if (sbSlug) query = query.eq('agent_id', sbSlug);
   const { data: namedStudio } = await query.maybeSingle();
   return namedStudio?.id || undefined;
 }

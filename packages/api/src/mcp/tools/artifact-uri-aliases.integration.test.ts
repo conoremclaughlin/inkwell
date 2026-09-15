@@ -84,7 +84,7 @@ describe.skipIf(!canRun)('artifact URI aliases (DB integration)', () => {
             title: 'Renamable',
             content: '# body',
             artifactType: 'note',
-            agentId: 'echo',
+            sbSlug: 'echo',
           },
           dataComposer
         )
@@ -102,7 +102,7 @@ describe.skipIf(!canRun)('artifact URI aliases (DB integration)', () => {
             uri: URI_BORN,
             newUri: URI_MOVED,
             changeSummary: 'moved for the integration suite',
-            agentId: 'echo',
+            sbSlug: 'echo',
           },
           dataComposer
         )
@@ -276,7 +276,7 @@ describe.skipIf(!canRun)('artifact URI aliases (DB integration)', () => {
           uri: URI_BORN,
           title: 'Squatter',
           content: 'X',
-          agentId: 'echo',
+          sbSlug: 'echo',
         },
         dataComposer
       )
@@ -336,7 +336,7 @@ describe.skipIf(!canRun)('artifact URI aliases (DB integration)', () => {
             workspaceId,
             uri: URI_MOVED,
             newUri: URI_BORN,
-            agentId: 'echo',
+            sbSlug: 'echo',
           },
           dataComposer
         )

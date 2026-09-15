@@ -83,11 +83,9 @@ vi.mock('../services/oauth', () => ({
   })),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -868,7 +866,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
             syncedAt: '2026-03-11T10:00:00Z',
             session: {
               id: 'session-in-workspace',
-              agentId: 'wren',
+              sbSlug: 'wren',
               agentName: 'Wren',
               agentRole: 'SB',
               backend: 'claude',
@@ -1467,7 +1465,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
     });
   });
 
-  describe('PATCH /identities/:agentId/settings', () => {
+  describe('PATCH /identities/:sbSlug/settings', () => {
     it('should update sandbox_bypass on a valid identity', async () => {
       mockSupabaseFrom.mockImplementation((table: string) => {
         if (table === 'agent_identities') {
@@ -1499,9 +1497,9 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         return createQueryChain(null);
       });
 
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
       const req = createAuthenticatedReq({
-        params: { agentId: 'lumen' },
+        params: { sbSlug: 'lumen' },
         body: { sandboxBypass: true },
       });
       const res = createMockRes();
@@ -1525,9 +1523,9 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         }),
       }));
 
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
       const req = createAuthenticatedReq({
-        params: { agentId: 'nonexistent' },
+        params: { sbSlug: 'nonexistent' },
         body: { sandboxBypass: true },
       });
       const res = createMockRes();
@@ -1576,8 +1574,8 @@ describe('admin endpoint handlers (no-500 regression)', () => {
     };
 
     const patchSettings = async (body: Record<string, unknown>) => {
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
-      const req = createAuthenticatedReq({ params: { agentId: 'myra' }, body });
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
+      const req = createAuthenticatedReq({ params: { sbSlug: 'myra' }, body });
       const res = createMockRes();
       await handler!(req, res);
       return res;

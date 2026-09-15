@@ -59,7 +59,7 @@ describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionId through --resume', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -73,7 +73,7 @@ describe('backend adapters session resume wiring', () => {
   it('does not force claude --session-id from pcp session id', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -87,7 +87,7 @@ describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionSeedId through --session-id', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -103,7 +103,7 @@ describe('backend adapters session resume wiring', () => {
   it('passes backendSessionId through codex resume subcommand', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: ['continue', 'work'],
       passthroughArgs: [],
@@ -125,7 +125,7 @@ describe('backend adapters session resume wiring', () => {
     // the prompt a positional under all parse rules.
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: ['exec', 'what is in this image?'],
       passthroughArgs: [],
@@ -154,7 +154,7 @@ describe('backend adapters session resume wiring', () => {
   it('media-free exec turns get no --image flags and no -- terminator', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: ['exec', 'plain work'],
       passthroughArgs: [],
@@ -170,7 +170,7 @@ describe('backend adapters session resume wiring', () => {
   it('places codex passthrough args after exec subcommand', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: ['exec', 'do work'],
       passthroughArgs: ['--sandbox', 'read-only', '--skip-git-repo-check'],
@@ -194,7 +194,7 @@ describe('backend adapters session resume wiring', () => {
   it('injects startup context into codex model instructions file when provided', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -219,7 +219,7 @@ describe('backend adapters session resume wiring', () => {
   it('maps --dangerous to claude --dangerously-skip-permissions', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -232,7 +232,7 @@ describe('backend adapters session resume wiring', () => {
   it('maps --dangerous to codex --dangerously-bypass-approvals-and-sandbox', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -249,7 +249,7 @@ describe('backend adapters session resume wiring', () => {
   it('maps --dangerous to gemini --yolo', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
-      agentId: 'aster',
+      sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -266,7 +266,7 @@ describe('backend adapters session resume wiring', () => {
   it('does not add auto-approve flags when dangerous is false', () => {
     const claude = new ClaudeAdapter();
     const claudePrep = claude.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -275,7 +275,7 @@ describe('backend adapters session resume wiring', () => {
 
     const codex = new CodexAdapter();
     const codexPrep = codex.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -288,7 +288,7 @@ describe('backend adapters session resume wiring', () => {
 
     const gemini = new GeminiAdapter();
     const geminiPrep = gemini.prepare({
-      agentId: 'aster',
+      sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -309,7 +309,7 @@ describe('backend adapters session resume wiring', () => {
   it('claude adapter grants --add-dir for each attachment directory', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -333,7 +333,7 @@ describe('backend adapters session resume wiring', () => {
     process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-adapter-${process.pid}`);
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -371,7 +371,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       for (const backendSessionId of [undefined, 'codex-sess-1']) {
         const prepared = new CodexAdapter().prepare({
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           model: undefined,
           promptParts: [],
           passthroughArgs: [],
@@ -403,7 +403,7 @@ describe('backend adapters session resume wiring', () => {
     process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-gemini-${process.pid}`);
     try {
       const prepared = new GeminiAdapter().prepare({
-        agentId: 'aster',
+        sbSlug: 'aster',
         model: undefined,
         promptParts: [],
         passthroughArgs: [],
@@ -431,7 +431,7 @@ describe('backend adapters session resume wiring', () => {
   it('injects INK_SESSION_ID into claude env when pcpSessionId is provided', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -445,7 +445,7 @@ describe('backend adapters session resume wiring', () => {
   it('does not inject INK_SESSION_ID into claude env when pcpSessionId is absent', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -457,7 +457,7 @@ describe('backend adapters session resume wiring', () => {
   it('injects INK_SESSION_ID into codex env when pcpSessionId is provided', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -475,7 +475,7 @@ describe('backend adapters session resume wiring', () => {
   it('does not inject INK_SESSION_ID into codex env when pcpSessionId is absent', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -491,7 +491,7 @@ describe('backend adapters session resume wiring', () => {
   it('injects INK_SESSION_ID into gemini env when pcpSessionId is provided', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
-      agentId: 'aster',
+      sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -509,7 +509,7 @@ describe('backend adapters session resume wiring', () => {
   it('does not inject INK_SESSION_ID into gemini env when pcpSessionId is absent', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
-      agentId: 'aster',
+      sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -524,14 +524,14 @@ describe('backend adapters session resume wiring', () => {
 
   it('injects both AGENT_ID and INK_SESSION_ID into all backend envs', () => {
     const configs = [
-      { adapter: new ClaudeAdapter(), agentId: 'wren', cleanup: false },
-      { adapter: new CodexAdapter(), agentId: 'lumen', cleanup: true },
-      { adapter: new GeminiAdapter(), agentId: 'aster', cleanup: true },
+      { adapter: new ClaudeAdapter(), sbSlug: 'wren', cleanup: false },
+      { adapter: new CodexAdapter(), sbSlug: 'lumen', cleanup: true },
+      { adapter: new GeminiAdapter(), sbSlug: 'aster', cleanup: true },
     ] as const;
 
-    for (const { adapter, agentId, cleanup } of configs) {
+    for (const { adapter, sbSlug, cleanup } of configs) {
       const prepared = (adapter as { prepare: typeof ClaudeAdapter.prototype.prepare }).prepare({
-        agentId,
+        sbSlug,
         model: undefined,
         promptParts: [],
         passthroughArgs: [],
@@ -540,7 +540,7 @@ describe('backend adapters session resume wiring', () => {
 
       try {
         expect(prepared.env).toBeDefined();
-        expect(prepared.env!.AGENT_ID).toBe(agentId);
+        expect(prepared.env!.AGENT_ID).toBe(sbSlug);
         expect(prepared.env!.INK_SESSION_ID).toBe('pcp-sess-shared');
       } finally {
         if (cleanup) prepared.cleanup();
@@ -551,7 +551,7 @@ describe('backend adapters session resume wiring', () => {
   it('passes backendSessionId through gemini --resume flag', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
-      agentId: 'aster',
+      sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -576,7 +576,7 @@ describe('backend adapters session resume wiring', () => {
   it('claude adapter produces INK_CONTEXT with session/studio/agent', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -590,7 +590,7 @@ describe('backend adapters session resume wiring', () => {
       expect(token).not.toBeNull();
       expect(token!.sessionId).toBe('sess-claude-123');
       expect(token!.studioId).toBe('studio-wren-456');
-      expect(token!.agentId).toBe('wren');
+      expect(token!.sbSlug).toBe('wren');
       expect(token!.runtime).toBe('claude');
       expect(token!.cliAttached).toBe(true);
     } finally {
@@ -601,7 +601,7 @@ describe('backend adapters session resume wiring', () => {
   it('codex adapter produces INK_CONTEXT with session/studio/agent', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -615,7 +615,7 @@ describe('backend adapters session resume wiring', () => {
       expect(token).not.toBeNull();
       expect(token!.sessionId).toBe('sess-codex-123');
       expect(token!.studioId).toBe('studio-lumen-456');
-      expect(token!.agentId).toBe('lumen');
+      expect(token!.sbSlug).toBe('lumen');
       expect(token!.runtime).toBe('codex');
       expect(token!.cliAttached).toBe(true);
     } finally {
@@ -626,7 +626,7 @@ describe('backend adapters session resume wiring', () => {
   it('codex adapter injects x-ink-context and a static bearer (not Authorization OAuth)', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -656,7 +656,7 @@ describe('backend adapters session resume wiring', () => {
   it('gemini adapter produces INK_CONTEXT with session/studio/agent', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
-      agentId: 'aster',
+      sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -670,7 +670,7 @@ describe('backend adapters session resume wiring', () => {
       expect(token).not.toBeNull();
       expect(token!.sessionId).toBe('sess-gemini-789');
       expect(token!.studioId).toBe('studio-aster-012');
-      expect(token!.agentId).toBe('aster');
+      expect(token!.sbSlug).toBe('aster');
       expect(token!.runtime).toBe('gemini');
       expect(token!.cliAttached).toBe(true);
     } finally {
@@ -681,7 +681,7 @@ describe('backend adapters session resume wiring', () => {
   it('gemini adapter generates settings.json with auth + context headers', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
-      agentId: 'aster',
+      sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
@@ -700,7 +700,7 @@ describe('backend adapters session resume wiring', () => {
       const contextToken = settings.mcpServers.inkwell.headers['x-ink-context'];
       const decoded = JSON.parse(Buffer.from(contextToken, 'base64url').toString());
       expect(decoded.sessionId).toBe('sess-gemini-789');
-      expect(decoded.agentId).toBe('aster');
+      expect(decoded.sbSlug).toBe('aster');
       expect(decoded.runtime).toBe('gemini');
       expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('sess-gemini-789');
     } finally {

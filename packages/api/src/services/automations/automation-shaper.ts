@@ -19,7 +19,7 @@ export interface AutomationItem {
   id: string;
   kind: AutomationKind;
   title: string;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string | null;
   cadence: string;
   status: string;
@@ -160,7 +160,7 @@ function reminderToAutomation(reminder: ReminderSourceRow): AutomationItem {
     id: reminder.id,
     kind: classifyReminder(reminder),
     title: reminder.title,
-    agentId: reminder.agent_identities?.agent_id ?? null,
+    sbSlug: reminder.agent_identities?.agent_id ?? null,
     agentName: reminder.agent_identities?.name ?? null,
     cadence: describeCron(reminder.cron_expression),
     status: reminder.status,
@@ -196,7 +196,7 @@ function strategyToAutomation(
     id: group.id,
     kind: 'strategy',
     title: `${group.title}${strategyLabel}`,
-    agentId: group.agent_identities?.agent_id ?? null,
+    sbSlug: group.agent_identities?.agent_id ?? null,
     agentName: group.agent_identities?.name ?? null,
     cadence,
     status: group.strategy_paused_at ? 'paused' : group.status,
