@@ -17,7 +17,7 @@ interface TranscriptPayload {
 interface ConversationResponse {
   session: {
     id: string;
-    agentId: string;
+    sbSlug: string;
     agentName: string;
     backend: string | null;
     backendSessionId: string | null;
@@ -37,7 +37,7 @@ interface ConversationResponse {
 interface SessionLogsResponse {
   session: {
     id: string;
-    agentId: string;
+    sbSlug: string;
     status: string;
     currentPhase: string | null;
     backend: string | null;
@@ -63,6 +63,7 @@ function phaseColor(phase: string | null, lifecycle: string | null): string {
     if (phase === 'runtime:generating') return 'bg-blue-100 text-blue-700';
     return 'bg-green-100 text-green-700';
   }
+  if (lifecycle === 'interrupted') return 'bg-amber-100 text-amber-700';
   if (phase?.startsWith('blocked')) return 'bg-amber-100 text-amber-700';
   if (lifecycle === 'idle') return 'bg-green-100 text-green-700';
   return 'bg-gray-100 text-gray-600';
@@ -73,6 +74,7 @@ function phaseLabel(phase: string | null, lifecycle: string | null): string {
     if (phase === 'runtime:generating') return 'Generating';
     return phase ?? 'Running';
   }
+  if (lifecycle === 'interrupted') return 'Interrupted';
   if (lifecycle === 'idle') return phase ?? 'Idle';
   if (lifecycle === 'completed') return 'Completed';
   return phase ?? lifecycle ?? 'unknown';
@@ -151,7 +153,7 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
         totalEvents: logsData.pagination.total,
         session: {
           ...logsData.session,
-          agentName: logsData.session.agentId,
+          agentName: logsData.session.sbSlug,
           lifecycle: logsData.session.status,
           activeThreadKey: null,
         },
@@ -238,7 +240,7 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
 
   if (!session) return null;
 
-  const agentName = session.agentName || session.agentId;
+  const agentName = session.agentName || session.sbSlug;
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden">
@@ -248,7 +250,7 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="font-semibold text-gray-900">{agentName}</h2>
             <Badge variant="outline" className="text-xs font-mono">
-              {session.agentId}
+              {session.sbSlug}
             </Badge>
             <Badge className={`text-xs ${phaseColor(session.currentPhase, session.lifecycle)}`}>
               {phaseLabel(session.currentPhase, session.lifecycle)}

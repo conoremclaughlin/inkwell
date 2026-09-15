@@ -17,16 +17,12 @@ import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline/promises';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
-
-interface PcpConfig {
-  userId?: string;
-  email?: string;
-}
 
 export interface Session {
   id: string;
-  agentId?: string;
+  sbSlug?: string;
   lifecycle?: string;
   status: string;
   currentPhase?: string;
@@ -76,7 +72,7 @@ interface SyncedTranscriptArchiveSummary {
   syncedAt: string;
   session: {
     id: string;
-    agentId?: string | null;
+    sbSlug?: string | null;
     agentName?: string | null;
     agentRole?: string | null;
     backend?: string | null;
@@ -120,19 +116,6 @@ interface TranscriptInstallPlan {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-function getPcpConfig(): PcpConfig | null {
-  const configPath = join(homedir(), '.pcp', 'config.json');
-  if (existsSync(configPath)) {
-    try {
-      return JSON.parse(readFileSync(configPath, 'utf-8'));
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
 
 function normalizePath(input: string): string {
   return resolvePath(input);
@@ -272,7 +255,7 @@ export function buildTranscriptInstallPlan(options: {
     return {
       destinationPath: join(
         targetCwd,
-        '.pcp',
+        '.ink',
         'runtime',
         'repl',
         `${options.sessionId}-synced-${backendSessionId}.${format === 'json' ? 'json' : 'jsonl'}`
@@ -296,7 +279,7 @@ export function renderSyncedTranscriptArchives(
   return archives.flatMap((archive) => {
     const header = `  ${chalk.cyan(archive.sessionId.substring(0, 8))} ${chalk.dim(`(${archive.backend || 'unknown'})`)}`;
     const thread = archive.session.threadKey || '-';
-    const agent = archive.session.agentName || archive.session.agentId || 'Unknown';
+    const agent = archive.session.agentName || archive.session.sbSlug || 'Unknown';
     const lines = [
       header,
       chalk.dim(`      Agent:   ${agent}`),
@@ -378,7 +361,7 @@ async function maybeConfirmImplicitCwd(cwd: string, skipConfirmation?: boolean):
 }
 
 async function resolvePullTarget(options: {
-  config: PcpConfig | null;
+  config: UserConfig | null;
   studio?: string;
   cwd?: string;
   path?: string;
@@ -398,7 +381,7 @@ async function resolvePullTarget(options: {
 
   if (options.studio) {
     if (!options.config?.email) {
-      throw new Error('PCP not configured. Run: ink init');
+      throw new Error(NOT_SIGNED_IN_MESSAGE);
     }
     const studio = await callPcpTool<StudioLookupResult>('get_studio', {
       email: options.config.email,
@@ -442,7 +425,7 @@ function formatSessionLine(session: Session): string[] {
     `  ${statusIcon} ${chalk.cyan(session.id.substring(0, 8))} ${chalk.dim(`(${phase})`)}`,
     chalk.dim(`      Started: ${formatDate(startedAt)}  Duration: ${duration}`),
     chalk.dim(`      Thread:  ${thread}`),
-    chalk.dim(`      Attach:  ink chat -a ${session.agentId || 'wren'} --attach ${session.id}`),
+    chalk.dim(`      Attach:  ink chat -a ${session.sbSlug || 'wren'} --attach ${session.id}`),
   ];
 
   if (session.summary) {
@@ -486,7 +469,7 @@ export function renderSessionsByAgent(sessions: Session[], flat = false): string
 
   const grouped = new Map<string, Session[]>();
   for (const session of sessions) {
-    const key = session.agentId || 'unknown';
+    const key = session.sbSlug || 'unknown';
     const list = grouped.get(key) || [];
     list.push(session);
     grouped.set(key, list);
@@ -514,16 +497,16 @@ async function listCommand(options: {
   limit?: string;
   flat?: boolean;
 }): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
   try {
     const result = await callPcpTool<SessionListResult>('list_sessions', {
       email: config.email,
-      agentId: options.agent,
+      sbSlug: options.agent,
       limit: parseInt(options.limit || '10', 10),
     });
 
@@ -538,9 +521,9 @@ async function listCommand(options: {
 }
 
 async function showCommand(sessionId: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -551,7 +534,7 @@ async function showCommand(sessionId: string): Promise<void> {
     });
 
     console.log(chalk.bold(`\nSession: ${session.id}\n`));
-    console.log(chalk.dim('  Agent:    ') + (session.agentId || 'unknown'));
+    console.log(chalk.dim('  Agent:    ') + (session.sbSlug || 'unknown'));
     console.log(chalk.dim('  Status:   ') + session.status);
     console.log(chalk.dim('  Started:  ') + formatDate(new Date(session.startedAt)));
 
@@ -600,9 +583,9 @@ async function showCommand(sessionId: string): Promise<void> {
 }
 
 async function resumeCommand(sessionId: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -630,9 +613,9 @@ async function resumeCommand(sessionId: string): Promise<void> {
 }
 
 async function endCommand(sessionId?: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -740,7 +723,7 @@ async function pullSyncedTranscriptCommand(
     json?: boolean;
   }
 ): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   try {
     const payload = await fetchAdminJson<SyncedTranscriptPayload>({
       path: `/api/admin/sessions/${encodeURIComponent(sessionId)}/transcript?format=json`,

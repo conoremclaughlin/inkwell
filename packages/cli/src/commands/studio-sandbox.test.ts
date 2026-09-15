@@ -41,12 +41,12 @@ describe('studio sandbox planning', () => {
     const studioPath = join(tmpRoot, 'repo--alpha');
     git(`worktree add -b lumen/studio/alpha "${studioPath}"`, repoRoot);
 
-    mkdirSync(join(studioPath, '.pcp'), { recursive: true });
+    mkdirSync(join(studioPath, '.ink'), { recursive: true });
     writeFileSync(
-      join(studioPath, '.pcp', 'identity.json'),
+      join(studioPath, '.ink', 'identity.json'),
       JSON.stringify(
         {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           studio: 'alpha',
           studioId: 'studio-alpha',
           branch: 'lumen/studio/alpha',

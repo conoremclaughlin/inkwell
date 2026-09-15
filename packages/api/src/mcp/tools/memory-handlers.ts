@@ -5,6 +5,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -18,10 +19,17 @@ import {
   pinSessionAgent,
   getRequestContext,
 } from '../../utils/request-context';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
+import {
+  isSessionAuthorized,
+  loadAuthorizedAmbientSession,
+  resolveCallerIdentity,
+  type CallerIdentity,
+} from './caller-identity';
 import { getCloudSkillsService } from '../../skills/cloud-service';
 import { resolveMainStudio } from '../../services/sessions/session-service';
+import { StudioLeaseService } from '../../services/studio-lease.service';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -45,13 +53,13 @@ const BUNDLED_CONVENTIONS_PATH = path.resolve(
 );
 
 // Enums for validation
-const memorySourceSchema = z.enum([
-  'conversation',
-  'observation',
-  'user_stated',
-  'inferred',
-  'session',
-]);
+// Source is provenance and is intentionally open. The DB CHECK constraint that
+// limited it to a fixed set was dropped (migration 20260219080201) so agents can
+// use descriptive sources, and the MemorySource model type is likewise open
+// (`string & {}`). Keep this a permissive string — a strict enum here is the one
+// remaining gate that wrongly rejects valid provenance like "pr-review" /
+// "codex-review". Canonical values are documented on the field describes below.
+const memorySourceSchema = z.string().min(1);
 const salienceSchema = z.enum(['low', 'medium', 'high', 'critical']);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -95,6 +103,160 @@ function resolveStudioScope(rawStudioId: string | undefined): string | null | un
   return undefined;
 }
 
+/** Why an implicit session lookup came back empty — shapes the error the caller sees. */
+export type ImplicitSessionFailure = 'no-agent-identity' | 'no-session' | 'ambiguous';
+
+export type ImplicitSessionResult =
+  | { session: Session; via: 'context' | 'lookup' }
+  | { session: null; reason: ImplicitSessionFailure; candidateCount?: number };
+
+/**
+ * Resolve the caller.
+ *
+ * Kept async and routed through one place because handlers each resolve the
+ * caller exactly once and pass it down; the identity itself is synchronous.
+ *
+ * An earlier revision derived the contact scope from the ambient session named
+ * by `x-ink-context`, verifying that session's IDENTITY first. That was not an
+ * authentication boundary: the header is unsigned base64url JSON, and a runner
+ * token serving contact A can name contact B's session under the SAME sbId, so
+ * the identity check passes and the caller adopts B's scope (Lumen, round 3).
+ * The scope now comes only from the signed token claim.
+ *
+ * An agent-bound caller with no signed contact claim therefore has owner scope,
+ * and the symmetric comparison in isSessionAuthorized refuses every
+ * contact-scoped session to it. That matches resolveObservePermission, which
+ * already denies contact sessions to agents outright.
+ */
+export async function resolveCaller(
+  _dataComposer: DataComposer,
+  _userId: string,
+  explicitSlug?: string
+): Promise<CallerIdentity> {
+  return resolveCallerIdentity(explicitSlug);
+}
+
+/** Error text for a denied explicit target. Deliberately does not confirm existence. */
+function unauthorizedSessionError(toolName: string): string {
+  return (
+    `Not authorized to target that session: it belongs to another identity. ` +
+    `${toolName} confines agent-bound callers to their own sessions — repairing ` +
+    `another agent's session is a user/admin operation.`
+  );
+}
+
+/**
+ * Resolve the session targeted by a call that omitted `sessionId`.
+ *
+ * Every candidate is scoped to the calling agent. The previous behaviour —
+ * `getActiveSession(user.id, params.sbSlug, studioScope)` with `params.sbSlug`
+ * passed through raw — degenerated to "the most recently started open session
+ * for this user" whenever the caller omitted both `sbSlug` and `studioId`,
+ * because the repository skips the `agent_id` and `studio_id` filters when they
+ * are undefined. On a single-user install every SB's session is a candidate, so
+ * an agent whose own session started long ago would deterministically write to
+ * whichever agent had started a session most recently.
+ *
+ * That is not hypothetical: on 2026-08-16 myra's heartbeat wrote its context and
+ * currentPhase onto lumen's `pr:500` session. myra's session had been open since
+ * Aug 5, so it could never win a recency race against a freshly spawned peer.
+ *
+ * Resolution order:
+ *   1. an explicit `studioId` from the caller — identity-scoped, in that studio
+ *   2. the session the caller is actually running in, per the `x-ink-context`
+ *      token, once confirmed to belong to the calling identity
+ *   3. an identity-scoped lookup using the studio scope from the request context
+ *
+ * Every step must identify EXACTLY ONE session. Where the first version of this
+ * fix still took the most recent of several, it now reports `ambiguous` — one SB
+ * routinely has a session per worktree, and picking the newest of those is the
+ * same guess that caused the incident, just one level in.
+ *
+ * Returns `no-agent-identity` when the caller cannot be identified. Callers MUST
+ * fail closed on that: an unscoped query is what caused the cross-agent write.
+ */
+export async function resolveImplicitSession(
+  dataComposer: DataComposer,
+  userId: string,
+  caller: CallerIdentity,
+  explicitStudioScope: string | null | undefined
+): Promise<ImplicitSessionResult> {
+  if (!caller.sbId && !caller.sbSlug) {
+    return { session: null, reason: 'no-agent-identity' };
+  }
+
+  const pick = (candidates: Session[]): ImplicitSessionResult => {
+    if (candidates.length === 0) return { session: null, reason: 'no-session' };
+    if (candidates.length > 1) {
+      return { session: null, reason: 'ambiguous', candidateCount: candidates.length };
+    }
+    return { session: candidates[0], via: 'lookup' };
+  };
+
+  // An explicit studioId means the caller is deliberately targeting a worktree
+  // other than (or including) the one they run in, so it outranks the ambient
+  // session from the request context.
+  if (explicitStudioScope !== undefined) {
+    return pick(
+      await dataComposer.repositories.memory.findOwnedActiveSessions({
+        userId,
+        sbId: caller.sbId,
+        sbSlug: caller.sbSlug,
+        contactId: caller.contactId,
+        studioId: explicitStudioScope,
+      })
+    );
+  }
+
+  const ctx = getRequestContext();
+
+  // The runtime tells us which session it is executing in. Prefer it over any
+  // lookup — but only once the row is loaded and authorized for this caller.
+  // The signed claim is authenticated; the header form is a caller-composed
+  // assertion that nothing has checked. One loader serves every stamp of a
+  // session onto a record (see caller-identity.ts), so this is the same
+  // decision send_response makes.
+  const ambient = await loadAuthorizedAmbientSession(dataComposer, userId, caller);
+  if (ambient.session) {
+    return { session: ambient.session, via: 'context' };
+  }
+
+  // No usable context session. Scope by the studio the caller is in when we know
+  // it; when we do not, several worktrees can match and we refuse rather than
+  // pick the newest.
+  return pick(
+    await dataComposer.repositories.memory.findOwnedActiveSessions({
+      userId,
+      sbId: caller.sbId,
+      sbSlug: caller.sbSlug,
+      contactId: caller.contactId,
+      studioId: resolveStudioScope(ctx?.studioId ?? ctx?.studioHint),
+    })
+  );
+}
+
+/** The error returned when an implicit session lookup finds nothing usable. */
+function implicitSessionError(
+  result: { reason: ImplicitSessionFailure; candidateCount?: number },
+  toolName: string
+): string {
+  if (result.reason === 'no-agent-identity') {
+    return (
+      `Cannot determine which session to target: no agent identity on this request. ` +
+      `Pass sessionId explicitly (or sbSlug) — ${toolName} will not fall back to an ` +
+      `unscoped lookup, because that can select another agent's session.`
+    );
+  }
+  if (result.reason === 'ambiguous') {
+    return (
+      `Ambiguous session: ${result.candidateCount ?? 'several'} active sessions match this ` +
+      `identity across studios, so ${toolName} will not guess which one you mean. ` +
+      `Pass sessionId, or studioId to scope to one worktree.`
+    );
+  }
+  return `No active session found for this identity. Start a session first, or pass sessionId explicitly.`;
+}
+
 /**
  * Resolve contactId from explicit param or session context.
  * This is the auto-inheritance mechanism: once a contact-scoped session
@@ -115,12 +277,12 @@ function resolveContactId(params: { contactId?: string }): string | undefined {
  * different agent must not be merged even if the sessionId matches.
  */
 export function isCallerSessionEligible(
-  callerSession: { userId?: string; agentId?: string },
+  callerSession: { userId?: string; sbSlug?: string },
   userId: string,
-  agentId: string | undefined
+  sbSlug: string | undefined
 ): boolean {
   if (callerSession.userId !== userId) return false;
-  if (agentId && callerSession.agentId !== agentId) return false;
+  if (sbSlug && callerSession.sbSlug !== sbSlug) return false;
   return true;
 }
 
@@ -131,7 +293,7 @@ export function isCallerSessionEligible(
 export function mapSessionForBootstrap(
   s: {
     id: string;
-    agentId?: string;
+    sbSlug?: string;
     studioId?: string;
     threadKey?: string;
     activeThreadKey?: string;
@@ -144,7 +306,7 @@ export function mapSessionForBootstrap(
 ) {
   return {
     id: s.id,
-    agentId: s.agentId,
+    sbSlug: s.sbSlug,
     studioId: s.studioId || null,
     threadKey: s.threadKey || null,
     activeThreadKey: s.activeThreadKey || null,
@@ -171,160 +333,11 @@ const topicsSchema = z
 
 // ==============================================// KNOWLEDGE SUMMARY BUILDER
 // ==============================================
-/** Default character budget for the bootstrap knowledge summary. Override with BOOTSTRAP_MEMORY_BUDGET env var. */
-const DEFAULT_MEMORY_BUDGET = 8000;
+// Moved to services/memory/knowledge-summary.ts so the ContextBuilder can use
+// the same budgeted renderer. Re-exported here for existing importers.
+import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
 
-function getMemoryBudget(): number {
-  const envBudget = process.env.BOOTSTRAP_MEMORY_BUDGET;
-  if (envBudget) {
-    const parsed = parseInt(envBudget, 10);
-    if (!isNaN(parsed) && parsed > 0) return parsed;
-  }
-  return DEFAULT_MEMORY_BUDGET;
-}
-
-interface TopicGroup {
-  topicKey: string;
-  memories: Array<{
-    id: string;
-    displayText: string;
-    salience: string;
-    createdAt: string;
-  }>;
-  memoryCount: number;
-  lastActivity: string;
-  topicSummary?: string; // From metadata.topicSummary on the most recent memory
-}
-
-/**
- * Build a budget-constrained knowledge summary from memories grouped by topic.
- * Returns both the formatted summary text and a topic index for overflow.
- */
-export function buildKnowledgeSummary(memories: import('../../data/models/memory').Memory[]): {
-  knowledgeSummary: string;
-  topicIndex: Array<{
-    topicKey: string;
-    memoryCount: number;
-    lastActivity: string;
-    topicSummary?: string;
-  }>;
-  memoriesIncluded: number;
-  memoryIds: string[];
-} {
-  const budget = getMemoryBudget();
-
-  // Group memories by topicKey (or first topic, or 'uncategorized')
-  const groups = new Map<string, TopicGroup>();
-
-  for (const m of memories) {
-    const key = m.topicKey || (m.topics.length > 0 ? m.topics[0] : 'uncategorized');
-    // Critical memories get full content (core identity, worth the budget).
-    // High memories get truncated. Skip summary when it's identical to content.
-    const rawText = m.summary && m.summary !== m.content ? m.summary : m.content;
-    const displayText =
-      m.salience === 'critical' ? truncateContent(rawText, 1000) : truncateContent(rawText, 200);
-    const createdAt = m.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
-
-    if (!groups.has(key)) {
-      groups.set(key, {
-        topicKey: key,
-        memories: [],
-        memoryCount: 0,
-        lastActivity: createdAt,
-        topicSummary: (m.metadata?.topicSummary as string) || undefined,
-      });
-    }
-
-    const group = groups.get(key)!;
-    group.memories.push({
-      id: m.id,
-      displayText,
-      salience: m.salience,
-      createdAt,
-    });
-    group.memoryCount++;
-    if (createdAt > group.lastActivity) group.lastActivity = createdAt;
-    // Use topicSummary from the most recent memory that has one
-    if (!group.topicSummary && m.metadata?.topicSummary) {
-      group.topicSummary = m.metadata.topicSummary as string;
-    }
-  }
-
-  // Sort groups: most recent activity first
-  const sortedGroups = Array.from(groups.values()).sort((a, b) =>
-    b.lastActivity.localeCompare(a.lastActivity)
-  );
-
-  // Build the summary within budget
-  let summary = '';
-  let charsUsed = 0;
-  let memoriesIncluded = 0;
-  const includedTopics = new Set<string>();
-  const includedMemoryIds: string[] = [];
-  const overflowTopics: typeof sortedGroups = [];
-
-  for (const group of sortedGroups) {
-    // Format this group
-    const header = group.topicSummary
-      ? `### ${group.topicKey} — ${truncateContent(group.topicSummary, 120)}\n`
-      : `### ${group.topicKey}\n`;
-
-    let groupText = header;
-    for (const mem of group.memories) {
-      groupText += `- ${mem.displayText} (${mem.salience}, ${mem.createdAt})\n`;
-    }
-    groupText += '\n';
-
-    if (charsUsed + groupText.length <= budget) {
-      summary += groupText;
-      charsUsed += groupText.length;
-      memoriesIncluded += group.memories.length;
-      includedTopics.add(group.topicKey);
-      for (const mem of group.memories) includedMemoryIds.push(mem.id);
-    } else if (charsUsed + header.length + 50 <= budget) {
-      // Try to fit at least the header + first memory
-      const firstMem = group.memories[0];
-      const partialText =
-        header + `- ${firstMem.displayText} (${firstMem.salience}, ${firstMem.createdAt})\n`;
-      const suffix =
-        group.memories.length > 1
-          ? `  ... and ${group.memories.length - 1} more memories\n\n`
-          : '\n';
-      const totalPartial = partialText + suffix;
-      if (charsUsed + totalPartial.length <= budget) {
-        summary += totalPartial;
-        charsUsed += totalPartial.length;
-        memoriesIncluded += 1;
-        includedTopics.add(group.topicKey);
-        includedMemoryIds.push(firstMem.id);
-      } else {
-        overflowTopics.push(group);
-      }
-    } else {
-      overflowTopics.push(group);
-    }
-  }
-
-  // Build topic index from ALL topics (including overflow)
-  const topicIndex = sortedGroups.map((g) => ({
-    topicKey: g.topicKey,
-    memoryCount: g.memoryCount,
-    lastActivity: g.lastActivity,
-    topicSummary: g.topicSummary,
-  }));
-
-  return {
-    knowledgeSummary: summary.trim(),
-    topicIndex,
-    memoriesIncluded,
-    memoryIds: includedMemoryIds,
-  };
-}
-
-function truncateContent(content: string, maxLen: number): string {
-  if (content.length <= maxLen) return content;
-  return content.slice(0, maxLen - 3) + '...';
-}
+export { buildKnowledgeSummary };
 
 // ==============================================// MEMORY TOOLS
 // ==============================================
@@ -348,18 +361,22 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .describe(
       'One-liner description of the topic itself (not this memory). Used to build the topic index at bootstrap. Only needed when creating a new topic or updating its description.'
     ),
-  source: memorySourceSchema.optional().describe('Source of the memory (default: observation)'),
+  source: memorySourceSchema
+    .optional()
+    .describe(
+      'Provenance of the memory. Canonical values: conversation, observation, user_stated, inferred, session, reflection. Free-form is allowed for specific provenance (e.g. "pr-review", "codex-review", "posthoc-review"). Default: observation.'
+    ),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
   topics: topicsSchema.describe('Topics for categorization'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-  expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
-  agentId: z
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
+  expiresAt: isoDateTime().optional().describe('Optional expiration date (ISO 8601)'),
+  sbSlug: z
     .string()
     .optional()
     .describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Contact ID for per-sender memory scoping. Auto-inherited from session context when available. Null = owner/system memory.'
@@ -369,6 +386,17 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .optional()
     .describe(
       'Studio ID — preferred session scope for parallel worktree scenarios. Stored in metadata, not as a first-class field.'
+    ),
+  // The caller sometimes knows exactly which session this memory belongs to —
+  // chat's /eject passes its own runtime.sessionId. That is strictly better
+  // information than re-deriving "the active session" server-side, which is a
+  // heuristic that can resolve to a sibling session in parallel worktrees.
+  sessionId: z
+    .string()
+    .guid()
+    .optional()
+    .describe(
+      'Session to attribute this memory to. Takes precedence over the server-side active-session lookup; omit to let the server infer it.'
     ),
 });
 
@@ -380,22 +408,26 @@ export const recallSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback to text). Default: hybrid.'
     ),
-  source: memorySourceSchema.optional().describe('Filter by source'),
+  source: memorySourceSchema
+    .optional()
+    .describe(
+      'Filter by source (any provenance string, e.g. observation, user_stated, pr-review).'
+    ),
   salience: salienceSchema.optional().describe('Filter by salience'),
   topics: topicsSchema.describe('Filter by topics (any match)'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
   includeExpired: z.boolean().optional().describe('Include expired memories'),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
   includeShared: z
     .boolean()
     .optional()
-    .describe('Include shared memories (agentId=null) when filtering by agentId (default: true)'),
+    .describe('Include shared memories (sbSlug=null) when filtering by sbSlug (default: true)'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Filter by contact ID for per-sender memory isolation. When set, only returns memories scoped to this contact.'
@@ -403,14 +435,14 @@ export const recallSchema = userIdentifierBaseSchema.extend({
 });
 
 export const forgetSchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to forget'),
+  memoryId: z.string().guid().describe('ID of the memory to forget'),
 });
 
 export const updateMemorySchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to update'),
+  memoryId: z.string().guid().describe('ID of the memory to update'),
   salience: salienceSchema.optional().describe('New salience level'),
   topics: topicsSchema.describe('New topics'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata to merge'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata to merge'),
 });
 
 // ==============================================// SESSION TOOLS
@@ -418,12 +450,12 @@ export const updateMemorySchema = userIdentifierBaseSchema.extend({
 export const startSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Optional PCP session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
     ),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Identifier for the agent (e.g., "claude-code", "telegram-myra")'),
@@ -446,12 +478,12 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
   model: z.string().optional().describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Contact ID for per-sender session isolation. When set, the session is scoped to this contact.'
     ),
-  metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional session metadata'),
   repoRoot: z
     .string()
     .optional()
@@ -467,10 +499,10 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
 export const endSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID (uses active session if not provided)'),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -484,10 +516,10 @@ export const endSessionSchema = userIdentifierBaseSchema.extend({
 export const getSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID (returns active session if not provided)'),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -499,7 +531,7 @@ export const getSessionSchema = userIdentifierBaseSchema.extend({
 });
 
 export const listSessionsSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().optional().describe('Filter by agent'),
+  sbSlug: z.string().optional().describe('Filter by agent'),
   studioId: z
     .string()
     .optional()
@@ -514,6 +546,18 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
       }
     ),
   backend: z.string().optional().describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
+  // `ink attach` and `ink mission` have always passed status: 'active' here.
+  // The parameter was never declared, so zod stripped it and every caller
+  // silently received unfiltered results. Declaring it without honouring it
+  // would be the same bug with extra steps, so listSessions filters on it —
+  // on the session's derived current state, not on the deprecated
+  // `sessions.status` column, which no terminal path keeps in sync.
+  status: z
+    .enum(['active', 'paused', 'resumable', 'completed', 'attachable'])
+    .optional()
+    .describe(
+      "Filter by current state. 'active' = not finished, which includes sessions an agent marked paused or resumable, and excludes crashed ones; 'attachable' = 'active' plus crashed sessions (lifecycle 'failed'), which is what session pickers want since a crashed session is the one its agent resumes next; 'completed' = finished or failed; 'paused'/'resumable' = agent-declared, among unfinished sessions only."
+    ),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
@@ -522,7 +566,7 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
 export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Session ID (uses active session if not provided). Most reliable way to target a specific session.'
@@ -545,7 +589,7 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
     .describe(
       "Optional note explaining the phase (e.g., what you're blocked on). Included in auto-created memory for blocked/waiting phases."
     ),
-  agentId: z.string().optional().describe('Agent identity for memory attribution'),
+  sbSlug: z.string().optional().describe('Agent identity for memory attribution'),
   createTask: z
     .boolean()
     .optional()
@@ -590,7 +634,7 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
 // ==============================================// MEMORY HISTORY SCHEMAS
 // ==============================================
 export const getMemoryHistorySchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to get history for'),
+  memoryId: z.string().guid().describe('ID of the memory to get history for'),
 });
 
 export const getUserHistorySchema = userIdentifierBaseSchema.extend({
@@ -599,7 +643,7 @@ export const getUserHistorySchema = userIdentifierBaseSchema.extend({
 });
 
 export const restoreMemorySchema = userIdentifierBaseSchema.extend({
-  historyId: z.string().uuid().describe('ID of the history entry to restore from'),
+  historyId: z.string().guid().describe('ID of the history entry to restore from'),
 });
 
 // ==============================================// BOOTSTRAP SCHEMA
@@ -607,7 +651,7 @@ export const restoreMemorySchema = userIdentifierBaseSchema.extend({
 export const bootstrapSchema = userIdentifierBaseSchema.extend({
   workspaceId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional product workspace scope for shared document resolution'),
   includeRecentMemories: z
@@ -628,7 +672,7 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Set true when bootstrapping after context compaction. Includes the most recent memories regardless of salience to restore context continuity.'
     ),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe(
@@ -637,7 +681,7 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
   identityBasePath: z
     .string()
     .optional()
-    .describe('Base path for identity files (default: ~/.pcp)'),
+    .describe('Base path for identity files (default: ~/.ink)'),
   threadKey: z
     .string()
     .optional()
@@ -657,10 +701,10 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
 export const compactSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID to compact (uses active session if not provided)'),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -687,20 +731,59 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);
   const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
-  const agentId = getEffectiveAgentId(params.agentId);
+  const sbSlug = getEffectiveSlug(params.sbSlug);
 
-  // If there's an active session, attach its ID to the memory metadata for traceability.
-  // Never require a session — memories are too important to lose.
-  let sessionId: string | undefined;
-  try {
-    const activeSession = await dataComposer.repositories.memory.getActiveSession(
-      user.id,
-      agentId,
-      studioScope
-    );
-    sessionId = activeSession?.id;
-  } catch {
-    // Session lookup failed — save the memory anyway
+  // Attach a session ID to the memory metadata for traceability. An explicit
+  // sessionId from the caller wins: it knows which session it is.
+  //
+  // Otherwise resolve it the same way every other session-targeting tool does,
+  // which prefers the session the caller is ACTUALLY RUNNING IN (per the signed
+  // token / `x-ink-context`) over any lookup. This handler used to call
+  // `getActiveSession(user.id, sbSlug, studioScope)` directly — the unscoped
+  // recency lookup described at `resolveImplicitSession`, which returns "the
+  // most recently started open session" for the identity and so deterministically
+  // loses to any newer sibling row.
+  //
+  // That is not hypothetical. On 2026-09-10 routing created myra session
+  // d1d105ec with no process behind it (backend_session_id null, every token
+  // counter 0, lifecycle 'running'). As the newest myra row it captured EVERY
+  // subsequent remember() call — 0 of that day's memories reached her live
+  // session — while `update_session_state`, already on the resolver below, kept
+  // writing to the right one from the same agent in the same minute.
+  //
+  // Attribution failure must never cost a memory, so unlike its peers this
+  // handler does not fail closed: an unresolved session saves with no sessionId
+  // rather than throwing. Absent provenance is recoverable; wrong provenance
+  // silently corrupts the record.
+  let sessionId: string | undefined = params.sessionId;
+  if (!sessionId) {
+    try {
+      // The effective identity, not the raw parameter. On the normal local
+      // auth shape — a user bearer plus ctx.sbSlug enriched from the ambient
+      // session — a call that omits its optional sbSlug still knows who it
+      // is: `sbSlug` above is already 'myra'. Passing params.sbSlug here
+      // handed the resolver `undefined`, which exited with no-agent-identity
+      // before ever inspecting a valid, unambiguous ambient session (Lumen,
+      // #596). For an agent-bound token the explicit value is ignored by
+      // resolveCallerIdentity, so this never confers agent authority: the
+      // caller stays a user token, confined to same-user sessions only.
+      const caller = await resolveCaller(dataComposer, user.id, sbSlug);
+      const resolved = await resolveImplicitSession(dataComposer, user.id, caller, studioScope);
+      sessionId = resolved.session?.id;
+      if (!resolved.session) {
+        logger.warn('Saving memory without session attribution', {
+          sbSlug: sbSlug || 'none',
+          reason: resolved.reason,
+          candidateCount: resolved.candidateCount,
+        });
+      }
+    } catch (error) {
+      // Session lookup failed — save the memory anyway, unattributed.
+      logger.warn('Session resolution threw while saving a memory', {
+        sbSlug: sbSlug || 'none',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   const metadata = {
@@ -722,14 +805,14 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
     topics: params.topics,
     metadata,
     expiresAt: params.expiresAt ? new Date(params.expiresAt) : undefined,
-    agentId,
+    sbSlug,
     contactId,
   });
 
   logger.info(`Memory created for user ${user.id}`, {
     memoryId: memory.id,
     source: memory.source,
-    agentId: agentId || 'none',
+    sbSlug: sbSlug || 'none',
     sessionId: sessionId || 'none',
   });
 
@@ -749,7 +832,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
               source: memory.source,
               salience: memory.salience,
               topics: memory.topics,
-              agentId: memory.agentId,
+              sbSlug: memory.sbSlug,
               sessionId: sessionId || null,
               createdAt: memory.createdAt.toISOString(),
             },
@@ -775,7 +858,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
     topics: params.topics,
     limit: params.limit,
     includeExpired: params.includeExpired,
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     includeShared: params.includeShared,
     contactId,
   };
@@ -787,7 +870,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
   );
 
   logger.info(`Recalled ${candidates.length} memories for user ${user.id}`, {
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
   });
 
   return {
@@ -807,7 +890,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
               source: c.memory.source,
               salience: c.memory.salience,
               topics: c.memory.topics,
-              agentId: c.memory.agentId,
+              sbSlug: c.memory.sbSlug,
               metadata: c.memory.metadata,
               createdAt: c.memory.createdAt.toISOString(),
               expiresAt: c.memory.expiresAt?.toISOString(),
@@ -831,7 +914,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
   accepted: z
     .array(
       z.object({
-        memoryId: z.string().uuid(),
+        memoryId: z.string().guid(),
         semanticScore: z.number().optional(),
         textScore: z.number().optional(),
         finalScore: z.number().optional(),
@@ -843,7 +926,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
   dismissed: z
     .array(
       z.object({
-        memoryId: z.string().uuid(),
+        memoryId: z.string().guid(),
         semanticScore: z.number().optional(),
         textScore: z.number().optional(),
         finalScore: z.number().optional(),
@@ -852,8 +935,8 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default([])
     .describe('Memories the SB found irrelevant — will be evicted from context'),
-  agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
-  sessionId: z.string().uuid().optional().describe('Current session ID for attribution'),
+  sbSlug: z.string().optional().describe('Agent identity (e.g., "wren")'),
+  sessionId: z.string().guid().optional().describe('Current session ID for attribution'),
 });
 
 export async function handleCurateRecall(args: unknown, dataComposer: DataComposer) {
@@ -905,7 +988,7 @@ export async function handleCurateRecall(args: unknown, dataComposer: DataCompos
 
   const saved = await dataComposer.repositories.recallFeedback.saveFeedback({
     userId: user.id,
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     query: params.query,
     sessionId: params.sessionId,
     entries,
@@ -915,7 +998,7 @@ export async function handleCurateRecall(args: unknown, dataComposer: DataCompos
 
   logger.info(
     `Recall curation: ${params.accepted.length} accepted, ${params.dismissed.length} dismissed for user ${user.id}`,
-    { agentId: params.agentId }
+    { sbSlug: params.sbSlug }
   );
 
   return {
@@ -1017,40 +1100,86 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
   let studioScope = resolveStudioScope(rawStudioId);
-  const agentId = getEffectiveAgentId(params.agentId);
+  const sbSlug = getEffectiveSlug(params.sbSlug);
 
   // When studioScope is null ("main" sentinel) and repoRoot is provided,
   // resolve to a real studio UUID — auto-creating the studio if needed.
-  if (studioScope === null && params.repoRoot && agentId) {
+  if (studioScope === null && params.repoRoot && sbSlug) {
     const client = dataComposer.getClient();
-    const mainStudioId = await resolveMainStudio(client, user.id, params.repoRoot, agentId, {
+    const mainStudioId = await resolveMainStudio(client, user.id, params.repoRoot, sbSlug, {
       autoCreate: true,
     });
     if (mainStudioId) studioScope = mainStudioId;
   }
 
+  // Resolve the caller BEFORE any reuse lookup. The canonical identity used to
+  // be computed only at insert time, so reuse matched on the slug alone and
+  // could hand back a same-named identity's session from another workspace —
+  // including its backendSessionId, which resumes that conversation.
+  const creator = resolveCallerIdentity(params.sbSlug);
+
+  // A contact scope is part of who the caller is, not a parameter it picks.
+  // Without this an agent-bound caller could mint or adopt a session in any
+  // contact scope and then authorize itself into it.
+  const requestedContactId = params.contactId;
+  if (creator.agentBound && requestedContactId && requestedContactId !== creator.contactId) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error:
+                'Not authorized to start a session in that contact scope: contactId must match ' +
+                'the contact this runner was issued for. Contact scope comes from the signed ' +
+                'token binding, not from a parameter.',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+  const contactScope = creator.agentBound ? creator.contactId : requestedContactId;
+
   // Session matching priority:
-  // 1. threadKey match — find active session with same agent+threadKey
-  // 2. studioId match — find active session scoped by agent+studio (existing behavior)
+  // 1. threadKey match — find active session with same identity+threadKey
+  // 2. studioId match — find active session scoped by identity+studio
   let existingSession = null;
 
-  if (!params.forceNew && params.threadKey && agentId) {
+  if (!params.forceNew && params.threadKey && sbSlug) {
     existingSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
       user.id,
-      agentId,
+      sbSlug,
       params.threadKey,
       studioScope,
-      params.contactId
+      contactScope,
+      creator.sbId
     );
   }
 
   if (!params.forceNew && !existingSession) {
     existingSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
-      agentId,
+      sbSlug,
       studioScope,
-      params.contactId
+      contactScope,
+      creator.sbId
     );
+  }
+
+  // Belt and braces: a reused row must still pass the boundary. The scoped
+  // queries above should make this unreachable, which is the point — an
+  // unreachable check is cheap, and a reachable one here would be a disclosure.
+  if (existingSession && !isSessionAuthorized(existingSession, user.id, creator)) {
+    logger.warn('Refusing to reuse a session the caller is not authorized for', {
+      sessionId: existingSession.id,
+      callerSbId: creator.sbId,
+      callerSlug: creator.sbSlug,
+    });
+    existingSession = null;
   }
 
   if (existingSession) {
@@ -1065,7 +1194,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
               user: { id: user.id, resolvedBy },
               session: {
                 id: existingSession.id,
-                agentId: existingSession.agentId,
+                sbSlug: existingSession.sbSlug,
                 studioId: existingSession.studioId,
                 threadKey: existingSession.threadKey || null,
                 status: existingSession.status || null,
@@ -1089,16 +1218,25 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
 
   // Pass studioScope directly: "main" → null writes studio_id=NULL explicitly,
   // UUID → writes the UUID, undefined → column omitted (DB default NULL).
+  // Stamp the row with the caller's VERIFIED canonical identity when there is
+  // one (resolved above, before the reuse lookups). Without it startSession
+  // re-resolves the slug, and `agent_id` is unique only per
+  // (user_id, workspace_id) — so a same-named identity in another workspace can
+  // end up owning the row, which is the collision the authorization checks then
+  // have to litigate.
   const session = await dataComposer.repositories.memory.startSession({
     id: params.sessionId,
     userId: user.id,
-    agentId,
+    sbSlug,
+    ...(creator.agentBound && creator.sbId && creator.sbSlug === sbSlug
+      ? { sbId: creator.sbId }
+      : {}),
     studioId: studioScope,
     threadKey: params.threadKey,
     backend: params.backend,
     model: params.model,
     metadata: params.metadata,
-    contactId: params.contactId,
+    contactId: contactScope,
   });
 
   // Persist CLI-attached flag from request context to session record.
@@ -1123,7 +1261,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
       // stdio mode: update the session-scoped context
       setSessionContext({
         userId: user.id,
-        agentId,
+        sbSlug,
         contactId: params.contactId,
       });
     }
@@ -1131,7 +1269,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
 
   logger.info(`Session started for user ${user.id}`, {
     sessionId: session.id,
-    agentId: session.agentId,
+    sbSlug: session.sbSlug,
     studioId: session.studioId,
     threadKey: session.threadKey,
   });
@@ -1147,7 +1285,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
             user: { id: user.id, resolvedBy },
             session: {
               id: session.id,
-              agentId: session.agentId,
+              sbSlug: session.sbSlug,
               studioId: session.studioId,
               threadKey: session.threadKey || null,
               status: session.status || null,
@@ -1172,27 +1310,46 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);
-  const agentId = getEffectiveAgentId(params.agentId);
 
-  // Get session ID (use provided or find active, scoped by agent+studio)
+  // end_session is terminal and releases lease/routing state, so it needs the
+  // same boundary as update/compact. It previously had none at all: an explicit
+  // UUID went straight to endSession(), and the implicit branch used the old
+  // slug+recency getActiveSession — the very lookup this PR exists to remove.
+  const endCaller = await resolveCaller(dataComposer, user.id, params.sbSlug);
   let sessionId = params.sessionId;
-  if (!sessionId) {
-    const activeSession = await dataComposer.repositories.memory.getActiveSession(
-      user.id,
-      agentId,
-      studioScope
-    );
-    if (!activeSession) {
+  if (sessionId) {
+    const target = await dataComposer.repositories.memory.getSession(sessionId);
+    if (!target || !isSessionAuthorized(target, user.id, endCaller)) {
       return {
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify({ success: false, error: 'No active session found.' }, null, 2),
+            text: JSON.stringify(
+              { success: false, error: unauthorizedSessionError('end_session') },
+              null,
+              2
+            ),
           },
         ],
       };
     }
-    sessionId = activeSession.id;
+  } else {
+    const resolved = await resolveImplicitSession(dataComposer, user.id, endCaller, studioScope);
+    if (!resolved.session) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: implicitSessionError(resolved, 'end_session') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    sessionId = resolved.session.id;
   }
 
   const session = await dataComposer.repositories.memory.endSession(sessionId, params.summary);
@@ -1209,6 +1366,22 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   }
 
   if (session) {
+    // Automatic lease release — end_session is a terminal path regardless of
+    // which side (server or agent CLI) initiated it. MUST run BEFORE the
+    // cli_attached clear below: releaseUnlessRunning reads that flag to
+    // detect an end_session issued from inside a live CLI turn, and defers so
+    // no other thread enters the worktree while the local model is still
+    // executing in it. The deferred release fires at the CLI stop boundary
+    // (hook-lifecycle) or the server run boundary.
+    await new StudioLeaseService(dataComposer.getClient())
+      .releaseUnlessRunning(session.id, { userId: user.id, reason: 'session-end' })
+      .catch((err: unknown) => {
+        logger.warn('[StudioLease] Release on end_session failed', {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
     // Clear cli_attached flag so triggers don't get stuck in the pending queue
     // after the CLI detaches.
     await dataComposer.repositories.memory
@@ -1242,7 +1415,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
       source: 'session',
       salience: 'high',
       topics: ['session-summary'],
-      metadata: { sessionId: session.id, agentId: session.agentId },
+      metadata: { sessionId: session.id, sbSlug: session.sbSlug },
     });
   }
 
@@ -1257,7 +1430,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
             user: { id: user.id, resolvedBy },
             session: {
               id: session.id,
-              agentId: session.agentId,
+              sbSlug: session.sbSlug,
               studioId: session.studioId,
               lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
@@ -1288,15 +1461,39 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);
 
+  const caller = await resolveCaller(dataComposer, user.id, params.sbSlug);
   let session;
   if (params.sessionId) {
-    session = await dataComposer.repositories.memory.getSession(params.sessionId);
-  } else {
+    // Same gate as the mutating handlers: a bare UUID must not read across
+    // identities, and under the service role nothing else stops it.
+    const target = await dataComposer.repositories.memory.getSession(params.sessionId);
+    if (target && !isSessionAuthorized(target, user.id, caller)) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: unauthorizedSessionError('get_session') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    session = target;
+  } else if (params.sbSlug) {
+    // Read semantics: an explicit sbSlug stays a free filter, so an agent can
+    // see a peer's status. Logs are withheld below — status is not transcript.
     session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
-      params.agentId,
+      params.sbSlug,
       studioScope
     );
+  } else {
+    // No sbSlug given: "my session", not "whichever session started last".
+    const resolved = await resolveImplicitSession(dataComposer, user.id, caller, studioScope);
+    session = resolved.session;
   }
 
   if (!session) {
@@ -1314,8 +1511,10 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
     };
   }
 
+  // Logs are the session's transcript. A peer may see that another SB is
+  // "reviewing"; it may not read what that SB recorded while doing so.
   let logs;
-  if (params.includeLogs) {
+  if (params.includeLogs && isSessionAuthorized(session, user.id, caller)) {
     logs = await dataComposer.repositories.memory.getSessionLogs(session.id);
   }
 
@@ -1329,7 +1528,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
             user: { id: user.id, resolvedBy },
             session: {
               id: session.id,
-              agentId: session.agentId,
+              sbSlug: session.sbSlug,
               studioId: session.studioId,
               lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
@@ -1365,10 +1564,11 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   const filterNullStudio = scope === null;
 
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     studioId,
     filterNullStudio,
     backend: params.backend,
+    status: params.status,
     limit: params.limit,
   });
 
@@ -1390,7 +1590,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
             count: sessions.length,
             sessions: sessions.map((s) => ({
               id: s.id,
-              agentId: s.agentId,
+              sbSlug: s.sbSlug,
               studioId: s.studioId,
               studio: s.studioId
                 ? (() => {
@@ -1441,6 +1641,23 @@ function isSignificantPhaseTransition(phase: string): boolean {
   return phase.startsWith('blocked:') || phase.startsWith('waiting:') || phase === 'complete';
 }
 
+/**
+ * Whether this update finishes the session, and so should stamp `ended_at`.
+ *
+ * Nothing used to stamp it. That left `ended_at` NULL on every completed
+ * session, which in turn made the `ended_at IS NULL` clause in
+ * findByThreadKey filter nothing — so a thread whose conversation was over
+ * routed the next trigger back into the finished session instead of starting
+ * fresh (PR #349, revived).
+ *
+ * Both spellings are checked because either can carry the completion: callers
+ * may pass the legacy `status: 'completed'` or the current
+ * `lifecycle: 'completed'`.
+ */
+export function shouldStampEndedAt(params: { status?: string; lifecycle?: string }): boolean {
+  return params.status === 'completed' || params.lifecycle === 'completed';
+}
+
 function buildPhaseTransitionMemoryContent(params: {
   phase: string;
   note?: string;
@@ -1457,7 +1674,7 @@ function buildPhaseTransitionMemoryContent(params: {
 }
 
 type SessionTraceField =
-  | 'agentId'
+  | 'sbSlug'
   | 'currentPhase'
   | 'lifecycle'
   | 'status'
@@ -1467,7 +1684,7 @@ type SessionTraceField =
   | 'activeThreadKey';
 
 interface SessionTraceSnapshot {
-  agentId: string | null;
+  sbSlug: string | null;
   currentPhase: string | null;
   lifecycle: string | null;
   status: string | null;
@@ -1478,7 +1695,7 @@ interface SessionTraceSnapshot {
 }
 
 const SESSION_TRACE_FIELDS: SessionTraceField[] = [
-  'agentId',
+  'sbSlug',
   'currentPhase',
   'lifecycle',
   'status',
@@ -1497,7 +1714,7 @@ function normalizeTraceString(value: string | null | undefined, truncateAt = 240
 
 function toSessionTraceSnapshot(session: Session | null | undefined): SessionTraceSnapshot {
   return {
-    agentId: normalizeTraceString(session?.agentId),
+    sbSlug: normalizeTraceString(session?.sbSlug),
     currentPhase: normalizeTraceString(session?.currentPhase),
     lifecycle: normalizeTraceString(session?.lifecycle),
     status: normalizeTraceString(session?.status),
@@ -1557,21 +1774,23 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     };
   }
 
-  // Resolve session: sessionId > studioId-scoped lookup > most recent active
+  // Resolve session: explicit sessionId > agent-scoped implicit resolution.
+  // The implicit path is always scoped to the calling agent and fails closed —
+  // see resolveImplicitSession for why an unscoped fallback is unsafe here.
+  const updateCaller = await resolveCaller(dataComposer, user.id, params.sbSlug);
   let sessionId = params.sessionId;
-  if (!sessionId) {
-    const session = await dataComposer.repositories.memory.getActiveSession(
-      user.id,
-      params.agentId,
-      studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → no filter
-    );
-    if (!session) {
+  if (sessionId) {
+    // An explicit id is a target, not an authorization. updateSession() filters
+    // on the primary key alone and the repository runs as the service role, so
+    // without this check a UUID reaches any session — including another user's.
+    const target = await dataComposer.repositories.memory.getSession(sessionId);
+    if (!target || !isSessionAuthorized(target, user.id, updateCaller)) {
       return {
         content: [
           {
             type: 'text' as const,
             text: JSON.stringify(
-              { success: false, error: 'No active session found. Start a session first.' },
+              { success: false, error: unauthorizedSessionError('update_session_state') },
               null,
               2
             ),
@@ -1579,7 +1798,28 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         ],
       };
     }
-    sessionId = session.id;
+  } else {
+    const resolved = await resolveImplicitSession(
+      dataComposer,
+      user.id,
+      updateCaller,
+      studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → infer from context
+    );
+    if (!resolved.session) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: implicitSessionError(resolved, 'update_session_state') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    sessionId = resolved.session.id;
   }
 
   let beforeSession: Session | null = null;
@@ -1603,6 +1843,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     cliAttached?: boolean;
     alias?: string | null;
     activeThreadKey?: string | null;
+    endedAt?: Date | null;
   } = {};
 
   // Map runtime: prefix phases to lifecycle (backward compat for old callers)
@@ -1634,6 +1875,11 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.status !== undefined) {
     updates.status = params.status;
   }
+
+  if (shouldStampEndedAt({ status: params.status, lifecycle: updates.lifecycle })) {
+    updates.endedAt = new Date();
+  }
+
   if (params.backendSessionId !== undefined) {
     updates.backendSessionId = params.backendSessionId;
   }
@@ -1666,6 +1912,25 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     };
   }
 
+  // update_session_state(status/lifecycle: completed) is a terminal path just
+  // like end_session — the studio lease must not wait for expiry. Deferred
+  // while the session's in-process run is still executing; the run boundary
+  // releases then.
+  const becameTerminal =
+    updates.endedAt instanceof Date ||
+    updates.status === 'completed' ||
+    updates.lifecycle === 'completed';
+  if (becameTerminal) {
+    await new StudioLeaseService(dataComposer.getClient())
+      .releaseUnlessRunning(sessionId, { userId: user.id, reason: 'session-completed' })
+      .catch((err: unknown) => {
+        logger.warn('[StudioLease] Release on update_session_state(completed) failed', {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
   const messageParts: string[] = [];
   if (params.phase) messageParts.push(`phase → ${params.phase}`);
   if (updates.lifecycle) messageParts.push(`lifecycle → ${updates.lifecycle}`);
@@ -1683,7 +1948,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     user: { id: user.id, resolvedBy },
     session: {
       id: updated.id,
-      agentId: updated.agentId,
+      sbSlug: updated.sbSlug,
       studioId: updated.studioId,
       lifecycle: updated.lifecycle || null,
       currentPhase: updated.currentPhase || null,
@@ -1703,45 +1968,38 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
           return linked === backendSessionId;
         });
 
-        if (
-          conflict &&
-          conflict.agentId &&
-          conflict.agentId !== (updated.agentId || params.agentId)
-        ) {
+        if (conflict && conflict.sbSlug && conflict.sbSlug !== (updated.sbSlug || params.sbSlug)) {
           logger.warn('Session backendSessionId ownership conflict detected', {
             sessionId,
-            agentId: updated.agentId || params.agentId || null,
+            sbSlug: updated.sbSlug || params.sbSlug || null,
             backendSessionId,
             conflictingSessionId: conflict.id,
-            conflictingAgentId: conflict.agentId,
+            conflictingSlug: conflict.sbSlug,
           });
 
           result.sessionConflict = {
             backendSessionId,
             conflictingSessionId: conflict.id,
-            conflictingAgentId: conflict.agentId,
+            conflictingSlug: conflict.sbSlug,
           };
 
           if (activityStreamRepo?.logActivity) {
             try {
               await activityStreamRepo.logActivity({
                 userId: user.id,
-                agentId:
-                  getEffectiveAgentId(params.agentId) ??
-                  params.agentId ??
-                  updated.agentId ??
-                  'unknown',
+                sbSlug:
+                  getEffectiveSlug(params.sbSlug) ?? params.sbSlug ?? updated.sbSlug ?? 'unknown',
                 type: 'state_change',
                 subtype: 'session_backend_conflict',
                 sessionId,
                 status: 'completed',
-                content: `Session ${sessionId.slice(0, 8)} backendSessionId ${backendSessionId.slice(0, 8)} already linked to ${conflict.agentId}:${conflict.id.slice(0, 8)}`,
+                content: `Session ${sessionId.slice(0, 8)} backendSessionId ${backendSessionId.slice(0, 8)} already linked to ${conflict.sbSlug}:${conflict.id.slice(0, 8)}`,
                 payload: {
                   backendSessionId,
                   targetSessionId: sessionId,
-                  targetAgentId: updated.agentId || params.agentId || null,
+                  targetSlug: updated.sbSlug || params.sbSlug || null,
                   conflictingSessionId: conflict.id,
-                  conflictingAgentId: conflict.agentId,
+                  conflictingSlug: conflict.sbSlug,
                 },
               });
             } catch (error) {
@@ -1766,16 +2024,16 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   const trace = buildSessionTraceDiff(beforeSession, updated);
   if (trace.changedFields.length > 0) {
     if (activityStreamRepo?.logActivity) {
-      const effectiveAgentId =
-        getEffectiveAgentId(params.agentId) ??
-        params.agentId ??
-        updated.agentId ??
-        beforeSession?.agentId ??
+      const effectiveSlug =
+        getEffectiveSlug(params.sbSlug) ??
+        params.sbSlug ??
+        updated.sbSlug ??
+        beforeSession?.sbSlug ??
         'unknown';
       try {
         await activityStreamRepo.logActivity({
           userId: user.id,
-          agentId: effectiveAgentId,
+          sbSlug: effectiveSlug,
           type: 'state_change',
           subtype: 'session_update',
           sessionId,
@@ -1786,7 +2044,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
             changedFields: trace.changedFields,
             before: trace.beforeSnapshot,
             after: trace.afterSnapshot,
-            requestedByAgentId: params.agentId || null,
+            requestedBySlug: params.sbSlug || null,
             updateRequest: {
               phase: params.phase || null,
               lifecycle: params.lifecycle || null,
@@ -1827,7 +2085,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         salience: 'high',
         topics: ['session-phase', params.phase.split(':')[0]],
         metadata: { sessionId, phase: params.phase },
-        agentId: params.agentId || updated.agentId,
+        sbSlug: params.sbSlug || updated.sbSlug,
       });
 
       result.memoryCreated = {
@@ -1861,9 +2119,9 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
           tags: [
             'agent-orchestration',
             'session-phase',
-            params.agentId || updated.agentId || 'unknown',
+            params.sbSlug || updated.sbSlug || 'unknown',
           ],
-          created_by: params.agentId || updated.agentId || 'system',
+          created_by: params.sbSlug || updated.sbSlug || 'system',
         });
 
         result.taskCreated = {
@@ -2019,7 +2277,6 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
  *
  * Returns:
  * - Constitution: values, user, process (shared) + identity, heartbeat, soul (per-agent)
- * - Identity Core: user, assistant, relationship context from DB
  * - Active Context: current projects, focus, recent high-salience memories
  * - Active Session: current session info if any
  */
@@ -2028,35 +2285,35 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
   // Pin the agent identity for this session (immutable once set).
-  // If request context already has an agentId from a token, validate it matches.
-  if (params.agentId) {
+  // If request context already has an sbSlug from a token, validate it matches.
+  if (params.sbSlug) {
     const reqCtx = getRequestContext();
-    if (reqCtx?.agentId && reqCtx.agentId !== params.agentId) {
+    if (reqCtx?.sbSlug && reqCtx.sbSlug !== params.sbSlug) {
       throw new Error(
-        `Token is bound to agent "${reqCtx.agentId}" but bootstrap was called with "${params.agentId}". ` +
+        `Token is bound to agent "${reqCtx.sbSlug}" but bootstrap was called with "${params.sbSlug}". ` +
           `Use a token issued for this agent, or remove the agent_id from the token.`
       );
     }
-    pinSessionAgent(params.agentId);
+    pinSessionAgent(params.sbSlug);
   }
 
   // Set session context so subsequent MCP tool calls can use this user
   setSessionContext({
     userId: user.id,
     email: user.email || undefined,
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
   });
 
   const includeMemories = params.includeRecentMemories !== false;
   const memoryLimit = params.memoryLimit ?? 50;
   const postCompact = params.postCompact === true;
-  const agentId = params.agentId;
-  const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
+  const sbSlug = params.sbSlug;
+  const basePath = params.identityBasePath || path.join(os.homedir(), '.ink');
   const supabase = dataComposer.getClient();
 
-  // Load identity files if agentId is provided
+  // Load identity files if sbSlug is provided
   let identityFiles: {
-    agentId: string;
+    sbSlug: string;
     values: string | null;
     user: string | null;
     process: string | null;
@@ -2065,22 +2322,22 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     soul: string | null;
   } | null = null;
 
-  if (agentId) {
+  if (sbSlug) {
     // Load constitution from local filesystem (fallback for DB)
-    // Agent-specific: ~/.ink/individuals/{agentId}/ (identity, heartbeat, soul)
+    // Agent-specific: ~/.ink/individuals/{sbSlug}/ (identity, heartbeat, soul)
     // Shared: ~/.ink/shared/ (values, user, process)
     const [valuesContent, userContent, processContent, selfContent, heartbeatContent, soulContent] =
       await Promise.all([
         safeReadFile(path.join(basePath, 'shared', 'VALUES.md')),
         safeReadFile(path.join(basePath, 'shared', 'USER.md')),
         safeReadFile(path.join(basePath, 'shared', 'PROCESS.md')),
-        safeReadFile(path.join(basePath, 'individuals', agentId, 'IDENTITY.md')),
-        safeReadFile(path.join(basePath, 'individuals', agentId, 'HEARTBEAT.md')),
-        safeReadFile(path.join(basePath, 'individuals', agentId, 'SOUL.md')),
+        safeReadFile(path.join(basePath, 'individuals', sbSlug, 'IDENTITY.md')),
+        safeReadFile(path.join(basePath, 'individuals', sbSlug, 'HEARTBEAT.md')),
+        safeReadFile(path.join(basePath, 'individuals', sbSlug, 'SOUL.md')),
       ]);
 
     identityFiles = {
-      agentId,
+      sbSlug,
       values: valuesContent,
       user: userContent,
       process: processContent,
@@ -2098,57 +2355,47 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
-  const [
-    contexts,
-    projects,
-    focus,
-    activeSessions,
-    dbIdentity,
-    userTimezone,
-    userSkills,
-    siblingIdentities,
-  ] = await Promise.all([
-    // Identity Core: all context summaries
-    dataComposer.repositories.context.findAllByUser(user.id),
-    // Active projects
-    dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
-    // Current focus
-    dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-    // All active sessions (filter by agentId if provided) — client picks the right one
-    dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
-    // Database identity (for cloud agents, includes metadata, heartbeat, soul)
-    agentId
-      ? dataComposer
-          .getClient()
-          .from('agent_identities')
-          .select('*')
-          .eq('user_id', user.id)
-          .eq('agent_id', agentId)
-          .single()
-          .then(({ data }) => data)
-      : Promise.resolve(null),
-    // User timezone for timestamp conversion
-    dataComposer
-      .getClient()
-      .from('users')
-      .select('timezone')
-      .eq('id', user.id)
-      .single()
-      .then(({ data }) => data?.timezone || 'UTC'),
-    // User's installed skills (local + cloud merged)
-    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
-      logger.warn('Failed to load user skills:', err);
-      return [];
-    }),
-    // Live sibling identities — structural facts for all agents under this user.
-    // Agents cross-reference this with their personal `relationships` notes.
-    supabase
-      .from('agent_identities')
-      .select('agent_id, name, role, backend, session_scope, capabilities, description')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: true })
-      .then(({ data }) => data || []),
-  ]);
+  const [projects, focus, activeSessions, dbIdentity, userTimezone, userSkills, siblingIdentities] =
+    await Promise.all([
+      // Active projects
+      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+      // Current focus
+      dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
+      // All active sessions (filter by sbSlug if provided) — client picks the right one
+      dataComposer.repositories.memory.getActiveSessions(user.id, sbSlug),
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      sbSlug
+        ? dataComposer
+            .getClient()
+            .from('agent_identities')
+            .select('*')
+            .eq('user_id', user.id)
+            .eq('agent_id', sbSlug)
+            .single()
+            .then(({ data }) => data)
+        : Promise.resolve(null),
+      // User timezone for timestamp conversion
+      dataComposer
+        .getClient()
+        .from('users')
+        .select('timezone')
+        .eq('id', user.id)
+        .single()
+        .then(({ data }) => data?.timezone || 'UTC'),
+      // User's installed skills (local + cloud merged)
+      cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+        logger.warn('Failed to load user skills:', err);
+        return [];
+      }),
+      // Live sibling identities — structural facts for all agents under this user.
+      // Agents cross-reference this with their personal `relationships` notes.
+      supabase
+        .from('agent_identities')
+        .select('agent_id, name, role, backend, session_scope, capabilities, description')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: true })
+        .then(({ data }) => data || []),
+    ]);
 
   // Ensure the caller's own session is always in the activeSessions list.
   // getActiveSessions is capped to 10 by started_at — a long-running session
@@ -2157,7 +2404,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   let mergedSessions = activeSessions;
   if (callerSessionId && !activeSessions.some((s) => s.id === callerSessionId)) {
     const callerSession = await dataComposer.repositories.memory.getSession(callerSessionId);
-    if (callerSession && isCallerSessionEligible(callerSession, user.id, agentId)) {
+    if (callerSession && isCallerSessionEligible(callerSession, user.id, sbSlug)) {
       mergedSessions = [callerSession, ...activeSessions];
     }
   }
@@ -2167,16 +2414,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const focusText = params.focusText || focus?.focus_summary || undefined;
 
   const knowledgeMemoriesBase = includeMemories
-    ? await dataComposer.repositories.memory.getKnowledgeMemories(
-        user.id,
-        agentId,
-        memoryLimit,
-        7,
-        {
-          threadKey: inferredThreadKey || undefined,
-          focusText,
-        }
-      )
+    ? await dataComposer.repositories.memory.getKnowledgeMemories(user.id, sbSlug, memoryLimit, 7, {
+        threadKey: inferredThreadKey || undefined,
+        focusText,
+      })
     : [];
 
   // Post-compact: merge in most recent memories regardless of salience
@@ -2185,7 +2426,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   if (postCompact && includeMemories) {
     const recentMemories = await dataComposer.repositories.memory.getRecentMemories(
       user.id,
-      agentId,
+      sbSlug,
       10
     );
     // Merge and dedupe — recent memories may already be in the knowledge set
@@ -2225,7 +2466,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   const legacyUserIdentityQuery = supabase
     .from('user_identity')
-    .select('shared_values_md, process_md')
+    .select('user_profile_md, shared_values_md, process_md')
     .eq('user_id', user.id);
   const { data: dbUserIdentity } = resolvedWorkspaceId
     ? await legacyUserIdentityQuery.eq('workspace_id', resolvedWorkspaceId).maybeSingle()
@@ -2234,15 +2475,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
-
-  // Organize contexts by type
-  const identityCore = {
-    user: contexts.find((c) => c.context_type === 'user' && !c.context_key),
-    assistant: contexts.find((c) => c.context_type === 'assistant' && !c.context_key),
-    relationship: contexts.find((c) => c.context_type === 'relationship' && !c.context_key),
-  };
-
-  const projectContexts = contexts.filter((c) => c.context_type === 'project');
 
   // Compute reflection status from identity metadata
   const identityMetadata = dbIdentity?.metadata as Record<string, unknown> | null;
@@ -2253,7 +2485,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     suggestion: string | null;
   } | null = null;
 
-  if (agentId) {
+  if (sbSlug) {
     let daysSince: number | null = null;
     let suggestion: string | null = null;
 
@@ -2292,6 +2524,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
           (dbWorkspaceSharedDocs?.process as string | null) ||
           (dbUserIdentity?.process_md as string | null) ||
           identityFiles.process,
+        // USER.md lives in the database; the filesystem copy is a stale cache
+        // that usually does not exist at all. Without this the doc describing
+        // the human never reached any session.
+        user: (dbUserIdentity?.user_profile_md as string | null) || identityFiles.user,
         self: (dbIdentity?.description as string | null) || identityFiles.self,
         heartbeat: (dbIdentity?.heartbeat as string | null) || identityFiles.heartbeat,
         soul: (dbIdentity?.soul as string | null) || identityFiles.soul,
@@ -2317,7 +2553,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
     // Try cache for the summary text (avoid regenerating the formatted string)
     try {
-      const cached = await dataComposer.repositories.memory.getCachedSummary(user.id, agentId);
+      const cached = await dataComposer.repositories.memory.getCachedSummary(user.id, sbSlug);
       if (cached) {
         cachedSummary = cached.summaryText;
       }
@@ -2330,7 +2566,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       dataComposer.repositories.memory
         .setCachedSummary(
           user.id,
-          agentId,
+          sbSlug,
           knowledgeSummaryResult.knowledgeSummary,
           knowledgeMemories.length
         )
@@ -2346,8 +2582,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const knowledgeMemoryIds = usedCache ? [] : knowledgeSummaryResult?.memoryIds || [];
 
   logger.info(`Bootstrap loaded for user ${user.id}`, {
-    agentId: agentId || 'none',
-    contextCount: contexts.length,
+    sbSlug: sbSlug || 'none',
     projectCount: projects.length,
     memoryCount: knowledgeMemories.length,
     knowledgeSummaryChars: knowledgeSummary.length,
@@ -2392,25 +2627,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Constitution (merged: Supabase priority, local fallback)
             identityFiles: mergedIdentity,
 
-            // Tier 1: Identity Core from DB
-            identityCore: {
-              user: identityCore.user
-                ? { summary: identityCore.user.summary, metadata: identityCore.user.metadata }
-                : null,
-              assistant: identityCore.assistant
-                ? {
-                    summary: identityCore.assistant.summary,
-                    metadata: identityCore.assistant.metadata,
-                  }
-                : null,
-              relationship: identityCore.relationship
-                ? {
-                    summary: identityCore.relationship.summary,
-                    metadata: identityCore.relationship.metadata,
-                  }
-                : null,
-            },
-
             // Tier 2: Active Context
             activeContext: {
               projects: projects.map((p) => ({
@@ -2420,10 +2636,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 status: p.status,
                 techStack: p.tech_stack,
                 goals: p.goals,
-              })),
-              projectContexts: projectContexts.map((c) => ({
-                key: c.context_key,
-                summary: c.summary,
               })),
               focus: focus
                 ? {
@@ -2444,7 +2656,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                         id: cs.id,
                         backendSessionId: cs.backendSessionId || null,
                         studioId: cs.studioId || null,
-                        agentId: cs.agentId || null,
+                        sbSlug: cs.sbSlug || null,
                         context: cs.context || null,
                       }
                     : null;
@@ -2470,7 +2682,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Database identity (structural fields only — heartbeat/soul already in identityFiles)
             dbIdentity: dbIdentity
               ? {
-                  agentId: dbIdentity.agent_id,
+                  sbSlug: dbIdentity.agent_id,
                   name: dbIdentity.name,
                   role: dbIdentity.role,
                   description: dbIdentity.description,
@@ -2487,9 +2699,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // full picture. This ensures role/backend/scope changes propagate automatically
             // without requiring each sibling to manually update their relationship entries.
             siblings: siblingIdentities
-              .filter((s) => s.agent_id !== agentId)
+              .filter((s) => s.agent_id !== sbSlug)
               .map((s) => ({
-                agentId: s.agent_id,
+                sbSlug: s.agent_id,
                 name: s.name,
                 role: s.role,
                 backend: s.backend,
@@ -2546,19 +2758,53 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
   const minSalience = params.minSalience || 'medium';
   const preserveLogs = params.preserveLogs ?? false;
 
-  // Get session ID
+  // Get session ID. Compaction reads a session's logs and soft-deletes them, so
+  // both paths must be confined to the caller's own sessions — this is the most
+  // destructive of the three handlers.
+  const compactCaller = await resolveCaller(dataComposer, user.id, params.sbSlug);
   let sessionId = params.sessionId;
   let session;
 
   if (sessionId) {
-    session = await dataComposer.repositories.memory.getSession(sessionId);
+    const target = await dataComposer.repositories.memory.getSession(sessionId);
+    if (!target || !isSessionAuthorized(target, user.id, compactCaller)) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: unauthorizedSessionError('compact_session') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    session = target;
   } else {
-    session = await dataComposer.repositories.memory.getActiveSession(
+    const resolved = await resolveImplicitSession(
+      dataComposer,
       user.id,
-      params.agentId,
+      compactCaller,
       studioScope
     );
-    sessionId = session?.id;
+    if (!resolved.session) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: implicitSessionError(resolved, 'compact_session') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    session = resolved.session;
+    sessionId = session.id;
   }
 
   if (!session || !sessionId) {

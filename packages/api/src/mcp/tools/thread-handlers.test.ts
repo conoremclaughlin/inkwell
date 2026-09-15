@@ -6,24 +6,24 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveTriggeredAgents } from './thread-handlers';
+import { resolveTriggeredAgents, resolveEffectiveFloor, isLaterInstant } from './thread-handlers';
 
 describe('resolveTriggeredAgents', () => {
   describe('1:1 threads (2 participants)', () => {
     it('should trigger the other participant', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['lumen']);
     });
 
     it('should trigger creator when non-creator replies in 1:1', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['wren']);
     });
@@ -34,18 +34,18 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger creator only when non-creator replies', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['wren']);
     });
 
     it('should trigger all others when creator replies with a plain message', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'message',
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
@@ -53,18 +53,18 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger all others when creator replies with no messageType (default)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
     });
 
     it('should trigger only explicit recipient when creator targets one person', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['myra'],
       });
       expect(result).toEqual(['myra']);
@@ -72,9 +72,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger only explicit recipient when non-creator targets one person', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['myra'],
       });
       expect(result).toEqual(['myra']);
@@ -82,9 +82,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger no one when creator explicitly targets self (same studio)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['wren'],
       });
       expect(result).toEqual([]);
@@ -92,9 +92,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger no one when non-creator explicitly targets self (same studio)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['lumen'],
       });
       expect(result).toEqual([]);
@@ -102,9 +102,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger self when explicitly targeting self with selfStudioTarget', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['wren'],
         selfStudioTarget: true,
       });
@@ -113,9 +113,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should filter explicit recipients to actual participants', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['myra', 'benson'],
       });
       expect(result).toEqual(['myra']);
@@ -127,9 +127,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger recipients when creator sends task_request', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
         recipients: ['lumen'],
       });
@@ -138,9 +138,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger all other participants when creator sends task_request without explicit recipients', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
@@ -148,9 +148,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger recipients when creator sends session_resume', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'session_resume',
         recipients: ['aster'],
       });
@@ -159,9 +159,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should filter recipients to actual participants only', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
         recipients: ['lumen', 'aster'], // aster is not a participant
       });
@@ -172,18 +172,18 @@ describe('resolveTriggeredAgents', () => {
   describe('self-thread (1 participant)', () => {
     it('should trigger no one for plain messages', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual([]);
     });
 
     it('should trigger self for session_resume (strategy self-trigger)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'session_resume',
       });
       expect(result).toEqual(['wren']);
@@ -191,9 +191,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger self for task_request', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
       });
       expect(result).toEqual(['wren']);
@@ -201,9 +201,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should not trigger self for notification', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'notification',
       });
       expect(result).toEqual([]);
@@ -213,9 +213,9 @@ describe('resolveTriggeredAgents', () => {
   describe('triggerAll override', () => {
     it('should trigger all participants except sender', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster', 'myra'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAll: true,
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
@@ -223,9 +223,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should work in 1:1 threads', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAll: true,
       });
       expect(result).toEqual(['lumen']);
@@ -235,9 +235,9 @@ describe('resolveTriggeredAgents', () => {
   describe('triggerAgents override', () => {
     it('should trigger only specified participants', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster', 'myra'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['lumen'],
       });
       expect(result).toEqual(['lumen']);
@@ -245,9 +245,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should silently ignore non-participants', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['aster', 'lumen'],
       });
       expect(result).toEqual(['lumen']);
@@ -255,9 +255,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should not trigger the sender even if listed', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['wren', 'lumen'],
       });
       expect(result).toEqual(['lumen']);
@@ -265,9 +265,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should take precedence over triggerAll', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster', 'myra'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['aster'],
         triggerAll: true,
       });
@@ -279,9 +279,9 @@ describe('resolveTriggeredAgents', () => {
   describe('cross-studio self-messaging (selfStudioTarget)', () => {
     it('should trigger sender on self-thread when selfStudioTarget is true', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         selfStudioTarget: true,
       });
       expect(result).toEqual(['wren']);
@@ -289,9 +289,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should NOT trigger sender on self-thread when selfStudioTarget is false', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         selfStudioTarget: false,
       });
       expect(result).toEqual([]);
@@ -299,9 +299,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should include sender in triggerAll when selfStudioTarget is true', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAll: true,
         selfStudioTarget: true,
       });
@@ -310,9 +310,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should include sender in explicit triggerAgents when selfStudioTarget is true', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['wren'],
         selfStudioTarget: true,
       });
@@ -321,9 +321,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should still exclude sender from explicit triggerAgents without selfStudioTarget', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['wren'],
       });
       expect(result).toEqual([]);
@@ -364,15 +364,23 @@ vi.mock('../../channels/agent-gateway.js', () => ({
       processed: false,
       accepted: true,
     }),
+    // Synchronous assignment dispatch (spec §3a) — a missing/failed
+    // processTrigger now surfaces as routingFailures (round 2), so the mock
+    // must report success for happy-path routing tests.
+    processTrigger: vi.fn().mockResolvedValue({
+      success: true,
+      triggerId: 'trigger-sync-1',
+      processed: true,
+    }),
   }),
 }));
 
 vi.mock('../../auth/enforce-identity', () => ({
-  getEffectiveAgentId: vi.fn((id?: string) => id || null),
+  getEffectiveSlug: vi.fn((id?: string) => id || null),
 }));
 
 vi.mock('../../auth/resolve-identity', () => ({
-  resolveIdentityId: vi.fn().mockResolvedValue('identity-uuid'),
+  resolveSbId: vi.fn().mockResolvedValue('identity-uuid'),
 }));
 
 vi.mock('../../utils/request-context', () => ({
@@ -504,23 +512,23 @@ describe('handleSendToInbox - validation', () => {
     vi.clearAllMocks();
   });
 
-  it('should reject when both recipientAgentId and recipients are provided', async () => {
+  it('should reject when both recipientSlug and recipients are provided', async () => {
     const mockDc = createMockDataComposer();
     await expect(
       handleSendToInbox(
         {
           email: 'test@test.com',
-          recipientAgentId: 'lumen',
+          recipientSlug: 'lumen',
           recipients: ['lumen', 'aster'],
           threadKey: 'pr:32',
           content: 'test',
         },
         mockDc as never
       )
-    ).rejects.toThrow('Provide exactly one of recipientAgentId or recipients');
+    ).rejects.toThrow('Provide exactly one of recipientSlug or recipients');
   });
 
-  it('should reject when neither recipientAgentId nor recipients are provided', async () => {
+  it('should reject when neither recipientSlug nor recipients are provided', async () => {
     const mockDc = createMockDataComposer();
     await expect(
       handleSendToInbox(
@@ -530,7 +538,7 @@ describe('handleSendToInbox - validation', () => {
         },
         mockDc as never
       )
-    ).rejects.toThrow('Provide exactly one of recipientAgentId or recipients');
+    ).rejects.toThrow('Provide exactly one of recipientSlug or recipients');
   });
 
   it('should reject recipients[] without threadKey', async () => {
@@ -585,15 +593,15 @@ describe('handleSendToInbox - thread routing', () => {
     vi.clearAllMocks();
   });
 
-  it('should route to thread tables when threadKey is provided with recipientAgentId', async () => {
+  it('should route to thread tables when threadKey is provided with recipientSlug', async () => {
     const mockSb = createThreadMockSupabase();
     const mockDc = createMockDataComposer(mockSb);
 
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:32',
         content: 'Review PR #32',
       },
@@ -616,7 +624,7 @@ describe('handleSendToInbox - thread routing', () => {
       {
         email: 'test@test.com',
         recipients: ['lumen', 'aster'],
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         threadKey: 'spec:group-threads',
         content: 'RFC for review',
       },
@@ -639,8 +647,8 @@ describe('handleSendToInbox - thread routing', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         content: 'Simple message',
       },
       mockDc as never
@@ -660,8 +668,8 @@ describe('handleSendToInbox - thread routing', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         recipientStudioSlug: 'wren-review',
         content: 'Direct slug-routed message',
       },
@@ -680,8 +688,8 @@ describe('handleSendToInbox - thread routing', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         recipientStudioHint: 'main',
         content: 'Legacy hint caller',
       },
@@ -704,7 +712,7 @@ describe('handleSendToInbox - thread routing', () => {
       {
         email: 'test@test.com',
         recipients: ['lumen', 'aster'],
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         threadKey: 'spec:test',
         content: 'Hello team',
       },
@@ -715,14 +723,14 @@ describe('handleSendToInbox - thread routing', () => {
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledTimes(2);
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'lumen',
+        toSlug: 'lumen',
         threadKey: 'spec:test',
         threadMessageId: 'tmsg-123',
       })
     );
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'aster',
+        toSlug: 'aster',
         threadKey: 'spec:test',
         threadMessageId: 'tmsg-123',
       })
@@ -730,5 +738,696 @@ describe('handleSendToInbox - thread routing', () => {
     expect(mockGateway.dispatchTrigger).not.toHaveBeenCalledWith(
       expect.objectContaining({ recipientUserId: 'user-123' })
     );
+  });
+});
+
+// =====================================================
+// get_thread_messages — cold-start guard (spec inkmail-read-state §4)
+// =====================================================
+
+import { handleGetThreadMessages, handleMarkThreadRead } from './thread-handlers';
+
+vi.mock('./read-state.js', () => ({
+  advanceThreadReadPointer: vi.fn().mockResolvedValue({ success: true }),
+}));
+
+interface GuardMsg {
+  id: string;
+  created_at: string;
+  message_type: string;
+  sender_agent_id: string;
+  content: string;
+}
+
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3600 * 1000).toISOString();
+
+function guardMsg(id: string, ageHours: number): GuardMsg {
+  return {
+    id,
+    created_at: hoursAgo(ageHours),
+    message_type: 'message',
+    sender_agent_id: 'lumen',
+    content: `msg ${id}`,
+  };
+}
+
+/**
+ * In-memory query engine over a message table so window math (gt/lt floors,
+ * DESC truncation, head counts) is actually exercised, not stubbed.
+ */
+function createGuardMockSupabase(
+  rows: GuardMsg[],
+  opts: { lastReadAt?: string | null; joinedAt?: string | null } = {}
+) {
+  const messagesChain = () => {
+    const state = {
+      gts: [] as string[],
+      lts: [] as string[],
+      neqType: null as string | null,
+      idEq: null as string | null,
+      asc: true,
+      limit: null as number | null,
+      head: false,
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const self: any = {};
+    self.select = vi.fn((_sel: string, o?: { head?: boolean }) => {
+      state.head = !!o?.head;
+      return self;
+    });
+    self.eq = vi.fn((col: string, val: string) => {
+      if (col === 'id') state.idEq = val;
+      return self;
+    });
+    self.neq = vi.fn((col: string, val: string) => {
+      if (col === 'message_type') state.neqType = val;
+      return self;
+    });
+    self.gt = vi.fn((_col: string, val: string) => {
+      state.gts.push(val);
+      return self;
+    });
+    self.lt = vi.fn((_col: string, val: string) => {
+      state.lts.push(val);
+      return self;
+    });
+    self.order = vi.fn((_col: string, o?: { ascending?: boolean }) => {
+      state.asc = o?.ascending !== false;
+      return self;
+    });
+    self.limit = vi.fn((n: number) => {
+      state.limit = n;
+      return self;
+    });
+    const compute = () => {
+      let out = rows.filter(
+        (r) =>
+          state.gts.every((g) => r.created_at > g) &&
+          state.lts.every((l) => r.created_at < l) &&
+          (state.neqType === null || r.message_type !== state.neqType)
+      );
+      out = out.sort((a, b) =>
+        state.asc
+          ? a.created_at.localeCompare(b.created_at)
+          : b.created_at.localeCompare(a.created_at)
+      );
+      const count = out.length;
+      if (state.limit !== null) out = out.slice(0, state.limit);
+      return { data: state.head ? null : out, error: null, count };
+    };
+    self.single = vi.fn(() => {
+      const row = rows.find((r) => r.id === state.idEq);
+      return Promise.resolve({ data: row || null, error: null });
+    });
+    self.maybeSingle = vi.fn(() => {
+      if (state.idEq) {
+        const row = rows.find((r) => r.id === state.idEq);
+        return Promise.resolve({ data: row || null, error: null });
+      }
+      const { data } = compute();
+      return Promise.resolve({ data: data && data.length ? data[0] : null, error: null });
+    });
+    self.then = (resolve: (v: unknown) => unknown) => Promise.resolve(compute()).then(resolve);
+    return self;
+  };
+
+  const simpleRow = (data: unknown) => ({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          maybeSingle: vi.fn().mockResolvedValue({ data, error: null }),
+        }),
+        maybeSingle: vi.fn().mockResolvedValue({ data, error: null }),
+      }),
+    }),
+  });
+
+  const fromFn = vi.fn().mockImplementation((table: string) => {
+    switch (table) {
+      case 'inbox_threads':
+        return simpleRow({
+          id: 't-guard',
+          thread_key: 'pr:guard',
+          title: null,
+          status: 'open',
+          created_by_agent_id: 'lumen',
+        });
+      case 'inbox_thread_participants':
+        return simpleRow({
+          agent_id: 'wren',
+          joined_at: opts.joinedAt === undefined ? hoursAgo(24 * 120) : opts.joinedAt,
+        });
+      case 'inbox_thread_read_status':
+        return simpleRow(
+          opts.lastReadAt === undefined || opts.lastReadAt === null
+            ? null
+            : { last_read_at: opts.lastReadAt }
+        );
+      case 'inbox_thread_messages':
+        return messagesChain();
+      default:
+        return simpleRow(null);
+    }
+  });
+
+  return { from: fromFn, rpc: vi.fn().mockResolvedValue({ data: null, error: null }) };
+}
+
+function guardComposer(sb: ReturnType<typeof createGuardMockSupabase>) {
+  return { getClient: vi.fn().mockReturnValue(sb) } as never;
+}
+
+async function callGuard(
+  sb: ReturnType<typeof createGuardMockSupabase>,
+  extra: Record<string, unknown> = {}
+) {
+  const result = await handleGetThreadMessages(
+    { email: 'test@test.com', sbSlug: 'wren', threadKey: 'pr:guard', ...extra },
+    guardComposer(sb)
+  );
+  return JSON.parse(result.content[0].text);
+}
+
+describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('bounds a stale-pointer delivery poll to the 48h window, newest-first, skips visible', async () => {
+    // 40 old (ages 100h+) + 20 recent (1–40h). Participant joined 120 days
+    // ago, never read — the July 30 shape. Without the guard this replays 60.
+    const rows = [
+      ...Array.from({ length: 40 }, (_, i) => guardMsg(`old-${i}`, 100 + i * 10)),
+      ...Array.from({ length: 20 }, (_, i) => guardMsg(`new-${i}`, 1 + i * 2)),
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), { channelPoll: true });
+    expect(parsed.success).toBe(true);
+    expect(parsed.coldStartGuard).toBe(true);
+    expect(parsed.messageCount).toBe(20);
+    expect(parsed.skippedOlderCount).toBe(40);
+    const ids = (parsed.messages as Array<{ id: string }>).map((m) => m.id);
+    expect(ids.every((id) => id.startsWith('new-'))).toBe(true);
+    // Response ordering stays oldest-first
+    const times = (parsed.messages as Array<{ createdAt: string }>).map((m) => m.createdAt);
+    expect([...times].sort()).toEqual(times);
+  });
+
+  it('floor: delivers the newest 10 unseen when the 48h window is emptier than that', async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => guardMsg(`old-${i}`, 50 + i * 10));
+    const parsed = await callGuard(createGuardMockSupabase(rows), { channelPoll: true });
+    expect(parsed.messageCount).toBe(10);
+    expect(parsed.skippedOlderCount).toBe(20);
+    // The newest 10 (smallest ages), not the earliest
+    const ids = (parsed.messages as Array<{ id: string }>).map((m) => m.id);
+    expect(ids).toContain('old-0');
+    expect(ids).not.toContain('old-29');
+  });
+
+  it('explicit afterMessageId bypasses the guard entirely', async () => {
+    const rows = Array.from({ length: 15 }, (_, i) => guardMsg(`m-${i}`, 200 - i * 10));
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      afterMessageId: '11111111-1111-1111-1111-111111111111',
+    });
+    // Cursor id not found → no floor from it; guard must NOT kick in.
+    expect(parsed.coldStartGuard).toBeUndefined();
+    expect(parsed.skippedOlderCount).toBeUndefined();
+    expect(parsed.messageCount).toBe(15);
+  });
+
+  it('fullHistory bypasses the guard', async () => {
+    const rows = Array.from({ length: 25 }, (_, i) => guardMsg(`m-${i}`, 100 + i * 20));
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      fullHistory: true,
+    });
+    expect(parsed.coldStartGuard).toBeUndefined();
+    expect(parsed.messageCount).toBe(25);
+  });
+
+  it('latestN returns the newest N with visible skip accounting (no channelPoll)', async () => {
+    const rows = Array.from({ length: 20 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
+    const parsed = await callGuard(createGuardMockSupabase(rows, { joinedAt: null }), {
+      latestN: 5,
+    });
+    expect(parsed.messageCount).toBe(5);
+    expect(parsed.skippedOlderCount).toBe(15);
+    const ids = (parsed.messages as Array<{ id: string }>).map((m) => m.id);
+    expect(ids).toEqual(['m-4', 'm-3', 'm-2', 'm-1', 'm-0']);
+  });
+
+  it('guard mode advances ONLY through the newest deliberately-skipped message — never the batch', async () => {
+    // 15 old (100h+) + 5 recent: window delivers 5, floor tops up to the
+    // newest 10 (5 recent + 5 newest-old), skipping the 10 oldest. The
+    // pointer must advance through the newest SKIPPED message — the
+    // delivered batch stays unread until the consumer acks (Lumen §1).
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [
+      ...Array.from({ length: 15 }, (_, i) => guardMsg(`old-${i}`, 100 + i * 10)),
+      ...Array.from({ length: 5 }, (_, i) => guardMsg(`new-${i}`, 1 + i)),
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      markRead: true,
+    });
+    expect(parsed.messageCount).toBe(10);
+    expect(parsed.skippedOlderCount).toBe(10);
+    // Newest skipped = old-4 is delivered (ages 100..140 in the top-10);
+    // the newest NOT delivered is old-5 (age 150).
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        throughMessageId: 'old-5',
+        source: 'get_thread_messages:deliberate_skip',
+      })
+    );
+  });
+
+  it('guard mode with zero skips advances nothing (batch awaits consumer ack)', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [guardMsg('a', 5), guardMsg('b', 1)];
+    await callGuard(createGuardMockSupabase(rows), { channelPoll: true, markRead: true });
+    expect(vi.mocked(advanceThreadReadPointer)).not.toHaveBeenCalled();
+  });
+
+  it('non-guard markRead keeps the pre-existing batch advance', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [guardMsg('older', 30), guardMsg('newest', 1)];
+    await callGuard(createGuardMockSupabase(rows, { joinedAt: null }), { markRead: true });
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        throughMessageId: 'newest',
+        source: 'get_thread_messages:markRead',
+      })
+    );
+  });
+
+  it('mark_thread_read with throughMessageId acks EXACTLY that message', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [guardMsg('m-1', 3), guardMsg('m-2', 2), guardMsg('m-3', 1)];
+    const sb = createGuardMockSupabase(rows);
+    const result = await handleMarkThreadRead(
+      {
+        email: 'test@test.com',
+        sbSlug: 'wren',
+        threadKey: 'pr:guard',
+        throughMessageId: '00000000-0000-0000-0000-000000000000',
+      },
+      guardComposer(sb)
+    );
+    // UUID not in the thread → refused, no advance.
+    expect(JSON.parse(result.content[0].text).success).toBe(false);
+    expect(vi.mocked(advanceThreadReadPointer)).not.toHaveBeenCalled();
+  });
+
+  it('mark_thread_read acks a real message id and advances exactly through it', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const ackId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const rows = [guardMsg(ackId, 3), guardMsg('m-newer', 1)];
+    const sb = createGuardMockSupabase(rows);
+    const result = await handleMarkThreadRead(
+      { email: 'test@test.com', sbSlug: 'wren', threadKey: 'pr:guard', throughMessageId: ackId },
+      guardComposer(sb)
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.throughMessageId).toBe(ackId);
+    // Advanced exactly through the acked message — NOT the thread's newest.
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ throughMessageId: ackId, source: 'mark_thread_read:ack' })
+    );
+  });
+
+  it('surfaces a failed deliberate_skip advance in the response (checked write, round 3)', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    vi.mocked(advanceThreadReadPointer).mockResolvedValueOnce(false as never);
+    const rows = [
+      ...Array.from({ length: 15 }, (_, i) => guardMsg(`old-${i}`, 100 + i * 10)),
+      ...Array.from({ length: 5 }, (_, i) => guardMsg(`new-${i}`, 1 + i)),
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      markRead: true,
+    });
+    expect(parsed.success).toBe(true); // messages WERE returned
+    expect(parsed.advanceFailed).toBe(true);
+    expect(parsed.warning).toContain('read-pointer advance failed');
+  });
+
+  it('surfaces a failed non-guard markRead advance in the response (checked write, round 3)', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    vi.mocked(advanceThreadReadPointer).mockResolvedValueOnce(false as never);
+    const rows = [guardMsg('m-1', 2), guardMsg('m-2', 1)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { joinedAt: null }), {
+      markRead: true,
+    });
+    expect(parsed.advanceFailed).toBe(true);
+    expect(parsed.warning).toContain('read-pointer advance failed');
+  });
+
+  it('no truncation → no skippedOlderCount field, delivery unchanged', async () => {
+    const rows = Array.from({ length: 5 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
+    const parsed = await callGuard(createGuardMockSupabase(rows), { channelPoll: true });
+    expect(parsed.messageCount).toBe(5);
+    expect(parsed.skippedOlderCount).toBeUndefined();
+    expect(parsed.coldStartGuard).toBe(true);
+  });
+});
+
+describe('handleCloseThread — lease/teardown wiring (v18 S2)', () => {
+  it('feeds the studios the lease rode into teardown as candidates (Lumen r1 P1-2)', async () => {
+    // The candidates line is one argument in one call — exactly the kind of
+    // wiring that dies silently behind green unit tests on either side of
+    // it. This drives the real handler and asserts the hand-off.
+    const { handleCloseThread } = await import('./thread-handlers');
+    const { StudioLeaseService } = await import('../../services/studio-lease.service.js');
+    const { StudioOverflowService } = await import('../../services/studio-overflow.service.js');
+    const userResolver = await import('../../services/user-resolver');
+    const { makeFakeSupabase } = await import('../../services/sessions/fake-supabase.js');
+
+    const resolveSpy = vi
+      .spyOn(userResolver, 'resolveUserOrThrow')
+      .mockResolvedValue({ user: { id: 'user-1' } } as never);
+    const releaseSpy = vi
+      .spyOn(StudioLeaseService.prototype, 'releaseByThread')
+      .mockResolvedValue({ released: 0, deferred: 0, removed: 1, studioIds: ['eph-1'] });
+    const teardownSpy = vi
+      .spyOn(StudioOverflowService.prototype, 'teardownEphemeralStudiosForThread')
+      .mockResolvedValue(0);
+
+    const tables = {
+      inbox_threads: [
+        {
+          id: 't1',
+          user_id: 'user-1',
+          thread_key: 'pr:9',
+          status: 'open',
+          created_by_agent_id: 'wren',
+        },
+      ],
+      inbox_thread_participants: [{ thread_id: 't1', agent_id: 'wren' }],
+      inbox_thread_messages: [],
+    };
+    const supabase = makeFakeSupabase(tables);
+    const dataComposer = {
+      getClient: () => supabase,
+      repositories: { studios: {} },
+    } as never;
+
+    try {
+      const result = await handleCloseThread({ threadKey: 'pr:9', sbSlug: 'wren' }, dataComposer);
+      const payload = JSON.parse((result.content[0] as { text: string }).text);
+      expect(payload.success).toBe(true);
+
+      expect(releaseSpy).toHaveBeenCalledWith('user-1', 'pr:9', { reason: 'thread-closed' });
+      expect(teardownSpy).toHaveBeenCalledWith('user-1', 'pr:9', {
+        reason: 'thread pr:9 closed',
+        candidateStudioIds: ['eph-1'],
+      });
+    } finally {
+      resolveSpy.mockRestore();
+      releaseSpy.mockRestore();
+      teardownSpy.mockRestore();
+    }
+  });
+});
+
+/**
+ * Lumen's blocker on PR #554.
+ *
+ * Widening the schemas to accept offsets exposed a floor comparison that was
+ * lexicographic on timestamp strings. It had always been correct in practice
+ * because every timestamp reaching it was UTC, so text order matched time
+ * order — an accident of spelling, not a property of the code.
+ *
+ * My "widening only" claim was true of the validator and false of the system:
+ * I checked Zod against Zod and never asked what the consumers assumed.
+ */
+describe('read floors compare instants, not spellings', () => {
+  const readFloor = '2026-09-01T12:00:00Z';
+
+  it('does not lower the floor for an offset time that only LOOKS later', () => {
+    // 23:00+14:00 is 09:00Z — three hours BEFORE the floor — but sorts after
+    // it as text. Taking it would replay messages the caller already read.
+    const floor = resolveEffectiveFloor({
+      readStateFloor: readFloor,
+      afterTs: null,
+      newerThan: '2026-09-01T23:00:00+14:00',
+    });
+
+    expect(floor).toBe(readFloor);
+  });
+
+  it('does raise the floor for an offset time that genuinely is later', () => {
+    // 08:00-05:00 is 13:00Z, an hour after the floor.
+    const later = '2026-09-01T08:00:00-05:00';
+    const floor = resolveEffectiveFloor({
+      readStateFloor: readFloor,
+      afterTs: null,
+      newerThan: later,
+    });
+
+    expect(floor).toBe(later);
+  });
+
+  it('picks the latest instant across all three sources', () => {
+    expect(
+      resolveEffectiveFloor({
+        readStateFloor: '2026-09-01T12:00:00Z',
+        afterTs: '2026-09-01T09:00:00-04:00', // 13:00Z — the winner
+        newerThan: '2026-09-01T23:00:00+14:00', // 09:00Z
+      })
+    ).toBe('2026-09-01T09:00:00-04:00');
+  });
+
+  it('keeps the existing floor when a value cannot be parsed', () => {
+    // Too high under-delivers and is visible; too low silently replays.
+    expect(
+      resolveEffectiveFloor({
+        readStateFloor: readFloor,
+        afterTs: null,
+        newerThan: 'not a timestamp',
+      })
+    ).toBe(readFloor);
+  });
+
+  it('accepts the Postgres +00:00 spelling as equal to Z', () => {
+    // Both forms reach these floors today: toISOString() gives Z, Supabase
+    // gives +00:00. Neither should displace the other.
+    expect(isLaterInstant('2026-09-01T12:00:00+00:00', '2026-09-01T12:00:00Z')).toBe(false);
+    expect(isLaterInstant('2026-09-01T12:00:00Z', '2026-09-01T12:00:00+00:00')).toBe(false);
+  });
+
+  it('takes any real value over a missing floor', () => {
+    expect(
+      resolveEffectiveFloor({ readStateFloor: null, afterTs: null, newerThan: readFloor })
+    ).toBe(readFloor);
+    expect(resolveEffectiveFloor({ readStateFloor: null, afterTs: null, newerThan: null })).toBe(
+      null
+    );
+  });
+});
+
+/**
+ * reopen_thread — spec inkmail-thread-scope §2, §6.
+ *
+ * Reopening is explicit: a reply into a closed thread never reopens it, and
+ * these tests drive the tool that does. What they pin is the shape of the
+ * write (status, both closure fields, and the audit event move together),
+ * who may ask (a participant, same rule as close), and that a reopen which
+ * loses a race writes nothing. The flip and the audit event are one SQL
+ * function (reopen_inbox_thread, migration 20260913083000); the fake client
+ * mirrors it, and thread-reopen.integration.test.ts pins the real one —
+ * including that a rejected audit event rolls the flip back.
+ */
+describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)', () => {
+  async function setup(opts: { status?: string; participants?: string[] } = {}) {
+    const { handleReopenThread, reopenThreadRow } = await import('./thread-handlers');
+    const userResolver = await import('../../services/user-resolver');
+    const { StudioLeaseService } = await import('../../services/studio-lease.service.js');
+    const { makeFakeSupabase } = await import('../../services/sessions/fake-supabase.js');
+
+    const resolveSpy = vi
+      .spyOn(userResolver, 'resolveUserOrThrow')
+      .mockResolvedValue({ user: { id: 'user-1' } } as never);
+    const releaseSpy = vi.spyOn(StudioLeaseService.prototype, 'releaseByThread');
+
+    const closed = (opts.status ?? 'closed') === 'closed';
+    const tables = {
+      inbox_threads: [
+        {
+          id: 't1',
+          user_id: 'user-1',
+          thread_key: 'pr:9',
+          status: closed ? 'closed' : 'open',
+          closed_at: closed ? '2026-09-01T00:00:00Z' : null,
+          closed_by_agent_id: closed ? 'lumen' : null,
+          created_by_agent_id: 'wren',
+        },
+      ],
+      inbox_thread_participants: (opts.participants ?? ['wren', 'lumen']).map((agent_id) => ({
+        thread_id: 't1',
+        agent_id,
+      })),
+      inbox_thread_messages: [] as Array<Record<string, unknown>>,
+    };
+    const supabase = makeFakeSupabase(tables);
+    const dataComposer = { getClient: () => supabase, repositories: {} } as never;
+    const call = async (sbSlug: string) => {
+      const result = await handleReopenThread({ threadKey: 'pr:9', sbSlug }, dataComposer);
+      return JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
+    };
+    const restore = () => {
+      resolveSpy.mockRestore();
+      releaseSpy.mockRestore();
+    };
+    return { call, tables, supabase, reopenThreadRow, releaseSpy, restore };
+  }
+
+  it('a participant reopens: status open, both closure fields cleared, one system audit event, nobody woken', async () => {
+    const { call, tables, releaseSpy, restore } = await setup();
+    try {
+      const payload = await call('wren');
+      expect(payload).toMatchObject({ success: true, threadKey: 'pr:9', reopenedBy: 'wren' });
+      expect(payload.alreadyOpen).toBeUndefined();
+
+      const thread = tables.inbox_threads[0];
+      expect(thread.status).toBe('open');
+      expect(thread.closed_at).toBeNull();
+      expect(thread.closed_by_agent_id).toBeNull();
+
+      // Exactly one row landed, and it is an audit event — not a deliverable
+      // message that would count as unread or wake anyone.
+      expect(tables.inbox_thread_messages).toHaveLength(1);
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        thread_id: 't1',
+        sender_agent_id: 'system',
+        message_type: 'system',
+        metadata: { type: 'thread_reopened', reopenedBy: 'wren' },
+      });
+      // Close releases studio leases; reopen touches none of that.
+      expect(releaseSpy).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it('a non-participant is refused and nothing changes', async () => {
+    const { call, tables, restore } = await setup({ participants: ['lumen'] });
+    try {
+      const payload = await call('wren');
+      expect(payload.success).toBe(false);
+      expect(String(payload.error)).toMatch(/not a participant/);
+      expect(tables.inbox_threads[0]).toMatchObject({
+        status: 'closed',
+        closed_at: '2026-09-01T00:00:00Z',
+        closed_by_agent_id: 'lumen',
+      });
+      expect(tables.inbox_thread_messages).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('an open thread answers alreadyOpen and records no event', async () => {
+    const { call, tables, restore } = await setup({ status: 'open' });
+    try {
+      const payload = await call('wren');
+      expect(payload).toMatchObject({ success: true, alreadyOpen: true });
+      expect(tables.inbox_thread_messages).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('the flip is guarded on the row still being closed: a second reopen writes nothing', async () => {
+    // Two callers can both read "closed" and both try to write. The UPDATE
+    // itself carries the guard, so only one of them records the event.
+    const { supabase, tables, reopenThreadRow, restore } = await setup();
+    try {
+      expect(
+        await reopenThreadRow(supabase as never, 't1', { kind: 'sb', sbSlug: 'wren' })
+      ).toEqual({ reopened: true });
+      expect(await reopenThreadRow(supabase as never, 't1', { kind: 'user' })).toEqual({
+        reopened: false,
+      });
+      expect(tables.inbox_thread_messages).toHaveLength(1);
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        metadata: { type: 'thread_reopened', reopenedBy: 'wren' },
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it("the owner's recovery is recorded as the owner, not as an SB", async () => {
+    const { supabase, tables, reopenThreadRow, restore } = await setup();
+    try {
+      await reopenThreadRow(supabase as never, 't1', { kind: 'user' });
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        sender_agent_id: 'system',
+        message_type: 'system',
+        metadata: { type: 'thread_reopened', reopenedBy: 'user', channel: 'admin-api' },
+      });
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('reopenThreadRow — a failed call is an error, never a silent success', () => {
+  // The flip and the audit event are one SQL function now (migration
+  // 20260913083000); the client sees one reply. An error reply throws, and a
+  // reply that is not the function's boolean throws too — a mocked or
+  // unmigrated client must not be read as "reopened".
+  const rpcClient = (reply: { data: unknown; error: { message: string } | null }) => ({
+    rpc: async () => reply,
+  });
+
+  it('propagates an RPC error', async () => {
+    const { reopenThreadRow } = await import('./thread-handlers');
+    await expect(
+      reopenThreadRow(
+        rpcClient({ data: null, error: { message: 'audit rejected' } }) as never,
+        't1',
+        { kind: 'user' }
+      )
+    ).rejects.toThrow('Failed to reopen thread: audit rejected');
+  });
+
+  it('refuses a reply that is not the boolean the function returns', async () => {
+    const { reopenThreadRow } = await import('./thread-handlers');
+    await expect(
+      reopenThreadRow(rpcClient({ data: null, error: null }) as never, 't1', {
+        kind: 'sb',
+        sbSlug: 'wren',
+      })
+    ).rejects.toThrow('Failed to reopen thread: unexpected reply null');
+  });
+
+  it('passes the actor to the function as kind + agent id', async () => {
+    const { reopenThreadRow } = await import('./thread-handlers');
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const client = {
+      rpc: async (fn: string, args: Record<string, unknown>) => {
+        calls.push([fn, args]);
+        return { data: true, error: null };
+      },
+    };
+    expect(await reopenThreadRow(client as never, 't1', { kind: 'sb', sbSlug: 'wren' })).toEqual({
+      reopened: true,
+    });
+    expect(await reopenThreadRow(client as never, 't1', { kind: 'user' })).toEqual({
+      reopened: true,
+    });
+    expect(calls).toEqual([
+      ['reopen_inbox_thread', { p_thread_id: 't1', p_actor_kind: 'sb', p_actor_agent_id: 'wren' }],
+      ['reopen_inbox_thread', { p_thread_id: 't1', p_actor_kind: 'user', p_actor_agent_id: null }],
+    ]);
   });
 });

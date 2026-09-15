@@ -67,9 +67,31 @@ export interface MoveFileOptions {
 export type DriveOperation =
   | 'list_files'
   | 'get_file'
+  | 'download_file'
   | 'create_folder'
   | 'move_file'
   | 'trash_file'
   | 'delete_file';
 
 export const FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
+
+export interface DownloadFileOptions {
+  fileId: string;
+  /**
+   * Export MIME type for Google-native files (Docs/Sheets/Slides). Defaults
+   * per type: document → text/plain, spreadsheet → text/csv,
+   * presentation → text/plain. Ignored for binary files, which download as-is.
+   */
+  exportMimeType?: string;
+}
+
+export interface DownloadedFile {
+  file: DriveFile;
+  content: Buffer;
+  /** MIME type of the downloaded bytes (export type for Google-native files). */
+  effectiveMimeType: string;
+  /** Filename extension matching effectiveMimeType, including the dot. */
+  extension: string;
+  /** True when the bytes came from files.export (Google-native source). */
+  exported: boolean;
+}

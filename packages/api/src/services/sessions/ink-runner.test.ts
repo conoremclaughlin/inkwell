@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { InkRunner } from './ink-runner';
+import {
+  InkRunner,
+  DEFAULT_MAX_TURNS,
+  clampMaxTurns,
+  parseInkModelUsage,
+  BOOTSTRAP_REQUIRED_EXIT_MARKER,
+} from './ink-runner';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -11,7 +17,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-123', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
 
       expect(args).toContain('chat');
@@ -23,11 +29,56 @@ describe('InkRunner', () => {
       expect(args).toContain('session-123');
     });
 
+    it('defaults --max-turns to DEFAULT_MAX_TURNS when no per-SB value is set', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-mt', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+      });
+
+      const idx = args.indexOf('--max-turns');
+      expect(idx).toBeGreaterThan(-1);
+      expect(args[idx + 1]).toBe(String(DEFAULT_MAX_TURNS));
+    });
+
+    it('honors a dashboard-configured maxTurns, clamped to a sane range', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-mt2', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+        maxTurns: 12,
+      });
+      const idx = args.indexOf('--max-turns');
+      expect(args[idx + 1]).toBe('12');
+    });
+
+    it('always passes --tool-routing explicitly, failing closed to local', () => {
+      // The headless boundary must never depend on worktree .ink/identity.json
+      // preferences or the chat loop's own defaults.
+      const runner = new InkRunner();
+      const withRouting = (runner as any).buildArgs('session-tr', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+        toolRouting: 'backend',
+      });
+      const idx = withRouting.indexOf('--tool-routing');
+      expect(idx).toBeGreaterThan(-1);
+      expect(withRouting[idx + 1]).toBe('backend');
+
+      const withoutRouting = (runner as any).buildArgs('session-tr2', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+      });
+      const defaultIdx = withoutRouting.indexOf('--tool-routing');
+      expect(defaultIdx).toBeGreaterThan(-1);
+      expect(withoutRouting[defaultIdx + 1]).toBe('local');
+    });
+
     it('includes --model when specified', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-789', {
         workingDirectory: '/tmp',
-        agentId: 'wren',
+        sbSlug: 'wren',
         model: 'claude-sonnet-4-20250514',
       });
 
@@ -35,7 +86,25 @@ describe('InkRunner', () => {
       expect(args).toContain('claude-sonnet-4-20250514');
     });
 
-    it('omits --agent when agentId is not provided', () => {
+    it('includes --effort when specified, and never otherwise (task 7ea6cdf7)', () => {
+      const runner = new InkRunner();
+      const withEffort = (runner as any).buildArgs('session-eff', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+        effort: 'xhigh',
+      });
+      const idx = withEffort.indexOf('--effort');
+      expect(idx).toBeGreaterThan(-1);
+      expect(withEffort[idx + 1]).toBe('xhigh');
+
+      const without = (runner as any).buildArgs('session-eff2', {
+        workingDirectory: '/tmp',
+        sbSlug: 'myra',
+      });
+      expect(without).not.toContain('--effort');
+    });
+
+    it('omits --agent when sbSlug is not provided', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-000', {
         workingDirectory: '/tmp',
@@ -50,7 +119,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs(
         'session-media',
-        { workingDirectory: '/tmp', agentId: 'myra' },
+        { workingDirectory: '/tmp', sbSlug: 'myra' },
         [
           { type: 'image', path: '/home/u/.ink/files/telegram/photo.jpg' },
           { type: 'document', path: '/home/u/.ink/files/telegram/report.pdf' },
@@ -75,7 +144,7 @@ describe('InkRunner', () => {
       }));
       const args = (runner as any).buildArgs(
         'session-cap',
-        { workingDirectory: '/tmp', agentId: 'myra' },
+        { workingDirectory: '/tmp', sbSlug: 'myra' },
         media
       );
 
@@ -87,7 +156,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-nomedia', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
 
       expect(args).not.toContain('--attach-file');
@@ -97,7 +166,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-policy', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
 
       expect(args).toContain('--profile');
@@ -228,5 +297,608 @@ describe('InkRunner', () => {
       expect(result.responses[0].content).toBe('Routed via MCP');
       expect(result.finalTextResponse).toBe('Fallback text from ledger');
     });
+  });
+});
+
+/**
+ * The ink path had the same undercount as the direct claude path, one layer
+ * further out: the CLI parser keeps cached tokens in separate fields, and the
+ * result line forwarded only the fresh remainder. That is why Myra's sessions
+ * recorded a few hundred input tokens across hundreds of messages.
+ */
+describe('InkRunner usage parsing', () => {
+  it('counts the cache split as input and keeps the breakdown', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      text: 'done',
+      usage: {
+        contextTokens: 42_000,
+        inputTokens: 120,
+        outputTokens: 900,
+        cacheReadTokens: 38_000,
+        cacheWriteTokens: 1_200,
+      },
+      model: 'claude-fable-5',
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.inputTokens).toBe(39_320);
+    expect(result.usage.cacheReadTokens).toBe(38_000);
+    expect(result.usage.cacheWriteTokens).toBe(1_200);
+    // Context stays the CLI's own budget figure, not the billed sum.
+    expect(result.usage.contextTokens).toBe(42_000);
+    expect(result.servedModel).toBe('claude-fable-5');
+  });
+
+  // An older ink build on a studio that has not been rebuilt omits the new
+  // fields; that must degrade to the previous behaviour, not throw or zero.
+  it('falls back to fresh-only input when cache fields are absent', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: { contextTokens: 1_000, inputTokens: 120, outputTokens: 900 },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.inputTokens).toBe(120);
+    expect(result.usage.cacheReadTokens).toBe(0);
+    expect(result.servedModel).toBeUndefined();
+  });
+});
+
+/**
+ * Cost attribution for ink sessions. #493 gave direct-claude spawns a per-model
+ * map with the backend's own costUSD; the ink path forwarded only the model
+ * name, so ink-backed agents (Myra) had no dollar figure at all.
+ */
+describe('parseInkModelUsage', () => {
+  it('maps the per-model block, cost included, keys as reported', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 900,
+        outputTokens: 120,
+        cacheReadTokens: 40_000,
+        cacheWriteTokens: 1_200,
+        costUSD: 0.0431,
+        canonicalModel: 'claude-opus-5',
+      },
+      'claude-haiku-4-5-20251001': {
+        inputTokens: 500,
+        outputTokens: 15,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUSD: 0.0006,
+        canonicalModel: 'claude-haiku-4-5',
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costUSD).toBeCloseTo(0.0431);
+    expect(parsed['claude-opus-5'].cacheReadTokens).toBe(40_000);
+    // Both keys survive — a dated id and an alias can be distinct call sites.
+    expect(Object.keys(parsed).sort()).toEqual(['claude-haiku-4-5-20251001', 'claude-opus-5']);
+  });
+
+  // An older ink build emits no block at all; the field must be absent rather
+  // than a zeroed map that would read as "this run cost nothing".
+  it('returns undefined for absent or malformed input', () => {
+    expect(parseInkModelUsage(undefined)).toBeUndefined();
+    expect(parseInkModelUsage({})).toBeUndefined();
+    expect(parseInkModelUsage('nonsense')).toBeUndefined();
+    // Entries with nothing numeric are unreadable, not free: a present
+    // zero-cost map would read as a measured $0.00 (Lumen, PR #500 round 1).
+    expect(
+      parseInkModelUsage({ 'claude-opus-5': { inputTokens: 'lots', costUSD: null } })
+    ).toBeUndefined();
+    // A partially-readable entry still counts — but an unreported cost stays
+    // ABSENT rather than 0, or a summed session cost silently under-reports
+    // with no way to tell a measured zero from a never-reported one.
+    const partial = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 12 } });
+    expect(partial!['claude-opus-5'].outputTokens).toBe(12);
+    expect(partial!['claude-opus-5'].costUSD).toBeUndefined();
+    // A genuinely reported zero is preserved as a measurement.
+    const freeTurn = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 1, costUSD: 0 } });
+    expect(freeTurn!['claude-opus-5'].costUSD).toBe(0);
+  });
+
+  // The CLI is the only layer that sees every invocation of a run, so its
+  // completeness verdict is the authoritative one. Dropping it here promoted a
+  // lower bound back to a total at the process boundary (Lumen, PR #500 r4).
+  it('forwards the CLI cost-completeness marker across the boundary', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 1_000,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+        costPartial: true,
+        canonicalModel: 'claude-opus-5',
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costUSD).toBeCloseTo(0.01);
+    expect(parsed['claude-opus-5'].costPartial).toBe(true);
+  });
+
+  it('does not invent a marker for a complete entry', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costPartial).toBeUndefined();
+  });
+
+  it('carries the block through parseOutput into usage', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      text: 'done',
+      usage: { contextTokens: 5_000, inputTokens: 10, outputTokens: 20 },
+      model: 'claude-opus-5',
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 4_900,
+          cacheWriteTokens: 0,
+          costUSD: 0.0125,
+          canonicalModel: 'claude-opus-5',
+        },
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.modelUsage['claude-opus-5'].costUSD).toBeCloseTo(0.0125);
+  });
+});
+
+describe('clampMaxTurns', () => {
+  it('defaults when absent or non-finite', () => {
+    expect(clampMaxTurns(undefined)).toBe(DEFAULT_MAX_TURNS);
+    expect(clampMaxTurns(Number.NaN)).toBe(DEFAULT_MAX_TURNS);
+    expect(clampMaxTurns(Number.POSITIVE_INFINITY)).toBe(DEFAULT_MAX_TURNS);
+  });
+
+  it('clamps to [1, 25] and rounds fractions', () => {
+    expect(clampMaxTurns(0)).toBe(1);
+    expect(clampMaxTurns(-3)).toBe(1);
+    expect(clampMaxTurns(99)).toBe(25);
+    expect(clampMaxTurns(7.6)).toBe(8);
+    expect(clampMaxTurns(5)).toBe(5);
+  });
+});
+
+// ============================================================================
+// The child self-hydrates: the server must not send bootstrap content twice
+// ============================================================================
+
+describe('InkRunner — bootstrap-derived content', () => {
+  function contextWithEverything() {
+    return {
+      agent: {
+        sbSlug: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        heartbeat: 'HEARTBEAT-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [{ id: 'p1', name: 'PROJECT-BODY', status: 'active' }],
+    } as never;
+  }
+
+  it('does not resend the constitution or digest that `ink chat` already renders', async () => {
+    // `ink chat` calls bootstrap and renders these through
+    // formatBootstrapContext. Sending them here too doubled myra's first turn.
+    const runner = new InkRunner();
+    let sentMessage = '';
+    (runner as any).spawnProcess = vi.fn(async (_args: string[], message: string) => {
+      sentMessage = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      injectedContext: contextWithEverything(),
+      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', sbSlug: 'myra' },
+    } as never);
+
+    expect(sentMessage).toContain('hello');
+    for (const dup of [
+      'VALUES-BODY',
+      'PROCESS-BODY',
+      'USER-BODY',
+      'DIGEST-BODY',
+      'PROJECT-BODY',
+      'SOUL-BODY',
+      'HEARTBEAT-BODY',
+    ]) {
+      expect(sentMessage).not.toContain(dup);
+    }
+  });
+
+  it('still sends the sender and time context, which bootstrap cannot supply', async () => {
+    const runner = new InkRunner();
+    let sentMessage = '';
+    (runner as any).spawnProcess = vi.fn(async (_args: string[], message: string) => {
+      sentMessage = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    const ctx = contextWithEverything() as unknown as Record<string, unknown>;
+    ctx.contact = { id: 'c1', name: 'CONTACT-NAME', type: 'external', platform: 'telegram' };
+
+    await runner.run('hello', {
+      injectedContext: ctx,
+      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', sbSlug: 'myra' },
+    } as never);
+
+    expect(sentMessage).toContain('CONTACT-NAME');
+    expect(sentMessage).toContain('Myra');
+  });
+});
+
+// ============================================================================
+// Failure path: the child could not load the context we chose not to send
+// ============================================================================
+
+describe('InkRunner — bootstrap failure in the child', () => {
+  function ctx() {
+    return {
+      agent: {
+        sbSlug: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [],
+    } as never;
+  }
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    sbSlug: 'myra',
+  } as never;
+
+  it('demands the child prove it loaded identity context on a fresh turn', async () => {
+    const runner = new InkRunner();
+    const seen: string[][] = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[]) => {
+      seen.push(args);
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', { injectedContext: ctx(), config: cfg } as never);
+
+    expect(seen[0]).toContain('--require-bootstrap');
+  });
+
+  it('resends the constitution itself when the child refuses, rather than losing the turn', async () => {
+    // Without this the person on the other end gets either no reply, or a
+    // confident one from an agent with no soul, values or memory.
+    const runner = new InkRunner();
+    const calls: Array<{ args: string[]; message: string }> = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[], message: string) => {
+      calls.push({ args, message });
+      if (calls.length === 1) {
+        return { responses: [], toolCalls: [], bootstrapRequiredFailure: true };
+      }
+      return { responses: [], toolCalls: [], finalTextResponse: 'recovered' };
+    });
+
+    const result = await runner.run('hello', {
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(2);
+
+    // First attempt: lean, and demanding proof.
+    expect(calls[0].args).toContain('--require-bootstrap');
+    expect(calls[0].message).not.toContain('VALUES-BODY');
+
+    // Retry: the server supplies what the child could not fetch, and stops
+    // demanding proof it already knows the child cannot provide.
+    expect(calls[1].args).not.toContain('--require-bootstrap');
+    expect(calls[1].message).toContain('VALUES-BODY');
+    expect(calls[1].message).toContain('PROCESS-BODY');
+    expect(calls[1].message).toContain('USER-BODY');
+    expect(calls[1].message).toContain('DIGEST-BODY');
+    // Soul too. This child has no appendSystemPrompt path, and its own
+    // bootstrap just failed, so the fallback is soul's only delivery. The
+    // fixture carried SOUL-BODY all along and nothing asserted it.
+    expect(calls[1].message).toContain('SOUL-BODY');
+
+    expect(result.success).toBe(true);
+    expect(result.finalTextResponse).toBe('recovered');
+  });
+
+  it('recognises the marker the CLI actually prints', () => {
+    // The two processes share no module. If either literal is edited alone,
+    // the runner silently stops recovering and the failure becomes invisible.
+    expect(BOOTSTRAP_REQUIRED_EXIT_MARKER).toBe('INK_BOOTSTRAP_REQUIRED_FAILURE');
+  });
+});
+
+describe('InkRunner — resumed turns are equally exposed', () => {
+  function ctx() {
+    return {
+      agent: {
+        sbSlug: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [],
+    } as never;
+  }
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    sbSlug: 'myra',
+  } as never;
+
+  it('requires bootstrap on a resumed turn too', async () => {
+    // Every run is a new `ink chat` process that bootstraps from scratch, so a
+    // resume is exactly as exposed as a fresh turn.
+    const runner = new InkRunner();
+    const seen: string[][] = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[]) => {
+      seen.push(args);
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(seen[0]).toContain('--require-bootstrap');
+  });
+
+  it('keeps a healthy resumed prompt lean', async () => {
+    const runner = new InkRunner();
+    let sent = '';
+    (runner as any).spawnProcess = vi.fn(async (_a: string[], message: string) => {
+      sent = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(sent).toBe('hello');
+  });
+
+  it('recovers a resumed turn with the full context, soul included', async () => {
+    const runner = new InkRunner();
+    const calls: Array<{ args: string[]; message: string }> = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[], message: string) => {
+      calls.push({ args, message });
+      if (calls.length === 1) {
+        return { responses: [], toolCalls: [], bootstrapRequiredFailure: true };
+      }
+      return { responses: [], toolCalls: [], finalTextResponse: 'recovered' };
+    });
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1].message).toContain('SOUL-BODY');
+    expect(calls[1].message).toContain('VALUES-BODY');
+    expect(result.success).toBe(true);
+  });
+
+  it('reports failure rather than respawning a stranger when it has nothing to supply', async () => {
+    const runner = new InkRunner();
+    const calls: string[][] = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[]) => {
+      calls.push(args);
+      return { responses: [], toolCalls: [], bootstrapRequiredFailure: true };
+    });
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('identity context');
+  });
+});
+
+// ============================================================================
+// Recoveries compose: whichever fires first, the next result is still checked
+// ============================================================================
+
+describe('InkRunner — chained failures', () => {
+  function ctx() {
+    return {
+      agent: {
+        sbSlug: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [],
+    } as never;
+  }
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    sbSlug: 'myra',
+  } as never;
+
+  function stub(runner: InkRunner, outcomes: Array<Record<string, unknown>>) {
+    const calls: Array<{ args: string[]; message: string }> = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[], message: string) => {
+      calls.push({ args, message });
+      const next = outcomes.shift() ?? { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+      return { responses: [], toolCalls: [], ...next };
+    });
+    return calls;
+  }
+
+  it('recovers when a failed resume is followed by a bootstrap refusal', async () => {
+    // The hole: the nested spawn after resumeFailedNoSession was returned as
+    // success:true with no responses, so SessionService recorded a successful
+    // turn and the person's message was dropped without trace.
+    const runner = new InkRunner();
+    const calls = stub(runner, [
+      { resumeFailedNoSession: true },
+      { bootstrapRequiredFailure: true },
+      { finalTextResponse: 'recovered' },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(3);
+    expect(calls[2].message).toContain('SOUL-BODY');
+    expect(calls[2].message).toContain('VALUES-BODY');
+    expect(calls[2].args).not.toContain('--require-bootstrap');
+    expect(result.success).toBe(true);
+    expect(result.finalTextResponse).toBe('recovered');
+  });
+
+  it('recovers in the inverse order too', async () => {
+    const runner = new InkRunner();
+    const calls = stub(runner, [
+      { bootstrapRequiredFailure: true },
+      { resumeFailedNoSession: true },
+      { finalTextResponse: 'recovered' },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(3);
+    // Context supplied by attempt 2 must not be dropped by the resume reset.
+    expect(calls[2].message).toContain('SOUL-BODY');
+    expect(result.success).toBe(true);
+    expect(result.finalTextResponse).toBe('recovered');
+  });
+
+  it('never reports success with nothing to say', async () => {
+    // Every failure path must be visible to SessionService. A silently
+    // successful empty turn is the one outcome that loses the message.
+    const runner = new InkRunner();
+    stub(runner, [
+      { resumeFailedNoSession: true },
+      { bootstrapRequiredFailure: true },
+      { bootstrapRequiredFailure: true },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  it('does not retry a resume reset forever', async () => {
+    const runner = new InkRunner();
+    stub(runner, [
+      { resumeFailedNoSession: true },
+      { resumeFailedNoSession: true },
+      { resumeFailedNoSession: true },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeTruthy();
   });
 });

@@ -20,6 +20,8 @@ export interface PcpAuthConfig {
 
 interface JsonRpcToolResult {
   content?: Array<{ type?: string; text?: string }>;
+  /** MCP's per-call failure flag — set for validation errors, unknown tools, thrown handlers. */
+  isError?: boolean;
   [key: string]: unknown;
 }
 
@@ -72,18 +74,41 @@ export async function fetchWithTimeout(
   }
 }
 
+export interface PcpClientOptions {
+  /**
+   * Lazily builds the x-ink-context token attached to every tool call.
+   * Lazy because session identity (sessionId) is established after client
+   * construction; the callback reflects current runtime state per call.
+   *
+   * Without this header, ink-routed tool calls reach the server with NO
+   * request identity — workspace derivation for artifact writes fails,
+   * session attribution degrades, and trigger context goes missing (the
+   * regression Myra hit when wholly-in-ink moved tool calls off the
+   * provider's MCP connection, which carried the header via .mcp.json).
+   */
+  getContextToken?: () => string | null;
+}
+
 export class PcpClient {
   private configPath: string;
   private baseUrl: string;
   private config: PcpAuthConfig;
+  private options: PcpClientOptions;
 
-  constructor(baseUrl?: string, configPath?: string) {
+  constructor(baseUrl?: string, configPath?: string, options: PcpClientOptions = {}) {
     this.baseUrl = (baseUrl || process.env.INK_SERVER_URL || 'http://localhost:3001').replace(
       /\/+$/,
       ''
     );
     this.configPath = configPath || join(homedir(), '.ink', 'config.json');
     this.config = this.loadConfig();
+    this.options = options;
+  }
+
+  /** Identity context header for the current call, when the caller provides one. */
+  private contextHeader(): Record<string, string> {
+    const token = this.options.getContextToken?.();
+    return token ? { 'x-ink-context': token } : {};
   }
 
   public getConfig(): PcpAuthConfig {
@@ -243,13 +268,33 @@ export class PcpClient {
     }
 
     const toolResult = payload.result;
-    const firstText = toolResult?.content?.[0]?.text;
+    const firstText = toolResult?.content?.find((item) => typeof item.text === 'string')?.text;
     if (typeof firstText === 'string') {
       try {
         return JSON.parse(firstText) as PcpToolCallResult;
       } catch {
+        // Unparseable text on an isError result is a protocol-level failure —
+        // argument validation, an unknown tool, a thrown handler. The server
+        // reports these as `isError` with a bare message rather than the usual
+        // JSON envelope, and returning `{ text }` here made them indistinguishable
+        // from success: callers read a result object with no `sessions` key and
+        // concluded there were no sessions. Throw so a failed call fails.
+        //
+        // Structured `{"success":false,...}` bodies deliberately do NOT come
+        // through here — they parse as JSON above and keep their existing
+        // contract, because callers inspect `success` and expect to.
+        if (toolResult?.isError) {
+          throw new Error(`PCP tool call failed: ${firstText}`);
+        }
         return { text: firstText };
       }
+    }
+
+    // CallToolResult content is not restricted to text. Preserve the failure
+    // boundary even when an error contains only media (or no content at all),
+    // rather than returning the raw isError object as a successful result.
+    if (toolResult?.isError) {
+      throw new Error('PCP tool call failed without a text error message');
     }
 
     return (toolResult as PcpToolCallResult) || {};
@@ -331,6 +376,7 @@ export class PcpClient {
             // JSON responses and SSE frames.
             Accept: 'application/json, text/event-stream',
             Authorization: `Bearer ${accessToken}`,
+            ...this.contextHeader(),
           },
           body: JSON.stringify({
             jsonrpc: '2.0',
@@ -406,6 +452,7 @@ export class PcpClient {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
+          ...this.contextHeader(),
         },
         body: JSON.stringify({ tool, args }),
       },

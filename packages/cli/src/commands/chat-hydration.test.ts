@@ -1,9 +1,16 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
-import { hydrateLedgerFromTranscript, formatTranscriptSize } from './chat.js';
+import {
+  BOOTSTRAP_REQUIRED_EXIT_MARKER,
+  failIfBootstrapRequired,
+  findLastDetectedModel,
+  formatTranscriptSize,
+  hydrateLedgerFromTranscript,
+  keptEntriesForCompaction,
+} from './chat.js';
 
 describe('hydrateLedgerFromTranscript — tool call replay', () => {
   let dir: string;
@@ -32,8 +39,9 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
           eid: 2,
           type: 'local_tool_call',
           tool: 'send_response',
-          args: { channel: 'telegram', conversationId: '726555973', content: 'heads-up!' },
+          args: { channel: 'telegram', conversationId: '100200300', content: 'heads-up!' },
           status: 'executed',
+          result: { success: true, messageId: 'tg-401' },
         },
         {
           eid: 3,
@@ -47,12 +55,12 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     );
 
     const ledger = new ContextLedger();
-    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
 
-    // The tool call shows in the replay as an event row...
+    // The tool call shows in the replay as an event row, attributed to the agent...
     const eventRows = result.tailPreview.filter((p) => p.role === 'event');
     expect(eventRows).toHaveLength(1);
-    expect(eventRows[0].content).toContain('send_response');
+    expect(eventRows[0].content).toContain('myra · send_response');
     expect(eventRows[0].content).toContain('(executed)');
     expect(eventRows[0].content).toContain('telegram');
     expect(eventRows[0].eid).toBe(2);
@@ -65,13 +73,47 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     expect(result.messageCount).toBe(2);
     expect(ledger.listEntries().some((e) => e.content.includes('send_response'))).toBe(false);
 
-    // ...and is collected for the context inspector's Tool Calls section
+    // ...and is collected for the context inspector's Tool Calls section,
+    // result included (Ctrl+T is the drill-down for the scrollback teaser)
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls[0].tool).toBe('send_response');
-    expect(result.toolCalls[0].args).toContain('726555973');
+    expect(result.toolCalls[0].args).toContain('100200300');
+    expect(result.toolCalls[0].result).toContain('tg-401');
   });
 
-  it('caps long tool args in the replay preview', () => {
+  it('carries denied reasons and thrown errors into the inspector record (reason/error fallback)', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        {
+          eid: 1,
+          type: 'local_tool_call',
+          tool: 'bash',
+          args: { command: 'rm -rf /' },
+          status: 'denied',
+          reason: 'blocked by tool policy',
+        },
+        {
+          eid: 2,
+          type: 'local_tool_call',
+          tool: 'get_inbox',
+          args: { sbSlug: 'myra' },
+          status: 'error',
+          error: 'ECONNREFUSED 127.0.0.1:3001',
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    expect(result.toolCalls).toHaveLength(2);
+    expect(result.toolCalls[0].result).toBe('blocked by tool policy');
+    expect(result.toolCalls[1].result).toBe('ECONNREFUSED 127.0.0.1:3001');
+  });
+
+  it('caps long tool args and results in the replay preview', () => {
     writeFileSync(
       transcriptPath,
       JSON.stringify({
@@ -80,6 +122,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
         tool: 'remember',
         args: { content: 'x'.repeat(500) },
         status: 'executed',
+        result: { echo: 'y'.repeat(3000) },
       }) + '\n'
     );
 
@@ -93,6 +136,8 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     // The inspector record keeps a longer (but still capped) version
     expect(result.toolCalls[0].args!.length).toBeLessThanOrEqual(401);
     expect(result.toolCalls[0].args!.endsWith('…')).toBe(true);
+    expect(result.toolCalls[0].result!.length).toBeLessThanOrEqual(2001);
+    expect(result.toolCalls[0].result!.endsWith('…')).toBe(true);
   });
 });
 
@@ -347,6 +392,202 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
   });
 });
 
+describe('hydrateLedgerFromTranscript — a hash-selected eviction replays as itself (Lumen, PR #582)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-evict-ref-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('REGRESSION: two hydrated entries share an eid; the persisted eid+hash ref evicts only the hashed one', () => {
+    // A compaction's kept tail and a later event can both hydrate with the
+    // same eid. The SB evicted `target` by ref; the hook persisted
+    // { eid, hash }. Replay must not take `neighbour` with it.
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 7, type: 'user', content: 'target' },
+        { eid: 7, type: 'user', content: 'neighbour' },
+        {
+          eid: 8,
+          type: 'context_evict',
+          actor: 'sb',
+          reason: 'by ref',
+          refs: [{ eid: 7, hash: entryRefHash('user', 'target') }],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['neighbour']);
+  });
+});
+
+describe('hydrateLedgerFromTranscript — the provider sample survives a process boundary (Lumen, PR #583 round 2)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-sample-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const write = (events: Array<Record<string, unknown>>) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const sample = {
+    type: 'provider_sample',
+    at: '2026-09-03T20:00:00.000Z',
+    backend: 'claude',
+    model: 'claude-opus-5',
+    backendSessionId: 'sess-1',
+    envelopeShape: 'shape-a',
+    contextTokens: 541_000,
+    inputTokens: 1_000,
+    cacheReadTokens: 500_000,
+    cacheWriteTokens: 40_000,
+  };
+
+  it('replays the last sample under the scope it was taken in', () => {
+    write([
+      { type: 'user', content: 'hi' },
+      sample,
+      { type: 'assistant', content: 'ok', backend: 'claude' },
+    ]);
+    const result = hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath);
+    expect(result.providerSample).toEqual({
+      at: '2026-09-03T20:00:00.000Z',
+      scope: {
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+      },
+      contextTokens: 541_000,
+      inputTokens: 1_000,
+      cacheReadTokens: 500_000,
+      cacheWriteTokens: 40_000,
+    });
+  });
+
+  it.each([
+    ['context_evict', { type: 'context_evict', refs: [] }],
+    ['context_trim', { type: 'context_trim', reason: 'x' }],
+    ['compaction', { type: 'compaction', summary: 's', keptEntries: [] }],
+    ['backend_session_invalidated', { type: 'backend_session_invalidated', id: 'sess-1' }],
+  ])('a %s after the sample drops it — the window it measured is gone', (_t, event) => {
+    write([sample, event]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
+  it('REGRESSION (Lumen, round 3): a newer report with no usable measurement is a tombstone — valid → unknown → nothing', () => {
+    write([
+      sample,
+      {
+        type: 'provider_sample',
+        at: '2026-09-03T20:01:00.000Z',
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+        unknown: true,
+      },
+    ]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
+  it('a later sample replaces an earlier one; a malformed one is ignored', () => {
+    write([sample, { ...sample, contextTokens: 600_000 }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample?.contextTokens
+    ).toBe(600_000);
+    write([{ type: 'provider_sample', backend: 'claude' }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+});
+
+describe('hydrateLedgerFromTranscript — a persisted context note survives reattach (PR #584)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-note-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stays hidden from the replay preview when it rides a compaction kept tail (Lumen, round 3)', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'q' },
+        {
+          eid: 2,
+          type: 'compaction',
+          summary: 'the summary',
+          keptEntries: [
+            {
+              role: 'system',
+              content:
+                '[2 earlier tool results were cleared … write calls that RAN (send_response)]',
+              source: 'auto-evict',
+            },
+            { role: 'assistant', content: 'kept answer', source: 'claude' },
+          ],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    // In the window (the model needs it) …
+    expect(ledger.listEntries().some((e) => e.source === 'auto-evict')).toBe(true);
+    // … but never a visible system message in the scrollback replay — the
+    // same classification a direct replay gets.
+    expect(result.tailPreview.some((p) => p.content.includes('tool results were cleared'))).toBe(
+      false
+    );
+    expect(result.tailPreview.some((p) => p.content.includes('kept answer'))).toBe(true);
+  });
+
+  it('replays the auto-evict tombstone as the system entry it was live', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'hello' },
+        { eid: 2, type: 'assistant', content: 'hi', backend: 'claude' },
+        {
+          eid: 3,
+          type: 'context_note',
+          source: 'auto-evict',
+          content: '[3 earlier tool results were cleared … those calls ALREADY HAPPENED]',
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    const note = ledger.listEntries().find((e) => e.source === 'auto-evict');
+    expect(note?.content).toContain('ALREADY HAPPENED');
+    expect(note?.eid).toBe(3);
+  });
+});
+
 describe('hydrateLedgerFromTranscript — context_evict events', () => {
   let dir: string;
   let transcriptPath: string;
@@ -481,5 +722,456 @@ describe('hydrateLedgerFromTranscript — context_evict events', () => {
     const ledger = new ContextLedger();
     const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
     expect(result.maxEid).toBe(12);
+  });
+});
+
+describe('hydrateLedgerFromTranscript — platform message replay (activity entries)', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-activity-replay-test-'));
+    transcriptPath = join(dir, 'session-activity.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (events: unknown[]) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  it('replays outbound platform messages as directional message blocks, not just tool receipts', () => {
+    // Conor's reattach report (2026-08-12): Myra's Telegram sends showed only
+    // as collapsed send_response events after detach/reattach. The activity
+    // entry holds the FULL sent content — replay it as the same 📤 block the
+    // live activity poll renders.
+    write([
+      {
+        eid: 1,
+        type: 'local_tool_call',
+        tool: 'send_response',
+        args: {
+          channel: 'telegram',
+          conversationId: '100200300',
+          content: 'Post-session catch-up',
+        },
+        status: 'executed',
+        result: { success: true },
+      },
+      {
+        eid: 2,
+        type: 'activity',
+        activityId: 'act-1',
+        activityType: 'message_out',
+        sbSlug: 'myra',
+        platform: 'telegram',
+        createdAt: '2026-08-12T22:03:00Z',
+        content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+
+    // The tool receipt stays a dim event row...
+    const eventRows = result.tailPreview.filter((p) => p.role === 'event');
+    expect(eventRows).toHaveLength(1);
+    expect(eventRows[0].content).toContain('send_response');
+
+    // ...and the SENT MESSAGE is a labeled assistant block with full content.
+    const sent = result.tailPreview.find((p) => p.role === 'assistant');
+    expect(sent).toBeDefined();
+    expect(sent!.label).toBe('📤 myra → telegram');
+    expect(sent!.content).toContain('Ruoshan emailed about the picnic');
+    expect(sent!.ts).toBe('2026-08-12T22:03:00Z');
+
+    // The activity id is marked seen so the live poll cannot double-render it.
+    expect(result.seenActivityIds).toContain('act-1');
+  });
+
+  it('replays inbound platform messages as user blocks', () => {
+    write([
+      {
+        eid: 1,
+        type: 'activity',
+        activityId: 'act-2',
+        activityType: 'message_in',
+        sbSlug: 'myra',
+        platform: 'telegram',
+        content: 'Therapy finished 45 minutes ago!',
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    const received = result.tailPreview.find((p) => p.role === 'user');
+    expect(received).toBeDefined();
+    expect(received!.label).toBe('📨 telegram → myra');
+  });
+
+  it('legacy activity entries without platform still replay with the generic channel label', () => {
+    write([
+      {
+        eid: 1,
+        type: 'activity',
+        activityId: 'act-3',
+        activityType: 'message_out',
+        sbSlug: 'myra',
+        content: 'sent before platform was persisted',
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    expect(result.tailPreview.find((p) => p.role === 'assistant')?.label).toBe('📤 myra → channel');
+  });
+
+  it('bookkeeping and other-agent activity stays out of the message replay', () => {
+    write([
+      {
+        eid: 1,
+        type: 'activity',
+        activityId: 'act-4',
+        activityType: 'tool_call',
+        sbSlug: 'myra',
+        content: 'list_emails',
+      },
+      {
+        eid: 2,
+        type: 'activity',
+        activityId: 'act-5',
+        activityType: 'state_change',
+        sbSlug: 'lumen',
+        content: 'phase: reviewing',
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    expect(result.tailPreview).toHaveLength(0);
+    // Still in the ledger (context) and marked seen, as before.
+    expect(result.seenActivityIds).toEqual(expect.arrayContaining(['act-4', 'act-5']));
+  });
+});
+
+describe('platform message replay survives compaction (PR #478 round 2)', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-compact-replay-test-'));
+    transcriptPath = join(dir, 'session-compact.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (events: unknown[]) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const sendActivity = {
+    eid: 3,
+    type: 'activity',
+    activityId: 'act-send',
+    activityType: 'message_out',
+    sbSlug: 'myra',
+    platform: 'telegram',
+    createdAt: '2026-08-12T22:03:00Z',
+    content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+  };
+
+  it('a platform send in the compaction kept tail replays as a message block, not the ⚡ line', () => {
+    // Compact → detach → reattach: the kept tail serializes ledger entries;
+    // the replay metadata rides along so the send stays a visible message.
+    write([
+      { eid: 1, type: 'user', content: 'old question' },
+      { eid: 2, type: 'assistant', content: 'old answer', backend: 'claude' },
+      {
+        eid: 4,
+        type: 'compaction',
+        summary: '[Conversation summary — compacted 2 earlier entries]\nOld stuff.',
+        keptEntries: [
+          { role: 'assistant', content: 'recent answer', source: 'claude' },
+          {
+            role: 'system',
+            content: '⚡ myra sent — Post-session catch-up…',
+            source: 'pcp-activity',
+            eid: 3,
+            replay: {
+              role: 'assistant',
+              label: '📤 myra → telegram',
+              body: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+              at: '2026-08-12T22:03:00Z',
+            },
+          },
+        ],
+        removedCount: 2,
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+
+    // The send replays as the directional block with FULL content…
+    const sent = result.tailPreview.find((p) => p.label === '📤 myra → telegram');
+    expect(sent).toBeDefined();
+    expect(sent!.role).toBe('assistant');
+    expect(sent!.content).toContain('Ruoshan emailed about the picnic');
+    expect(sent!.ts).toBe('2026-08-12T22:03:00Z');
+
+    // …while the LEDGER keeps the compact ⚡ line (context unchanged) with
+    // the replay metadata restored for the NEXT compaction cycle.
+    const ledgerEntry = ledger.listEntries().find((e) => e.source === 'pcp-activity');
+    expect(ledgerEntry).toBeDefined();
+    expect(ledgerEntry!.content).toContain('⚡ myra sent');
+    expect(ledgerEntry!.replay?.label).toBe('📤 myra → telegram');
+  });
+
+  it('kept internal-source entries WITHOUT replay metadata stay suppressed (legacy behavior)', () => {
+    write([
+      {
+        eid: 2,
+        type: 'compaction',
+        summary: 'summary',
+        keptEntries: [
+          { role: 'system', content: '⚡ myra tool call — list_emails', source: 'pcp-activity' },
+        ],
+        removedCount: 1,
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    expect(result.tailPreview).toHaveLength(0);
+  });
+
+  it('FULL CYCLE: hydrate activity → live compaction serializes replay → next reattach still shows the block', () => {
+    // Cycle 1: reattach hydrates the raw activity event.
+    write([sendActivity]);
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    const hydratedEntry = ledger.listEntries().find((e) => e.source === 'pcp-activity-history');
+    expect(hydratedEntry?.replay?.label).toBe('📤 myra → telegram');
+
+    // Live compaction in this process: the production keptEntries writer
+    // serializes the ledger tail — replay metadata must ride along.
+    ledger.compactToSummary('[Conversation summary]', 12);
+    const kept = keptEntriesForCompaction(ledger);
+    const keptSend = kept.find(
+      (k) => (k as { source?: string }).source === 'pcp-activity-history'
+    ) as { replay?: { label?: string; body?: string } } | undefined;
+    expect(keptSend?.replay?.label).toBe('📤 myra → telegram');
+    expect(keptSend?.replay?.body).toContain('Ruoshan emailed');
+
+    // Cycle 2: next process reattaches onto the compaction event.
+    write([
+      sendActivity,
+      { eid: 4, type: 'compaction', summary: '[Conversation summary]', keptEntries: kept },
+    ]);
+    const ledger2 = new ContextLedger();
+    const result2 = hydrateLedgerFromTranscript(ledger2, transcriptPath, 'myra');
+    const sent2 = result2.tailPreview.find((p) => p.label === '📤 myra → telegram');
+    expect(sent2).toBeDefined();
+    expect(sent2!.content).toContain('Ruoshan emailed about the picnic');
+  });
+});
+
+describe('findLastDetectedModel — persisted provider model recovery', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-model-detect-test-'));
+    transcriptPath = join(dir, 'session-model.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (events: unknown[]) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  it('recovers the last model_detected entry for the backend', () => {
+    write([
+      { eid: 1, type: 'user_turn', content: 'hi' },
+      { eid: 2, type: 'model_detected', backend: 'claude', model: 'claude-opus-4-6' },
+      { eid: 3, type: 'model_detected', backend: 'claude', model: 'claude-fable-5' },
+    ]);
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBe('claude-fable-5');
+  });
+
+  it('ignores entries persisted under a DIFFERENT backend', () => {
+    // A /backend switch mid-session leaves the old provider's entry behind;
+    // it must not drive the new backend's window.
+    write([{ eid: 1, type: 'model_detected', backend: 'claude', model: 'claude-fable-5' }]);
+    expect(findLastDetectedModel(transcriptPath, 'codex')).toBeUndefined();
+  });
+
+  it('returns undefined for legacy transcripts, missing files, and malformed lines', () => {
+    write([{ eid: 1, type: 'user_turn', content: 'no model entry here' }]);
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
+    expect(findLastDetectedModel(join(dir, 'nope.jsonl'), 'claude')).toBeUndefined();
+    writeFileSync(
+      transcriptPath,
+      'not json\n{"type":"model_detected","backend":"claude","model":42}\n'
+    );
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
+  });
+});
+
+describe('hydrateLedgerFromTranscript — shadow clone handoff', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-hydration-clones-test-'));
+    transcriptPath = join(dir, 'session-clones.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(events: Array<Record<string, unknown>>) {
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+
+  it('replays a fan-out summary into the reattached ledger', () => {
+    // The clones' summaries are the parent's ONLY record of that work — their
+    // own transcripts are separate files it never replays. Without this branch
+    // a reattached parent silently loses every clone result it paid for.
+    write([
+      { ts: '2026-08-14T09:00:00Z', eid: 1, type: 'user', content: 'go look at two things' },
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 2,
+        type: 'clone_fanout',
+        outcomes: [
+          {
+            id: 'clone-1',
+            label: 'audit auth paths',
+            status: 'completed',
+            summary: 'Three entry points, all in auth.ts.',
+          },
+          {
+            id: 'clone-2',
+            label: 'map coverage',
+            status: 'failed',
+            error: 'backend backend-failure',
+          },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+
+    const clone = ledger.listEntries().find((e) => e.source === 'shadow-clone');
+    expect(clone).toBeDefined();
+    expect(clone?.content).toContain('clone-1 · audit auth paths — completed');
+    expect(clone?.content).toContain('Three entry points, all in auth.ts.');
+    expect(clone?.content).toContain('backend backend-failure');
+  });
+
+  it('keeps the replayed handoff to one entry, whatever the fan-out width', () => {
+    write([
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 1,
+        type: 'clone_fanout',
+        outcomes: [
+          { id: 'clone-1', label: 'a', status: 'completed', summary: 'x' },
+          { id: 'clone-2', label: 'b', status: 'completed', summary: 'y' },
+          { id: 'clone-3', label: 'c', status: 'completed', summary: 'z' },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+    expect(ledger.listEntries().filter((e) => e.source === 'shadow-clone')).toHaveLength(1);
+  });
+
+  it('survives a malformed fan-out event rather than dropping the transcript', () => {
+    write([
+      { ts: '2026-08-14T09:01:00Z', eid: 1, type: 'clone_fanout' },
+      { ts: '2026-08-14T09:02:00Z', eid: 2, type: 'user', content: 'still here' },
+    ]);
+
+    const ledger = new ContextLedger();
+    expect(() => hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren')).not.toThrow();
+    expect(ledger.listEntries().some((e) => e.content === 'still here')).toBe(true);
+  });
+
+  it('lets a later compaction supersede a replayed fan-out', () => {
+    // The failure this guards: hydration added the fan-out entry but did not
+    // track its id, so the compaction event that replaced it evicted everything
+    // EXCEPT it — leaving the superseded clone summary sitting alongside the
+    // compacted state that was meant to stand in for it.
+    write([
+      { ts: '2026-08-14T09:00:00Z', eid: 1, type: 'user', content: 'go look at two things' },
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 2,
+        type: 'clone_fanout',
+        outcomes: [
+          { id: 'clone-1', label: 'audit', status: 'completed', summary: 'Three entry points.' },
+        ],
+      },
+      {
+        ts: '2026-08-14T09:02:00Z',
+        eid: 3,
+        type: 'compaction',
+        summary: 'Earlier work compacted: clones audited auth.',
+        kept: [],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+
+    const entries = ledger.listEntries();
+    expect(entries.some((e) => e.content.includes('Three entry points.'))).toBe(false);
+    expect(entries.some((e) => e.source === 'compaction-history')).toBe(true);
+  });
+});
+
+describe('BOOTSTRAP_REQUIRED_EXIT_MARKER', () => {
+  it('matches the literal the server-side InkRunner greps stderr for', () => {
+    // packages/api InkRunner carries its own copy of this string; the two
+    // processes share no module, so the literal is the whole contract. If this
+    // side is renamed alone, the runner stops recognising the refusal and a
+    // failed turn looks like a crash instead of something recoverable.
+    expect(BOOTSTRAP_REQUIRED_EXIT_MARKER).toBe('INK_BOOTSTRAP_REQUIRED_FAILURE');
+  });
+});
+
+describe('failIfBootstrapRequired', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('stops the run and names itself on stderr when identity context is required', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('exited');
+    }) as never);
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() =>
+      failIfBootstrapRequired({ requireBootstrap: true }, 'bootstrap unavailable')
+    ).toThrow('exited');
+
+    expect(exit).toHaveBeenCalledWith(78);
+    // The runner greps stderr for this; a bare exit code is not enough to tell
+    // a refusal apart from a crash.
+    expect(String(err.mock.calls[0][0])).toContain(BOOTSTRAP_REQUIRED_EXIT_MARKER);
+  });
+
+  it('leaves an interactive run alone, where a human can read the warning', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('exited');
+    }) as never);
+
+    expect(() => failIfBootstrapRequired({}, 'bootstrap unavailable')).not.toThrow();
+    expect(exit).not.toHaveBeenCalled();
   });
 });

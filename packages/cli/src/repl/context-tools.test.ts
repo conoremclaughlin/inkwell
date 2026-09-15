@@ -1,6 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ContextLedger } from './context-ledger.js';
-import { isClientLocalTool, handleClientLocalTool, CLIENT_LOCAL_TOOLS } from './context-tools.js';
+import {
+  isClientLocalTool,
+  handleClientLocalTool,
+  parseCompactContextArgs,
+  compactionShrinks,
+  effectiveContextTokens,
+  CLIENT_LOCAL_TOOLS,
+  COMPACT_CONTEXT_MAX_KEEP_RECENT,
+  COMPACT_CONTEXT_SUMMARY_MAX_CHARS,
+  EVICT_CONTEXT_PREVIEW_LIMIT,
+  LIST_CONTEXT_BOOKMARK_LIMIT,
+  LIST_CONTEXT_DEFAULT_LIMIT,
+  LIST_CONTEXT_MAX_LIMIT,
+} from './context-tools.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 
 /** Extract parsed JSON from a tool call result */
@@ -197,6 +210,156 @@ describe('handleClientLocalTool: evict_context', () => {
   });
 });
 
+// ─── list_context is a page, not the window (#571) ──────────────
+
+describe('handleClientLocalTool: list_context paging', () => {
+  function bigLedger(n: number): ContextLedger {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < n; i++) {
+      const source = i % 3 === 0 ? 'heartbeat' : i % 3 === 1 ? 'local-tool' : 'inkmail';
+      ledger.addEntry(
+        i % 4 === 0 ? 'inbox' : 'system',
+        `entry ${i} ${'x'.repeat((i % 7) * 40)}`,
+        source
+      );
+    }
+    return ledger;
+  }
+
+  it('REGRESSION: never returns the whole window — one page, totals still complete', () => {
+    const ledger = bigLedger(3500);
+    const parsed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(parsed.totalEntries).toBe(3500);
+    expect(parsed.entries).toHaveLength(LIST_CONTEXT_DEFAULT_LIMIT);
+    expect(parsed.page).toMatchObject({ matched: 3500, offset: 0, returned: 50, remaining: 3450 });
+    expect(parsed.note).toContain('3450 more');
+    expect(parsed.bySource.heartbeat.count).toBe(1167);
+    // The result the model reads stays small however large the window is.
+    const text = (
+      handleClientLocalTool('list_context', {}, ledger)!.content as Array<{ text: string }>
+    )[0].text;
+    expect(text.length).toBeLessThan(20_000);
+  });
+
+  it('pages with offset and caps limit', () => {
+    const ledger = bigLedger(500);
+    const p2 = parseResult(
+      handleClientLocalTool('list_context', { offset: 50, limit: 25 }, ledger)
+    );
+    expect(p2.entries[0].preview).toContain('entry 50 ');
+    expect(p2.entries).toHaveLength(25);
+    const capped = parseResult(handleClientLocalTool('list_context', { limit: 10_000 }, ledger));
+    expect(capped.entries).toHaveLength(LIST_CONTEXT_MAX_LIMIT);
+    expect(capped.page.limit).toBe(LIST_CONTEXT_MAX_LIMIT);
+  });
+
+  it('filters by source, role and minimum size', () => {
+    const ledger = bigLedger(300);
+    const bySource = parseResult(
+      handleClientLocalTool('list_context', { source: 'inkmail' }, ledger)
+    );
+    expect(bySource.page.matched).toBe(100);
+    expect(bySource.entries.every((e: { source: string }) => e.source === 'inkmail')).toBe(true);
+    const byRole = parseResult(handleClientLocalTool('list_context', { role: 'inbox' }, ledger));
+    expect(byRole.page.matched).toBe(75);
+    const big = parseResult(handleClientLocalTool('list_context', { minTokens: 50 }, ledger));
+    expect(big.entries.every((e: { tokens: number }) => e.tokens >= 50)).toBe(true);
+    expect(big.page.matched).toBeLessThan(300);
+    expect(big.page.matched).toBeGreaterThan(0);
+  });
+
+  it('sorts largest-first so the model can find what is worth evicting', () => {
+    const ledger = bigLedger(200);
+    const parsed = parseResult(
+      handleClientLocalTool('list_context', { sort: 'largest', limit: 5 }, ledger)
+    );
+    const tokens = parsed.entries.map((e: { tokens: number }) => e.tokens);
+    expect([...tokens].sort((a, b) => b - a)).toEqual(tokens);
+    const newest = parseResult(
+      handleClientLocalTool('list_context', { sort: 'newest', limit: 1 }, ledger)
+    );
+    expect(newest.entries[0].preview).toContain('entry 199 ');
+  });
+
+  it('REGRESSION (Lumen, PR #576): many bookmarks cannot re-explode the payload', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 3500; i++) {
+      ledger.addEntry('inbox', `message ${i}`, 'inkmail');
+      ledger.createBookmark(`bookmark ${i} ${'y'.repeat(84)}`);
+    }
+    const result = handleClientLocalTool('list_context', {}, ledger)!;
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+
+    expect(parsed.bookmarkCount).toBe(3500);
+    expect(parsed.bookmarks).toHaveLength(LIST_CONTEXT_BOOKMARK_LIMIT);
+    expect(parsed.bookmarksNotShown).toBe(3500 - LIST_CONTEXT_BOOKMARK_LIMIT);
+    // The whole result still parses as one document — the relay cap must
+    // never have to cut it mid-JSON.
+    expect(text.length).toBeLessThan(20_000);
+    expect(() => JSON.parse(text)).not.toThrow();
+  });
+
+  it('truncates a long bookmark label and keeps the most recent bookmarks', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hi');
+    for (let i = 0; i < 25; i++) ledger.createBookmark(`b${i} ${'z'.repeat(500)}`);
+    const parsed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(parsed.bookmarks[parsed.bookmarks.length - 1].label.startsWith('b24 ')).toBe(true);
+    for (const b of parsed.bookmarks) expect(b.label.length).toBeLessThanOrEqual(121);
+  });
+
+  it('no note when everything fits', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hi');
+    const parsed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(parsed.note).toBeUndefined();
+    expect(parsed.page.remaining).toBe(0);
+  });
+});
+
+// ─── evict_context: refs go to the runtime, not the model (#571) ──
+
+describe('handleClientLocalTool: evict_context refs', () => {
+  it('REGRESSION: the model-facing result carries no evictRefs; the hook carries every one', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 3000; i++) ledger.addEntry('inbox', `message ${i}`, 'inkmail');
+    const hook = vi.fn();
+    const result = handleClientLocalTool('evict_context', { role: 'inbox' }, ledger, undefined, {
+      onEvict: hook,
+    });
+    const text = (result!.content as Array<{ text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+
+    expect(parsed.evicted).toBe(3000);
+    expect(parsed.removedPreviews).toHaveLength(EVICT_CONTEXT_PREVIEW_LIMIT);
+    expect(parsed.removedNotShown).toBe(2990);
+    expect(parsed.evictRefs).toBeUndefined();
+    expect(text.length).toBeLessThan(3_000);
+
+    expect(hook).toHaveBeenCalledTimes(1);
+    const eviction = hook.mock.calls[0][0];
+    expect(eviction.args).toEqual({ role: 'inbox' });
+    expect(eviction.refs).toHaveLength(3000);
+    expect(eviction.refs[0]).toMatchObject({
+      role: 'inbox',
+      source: 'inkmail',
+      hash: expect.any(String),
+    });
+    expect(eviction.tokensFreed).toBe(parsed.tokensFreed);
+  });
+
+  it('no hook call when nothing was evicted', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hello');
+    const hook = vi.fn();
+    handleClientLocalTool('evict_context', { entryIds: [999] }, ledger, undefined, {
+      onEvict: hook,
+    });
+    expect(hook).not.toHaveBeenCalled();
+  });
+});
+
 // ─── handleClientLocalTool: unknown tool ────────────────────────
 
 describe('handleClientLocalTool: unknown', () => {
@@ -290,5 +453,196 @@ describe('eviction affects prompt transcript', () => {
 
     const transcript = ledger.buildPromptTranscript();
     expect(transcript).toBe('');
+  });
+});
+
+// ─── compact_context (task 609b1833) ────────────────────────────
+
+describe('compact_context', () => {
+  it('is client-local: policy bypass, never forwarded to the server, never persisted into the ledger', () => {
+    expect(isClientLocalTool('compact_context')).toBe(true);
+  });
+
+  it('is refused by the generic handler — only the REPL host can compact', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hello');
+    const result = handleClientLocalTool('compact_context', { summary: 'x' }, ledger);
+    expect(result?.isError).toBe(true);
+    expect(parseResult(result).error).toContain('not available');
+    expect(ledger.listEntries()).toHaveLength(1);
+  });
+
+  it('compactionShrinks refuses a summary that is not smaller than what it replaces (Lumen, PR #578)', () => {
+    expect(compactionShrinks(13, 5012)).toBe(false);
+    expect(compactionShrinks(100, 100)).toBe(false);
+    expect(compactionShrinks(100, 99)).toBe(true);
+  });
+
+  describe('parseCompactContextArgs', () => {
+    it('accepts an agent-written summary and a keepRecent', () => {
+      expect(parseCompactContextArgs({ summary: '  the brief  ', keepRecent: 4.7 })).toEqual({
+        summary: 'the brief',
+        keepRecent: 4,
+      });
+    });
+
+    it('accepts nothing — the runtime summarizes with its default tail', () => {
+      expect(parseCompactContextArgs({})).toEqual({});
+    });
+
+    it('rejects an empty or oversized summary and a bad keepRecent', () => {
+      expect(parseCompactContextArgs({ summary: '   ' })).toMatchObject({
+        error: expect.stringContaining('empty'),
+      });
+      expect(parseCompactContextArgs({ summary: 42 })).toMatchObject({
+        error: expect.stringContaining('string'),
+      });
+      expect(
+        parseCompactContextArgs({ summary: 'x'.repeat(COMPACT_CONTEXT_SUMMARY_MAX_CHARS + 1) })
+      ).toMatchObject({ error: expect.stringContaining('ceiling') });
+      expect(parseCompactContextArgs({ keepRecent: -1 })).toMatchObject({
+        error: expect.stringContaining('non-negative'),
+      });
+      expect(parseCompactContextArgs({ keepRecent: 'many' })).toMatchObject({
+        error: expect.stringContaining('non-negative'),
+      });
+      expect(
+        parseCompactContextArgs({ keepRecent: COMPACT_CONTEXT_MAX_KEEP_RECENT + 1 })
+      ).toMatchObject({
+        error: expect.stringContaining('at most'),
+      });
+    });
+  });
+});
+
+// ─── refs: the durable address (#570) ───────────────────────────
+
+describe('entry refs — hash-addressed, stable across reattach and eviction (#570)', () => {
+  it('the model-facing payloads carry refs and no process ordinal (Lumen, PR #582)', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('inbox', 'a', 'inkmail');
+    const listed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(listed.entries[0].id).toBeUndefined();
+    expect(listed.entries[0].ref).toMatch(/^sha1:/);
+    const evicted = parseResult(
+      handleClientLocalTool('evict_context', { refs: [listed.entries[0].ref] }, ledger)
+    );
+    expect(evicted.removedPreviews[0].id).toBeUndefined();
+    expect(evicted.removedPreviews[0].ref).toBe(listed.entries[0].ref);
+  });
+
+  it('list_context hands out a ref per entry, and evict_context takes refs', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('inbox', 'keep me', 'inkmail');
+    ledger.addEntry('inbox', 'evict me', 'inkmail');
+    const listed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    const target = listed.entries.find((e: { preview: string }) => e.preview === 'evict me');
+    expect(target.ref).toMatch(/^sha1:[0-9a-f]{16}$/);
+    const evicted = parseResult(
+      handleClientLocalTool('evict_context', { refs: [target.ref] }, ledger)
+    );
+    expect(evicted.evicted).toBe(1);
+    expect(evicted.removedPreviews[0].ref).toBe(target.ref);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['keep me']);
+  });
+
+  it('REGRESSION (Myra): a ref captured before an eviction still names the same content, never a neighbour', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 6; i++) ledger.addEntry('inbox', `message ${i}`, 'inkmail');
+    const listed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    const refOf3 = listed.entries[3].ref;
+    // An earlier eviction shifts everything positionally…
+    handleClientLocalTool(
+      'evict_context',
+      { refs: [listed.entries[0].ref, listed.entries[1].ref] },
+      ledger
+    );
+    // …but the ref still points at "message 3".
+    const evicted = parseResult(handleClientLocalTool('evict_context', { refs: [refOf3] }, ledger));
+    expect(evicted.removedPreviews.map((p: { preview: string }) => p.preview)).toEqual([
+      'message 3',
+    ]);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual([
+      'message 2',
+      'message 4',
+      'message 5',
+    ]);
+  });
+
+  it('a ref survives reattach — a fresh ledger with the same content resolves it', () => {
+    const before = new ContextLedger();
+    before.addEntry('system', 'bootstrap blob', 'bootstrap');
+    before.addEntry('inbox', 'a message', 'inkmail');
+    const ref = parseResult(handleClientLocalTool('list_context', {}, before)).entries[1].ref;
+    // Reattach: ids restart, content replays.
+    const after = new ContextLedger();
+    after.addEntry('system', 'unrelated new entry', 'repl');
+    after.addEntry('system', 'bootstrap blob', 'bootstrap');
+    after.addEntry('inbox', 'a message', 'inkmail');
+    const evicted = parseResult(handleClientLocalTool('evict_context', { refs: [ref] }, after));
+    expect(evicted.evicted).toBe(1);
+    expect(after.listEntries().map((e) => e.content)).toEqual([
+      'unrelated new entry',
+      'bootstrap blob',
+    ]);
+  });
+
+  it('an unknown ref evicts nothing and says so', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hello');
+    const evicted = parseResult(
+      handleClientLocalTool('evict_context', { refs: ['sha1:0000000000000000'] }, ledger)
+    );
+    expect(evicted.evicted).toBe(0);
+    expect(ledger.listEntries()).toHaveLength(1);
+  });
+});
+
+// ─── provider-measured accounting (task 9cf538a2) ───────────────
+
+describe("list_context — the provider's measurement beside the estimate", () => {
+  it('reports both numbers and reasons with the larger', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 20; i++) ledger.addEntry('inbox', 'x'.repeat(400), 'inkmail');
+    const estimate = ledger.totalTokens();
+    const parsed = parseResult(
+      handleClientLocalTool('list_context', {}, ledger, undefined, {
+        providerUsage: () => ({
+          contextTokens: 541_000,
+          inputTokens: 1_000,
+          cacheReadTokens: 540_000,
+          model: 'claude-opus-5',
+          measuredAt: '2026-09-03T00:00:00.000Z',
+        }),
+      })
+    );
+    expect(parsed.totalTokens).toBe(estimate);
+    expect(parsed.effectiveTokens).toBe(541_000);
+    expect(parsed.providerMeasured.contextTokens).toBe(541_000);
+    expect(parsed.providerMeasured.model).toBe('claude-opus-5');
+    expect(parsed.accountingNote).toContain('541,000');
+    expect(parsed.accountingNote).toContain('effectiveTokens');
+  });
+
+  it('no note when the two agree, and no measurement fields when there is none', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 20; i++) ledger.addEntry('inbox', 'x'.repeat(400), 'inkmail');
+    const estimate = ledger.totalTokens();
+    const close = parseResult(
+      handleClientLocalTool('list_context', {}, ledger, undefined, {
+        providerUsage: () => ({ contextTokens: Math.round(estimate * 1.1) }),
+      })
+    );
+    expect(close.accountingNote).toBeUndefined();
+    expect(close.effectiveTokens).toBe(Math.round(estimate * 1.1));
+    const none = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(none.providerMeasured).toBeUndefined();
+    expect(none.effectiveTokens).toBe(estimate);
+  });
+
+  it('effectiveContextTokens is the larger of the two, or the estimate alone', () => {
+    expect(effectiveContextTokens(297_000, { contextTokens: 541_000 })).toBe(541_000);
+    expect(effectiveContextTokens(297_000, { contextTokens: 100_000 })).toBe(297_000);
+    expect(effectiveContextTokens(297_000, undefined)).toBe(297_000);
   });
 });

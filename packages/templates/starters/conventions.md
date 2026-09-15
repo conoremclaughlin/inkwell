@@ -31,7 +31,7 @@ Messages with the same threadKey are routed to the same session on the recipient
 
 Studios are git worktrees, and **a single branch can only be checked out in one worktree at a time**.
 
-- Each studio should use its own home branch: `<agentId>/studio/main-<studio-slug>`
+- Each studio should use its own home branch: `<sbSlug>/studio/main-<studio-slug>`
 - Treat that branch as a **return point**, not a feature branch
 - Keep it fast-forwarded from `main` (`origin/main`)
 - Do **not** commit work directly on this branch

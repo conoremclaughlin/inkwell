@@ -33,6 +33,7 @@ vi.mock('child_process', async (importOriginal) => {
 
 vi.mock('fs/promises', () => ({
   access: vi.fn().mockResolvedValue(undefined),
+  mkdir: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('./resolve-binary.js', () => ({
@@ -123,6 +124,8 @@ describe('CodexRunner', () => {
       contextTokens: 42,
       inputTokens: 12,
       outputTokens: 5,
+      // Codex reports thread-cumulative totals; the repository diffs them.
+      cumulative: true,
     });
     expect(result.finalTextResponse).toBe('done');
     expect(result.toolCalls?.length).toBe(1);
@@ -460,6 +463,63 @@ describe('CodexRunner', () => {
       expect(configArg).toMatch(/^model_instructions_file=\/run\/ink\//);
     });
 
+    it('injects host.docker.internal, not loopback, when running in a container', async () => {
+      // Lumen's blocker on PR #430. Inside a Docker sandbox `resolveSpawnTarget`
+      // wraps the command in `docker exec`, so a hardcoded localhost resolves to
+      // the CONTAINER's own loopback rather than the API server — bypassing the
+      // orchestrator's host.docker.internal rewrite and stranding the run with
+      // no Ink tools.
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: {
+          workingDirectory: process.cwd(),
+          mcpConfigPath: '',
+          container: { containerName: 'ink-sandbox-test-abc', runtimeDir },
+        },
+      });
+
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+      await runPromise;
+
+      const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
+      const urlArg = args.find(
+        (a: string) => typeof a === 'string' && a.startsWith('mcp_servers.inkwell.url=')
+      );
+      expect(urlArg).toBeDefined();
+      expect(urlArg).toContain('host.docker.internal');
+      expect(urlArg).not.toContain('localhost');
+    });
+
+    it('injects localhost when running on the host', async () => {
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: { workingDirectory: process.cwd(), mcpConfigPath: '' },
+      });
+
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+      await runPromise;
+
+      const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
+      const urlArg = args.find(
+        (a: string) => typeof a === 'string' && a.startsWith('mcp_servers.inkwell.url=')
+      );
+      expect(urlArg).toBeDefined();
+      expect(urlArg).toContain('localhost');
+      expect(urlArg).not.toContain('host.docker.internal');
+    });
+
     it('writes the identity prompt file to runtimeDir on the host', async () => {
       const mockProc = createMockProcess();
       (spawn as Mock).mockReturnValue(mockProc);
@@ -566,5 +626,149 @@ describe('CodexRunner', () => {
     expect(result.error).toContain('thread.started');
     expect(result.error).toContain('turn.started');
     expect(result.error).toContain('stream disconnected before completion');
+  });
+});
+
+describe('CodexRunner token usage extraction', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function runWithEvents(events: Record<string, unknown>[]) {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    setTimeout(() => {
+      for (const event of events) {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify(event)}\n`));
+      }
+      mockProc.emit('close', 0);
+    }, 5);
+
+    return runPromise;
+  }
+
+  // codex exec --json emits turn.completed.usage from ThreadTokenUsage.total,
+  // i.e. a running total for the thread. It must be flagged so the repository
+  // diffs rather than adds — adding it re-applied the whole history every turn
+  // and grew one session to 3,441,018,986 tokens, overflowing int32 on write.
+  it('flags Codex usage as cumulative', async () => {
+    const result = await runWithEvents([
+      {
+        type: 'turn.completed',
+        usage: { input_tokens: 1200, output_tokens: 340 },
+      },
+    ]);
+
+    expect(result.usage?.cumulative).toBe(true);
+  });
+
+  // Real 0.146.1 shape. cached_input_tokens and cache_write_input_tokens are
+  // both represented WITHIN input_tokens; reasoning_output_tokens within
+  // output_tokens. None may be added on top.
+  it('does not add cache or reasoning figures already inside the totals', async () => {
+    const result = await runWithEvents([
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1000,
+          cached_input_tokens: 900,
+          cache_write_input_tokens: 64,
+          output_tokens: 50,
+          reasoning_output_tokens: 30,
+          total_tokens: 1050,
+        },
+      },
+    ]);
+
+    expect(result.usage?.inputTokens).toBe(1000);
+    expect(result.usage?.outputTokens).toBe(50);
+  });
+
+  it('still reads flat top-level usage fields', async () => {
+    const result = await runWithEvents([
+      { session_id: 'codex-session-123', input_tokens: 12, output_tokens: 5, context_tokens: 42 },
+    ]);
+
+    expect(result.usage?.inputTokens).toBe(12);
+    expect(result.usage?.outputTokens).toBe(5);
+    expect(result.usage?.contextTokens).toBe(42);
+  });
+
+  // Codex emits no per-turn context measure. Aliasing it to the cumulative
+  // input total stored a false 1.3-billion-token "context" reading, so an
+  // absent figure must stay absent — unknown, not zero and not the input sum.
+  it('reports no context figure when the backend does not provide one', async () => {
+    const result = await runWithEvents([
+      { type: 'turn.completed', usage: { input_tokens: 70, output_tokens: 5 } },
+    ]);
+
+    expect(result.usage?.contextTokens).toBeUndefined();
+    expect(result.usage?.inputTokens).toBe(70);
+  });
+
+  // An untyped deep scan for any object carrying input_tokens/output_tokens
+  // can consume token stats that belong to something else entirely — e.g. a
+  // benchmark harness reporting its own numbers into the event stream.
+  it('ignores token-shaped objects outside the usage container', async () => {
+    const result = await runWithEvents([
+      {
+        type: 'item.completed',
+        item: {
+          type: 'mcp_tool_call',
+          result: { benchmark_stats: { input_tokens: 3_437_373_064, output_tokens: 3_645_922 } },
+        },
+      },
+    ]);
+
+    expect(result.usage).toBeUndefined();
+  });
+});
+
+// spec:studio-materialization v8 (PR #544 r1 P1) — Codex defaults to
+// workspace-write, so without --add-dir the host MCP can mint a studio the
+// Codex session cannot edit, build, or test. The grant must ride BOTH arg
+// shapes: `exec ...` and `exec resume <sid> ...`.
+describe('CodexRunner ephemeral-studio root grant', () => {
+  it('grants --add-dir for the studios root on fresh and resume shapes', () => {
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-codex-${process.pid}`);
+    try {
+      const runner = new CodexRunner();
+      const config = { workingDirectory: '/tmp', mcpConfigPath: '' } as never;
+      const shapes: Array<[string | undefined, boolean]> = [
+        [undefined, false],
+        ['sess-1', true],
+      ];
+      for (const [sid, isResume] of shapes) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const args: string[] = (runner as any).buildArgs(sid, isResume, 'msg', config, '/tmp/p.md');
+        const granted = args
+          .map((arg, i) => (arg === '--add-dir' ? args[i + 1] : null))
+          .filter(Boolean);
+        expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
+        // r2: `--add-dir` is valid on `exec` but REJECTED by the
+        // `exec resume` subcommand ("unexpected argument", verified against
+        // the installed binary). exec scope applies to the resumed session,
+        // so the required order is exec < --add-dir < resume.
+        expect(args.indexOf('--add-dir')).toBeGreaterThan(args.indexOf('exec'));
+        if (isResume) {
+          expect(args.indexOf('--add-dir')).toBeLessThan(args.indexOf('resume'));
+        }
+      }
+    } finally {
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { type SessionVisibility, ToolPolicyState } from './tool-policy.js';
 import { applyProfile } from './tool-profiles.js';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -228,6 +228,102 @@ describe('ToolPolicyState', () => {
     expect(policy.canCallPcpTool('send_to_inbox', 'finite').allowed).toBe(false);
   });
 
+  describe('inspectPcpTool (non-consuming)', () => {
+    it('does not spend a scoped one-use grant', () => {
+      const policy = new ToolPolicyState('off', { persist: false });
+      policy.addPromptTool('send_to_inbox');
+      policy.grantTool('send_to_inbox', 2);
+
+      // Ten looks, zero spend.
+      for (let i = 0; i < 10; i++) {
+        expect(policy.inspectPcpTool('send_to_inbox').allowed).toBe(true);
+      }
+      expect(policy.listGrants()).toEqual([{ tool: 'send_to_inbox', uses: 2 }]);
+
+      // The consuming path still counts down from the untouched balance.
+      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    });
+
+    it('flags that the allow verdict rests on a one-use grant', () => {
+      const policy = new ToolPolicyState('off', { persist: false });
+      policy.addPromptTool('send_to_inbox');
+      policy.grantTool('send_to_inbox', 1);
+
+      const inspected = policy.inspectPcpTool('send_to_inbox');
+      expect(inspected.allowed).toBe(true);
+      expect(inspected.wouldConsumeGrant).toBe(true);
+
+      // The consuming path has already spent it, so there is nothing to warn about.
+      expect(policy.canCallPcpTool('send_to_inbox').wouldConsumeGrant).toBeUndefined();
+    });
+
+    it('does not decrement a finite session grant', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.addPromptTool('send_to_inbox');
+      (policy as unknown as { sessionGrants: Map<string, Map<string, number>> }).sessionGrants.set(
+        'finite',
+        new Map([['send_to_inbox', 1]])
+      );
+
+      expect(policy.inspectPcpTool('send_to_inbox', 'finite').allowed).toBe(true);
+      expect(policy.inspectPcpTool('send_to_inbox', 'finite').allowed).toBe(true);
+      expect(policy.inspectPcpTool('send_to_inbox', 'finite').wouldConsumeGrant).toBe(true);
+
+      // Still exactly one use left for the real call.
+      expect(policy.canCallPcpTool('send_to_inbox', 'finite').allowed).toBe(true);
+      expect(policy.canCallPcpTool('send_to_inbox', 'finite').allowed).toBe(false);
+    });
+
+    it('treats a session-wide grant as standing permission, not a countdown', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.addPromptTool('send_to_inbox');
+      policy.grantToolForSession('sess-1', 'send_to_inbox');
+
+      const inspected = policy.inspectPcpTool('send_to_inbox', 'sess-1');
+      expect(inspected.allowed).toBe(true);
+      expect(inspected.wouldConsumeGrant).toBeUndefined();
+    });
+
+    it('never writes policy to disk', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'policy-inspect-'));
+      const policyPath = join(dir, 'tool-policy.json');
+      try {
+        const policy = new ToolPolicyState('off', { persist: true, policyPath });
+        policy.addPromptTool('send_to_inbox');
+        policy.grantTool('send_to_inbox', 3);
+
+        const before = readFileSync(policyPath, 'utf8');
+        expect(policy.inspectPcpTool('send_to_inbox').allowed).toBe(true);
+        expect(readFileSync(policyPath, 'utf8')).toBe(before);
+
+        // Contrast: the consuming path does persist the decrement.
+        expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+        expect(readFileSync(policyPath, 'utf8')).not.toBe(before);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('agrees with canCallPcpTool on every non-grant verdict', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.denyTool('send_to_inbox');
+      policy.addPromptTool('remember');
+      policy.allowTool('group:ink-comms', { scope: 'global' });
+
+      for (const tool of ['get_inbox', 'send_to_inbox', 'remember', 'trigger_agent', '   ']) {
+        const inspected = policy.inspectPcpTool(tool);
+        const decided = policy.canCallPcpTool(tool);
+        expect({ tool, allowed: inspected.allowed, promptable: inspected.promptable }).toEqual({
+          tool,
+          allowed: decided.allowed,
+          promptable: decided.promptable,
+        });
+      }
+    });
+  });
+
   it('rejects invalid tool names and sorts grants deterministically', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     const invalid = policy.canCallPcpTool('   ');
@@ -246,7 +342,7 @@ describe('ToolPolicyState', () => {
     policy.allowTool('send_to_inbox', { scope: 'workspace', id: 'ws-1' });
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
 
-    policy.setContext({ workspaceId: 'ws-1', agentId: 'lumen' });
+    policy.setContext({ workspaceId: 'ws-1', sbSlug: 'lumen' });
     policy.allowTool('trigger_agent', { scope: 'agent', id: 'lumen' });
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
     expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(false);
@@ -321,7 +417,7 @@ describe('ToolPolicyState', () => {
 
   it('enforces session visibility guardrails across scopes', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.setContext({ agentId: 'lumen', workspaceId: 'ws-1', studioId: 'studio-1' });
+    policy.setContext({ sbSlug: 'lumen', workspaceId: 'ws-1', studioId: 'studio-1' });
 
     expect(policy.getSessionVisibility()).toBe('agent');
 
@@ -331,14 +427,14 @@ describe('ToolPolicyState', () => {
       policy.canAccessSession({
         action: 'list',
         requester: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-1',
           sessionId: 'sess-1',
           threadKey: 'pr:1',
         },
         target: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-1',
           sessionId: 'sess-2',
@@ -351,14 +447,14 @@ describe('ToolPolicyState', () => {
       policy.canAccessSession({
         action: 'list',
         requester: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-1',
           sessionId: 'sess-1',
           threadKey: 'pr:1',
         },
         target: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-2',
           sessionId: 'sess-3',
@@ -383,7 +479,7 @@ describe('ToolPolicyState', () => {
 
   it('runs visibility matrix across all visibility modes and actions', () => {
     const requester = {
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       workspaceId: 'ws-1',
       studioId: 'studio-1',
       sessionId: 'sess-1',
@@ -391,42 +487,42 @@ describe('ToolPolicyState', () => {
     };
     const targets = {
       self: {
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         workspaceId: 'ws-1',
         studioId: 'studio-1',
         sessionId: 'sess-1',
         threadKey: 'pr:1',
       },
       sameThread: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-9',
         studioId: 'studio-9',
         sessionId: 'sess-2',
         threadKey: 'pr:1',
       },
       sameStudio: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-1',
         studioId: 'studio-1',
         sessionId: 'sess-3',
         threadKey: 'pr:3',
       },
       sameWorkspace: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-1',
         studioId: 'studio-8',
         sessionId: 'sess-4',
         threadKey: 'pr:4',
       },
       sameAgent: {
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         workspaceId: 'ws-8',
         studioId: 'studio-8',
         sessionId: 'sess-5',
         threadKey: 'pr:5',
       },
       crossAll: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-9',
         studioId: 'studio-9',
         sessionId: 'sess-6',

@@ -271,7 +271,7 @@ describe('Pi Coding Tools Adapter', () => {
     beforeAll(async () => {
       guardedTools = await createInkCodingTools({
         cwd: testDir,
-        agentId: 'test-agent',
+        sbSlug: 'test-agent',
       });
     });
 
@@ -324,8 +324,8 @@ describe('Pi Coding Tools Adapter', () => {
       expect(result).toContain('guarded-hello');
     });
 
-    it('does not guard when agentId is not set', async () => {
-      // The original tools (no agentId) should work normally
+    it('does not guard when sbSlug is not set', async () => {
+      // The original tools (no sbSlug) should work normally
       const bash = tools.find((t) => t.schema.name === 'bash')!;
       const result = await bash.execute({ command: 'echo unguarded' });
       expect(result).toContain('unguarded');

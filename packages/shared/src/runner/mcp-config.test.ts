@@ -173,18 +173,20 @@ describe('injectSessionHeaders', () => {
 });
 
 describe('buildSessionEnv', () => {
-  it('includes INK_ACCESS_TOKEN and INK_AUTH_BEARER when accessToken provided', () => {
+  it('includes INK_ACCESS_TOKEN (raw) when accessToken provided', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
       studioId: 'studio-456',
       accessToken: 'tok-789',
-      agentId: 'wren',
+      sbSlug: 'wren',
     });
 
     expect(env.INK_SESSION_ID).toBe('sess-123');
     expect(env.INK_STUDIO_ID).toBe('studio-456');
     expect(env.INK_ACCESS_TOKEN).toBe('tok-789');
-    expect(env.INK_AUTH_BEARER).toBe('Bearer tok-789');
+    // No pre-formatted Authorization value — codex uses bearer_token_env_var
+    // pointing at the raw INK_ACCESS_TOKEN and prepends "Bearer " itself.
+    expect(env).not.toHaveProperty('INK_AUTH_BEARER');
   });
 
   it('omits INK_ACCESS_TOKEN when not provided', () => {
@@ -197,11 +199,11 @@ describe('buildSessionEnv', () => {
     expect(env).not.toHaveProperty('INK_AUTH_BEARER');
   });
 
-  it('includes INK_CONTEXT when agentId and sessionId provided', () => {
+  it('includes INK_CONTEXT when sbSlug and sessionId provided', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
       studioId: 'studio-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       runtime: 'claude',
       cliAttached: false,
     });
@@ -211,7 +213,7 @@ describe('buildSessionEnv', () => {
     const decoded = JSON.parse(Buffer.from(env.INK_CONTEXT, 'base64url').toString());
     expect(decoded.sessionId).toBe('sess-123');
     expect(decoded.studioId).toBe('studio-456');
-    expect(decoded.agentId).toBe('wren');
+    expect(decoded.sbSlug).toBe('wren');
     expect(decoded.runtime).toBe('claude');
     expect(decoded.cliAttached).toBe(false);
   });
@@ -219,7 +221,7 @@ describe('buildSessionEnv', () => {
   it('sets cliAttached in context token', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
     });
 
@@ -227,7 +229,7 @@ describe('buildSessionEnv', () => {
     expect(decoded.cliAttached).toBe(true);
   });
 
-  it('omits INK_CONTEXT when agentId is missing', () => {
+  it('omits INK_CONTEXT when sbSlug is missing', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
     });
@@ -241,7 +243,7 @@ describe('encodeContextToken / decodeContextToken', () => {
     const token: PcpContextToken = {
       sessionId: 'sess-abc',
       studioId: 'studio-def',
-      agentId: 'myra',
+      sbSlug: 'myra',
       cliAttached: true,
       runtime: 'claude',
     };

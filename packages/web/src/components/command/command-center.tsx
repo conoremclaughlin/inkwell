@@ -95,7 +95,10 @@ export function CommandCenter() {
               <AgentPanel />
             </div>
           ) : (
-            <div className="flex-1">
+            // overflow-hidden so the graph's tall sidebar can't stretch the
+            // pane past the viewport — fitView centers in whatever height
+            // this box has, and an unconstrained flex child grows to content.
+            <div className="flex-1 overflow-hidden">
               <TaskGraph />
             </div>
           )}

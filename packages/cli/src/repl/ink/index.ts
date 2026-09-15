@@ -9,7 +9,6 @@ export {
   type FeedEventType,
   type AgentSummary,
 } from './MissionApp.js';
-export { StatusBar } from './StatusBar.js';
 export { InfoBar } from './InfoBar.js';
 export { PromptInput } from './PromptInput.js';
 export { Separator } from './Separator.js';

@@ -6,10 +6,13 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import type { ChannelType, AgentResponse, ResponseFormat, OutboundMedia } from '../../agent/types';
 import { logger } from '../../utils/logger';
-import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
+import { hasDeliveryEvidence } from '../../services/channel-forward.js';
+import { getPinnedSlug, getRequestContext } from '../../utils/request-context';
+import { resolveAttributedSession } from './caller-identity';
 
 // Response result returned by the callback (optional — void is still accepted)
 export interface ResponseResult {
@@ -24,8 +27,15 @@ export type ResponseCallback = (response: AgentResponse) => Promise<ResponseResu
 // Global response callback - set by the session host
 let globalResponseCallback: ResponseCallback | null = null;
 
-// Track which conversations have received explicit responses via send_response
-// Key: "channel:conversationId", Value: timestamp of last response
+// Best-effort delivery marker, keyed per CONVERSATION — "channel:conversationId"
+// — not per turn. The value is a timestamp for debugging only; nothing reads it.
+//
+// The distinction matters and is easy to lose: a marker says *someone* delivered
+// on this conversation, not that the turn now reading it is the turn that sent.
+// Two turns on the same conversation share one key, so a reader cannot tell its
+// own delivery from a concurrent one. Consuming on read (below) stops a marker
+// being seen twice; it does not establish who it belonged to. Real turn
+// ownership needs a per-turn identity and is tracked separately.
 const explicitResponseTracker: Map<string, number> = new Map();
 
 /**
@@ -44,32 +54,40 @@ export function getResponseCallback(): ResponseCallback | null {
 }
 
 /**
- * Check if a conversation has received an explicit send_response during this
- * turn. Turn-scoped, not time-windowed — ink turns can run for many minutes,
- * so a fixed time window would miss early responses. Call clearExplicitResponse
- * after the auto-forward decision to reset for the next turn.
+ * Read the marker and clear it in ONE step.
+ *
+ * The two-call form — check, then act, then clear — has an ordering hazard that
+ * is easy to reintroduce and hard to see: `releaseConversation` drains a pending
+ * next turn SYNCHRONOUSLY, so a marker still standing at that moment is read by
+ * the nested turn as its own delivery, suppressing that turn's fallback and its
+ * warning (Lumen, PR #580 r2).
+ *
+ * Reordering two lines fixes today's instance and leaves the hazard. Making the
+ * read consume the marker removes it: there is no window because there is no
+ * interval. Callers cannot get the order wrong when there is only one call.
+ *
+ * What this does NOT do: establish that the marker belonged to the calling turn.
+ * The key is the conversation, so a same-conversation turn that delivered while
+ * this one was queued leaves a marker this call will happily consume and read as
+ * its own. Consuming bounds the damage to one reader; it does not identify the
+ * writer. Treat the result as "this conversation was answered recently," never
+ * as "this turn answered." Turn ownership is deliberately out of scope here —
+ * it needs a per-turn identity threaded to the runner, which is its own change.
  */
-export function hasExplicitResponse(channel: string, conversationId: string): boolean {
+export function consumeExplicitResponse(channel: string, conversationId: string): boolean {
   const key = `${channel}:${conversationId}`;
-  return explicitResponseTracker.has(key);
-}
-
-/**
- * Clear explicit response tracking for a conversation (call after the
- * auto-forward decision in server.ts). No time-based sweep — the map is
- * naturally bounded (one entry per active conversation) and each turn
- * clears its own key. Stale entries from error paths are overwritten on
- * the next message to the same conversation.
- */
-export function clearExplicitResponse(channel: string, conversationId: string): void {
-  const key = `${channel}:${conversationId}`;
+  const had = explicitResponseTracker.has(key);
   explicitResponseTracker.delete(key);
+  return had;
 }
 
 /**
- * Mark a conversation as having received an explicit response. No cleanup
- * here — concurrent turns' markers must not be swept mid-turn. Cleanup
- * happens in clearExplicitResponse after the auto-forward decision.
+ * Mark a conversation as having received an explicit response. Only called once
+ * delivery evidence exists — a send that threw, or that carried nothing, must
+ * leave the conversation looking unanswered so the fallback can still fire.
+ *
+ * No sweep here: the map holds one entry per active conversation, and the entry
+ * is removed by whoever consumes it after the auto-forward decision.
  */
 function markExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;
@@ -84,14 +102,14 @@ interface TtsConfig {
 async function resolveAgentDefaultVoice(dataComposer: DataComposer): Promise<string | undefined> {
   try {
     const reqCtx = getRequestContext();
-    const agentId = reqCtx?.agentId || getPinnedAgentId();
-    if (!agentId) return undefined;
+    const sbSlug = reqCtx?.sbSlug || getPinnedSlug();
+    if (!sbSlug) return undefined;
 
     const { data } = await dataComposer
       .getClient()
       .from('agent_identities')
       .select('tts_config')
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .not('tts_config', 'is', null)
       .limit(1)
       .single();
@@ -118,6 +136,44 @@ const outboundMediaSchema = z.object({
   caption: z.string().optional().describe('Caption for this attachment'),
 });
 
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv']);
+const AUDIO_EXTENSIONS = new Set(['m4a', 'mp3', 'ogg', 'oga', 'opus', 'wav', 'aac', 'flac']);
+
+export function inferMediaTypeFromPath(
+  pathOrUrl: string
+): 'image' | 'video' | 'audio' | 'document' {
+  const ext =
+    pathOrUrl
+      .toLowerCase()
+      .replace(/[?#].*$/, '')
+      .split('.')
+      .pop() ?? '';
+  if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+  if (AUDIO_EXTENSIONS.has(ext)) return 'audio';
+  return 'document';
+}
+
+/**
+ * One media entry: the canonical {type, path|url, ...} object, or a bare
+ * path/URL string coerced into one. Agents naturally write
+ * media: ["/path/file.m4a"], and rejecting that shape cost a real outbound
+ * Telegram message (Aug 13 silent-drop bug) — coerce it, inferring the type
+ * from the file extension.
+ */
+export const outboundMediaEntrySchema = z.union([
+  outboundMediaSchema,
+  z
+    .string()
+    .transform(
+      (entry): z.infer<typeof outboundMediaSchema> =>
+        /^https?:\/\//i.test(entry)
+          ? { type: inferMediaTypeFromPath(entry), url: entry }
+          : { type: inferMediaTypeFromPath(entry), path: entry }
+    ),
+]);
+
 export const sendResponseSchema = z.object({
   channel: z
     .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'slack', 'http', 'api', 'agent'])
@@ -141,11 +197,16 @@ export const sendResponseSchema = z.object({
     .describe(
       'Override voice for TTS synthesis. Only used when voiceReply is true. Omit to use the agent default from tts_config.'
     ),
-  metadata: z.record(z.unknown()).optional().describe('Additional channel-specific metadata'),
-  media: z
-    .array(outboundMediaSchema)
+  metadata: z
+    .record(z.string(), z.unknown())
     .optional()
-    .describe('Media attachments to send (images, videos, documents)'),
+    .describe('Additional channel-specific metadata'),
+  media: z
+    .array(outboundMediaEntrySchema)
+    .optional()
+    .describe(
+      'Media attachments to send. Each entry is {type, path|url, ...} — a bare path/URL string is also accepted and coerced.'
+    ),
 });
 
 type McpResponse = {
@@ -186,6 +247,31 @@ export async function handleSendResponse(
       if (resolvedVoice) metadata.ttsVoice = resolvedVoice;
     }
 
+    // Stamp the sending session at the tool boundary, where the request
+    // context is unambiguously this call's. On 2026-09-10 Conor received the
+    // same Thursday digest twice and neither `message_out` row said who sent
+    // it — both carried session_id null, as 69 of 69 outbound rows did that
+    // week — so the duplicate could only be attributed by reading a sibling's
+    // session context field and inferring.
+    //
+    // The context names a session in two forms: the signed token claim, and
+    // the unsigned `x-ink-context` assertion for tokens that predate the claim.
+    // Neither is stamped bare. resolveAttributedSession loads the row and
+    // authorizes it for this caller — same user always; same identity and
+    // contact scope for an agent-bound token — exactly as the session tools do,
+    // and yields nothing on any failure. Stamping the raw header let a legacy
+    // agent token write another user's session onto the activity row, and a
+    // nonexistent id failed the insert AFTER delivery, leaving no outgoing row
+    // at all (Lumen, #596). Delivery never depends on attribution.
+    const attribution = await resolveAttributedSession(_dataComposer);
+    if (attribution.sessionId === undefined) {
+      logger.debug('send_response: no session attribution for this outgoing message', {
+        channel: args.channel,
+        conversationId: args.conversationId,
+        reason: attribution.reason,
+      });
+    }
+
     const response: AgentResponse = {
       channel: args.channel as ChannelType,
       conversationId: args.conversationId,
@@ -194,10 +280,8 @@ export async function handleSendResponse(
       replyToMessageId: args.replyToMessageId,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       media: args.media as OutboundMedia[] | undefined,
+      sessionId: attribution.sessionId,
     };
-
-    // Mark this conversation as having received an explicit response
-    markExplicitResponse(args.channel, args.conversationId);
 
     // Try local callback first (when running in same process as session host)
     let callbackResult: ResponseResult | void = undefined;
@@ -211,11 +295,18 @@ export async function handleSendResponse(
         const httpResponse = await fetch(MYRA_SEND_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          // The validated session travels with the payload. Nothing in this
+          // repository serves the receiving end (no route handles
+          // /api/admin/send and nothing listens on the Myra port), so the
+          // receiver — wherever it lives — must treat this as a cross-process
+          // assertion and re-validate it the way resolveAttributedSession
+          // does before stamping anything.
           body: JSON.stringify({
             channel: args.channel,
             conversationId: args.conversationId,
             content: args.content,
             media: args.media,
+            sessionId: attribution.sessionId,
           }),
         });
 
@@ -236,6 +327,51 @@ export async function handleSendResponse(
         );
       }
     }
+
+    // Mark AFTER the send has actually succeeded, never before.
+    //
+    // This used to run before the callback/HTTP attempt, so a send that threw,
+    // returned a non-ok status, or hit the no-routing early return still left
+    // the conversation marked as answered. The server then read that mark,
+    // concluded an explicit response had been delivered, and suppressed BOTH
+    // the auto-forward fallback and the warning that says nothing was
+    // delivered — so a failed send became a silent one (Lumen, PR #580).
+    //
+    // Every path between here and the top either threw into the catch or
+    // returned early, so reaching this line is the only proof of delivery we
+    // have.
+    // ...and only when something actually reached the user. A resolved
+    // transport call is not proof: a blank body with no media, or a media-only
+    // send where every attachment failed, both resolve normally while
+    // delivering nothing (Lumen, PR #580 r2). Marking those would suppress the
+    // fallback and the warning for the most complete failure there is.
+    if (
+      !hasDeliveryEvidence({
+        content: args.content,
+        mediaRequested: args.media?.length ?? 0,
+        mediaSent: callbackResult?.mediaSent,
+      })
+    ) {
+      logger.warn('send_response delivered nothing', {
+        channel: args.channel,
+        conversationId: args.conversationId,
+        contentLength: args.content.trim().length,
+        mediaRequested: args.media?.length ?? 0,
+        mediaSent: callbackResult?.mediaSent,
+      });
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'Nothing was delivered: the message body was blank and no media was sent. The user received nothing.',
+          channel: args.channel,
+          conversationId: args.conversationId,
+        },
+        true
+      );
+    }
+
+    markExplicitResponse(args.channel, args.conversationId);
 
     const result: Record<string, unknown> = {
       success: true,
@@ -276,7 +412,7 @@ export const getPendingMessagesSchema = z.object({
     .default('all')
     .describe('Filter by channel (default: all)'),
   limit: z.number().min(1).max(50).optional().default(10).describe('Maximum messages to return'),
-  since: z.string().datetime().optional().describe('Only messages after this timestamp'),
+  since: isoDateTime().optional().describe('Only messages after this timestamp'),
 });
 
 // In-memory message queue for cross-channel visibility
@@ -288,8 +424,8 @@ interface PendingMessage {
   content: string;
   timestamp: Date;
   read: boolean;
-  /** Target agent ID — scopes delivery to the right CLI session */
-  agentId?: string;
+  /** Target SB slug — scopes delivery to the right CLI session */
+  sbSlug?: string;
   /** Target session ID — for precise routing */
   sessionId?: string;
 }
@@ -329,12 +465,12 @@ export async function handleGetPendingMessages(
 
     // Scope by calling agent + session — prevents cross-agent and
     // cross-session message leaks. Uses request context for identity.
-    const callerAgentId = getPinnedAgentId();
+    const callerSlug = getPinnedSlug();
     const reqCtx = getRequestContext();
     const callerSessionId = reqCtx?.sessionId;
 
-    if (callerAgentId) {
-      filtered = filtered.filter((m) => !m.agentId || m.agentId === callerAgentId);
+    if (callerSlug) {
+      filtered = filtered.filter((m) => !m.sbSlug || m.sbSlug === callerSlug);
     }
     if (callerSessionId) {
       filtered = filtered.filter((m) => !m.sessionId || m.sessionId === callerSessionId);

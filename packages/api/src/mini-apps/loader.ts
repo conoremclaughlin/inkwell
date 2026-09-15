@@ -7,7 +7,7 @@
 
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { logger } from '../utils/logger';
 
@@ -138,7 +138,7 @@ export function registerMiniAppTools(
             zodType = z.array(z.unknown());
             break;
           case 'object':
-            zodType = z.record(z.unknown());
+            zodType = z.record(z.string(), z.unknown());
             break;
           default:
             zodType = z.unknown();
@@ -146,12 +146,11 @@ export function registerMiniAppTools(
 
         inputSchema[key] = isOptional ? zodType.optional() : zodType;
       }
-
       server.registerTool(
         toolName,
         {
           description: `[${appName}] ${funcDef.description}`,
-          inputSchema,
+          inputSchema: z.object(inputSchema),
         },
         async (args) => {
           try {

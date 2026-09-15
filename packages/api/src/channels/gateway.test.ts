@@ -342,6 +342,71 @@ describe('ChannelGateway', () => {
       expect(processingConversations.has('telegram:chat456')).toBe(false);
     });
 
+    it('releases the processing lock after a successful auto-response (regression: 28h telegram wedge)', async () => {
+      // releaseConversation's auto-response path used to early-return on send
+      // success, assuming sendResponse would process pending — but sendResponse
+      // deliberately does not (duplicate-response fix). The two sides each
+      // assumed the other released the lock; nobody did. Every auto-routed
+      // reply (turn with no explicit send_response) then wedged the lane.
+      const processingConversations = (gateway as any).processingConversations;
+      processingConversations.add('telegram:chat123');
+      const sendSpy = vi.spyOn(gateway as any, 'sendResponse').mockResolvedValue(undefined);
+
+      await gateway.releaseConversation('telegram', 'chat123', {
+        content: 'auto-routed reply',
+        format: 'markdown',
+      });
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(processingConversations.has('telegram:chat123')).toBe(false);
+    });
+
+    it("passes the auto-response's session through to sendResponse", async () => {
+      // The auto-forwarded reply is attributed to the turn that produced it;
+      // dropping the field here would log the message_out row anonymous again.
+      const processingConversations = (gateway as any).processingConversations;
+      processingConversations.add('telegram:chat123');
+      const sendSpy = vi.spyOn(gateway as any, 'sendResponse').mockResolvedValue(undefined);
+
+      await gateway.releaseConversation('telegram', 'chat123', {
+        content: 'auto-routed reply',
+        format: 'markdown',
+        sessionId: 'session-of-the-turn',
+      });
+
+      expect(sendSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ content: 'auto-routed reply', sessionId: 'session-of-the-turn' })
+      );
+    });
+
+    it('drains messages that queued during the turn after a successful auto-response', async () => {
+      const processingConversations = (gateway as any).processingConversations;
+      const pendingBuffers = (gateway as any).pendingBuffers;
+      processingConversations.add('telegram:chat123');
+      pendingBuffers.set('telegram:chat123', {
+        channel: 'telegram',
+        conversationId: 'chat123',
+        sender: { id: 'user1' },
+        messages: [{ content: 'Queued while busy', timestamp: new Date() }],
+        metadata: {},
+      });
+      vi.spyOn(gateway as any, 'sendResponse').mockResolvedValue(undefined);
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      await gateway.releaseConversation('telegram', 'chat123', { content: 'auto-routed reply' });
+
+      // The queued message was forwarded instead of rotting in the pending buffer
+      expect(handler).toHaveBeenCalledWith(
+        'telegram',
+        'chat123',
+        { id: 'user1' },
+        'Queued while busy',
+        expect.any(Object)
+      );
+      expect(pendingBuffers.has('telegram:chat123')).toBe(false);
+    });
+
     it('should allow new messages after error recovery', async () => {
       let callCount = 0;
       const handler = vi.fn().mockImplementation(async () => {
@@ -431,7 +496,7 @@ describe('ChannelGateway', () => {
 
       await gateway.sendResponse({
         channel: 'telegram',
-        conversationId: 'chat123',
+        conversationId: '123456789',
         content: 'Here is your response',
         metadata: { voiceReply: true },
       });
@@ -440,6 +505,34 @@ describe('ChannelGateway', () => {
       expect(sendVoice).toHaveBeenCalledTimes(1);
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(cleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes the telegram:<chatId> conversation-id form through to the listener', async () => {
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      (gateway as any).telegramListener = { sendMessage };
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: 'telegram:12345',
+        content: 'hello',
+      });
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      // The listener owns prefix stripping — the gateway must not alter the id.
+      expect(sendMessage.mock.calls[0]![0]).toBe('telegram:12345');
+    });
+
+    it('rejects symbolic Telegram chat ids before any send is attempted', async () => {
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      (gateway as any).telegramListener = { sendMessage };
+
+      await expect(
+        gateway.sendResponse({
+          channel: 'telegram',
+          conversationId: 'myra-telegram',
+          content: 'hello',
+        })
+      ).rejects.toThrow(/Invalid Telegram chat id "myra-telegram"/);
+      expect(sendMessage).not.toHaveBeenCalled();
     });
 
     it('cleans pending voice reply flag when conversation is released without a response', async () => {
@@ -618,7 +711,7 @@ describe('Activity Stream Integration', () => {
   describe('Incoming Messages', () => {
     it('does not log inbound messages itself — SessionService is the canonical logger', async () => {
       // Regression: the gateway used to log message_in with a hardcoded
-      // agentId of 'myra' AND SessionService logged the same message again,
+      // sbSlug of 'myra' AND SessionService logged the same message again,
       // producing duplicate rows that double-rendered in attached CLI views.
       const handler = vi.fn().mockResolvedValue(undefined);
       gateway.setMessageHandler(handler);
@@ -734,7 +827,7 @@ describe('Activity Stream Integration', () => {
       expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith({
         userId: 'user-uuid-123',
-        agentId: 'myra',
+        sbSlug: 'myra',
         direction: 'out',
         content: 'Reply message',
         platform: 'telegram',

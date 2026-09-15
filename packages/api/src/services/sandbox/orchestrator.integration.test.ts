@@ -70,7 +70,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (integration)', () => {
     if (!fixtureWasPreExisting) {
       const result = await orchestrator.spinUp({
         userId: 'test-user',
-        agentId: 'test-agent',
+        sbSlug: 'test-agent',
         studioId: 'studio-integ-fixture',
         studioSlug: 'integ',
         worktreePath: testDir,
@@ -95,7 +95,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (integration)', () => {
   function makeRequest(overrides: Partial<SandboxSpinUpRequest> = {}): SandboxSpinUpRequest {
     return {
       userId: 'test-user',
-      agentId: 'test-agent',
+      sbSlug: 'test-agent',
       studioId: `studio-${Date.now()}`,
       studioSlug: 'test',
       worktreePath: testDir,
@@ -177,12 +177,12 @@ describe.skipIf(SKIP)('SandboxOrchestrator (integration)', () => {
 
       await orchestrator.spinUp(request);
 
-      const { stdout: agentId } = await orchestrator.exec(containerName, [
+      const { stdout: sbSlug } = await orchestrator.exec(containerName, [
         'bash',
         '-c',
         'echo $AGENT_ID',
       ]);
-      expect(agentId.trim()).toBe('test-agent');
+      expect(sbSlug.trim()).toBe('test-agent');
 
       const { stdout: tgId } = await orchestrator.exec(containerName, [
         'bash',
@@ -277,7 +277,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (integration)', () => {
     beforeAll(async () => {
       guardedTools = await createInkCodingTools({
         cwd: testDir,
-        agentId: 'integ-guard-agent',
+        sbSlug: 'integ-guard-agent',
       });
     });
 

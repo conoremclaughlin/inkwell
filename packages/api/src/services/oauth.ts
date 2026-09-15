@@ -6,9 +6,22 @@
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import {
+  GOOGLE_AUTH_URL,
+  GOOGLE_OAUTH_SCOPES,
+  GOOGLE_REVOKE_URL,
+  GOOGLE_TOKEN_URL,
+  parseGoogleCredentialSources,
+  type GoogleCredentialSource,
+} from '@inklabs/shared';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { getRequestContext, getSessionContext } from '../utils/request-context';
+import {
+  getDesktopGoogleCredentialStore,
+  type DesktopGoogleCredentialStore,
+} from './google-desktop-credentials';
+import { TOKEN_REFRESH_WINDOW_MS } from './oauth-refresh-window';
 
 // OAuth provider configurations
 interface OAuthProviderConfig {
@@ -22,23 +35,14 @@ interface OAuthProviderConfig {
 
 const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
   google: {
-    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
-    tokenUrl: 'https://oauth2.googleapis.com/token',
-    revokeUrl: 'https://oauth2.googleapis.com/revoke',
+    authUrl: GOOGLE_AUTH_URL,
+    tokenUrl: GOOGLE_TOKEN_URL,
+    revokeUrl: GOOGLE_REVOKE_URL,
     clientId: env.GOOGLE_CLIENT_ID || '',
     clientSecret: env.GOOGLE_CLIENT_SECRET || '',
-    scopes: [
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/gmail.send',
-      'https://www.googleapis.com/auth/gmail.modify',
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile',
-      'https://www.googleapis.com/auth/calendar.readonly',
-      'https://www.googleapis.com/auth/calendar.events', // Read + write events (respond, update)
-      'https://www.googleapis.com/auth/spreadsheets', // Sheets read/write
-      'https://www.googleapis.com/auth/documents', // Docs read/write
-      'https://www.googleapis.com/auth/drive', // Drive (list/read/write/move/delete)
-    ],
+    // The scope list is shared with `ink google login` (@inklabs/shared), so a
+    // desktop credential covers exactly what the cloud connection covers.
+    scopes: [...GOOGLE_OAUTH_SCOPES],
   },
 };
 
@@ -68,11 +72,128 @@ export interface TokenResponse {
   scope?: string;
 }
 
+/**
+ * The token getValidAccessToken would refresh with before its next call, or null
+ * if it would send the stored access token unchanged.
+ *
+ * Both halves of the condition matter: without a refresh token there is nothing
+ * to refresh with, so that method hands back the stored token and it works right
+ * up until expiry. Sharing only the five-minute window left the two methods
+ * disagreeing about exactly that case.
+ *
+ * Returning the token rather than a boolean means the caller that performs the
+ * refresh and the caller that describes it read one value, instead of two
+ * expressions that have to be kept in step by hand.
+ */
+function pendingRefreshToken(
+  expiresAt: string | null | undefined,
+  refreshToken: string | null | undefined
+): string | null {
+  if (!refreshToken || !expiresAt) return null;
+  const expiry = new Date(expiresAt).getTime();
+  if (Number.isNaN(expiry)) return null;
+  return expiry - Date.now() < TOKEN_REFRESH_WINDOW_MS ? refreshToken : null;
+}
+
+/**
+ * A read-only view of how a provider call would fare right now, derived from
+ * stored account state. `reason` is null only when the account is usable as-is.
+ */
+export interface ProviderAccountHealth {
+  /**
+   * - `active`: getValidAccessToken would hand back the stored token unchanged.
+   * - `refresh_required`: the next call will refresh before using the token —
+   *   inside the refresh window AND holding a refresh token to do it with.
+   *   Whether that refresh succeeds cannot be known without performing it, and
+   *   with Google's testing-mode seven-day expiry this is the state that fails.
+   *   An account with no refresh token never reaches here: nothing refreshes it,
+   *   so it stays `active` until expiry and is `unusable` after.
+   * - `unusable`: no call would succeed.
+   * - `missing`: nothing is connected for this provider.
+   * - `unknown`: account state could not be read, so there is no verdict.
+   */
+  state: 'active' | 'refresh_required' | 'unusable' | 'missing' | 'unknown';
+  /**
+   * Which credential source this verdict describes — the `connected_accounts`
+   * row (`cloud`) or a desktop file bound to the user (`desktop`). Null when no
+   * source had anything to say (`missing`, `unknown`).
+   */
+  source: GoogleCredentialSource | null;
+  /** The stored account status, when a row exists. */
+  accountStatus: 'active' | 'expired' | 'revoked' | 'error' | null;
+  reason: string | null;
+  lastError: string | null;
+  expiresAt: string | null;
+  lastUsedAt: string | null;
+  /** When the account row last changed — the age of this evidence. */
+  observedAt: string | null;
+}
+
+export interface OAuthServiceOptions {
+  /** Credential sources in the order they are tried; defaults to GOOGLE_CREDENTIAL_SOURCES. */
+  sources?: GoogleCredentialSource[];
+  desktopStore?: DesktopGoogleCredentialStore;
+}
+
+/** A user's email stays valid for a minute — the binding key for desktop files. */
+const USER_EMAIL_CACHE_MS = 60 * 1000;
+
 class OAuthService {
   private supabase: SupabaseClient;
+  private readonly sources: GoogleCredentialSource[];
+  private readonly desktopStore: DesktopGoogleCredentialStore;
+  private readonly userEmails = new Map<string, { email: string | null; at: number }>();
 
-  constructor() {
+  constructor(options: OAuthServiceOptions = {}) {
     this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    this.sources = options.sources ?? parseGoogleCredentialSources(env.GOOGLE_CREDENTIAL_SOURCES);
+    this.desktopStore = options.desktopStore ?? getDesktopGoogleCredentialStore();
+  }
+
+  /** The credential sources this service tries for Google, in order. */
+  getCredentialSources(): GoogleCredentialSource[] {
+    return [...this.sources];
+  }
+
+  private usesDesktopSource(provider: string): boolean {
+    return provider === 'google' && this.sources.includes('desktop');
+  }
+
+  /**
+   * The email a desktop credential must carry to be used for this user. A
+   * lookup FAILURE is reported as such and never cached: for access it binds
+   * nothing (guessing would hand one person's mailbox to another), and for
+   * health it must read as "could not look", not "nothing there" (Lumen, PR
+   * #588). A successful lookup — including a user with no email — is cached.
+   */
+  private async lookupUserEmail(
+    userId: string
+  ): Promise<{ email: string | null; error: string | null }> {
+    const cached = this.userEmails.get(userId);
+    if (cached && Date.now() - cached.at < USER_EMAIL_CACHE_MS) {
+      return { email: cached.email, error: null };
+    }
+    let failure: string;
+    try {
+      const { data, error } = await this.supabase
+        .from('users')
+        .select('email')
+        .eq('id', userId)
+        .maybeSingle();
+      if (!error) {
+        const email = (data?.email as string | null | undefined) ?? null;
+        this.userEmails.set(userId, { email, at: Date.now() });
+        return { email, error: null };
+      }
+      failure = error.message;
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    logger.warn('Could not resolve user email for desktop Google credential binding', {
+      userId,
+      error: failure,
+    });
+    return { email: null, error: `Could not resolve the user's email: ${failure}` };
   }
 
   private resolveWorkspaceId(workspaceId?: string | null): string | null | undefined {
@@ -439,7 +560,190 @@ class OAuthService {
   }
 
   /**
-   * Get a valid access token, refreshing if necessary
+   * Inspect stored account state without refreshing tokens or calling the
+   * provider. The non-mutating twin of getValidAccessToken: it mirrors that
+   * method's account selection, so the answer describes the account a real call
+   * would actually use rather than any row that happens to exist.
+   *
+   * Never throws — a lookup failure reports as 'unknown' with a reason, because
+   * a health check that explodes is worse than one that says "I can't tell".
+   * 'unknown' is deliberately distinct from 'missing': "I could not read the
+   * account table" is not the same claim as "nothing is connected".
+   */
+  async inspectAccountHealth(
+    userId: string,
+    provider: string,
+    workspaceId?: string | null
+  ): Promise<ProviderAccountHealth> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    if (!this.usesDesktopSource(provider)) {
+      return this.inspectCloudAccountHealth(userId, provider, resolvedWorkspaceId);
+    }
+
+    // Same order as getValidAccessToken: the first source that would be tried
+    // and looks usable is the one the next call depends on. When none is, the
+    // most informative failure wins — a refusal over a blank, a blank over an
+    // unreadable table — and with nothing anywhere, the cloud verdict keeps
+    // its long-standing wording.
+    const verdicts = new Map<GoogleCredentialSource, ProviderAccountHealth>();
+    for (const source of this.sources) {
+      const verdict =
+        source === 'cloud'
+          ? await this.inspectCloudAccountHealth(userId, provider, resolvedWorkspaceId)
+          : await this.inspectDesktopAccountHealth(userId);
+      if (verdict.state === 'active' || verdict.state === 'refresh_required') return verdict;
+      verdicts.set(source, verdict);
+    }
+    const all = [...verdicts.values()];
+    return (
+      all.find((v) => v.state === 'unusable') ??
+      all.find((v) => v.state === 'unknown') ??
+      verdicts.get('cloud') ??
+      all[0]
+    );
+  }
+
+  /** The desktop file bound to this user, described in the same vocabulary as the cloud row. */
+  private async inspectDesktopAccountHealth(userId: string): Promise<ProviderAccountHealth> {
+    const blank: Omit<ProviderAccountHealth, 'state' | 'source' | 'reason'> = {
+      accountStatus: null,
+      lastError: null,
+      expiresAt: null,
+      lastUsedAt: null,
+      observedAt: null,
+    };
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) return { ...blank, state: 'unknown', source: null, reason: lookup.error };
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    if (found.error) return { ...blank, state: 'unknown', source: null, reason: found.error };
+    const record = found.record;
+    if (!record) {
+      return {
+        ...blank,
+        state: 'missing',
+        source: null,
+        reason: lookup.email
+          ? `No desktop Google credential for ${lookup.email} in ${this.desktopStore.dir}`
+          : 'No desktop Google credential can be bound: the user has no email',
+      };
+    }
+    const verdict = this.desktopStore.inspect(record);
+    return {
+      state: verdict.state,
+      source: 'desktop',
+      accountStatus: null,
+      reason: verdict.reason,
+      lastError: verdict.state === 'unusable' ? verdict.reason : null,
+      expiresAt: verdict.expiresAt,
+      lastUsedAt: null,
+      observedAt: new Date(record.mtimeMs).toISOString(),
+    };
+  }
+
+  private async inspectCloudAccountHealth(
+    userId: string,
+    provider: string,
+    resolvedWorkspaceId: string | null | undefined
+  ): Promise<ProviderAccountHealth> {
+    let query = this.supabase
+      .from('connected_accounts')
+      .select('status, last_error, expires_at, last_used_at, updated_at, refresh_token')
+      .eq('user_id', userId)
+      .eq('provider', provider);
+
+    if (resolvedWorkspaceId === null) {
+      query = query.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data: rows, error } = await query.order('updated_at', { ascending: false });
+
+    if (error) {
+      return {
+        state: 'unknown',
+        source: null,
+        accountStatus: null,
+        reason: `Could not read account state: ${error.message}`,
+        lastError: null,
+        expiresAt: null,
+        lastUsedAt: null,
+        observedAt: null,
+      };
+    }
+
+    if (!rows || rows.length === 0) {
+      return {
+        state: 'missing',
+        source: null,
+        accountStatus: null,
+        reason: `No ${provider} account has been connected`,
+        lastError: null,
+        expiresAt: null,
+        lastUsedAt: null,
+        observedAt: null,
+      };
+    }
+
+    // getValidAccessToken filters on status='active', so an active row is the one
+    // a real call would pick. Only when none is active does the newest failed row
+    // explain why — matching the "No active <provider> account found" it throws.
+    const active = rows.find((row) => row.status === 'active');
+    const row = active ?? rows[0];
+
+    const base = {
+      source: 'cloud' as const,
+      accountStatus: row.status as ProviderAccountHealth['accountStatus'],
+      lastError: row.last_error ?? null,
+      expiresAt: row.expires_at ?? null,
+      lastUsedAt: row.last_used_at ?? null,
+      observedAt: row.updated_at ?? null,
+    };
+
+    if (!active) {
+      return {
+        ...base,
+        state: 'unusable',
+        reason: `No active ${provider} account found (stored status: ${row.status})`,
+      };
+    }
+
+    // These branches mirror getValidAccessToken exactly, in its order.
+    //
+    // It refreshes if and only if pendingRefreshToken returns one. The stored
+    // token is then not what the next call sends, and a refresh can fail, so no
+    // usable token can be promised without performing one.
+    if (pendingRefreshToken(row.expires_at, row.refresh_token)) {
+      return {
+        ...base,
+        state: 'refresh_required',
+        reason: `Access token expires at ${row.expires_at}; the next call must refresh it first, and that refresh may fail`,
+      };
+    }
+
+    // Otherwise it hands back the stored token untouched — which works right up
+    // until expiry, and is rejected by the provider after it.
+    const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
+    if (expiresAt !== null && expiresAt <= Date.now()) {
+      return {
+        ...base,
+        state: 'unusable',
+        reason: 'Access token expired and no refresh token is stored',
+      };
+    }
+
+    return { ...base, state: 'active', reason: null };
+  }
+
+  /**
+   * Get a valid access token, refreshing if necessary.
+   *
+   * For Google, the configured credential sources are tried in order and the
+   * first one that yields a token wins. A source with nothing bound to the user
+   * is silently skipped; a source that HAD a credential and failed is named in
+   * the error, so "the cloud row expired and the desktop file was refused" reads
+   * as exactly that. A user with no desktop file sees the message they always
+   * saw.
    */
   async getValidAccessToken(
     userId: string,
@@ -447,6 +751,103 @@ class OAuthService {
     workspaceId?: string | null
   ): Promise<string> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    if (!this.usesDesktopSource(provider)) {
+      const cloud = await this.getCloudAccessToken(userId, provider, resolvedWorkspaceId);
+      if (cloud.token !== null) return cloud.token;
+      throw new Error(cloud.reason);
+    }
+
+    const failures: string[] = [];
+    let cloudReason: string | null = null;
+    for (const source of this.sources) {
+      if (source === 'cloud') {
+        const cloud = await this.getCloudAccessToken(userId, provider, resolvedWorkspaceId);
+        if (cloud.token !== null) return cloud.token;
+        cloudReason = cloud.reason;
+        failures.push(`cloud: ${cloud.reason}`);
+      } else {
+        const desktop = await this.getDesktopAccessToken(userId);
+        if (desktop.token !== null) return desktop.token;
+        if (desktop.reason) failures.push(`desktop: ${desktop.reason}`);
+      }
+    }
+    if (failures.length === 1 && cloudReason) throw new Error(cloudReason);
+    if (failures.length === 0) throw new Error(`No active ${provider} account found`);
+    throw new Error(`No usable ${provider} credential — ${failures.join('; ')}`);
+  }
+
+  /**
+   * The desktop file bound to this user, as a token — or why not. A null reason
+   * means nothing was bound; a failed lookup or unreadable storage binds
+   * nothing too (fail closed) and is logged rather than named here, because
+   * naming it would change the message users without a desktop file see.
+   */
+  private async getDesktopAccessToken(
+    userId: string
+  ): Promise<{ token: string } | { token: null; reason: string | null }> {
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) return { token: null, reason: null };
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    if (found.error || !found.record) return { token: null, reason: null };
+    try {
+      return { token: await this.desktopStore.getAccessToken(found.record) };
+    } catch (err) {
+      return { token: null, reason: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Desktop credentials bound to this user — the ones a call could actually
+   * use. Files for other emails are not listed: they belong to other people.
+   */
+  async describeDesktopCredentials(userId: string): Promise<{
+    dir: string;
+    email: string | null;
+    /** Why the listing could not be trusted, when it could not (lookup or storage failure). */
+    error: string | null;
+    credentials: Array<{
+      email: string;
+      path: string;
+      scopes: string[];
+      obtainedAt: string | null;
+      state: 'active' | 'refresh_required' | 'unusable';
+      reason: string | null;
+      expiresAt: string | null;
+    }>;
+  }> {
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) {
+      return { dir: this.desktopStore.dir, email: null, error: lookup.error, credentials: [] };
+    }
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    const record = found.record;
+    const credentials = record
+      ? [
+          {
+            email: record.email,
+            path: record.path,
+            scopes: record.scopes,
+            obtainedAt: record.obtainedAt,
+            ...this.desktopStore.inspect(record),
+          },
+        ]
+      : [];
+    return { dir: this.desktopStore.dir, email: lookup.email, error: found.error, credentials };
+  }
+
+  private async getCloudAccessToken(
+    userId: string,
+    provider: string,
+    resolvedWorkspaceId: string | null | undefined
+  ): Promise<{ token: string; reason?: undefined } | { token: null; reason: string }> {
+    interface CloudAccountRow {
+      id: string;
+      access_token: string;
+      refresh_token: string | null;
+      expires_at: string | null;
+      /** The row version every write below is guarded on. */
+      updated_at: string;
+    }
     let query = this.supabase
       .from('connected_accounts')
       .select('*')
@@ -460,30 +861,50 @@ class OAuthService {
       query = query.eq('workspace_id', resolvedWorkspaceId);
     }
 
-    const { data: account, error } = await query
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const result = await query.order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    const account = result.data as CloudAccountRow | null;
 
-    if (error || !account) {
-      throw new Error(`No active ${provider} account found`);
+    if (result.error || !account) {
+      return { token: null, reason: `No active ${provider} account found` };
     }
 
-    // Check if token is expired or expiring soon (within 5 minutes)
-    const expiresAt = account.expires_at ? new Date(account.expires_at) : null;
-    const isExpiringSoon = expiresAt && expiresAt.getTime() - Date.now() < 5 * 60 * 1000;
+    // Shared with inspectAccountHealth so the health verdict describes the same
+    // decision this call actually makes.
+    const refreshToken = pendingRefreshToken(account.expires_at, account.refresh_token);
 
-    if (isExpiringSoon && account.refresh_token) {
+    if (!refreshToken) {
+      // Nothing to refresh with. A stored token past its expiry is not a
+      // token — handing it back would fail at the provider AND stop the next
+      // credential source from being tried, while inspectAccountHealth calls
+      // this row unusable (Lumen, PR #588). Mark it so the dashboard agrees.
+      const expiry = account.expires_at ? new Date(account.expires_at).getTime() : null;
+      if (expiry !== null && !Number.isNaN(expiry) && expiry <= Date.now()) {
+        const reason = 'Access token expired and no refresh token is stored';
+        // Guarded on the snapshot's version: a reconnect that landed on this
+        // row between the read and this write must not be marked expired
+        // with a stale reason (Lumen, PR #588 round 3).
+        await this.supabase
+          .from('connected_accounts')
+          .update({ status: 'expired', last_error: reason, updated_at: new Date().toISOString() })
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
+        return { token: null, reason };
+      }
+    }
+
+    if (refreshToken) {
       logger.info(`Refreshing ${provider} token for user ${userId}`);
 
       try {
-        const tokens = await this.refreshAccessToken(provider, account.refresh_token);
+        const tokens = await this.refreshAccessToken(provider, refreshToken);
 
         // Update stored tokens
         const newExpiresAt = tokens.expiresIn
           ? new Date(Date.now() + tokens.expiresIn * 1000).toISOString()
           : null;
 
+        // Same guard: a reconnect that raced this refresh keeps its own
+        // tokens; the refreshed token is still good for this call.
         await this.supabase
           .from('connected_accounts')
           .update({
@@ -494,9 +915,10 @@ class OAuthService {
             last_error: null,
             updated_at: new Date().toISOString(),
           })
-          .eq('id', account.id);
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
 
-        return tokens.accessToken;
+        return { token: tokens.accessToken };
       } catch (err) {
         // Mark account as expired
         await this.supabase
@@ -506,9 +928,10 @@ class OAuthService {
             last_error: err instanceof Error ? err.message : 'Token refresh failed',
             updated_at: new Date().toISOString(),
           })
-          .eq('id', account.id);
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
 
-        throw new Error(`Failed to refresh ${provider} token`);
+        return { token: null, reason: `Failed to refresh ${provider} token` };
       }
     }
 
@@ -518,7 +941,7 @@ class OAuthService {
       .update({ last_used_at: new Date().toISOString() })
       .eq('id', account.id);
 
-    return account.access_token;
+    return { token: account.access_token };
   }
 
   /**
@@ -627,6 +1050,11 @@ export function getOAuthService(): OAuthService {
     oauthService = new OAuthService();
   }
   return oauthService;
+}
+
+/** Test seam: replace the process-wide service. */
+export function setOAuthService(next: OAuthService | null): void {
+  oauthService = next;
 }
 
 export { OAuthService };

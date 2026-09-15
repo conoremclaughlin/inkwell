@@ -1,6 +1,6 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -9,6 +9,7 @@ import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { DataComposer } from '../data/composer';
+import { GraphExecutorService } from '../services/graph-executor.service';
 import {
   registerAllTools,
   setMiniAppsRegistry,
@@ -25,6 +26,7 @@ import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
+import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import {
   ChannelGateway,
@@ -32,7 +34,7 @@ import {
   type ChannelGatewayConfig,
   type IncomingMessageHandler,
 } from '../channels/gateway';
-import { runWithRequestContext } from '../utils/request-context';
+import { runWithRequestContext, tokenIdentityContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
@@ -56,6 +58,8 @@ export class MCPServer {
   private server: McpServer;
   private dataComposer: DataComposer;
   private httpServer: Server | null = null;
+  /** The SDK v2 HTTP handler behind POST /mcp; closed on shutdown. */
+  private mcpHttpHandler: ReturnType<typeof createMcpHandler> | null = null;
 
   private miniApps: Map<string, LoadedMiniApp> = new Map();
   private miniAppsInfo: Array<{
@@ -91,12 +95,12 @@ export class MCPServer {
    * Validate a context token by verifying the sessionId against the database.
    * The session was created via an authenticated start_session call, so a
    * matching active session proves the caller owns the identity. We also
-   * verify the agentId matches to prevent session-id reuse across agents.
+   * verify the sbSlug matches to prevent session-id reuse across agents.
    */
   private async resolveUserFromContextSession(
     sessionId: string,
-    agentId: string
-  ): Promise<{ userId: string; email: string; agentId: string; sbId: string } | null> {
+    sbSlug: string
+  ): Promise<{ userId: string; email: string; sbSlug: string; sbId: string } | null> {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!UUID_RE.test(sessionId)) {
       logger.debug('Context-based auth: malformed sessionId', { sessionId });
@@ -123,26 +127,63 @@ export class MCPServer {
       return null;
     }
 
-    if (session.agentId !== agentId) {
-      logger.warn('Context-based auth: agentId mismatch', {
+    if (session.sbSlug !== sbSlug) {
+      logger.warn('Context-based auth: sbSlug mismatch', {
         sessionId,
-        sessionAgentId: session.agentId,
-        contextAgentId: agentId,
+        sessionSlug: session.sbSlug,
+        contextSlug: sbSlug,
       });
       return null;
+    }
+
+    // Canonical-first: the session row stores its owning identity UUID
+    // (sessions.sb_id). Resolving by that UUID is unambiguous where the slug
+    // is not — the same agent_id can exist in multiple workspaces, and a
+    // slug .single() lookup errors on duplicates, breaking enrichment and
+    // artifact writes for exactly the identities that need disambiguation
+    // (PR #468 review 4902919349). Slug lookup remains only as the fallback
+    // for legacy sessions without sb_id.
+    if (session.sbId) {
+      const { data, error } = await this.dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id, agent_id, user_id, users!inner(email)')
+        .eq('id', session.sbId)
+        .single();
+
+      if (error || !data) {
+        logger.debug('Context-based auth: session sb_id has no identity row', {
+          sbId: session.sbId,
+          sessionId,
+        });
+        return null;
+      }
+      if (data.user_id !== session.userId || data.agent_id !== sbSlug) {
+        logger.warn('Context-based auth: session sb_id does not match session user/agent', {
+          sessionId,
+          sbId: session.sbId,
+          identityUserId: data.user_id,
+          sessionUserId: session.userId,
+          identitySlug: data.agent_id,
+          contextSlug: sbSlug,
+        });
+        return null;
+      }
+      const email = (data.users as unknown as { email: string })?.email ?? '';
+      return { userId: session.userId, email, sbSlug, sbId: data.id };
     }
 
     const { data, error } = await this.dataComposer
       .getClient()
       .from('agent_identities')
       .select('id, user_id, users!inner(email)')
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .eq('user_id', session.userId)
       .single();
 
     if (error || !data) {
       logger.debug('Context-based auth: no identity found for session user+agent', {
-        agentId,
+        sbSlug,
         userId: session.userId,
       });
       return null;
@@ -152,15 +193,75 @@ export class MCPServer {
     return {
       userId: session.userId,
       email,
-      agentId,
+      sbSlug,
       sbId: data.id,
     };
   }
 
-  private async deriveWorkspaceIdFromAgent(
-    userId: string,
-    agentId: string
-  ): Promise<string | null> {
+  /**
+   * Canonical workspace derivation: one identity UUID → its workspace.
+   * Preferred over the slug variant whenever sbId is known — the slug can
+   * match identities in multiple workspaces (ambiguous by schema).
+   */
+  private async deriveWorkspaceIdFromSbId(sbId: string): Promise<string | null> {
+    const { data, error } = await this.dataComposer
+      .getClient()
+      .from('agent_identities')
+      .select('workspace_id')
+      .eq('id', sbId)
+      .maybeSingle();
+
+    if (error) {
+      logger.warn('Failed to derive workspace from identity UUID in MCP request context', {
+        sbId,
+        error: error.message,
+      });
+      return null;
+    }
+    return data?.workspace_id ?? null;
+  }
+
+  /**
+   * Session-anchored identity enrichment. The normal local auth shape is an
+   * unbound USER bearer (~/.ink/auth.json) with no agent claim, while the
+   * x-ink-context token names the session's agent. The token alone is a
+   * client assertion, so identity is enriched only when the referenced
+   * session row (server truth) is live, matches the claimed agent, AND is
+   * owned by the AUTHENTICATED user. Without this, ink-routed tool calls run
+   * agent-less: workspace derivation for writes cannot run and
+   * create_artifact fails wanting workspace scope (found live by Myra).
+   */
+  private async enrichIdentityFromContextSession(
+    userData: { userId: string; email: string; sbSlug?: string; sbId?: string } | null,
+    contextToken: { sessionId?: string; sbSlug?: string } | null
+  ): Promise<{ userId: string; email: string; sbSlug?: string; sbId?: string } | null> {
+    if (!userData) return userData;
+    if (userData.sbSlug || !contextToken?.sessionId || !contextToken?.sbSlug) return userData;
+
+    const sessionIdentity = await this.resolveUserFromContextSession(
+      contextToken.sessionId,
+      contextToken.sbSlug
+    );
+    if (!sessionIdentity) return userData;
+    if (sessionIdentity.userId !== userData.userId) {
+      logger.warn('Context session enrichment rejected: session owned by different user', {
+        sessionId: contextToken.sessionId,
+        sessionUserId: sessionIdentity.userId,
+        authenticatedUserId: userData.userId,
+      });
+      return userData;
+    }
+
+    logger.debug('Context session enrichment: agent identity attached to user-token request', {
+      sessionId: contextToken.sessionId,
+      sbSlug: sessionIdentity.sbSlug,
+      sbId: sessionIdentity.sbId,
+      userId: userData.userId,
+    });
+    return { ...userData, sbSlug: sessionIdentity.sbSlug, sbId: sessionIdentity.sbId };
+  }
+
+  private async deriveWorkspaceIdFromAgent(userId: string, sbSlug: string): Promise<string | null> {
     // TODO(lumen): Deduplicate this with the artifact-handler variant in a
     // shared helper that can choose ambiguous-workspace behavior (warn/throw).
     const { data, error } = await this.dataComposer
@@ -168,12 +269,12 @@ export class MCPServer {
       .from('agent_identities')
       .select('workspace_id')
       .eq('user_id', userId)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
 
     if (error) {
       logger.warn('Failed to derive workspace from agent identity in MCP request context', {
         userId,
-        agentId,
+        sbSlug,
         error: error.message,
       });
       return null;
@@ -192,7 +293,7 @@ export class MCPServer {
     if (workspaceIds.length > 1) {
       logger.warn('Ambiguous workspace mapping for agent identity in MCP request context', {
         userId,
-        agentId,
+        sbSlug,
         workspaceCount: workspaceIds.length,
       });
     }
@@ -202,7 +303,7 @@ export class MCPServer {
 
   private async resolveWorkspaceContextForMcpRequest(
     req: express.Request,
-    userData: { userId: string; email: string; agentId?: string; sbId?: string }
+    userData: { userId: string; email: string; sbSlug?: string; sbId?: string }
   ): Promise<{ workspaceId?: string; workspaceSource?: 'header' | 'derived' }> {
     const requestedWorkspaceId = req.header('x-ink-workspace-id')?.trim();
 
@@ -217,9 +318,13 @@ export class MCPServer {
             return !!workspace;
           }
         : undefined,
-      deriveWorkspaceIdFromAgent: userData.agentId
-        ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
-        : undefined,
+      // Canonical UUID derivation first — the slug variant is ambiguous when
+      // the same agent_id exists in multiple workspaces.
+      deriveWorkspaceIdFromAgent: userData.sbId
+        ? () => this.deriveWorkspaceIdFromSbId(userData.sbId!)
+        : userData.sbSlug
+          ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.sbSlug!)
+          : undefined,
     });
 
     if (!resolution) return {};
@@ -302,10 +407,34 @@ export class MCPServer {
 
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)
-    // Each request gets a fresh transport — no session tracking, no stale sessions.
-    // Handles: POST (tool calls + initialize), GET (explicit 405 when no SSE stream
-    // is offered), DELETE (no-op)
+    // One SDK v2 handler serves the endpoint: clients that negotiate the
+    // 2026-07-28 revision (Claude Code 2.1.267+) get the modern per-request
+    // path; 2025-era clients get stateless serving from the SAME factory, so
+    // both eras expose identical tools. Every exchange builds a fresh server
+    // instance — no session tracking, no stale sessions. The factory reads
+    // the caller profile from the request it is serving; identity reaches the
+    // tool handlers through runWithRequestContext, which the SDK's
+    // per-request dispatch preserves (AsyncLocalStorage, verified live).
+    // Handles: POST (tool calls + initialize), GET (explicit 405 when no SSE
+    // stream is offered), DELETE (no-op)
     // ============================================================================
+    const callerProfileFromHeader = (value: string | null | undefined): 'agent' | 'runtime' =>
+      value?.trim().toLowerCase() === 'runtime' ? 'runtime' : 'agent';
+    const mcpHandler = createMcpHandler(
+      (mcpContext) =>
+        this.createMcpServerInstance(
+          callerProfileFromHeader(mcpContext.requestInfo?.headers.get('x-ink-caller-profile'))
+        ),
+      {
+        legacy: 'stateless',
+        onerror: (error) => logger.error('MCP handler error:', error),
+      }
+    );
+    this.mcpHttpHandler = mcpHandler;
+    const mcpNodeHandler = toNodeHandler(mcpHandler, {
+      onerror: (error) => logger.error('MCP request adapter error:', error),
+    });
+
     const handleMcpRequest = async (req: express.Request, res: express.Response) => {
       const authHeader = req.headers.authorization;
       let userData = await this.authProvider.verifyAccessToken(authHeader);
@@ -319,22 +448,22 @@ export class MCPServer {
       }
 
       // Session-validated context auth: when NO Authorization header is present
-      // but the request carries an x-ink-context with a sessionId + agentId,
+      // but the request carries an x-ink-context with a sessionId + sbSlug,
       // verify the session exists and is active in the database. The session was
       // created through an authenticated start_session call, so a matching
       // active session proves the caller owns the identity.
       //
       // This is NOT attempted when an Authorization header IS present but
       // invalid — that's a hard auth failure, not a fallback scenario.
-      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.agentId) {
+      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.sbSlug) {
         userData = await this.resolveUserFromContextSession(
           contextToken.sessionId,
-          contextToken.agentId
+          contextToken.sbSlug
         );
         if (userData) {
           logger.debug('Context-based auth: resolved identity from verified session', {
             sessionId: contextToken.sessionId,
-            agentId: contextToken.agentId,
+            sbSlug: contextToken.sbSlug,
             userId: userData.userId,
           });
         }
@@ -379,13 +508,29 @@ export class MCPServer {
         ? {
             userId: userData.userId,
             email: userData.email,
-            agentId: userData.agentId,
+            sbSlug: userData.sbSlug,
             sbId: userData.sbId,
           }
         : {};
-      const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
-      const callerProfile: 'agent' | 'runtime' =
-        callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
+
+      // Session-anchored identity enrichment (see
+      // enrichIdentityFromContextSession): attaches the session's agent
+      // identity — canonical sbId first — to user-token requests so
+      // pinned-agent dispatch and workspace derivation work for ink-routed
+      // tool calls.
+      // Snapshot the token's own identity before enrichment. Authorization
+      // reads these; everything below may be overwritten by session-derived
+      // values that are routing hints, not authentication facts.
+      Object.assign(ctx, tokenIdentityContext(userData));
+
+      const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
+      if (effectiveIdentity && effectiveIdentity !== userData) {
+        Object.assign(ctx, {
+          sbSlug: effectiveIdentity.sbSlug,
+          sbId: effectiveIdentity.sbId,
+        });
+      }
+      const callerProfile = callerProfileFromHeader(req.header('x-ink-caller-profile'));
       const sessionIdHeader = contextToken?.sessionId || req.header('x-ink-session-id')?.trim();
       // ── Studio scope (worktree-level) ──
       // studioId and workspaceId are DIFFERENT concepts. Never conflate them.
@@ -428,14 +573,19 @@ export class MCPServer {
       }
 
       // ── Workspace scope (parent-level) ──
-      // Always resolve workspace independently — it's a different scope than studio.
-      if (userData) {
+      // Always resolve workspace independently — it's a different scope than
+      // studio. Uses the session-enriched identity so agent-derived workspace
+      // resolution works for user-token requests too.
+      if (effectiveIdentity) {
         try {
-          Object.assign(ctx, await this.resolveWorkspaceContextForMcpRequest(req, userData));
+          Object.assign(
+            ctx,
+            await this.resolveWorkspaceContextForMcpRequest(req, effectiveIdentity)
+          );
         } catch (error) {
           logger.warn('Rejected MCP request due to invalid workspace scope', {
-            userId: userData.userId,
-            agentId: userData.agentId,
+            userId: effectiveIdentity.userId,
+            sbSlug: effectiveIdentity.sbSlug,
             error: error instanceof Error ? error.message : String(error),
           });
           res.status(403).json({
@@ -448,17 +598,10 @@ export class MCPServer {
       }
 
       await runWithRequestContext(ctx, async () => {
-        let transport: StreamableHTTPServerTransport | undefined;
-        let mcpServer: ReturnType<typeof this.createMcpServerInstance> | undefined;
         try {
-          // Stateless: fresh transport per request — no session IDs, no stale sessions
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined,
-          });
-          mcpServer = this.createMcpServerInstance(callerProfile);
-
-          await mcpServer.connect(transport);
-          await transport.handleRequest(req, res);
+          // The handler builds a fresh instance from the factory for this one
+          // exchange (modern or legacy era), serves it, and closes it.
+          await mcpNodeHandler(req, res, req.body);
         } catch (error) {
           logger.error('Error handling MCP request:', error);
           if (!res.headersSent) {
@@ -466,13 +609,6 @@ export class MCPServer {
               jsonrpc: '2.0',
               error: { code: -32603, message: 'Internal server error' },
               id: null,
-            });
-          }
-        } finally {
-          if (transport) transport.onclose = undefined;
-          if (mcpServer) {
-            mcpServer.close().catch((err) => {
-              logger.debug('Error closing stateless MCP server instance', { error: err });
             });
           }
         }
@@ -613,7 +749,7 @@ export class MCPServer {
         codeChallenge: code_challenge as string,
         redirectUri: redirect_uri as string,
         state: state as string,
-        agentId: agent_id as string | undefined,
+        sbSlug: agent_id as string | undefined,
       });
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';
@@ -730,12 +866,12 @@ export class MCPServer {
         return;
       }
 
-      const requestedAgentId =
-        typeof req.body?.agentId === 'string' ? req.body.agentId.trim().toLowerCase() : '';
-      if (!requestedAgentId) {
+      const requestedSlug =
+        typeof req.body?.sbSlug === 'string' ? req.body.sbSlug.trim().toLowerCase() : '';
+      if (!requestedSlug) {
         res.status(400).json({
           error: 'invalid_request',
-          error_description: 'Missing required field: agentId',
+          error_description: 'Missing required field: sbSlug',
         });
         return;
       }
@@ -745,13 +881,13 @@ export class MCPServer {
         .from('agent_identities')
         .select('id, agent_id')
         .eq('user_id', userData.userId)
-        .eq('agent_id', requestedAgentId)
+        .eq('agent_id', requestedSlug)
         .maybeSingle();
 
       if (identityError) {
         logger.error('Failed to resolve agent identity for delegated token', {
           userId: userData.userId,
-          requestedAgentId,
+          requestedSlug,
           error: identityError.message,
         });
         res.status(500).json({
@@ -775,7 +911,7 @@ export class MCPServer {
           sub: userData.userId,
           email: userData.email,
           scope: 'mcp:tools',
-          agentId: identity.agent_id,
+          sbSlug: identity.agent_id,
           identityId: identity.id,
         },
         DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS
@@ -836,6 +972,58 @@ export class MCPServer {
 
     // Live session event stream (SSE) — attached terminals + dashboard subscribe
     // to a session's turn events, fanned out from the session event bus.
+    // The durable ledger locator rides in the session row's metadata (no new
+    // tables) so observer replay survives bus eviction and process restarts.
+    const locatorClient = this.dataComposer.getClient();
+    sessionEventBus.setLocatorStore({
+      // Dedicated column, single-column UPDATE — no read-modify-write of the
+      // shared metadata object (that merge raced other session updates and
+      // could silently drop the locator). PostgREST reports failures via
+      // `error`, not exceptions — check and THROW so the bus's retry/logging
+      // actually sees them (Lumen re-review, blocker 1).
+      persist: async (sessionId, ledgerPath) => {
+        const { error } = await locatorClient
+          .from('sessions')
+          .update({ observer_ledger_path: ledgerPath })
+          .eq('id', sessionId);
+        if (error) {
+          throw new Error(`locator persist failed: ${error.message}`);
+        }
+      },
+      // activity: authoritative evidence for the vacuous-replay decision —
+      // 'completed' (markers prove durable history), 'attempted' (turn
+      // started, ledger may hold entries), 'none' (durably pristine idle).
+      load: async (sessionId) => {
+        const { data: row, error } = await locatorClient
+          .from('sessions')
+          .select(
+            'observer_ledger_path, backend_session_id, token_count, message_count, lifecycle, ended_at'
+          )
+          .eq('id', sessionId)
+          .maybeSingle();
+        if (error) {
+          throw new Error(`locator load failed: ${error.message}`);
+        }
+        // Completed markers are written only AFTER a turn returns; the ledger
+        // gains entries at turn START. A started-but-never-completed turn
+        // (lifecycle running/failed, or ended without markers) is therefore
+        // 'attempted' — never proof of a pristine session (Lumen M4.4).
+        const completed = Boolean(
+          row &&
+          (row.backend_session_id || (row.token_count ?? 0) > 0 || (row.message_count ?? 0) > 0)
+        );
+        const pristine =
+          !row || ((row.lifecycle === null || row.lifecycle === 'idle') && !row.ended_at);
+        return {
+          ledgerPath: row?.observer_ledger_path ?? null,
+          activity: completed
+            ? ('completed' as const)
+            : pristine
+              ? ('none' as const)
+              : ('attempted' as const),
+        };
+      },
+    });
     const sessionsRouter = createSessionsRouter({
       authProvider: this.authProvider,
       dataComposer: this.dataComposer,
@@ -894,6 +1082,24 @@ export class MCPServer {
       },
       6 * 60 * 60 * 1000
     );
+
+    // Workflow graph reconciliation sweep (spec v10 §Durable push): re-runs
+    // the same readiness evaluator as the push path over active graph
+    // groups — recovering lost dispatches, opening dwelling gates at
+    // eligible_at, reclaiming ended-session claims. Idempotent; duplicate
+    // triggers are absorbed by claims. Set ENABLE_GRAPH_SWEEP=false on
+    // isolated test servers (the main server owns dispatch).
+    if (process.env.ENABLE_GRAPH_SWEEP !== 'false') {
+      const sweepMs = Number(process.env.GRAPH_SWEEP_INTERVAL_MS || 60_000);
+      const graphExecutor = new GraphExecutorService(this.dataComposer);
+      // Dispatch-stamp recovery for interrupted turns runs in startServer,
+      // awaited BEFORE the listener accepts anything — see the call there for
+      // why it cannot live here (Lumen, PR #559 review).
+      setInterval(() => {
+        graphExecutor.sweepAll().catch((err) => logger.warn('Graph sweep tick failed:', err));
+      }, sweepMs);
+      logger.info(`Graph reconciliation sweep enabled (every ${Math.round(sweepMs / 1000)}s)`);
+    }
 
     // Initialize channel gateway if message handler is configured
     if (this.config.messageHandler) {
@@ -999,6 +1205,16 @@ export class MCPServer {
       await this.server.close();
     } catch (error) {
       logger.warn('Error closing primary MCP server:', error);
+    }
+
+    if (this.mcpHttpHandler) {
+      // Abort in-flight modern exchanges and close their per-request instances.
+      try {
+        await this.mcpHttpHandler.close();
+      } catch (error) {
+        logger.warn('Error closing MCP HTTP handler:', error);
+      }
+      this.mcpHttpHandler = null;
     }
 
     if (this.httpServer) {

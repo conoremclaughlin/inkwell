@@ -4,16 +4,16 @@
  * Media reaches ink chat as local file paths (--attach-file), downloaded
  * by the server's channel listeners (Telegram, Discord, Gmail) to
  * ~/.ink/files/<channel>/. The runtime forwards them to the provider
- * backend two ways:
+ * backend three ways (spec:provider-media-injection):
  *
- *   1. An attachment block appended to the turn's message text — the
- *      backend learns the exact path and is told to read it.
- *   2. Directory access for the backend spawn (claude: --add-dir per
- *      attachment directory) so the file is readable without prompts.
- *
- * The backend's native file tooling does the actual viewing (Claude
- * Code's Read renders images). No base64 inlining — see the server's
- * readImageAttachmentsAsBase64 for the future API-provider path.
+ *   1. Injection as prompt CONTENT for supported images — claude embeds
+ *      base64 image blocks via stream-json stdin; codex attaches
+ *      `--image=` flags. The preferred path: no filesystem tool needed.
+ *   2. An attachment block appended to the turn's message text — the
+ *      backend learns the exact path of every attachment.
+ *   3. Directory access for the backend spawn (claude: --add-dir per
+ *      attachment directory) so explicitly unsupported types (documents,
+ *      audio) are readable via the gated native-read fallback.
  */
 
 import { stat } from 'fs/promises';
@@ -84,7 +84,9 @@ export function buildAttachmentBlock(attachments: ResolvedAttachment[]): string 
       `- ${a.path}${meta ? ` (${meta})` : ''}${a.missing ? ' — MISSING (not readable)' : ''}`
     );
   }
-  lines.push('View attached files with your file-reading tool using the paths above.');
+  lines.push(
+    'Images may be attached inline with this message; use your file-reading tool (when available) for any files not shown inline.'
+  );
   return lines.join('\n');
 }
 

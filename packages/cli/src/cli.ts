@@ -27,6 +27,7 @@ import { registerAwakenCommand } from './commands/awaken.js';
 import { registerHooksCommands } from './commands/hooks.js';
 import { registerInitCommand } from './commands/init.js';
 import { registerAuthCommands } from './commands/auth.js';
+import { registerGoogleCommands } from './commands/google.js';
 import { registerChatCommand, runChat } from './commands/chat.js';
 import { registerDoctorCommand } from './commands/doctor.js';
 import { registerMissionCommand } from './commands/mission.js';
@@ -35,11 +36,13 @@ import { registerPermissionsCommands } from './commands/permissions.js';
 import { registerSkillsCommands } from './commands/skills.js';
 import { registerMemoryCommands } from './commands/memory.js';
 import { registerWaitCommand } from './commands/wait.js';
+import { registerObserveCommand } from './commands/observe.js';
 import { registerPolicyCommands } from './commands/policy.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
 import { initSbDebug, sbDebugLog } from './lib/sb-debug.js';
 import { maybeWarnServerUpdate } from './lib/server-update-notice.js';
+import { divertConsoleLogToStderr } from './lib/stdout-purity.js';
 
 const VERSION = '0.3.0';
 
@@ -218,6 +221,12 @@ program
 
     // Resolve backend from identity.json if not explicitly set
     const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
+    // Machine-readable output mode: everything printed between here and the
+    // payload (debug path, dangerous banner, server-update notice, hook
+    // health, PCP availability) belongs on stderr.
+    if (resolvedOptions.sessionCandidatesJson) {
+      divertConsoleLogToStderr();
+    }
     const debugFile = initSbDebug({
       enabled: resolvedOptions.sbDebug,
       context: {
@@ -254,6 +263,8 @@ program
         message: prompt || undefined,
         sbDebug: resolvedOptions.sbDebug || undefined,
         verbose: resolvedOptions.verbose || undefined,
+        sessionCandidates: resolvedOptions.sessionCandidates || undefined,
+        sessionCandidatesJson: resolvedOptions.sessionCandidatesJson || undefined,
       });
       return;
     }
@@ -311,6 +322,7 @@ registerAwakenCommand(program);
 registerHooksCommands(program);
 registerInitCommand(program);
 registerAuthCommands(program);
+registerGoogleCommands(program);
 registerChatCommand(program);
 registerDoctorCommand(program);
 registerMissionCommand(program);
@@ -319,6 +331,7 @@ registerPermissionsCommands(program);
 registerSkillsCommands(program);
 registerMemoryCommands(program);
 registerWaitCommand(program);
+registerObserveCommand(program);
 registerPolicyCommands(program);
 
 // ============================================================================

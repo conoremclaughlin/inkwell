@@ -7,7 +7,7 @@
  *
  * Publishers: ActivityStreamRepository.logActivity() emits every row it
  * inserts. Subscribers: the /api/admin/events SSE endpoint filters by
- * userId (required) plus optional sessionId / taskGroupId / agentId.
+ * userId (required) plus optional sessionId / taskGroupId / sbSlug.
  *
  * See ink://specs/live-session-experience (WS1).
  */
@@ -19,7 +19,7 @@ export interface ActivityFilter {
   userId: string;
   sessionId?: string;
   taskGroupId?: string;
-  agentId?: string;
+  sbSlug?: string;
 }
 
 type ActivityListener = (activity: Activity) => void;
@@ -45,7 +45,7 @@ class ActivityBus extends EventEmitter {
       if (activity.userId !== filter.userId) return;
       if (filter.sessionId && activity.sessionId !== filter.sessionId) return;
       if (filter.taskGroupId && activity.taskGroupId !== filter.taskGroupId) return;
-      if (filter.agentId && activity.agentId !== filter.agentId) return;
+      if (filter.sbSlug && activity.sbSlug !== filter.sbSlug) return;
       listener(activity);
     };
     this.on('activity', wrapped);

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Resolve the replay relative to THIS file, not the worktree being pushed from.
+# See scripts/check-commit-msg.sh for why that distinction matters on a machine
+# with worktrees. Stdin (the ref list) passes straight through to the script.
+replay="$(dirname "$0")/../scripts/check-push.sh"
+if [ ! -f "$replay" ] || [ ! -r "$replay" ]; then
+  printf '%s\n' 'Push blocked: the checkout providing pre-push is missing its readable replay script.' 'Update or repair the checkout owning core.hooksPath; nothing was pushed.' >&2
+  exit 2
+fi
+exec sh "$replay" "$@"

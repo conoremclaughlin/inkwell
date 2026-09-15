@@ -18,13 +18,13 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { createHash } from 'crypto';
-import { resolveAgentId, readIdentityJson, readRoleMd } from '../backends/identity.js';
+import { resolveSlug, readIdentityJson, readRoleMd } from '../backends/identity.js';
 import { getValidAccessToken, getValidDelegatedAccessToken } from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
@@ -33,7 +33,9 @@ import {
   setCurrentRuntimeSession,
   upsertRuntimeSession,
 } from '../session/runtime.js';
+import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
+import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -157,7 +159,7 @@ function detectBackend(cwd: string): HookCapabilities {
   return CLAUDE_CODE; // default
 }
 
-function getBackendByName(name: string): HookCapabilities {
+export function getBackendByName(name: string): HookCapabilities {
   switch (name.toLowerCase()) {
     case 'claude':
     case 'claude-code':
@@ -259,9 +261,9 @@ export async function callPcpTool(
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
   const hasInjectedEnvToken = Boolean(process.env.INK_ACCESS_TOKEN?.trim());
-  const delegatedAgentId =
-    typeof args.agentId === 'string' && args.agentId.trim().length > 0
-      ? args.agentId.trim().toLowerCase()
+  const delegatedSlug =
+    typeof args.sbSlug === 'string' && args.sbSlug.trim().length > 0
+      ? args.sbSlug.trim().toLowerCase()
       : null;
 
   // Propagate Inkwell session/studio IDs so the server can resolve studio scope and
@@ -275,7 +277,7 @@ export async function callPcpTool(
     'x-ink-caller-profile': 'runtime',
     // Forward-looking runtime identity signal for stricter server-side enforcement.
     // Today, effective agent identity is still sourced from JWT claims.
-    ...(delegatedAgentId ? { 'x-ink-agent-id': delegatedAgentId } : {}),
+    ...(delegatedSlug ? { 'x-ink-agent-id': delegatedSlug } : {}),
     ...(pcpSessionId ? { 'x-ink-session-id': pcpSessionId } : {}),
     ...(pcpStudioId ? { 'x-ink-studio-id': pcpStudioId } : {}),
   };
@@ -305,8 +307,8 @@ export async function callPcpTool(
     allowEnvToken?: boolean;
     skipDelegated?: boolean;
   }): Promise<{ token: string | null; source: 'delegated' | 'base' }> => {
-    if (delegatedAgentId && !options?.skipDelegated) {
-      const delegatedToken = getValidDelegatedAccessToken(delegatedAgentId);
+    if (delegatedSlug && !options?.skipDelegated) {
+      const delegatedToken = getValidDelegatedAccessToken(delegatedSlug);
       if (delegatedToken) {
         return { token: delegatedToken, source: 'delegated' };
       }
@@ -485,14 +487,14 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
   const { studioId } = getIdentitySessionContext(cwd);
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
 
   // 2. INK_RUNTIME_LINK_ID → sessions.json lookup (server-spawned sessions)
   const runtimeLinkId = process.env.INK_RUNTIME_LINK_ID;
   if (runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
       backend: sessionBackend,
-      agentId,
+      sbSlug,
       ...(studioId ? { studioId } : {}),
     });
     if (linked?.pcpSessionId) return linked.pcpSessionId;
@@ -540,7 +542,7 @@ function getRuntimeLinkId(): string | undefined {
 
 async function findPcpSessionByBackendSessionId(
   config: PcpConfig | null,
-  agentId: string,
+  sbSlug: string,
   sessionBackend: string,
   backendSessionId: string,
   studioId?: string
@@ -548,7 +550,7 @@ async function findPcpSessionByBackendSessionId(
   try {
     const listArgs: Record<string, unknown> = {
       email: config?.email,
-      agentId,
+      sbSlug,
       limit: 50,
       ...(studioId ? { studioId } : {}),
     };
@@ -586,7 +588,7 @@ async function findPcpSessionByBackendSessionId(
 async function reconcileBackendSignal(
   cwd: string,
   config: PcpConfig | null,
-  agentId: string,
+  sbSlug: string,
   stdin: Record<string, unknown>,
   options?: {
     initialPcpSessionId?: string;
@@ -603,7 +605,7 @@ async function reconcileBackendSignal(
   const runtimeLinkId = getRuntimeLinkId();
   sbDebugLog('hooks', 'reconcile_start', {
     sessionBackend,
-    agentId,
+    sbSlug,
     initialPcpSessionId: options?.initialPcpSessionId || null,
     initialThreadKey: options?.initialThreadKey || null,
     extractedBackendSessionId: backendSessionId || null,
@@ -618,7 +620,7 @@ async function reconcileBackendSignal(
   if (!pcpSessionId && runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
       backend: sessionBackend,
-      agentId,
+      sbSlug,
       ...(studioId ? { studioId } : {}),
     });
     if (linked?.pcpSessionId) {
@@ -636,7 +638,7 @@ async function reconcileBackendSignal(
   if (!pcpSessionId && backendSessionId) {
     const linkedByBackendSessionId = listRuntimeSessions(cwd, sessionBackend).find(
       (session) =>
-        session.agentId === agentId &&
+        session.sbSlug === sbSlug &&
         (!studioId || session.studioId === studioId) &&
         (session.backendSessionId === backendSessionId ||
           session.backendSessionIds?.includes(backendSessionId))
@@ -658,7 +660,7 @@ async function reconcileBackendSignal(
     const local = listRuntimeSessions(cwd, sessionBackend).find(
       (session) =>
         session.pcpSessionId === pcpSessionId &&
-        session.agentId === agentId &&
+        session.sbSlug === sbSlug &&
         (!studioId || session.studioId === studioId)
     );
     hasLocalBackendLink = !!(
@@ -672,7 +674,7 @@ async function reconcileBackendSignal(
     // Reconcile mismatched pcpSessionId/backendSessionId by checking existing server-side links first.
     const matched = await findPcpSessionByBackendSessionId(
       config,
-      agentId,
+      sbSlug,
       sessionBackend,
       backendSessionId,
       studioId
@@ -708,7 +710,7 @@ async function reconcileBackendSignal(
   upsertRuntimeSession(cwd, {
     pcpSessionId,
     backend: sessionBackend,
-    agentId,
+    sbSlug,
     ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(threadKey ? { threadKey } : {}),
@@ -718,7 +720,7 @@ async function reconcileBackendSignal(
     updatedAt: new Date().toISOString(),
   });
   setCurrentRuntimeSession(cwd, pcpSessionId, sessionBackend, {
-    agentId,
+    sbSlug,
     ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
   });
@@ -738,37 +740,288 @@ async function reconcileBackendSignal(
   };
 }
 
-async function updateRuntimeGenerationState(
+/**
+ * Why a prompt's turn takeover failed. Named explicitly (PR #590) because
+ * the honest warning differs: a lost lease means another session may own
+ * this checkout; an unavailable server means nothing is known either way.
+ * `!leaseLost` alone was never proof of transience — a 409 is authoritative.
+ */
+export type TakeoverFailureReason =
+  /** No usable answer after three attempts: network error, timeout, or an unclassified non-2xx. */
+  | 'unavailable'
+  /** HTTP 409 — the server recorded this turn as already stopped. Refused for good. */
+  | 'refused'
+  /** HTTP 403 — the session or studio belongs to another user or tenant. Permanent. */
+  | 'forbidden'
+  /** 2xx with studioLeaseHeld:false — another holder, a closed thread, or a retired studio. */
+  | 'lease-not-held';
+
+export interface TakeoverResult {
+  ok: boolean;
+  turnEpoch?: string;
+  /** The server answered and reported the studio lease is NOT held. */
+  leaseLost?: boolean;
+  reason?: TakeoverFailureReason;
+}
+
+export async function updateRuntimeGenerationState(
   cwd: string,
   _config: PcpConfig | null,
-  agentId: string,
-  lifecycle: 'running' | 'idle' | 'compacting'
-): Promise<void> {
+  sbSlug: string,
+  lifecycle: 'running' | 'idle' | 'compacting',
+  // Which hook fired. Lifecycle values are ambiguous (post-compact and
+  // on-stop both send 'idle'); the server uses the event to manage the
+  // hook-owned CLI turn signal and to run the lease boundary ONLY on the
+  // real stop (PR #492).
+  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact',
+  opts?: {
+    /**
+     * Server-spawned (headless) turns must say so: the server's pre-turn
+     * write already owns the turn epoch, and an interactive-style prompt
+     * claim from the child's own hook would rotate it and fence the server's
+     * finalize out of its own turn (PR #563 round 6).
+     */
+    headless?: boolean;
+    /**
+     * Stop events (round 10): the epoch of the turn this stop is ending,
+     * read back from the record the prompt claim wrote. The server fences
+     * the lease boundary on it.
+     */
+    turnEpoch?: string;
+    /**
+     * Stop events (round 11): modern sender, but the epoch record is gone —
+     * the server fails closed (suppresses destructive boundary releases)
+     * instead of treating this stop as a legacy unfenced one.
+     */
+    turnEpochMissing?: boolean;
+    /** Round 21: attempt tokens this stop abandons — appended to the fence. */
+    fenceAttempts?: string[];
+    /** Round 21: adjudicating reclaim — the marker's birth time (tombstone CAS). */
+    reclaimOf?: string;
+    /** Round 21: adjudicating reclaim — the marker's attempt token. */
+    attemptId?: string;
+    /**
+     * Prompt events (round 11): the caller's worktree studio. The server
+     * restamps + exact-CAS-touches ITS lease and reports `studioLeaseHeld`;
+     * false means a concurrent release won — the takeover is UNACKNOWLEDGED
+     * and this function reports ok:false without retrying (the lease is
+     * gone, not flaky).
+     */
+    studioId?: string;
+  }
+): Promise<TakeoverResult> {
   const sessionId = resolveActivePcpSessionId(cwd);
-  if (!sessionId) return;
+  if (!sessionId) return { ok: true }; // nothing to take over — vacuously fine
 
-  try {
-    const serverUrl = getPcpServerUrl();
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const token = await getValidAccessToken(serverUrl);
-    if (token) headers.Authorization = `Bearer ${token}`;
-    const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ sessionId, lifecycle, agentId, workingDir: cwd }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!resp.ok) {
+  // Three attempts: a prompt event is now a turn-epoch TAKEOVER on the
+  // server (claim + lifecycle + marker in one statement), so a swallowed
+  // failure is no longer just an invisible marker — an interactive prompt
+  // that proceeds unclaimed runs under a stale epoch that an old turn's
+  // fenced finalize can still clobber. No prompt hook refuses the prompt
+  // when this returns false (PR #590): the caller names the reason to the
+  // SB, writes the marker, and lets the human decide.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const serverUrl = getPcpServerUrl();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const token = await getValidAccessToken(serverUrl);
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          sessionId,
+          lifecycle,
+          ...(event ? { event } : {}),
+          ...(opts?.headless ? { headless: true } : {}),
+          ...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {}),
+          ...(opts?.turnEpochMissing ? { turnEpochMissing: true } : {}),
+          ...(opts?.fenceAttempts ? { fenceAttempts: opts.fenceAttempts } : {}),
+          ...(opts?.reclaimOf ? { reclaimOf: opts.reclaimOf } : {}),
+          ...(opts?.attemptId ? { attemptId: opts.attemptId } : {}),
+          ...(opts?.studioId && opts.studioId !== 'main' ? { studioId: opts.studioId } : {}),
+          sbSlug,
+          workingDir: cwd,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (resp.status === 409) {
+        // A refused reclaim is authoritative — the turn is over. No retry.
+        return { ok: false, reason: 'refused' };
+      }
+      if (resp.status === 403) {
+        // Round 24: a cross-tenant/foreign refusal is as PERMANENT as a
+        // lost lease — enforce, never fold into generic failure or retry.
+        sbDebugLog('hooks', 'lifecycle_forbidden', { sessionId, lifecycle, attempt });
+        return { ok: false, leaseLost: true, reason: 'forbidden' };
+      }
+      if (resp.ok) {
+        // Round 10: a claimed prompt's response carries the fresh epoch —
+        // the identity the eventual stop needs to fence its boundary.
+        const body = (await resp.json().catch(() => null)) as {
+          turnEpoch?: string;
+          studioLeaseHeld?: boolean;
+        } | null;
+        // Round 11: a 2xx whose lease report says NOT HELD is an
+        // unacknowledged takeover — a concurrent release won the exact-CAS
+        // race. No retry: the lease is gone, not flaky; the caller's
+        // failed-takeover handling (block, or marker for the watcher) is the
+        // recovery path.
+        if (body?.studioLeaseHeld === false) {
+          sbDebugLog('hooks', 'lifecycle_lease_not_held', { sessionId, lifecycle, attempt });
+          // Round 23: a lost lease is a distinct verdict — the caller must
+          // NAME it (it is not transience), not fold it into generic failure.
+          return { ok: false, leaseLost: true, reason: 'lease-not-held' };
+        }
+        return {
+          ok: true,
+          ...(typeof body?.turnEpoch === 'string' ? { turnEpoch: body.turnEpoch } : {}),
+        };
+      }
       const body = await resp.text().catch(() => '');
       sbDebugLog('hooks', 'lifecycle_update_failed', {
         sessionId,
         lifecycle,
+        attempt,
         status: resp.status,
         body,
       });
+    } catch (error) {
+      // Non-fatal; hook execution should not fail due to transient session sync issues.
+      sbDebugLog('hooks', 'lifecycle_update_error', {
+        sessionId,
+        lifecycle,
+        attempt,
+        error: String(error),
+      });
     }
-  } catch {
-    // Non-fatal; hook execution should not fail due to transient session sync issues.
+    if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  return { ok: false, reason: 'unavailable' };
+}
+
+/**
+ * Where the pending-takeover marker lives, shared with the wrapper watcher
+ * and the on-stop adjudication. Round 20: PER WRAPPER GENERATION — one
+ * shared path was lossy across coexisting generations. The generation-less
+ * path remains for legacy wrapperless senders, whose own stop hook
+ * adjudicates it (round 26: the channel-plugin claimant was removed as
+ * unreachable — markers come only from codex/gemini, which run no plugin).
+ */
+export function pendingTakeoverMarkerPath(cwd: string, generation?: string): string {
+  return join(
+    cwd,
+    '.ink',
+    generation ? `pending-takeover.${generation}.json` : 'pending-takeover.json'
+  );
+}
+
+const TAKEOVER_FAILURE_CAUSES: Record<
+  TakeoverFailureReason,
+  { cause: string; leaseKnownLost: boolean }
+> = {
+  unavailable: {
+    cause: 'the Inkwell server could not be reached or returned an error',
+    leaseKnownLost: false,
+  },
+  refused: {
+    cause: 'the server refused the claim because it recorded this turn as already stopped',
+    leaseKnownLost: false,
+  },
+  forbidden: {
+    cause:
+      'the server refused this session (the session or studio belongs to another user or tenant)',
+    leaseKnownLost: true,
+  },
+  'lease-not-held': {
+    cause:
+      "this studio's lease is held by another session or was revoked (thread closed or studio retired)",
+    leaseKnownLost: true,
+  },
+};
+
+/**
+ * Prompt-hook policy for a failed turn takeover (PR #590, Conor's decision
+ * on 2026-09-10): the prompt is NEVER refused. With many studios per user,
+ * "lease held elsewhere" is routine, and refusing the prompt froze attached
+ * humans out of their own terminals. What the SB gets instead is an honest
+ * warning: it does not hold (or cannot confirm) the studio lease, nothing
+ * fences its edits against another session that may own the checkout, and
+ * it must clarify ownership with the user before changing files. The human
+ * decides; the hook does not. The per-backend `blocksOnFailedTakeover` knob
+ * is gone with the policy — no shipped backend ever set it, and a knob that
+ * is always off misdescribes what the code does.
+ *
+ * Recovery is a durable MARKER file, because this hook process is
+ * short-lived and an in-process timer dies with it (round 8). A long-lived
+ * `ink` wrapper watches the marker and converts it into a claim
+ * (takeover-watcher.ts). WITHOUT a wrapper — plain `claude` with installed
+ * hooks — nothing consumes the marker mid-turn; the on-stop hook adjudicates
+ * it once at the boundary. The warning says which of the two applies rather
+ * than promising a retry that will not happen.
+ *
+ * The SB is told on STDOUT — a prompt hook's stdout is injected into the
+ * model's context; stderr reaches only a human at the terminal.
+ *
+ * Injectable for tests; onPromptHandler passes the real implementations.
+ */
+export function handleFailedTakeover(
+  backend: Pick<HookCapabilities, 'name'>,
+  opts: {
+    sbSlug: string;
+    writePendingTakeover: () => void;
+    /** Why the takeover failed; absent when the caller could not classify it. */
+    reason?: TakeoverFailureReason;
+    /**
+     * The `ink` wrapper generation that spawned this backend
+     * (INK_RUNTIME_LINK_ID). Present means a watcher retries the claim in
+     * the background; absent means nothing retries until the turn ends.
+     */
+    wrapperGeneration?: string;
+  }
+): void {
+  const reason = opts.reason ?? 'unavailable';
+  const wrapped = Boolean(opts.wrapperGeneration);
+  hookLog('on_prompt_takeover_failed', {
+    sbSlug: opts.sbSlug,
+    backend: backend.name,
+    reason,
+    wrapped,
+  });
+
+  const { cause, leaseKnownLost } = TAKEOVER_FAILURE_CAUSES[reason];
+  const possession = leaseKnownLost
+    ? 'This session does NOT hold the studio lease for this checkout.'
+    : 'Inkwell could not confirm that this session holds the studio lease for this checkout.';
+  const recovery = wrapped
+    ? 'The ink wrapper is retrying the claim in the background; this warning stops once the lease is reclaimed.'
+    : 'No background retry runs for this launch (no ink wrapper is attached); the claim is retried once when this turn ends.';
+
+  process.stderr.write(
+    `Warning: Inkwell turn takeover failed (${cause}). ${possession} ` +
+      `The prompt runs anyway; edits here are not fenced against another session. ${recovery}\n`
+  );
+  process.stdout.write(
+    '\n<ink-warning>\n' +
+      `Inkwell could not take over this turn: ${cause}.\n` +
+      `${possession} The prompt is running anyway (Inkwell never refuses a prompt over a lease), ` +
+      'but nothing fences your edits against another session that may own this worktree, and turn ' +
+      'state may not be attributed to this session.\n' +
+      'Before changing files or running commands that touch this checkout, tell the user and confirm ' +
+      'that this session should take over the studio. Do not force leases, reset credentials, or ' +
+      'restart the server.\n' +
+      `${recovery}\n` +
+      '</ink-warning>\n'
+  );
+  try {
+    opts.writePendingTakeover();
+  } catch (err) {
+    hookLog('on_prompt_takeover_marker_failed', {
+      sbSlug: opts.sbSlug,
+      error: String(err),
+    });
   }
 }
 
@@ -865,6 +1118,18 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // Shared Block Builders
 // ============================================================================
 
+/**
+ * Whether the server already put the constitution and knowledge summary in this
+ * turn's prompt.
+ *
+ * Set by the runners when they inject. Only the session-start hook honours it:
+ * post-compact must re-inject unconditionally, because compaction is exactly
+ * the event that removes the original copy.
+ */
+export function serverAlreadyInjectedContext(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.INK_CONSTITUTION_INJECTED === '1';
+}
+
 export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): string {
   const files = bootstrapResult?.identityFiles as Record<string, string> | undefined;
   if (!files) return '';
@@ -919,11 +1184,27 @@ function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): 
   return lines.join('\n');
 }
 
-function buildMemoriesBlock(memories: Array<Record<string, unknown>> | undefined): string {
-  if (!memories || memories.length === 0) return '';
+/**
+ * Render the memory block from a bootstrap result.
+ *
+ * Bootstrap returns `knowledgeSummary` — a pre-formatted, budget-constrained
+ * digest grouped by topic, critical salience first. It does NOT return
+ * `recentMemories`; reading that key silently produced an empty block, so
+ * these hooks injected no memories at all. The array branch is kept only so an
+ * older server that still sends one keeps working.
+ */
+export function buildMemoriesBlock(bootstrapResult: Record<string, unknown>): string {
+  const summary = bootstrapResult?.knowledgeSummary;
+  if (typeof summary === 'string' && summary.trim()) {
+    return `### What You Know\n${summary.trim()}`;
+  }
+
+  const memories = bootstrapResult?.recentMemories;
+  if (!Array.isArray(memories) || memories.length === 0) return '';
   const lines = ['### Recent Memories'];
-  for (const mem of memories.slice(0, 5)) {
-    lines.push(`- ${mem.content || mem.key || JSON.stringify(mem)}`);
+  for (const mem of memories as Array<Record<string, unknown>>) {
+    const salience = mem.salience ? `[${mem.salience}] ` : '';
+    lines.push(`- ${salience}${mem.summary || mem.content || mem.key || JSON.stringify(mem)}`);
   }
   return lines.join('\n');
 }
@@ -933,7 +1214,7 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
   const lines = ['### Active Sessions'];
   for (const s of sessions) {
     const id = (s.id as string)?.substring(0, 8) || 'unknown';
-    const agent = s.agentId ? ` (${s.agentId})` : '';
+    const agent = s.sbSlug ? ` (${s.sbSlug})` : '';
     const phase = s.currentPhase ? ` — phase: ${s.currentPhase}` : '';
     const lifecycle = s.lifecycle ? ` [${s.lifecycle}]` : '';
     lines.push(`- ${id}${agent}${lifecycle}${phase}`);
@@ -1053,13 +1334,6 @@ const CODEX_HOOKS_END_MARKER = '# ink-managed:hooks:end';
 // Back-compat with earlier Codex hook marker format.
 const CODEX_LEGACY_HOOKS_START_MARKER = '# ink-managed';
 const CODEX_LEGACY_HOOKS_END_MARKER = '# end ink-managed';
-const PCP_HOOK_SIGNATURES = [
-  'hooks on-session-start',
-  'hooks on-stop',
-  'hooks on-prompt',
-  'hooks pre-compact',
-  'hooks post-compact',
-];
 
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
@@ -1104,12 +1378,91 @@ function resolveSbBinaryPath(cwd: string): string {
   return 'ink';
 }
 
-/** Check if a hook command is Inkwell-managed (handles both bare `ink` and absolute paths) */
-function isPcpHookCommand(cmd: string | undefined): boolean {
+/**
+ * Split a shell command line into words, honoring single quotes, double
+ * quotes, backslash escapes, and a trailing comment. Enough to find the launcher and the hook
+ * name in a managed hook line, whichever writer produced it: this CLI
+ * (`'/nvm/bin/node' '/x/cli.js' hooks on-prompt ...`) or the server's studio
+ * settings generator (`node "/x y/cli.js" hooks on-prompt ...`).
+ */
+function splitShellWords(line: string): string[] {
+  const words: string[] = [];
+  let current = '';
+  let inWord = false;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1]))
+        current += line[++i];
+      else current += ch;
+      continue;
+    }
+    if (ch === '#' && !inWord) break; // unquoted # at a word start: the rest is a comment
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < line.length) {
+      current += line[++i];
+      inWord = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inWord) {
+        words.push(current);
+        current = '';
+        inWord = false;
+      }
+      continue;
+    }
+    current += ch;
+    inWord = true;
+  }
+  if (inWord) words.push(current);
+  return words;
+}
+
+/**
+ * Trailing shell comment that marks a hook line as Inkwell-managed. Hook
+ * commands run through a shell, so the comment is invisible to the CLI. The
+ * server's studio settings generator writes the same marker
+ * (packages/api/src/services/studio-settings.ts); the cross-package install
+ * test pins the two copies to each other.
+ */
+const MANAGED_HOOK_MARKER = '# ink-managed';
+const MANAGED_HOOK_MARKER_RE = /\s#\s?ink-managed\s*$/;
+
+/**
+ * Whether a hook command is Inkwell-managed. The line must have the managed
+ * grammar — a launcher, then `hooks`, then a hook name — and then either:
+ *
+ *   - the launcher is a known ink entrypoint by shape (bare `ink`, a path to
+ *     it, or the CLI's own cli.js), which is what `ink hooks install` writes
+ *     and what older servers wrote; or
+ *   - the line ends with the managed marker, which the server writes for
+ *     every hook because its launcher may be an arbitrary INK_CLI_PATH.
+ *
+ * No hook-name list: a hook either writer adds later must not read as a
+ * conflict. No generic launcher rule: an unrelated CLI that happens to be
+ * called cli.js, or to have a `hooks` subcommand, is someone else's and must
+ * survive an install untouched.
+ */
+export function isPcpHookCommand(cmd: string | undefined): boolean {
   if (!cmd) return false;
-  return (
-    /\bink hooks\b/.test(cmd) || PCP_HOOK_SIGNATURES.some((signature) => cmd.includes(signature))
-  );
+  const words = splitShellWords(cmd);
+  const at = words.indexOf('hooks');
+  if (at < 1) return false;
+  const hookName = words[at + 1];
+  if (!hookName || !/^[a-z][a-z0-9-]*$/.test(hookName)) return false;
+  return MANAGED_HOOK_MARKER_RE.test(cmd) || looksLikeSbEntrypoint(words[at - 1]);
 }
 
 type InstallResult = 'installed' | 'already-installed' | 'conflict';
@@ -1127,6 +1480,11 @@ function buildManagedHookCommand(sbPath: string, hookName: string, backendName: 
   return `${sbPath} hooks ${hookName} --backend ${backendName}`;
 }
 
+/** Claude Code hook line: the managed command plus the marker the recognizer keys on. */
+function buildClaudeCodeHookCommand(sbPath: string, hookName: string): string {
+  return `${buildManagedHookCommand(sbPath, hookName, CLAUDE_CODE.name)} ${MANAGED_HOOK_MARKER}`;
+}
+
 function formatHookHint(backendName: string, hookName: string): string {
   return `ink hooks ${hookName} --backend ${backendName}`;
 }
@@ -1139,7 +1497,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'pre-compact', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'pre-compact'),
             },
           ],
         },
@@ -1150,7 +1508,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'post-compact', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'post-compact'),
             },
           ],
         },
@@ -1159,7 +1517,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-session-start', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-session-start'),
             },
           ],
         },
@@ -1169,7 +1527,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-tool-approval', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-tool-approval'),
             },
           ],
         },
@@ -1179,7 +1537,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-prompt', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-prompt'),
             },
           ],
         },
@@ -1189,7 +1547,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-stop', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-stop'),
             },
           ],
         },
@@ -1759,14 +2117,14 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   const backend = resolveLifecycleBackend(cwd, options?.backend);
 
   // Only set 'compacting' lifecycle if this backend has a postCompact event
   // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
   // the lifecycle gets stuck at 'compacting' permanently.
   if (backend.events.postCompact) {
-    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting');
+    await updateRuntimeGenerationState(cwd, config, sbSlug, 'compacting', 'pre-compact');
   }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
@@ -1777,10 +2135,11 @@ async function postCompactHandler(): Promise<void> {
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
 
-  // Reset lifecycle from compacting back to idle
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  // Reset lifecycle from compacting back to idle. NOT a turn boundary —
+  // the same turn resumes after compaction (PR #492 round 4).
+  await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'post-compact');
 
   let identityBlock = '';
   let memoriesBlock = '';
@@ -1791,13 +2150,11 @@ async function postCompactHandler(): Promise<void> {
   try {
     const bootstrap = await callPcpTool('bootstrap', {
       email: config?.email,
-      agentId,
+      sbSlug,
       postCompact: true,
     });
     identityBlock = buildIdentityBlock(bootstrap);
-    memoriesBlock = buildMemoriesBlock(
-      bootstrap.recentMemories as Array<Record<string, unknown>> | undefined
-    );
+    memoriesBlock = buildMemoriesBlock(bootstrap);
   } catch {
     identityBlock =
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
@@ -1807,7 +2164,7 @@ async function postCompactHandler(): Promise<void> {
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
-      agentId,
+      sbSlug,
       limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
@@ -1829,7 +2186,7 @@ async function postCompactHandler(): Promise<void> {
 
   const template = loadTemplate('hook-post-compact');
   const output = renderTemplate(template, {
-    AGENT_ID: agentId,
+    SB_SLUG: sbSlug,
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
     SKILLS_BLOCK: skillsBlock,
@@ -1881,11 +2238,11 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   const stdin = await readStdin();
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   const resolvedBackend = resolveLifecycleBackend(cwd, options?.backend);
 
   hookLog('on_session_start', {
-    agentId,
+    sbSlug,
     backend: resolvedBackend.name,
     hasInkContextToken: !!process.env.INK_CONTEXT,
     hasInkSessionId: !!process.env.INK_SESSION_ID,
@@ -1919,15 +2276,18 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   try {
     const bootstrapArgs: Record<string, unknown> = {
       email: config?.email,
-      agentId,
+      sbSlug,
     };
     if (studioId) bootstrapArgs.studioId = studioId;
 
     const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
-    identityBlock = buildIdentityBlock(bootstrap);
-    memoriesBlock = buildMemoriesBlock(
-      bootstrap.recentMemories as Array<Record<string, unknown>> | undefined
-    );
+    // A server-spawned session already carries the constitution AND the
+    // knowledge summary in its first message (the runner sets this). Re-emitting
+    // either here duplicates several thousand tokens for no gain. Post-compact
+    // deliberately does not check this — after compaction the original is gone.
+    const serverInjected = serverAlreadyInjectedContext();
+    identityBlock = serverInjected ? '' : buildIdentityBlock(bootstrap);
+    memoriesBlock = serverInjected ? '' : buildMemoriesBlock(bootstrap);
     sessionsBlock = buildSessionsBlock(
       bootstrap.activeSessions as Array<Record<string, unknown>> | undefined
     );
@@ -1952,7 +2312,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     try {
       const createArgs: Record<string, unknown> = {
         email: config?.email,
-        agentId,
+        sbSlug,
         repoRoot: repoRoot || cwd,
         slug: studioName,
         skipGitOperations: true,
@@ -1985,7 +2345,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
-      agentId,
+      sbSlug,
       limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
@@ -2022,14 +2382,14 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     const groups = groupsResult.groups as Array<Record<string, unknown>> | undefined;
     const allActiveTasks = standaloneResult.tasks as Array<Record<string, unknown>> | undefined;
     // Standalone = assigned to this agent but not in any group.
-    // Check metadata.assignment.agentId first (set by strategy service),
+    // Check metadata.assignment.sbSlug first (set by strategy service),
     // fall back to createdBy for tasks predating assignment metadata.
     const standalone = allActiveTasks?.filter((t) => {
       if (t.taskGroupId) return false;
       const meta = t.metadata as Record<string, unknown> | undefined;
       const assignment = meta?.assignment as Record<string, unknown> | undefined;
-      if (assignment?.agentId) return assignment.agentId === agentId;
-      return t.createdBy === agentId;
+      if (assignment?.sbSlug) return assignment.sbSlug === sbSlug;
+      return t.createdBy === sbSlug;
     });
     tasksBlock = buildTasksBlock(groups, standalone);
   } catch {
@@ -2050,7 +2410,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     if (!pcpSessionId) {
       const startArgs: Record<string, unknown> = {
         email: config?.email,
-        agentId,
+        sbSlug,
         backend: sessionBackend,
       };
       if (studioId) startArgs.studioId = studioId;
@@ -2071,7 +2431,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   }
 
   const startedAt = new Date().toISOString();
-  const reconciled = await reconcileBackendSignal(cwd, config, agentId, stdin, {
+  const reconciled = await reconcileBackendSignal(cwd, config, sbSlug, stdin, {
     initialPcpSessionId: pcpSessionId,
     initialThreadKey: pcpThreadKey,
     startedAt,
@@ -2093,7 +2453,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     try {
       const updateArgs: Record<string, unknown> = {
         email: config?.email,
-        agentId,
+        sbSlug,
         sessionId: pcpSessionId,
         lifecycle: 'idle',
         workingDir: cwd,
@@ -2120,7 +2480,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   const template = loadTemplate('hook-session-start');
   const output = renderTemplate(template, {
-    AGENT_ID: agentId,
+    SB_SLUG: sbSlug,
     WORKSPACE_LINE: studioLine,
     SESSION_IDENTITY: sessionIdentityBlock,
     ROLE_BLOCK: roleBlock,
@@ -2244,11 +2604,11 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   // synthesize a minimal token from available identity info.
   let contextToken = process.env.INK_CONTEXT?.trim();
   if (!contextToken) {
-    const agentId = resolveAgentId();
-    if (agentId) {
+    const sbSlug = resolveSlug();
+    if (sbSlug) {
       const { studioId: ctxStudioId } = getIdentitySessionContext(cwd);
       contextToken = Buffer.from(
-        JSON.stringify({ agentId, studioId: ctxStudioId || 'main', cliAttached: true })
+        JSON.stringify({ sbSlug, studioId: ctxStudioId || 'main', cliAttached: true })
       ).toString('base64url');
     }
   }
@@ -2355,17 +2715,17 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   });
 
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   hookLog('on_prompt', {
-    agentId,
+    sbSlug,
     backend: lifecycleBackend.name,
   });
 
-  const reconciled = await reconcileBackendSignal(cwd, config, agentId, stdin, {
+  const reconciled = await reconcileBackendSignal(cwd, config, sbSlug, stdin, {
     hookBackend: lifecycleBackend.name,
   });
   hookLog('on_prompt_reconciled', {
-    agentId,
+    sbSlug,
     backend: lifecycleBackend.name,
     pcpSessionId: reconciled.pcpSessionId || null,
     threadKey: reconciled.threadKey || null,
@@ -2377,8 +2737,77 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     backendSessionId: reconciled.backendSessionId || null,
   });
 
-  // Mark session as actively generating at prompt start.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'running');
+  // Mark session as actively generating at prompt start. For INTERACTIVE
+  // prompts this is a turn-epoch TAKEOVER on the server; headless spawns
+  // declare themselves so the route does not rotate the epoch the server's
+  // own pre-turn write already owns (PR #563 round 6).
+  const isHeadlessSpawn = isHeadlessSession();
+  // Round 11: name our studio so the server exact-CAS-touches ITS lease and
+  // the response's held report covers the worktree this prompt runs in.
+  const { studioId: promptStudioId } = getIdentitySessionContext(cwd);
+  const takeover = await updateRuntimeGenerationState(cwd, config, sbSlug, 'running', 'prompt', {
+    headless: isHeadlessSpawn,
+    studioId: promptStudioId,
+  });
+  const takeoverOk = takeover.ok;
+  if (!takeoverOk && !isHeadlessSpawn) {
+    handleFailedTakeover(lifecycleBackend, {
+      sbSlug,
+      reason: takeover.reason,
+      wrapperGeneration: process.env.INK_RUNTIME_LINK_ID || undefined,
+      writePendingTakeover: () => {
+        const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);
+        mkdirSync(dirname(markerPath), { recursive: true });
+        writeFileSync(
+          markerPath,
+          JSON.stringify({
+            sessionId: resolveActivePcpSessionId(cwd),
+            sbSlug,
+            at: new Date().toISOString(),
+            // Round 21: a FRESH attempt token — the fence is per attempt,
+            // so abandoning this one never refuses a later prompt.
+            attemptId: randomUUID(),
+            // Round 18: bind the marker to the wrapper that spawned this
+            // backend — a stale wrapper on the same session must neither
+            // claim nor retire a successor's marker.
+            ...(process.env.INK_RUNTIME_LINK_ID
+              ? { wrapperGeneration: process.env.INK_RUNTIME_LINK_ID }
+              : {}),
+          })
+        );
+      },
+    });
+  } else if (takeoverOk && !isHeadlessSpawn) {
+    // A successful takeover supersedes any marker from an earlier failed
+    // prompt — the recovery it described is no longer this generation's.
+    try {
+      rmSync(pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID), { force: true });
+    } catch {
+      // Best-effort cleanup.
+    }
+    // Round 10: persist the claimed epoch so the on-stop hook can identify
+    // the turn it is ending — the lease boundary fences on it.
+    const claimedSessionId = resolveActivePcpSessionId(cwd);
+    if (takeover.turnEpoch && claimedSessionId) {
+      const recorded = writeCliTurnEpoch(cwd, {
+        sessionId: claimedSessionId,
+        turnEpoch: takeover.turnEpoch,
+        ...(process.env.INK_RUNTIME_LINK_ID
+          ? { wrapperGeneration: process.env.INK_RUNTIME_LINK_ID }
+          : {}),
+      });
+      if (!recorded) {
+        // Round 11: a lost record is LOUD, not silent. Safety does not
+        // depend on this write — the modern on-stop sends `turnEpochMissing`
+        // when no record exists and the server fails closed (suppresses
+        // destructive boundary releases). Blocking here instead would strand
+        // the row running under the committed claim with no process behind
+        // it — the exact zombie class this PR removes.
+        hookLog('on_prompt_epoch_record_failed', { sbSlug, sessionId: claimedSessionId });
+        sbDebugLog('hooks', 'epoch_record_write_failed', { sessionId: claimedSessionId });
+      }
+    }
+  }
 
   // Mark session as CLI-attached (human present at REPL).
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
@@ -2388,7 +2817,6 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // IMPORTANT: headless/autonomous spawns set cliAttached=false in INK_CONTEXT.
   // Respect that — unconditionally setting true blocks all future strategy
   // triggers for the session (they see "CLI-attached" and skip spawn).
-  const isHeadlessSpawn = isHeadlessSession();
   if (isHeadlessSpawn && reconciled.pcpSessionId) {
     // Explicitly clear cli_attached for headless spawns. A previous interactive
     // session may have set it to true on this same PCP session; if we just skip,
@@ -2408,14 +2836,14 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         signal: AbortSignal.timeout(5000),
       });
       hookLog('cli_attached_cleared', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
         sessionId: reconciled.pcpSessionId,
       });
     } catch (err) {
       hookLog('cli_attached_clear_failed', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         sessionId: reconciled.pcpSessionId,
         error: err instanceof Error ? err.message : String(err),
@@ -2423,7 +2851,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
   } else if (isHeadlessSpawn) {
     hookLog('cli_attached_skipped', {
-      agentId,
+      sbSlug,
       backend: lifecycleBackend.name,
       reason: 'headless spawn, no pcpSessionId',
       sessionId: null,
@@ -2444,7 +2872,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         signal: AbortSignal.timeout(5000),
       });
       hookLog('cli_attached_set', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         sessionId: reconciled.pcpSessionId,
         status: lifecycleResp.status,
@@ -2452,7 +2880,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       });
     } catch (err) {
       hookLog('cli_attached_failed', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         sessionId: reconciled.pcpSessionId,
         error: err instanceof Error ? err.message : String(err),
@@ -2460,7 +2888,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
   } else {
     hookLog('cli_attached_skipped', {
-      agentId,
+      sbSlug,
       backend: lifecycleBackend.name,
       reason: 'no pcpSessionId',
       backendSessionId: reconciled.backendSessionId || null,
@@ -2509,7 +2937,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
-      agentId,
+      sbSlug,
       since: lastCheck || undefined,
     });
 
@@ -2528,12 +2956,13 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
 async function onStopHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
+
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
 
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   hookLog('on_stop', {
-    agentId,
+    sbSlug,
     backend: lifecycleBackend.name,
   });
   sbDebugLog('hooks', 'on_stop_begin', {
@@ -2542,7 +2971,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   });
 
   const parts: string[] = [];
-  const reconciled = await reconcileBackendSignal(cwd, config, agentId, stdin, {
+  const reconciled = await reconcileBackendSignal(cwd, config, sbSlug, stdin, {
     hookBackend: lifecycleBackend.name,
   });
   sbDebugLog('hooks', 'on_stop_reconciled', {
@@ -2551,8 +2980,124 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     backendSessionId: reconciled.backendSessionId || null,
   });
 
-  // Mark session as idle after each completed backend turn.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  // Mark session as idle after each completed backend turn. Round 10: the
+  // stop carries the epoch its prompt claimed (from the epoch record) so the
+  // server's lease boundary can fence on the turn actually ending; the
+  // record is scoped to OUR session — a foreign session's record is neither
+  // sent nor cleared. Round 11: a modern stop with NO record admits it
+  // (`turnEpochMissing`) rather than masquerading as a legacy sender — the
+  // server suppresses destructive boundary releases instead of running them
+  // unfenced (fail closed on degraded local state).
+  const stopSessionId = resolveActivePcpSessionId(cwd);
+  const stopGeneration = process.env.INK_RUNTIME_LINK_ID;
+  // Round 21: ADJUDICATE our own marker HERE, synchronously — fs.watch
+  // delivery is lossy under load and a short turn can end before any
+  // watcher tick, but this hook CAN await. A marker still standing means
+  // the prompt's takeover failed and was never reclaimed: reclaim it now
+  // (the claim's fences arbitrate) and close the turn with the fresh
+  // epoch; a refused attempt is handed to the fence instead.
+  const ownMarkerPath = pendingTakeoverMarkerPath(cwd, stopGeneration);
+  let adjudicatedEpoch: string | undefined;
+  let adjudicationLeaseLost = false;
+  const abandonedAttempts: string[] = [];
+  try {
+    const rawMarker = JSON.parse(readFileSync(ownMarkerPath, 'utf-8')) as {
+      sessionId?: string;
+      at?: string;
+      attemptId?: string;
+    };
+    if (rawMarker.sessionId && rawMarker.sessionId === stopSessionId && rawMarker.at) {
+      // Round 22: the adjudicating reclaim names our STUDIO — without it
+      // the claim skips the lease/revocation boundary entirely, and a
+      // short turn whose lease was revoked would be accepted at stop.
+      const { studioId: stopStudioId } = getIdentitySessionContext(cwd);
+      const reclaim = await updateRuntimeGenerationState(cwd, config, sbSlug, 'running', 'prompt', {
+        reclaimOf: rawMarker.at,
+        ...(rawMarker.attemptId ? { attemptId: rawMarker.attemptId } : {}),
+        studioId: stopStudioId,
+      });
+      if (reclaim.ok && reclaim.turnEpoch) {
+        adjudicatedEpoch = reclaim.turnEpoch;
+      } else {
+        if (rawMarker.attemptId) abandonedAttempts.push(rawMarker.attemptId);
+        if (reclaim.leaseLost) adjudicationLeaseLost = true;
+      }
+    }
+    // Round 22: the marker is NOT deleted here — evidence survives until
+    // the terminal stop below is ACKNOWLEDGED.
+  } catch {
+    // No marker (the normal case) or unreadable — nothing to adjudicate.
+  }
+  const epochRecord = readCliTurnEpoch(cwd);
+  // Round 19: the record must belong to OUR session AND OUR wrapper
+  // generation — a stale backend's on-stop must not send (and then clear) a
+  // successor generation's epoch. Generation-less pairs still match (legacy).
+  // Round 20: EXACT generation match — a legacy (generation-less) stop must
+  // not consume a modern generation's record, nor vice versa. Only a
+  // fully-legacy pair (both sides generation-less) still matches.
+  const recordIsOurs =
+    Boolean(stopSessionId) &&
+    epochRecord != null &&
+    epochRecord.sessionId === stopSessionId &&
+    (epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined);
+  const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);
+  const stopResult = await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'stop', {
+    ...(stopEpoch
+      ? { turnEpoch: stopEpoch }
+      : {
+          turnEpochMissing: true,
+          // Round 21: fence exactly the attempts this stop abandons.
+          fenceAttempts: abandonedAttempts,
+        }),
+  });
+  if (stopResult.ok) {
+    // The boundary is ACKNOWLEDGED: local evidence retires with it.
+    try {
+      rmSync(ownMarkerPath, { force: true });
+    } catch {
+      // Best-effort.
+    }
+    // Compare-and-delete: only the exact record we sent retires — a record
+    // replaced during the awaited request belongs to its replacer.
+    if (stopSessionId && recordIsOurs && epochRecord != null) {
+      clearCliTurnEpoch(cwd, stopSessionId, {
+        turnEpoch: epochRecord.turnEpoch,
+        wrapperGeneration: epochRecord.wrapperGeneration,
+      });
+    }
+  } else {
+    // Round 22: the stop was NOT acknowledged. A reclaim may have COMMITTED
+    // (row running under adjudicatedEpoch) — persist the epoch record so a
+    // later actor (the wrapper's scope-end finalize, the next stop) can
+    // close it, and keep the marker as evidence. Never delete what the
+    // server has not confirmed.
+    if (adjudicatedEpoch && stopSessionId) {
+      writeCliTurnEpoch(cwd, {
+        sessionId: stopSessionId,
+        turnEpoch: adjudicatedEpoch,
+        ...(stopGeneration ? { wrapperGeneration: stopGeneration } : {}),
+      });
+    }
+    hookLog('on_stop_unacknowledged', {
+      sbSlug,
+      sessionId: stopSessionId ?? null,
+      adjudicatedEpoch: adjudicatedEpoch ?? null,
+    });
+    sbDebugLog('hooks', 'stop_unacknowledged', {
+      sessionId: stopSessionId,
+      adjudicatedEpoch,
+    });
+  }
+  if (adjudicationLeaseLost) {
+    // Round 23: the turn ran in a worktree whose lease was REVOKED — the
+    // fence has retired the attempt, but the failure must be ENFORCED, not
+    // absorbed: a clean exit here would report a corrupted-context turn as
+    // success.
+    console.error(
+      'ink: this turn ran without its worktree lease (revoked or lost); reporting failure.'
+    );
+    process.exitCode = 1;
+  }
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');
@@ -2586,7 +3131,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     try {
       const inbox = await callPcpTool('get_inbox', {
         email: config?.email,
-        agentId,
+        sbSlug,
         since: lastCheck || undefined,
       });
 

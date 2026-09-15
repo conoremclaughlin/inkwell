@@ -20,11 +20,13 @@ import type {
   IRunner,
   ToolCall,
   MediaAttachment,
+  ModelUsageTotals,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { resolveInkCli, inkCliSpawn } from '../ink-cli.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
 // Absolute wall-clock backstop for a single ink turn — a final safety net for a
@@ -32,8 +34,63 @@ import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '
 // can't distinguish a turn that's still legitimately working from a hung one,
 // so it sits far above any realistic turn. The primary guard is the inactivity
 // timeout below. Override with INK_PROCESS_TIMEOUT_MS.
+//
+// 4 hours: agents doing real multi-step work on the user's behalf can run a
+// long time — the goal is to keep going wherever possible, not to reap eagerly.
 export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
+  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 4 * 60 * 60 * 1000;
+
+// Continuation-loop turn cap when the SB's dashboard settings don't specify
+// one (agent_identities.metadata.runtimeConfig.maxTurns). Deliberately modest:
+// signal_status is the sanctioned in-loop halt, so this only bounds runaway
+// continuations — and each extra turn is a full provider spawn.
+export const DEFAULT_MAX_TURNS = 5;
+
+/** Clamp a dashboard-supplied turn cap to a sane range; default when absent. */
+/**
+ * Map the ink result line's per-model block. Keys stay exactly as reported —
+ * grouping (e.g. by canonicalModel) belongs to the reporting layer, not here.
+ *
+ * Exported for tests.
+ */
+export function parseInkModelUsage(raw: unknown): Record<string, ModelUsageTotals> | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const out: Record<string, ModelUsageTotals> = {};
+  for (const [model, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') continue;
+    const entry = value as Record<string, unknown>;
+    const numeric = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    const fields = {
+      inputTokens: numeric(entry.inputTokens),
+      outputTokens: numeric(entry.outputTokens),
+      cacheReadTokens: numeric(entry.cacheReadTokens),
+      cacheWriteTokens: numeric(entry.cacheWriteTokens),
+      costUSD: numeric(entry.costUSD),
+    };
+    // Unreadable entries stay absent rather than becoming zeros — a zero cost
+    // reads as measured, and "we don't know" is the honest value.
+    if (Object.values(fields).every((v) => v === undefined)) continue;
+    out[model] = {
+      inputTokens: fields.inputTokens ?? 0,
+      outputTokens: fields.outputTokens ?? 0,
+      cacheReadTokens: fields.cacheReadTokens ?? 0,
+      cacheWriteTokens: fields.cacheWriteTokens ?? 0,
+      ...(fields.costUSD !== undefined ? { costUSD: fields.costUSD } : {}),
+      // The CLI already knows whether its per-run figure is complete — it saw
+      // every invocation. Dropping the marker here silently promoted a lower
+      // bound back to a total at the process boundary (Lumen, PR #500 round 4).
+      ...(entry.costPartial === true ? { costPartial: true } : {}),
+      ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+export function clampMaxTurns(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_MAX_TURNS;
+  return Math.min(25, Math.max(1, Math.round(value)));
+}
 
 // Inactivity timeout — the primary liveness guard. The countdown resets on any
 // stdout/stderr activity from the ink subprocess. A working turn emits a steady
@@ -43,18 +100,19 @@ export const PROCESS_TIMEOUT_MS =
 // stalled, network dead, wedged) goes silent and is reaped here, ~12x faster
 // than the absolute backstop.
 //
-// The window must exceed the longest *legitimate* silent gap:
-//   1. Buffered LLM generation — no token stream, so a single generation emits
-//      nothing until it completes (typically 40-55s, sometimes minutes).
-//   2. Away-mode approval polling — requestToolApproval polls silently for up to
-//      300s (DEFAULT_TIMEOUT_SECONDS in approval-api.ts). No stdout/stderr during
-//      the wait. The inactivity window must clear this with margin, or it races
-//      the approval timeout and SIGTERMs the process mid-approval.
+// The window must exceed the longest *legitimate* silent gap. With the ink
+// claude adapter now on stream-json, a turn emits events continuously while it
+// works, so the old buffered-generation silent gap is gone — the only remaining
+// silent gap is away-mode approval polling (requestToolApproval polls silently
+// for up to 300s, DEFAULT_TIMEOUT_SECONDS in approval-api.ts).
 //
-// 7 minutes (420s) clears the 300s approval window with 2 minutes of headroom.
+// 1 hour: deliberately generous. A working turn keeps resetting this the whole
+// time (a 40-minute download or a long research task never trips it); the window
+// only bites a genuinely wedged process, and we'd rather let real work finish
+// than reap it early. Clears the 300s approval poll with enormous margin.
 // Override with INK_INACTIVITY_TIMEOUT_MS.
 export const INACTIVITY_TIMEOUT_MS =
-  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 7 * 60 * 1000;
+  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
 
 // stderr substrings that mark a model-provider stall (vs. local work) — the same
 // family the trigger-retry classifier keys on. Logged when an idle turn is
@@ -72,6 +130,13 @@ const PROVIDER_STALL_SIGNATURES = [
 /** Max --attach-file args forwarded per spawn (matches the channel-side media cap) */
 const MAX_ATTACHMENT_ARGS = 10;
 
+/**
+ * Emitted by `ink chat --require-bootstrap` when it refuses to answer without
+ * identity context. Duplicated as a literal in packages/cli chat.ts — the two
+ * processes share no module, so the string itself is the contract.
+ */
+export const BOOTSTRAP_REQUIRED_EXIT_MARKER = 'INK_BOOTSTRAP_REQUIRED_FAILURE';
+
 export class InkRunner implements IRunner {
   async run(
     message: string,
@@ -87,54 +152,121 @@ export class InkRunner implements IRunner {
     const isResume = !!backendSessionId;
     const sessionId = config.pcpSessionId || backendSessionId || randomUUID();
 
-    let fullMessage = message;
-    if (injectedContext && !isResume) {
-      const contextBlock = formatInjectedContext(injectedContext);
-      fullMessage = `${contextBlock}\n\n---\n\n${message}`;
-    }
+    // Two things can go wrong that we can do something about: the child refuses
+    // to answer without identity context, and a resume finds no local session.
+    // They compose in either order, and each was previously handled by its own
+    // nested spawn whose result nothing re-examined — a refusal on the inner
+    // spawn was reported as a successful turn with no response at all.
+    //
+    // So there is one attempt loop instead. Every result, first or last, goes
+    // through the same checks, and each recovery may be applied once.
+    let suppliedContext = false;
+    let freshAfterFailedResume = false;
+    let usedContextFallback = false;
+    let resetAfterFailedResume = false;
 
-    const args = this.buildArgs(sessionId, config, mediaAttachments);
+    const composeMessage = (): string => {
+      if (!injectedContext) return message;
 
-    logger.info('Spawning ink chat (non-interactive)', {
-      sessionId,
-      pcpSessionId: config.pcpSessionId,
-      isResume,
-      workingDirectory: config.workingDirectory,
-      messageLength: fullMessage.length,
-    });
+      // The child normally loads all of this itself. We only carry it when its
+      // own bootstrap has failed — and then it is the sole delivery, so it
+      // includes soul, which no appendSystemPrompt reaches this runner with.
+      if (suppliedContext) {
+        const block = formatInjectedContext(injectedContext, { includeSoul: true });
+        return `${block}\n\n---\n\n${message}`;
+      }
+
+      // Lean. A resumed prompt carries nothing; a fresh one carries only what
+      // bootstrap cannot know.
+      if (isResume && !freshAfterFailedResume) return message;
+
+      const block = formatInjectedContext(injectedContext, { childCallsBootstrap: true });
+      return `${block}\n\n---\n\n${message}`;
+    };
+
+    const noContextFailure = (): RunnerResult => {
+      logger.error('ink chat has no identity context and none to supply', {
+        sessionId,
+        pcpSessionId: config.pcpSessionId,
+      });
+      return {
+        success: false,
+        backendSessionId: sessionId,
+        responses: [],
+        error: 'ink chat could not load identity context and none was available to supply',
+      };
+    };
 
     try {
-      const result = await this.spawnProcess(args, fullMessage, config);
-
-      if (result.resumeFailedNoSession && isResume) {
-        logger.warn('Resume failed - session not found locally. Starting fresh session.', {
-          oldSessionId: sessionId,
+      // Bounded by the two recoveries plus one final attempt.
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const fullMessage = composeMessage();
+        const args = this.buildArgs(sessionId, config, mediaAttachments, {
+          // Demanded on every server-spawned turn, resumes included: each run
+          // is a brand-new `ink chat` that bootstraps from scratch. Dropped
+          // only once we are the ones supplying the context.
+          requireBootstrap: !suppliedContext,
         });
 
-        if (injectedContext) {
-          const contextBlock = formatInjectedContext(injectedContext);
-          fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+        logger.info('Spawning ink chat (non-interactive)', {
+          sessionId,
+          pcpSessionId: config.pcpSessionId,
+          isResume,
+          attempt,
+          suppliedContext,
+          workingDirectory: config.workingDirectory,
+          messageLength: fullMessage.length,
+        });
+
+        const result = await this.spawnProcess(args, fullMessage, config);
+
+        if (result.bootstrapRequiredFailure) {
+          if (usedContextFallback || !injectedContext) return noContextFailure();
+          logger.warn('ink chat could not load identity context; retrying with server copy', {
+            sessionId,
+            pcpSessionId: config.pcpSessionId,
+            attempt,
+          });
+          usedContextFallback = true;
+          suppliedContext = true;
+          continue;
         }
 
-        const freshArgs = this.buildArgs(sessionId, config, mediaAttachments);
-        const retryResult = await this.spawnProcess(freshArgs, fullMessage, config);
+        if (result.resumeFailedNoSession && isResume) {
+          if (resetAfterFailedResume) {
+            return {
+              success: false,
+              backendSessionId: sessionId,
+              responses: [],
+              error: 'ink chat could not resume or start a session',
+            };
+          }
+          logger.warn('Resume failed - session not found locally. Starting fresh session.', {
+            oldSessionId: sessionId,
+            attempt,
+          });
+          resetAfterFailedResume = true;
+          freshAfterFailedResume = true;
+          continue;
+        }
+
         return {
           success: true,
           backendSessionId: sessionId,
-          responses: retryResult.responses,
-          usage: retryResult.usage,
-          finalTextResponse: retryResult.finalTextResponse,
-          toolCalls: retryResult.toolCalls,
+          responses: result.responses,
+          usage: result.usage,
+          servedModel: result.servedModel,
+          finalTextResponse: result.finalTextResponse,
+          toolCalls: result.toolCalls,
         };
       }
 
+      // Both recoveries applied and the last attempt still asked for another.
       return {
-        success: true,
+        success: false,
         backendSessionId: sessionId,
-        responses: result.responses,
-        usage: result.usage,
-        finalTextResponse: result.finalTextResponse,
-        toolCalls: result.toolCalls,
+        responses: [],
+        error: 'ink chat exhausted its recovery attempts',
       };
     } catch (error) {
       logger.error('ink chat process failed', {
@@ -153,12 +285,20 @@ export class InkRunner implements IRunner {
   private buildArgs(
     sessionId: string,
     config: ClaudeRunnerConfig,
-    mediaAttachments?: MediaAttachment[]
+    mediaAttachments?: MediaAttachment[],
+    options: { requireBootstrap?: boolean } = {}
   ): string[] {
     const args: string[] = ['chat', '--non-interactive'];
 
-    if (config.agentId) {
-      args.push('--agent', config.agentId);
+    // We omit the constitution from the prompt because this child loads its
+    // own. Demand that it actually did: without this the child warns and
+    // answers as a stranger, and we would record that as a successful turn.
+    if (options.requireBootstrap) {
+      args.push('--require-bootstrap');
+    }
+
+    if (config.sbSlug) {
+      args.push('--agent', config.sbSlug);
     }
 
     args.push('--session-id', sessionId);
@@ -166,10 +306,22 @@ export class InkRunner implements IRunner {
     if (config.model) {
       args.push('--model', config.model);
     }
+    if (config.effort) {
+      args.push('--effort', config.effort);
+    }
 
     // Turn backstop only — the real limit is the CLI's token budget
     // (200K default), which auto-compacts the transcript when approached.
-    args.push('--max-turns', '15');
+    // Per-SB tunable from the dashboard (runtimeConfig.maxTurns); the chat
+    // loop halts earlier when the model signals completion via signal_status.
+    args.push('--max-turns', String(clampMaxTurns(config.maxTurns)));
+
+    // Tool routing is ALWAYS explicit for server spawns — the headless
+    // boundary must not depend on worktree .ink/identity.json preferences or
+    // the chat loop's own defaults. session-service resolves the SB's
+    // dashboard setting (runtimeConfig.toolRouting) and fails closed to
+    // 'local' (ink-owned, provider withheld).
+    args.push('--tool-routing', config.toolRouting ?? 'local');
 
     // Use the safe profile with away mode for non-interactive spawns.
     // Safe profile allows read tools freely but requires approval for
@@ -202,18 +354,34 @@ export class InkRunner implements IRunner {
     config: ClaudeRunnerConfig
   ): Promise<{
     responses: ChannelResponse[];
-    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    usage?: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      modelUsage?: Record<string, ModelUsageTotals>;
+    };
+    servedModel?: string;
     resumeFailedNoSession?: boolean;
+    bootstrapRequiredFailure?: boolean;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
   }> {
-    const inkBin = await resolveBinaryPath('ink');
+    // This checkout's own CLI (or INK_CLI_PATH), run through this server's
+    // node. Never the global link. Only a checkout with no CLI build falls
+    // back to whatever `ink` the server's PATH provides.
+    const ownCli = resolveInkCli();
+    const launch = ownCli
+      ? inkCliSpawn(ownCli)
+      : { command: await resolveBinaryPath('ink'), args: [] as string[] };
+    const inkBin = launch.command;
 
     if (config.pcpSessionId && config.workingDirectory) {
       writeRuntimeSessionHint(
         config.workingDirectory,
         config.pcpSessionId,
-        config.agentId || 'unknown',
+        config.sbSlug || 'unknown',
         'ink',
         randomUUID(),
         config.studioId
@@ -231,20 +399,21 @@ export class InkRunner implements IRunner {
         : null;
 
     // Pass --message via args (not stdin) so ink chat gets it directly
-    const fullArgs = [...args, '--message', message];
+    const fullArgs = [...launch.args, ...args, '--message', message];
 
     const spawnPath = buildSpawnPath(inkBin);
     const sessionEnv = buildSessionEnv({
       pcpSessionId: config.pcpSessionId,
       studioId: config.studioId,
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
     });
 
     const env: Record<string, string> = {
       ...process.env,
       ...sessionEnv,
       PATH: spawnPath,
-      AGENT_ID: config.agentId || '',
+      SB_SLUG: config.sbSlug || '',
+      AGENT_ID: config.sbSlug || '',
       // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
       NODE_ENV: 'production',
       // Server-minted access token so the ink CLI's PcpClient can call /mcp
@@ -302,11 +471,24 @@ export class InkRunner implements IRunner {
             typeof evt === 'object' &&
             typeof (evt as { type?: unknown }).type === 'string'
           ) {
-            sessionEventBus.publish(
-              config.pcpSessionId,
-              (evt as { type: string }).type,
-              evt as Record<string, unknown>
-            );
+            const typed = evt as { type: string } & Record<string, unknown>;
+            if (typed.type === 'obs' && typed.entry && typeof typed.entry === 'object') {
+              // Canonical ledger entry (spec:observer-attach §4.2) — the exact
+              // appended transcript object, ledger eid included. Publish on the
+              // observer channel, preserving the eid; the bus never mints one.
+              sessionEventBus.publishObserverEntry(
+                config.pcpSessionId,
+                typed.entry as import('./session-event-bus.js').ObserverEntry
+              );
+            } else if (typed.type === 'session_meta') {
+              // The runtime announces its own ledger location at startup —
+              // the server-owned locator for durable observer replay.
+              if (typeof typed.transcriptPath === 'string') {
+                sessionEventBus.registerLedgerPath(config.pcpSessionId, typed.transcriptPath);
+              }
+            } else {
+              sessionEventBus.publish(config.pcpSessionId, typed.type, typed);
+            }
           }
         }
       };
@@ -372,9 +554,26 @@ export class InkRunner implements IRunner {
         mcpInjection?.cleanup();
         // Turn over: the buffered tail now describes a COMPLETED turn, so drop
         // it. A later idle attach must not replay it as live activity.
-        if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
+        if (config.pcpSessionId) {
+          sessionEventBus.clearReplay(config.pcpSessionId);
+          // Observer channel: start the retention window; observers detach
+          // after it unless a new turn re-registers the session. The durable
+          // ledger remains the replay source regardless.
+          sessionEventBus.releaseObserverSession(config.pcpSessionId);
+        }
 
         if (code !== 0) {
+          // The child refused to answer without identity context. Recoverable:
+          // the server holds that context and can supply it directly.
+          if (stderr.includes(BOOTSTRAP_REQUIRED_EXIT_MARKER)) {
+            resolve({
+              responses: [],
+              bootstrapRequiredFailure: true,
+              toolCalls: [],
+            });
+            return;
+          }
+
           // Check for resume failure
           if (stderr.includes('session not found') || stderr.includes('No such session')) {
             resolve({
@@ -410,7 +609,15 @@ export class InkRunner implements IRunner {
     _stderr: string
   ): {
     responses: ChannelResponse[];
-    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    usage?: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      modelUsage?: Record<string, ModelUsageTotals>;
+    };
+    servedModel?: string;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
   } {
@@ -420,7 +627,17 @@ export class InkRunner implements IRunner {
     let exitPhase: string | undefined;
     let exitSignal: string | undefined;
     let exitReason: string | undefined;
-    let usage: { contextTokens: number; inputTokens: number; outputTokens: number } | undefined;
+    let usage:
+      | {
+          contextTokens: number;
+          inputTokens: number;
+          outputTokens: number;
+          cacheReadTokens?: number;
+          cacheWriteTokens?: number;
+          modelUsage?: Record<string, ModelUsageTotals>;
+        }
+      | undefined;
+    let servedModel: string | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
     // CLI chrome, status lines, or other noise that must NOT be treated as
@@ -457,11 +674,28 @@ export class InkRunner implements IRunner {
           // Without this, sessions report contextTokens=0 and token-based
           // lifecycle decisions never fire for the ink backend.
           if (parsed.usage && typeof parsed.usage === 'object') {
+            // The CLI reports fresh input and the cache split separately;
+            // input is their sum, since cached tokens are still input that
+            // was sent and billed. Older ink builds omit the cache fields —
+            // those degrade to the previous fresh-only figure rather than
+            // failing.
+            const cacheReadTokens = Number(parsed.usage.cacheReadTokens) || 0;
+            const cacheWriteTokens = Number(parsed.usage.cacheWriteTokens) || 0;
+            // Per-model breakdown with the backend's own costUSD. Older ink
+            // builds omit it; the field is simply absent then, never faked.
+            const modelUsage = parseInkModelUsage(parsed.modelUsage);
             usage = {
               contextTokens: Number(parsed.usage.contextTokens) || 0,
-              inputTokens: Number(parsed.usage.inputTokens) || 0,
+              inputTokens:
+                (Number(parsed.usage.inputTokens) || 0) + cacheReadTokens + cacheWriteTokens,
               outputTokens: Number(parsed.usage.outputTokens) || 0,
+              cacheReadTokens,
+              cacheWriteTokens,
+              ...(modelUsage ? { modelUsage } : {}),
             };
+          }
+          if (typeof parsed.model === 'string' && parsed.model.trim()) {
+            servedModel = parsed.model.trim();
           }
         }
       } catch {
@@ -484,6 +718,7 @@ export class InkRunner implements IRunner {
     return {
       responses,
       usage,
+      servedModel,
       finalTextResponse,
       toolCalls,
     };

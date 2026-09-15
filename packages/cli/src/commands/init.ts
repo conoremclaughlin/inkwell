@@ -17,6 +17,7 @@ import { installHooks } from './hooks.js';
 import { syncMcpConfig } from './mcp.js';
 import { syncSkills } from './skills.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
+import { resolveChannelPluginPath } from '../lib/skill-mcp.js';
 
 // ============================================================================
 // Helpers
@@ -41,18 +42,6 @@ function getPcpConfig(): PcpConfig | null {
 
 function getPcpServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
-}
-
-function resolveChannelPluginPath(cwd: string): string | null {
-  // Look for the channel plugin relative to the repo root
-  const candidates = [
-    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
-    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return null;
 }
 
 function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, unknown> {
@@ -215,8 +204,16 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
     console.log(chalk.yellow('  Run `ink auth login` to authenticate.'));
   } else {
     console.log(chalk.yellow('  Not authenticated. Run: ink auth login'));
+    console.log(
+      chalk.dim('  No account yet? Same command — the page it opens has a sign-up link.')
+    );
   }
   console.log('');
+
+  // Whether the repo steps below are worth anything. They all succeed without
+  // auth, which is how `ink init` used to print a wall of green ticks and then
+  // let the very next command fail — the shape of issue #331.
+  const authenticated = Boolean(auth && !isTokenExpired(auth));
 
   const steps: InitStepResult[] = [
     ensurePcpDir(cwd),
@@ -264,7 +261,26 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
     console.log(`  ${icon} ${step.label}: ${statusText}${detail}`);
   }
 
-  console.log(chalk.dim('\nDone.'));
+  if (authenticated) {
+    console.log(chalk.dim('\nDone.'));
+    console.log(
+      chalk.dim('Next: ') + chalk.cyan('ink awaken') + chalk.dim(' to meet your first SB.')
+    );
+    return;
+  }
+
+  // Deliberately not "Done." — the repo is set up but unusable until there is
+  // an account behind it, and reporting unqualified success here is what sent
+  // the reporter of #331 one command further before anything told them.
+  console.log(chalk.yellow('\nRepo is set up, but Inkwell is not signed in yet.'));
+  console.log(chalk.dim('  Nothing above talks to the server until you authenticate.'));
+  console.log(
+    chalk.dim('  Next: ') +
+      chalk.cyan('ink auth login') +
+      chalk.dim(', then ') +
+      chalk.cyan('ink awaken')
+  );
+  process.exitCode = 1;
 }
 
 // ============================================================================

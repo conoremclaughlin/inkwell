@@ -1,4 +1,9 @@
 /**
+ * DEPRECATED FOR NOW — see DEPRECATED_BACKENDS in ./index.ts. The Gemini CLI
+ * requires an enterprise plan; the adapter is kept so existing transcripts and
+ * configs still resolve, and selecting it warns once per process.
+ */
+/**
  * Gemini CLI Backend Adapter
  *
  * Identity injection via GEMINI_SYSTEM_MD=<tmpfile> env var
@@ -10,7 +15,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir, homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
@@ -47,8 +52,9 @@ function buildGeminiSettings(
     }
   }
 
-  // Merge Inkwell auth + session headers — prefer 'inkwell', fall back to 'pcp'
-  const serverKey = mcpServers.inkwell ? 'inkwell' : mcpServers.pcp ? 'pcp' : 'inkwell';
+  // Merge Inkwell auth + session headers into the canonical 'inkwell' server.
+  // The legacy 'pcp' server name is retired — never target or create it.
+  const serverKey = 'inkwell';
   const serverConfig = (mcpServers[serverKey] || {}) as Record<string, unknown>;
   const existingHeaders = (serverConfig.headers || {}) as Record<string, string>;
   mcpServers[serverKey] = {
@@ -87,9 +93,15 @@ function buildGeminiSettings(
 export class GeminiAdapter implements BackendAdapter {
   readonly name = 'gemini';
   readonly binary = 'gemini';
+  // Prompt rides argv (`-p <prompt>`) — bounded by OS ARG_MAX.
+  readonly promptTransport = 'argv' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
-    const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(config.agentId);
+    const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(
+      config.sbSlug,
+      undefined,
+      config.systemPromptOverride
+    );
 
     const args: string[] = [];
 
@@ -116,6 +128,17 @@ export class GeminiAdapter implements BackendAdapter {
       args.push('--yolo');
     }
 
+    // Ephemeral-studio root (spec:studio-materialization v8): Gemini's
+    // workspace-grant equivalent of --add-dir, so studios minted mid-session
+    // stay editable. Created if missing.
+    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    try {
+      mkdirSync(inkStudiosDir, { recursive: true });
+    } catch {
+      // Non-fatal — worst case the grant is a no-op until the dir exists.
+    }
+    args.push('--include-directories', inkStudiosDir);
+
     // Passthrough flags
     args.push(...config.passthroughArgs);
 
@@ -123,7 +146,7 @@ export class GeminiAdapter implements BackendAdapter {
     const contextToken = encodeContextToken({
       sessionId: config.pcpSessionId || '',
       studioId: config.studioId || '',
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       cliAttached: true,
       runtime: 'gemini',
     });
@@ -146,7 +169,8 @@ export class GeminiAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
-        AGENT_ID: config.agentId,
+        SB_SLUG: config.sbSlug,
+        AGENT_ID: config.sbSlug,
         GEMINI_SYSTEM_MD: promptFile,
         INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),

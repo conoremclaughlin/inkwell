@@ -10,17 +10,25 @@ import type { DataComposer } from '../../data/composer';
 import type { TaskStatus, TaskPriority } from '../../data/repositories/project-tasks.repository';
 import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
-import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
-import { getRequestContext } from '../../utils/request-context';
+import { resolveUser, type UserIdentifier, type ResolvedUser } from '../../services/user-resolver';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { getRequestContext, getSessionContext } from '../../utils/request-context';
+import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
+import { isBareDate, resolveDueDate, InvalidDueDateError } from '../../utils/due-date';
 import { logger } from '../../utils/logger';
+import { resolveSbId } from '../../auth/resolve-identity';
+
+export const DUE_DATE_DESCRIPTION =
+  'Deadline. Bare YYYY-MM-DD (e.g. "2026-09-14") resolves to the end of that day in the ' +
+  "user's timezone, so the task is not overdue until the day has passed. A full ISO 8601 " +
+  'timestamp (e.g. "2026-09-14T17:00:00-07:00") is stored exactly as given.';
 
 // Common user identifier schema
 // Usually unnecessary — userId and email are auto-resolved from OAuth token.
 const userIdentifierSchema = z.object({
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -44,14 +52,15 @@ const userIdentifierSchema = z.object({
 
 export const createTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().optional().describe('Project ID to add the task to'),
-  taskGroupId: z.string().uuid().optional().describe('Task group ID to add the task to'),
+  projectId: z.string().guid().optional().describe('Project ID to add the task to'),
+  taskGroupId: z.string().guid().optional().describe('Task group ID to add the task to'),
   taskOrder: z.number().int().min(0).optional().describe('Order within the task group (0-based)'),
   title: z.string().min(1).max(500).describe('Task title'),
   description: z.string().optional().describe('Detailed task description'),
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional().default('medium'),
   tags: z.array(z.string()).optional().describe('Tags for categorization'),
   createdBy: z.string().optional().describe('Who created this task (e.g., "claude", "user")'),
+  dueDate: z.string().optional().describe(DUE_DATE_DESCRIPTION),
 });
 
 type McpResponse = {
@@ -64,6 +73,39 @@ function mcpResponse(data: object, isError = false): McpResponse {
     content: [{ type: 'text' as const, text: JSON.stringify(data) }],
     isError,
   };
+}
+
+/**
+ * Resolve a caller-supplied dueDate to a storable timestamp.
+ *
+ * Only a bare YYYY-MM-DD needs the user's timezone to land on the right day, so
+ * the lookup is skipped for fully-qualified timestamps. A missing or unreadable
+ * timezone falls back to UTC rather than failing the write.
+ */
+async function resolveDueDateForUser(
+  value: string,
+  resolved: ResolvedUser,
+  dataComposer: DataComposer
+): Promise<string> {
+  if (!isBareDate(value)) return resolveDueDate(value, 'UTC');
+
+  const onRow = (resolved.user as { timezone?: string | null }).timezone;
+  let timezone = onRow || undefined;
+  if (!timezone) {
+    try {
+      const { data } = await dataComposer
+        .getClient()
+        .from('users')
+        .select('timezone')
+        .eq('id', resolved.user.id)
+        .single();
+      timezone = (data as { timezone?: string | null } | null)?.timezone || undefined;
+    } catch (err) {
+      logger.warn('Failed to load user timezone for dueDate resolution:', err);
+    }
+  }
+
+  return resolveDueDate(value, timezone || 'UTC');
 }
 
 export async function handleCreateTask(
@@ -101,6 +143,18 @@ export async function handleCreateTask(
       }
     }
 
+    let dueDate: string | undefined;
+    if (args.dueDate !== undefined) {
+      try {
+        dueDate = await resolveDueDateForUser(args.dueDate, resolved, dataComposer);
+      } catch (err) {
+        if (err instanceof InvalidDueDateError) {
+          return mcpResponse({ success: false, error: err.message }, true);
+        }
+        throw err;
+      }
+    }
+
     const task = await dataComposer.repositories.tasks.create({
       project_id: args.projectId || null,
       user_id: resolved.user.id,
@@ -111,6 +165,7 @@ export async function handleCreateTask(
       created_by: args.createdBy || 'claude',
       task_group_id: args.taskGroupId,
       task_order: args.taskOrder,
+      due_date: dueDate,
     });
 
     return mcpResponse({
@@ -124,6 +179,7 @@ export async function handleCreateTask(
         tags: task.tags,
         taskGroupId: task.task_group_id || null,
         taskOrder: task.task_order ?? null,
+        dueDate: task.due_date || null,
         createdAt: task.created_at,
       },
     });
@@ -144,8 +200,8 @@ export async function handleCreateTask(
 
 export const listTasksSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().optional().describe('Filter by project'),
-  groupId: z.string().uuid().optional().describe('Filter by task group'),
+  projectId: z.string().guid().optional().describe('Filter by project'),
+  groupId: z.string().guid().optional().describe('Filter by task group'),
   status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
   activeOnly: z.boolean().optional().default(false).describe('Only show pending/in_progress tasks'),
   limit: z.number().optional().default(50),
@@ -235,12 +291,17 @@ export async function handleListTasks(
 
 export const updateTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to update'),
+  taskId: z.string().guid().describe('Task ID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
   status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
   tags: z.array(z.string()).optional(),
+  dueDate: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(`${DUE_DATE_DESCRIPTION} Pass null to clear an existing due date.`),
 });
 
 export async function handleUpdateTask(
@@ -262,6 +323,24 @@ export async function handleUpdateTask(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
+    // Friendly precheck; the enforce_graph_execution_path trigger is the
+    // authoritative fence for graph-mode execution state.
+    if (args.status !== undefined && existing.task_group_id) {
+      const group = await dataComposer.repositories.taskGroups.findById(existing.task_group_id);
+      if (group?.execution_model === 'graph') {
+        return mcpResponse(
+          {
+            success: false,
+            error:
+              'Status is executor-owned for graph-mode groups — use claim_task / ' +
+              'complete_task(claimToken) / record_gate_verdict / retry_gate. ' +
+              'Title, description, priority, and tags remain editable here.',
+          },
+          true
+        );
+      }
+    }
+
     const updates: Record<string, unknown> = {};
     if (args.title !== undefined) updates.title = args.title;
     if (args.description !== undefined) updates.description = args.description;
@@ -275,15 +354,41 @@ export async function handleUpdateTask(
     }
     if (args.priority !== undefined) updates.priority = args.priority;
     if (args.tags !== undefined) updates.tags = args.tags;
+    if (args.dueDate !== undefined) {
+      try {
+        updates.due_date =
+          args.dueDate === null
+            ? null
+            : await resolveDueDateForUser(args.dueDate, resolved, dataComposer);
+      } catch (err) {
+        if (err instanceof InvalidDueDateError) {
+          return mcpResponse({ success: false, error: err.message }, true);
+        }
+        throw err;
+      }
+    }
+
+    // Without this an all-unknown-fields call reaches PostgREST as an empty
+    // UPDATE, which matches no rows and surfaces as a JSON coercion error.
+    if (Object.keys(updates).length === 0) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'No fields to update. Provide at least one of: title, description, status, priority, tags, dueDate.',
+        },
+        true
+      );
+    }
 
     const task = await dataComposer.repositories.tasks.update(args.taskId, updates);
 
     if (args.status && args.status !== existing.status) {
       try {
-        const agentId = getEffectiveAgentId(undefined) || 'system';
+        const sbSlug = getEffectiveSlug(undefined) || 'system';
         await dataComposer.repositories.activityStream.logActivity({
           userId: resolved.user.id,
-          agentId,
+          sbSlug,
           type: 'state_change',
           subtype: 'task_status_change',
           content: `${task.title}: ${existing.status} → ${args.status}`,
@@ -310,6 +415,7 @@ export async function handleUpdateTask(
         status: task.status,
         priority: task.priority,
         tags: task.tags,
+        dueDate: task.due_date || null,
         completedAt: task.completed_at,
       },
     });
@@ -330,7 +436,7 @@ export async function handleUpdateTask(
 
 export const completeTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to mark as completed'),
+  taskId: z.string().guid().describe('Task ID to mark as completed'),
   summary: z
     .string()
     .max(2000)
@@ -338,7 +444,99 @@ export const completeTaskSchema = z.object({
     .describe(
       'Brief summary of what was accomplished (shown in mission feed and preserved in activity stream)'
     ),
+  claimToken: z
+    .string()
+    .guid()
+    .optional()
+    .describe(
+      'Required for tasks in graph-mode groups: the claim token returned by claim_task. Graph completion refuses without a valid claim.'
+    ),
+  sessionId: z
+    .string()
+    .guid()
+    .optional()
+    .describe(
+      'Claim-holding session for graph-mode tasks — usually unnecessary, resolved from session context. Must match the claiming session.'
+    ),
 });
+
+/**
+ * Graph-mode completion path shared by complete_task and close_task: the
+ * claim-token-gated RPC terminates the node and transitions newly-ready
+ * downstream nodes in the same transaction; dispatch happens post-commit
+ * and its failure never fails the completion (the sweep recovers it).
+ */
+async function completeGraphModeTask(
+  dataComposer: DataComposer,
+  userId: string,
+  taskId: string,
+  outcome: 'completed' | 'failed' | 'skipped',
+  claimToken: string | undefined,
+  summary: string | undefined,
+  explicitSessionId?: string
+): Promise<McpResponse> {
+  const ctx = getRequestContext() || getSessionContext();
+  // Explicit wins (sessions without CLI-hook context, e.g. raw .mcp.json
+  // runners); the RPC CASes session + token together, so a wrong session
+  // cannot complete over someone else's claim regardless.
+  const sessionId = explicitSessionId || ctx?.sessionId;
+  if (!claimToken || !sessionId) {
+    return mcpResponse(
+      {
+        success: false,
+        error:
+          'This task is in a graph-mode group: completion is claim-token-gated. ' +
+          'Claim it first with claim_task (from a bootstrapped session) and pass claimToken here.',
+      },
+      true
+    );
+  }
+
+  const result = await dataComposer.repositories.taskGroups.completeGraphTask({
+    userId,
+    taskId,
+    sessionId,
+    claimToken,
+    outcome,
+    reason: summary,
+  });
+  if (result.success === false) return mcpResponse(result, true);
+
+  const taskGroupId = (await dataComposer.repositories.tasks.findById(taskId))?.task_group_id;
+  try {
+    const sbSlug = getEffectiveSlug(undefined) || 'system';
+    await dataComposer.repositories.activityStream.logActivity({
+      userId,
+      sbSlug,
+      type: 'state_change',
+      subtype: outcome === 'completed' ? 'task_completed' : 'task_closed',
+      content: summary || `${outcome}: graph node ${taskId}`,
+      taskGroupId: taskGroupId || undefined,
+      payload: { taskId, outcome, summary: summary || null, graphMode: true },
+    });
+  } catch (err) {
+    logger.warn('Failed to log graph task completion activity:', err);
+  }
+
+  if (taskGroupId) {
+    try {
+      const group = await dataComposer.repositories.taskGroups.findById(taskGroupId);
+      if (group) {
+        const executor = new GraphExecutorService(dataComposer);
+        await executor.dispatchEvaluation(
+          userId,
+          group,
+          result.evaluation as unknown as GraphEvaluation,
+          { dedupe: false }
+        );
+      }
+    } catch (err) {
+      logger.warn(`Graph post-completion dispatch failed for task ${taskId}:`, err);
+    }
+  }
+
+  return mcpResponse(result);
+}
 
 export async function handleCompleteTask(
   args: z.infer<typeof completeTaskSchema>,
@@ -359,11 +557,28 @@ export async function handleCompleteTask(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
+    // Graph-mode groups complete through the claim-token-gated RPC — the
+    // legacy path would bypass the executor (no claim check, no push).
+    if (existing.task_group_id) {
+      const group = await dataComposer.repositories.taskGroups.findById(existing.task_group_id);
+      if (group?.execution_model === 'graph') {
+        return completeGraphModeTask(
+          dataComposer,
+          resolved.user.id,
+          args.taskId,
+          'completed',
+          args.claimToken,
+          args.summary,
+          args.sessionId
+        );
+      }
+    }
+
     const task = await dataComposer.repositories.tasks.completeTask(args.taskId);
 
     // Auto-remember: persist task completion as a memory for session continuity
     try {
-      const agentId = getEffectiveAgentId(undefined);
+      const sbSlug = getEffectiveSlug(undefined);
       const salience = task.priority === 'high' || task.priority === 'critical' ? 'high' : 'medium';
       const topics = [`task:${task.id}`, ...(task.tags || [])];
       if (task.project_id) topics.push(`project:${task.project_id}`);
@@ -376,7 +591,7 @@ export async function handleCompleteTask(
         source: 'session',
         salience: salience as 'medium' | 'high',
         topics,
-        agentId: agentId || undefined,
+        sbSlug: sbSlug || undefined,
         metadata: { taskId: task.id, autoCreated: true },
       });
     } catch (err) {
@@ -386,11 +601,11 @@ export async function handleCompleteTask(
 
     // Log task_completed to activity stream for mission feed visibility
     try {
-      const agentId = getEffectiveAgentId(undefined) || 'system';
+      const sbSlug = getEffectiveSlug(undefined) || 'system';
       const summaryText = args.summary || `Completed: ${task.title}`;
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId,
+        sbSlug,
         type: 'state_change',
         subtype: 'task_completed',
         content: summaryText,
@@ -478,7 +693,7 @@ const taskOutcomeSchema = z.enum(['completed', 'skipped', 'blocked', 'failed']);
 
 export const closeTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to close'),
+  taskId: z.string().guid().describe('Task ID to close'),
   outcome: taskOutcomeSchema.describe(
     'Outcome: completed (done), skipped (not needed), blocked (cannot proceed), failed (attempted but failed)'
   ),
@@ -488,6 +703,16 @@ export const closeTaskSchema = z.object({
     .max(2000)
     .optional()
     .describe('Brief summary of what happened (shown in mission feed)'),
+  claimToken: z
+    .string()
+    .guid()
+    .optional()
+    .describe('Required for tasks in graph-mode groups: the claim token from claim_task'),
+  sessionId: z
+    .string()
+    .guid()
+    .optional()
+    .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
 });
 
 export async function handleCloseTask(
@@ -508,13 +733,40 @@ export async function handleCloseTask(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
+    // Graph-mode groups terminate through the claim-token-gated RPC.
+    if (existing.task_group_id) {
+      const group = await dataComposer.repositories.taskGroups.findById(existing.task_group_id);
+      if (group?.execution_model === 'graph') {
+        if (args.outcome === 'blocked') {
+          return mcpResponse(
+            {
+              success: false,
+              error:
+                "Graph-mode nodes don't close as 'blocked' — blockage is derived from the graph. " +
+                "Release the claim (release_claim) to hand the node back, or fail it (outcome: 'failed').",
+            },
+            true
+          );
+        }
+        return completeGraphModeTask(
+          dataComposer,
+          resolved.user.id,
+          args.taskId,
+          args.outcome,
+          args.claimToken,
+          args.summary ?? args.reason,
+          args.sessionId
+        );
+      }
+    }
+
     const task = await dataComposer.repositories.tasks.closeTask(
       args.taskId,
       args.outcome,
       args.reason
     );
 
-    const agentId = getEffectiveAgentId(undefined) || 'system';
+    const sbSlug = getEffectiveSlug(undefined) || 'system';
     const outcomeLabel =
       args.outcome === 'completed'
         ? `✓ ${args.summary || task.title}`
@@ -523,7 +775,7 @@ export async function handleCloseTask(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId,
+        sbSlug,
         type: 'state_change',
         subtype: args.outcome === 'completed' ? 'task_completed' : 'task_closed',
         content: outcomeLabel,
@@ -602,7 +854,7 @@ export async function handleCloseTask(
 
 export const getTaskStatsSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().describe('Project ID to get stats for'),
+  projectId: z.string().guid().describe('Project ID to get stats for'),
 });
 
 export async function handleGetTaskStats(
@@ -652,30 +904,29 @@ export async function handleGetTaskStats(
 
 export const addTaskCommentSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to comment on'),
+  taskId: z.string().guid().describe('Task ID to comment on'),
   content: z.string().min(1).max(5000).describe('Comment content'),
-  parentCommentId: z.string().uuid().optional().describe('Parent comment ID for threaded replies'),
-  agentId: z.string().optional().describe('Agent ID for identity attribution'),
+  parentCommentId: z.string().guid().optional().describe('Parent comment ID for threaded replies'),
+  sbSlug: z.string().optional().describe('SB slug for identity attribution'),
 });
 
-async function resolveIdentityIdForAgent(
+/**
+ * Slug -> canonical identity UUID, via the shared resolver.
+ *
+ * This used to query agent_identities itself with .limit(1).single(), which
+ * differed from the shared resolver in two ways that both lost attribution:
+ * with no workspace it silently took whichever row came back first, and WITH a
+ * workspace it matched workspace_id exactly, so an identity not yet backfilled
+ * (workspace_id IS NULL) resolved to nothing and the comment lost its sbId.
+ */
+async function resolveSbIdForSlug(
   dataComposer: DataComposer,
   userId: string,
-  agentId: string | undefined,
+  sbSlug: string | undefined,
   workspaceId: string | undefined
 ): Promise<string | null> {
-  if (!agentId) return null;
-  let query = dataComposer
-    .getClient()
-    .from('agent_identities')
-    .select('id')
-    .eq('agent_id', agentId)
-    .eq('user_id', userId);
-  if (workspaceId) {
-    query = query.eq('workspace_id', workspaceId);
-  }
-  const { data } = await query.limit(1).single();
-  return (data as { id: string } | null)?.id ?? null;
+  if (!sbSlug) return null;
+  return resolveSbId(dataComposer.getClient(), userId, sbSlug, workspaceId);
 }
 
 export async function handleAddTaskComment(
@@ -697,16 +948,11 @@ export async function handleAddTaskComment(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      agentId,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { data: rawComment, error } = await dataComposer
       .getClient()
@@ -716,7 +962,7 @@ export async function handleAddTaskComment(
         user_id: resolved.user.id,
         content: args.content.trim(),
         parent_comment_id: args.parentCommentId || null,
-        created_by_agent_id: agentId || null,
+        created_by_agent_id: sbSlug || null,
         created_by_sb_id: sbId,
       } as never)
       .select()
@@ -739,7 +985,7 @@ export async function handleAddTaskComment(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId: agentId || 'system',
+        sbSlug: sbSlug || 'system',
         type: 'state_change',
         subtype: 'task_comment',
         content: args.content.trim().slice(0, 200),
@@ -762,7 +1008,7 @@ export async function handleAddTaskComment(
         id: comment.id,
         taskId: comment.task_id,
         content: comment.content,
-        authorAgentId: agentId || null,
+        authorSlug: sbSlug || null,
         createdAt: comment.created_at,
       },
     });
@@ -783,14 +1029,14 @@ export async function handleAddTaskComment(
 
 export const addTaskGroupCommentSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to comment on'),
+  groupId: z.string().guid().describe('Task group ID to comment on'),
   content: z.string().min(1).max(5000).describe('Comment content'),
   commentType: z
     .enum(['comment', 'conclusion', 'status_change'])
     .optional()
     .default('comment')
     .describe('Comment type (comment, conclusion, status_change)'),
-  agentId: z.string().optional().describe('Agent ID for identity attribution'),
+  sbSlug: z.string().optional().describe('SB slug for identity attribution'),
 });
 
 export async function handleAddTaskGroupComment(
@@ -814,16 +1060,11 @@ export async function handleAddTaskGroupComment(
       );
     }
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      agentId,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { data: rawComment, error } = await dataComposer
       .getClient()
@@ -833,7 +1074,7 @@ export async function handleAddTaskGroupComment(
         user_id: resolved.user.id,
         content: args.content.trim(),
         comment_type: args.commentType || 'comment',
-        agent_id: agentId || null,
+        agent_id: sbSlug || null,
         created_by_sb_id: sbId,
       } as never)
       .select()
@@ -857,7 +1098,7 @@ export async function handleAddTaskGroupComment(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId: agentId || 'system',
+        sbSlug: sbSlug || 'system',
         type: 'state_change',
         subtype: 'task_group_comment',
         content: args.content.trim().slice(0, 200),
@@ -881,7 +1122,7 @@ export async function handleAddTaskGroupComment(
         groupId: comment.task_group_id,
         content: comment.content,
         commentType: comment.comment_type,
-        authorAgentId: agentId || null,
+        authorSlug: sbSlug || null,
         createdAt: comment.created_at,
       },
     });
@@ -898,7 +1139,7 @@ export async function handleAddTaskGroupComment(
 
 export const listTaskGroupCommentsSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to list comments for'),
+  groupId: z.string().guid().describe('Task group ID to list comments for'),
   commentType: z
     .enum(['comment', 'conclusion', 'status_change'])
     .optional()
@@ -956,7 +1197,7 @@ export async function handleListTaskGroupComments(
         groupId: c.task_group_id,
         content: c.content,
         commentType: c.comment_type,
-        authorAgentId: c.agent_id,
+        authorSlug: c.agent_id,
         createdAt: c.created_at,
       })),
     });
@@ -979,7 +1220,7 @@ const taskGroupOutcomeSchema = z.enum(['completed', 'partial', 'abandoned', 'fai
 
 export const closeTaskGroupSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to close'),
+  groupId: z.string().guid().describe('Task group ID to close'),
   outcome: taskGroupOutcomeSchema.describe(
     'Outcome: completed (all done), partial (some done), abandoned (gave up), failed (critical failure)'
   ),
@@ -988,7 +1229,7 @@ export const closeTaskGroupSchema = z.object({
     .max(5000)
     .optional()
     .describe('Conclusion summary. Auto-generated if not provided.'),
-  agentId: z.string().optional().describe('Agent ID for attribution'),
+  sbSlug: z.string().optional().describe('SB slug for attribution'),
 });
 
 export async function handleCloseTaskGroup(
@@ -1057,15 +1298,10 @@ export async function handleCloseTaskGroup(
       conclusion: autoConclusion,
     });
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      agentId,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { error: commentError } = await dataComposer
       .getClient()
@@ -1075,7 +1311,7 @@ export async function handleCloseTaskGroup(
         user_id: resolved.user.id,
         content: autoConclusion,
         comment_type: 'conclusion',
-        agent_id: agentId || null,
+        agent_id: sbSlug || null,
         created_by_sb_id: sbId,
       } as never);
 
@@ -1086,7 +1322,7 @@ export async function handleCloseTaskGroup(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId: agentId || 'system',
+        sbSlug: sbSlug || 'system',
         type: 'state_change',
         subtype: 'task_group_closed',
         content: `Group closed (${args.outcome}): ${autoConclusion}`,
@@ -1137,7 +1373,7 @@ export const createTaskGroupSchema = z.object({
   ...userIdentifierSchema.shape,
   title: z.string().min(1).max(500).describe('Task group title'),
   description: z.string().optional().describe('Detailed description / strategy'),
-  projectId: z.string().uuid().optional().describe('Optional project scope'),
+  projectId: z.string().guid().optional().describe('Optional project scope'),
   priority: taskGroupPriorityEnum.optional().default('normal'),
   status: taskGroupStatusEnum.optional().default('active'),
   tags: z.array(z.string()).optional(),
@@ -1160,8 +1396,8 @@ export const createTaskGroupSchema = z.object({
     .optional()
     .describe('Expected deliverable type (spec, pr, report, proposal)'),
   outputStatus: taskGroupOutputStatusEnum.optional(),
-  metadata: z.record(z.unknown()).optional(),
-  agentId: z
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  sbSlug: z
     .string()
     .optional()
     .describe('Agent identity to attribute the group to (defaults to caller)'),
@@ -1189,7 +1425,7 @@ export async function handleCreateTaskGroup(
       }
     }
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
 
     if (!effectiveProjectId && reqCtx?.studioId) {
@@ -1203,10 +1439,10 @@ export async function handleCreateTaskGroup(
         }
       }
     }
-    const sbId = await resolveIdentityIdForAgent(
+    const sbId = await resolveSbIdForSlug(
       dataComposer,
       resolved.user.id,
-      agentId,
+      sbSlug,
       reqCtx?.workspaceId
     );
 
@@ -1239,7 +1475,7 @@ export async function handleCreateTaskGroup(
         tags: group.tags,
         projectId: group.project_id,
         sbId: group.sb_id,
-        agentId: agentId || null,
+        sbSlug: sbSlug || null,
         autonomous: group.autonomous,
         maxSessions: group.max_sessions,
         sessionsUsed: group.sessions_used,
@@ -1270,14 +1506,14 @@ export async function handleCreateTaskGroup(
 
 export const updateTaskGroupSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group UUID to update'),
+  groupId: z.string().guid().describe('Task group UUID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().nullable().optional(),
   status: taskGroupStatusEnum.optional().describe('active | paused | completed | cancelled'),
   priority: taskGroupPriorityEnum.optional(),
   tags: z.array(z.string()).optional(),
   metadata: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .optional()
     .describe(
       'Metadata object. When provided with mergeMetadata=true (default), keys are merged into existing metadata; otherwise metadata is replaced.'
@@ -1301,7 +1537,7 @@ export const updateTaskGroupSchema = z.object({
   threadKey: z.string().nullable().optional(),
   sbId: z
     .string()
-    .uuid()
+    .guid()
     .nullable()
     .optional()
     .describe('Agent identity UUID. Pass null to clear.'),
@@ -1463,12 +1699,12 @@ export const listTaskGroupsSchema = z.object({
     .describe(
       'Filter by one or more statuses: active, paused, completed, cancelled. Omit or pass empty array to include all statuses.'
     ),
-  projectId: z.string().uuid().optional().describe('Filter by project UUID'),
+  projectId: z.string().guid().optional().describe('Filter by project UUID'),
   projectName: z
     .string()
     .optional()
     .describe('Filter by project name (exact match). Alternative to projectId.'),
-  sbId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
+  sbId: z.string().guid().optional().describe('Filter by agent identity UUID'),
   autonomousOnly: z.boolean().optional().default(false).describe('Only autonomous groups'),
   includeTaskCounts: z
     .boolean()
@@ -1529,7 +1765,7 @@ export async function handleListTaskGroups(
     const projectMap = new Map(projects.filter(Boolean).map((p) => [p!.id, p!.name]));
 
     const sbIds = [...new Set(groups.map((g) => g.sb_id).filter(Boolean))] as string[];
-    const identityMap = new Map<string, { agentId: string; name: string | null }>();
+    const identityMap = new Map<string, { sbSlug: string; name: string | null }>();
     if (sbIds.length > 0) {
       const { data: identities } = await dataComposer
         .getClient()
@@ -1541,7 +1777,7 @@ export async function handleListTaskGroups(
         agent_id: string;
         name: string | null;
       }>) {
-        identityMap.set(row.id, { agentId: row.agent_id, name: row.name });
+        identityMap.set(row.id, { sbSlug: row.agent_id, name: row.name });
       }
     }
 
@@ -1557,7 +1793,7 @@ export async function handleListTaskGroups(
         projectId: g.project_id,
         projectName: g.project_id ? projectMap.get(g.project_id) || null : null,
         sbId: g.sb_id,
-        agentId: g.sb_id ? identityMap.get(g.sb_id)?.agentId || null : null,
+        sbSlug: g.sb_id ? identityMap.get(g.sb_id)?.sbSlug || null : null,
         agentName: g.sb_id ? identityMap.get(g.sb_id)?.name || null : null,
         autonomous: g.autonomous,
         maxSessions: g.max_sessions,
