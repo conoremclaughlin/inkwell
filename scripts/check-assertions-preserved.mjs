@@ -92,41 +92,54 @@ function resolveCommit(ref) {
 }
 
 /**
- * Changed files and their status, NUL-delimited.
+ * Changed files, NUL-delimited, as the pair of paths each revision knows.
  *
- * Returns Map<path, 'A' | 'M' | 'D'> — a rename is recorded against its new
- * path as a modification, which is what a preservation check cares about.
+ * A file can be called one thing before and another after, so one path is not
+ * enough. Each record carries the path to read at each side — null where the
+ * file legitimately does not exist there — plus ONE key both sides are counted
+ * under. Keying a rename by its two different names would report every
+ * assertion in it as simultaneously lost and gained.
+ *
+ *   A  ->  { before: null, after: path }
+ *   D  ->  { before: path, after: null }
+ *   M  ->  { before: path, after: path }
+ *   R  ->  { before: old,  after: new  }   (same for C, whose source also exists)
  */
 function changedFiles(before, after, pathspec) {
   const raw = git(['diff', '--name-status', '-z', before, after, '--', ...pathspec]);
-  const fields = raw.split('\0').filter((f) => f !== '');
-  const files = new Map();
+  const fields = raw.split('\0').filter((field) => field !== '');
+  const records = [];
   for (let i = 0; i < fields.length; ) {
-    const status = fields[i++];
-    const letter = status[0];
+    const letter = fields[i++][0];
     if (letter === 'R' || letter === 'C') {
-      i++; // old path
+      const from = fields[i++];
       const to = fields[i++];
-      if (to !== undefined) files.set(to, 'M');
+      if (from === undefined || to === undefined) continue;
+      records.push({ before: from, after: to, key: to });
     } else {
       const path = fields[i++];
-      if (path !== undefined) files.set(path, letter);
+      if (path === undefined) continue;
+      records.push({
+        before: letter === 'A' ? null : path,
+        after: letter === 'D' ? null : path,
+        key: path,
+      });
     }
   }
-  return files;
+  return records;
 }
 
 /**
- * Read one object, distinguishing "should not exist" from "could not be read".
+ * Read one object that the diff says exists at this revision.
  *
- * `expected` comes from the diff status. If a file the diff says exists cannot
- * be read, that is an operational failure and must stop the run — the whole
- * point is that a failed read never masquerades as an absent file.
+ * Callers skip the null paths themselves, so reaching here means the file is
+ * supposed to be readable. A failure is therefore operational and stops the
+ * run — the whole point is that a failed read never masquerades as an absent
+ * file, quietly contributing zero assertions.
  */
-function readAt(rev, file, expected) {
+function readAt(rev, file) {
   const source = git(['show', `${rev}:${file}`], { allowFailure: true });
   if (source === null) {
-    if (!expected) return null; // legitimately absent at this revision
     die(`could not read ${file} at ${rev.slice(0, 8)}, though the diff says it exists there`);
   }
   return source;
@@ -204,17 +217,17 @@ const before = resolveCommit(beforeRef);
 const after = resolveCommit(afterRef);
 const files = changedFiles(before, after, pathspec);
 
-if (files.size === 0) {
+if (files.length === 0) {
   console.log('no test files changed between those revisions — nothing to compare');
   process.exit(0);
 }
 
 const gather = (rev, side) => {
   const rows = [];
-  for (const [file, status] of files) {
-    const exists = side === 'before' ? status !== 'A' : status !== 'D';
-    const source = readAt(rev, file, exists);
-    if (source !== null) rows.push(...assertionsIn(source, file));
+  for (const record of files) {
+    const path = side === 'before' ? record.before : record.after;
+    if (path === null) continue; // legitimately absent at this revision
+    rows.push(...assertionsIn(readAt(rev, path), record.key));
   }
   return rows;
 };
@@ -230,7 +243,7 @@ const contexts = [...new Set([...Object.keys(fromAssertions), ...Object.keys(toA
 const drift = contexts.filter((c) => (fromAssertions[c] || 0) !== (toAssertions[c] || 0));
 
 console.log(`comparing ${before.slice(0, 8)} -> ${after.slice(0, 8)}`);
-console.log(`  test files changed : ${files.size}`);
+console.log(`  test files changed : ${files.length}`);
 console.log(`  bare expect() calls: ${keysOf(from, 'assertion').length} -> ${keysOf(to, 'assertion').length}`);
 console.log(`  matcher helpers    : ${keysOf(from, 'matcher').length} -> ${keysOf(to, 'matcher').length}`);
 console.log(`  contexts drifted   : ${drift.length}`);
