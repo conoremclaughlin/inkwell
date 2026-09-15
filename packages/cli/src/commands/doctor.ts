@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { execFileSync, execSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
+import { promisify } from 'util';
 import { createInterface } from 'readline/promises';
 import { stdin as input, stdout as output } from 'process';
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'fs';
@@ -109,6 +110,7 @@ export function analyzeCliLink(
 ): DoctorResult {
   const binDir = options.binDir || join(homedir(), '.local', 'bin');
   const binaryName = options.name || resolveDefaultCliName(fsOps);
+  buildFixArgs(binaryName); // validate before it is used as a path or suggested command
   const linkPath = join(binDir, binaryName);
   const checks: DoctorCheck[] = [];
 
@@ -218,8 +220,20 @@ function iconForStatus(status: CheckStatus): string {
 }
 
 function buildFixCommand(binaryName: string): string {
-  if (binaryName === 'ink') return 'ink studio cli';
-  return `ink studio cli --name ${binaryName}`;
+  return ['ink', ...buildFixArgs(binaryName)].join(' ');
+}
+
+export function buildFixArgs(binaryName: string): string[] {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(binaryName)) {
+    throw new Error('CLI alias must contain only letters, numbers, underscores, and hyphens');
+  }
+  return binaryName === 'ink' ? ['studio', 'cli'] : ['studio', 'cli', '--name', binaryName];
+}
+
+export async function applyCliLinkFix(binaryName: string): Promise<void> {
+  const { stdout, stderr } = await promisify(execFile)('ink', buildFixArgs(binaryName));
+  if (stdout) process.stdout.write(stdout);
+  if (stderr) process.stderr.write(stderr);
 }
 
 function resolveRepoRoot(fsOps: Pick<DoctorFs, 'existsSync'>): string | undefined {
@@ -388,7 +402,7 @@ async function doctorCommand(options: {
           .trim()
           .toLowerCase();
         if (answer === 'y' || answer === 'yes') {
-          execSync(fixCmd, { stdio: 'inherit' });
+          await applyCliLinkFix(result.binaryName);
           console.log(chalk.green('\nApplied fix command.'));
         } else {
           console.log(chalk.dim('Skipped fix command.'));

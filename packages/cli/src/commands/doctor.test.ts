@@ -1,5 +1,29 @@
-import { describe, expect, it } from 'vitest';
-import { analyzeCliLink } from './doctor.js';
+import { describe, expect, it, vi } from 'vitest';
+import { execFile } from 'child_process';
+import { analyzeCliLink, applyCliLinkFix, buildFixArgs } from './doctor.js';
+
+vi.mock('child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('child_process')>()),
+  execFile: vi.fn((_binary, _args, callback) => callback(null, '', '')),
+}));
+
+describe('doctor repair execution', () => {
+  it.each(['../demo', '/tmp/demo', 'ink demo', 'ink;echo', 'ink$(echo marker)', '--demo', ''])(
+    'rejects unsafe aliases before execution: %s',
+    (name) => expect(() => buildFixArgs(name)).toThrow('CLI alias')
+  );
+
+  it('keeps the alias as a validated argument, not shell text', async () => {
+    expect(buildFixArgs('ink')).toEqual(['studio', 'cli']);
+    expect(buildFixArgs('ink-demo')).toEqual(['studio', 'cli', '--name', 'ink-demo']);
+    await applyCliLinkFix('ink-demo');
+    expect(execFile).toHaveBeenCalledWith(
+      'ink',
+      ['studio', 'cli', '--name', 'ink-demo'],
+      expect.any(Function)
+    );
+  });
+});
 
 function makeFs(overrides?: {
   files?: Record<string, string>;

@@ -18,13 +18,15 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
+  rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { discoverSkills } from '../repl/skills.js';
 import { parseSkillMcpConfig } from '../lib/skill-mcp.js';
 import { callPcpTool } from '../lib/pcp-mcp.js';
@@ -97,7 +99,7 @@ const BACKEND_SKILL_DIRS = [
 
 function getWorktrees(): string[] {
   try {
-    const output = execSync('git worktree list --porcelain', {
+    const output = execFileSync('git', ['worktree', 'list', '--porcelain'], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
@@ -173,13 +175,33 @@ function injectMcpServers(
   return { added, existed };
 }
 
-/**
- * Write a SKILL.md to the canonical PCP skills dir.
- * Returns true if written (false if content unchanged).
- */
-function writeCanonicalSkill(skillName: string, content: string): boolean {
+/** Validate server-provided names before they reach any filesystem operation. */
+export function assertSkillName(skillName: string): void {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(skillName)) {
+    throw new Error('Skill name must be a single alphanumeric-led path component');
+  }
+}
+
+function entryAt(filePath: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/** Write canonical SKILL.md; return false when its content is unchanged. */
+export function writeCanonicalSkill(skillName: string, content: string): boolean {
+  assertSkillName(skillName);
   const skillDir = join(PCP_SKILLS_DIR, skillName);
   const skillFile = join(skillDir, 'SKILL.md');
+
+  for (const candidate of [skillDir, skillFile]) {
+    if (entryAt(candidate)?.isSymbolicLink()) {
+      throw new Error('Refusing to write a canonical skill through a symlink');
+    }
+  }
 
   if (existsSync(skillFile)) {
     const existing = readFileSync(skillFile, 'utf-8');
@@ -195,42 +217,29 @@ function writeCanonicalSkill(skillName: string, content: string): boolean {
  * Create a symlink from a backend skill dir to the canonical PCP skill dir.
  * Returns 'created' | 'exists' | 'updated' (if symlink target changed).
  */
-function ensureSkillSymlink(
+export function ensureSkillSymlink(
   backendDir: string,
   skillName: string
 ): 'created' | 'exists' | 'updated' {
+  assertSkillName(skillName);
   const linkPath = join(backendDir, skillName);
   const targetPath = join(PCP_SKILLS_DIR, skillName);
 
   mkdirSync(backendDir, { recursive: true });
 
-  if (existsSync(linkPath)) {
-    try {
-      const stat = lstatSync(linkPath);
-      if (stat.isSymbolicLink()) {
-        // Already a symlink — check if target matches
-        const currentTarget = readFileSync(linkPath + '/SKILL.md', 'utf-8');
-        const canonicalContent = readFileSync(join(targetPath, 'SKILL.md'), 'utf-8');
-        if (currentTarget === canonicalContent) return 'exists';
-        // Stale symlink — remove and recreate
-        unlinkSync(linkPath);
-      } else {
-        // Real directory — remove it and replace with symlink
-        // (safe: we just wrote the canonical version)
-        execSync(`rm -rf ${JSON.stringify(linkPath)}`, { stdio: 'ignore' });
-      }
-    } catch {
-      // If we can't stat it, remove and recreate
-      try {
-        unlinkSync(linkPath);
-      } catch {
-        /* ignore */
-      }
-    }
+  const entry = entryAt(linkPath);
+  if (entry?.isSymbolicLink()) {
+    if (readlinkSync(linkPath) === targetPath) return 'exists';
+    // lstat also sees dangling links. Remove the link, never its target.
+    unlinkSync(linkPath);
+  } else if (entry) {
+    // The name is validated before any IO, so a server response cannot
+    // escape the backend directory. No shell interprets the path.
+    rmSync(linkPath, { recursive: true, force: true });
   }
 
   symlinkSync(targetPath, linkPath);
-  return 'created';
+  return entry ? 'updated' : 'created';
 }
 
 // ============================================================================
@@ -338,6 +347,7 @@ export async function syncSkills(
 
   // Step 1: Write canonical SKILL.md + symlink to backend dirs
   for (const skill of mcpSkills) {
+    assertSkillName(skill.name);
     let detail: GetSkillResponse;
     try {
       detail = await callPcpTool<GetSkillResponse>('get_skill', { skillName: skill.name });

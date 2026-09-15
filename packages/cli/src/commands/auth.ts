@@ -14,7 +14,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import http from 'http';
 import crypto from 'crypto';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import {
   generatePkce,
   loadAuth,
@@ -41,9 +41,9 @@ function getPcpServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
 }
 
-function openBrowser(url: string): void {
+export function openBrowser(url: string): void {
   // macOS — extend for Linux/Windows later
-  exec(`open "${url}"`);
+  execFile('open', [url]);
 }
 
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -69,7 +69,7 @@ interface CallbackResult {
   state: string;
 }
 
-function startCallbackServer(
+export function startCallbackServer(
   expectedState: string
 ): Promise<{ result: Promise<CallbackResult>; port: number; close: () => void }> {
   return new Promise((resolveServer) => {
@@ -94,10 +94,26 @@ function startCallbackServer(
       const state = url.searchParams.get('state');
       const error = url.searchParams.get('error');
 
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
+
+      if (state !== expectedState) {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(ERROR_HTML('State mismatch — possible CSRF. Try again.'));
+        clearTimeout(timeout);
+        rejectResult(new Error('State mismatch'));
+        return;
+      }
+
       if (error) {
         const desc = url.searchParams.get('error_description') || error;
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(ERROR_HTML(desc));
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        // Provider-supplied descriptions are not HTML. Keep the browser page
+        // static; the terminal receives the diagnostic through the result.
+        res.end(
+          ERROR_HTML('The authorization server rejected login. Return to the terminal for details.')
+        );
         clearTimeout(timeout);
         rejectResult(new Error(desc));
         return;
@@ -108,14 +124,6 @@ function startCallbackServer(
         res.end(ERROR_HTML('Missing code or state parameter'));
         clearTimeout(timeout);
         rejectResult(new Error('Missing code or state in callback'));
-        return;
-      }
-
-      if (state !== expectedState) {
-        res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(ERROR_HTML('State mismatch — possible CSRF. Try again.'));
-        clearTimeout(timeout);
-        rejectResult(new Error('State mismatch'));
         return;
       }
 
