@@ -406,9 +406,21 @@ realdom=gmail.com
 lookalike=northside-clinic.com
 
 r=$(new_repo scan-addr-reserved "$nohooks")
-stage "$r" src/fixture.ts "const a = 'ada@example.com'; const b = 'x@clinic.example'; const c = 'y@host.test'; const d = 'z@nope.invalid'; const e = 'q@sub.example.co.uk'; const f = 'me@example.com.json'; const g = 'a@-example.com'; const h = 'a@example..com';"
+stage "$r" src/fixture.ts "const a = 'ada@example.com'; const b = 'x@clinic.example'; const c = 'y@host.test'; const d = 'z@nope.invalid'; const e = 'q@sub.mail.example.org'; const f = 'me@example.com.json'; const g = 'a@-example.com'; const h = 'a@example..test';"
 out=$(run_index "$r"); rc=$?
 [ "$rc" -eq 0 ] && ok "reserved-domain addresses are allowed (example.*, .test, .invalid, .example, odd example forms)" || bad "reserved-domain addresses are allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# Registrable names that merely contain `example` are not reserved. Both are
+# assembled at runtime so this file passes the tree scan.
+# (The first spelling here left `sub.example.co` readable before the variable, and
+# the guard refused this very file. The whole public suffix is assembled.)
+couk=co.uk
+comtld=com
+r=$(new_repo scan-addr-example-lookalike "$nohooks")
+stage "$r" a.txt "q@sub.example.$couk"
+stage "$r" b.txt "a@example..$comtld"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "example.co.uk and example..com are refused (registrable, not reserved)" || bad "example.co.uk and example..com are refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 r=$(new_repo scan-addr-legacy "$nohooks")
 stage "$r" src/fixture.ts "const a = 'a@test.com'; const b = 'b@x.com'; const c = 'notify@noreply.github.com'; const d = 'id@mail.gmail.com';"
@@ -435,7 +447,11 @@ r=$(new_repo scan-addr-exempt "$nohooks")
 stage "$r" .mailmap "Someone <noreply@pcp.dev> <someone@$realdom>"
 stage "$r" .yarn/releases/yarn.cjs "// hello@$realdom"
 out=$(run_index "$r"); rc=$?
-[ "$rc" -eq 0 ] && ok ".mailmap and .yarn/ are exempt from the address arm" || bad ".mailmap and .yarn/ are exempt from the address arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+[ "$rc" -eq 0 ] && ok ".mailmap and .yarn/releases/ are exempt from the address arm" || bad ".mailmap and .yarn/releases/ are exempt from the address arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+r=$(new_repo scan-addr-yarn-narrow "$nohooks")
+stage "$r" .yarn/sdks/shim.js "// hello@$realdom"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok ".yarn/sdks and .yarn/patches are not exempt" || bad ".yarn/sdks and .yarn/patches are not exempt" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 r=$(new_repo scan-addr-nested-mailmap "$nohooks")
 stage "$r" docs/.mailmap "x@$realdom"
@@ -509,6 +525,66 @@ r=$(new_repo scan-marker-dir "$nohooks")
 stage "$r" src/x.ts 'clean'
 out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/markers-dir" sh "$guard" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "a directory at the marker path refuses with exit 2" || bad "a directory at the marker path refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# RFC-strict reservation (Lumen r1 #2). Only example.com/net/org, their
+# subdomains, and the four reserved TLDs are reserved; an `example` label
+# under any other parent is a registrable name. Parents assembled at runtime.
+iotld=io
+r=$(new_repo scan-addr-example-label "$nohooks")
+stage "$r" a.txt "x@example.$iotld"
+stage "$r" b.txt "y@sub.example.$realdom"
+stage "$r" c.txt "z@example.$realdom"
+stage "$r" d.txt "w@sub.example.$iotld"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "an example label under an unreserved parent is refused" || bad "an example label under an unreserved parent is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -E '^\s+[abcd]\.txt: line\(s\) 1$')
+[ "$c" -eq 4 ] && ok "all four example-label forms are listed, sub.example.<tld> included" || bad "all four example-label forms are listed" "listed $c of 4: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-one-label "$nohooks")
+stage "$r" ok.ts "const f = 'me@example.com.json'; const g = 'a_b@sub.example.net.bak';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "a reserved name with one trailing label (a file named after an address) is allowed" || bad "a reserved name with one trailing label is allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+stage "$r" bad.ts "const h = 'x@example.com.$realdom';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "a reserved name followed by more than one label is refused" || bad "a reserved name followed by more than one label is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'bad.ts: line(s) 1' && ok "only the offending file is listed" || bad "only the offending file is listed" "$(echo "$out" | tr '\n' ' ')"
+
+# Working directory (Lumen r1 #3): --tree from a subdirectory listed
+# cwd-relative paths and then read the root's file of the same name.
+r=$(new_repo scan-subdir "$nohooks")
+stage "$r" fixture.txt 'clean at the root'
+stage "$r" sub/fixture.txt 'mentions canaryperson below the root'
+git -C "$r" commit -q --no-verify -m 'fixture: same name at two depths' 2>/dev/null
+out=$(cd "$r/sub" && sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--tree from a subdirectory still refuses a marker below it" || bad "--tree from a subdirectory still refuses a marker below it" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'sub/fixture.txt: line(s) 1' && ok "--tree from a subdirectory reports the root-relative path" || bad "--tree from a subdirectory reports the root-relative path" "$(echo "$out" | tr '\n' ' ')"
+stage "$r" sub/token.ts "const t = 'ghp_$F36';"
+out=$(cd "$r/sub" && sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "index mode from a subdirectory still refuses" || bad "index mode from a subdirectory still refuses" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+printf 'CANARYPERSON\n' > "$r/sub/rel-markers"
+stage "$r" sub/note.txt 'canaryperson again'
+out=$(cd "$r/sub" && INK_PRIVATE_MARKERS=rel-markers sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "a relative INK_PRIVATE_MARKERS resolves against the caller's directory" || bad "a relative INK_PRIVATE_MARKERS resolves against the caller's directory" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# A faulted marker count (Lumen r1 #4): grep -c that prints 0 and exits 2
+# must not read as "no markers". The stub fires only for the three-argument
+# count of the marker file; the path-list count reads stdin and is untouched.
+mkdir -p "$work/grepstub"
+realgrep=$(command -v grep)
+cat > "$work/grepstub/grep" <<'GREPSTUB'
+#!/bin/sh
+if [ "$1" = -c ] && [ "$2" = '' ] && [ $# -eq 3 ]; then
+  printf '0\n'
+  exit 2
+fi
+exec "$REAL_GREP" "$@"
+GREPSTUB
+chmod +x "$work/grepstub/grep"
+r=$(new_repo scan-count-fault "$nohooks")
+stage "$r" a.txt 'has canaryperson in it'
+out=$(cd "$r" && PATH="$work/grepstub:$PATH" REAL_GREP="$realgrep" sh "$guard" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "a faulted marker count never reports clean" || bad "a faulted marker count never reports clean" "exit 0 with a marker staged: $(echo "$out" | tr '\n' ' ')"
+[ "$rc" -eq 2 ] && ok "a faulted marker count fails closed (exit 2)" || bad "a faulted marker count fails closed (exit 2)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 # Fail closed: the credential library is present but the domain list is not.
 mkdir -p "$work/nodomains/lib"

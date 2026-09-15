@@ -117,7 +117,7 @@ describe('GmailService.replyToEmail', () => {
 
   it('builds a valid Cc when replying all to a bare-address recipient', async () => {
     // Regression for the live failure: the old parser split the bare To
-    // address into name "user@example.co" + email "m", and "m"
+    // address into a name (all of it but the last letter) + email "m", and "m"
     // landed in the Cc header, so Gmail returned "Invalid Cc header".
     await service.replyToEmail('user-1', {
       messageId: 'orig-1',

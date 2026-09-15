@@ -105,7 +105,7 @@ describe('parseAddressList', () => {
 });
 
 describe('isValidAddress', () => {
-  it.each(['a@b.com', 'first.last+tag@sub.example.co.uk', 'x_y@z.io'])('accepts %s', (addr) => {
+  it.each(['a@b.com', 'first.last+tag@sub.mail.example.com', 'x_y@z.io'])('accepts %s', (addr) => {
     expect(isValidAddress(addr)).toBe(true);
   });
 
@@ -125,7 +125,7 @@ describe('isValidAddress', () => {
     'Team: a@example.com',
     'a@example.com:',
     'a@exa mple.com',
-    'a@example..com',
+    'a@example..test',
     'a@-example.com',
     'a@example.com-',
     '(comment)a@example.com',

@@ -37,7 +37,7 @@
 #
 # Two paths are exempt from the ADDRESSES and MARKERS arms and from nothing
 # else: .mailmap, whose purpose is real author addresses that every commit
-# object already carries, and .yarn/, which is vendored.
+# object already carries, and .yarn/releases/, which is vendored.
 #
 # The commit-msg guard cannot see files and this guard cannot see the message;
 # they are two halves. This one exists because `git add .` and `git add -A`
@@ -148,6 +148,20 @@ fail_closed() { # reason...
   exit 2
 }
 
+# Every path this guard handles is root-relative: the diff listings are by
+# default, `git show REV:path` always is, and `ls-tree` only with --full-tree.
+# Run from the top level so no mode depends on the caller's directory. (Lumen,
+# r1: --tree from a subdirectory listed cwd-relative paths and then read the
+# ROOT's file of the same name, so a marker in sub/fixture.txt beside a clean
+# fixture.txt reported clean.) A relative INK_PRIVATE_MARKERS is resolved
+# first so the cd does not move it.
+case "${INK_PRIVATE_MARKERS:-}" in
+  '' | /*) ;;
+  *) INK_PRIVATE_MARKERS="$PWD/$INK_PRIVATE_MARKERS" ;;
+esac
+top=$(git rev-parse --show-toplevel 2>/dev/null) || fail_closed "not inside a git work tree"
+cd "$top" || fail_closed "could not enter the repository top level at $top"
+
 raw=$(mktemp "${TMPDIR:-/tmp}/check-staged-paths.XXXXXX") || exit 2
 list=$(mktemp "${TMPDIR:-/tmp}/check-staged-list.XXXXXX") || { rm -f "$raw"; exit 2; }
 blob=$(mktemp "${TMPDIR:-/tmp}/check-staged-blob.XXXXXX") || { rm -f "$raw" "$list"; exit 2; }
@@ -188,8 +202,15 @@ fi
 # filter is load-bearing and its failure is a failed scan, not an empty list.
 tr -d '\r' < "$markers_src" > "$markers_raw" || fail_closed "could not read the private-marker list at $markers_src"
 sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*#/d' -e '/^$/d' "$markers_raw" > "$markers" || fail_closed "could not filter the private-marker list at $markers_src"
+# grep -c prints a count and exits 1 when the file is empty, which is the
+# legitimate opt-out. It can also print a count and exit 2 — and a count
+# printed by a grep that failed is not a count. The first version read the
+# number alone, so a faulted grep printing 0 switched the marker arm off and
+# the guard reported clean (Lumen, r1). Status first, then the number.
 markers_count=$(grep -c '' "$markers")
-case "$markers_count" in '' | *[!0-9]*) fail_closed "could not count the private markers" ;; esac
+rc=$?
+[ "$rc" -ge 2 ] && fail_closed "could not count the private markers (grep exited $rc)"
+case "$markers_count" in '' | *[!0-9]*) fail_closed "could not count the private markers (non-numeric count)" ;; esac
 
 # The comparison base for --commit: the first parent, or the empty tree for a
 # root commit. `git diff-tree <sha>` alone shows NOTHING for a merge commit,
@@ -215,7 +236,7 @@ case "$mode" in
     rc=$?
     ;;
   tree)
-    git ls-tree -r -z --name-only "$rev" > "$raw"
+    git ls-tree -r -z --full-tree --name-only "$rev" > "$raw"
     rc=$?
     ;;
 esac
@@ -271,11 +292,12 @@ forbidden_name() {
 # Paths the ADDRESSES and MARKERS arms do not read. Exactly two, each for a
 # reason that does not generalise: git's author map exists to hold the real
 # addresses that every commit object carries anyway, and the vendored yarn
-# release is not our text. Nothing else is exempt, fixtures least of all.
+# release bundle is not our text. .yarn/patches and .yarn/sdks are ours and
+# are scanned. Nothing else is exempt, fixtures least of all.
 personal_exempt() {
   case "/$1" in
     /.mailmap) return 0 ;;
-    /.yarn/*) return 0 ;;
+    /.yarn/releases/*) return 0 ;;
   esac
   return 1
 }
@@ -285,21 +307,54 @@ personal_exempt() {
 # (The previous wording of this comment was an address, and the guard caught it.)
 email_re='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 
-# The rules from scripts/lib/fixture-domains.sh. The caller has already folded
-# case. Hyphens are trimmed from each label so that a fixture testing rejection
-# of `a@-example.com` still reads as an example.
+# The reserved names, and only those (RFC 2606 section 2, RFC 6761):
+# example.com, example.net and example.org with their subdomains, and anything
+# under the .test, .example, .invalid and .localhost top-level names. An
+# `example` label anywhere else — example.co, sub.example.io — is a registrable
+# name and is NOT reserved. The first version of this rule accepted any such
+# label; Lumen (r1) called it correctly as broader than the RFCs.
+reserved_second_level() { # domain, already lower-cased and hyphen-trimmed
+  case "$1" in
+    example.com | example.net | example.org) return 0 ;;
+    *.example.com | *.example.net | *.example.org) return 0 ;;
+  esac
+  return 1
+}
+reserved_domain() { # domain, already lower-cased and hyphen-trimmed
+  reserved_second_level "$1" && return 0
+  case "$1" in
+    *.test | *.example | *.invalid | *.localhost) return 0 ;;
+  esac
+  return 1
+}
+
+# The caller has already folded case. Hyphens are trimmed from each label so a
+# fixture that tests REJECTION of `a@-example.com` still reads as the example
+# it is.
 domain_allowed() { # domain
   d=$1
   case "$d" in *.) d=${d%.} ;; esac
-  case "${d##*.}" in test | invalid | example | localhost) return 0 ;; esac
+  trimmed=''
   rest=$d
   while :; do
-    label=${rest%%.*}
+    case "$rest" in
+      *.*) label=${rest%%.*}; rest=${rest#*.} ;;
+      *) label=$rest; rest='' ;;
+    esac
     while [ "${label#-}" != "$label" ]; do label=${label#-}; done
     while [ "${label%-}" != "$label" ]; do label=${label%-}; done
-    [ "$label" = example ] && return 0
-    case "$rest" in *.*) rest=${rest#*.} ;; *) break ;; esac
+    trimmed="${trimmed:+$trimmed.}$label"
+    [ -z "$rest" ] && break
   done
+  d=$trimmed
+  reserved_domain "$d" && return 0
+  # A reserved SECOND-LEVEL name with exactly ONE label after it: a file
+  # named after an address, me@example.com.json, which the address shape
+  # cannot tell from a host. One label, not any suffix, so
+  # example.com.anything.else is refused — and second-level only, because
+  # granting the same to the reserved TLDs would let sub.example.io through
+  # as "sub.example" plus one label, which is the hole Lumen's finding names.
+  case "$d" in *.*) reserved_second_level "${d%.*}" && return 0 ;; esac
   for allowed in $fixture_domains_legacy $fixture_domains_infra; do
     [ "$d" = "$allowed" ] && return 0
     case "$d" in *".$allowed") return 0 ;; esac
