@@ -12,7 +12,7 @@ export interface RecallFeedbackEntry {
 
 export interface RecallFeedbackInput {
   userId: string;
-  agentId?: string;
+  sbSlug?: string;
   query: string;
   sessionId?: string;
   entries: RecallFeedbackEntry[];
@@ -24,7 +24,7 @@ export class RecallFeedbackRepository {
   async saveFeedback(input: RecallFeedbackInput): Promise<number> {
     const rows = input.entries.map((e) => ({
       user_id: input.userId,
-      agent_id: input.agentId ?? null,
+      agent_id: input.sbSlug ?? null,
       query: input.query,
       memory_id: e.memoryId,
       verdict: e.verdict,
@@ -44,15 +44,15 @@ export class RecallFeedbackRepository {
     return rows.length;
   }
 
-  async getDismissalCount(memoryId: string, agentId?: string): Promise<number> {
+  async getDismissalCount(memoryId: string, sbSlug?: string): Promise<number> {
     let query = this.supabase
       .from('recall_feedback')
       .select('id', { count: 'exact', head: true })
       .eq('memory_id', memoryId)
       .eq('verdict', 'dismissed');
 
-    if (agentId) {
-      query = query.eq('agent_id', agentId);
+    if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
     }
 
     const { count, error } = await query;

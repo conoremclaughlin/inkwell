@@ -84,7 +84,7 @@ Inkwell tools are available via MCP. If the Inkwell MCP server is not already co
 At the start of every session, call `bootstrap` to load your identity and context:
 
 ```
-bootstrap(agentId: "your-agent-id")
+bootstrap(sbSlug: "your-agent-id")
 ```
 
 This returns your identity documents, recent memories, active sessions, and team context. Everything you need to know who you are and what you've been working on.
@@ -94,13 +94,13 @@ This returns your identity documents, recent memories, active sessions, and team
 ### Memory — What You Know
 
 ```
-remember(content: "Decided to use X because...", agentId: "wren", topicKey: "decision:auth")
+remember(content: "Decided to use X because...", sbSlug: "wren", topicKey: "decision:auth")
 ```
 
-Saves to long-term memory with topic tagging. Memories persist across sessions and are filtered by your agentId.
+Saves to long-term memory with topic tagging. Memories persist across sessions and are filtered by your sbSlug.
 
 ```
-recall(query: "auth approach", agentId: "wren")
+recall(query: "auth approach", sbSlug: "wren")
 ```
 
 Searches your memories. Returns matches sorted by relevance and salience.
@@ -129,7 +129,7 @@ Send messages to other agents:
 
 ```
 send_to_inbox(
-  recipientAgentId: "lumen",
+  recipientSlug: "lumen",
   messageType: "task_request",
   threadKey: "pr:42",
   subject: "Review PR #42",
@@ -140,13 +140,13 @@ send_to_inbox(
 Check your inbox:
 
 ```
-get_inbox(agentId: "wren")
+get_inbox(sbSlug: "wren")
 ```
 
 Read thread messages:
 
 ```
-get_thread_messages(threadKey: "pr:42", agentId: "wren")
+get_thread_messages(threadKey: "pr:42", sbSlug: "wren")
 ```
 
 **threadKey convention:** `pr:42`, `spec:cli-hooks`, `issue:15`, `thread:perf-audit`.
@@ -164,7 +164,7 @@ Your identity is stored in the database and served via bootstrap. Six documents 
 | process   | Shared    | How we work               |
 | user      | Shared    | About the human           |
 
-Read: `get_identity(agentId, file: "identity")`. Write: `save_identity(description: "...")`.
+Read: `get_identity(sbSlug, file: "identity")`. Write: `save_identity(description: "...")`.
 
 ## Tool Reference
 
@@ -190,7 +190,7 @@ Read: `get_identity(agentId, file: "identity")`. Write: `save_identity(descripti
 ## Conventions
 
 - **Always bootstrap first.** It loads your identity, context, and recent memories.
-- **Attribute memories.** Include `agentId` and `topicKey` on every `remember()` call.
+- **Attribute memories.** Include `sbSlug` and `topicKey` on every `remember()` call.
 - **Use threadKey.** Every `send_to_inbox` should include a threadKey for conversation continuity.
 - **All messages trigger by default.** Only set `trigger: false` if the message can wait 5+ hours.
 - **Phases are semantic.** Use `blocked:awaiting-review` not just `blocked`.

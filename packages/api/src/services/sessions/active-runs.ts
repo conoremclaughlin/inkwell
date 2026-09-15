@@ -40,12 +40,12 @@ export interface ActiveRun {
   sessionId: string;
   userId: string;
   /** The agent whose turn is executing. */
-  agentId: string;
+  sbSlug: string;
   backend: string;
   /** Present for thread-borne work — where the interruption notice goes. */
   threadKey?: string;
   /** Who asked for this run; the agent left waiting when it dies. */
-  senderAgentId?: string;
+  senderSlug?: string;
   startedAt: number;
   /**
    * Set when the runner promise settled — the child process has exited and
@@ -102,7 +102,7 @@ export function registerActiveRun(run: ActiveRun): boolean {
   if (!intakeOpen) {
     logger.warn('[ActiveRuns] Refusing to register a run during shutdown', {
       sessionId: run.sessionId,
-      agentId: run.agentId,
+      sbSlug: run.sbSlug,
     });
     return false;
   }

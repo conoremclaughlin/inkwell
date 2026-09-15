@@ -7,7 +7,7 @@ function makeActivity(overrides: Partial<Activity> = {}): Activity {
     id: `act-${Math.random().toString(36).slice(2)}`,
     userId: 'user-1',
     sessionId: 'session-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     type: 'tool_call',
     subtype: null,
     content: 'test',
@@ -85,14 +85,14 @@ describe('activityBus', () => {
     unsubscribe();
   });
 
-  it('filters by agentId when provided', () => {
+  it('filters by sbSlug when provided', () => {
     const listener = vi.fn();
-    const unsubscribe = activityBus.subscribe({ userId: 'user-1', agentId: 'myra' }, listener);
+    const unsubscribe = activityBus.subscribe({ userId: 'user-1', sbSlug: 'myra' }, listener);
 
-    activityBus.publish(makeActivity({ agentId: 'wren' }));
+    activityBus.publish(makeActivity({ sbSlug: 'wren' }));
     expect(listener).not.toHaveBeenCalled();
 
-    const match = makeActivity({ agentId: 'myra' });
+    const match = makeActivity({ sbSlug: 'myra' });
     activityBus.publish(match);
     expect(listener).toHaveBeenCalledWith(match);
     unsubscribe();

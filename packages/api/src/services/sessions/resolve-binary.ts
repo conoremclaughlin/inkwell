@@ -17,8 +17,9 @@
  */
 
 import { execFile } from 'child_process';
-import { access } from 'fs/promises';
-import { delimiter, dirname, isAbsolute } from 'path';
+import { access, stat } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import { delimiter, dirname, isAbsolute, join, parse } from 'path';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
 
@@ -27,12 +28,80 @@ const execFileAsync = promisify(execFile);
 interface CacheEntry {
   path: string | null;
   timestamp: number;
+  /**
+   * Resolved from this server's own workspace rather than PATH.
+   *
+   * Revalidation is stricter for these. A PATH entry was vetted by `which`,
+   * which already refuses a non-executable; a local candidate bypasses `which`
+   * entirely, so nothing else checks that it can still be run.
+   */
+  local?: boolean;
 }
 
 const resolvedPaths = new Map<string, CacheEntry>();
 
 /** How long to cache a failed resolution before retrying (5 minutes). */
 const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Binaries this repository ships itself.
+ *
+ * For a third-party CLI (`claude`, `codex`, `gemini`) the ambient PATH is the
+ * right answer — there is one install and the user owns it. For a binary we
+ * BUILD, it is the wrong answer twice over: it depends on whatever PATH the
+ * server happened to inherit, and the result is cached process-wide, so one
+ * bad answer is reused by every subsequent spawn.
+ *
+ * How long it is reused for is NOT "until restart" — an earlier version of this
+ * comment said so, and it was wrong. The cache revalidates (see
+ * `resolveBinaryPath`), so an entry survives only while its path still exists.
+ * That is weaker than it sounds, because a stale build is a real file that
+ * passes the check — it is wrong, not missing. The reuse window is bounded by
+ * nothing we control, which is the reason not to depend on PATH here at all.
+ *
+ * WHAT THIS DOES NOT FIX, because two earlier versions of this comment claimed
+ * otherwise and the claim is load-bearing for anyone reading it later. Myra's
+ * heartbeats died on 2026-09-11 with `unknown option '--require-bootstrap'`,
+ * spawned against an `ink` dated 2026-04-09 in personal-context-protocol--wren.
+ * That was NOT `which` reaching into a sibling worktree. There were two API
+ * servers on the same database, and the second one was RUNNING FROM that
+ * worktree — so it spawned from its own directory, correctly, and its own
+ * directory held a five-month-old build. Resolving against the server's own
+ * checkout, which is what this file now does, would have picked exactly the
+ * same stale binary: `workspaceBinCandidates` walks up from `__dirname`, and
+ * for that server `__dirname` was inside the worktree too. The fix for the
+ * outage is stopping a worktree server from claiming reminders at all (#609).
+ *
+ * This change stands on its own terms regardless: a binary we build should not
+ * resolve through ambient PATH, where the answer depends on whatever shell
+ * environment the server inherited. Eleven worktrees on that machine each carry
+ * a node_modules/.bin/ink and eight were stale — any of them reachable by a
+ * PATH lookup, on some future day with a different cause. The server's own
+ * checkout is the defensible answer because it is the build that ships with the
+ * code doing the spawning, so their flags agree by construction.
+ */
+const FIRST_PARTY_BINARIES = new Set(['ink']);
+
+/**
+ * Every `<ancestor>/node_modules/.bin/<binary>` from this module outward.
+ *
+ * Walking up from __dirname rather than process.cwd() is the point — cwd is
+ * ambient state and can be any studio, while __dirname is where the running
+ * server's code actually lives. Nearest ancestor wins.
+ */
+function workspaceBinCandidates(binary: string): string[] {
+  const candidates: string[] = [];
+  const { root } = parse(__dirname);
+  let dir = __dirname;
+  while (true) {
+    candidates.push(join(dir, 'node_modules', '.bin', binary));
+    if (dir === root) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return candidates;
+}
 
 /**
  * Verify that a resolved path actually exists on disk.
@@ -48,6 +117,31 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Verify that a path is something we can actually execute.
+ *
+ * Existence is the wrong test for a candidate we picked ourselves. `access()`
+ * with no mode is F_OK — it says a name resolves, not that it is a file or that
+ * it can be run. A `node_modules/.bin/ink` left at mode 0644 by a failed or
+ * partial install passes F_OK, and so does a DIRECTORY named `ink`. Either one
+ * would be selected here, cached, and then handed to spawn, which fails with
+ * EACCES — and because the selection happened before the PATH fallback, a
+ * perfectly good executable on PATH never got its turn.
+ *
+ * `stat` follows symlinks, so a dangling shim still fails this and correctly
+ * falls through to PATH.
+ */
+async function isUsableExecutable(filePath: string): Promise<boolean> {
+  try {
+    const stats = await stat(filePath);
+    if (!stats.isFile()) return false;
+    await access(filePath, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Resolve a binary name to its full path, with zsh login shell fallback.
  * Returns the binary name unchanged if resolution fails (spawn will produce
  * a clear ENOENT error).
@@ -56,12 +150,19 @@ export async function resolveBinaryPath(binary: string): Promise<string> {
   const cached = resolvedPaths.get(binary);
   if (cached) {
     if (cached.path) {
-      // Successful resolution — verify it still exists (nvm version switch, etc.)
-      if (await pathExists(cached.path)) {
+      // Successful resolution — verify it is still usable (nvm version switch,
+      // a reinstall that dropped the mode bit, etc.). A locally-selected path
+      // has to clear the same bar it was selected on: it never went through
+      // `which`, so this is the only thing standing between a shim that lost
+      // its +x and an EACCES on every spawn for the life of the process.
+      const stillUsable = cached.local
+        ? await isUsableExecutable(cached.path)
+        : await pathExists(cached.path);
+      if (stillUsable) {
         return cached.path;
       }
-      // Stale cache — path no longer exists, re-resolve
-      logger.warn(`Cached path for ${binary} no longer exists: ${cached.path}. Re-resolving.`);
+      // Stale cache — path is gone or no longer runnable, re-resolve
+      logger.warn(`Cached path for ${binary} is no longer usable: ${cached.path}. Re-resolving.`);
       resolvedPaths.delete(binary);
     } else {
       // Failed resolution — check if TTL has expired
@@ -72,6 +173,34 @@ export async function resolveBinaryPath(binary: string): Promise<string> {
       logger.info(`Retrying resolution for ${binary} (failure cache expired)`);
       resolvedPaths.delete(binary);
     }
+  }
+
+  // 0. First-party binaries resolve against the server's own checkout, never
+  //    the ambient PATH. Deterministic, and immune to sibling worktrees.
+  if (FIRST_PARTY_BINARIES.has(binary)) {
+    for (const candidate of workspaceBinCandidates(binary)) {
+      if (await isUsableExecutable(candidate)) {
+        resolvedPaths.set(binary, { path: candidate, timestamp: Date.now(), local: true });
+        logger.info(`Resolved ${binary} from the server's own workspace: ${candidate}`);
+        return candidate;
+      }
+      // Present but not runnable — a directory, or a file without +x. Preferring
+      // it would mask a working PATH executable and fail at spawn with EACCES,
+      // so skip it and keep looking. Worth a line: a shim that exists and cannot
+      // run is a broken install, and silence here would make it look absent.
+      if (await pathExists(candidate)) {
+        logger.warn(
+          `${binary} candidate exists but is not an executable file, skipping: ${candidate}`
+        );
+      }
+    }
+    // Falling through to PATH means this checkout has no build of its own
+    // binary. That is recoverable but it is also how a stale sibling gets
+    // picked, so say so rather than resolving quietly.
+    logger.warn(
+      `${binary} is first-party but absent from this server's workspace — ` +
+        `falling back to PATH, which may resolve a stale build from another worktree.`
+    );
   }
 
   // 1. Try current process PATH

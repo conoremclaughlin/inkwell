@@ -10,7 +10,7 @@ import chalk from 'chalk';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { decodeJwtPayload, isTokenExpired, loadAuth } from '../auth/tokens.js';
-import { resolveAgentId, resolveBackend } from '../backends/index.js';
+import { resolveSlug, resolveBackend } from '../backends/index.js';
 import { readIdentityJson } from '../backends/identity.js';
 import { getPcpServerUrl } from '../lib/pcp-mcp.js';
 
@@ -186,7 +186,7 @@ export function getMcpConfigStatus(cwd: string): McpConfigStatus {
 async function statusCommand(options: { backend?: string }): Promise<void> {
   const cwd = process.cwd();
   const identity = readIdentityJson(cwd);
-  const agentId = resolveAgentId() || 'unresolved';
+  const sbSlug = resolveSlug() || 'unresolved';
   const backend = normalizeBackend(resolveBackend(options.backend));
   const hookConfig = getHookConfigPath(backend);
 
@@ -200,7 +200,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
   const pcpServerUrl = getPcpServerUrl();
 
   console.log(chalk.bold('\nSB Status\n'));
-  console.log(`  ${chalk.bold('Agent:')}   ${agentId}`);
+  console.log(`  ${chalk.bold('Agent:')}   ${sbSlug}`);
   console.log(`  ${chalk.bold('Backend:')} ${backend}`);
   if (identity?.sbId) {
     console.log(`  ${chalk.bold('Identity:')} ${chalk.dim(identity.sbId)}`);

@@ -25,7 +25,7 @@ export interface SpineThreadRow {
   keyId: string | null;
   title: string | null;
   status: string;
-  createdByAgentId: string;
+  createdBySlug: string;
   updatedAt: string;
   closedAt: string | null;
   participants: string[];
@@ -33,7 +33,7 @@ export interface SpineThreadRow {
 
 export interface SpineSessionRow {
   id: string;
-  agentId: string | null;
+  sbSlug: string | null;
   lifecycle: string | null;
   status: string | null;
   currentPhase: string | null;
@@ -49,12 +49,12 @@ export interface SpineStudioRow {
   id: string;
   slug: string | null;
   branch: string;
-  agentId: string;
+  sbSlug: string;
   /** Studio affinity — the key this studio is dedicated to, if any. */
   threadKey: string | null;
   /** Live occupancy — the key the current lease was acquired for. */
   leaseThreadKey: string | null;
-  leaseAgentId: string | null;
+  leaseSlug: string | null;
   updatedAt: string;
 }
 
@@ -84,13 +84,13 @@ export interface ThreadSpine {
   thread: {
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     participants: string[];
     closedAt: string | null;
   } | null;
   sessions: Array<{
     id: string;
-    agentId: string | null;
+    sbSlug: string | null;
     lifecycle: string | null;
     status: string | null;
     phase: string | null;
@@ -103,10 +103,10 @@ export interface ThreadSpine {
     id: string;
     slug: string | null;
     branch: string;
-    agentId: string;
+    sbSlug: string;
     /** Dedicated to this key, currently leased for it, or both. */
     relation: 'affinity' | 'lease' | 'both';
-    leaseAgentId: string | null;
+    leaseSlug: string | null;
     updatedAt: string;
   }>;
   taskGroups: Array<{
@@ -184,7 +184,7 @@ const OCCUPANCY_EVENTS = new Set(['acquired', 'released', 'expired', 'reclaimed'
 
 export interface StudioLeaseEventRow {
   studioId: string;
-  agentId: string | null;
+  sbSlug: string | null;
   event: string;
   createdAt: string;
 }
@@ -221,7 +221,7 @@ export function aggregateStudioHistory(events: StudioLeaseEventRow[]): StudioHis
     if (!entry) {
       byStudio.set(ev.studioId, {
         studioId: ev.studioId,
-        agents: new Set(ev.agentId ? [ev.agentId] : []),
+        agents: new Set(ev.sbSlug ? [ev.sbSlug] : []),
         firstAtMs: ms,
         lastAtMs: ms,
         firstAt: ev.createdAt,
@@ -230,7 +230,7 @@ export function aggregateStudioHistory(events: StudioLeaseEventRow[]): StudioHis
       });
       continue;
     }
-    if (ev.agentId) entry.agents.add(ev.agentId);
+    if (ev.sbSlug) entry.agents.add(ev.sbSlug);
     if (ms < entry.firstAtMs) {
       entry.firstAtMs = ms;
       entry.firstAt = ev.createdAt;
@@ -295,7 +295,7 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
     spine.thread = {
       title: t.title,
       status: t.status,
-      createdByAgentId: t.createdByAgentId,
+      createdBySlug: t.createdBySlug,
       participants: t.participants,
       closedAt: t.closedAt,
     };
@@ -318,7 +318,7 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
       const spine = spineFor(key);
       spine.sessions.push({
         id: s.id,
-        agentId: s.agentId,
+        sbSlug: s.sbSlug,
         lifecycle: s.lifecycle,
         status: s.status,
         phase: s.currentPhase,
@@ -326,7 +326,7 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
         updatedAt: s.updatedAt,
         studioId: s.studioId,
       });
-      if (s.agentId) spine.participants.add(s.agentId);
+      if (s.sbSlug) spine.participants.add(s.sbSlug);
       spine.sources.add('session');
       spine.lastActivityAt = laterIso(spine.lastActivityAt, s.updatedAt);
     }
@@ -344,13 +344,13 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
         id: st.id,
         slug: st.slug,
         branch: st.branch,
-        agentId: st.agentId,
+        sbSlug: st.sbSlug,
         relation,
-        leaseAgentId: relation === 'affinity' ? null : st.leaseAgentId,
+        leaseSlug: relation === 'affinity' ? null : st.leaseSlug,
         updatedAt: st.updatedAt,
       });
-      if (relation !== 'affinity' && st.leaseAgentId) {
-        spine.participants.add(st.leaseAgentId);
+      if (relation !== 'affinity' && st.leaseSlug) {
+        spine.participants.add(st.leaseSlug);
       }
       spine.sources.add('studio');
       // Deliberately NOT folded into lastActivityAt: studio rows are touched

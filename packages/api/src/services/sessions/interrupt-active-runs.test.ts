@@ -39,10 +39,10 @@ import type { ActiveRun } from './active-runs.js';
 const run = (over: Partial<ActiveRun> = {}): ActiveRun => ({
   sessionId: 'sess-1',
   userId: 'user-1',
-  agentId: 'lumen',
+  sbSlug: 'lumen',
   backend: 'codex-cli',
   threadKey: 'pr:485',
-  senderAgentId: 'wren',
+  senderSlug: 'wren',
   startedAt: 1_000,
   ...over,
 });
@@ -1239,7 +1239,7 @@ describe('turn_interrupted activity event', () => {
 
     expect(logActivity).toHaveBeenCalledTimes(1);
     expect(logActivity.mock.calls[0]![0]).toMatchObject({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       type: 'error',
       subtype: 'turn_interrupted',
       sessionId: 'sess-1',

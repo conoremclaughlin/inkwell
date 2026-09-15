@@ -74,7 +74,7 @@ function cleanupTestRepo(): void {
 describe('Studio Identity', () => {
   it('should create valid identity JSON structure', () => {
     const identity = {
-      agentId: 'wren',
+      sbSlug: 'wren',
       context: 'studio-test-feature',
       description: 'Studio: test-feature',
       studio: 'test-feature',
@@ -83,17 +83,17 @@ describe('Studio Identity', () => {
       createdBy: 'test@test.com',
     };
 
-    expect(identity.agentId).toBe('wren');
+    expect(identity.sbSlug).toBe('wren');
     expect(identity.context).toContain('studio-');
     expect(identity.branch).toMatch(/^wren\/studio\//);
     expect(identity.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('should allow different agent IDs for different studios', () => {
-    const wrenStudio = { agentId: 'wren', studio: 'frontend' };
-    const bensonStudio = { agentId: 'benson', studio: 'backend' };
+  it('should allow different SB slugs for different studios', () => {
+    const wrenStudio = { sbSlug: 'wren', studio: 'frontend' };
+    const bensonStudio = { sbSlug: 'benson', studio: 'backend' };
 
-    expect(wrenStudio.agentId).not.toBe(bensonStudio.agentId);
+    expect(wrenStudio.sbSlug).not.toBe(bensonStudio.sbSlug);
     expect(wrenStudio.studio).not.toBe(bensonStudio.studio);
   });
 });
@@ -225,7 +225,7 @@ describe('Studio PCP Identity Integration', () => {
     mkdirSync(pcpDir, { recursive: true });
 
     const identity = {
-      agentId: 'wren',
+      sbSlug: 'wren',
       context: 'studio-feature5',
       description: 'Studio: feature5',
       studio: 'feature5',
@@ -240,7 +240,7 @@ describe('Studio PCP Identity Integration', () => {
     expect(existsSync(identityPath)).toBe(true);
 
     const savedIdentity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-    expect(savedIdentity.agentId).toBe('wren');
+    expect(savedIdentity.sbSlug).toBe('wren');
     expect(savedIdentity.studio).toBe('feature5');
   });
 
@@ -264,11 +264,11 @@ describe('Studio PCP Identity Integration', () => {
 
     writeFileSync(
       join(ws1Path, '.ink', 'identity.json'),
-      JSON.stringify({ agentId: 'wren', context: 'studio-frontend' }, null, 2)
+      JSON.stringify({ sbSlug: 'wren', context: 'studio-frontend' }, null, 2)
     );
     writeFileSync(
       join(ws2Path, '.ink', 'identity.json'),
-      JSON.stringify({ agentId: 'wren', context: 'studio-backend' }, null, 2)
+      JSON.stringify({ sbSlug: 'wren', context: 'studio-backend' }, null, 2)
     );
 
     // Verify both exist with different contexts
@@ -277,7 +277,7 @@ describe('Studio PCP Identity Integration', () => {
 
     expect(id1.context).toBe('studio-frontend');
     expect(id2.context).toBe('studio-backend');
-    expect(id1.agentId).toBe(id2.agentId); // Same agent, different contexts
+    expect(id1.sbSlug).toBe(id2.sbSlug); // Same agent, different contexts
   });
 });
 
@@ -289,7 +289,7 @@ describe('Studio Naming Conventions', () => {
     expect(expectedDir).toBe('test-repo--my-feature');
   });
 
-  it('should use agentId/studio/ prefix for branch names', () => {
+  it('should use sbSlug/studio/ prefix for branch names', () => {
     const studioName = 'auth-refactor';
     const expectedBranch = `wren/studio/${studioName}`;
 

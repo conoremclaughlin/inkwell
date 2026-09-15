@@ -49,7 +49,7 @@ describe('ActivityStreamRepository', () => {
 
       const result = await repo.logActivity({
         userId: 'user-456',
-        agentId: 'myra',
+        sbSlug: 'myra',
         type: 'message_in',
         content: 'Hello from Telegram!',
         platform: 'telegram',
@@ -60,7 +60,7 @@ describe('ActivityStreamRepository', () => {
 
       expect(result.id).toBe('act-123');
       expect(result.type).toBe('message_in');
-      expect(result.agentId).toBe('myra');
+      expect(result.sbSlug).toBe('myra');
       expect(result.platform).toBe('telegram');
       expect(result.platformMessageId).toBe('tg-msg-789');
       expect(result.isDm).toBe(true);
@@ -96,7 +96,7 @@ describe('ActivityStreamRepository', () => {
 
       const result = await repo.logActivity({
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
         type: 'tool_call',
         content: 'Searching for files...',
         subtype: 'Glob',
@@ -119,7 +119,7 @@ describe('ActivityStreamRepository', () => {
       await expect(
         repo.logActivity({
           userId: 'user-456',
-          agentId: 'myra',
+          sbSlug: 'myra',
           type: 'message_in',
           content: 'Test',
         })
@@ -157,7 +157,7 @@ describe('ActivityStreamRepository', () => {
 
       const result = await repo.logMessage({
         userId: 'user-456',
-        agentId: 'myra',
+        sbSlug: 'myra',
         direction: 'in',
         content: 'Hey Myra, can you help me with something?',
         sessionId: 'session-abc',
@@ -205,7 +205,7 @@ describe('ActivityStreamRepository', () => {
 
       const result = await repo.logMessage({
         userId: 'user-456',
-        agentId: 'myra',
+        sbSlug: 'myra',
         direction: 'out',
         content: 'Of course! What do you need help with?',
         sessionId: 'session-abc',
@@ -251,7 +251,7 @@ describe('ActivityStreamRepository', () => {
 
       const result = await repo.logMessage({
         userId: 'user-456',
-        agentId: 'myra',
+        sbSlug: 'myra',
         direction: 'in',
         content: 'Check-in on the mission',
         platform: 'telegram',

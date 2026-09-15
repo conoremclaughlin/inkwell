@@ -46,7 +46,7 @@ describe('studio sandbox planning', () => {
       join(studioPath, '.ink', 'identity.json'),
       JSON.stringify(
         {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           studio: 'alpha',
           studioId: 'studio-alpha',
           branch: 'lumen/studio/alpha',

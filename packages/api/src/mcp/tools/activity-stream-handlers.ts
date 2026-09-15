@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import type {
   ActivityType,
@@ -65,7 +65,7 @@ const activityStatusSchema = z.enum(['pending', 'running', 'completed', 'failed'
 
 export const logActivitySchema = z.object({
   ...userIdentifierFields,
-  agentId: z.string().describe('Agent identifier (e.g., "wren", "myra", "benson")'),
+  sbSlug: z.string().describe('Agent identifier (e.g., "wren", "myra", "benson")'),
   type: activityTypeSchema.describe('Type of activity'),
   content: z.string().describe('Human-readable content/description of the activity'),
   sessionId: z.string().guid().optional().describe('Session ID if within a session'),
@@ -102,7 +102,7 @@ export const logActivitySchema = z.object({
 
 export const logMessageSchema = z.object({
   ...userIdentifierFields,
-  agentId: z.string().describe('Agent identifier'),
+  sbSlug: z.string().describe('Agent identifier'),
   direction: z.enum(['in', 'out']).describe('Message direction: "in" for received, "out" for sent'),
   content: z.string().describe('Message content'),
   sessionId: z.string().guid().optional().describe('Session ID'),
@@ -117,7 +117,7 @@ export const logMessageSchema = z.object({
 export const getActivitySchema = z.object({
   ...userIdentifierFields,
   sessionId: z.string().guid().optional().describe('Filter by session'),
-  agentId: z.string().optional().describe('Filter by agent'),
+  sbSlug: z.string().optional().describe('Filter by agent'),
   types: z.array(activityTypeSchema).optional().describe('Filter by activity types'),
   contactId: z.string().guid().optional().describe('Filter by contact'),
   platform: z.string().optional().describe('Filter by activity platform'),
@@ -186,7 +186,7 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
 
   const activity = await dataComposer.repositories.activityStream.logActivity({
     userId: user.id,
-    agentId: getEffectiveAgentId(params.agentId) ?? params.agentId,
+    sbSlug: getEffectiveSlug(params.sbSlug) ?? params.sbSlug,
     type: params.type as ActivityType,
     content: params.content,
     sessionId: params.sessionId,
@@ -207,7 +207,7 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
   logger.info(`Activity logged for user ${user.id}`, {
     activityId: activity.id,
     type: activity.type,
-    agentId: activity.agentId,
+    sbSlug: activity.sbSlug,
   });
 
   return {
@@ -222,7 +222,7 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
             activity: {
               id: activity.id,
               type: activity.type,
-              agentId: activity.agentId,
+              sbSlug: activity.sbSlug,
               createdAt: activity.createdAt.toISOString(),
             },
           },
@@ -243,7 +243,7 @@ export async function handleLogMessage(args: unknown, dataComposer: DataComposer
 
   const activity = await dataComposer.repositories.activityStream.logMessage({
     userId: user.id,
-    agentId: getEffectiveAgentId(params.agentId) ?? params.agentId,
+    sbSlug: getEffectiveSlug(params.sbSlug) ?? params.sbSlug,
     direction: params.direction,
     content: params.content,
     sessionId: params.sessionId,
@@ -294,7 +294,7 @@ export async function handleGetActivity(args: unknown, dataComposer: DataCompose
 
   const activities = await dataComposer.repositories.activityStream.getActivity(user.id, {
     sessionId: params.sessionId,
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     types: params.types as ActivityType[],
     contactId: params.contactId,
     platform: params.platform,
@@ -323,7 +323,7 @@ export async function handleGetActivity(args: unknown, dataComposer: DataCompose
               id: a.id,
               type: a.type,
               subtype: a.subtype,
-              agentId: a.agentId,
+              sbSlug: a.sbSlug,
               content: a.content,
               platform: a.platform,
               contactId: a.contactId,
@@ -378,7 +378,7 @@ export async function handleGetConversationHistory(args: unknown, dataComposer: 
               type: m.type,
               direction: m.type === 'message_in' ? 'in' : 'out',
               content: m.content,
-              agentId: m.agentId,
+              sbSlug: m.sbSlug,
               platform: m.platform,
               platformMessageId: m.platformMessageId,
               contactId: m.contactId,
@@ -430,7 +430,7 @@ export async function handleGetSessionContext(args: unknown, dataComposer: DataC
               id: a.id,
               type: a.type,
               subtype: a.subtype,
-              agentId: a.agentId,
+              sbSlug: a.sbSlug,
               content: a.content,
               platform: a.platform,
               contactId: a.contactId,

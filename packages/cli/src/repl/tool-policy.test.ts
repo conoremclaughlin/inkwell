@@ -342,7 +342,7 @@ describe('ToolPolicyState', () => {
     policy.allowTool('send_to_inbox', { scope: 'workspace', id: 'ws-1' });
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
 
-    policy.setContext({ workspaceId: 'ws-1', agentId: 'lumen' });
+    policy.setContext({ workspaceId: 'ws-1', sbSlug: 'lumen' });
     policy.allowTool('trigger_agent', { scope: 'agent', id: 'lumen' });
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
     expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(false);
@@ -417,7 +417,7 @@ describe('ToolPolicyState', () => {
 
   it('enforces session visibility guardrails across scopes', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.setContext({ agentId: 'lumen', workspaceId: 'ws-1', studioId: 'studio-1' });
+    policy.setContext({ sbSlug: 'lumen', workspaceId: 'ws-1', studioId: 'studio-1' });
 
     expect(policy.getSessionVisibility()).toBe('agent');
 
@@ -427,14 +427,14 @@ describe('ToolPolicyState', () => {
       policy.canAccessSession({
         action: 'list',
         requester: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-1',
           sessionId: 'sess-1',
           threadKey: 'pr:1',
         },
         target: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-1',
           sessionId: 'sess-2',
@@ -447,14 +447,14 @@ describe('ToolPolicyState', () => {
       policy.canAccessSession({
         action: 'list',
         requester: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-1',
           sessionId: 'sess-1',
           threadKey: 'pr:1',
         },
         target: {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           workspaceId: 'ws-1',
           studioId: 'studio-2',
           sessionId: 'sess-3',
@@ -479,7 +479,7 @@ describe('ToolPolicyState', () => {
 
   it('runs visibility matrix across all visibility modes and actions', () => {
     const requester = {
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       workspaceId: 'ws-1',
       studioId: 'studio-1',
       sessionId: 'sess-1',
@@ -487,42 +487,42 @@ describe('ToolPolicyState', () => {
     };
     const targets = {
       self: {
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         workspaceId: 'ws-1',
         studioId: 'studio-1',
         sessionId: 'sess-1',
         threadKey: 'pr:1',
       },
       sameThread: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-9',
         studioId: 'studio-9',
         sessionId: 'sess-2',
         threadKey: 'pr:1',
       },
       sameStudio: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-1',
         studioId: 'studio-1',
         sessionId: 'sess-3',
         threadKey: 'pr:3',
       },
       sameWorkspace: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-1',
         studioId: 'studio-8',
         sessionId: 'sess-4',
         threadKey: 'pr:4',
       },
       sameAgent: {
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         workspaceId: 'ws-8',
         studioId: 'studio-8',
         sessionId: 'sess-5',
         threadKey: 'pr:5',
       },
       crossAll: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: 'ws-9',
         studioId: 'studio-9',
         sessionId: 'sess-6',

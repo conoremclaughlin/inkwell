@@ -54,9 +54,9 @@ describe('isoDateTime', () => {
 describe('create_reminder accepts the time Myra actually sent', () => {
   it('takes an offset timestamp for runAt', () => {
     const parsed = createReminderSchema.safeParse({
-      title: 'Spravato prep — eat before 9 AM',
+      title: 'Eat before 9 AM',
       runAt: '2026-09-02T07:30:00-07:00',
-      agentId: 'myra',
+      sbSlug: 'myra',
     });
 
     expect(parsed.success).toBe(true);

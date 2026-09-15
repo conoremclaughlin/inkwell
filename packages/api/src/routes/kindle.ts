@@ -68,10 +68,10 @@ export function createKindleRouter(): Router {
   router.post('/create-token', async (req: Request, res: Response) => {
     try {
       const { userId } = req as ChatAuthRequest;
-      const { agentId, expiresInHours } = req.body;
+      const { sbSlug, expiresInHours } = req.body;
 
       const kindleService = getKindleService();
-      const token = await kindleService.createKindleToken(userId, agentId, expiresInHours || 168);
+      const token = await kindleService.createKindleToken(userId, sbSlug, expiresInHours || 168);
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';
       const inviteUrl = `${webPortalUrl}/kindle/${token.token}`;
@@ -107,7 +107,7 @@ export function createKindleRouter(): Router {
 
       res.json({
         kindleId: lineage.id,
-        agentId: lineage.childAgentId,
+        sbSlug: lineage.childSlug,
         onboardingStatus: lineage.onboardingStatus,
       });
     } catch (error) {
@@ -164,7 +164,7 @@ export function createKindleRouter(): Router {
 
       res.json({
         kindle: lineage,
-        agentId: lineage.childAgentId,
+        sbSlug: lineage.childSlug,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to complete onboarding';

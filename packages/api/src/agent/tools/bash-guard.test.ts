@@ -355,24 +355,24 @@ describe('Bash Guard', () => {
 
     describe('dangerous command blocking', () => {
       it('blocks fork bombs', () => {
-        const result = guardBashCommand(':(){ :|:& };:', { agentId: 'wren' });
+        const result = guardBashCommand(':(){ :|:& };:', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
         expect(result.reason).toContain('fork bomb');
       });
 
       it('blocks rm -rf /', () => {
-        const result = guardBashCommand('rm -rf /', { agentId: 'wren' });
+        const result = guardBashCommand('rm -rf /', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
       });
 
       it('allows safe commands', () => {
-        const result = guardBashCommand('echo hello', { agentId: 'wren' });
+        const result = guardBashCommand('echo hello', { sbSlug: 'wren' });
         expect(result.allowed).toBe(true);
       });
 
       it('can be disabled', () => {
         const result = guardBashCommand(':(){ :|:& };:', {
-          agentId: 'wren',
+          sbSlug: 'wren',
           blockDangerousCommands: false,
         });
         expect(result.allowed).toBe(true);
@@ -381,7 +381,7 @@ describe('Bash Guard', () => {
 
     describe('kill scope enforcement', () => {
       it('blocks kill targeting unregistered PIDs', () => {
-        const result = guardBashCommand('kill 1234', { agentId: 'wren' });
+        const result = guardBashCommand('kill 1234', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
         expect(result.reason).toContain('not owned by this agent');
       });
@@ -390,7 +390,7 @@ describe('Bash Guard', () => {
         const registry = getProcessRegistry();
         registry.register('wren', 1234, 'sleep 100');
 
-        const result = guardBashCommand('kill 1234', { agentId: 'wren' });
+        const result = guardBashCommand('kill 1234', { sbSlug: 'wren' });
         expect(result.allowed).toBe(true);
       });
 
@@ -398,7 +398,7 @@ describe('Bash Guard', () => {
         const registry = getProcessRegistry();
         registry.register('lumen', 1234, 'sleep 100');
 
-        const result = guardBashCommand('kill 1234', { agentId: 'wren' });
+        const result = guardBashCommand('kill 1234', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
         expect(result.reason).toContain('1234');
       });
@@ -408,7 +408,7 @@ describe('Bash Guard', () => {
         registry.register('wren', 100, 'a');
         registry.register('wren', 200, 'b');
 
-        const result = guardBashCommand('kill 100 200', { agentId: 'wren' });
+        const result = guardBashCommand('kill 100 200', { sbSlug: 'wren' });
         expect(result.allowed).toBe(true);
       });
 
@@ -416,32 +416,32 @@ describe('Bash Guard', () => {
         const registry = getProcessRegistry();
         registry.register('wren', 100, 'a');
 
-        const result = guardBashCommand('kill 100 200', { agentId: 'wren' });
+        const result = guardBashCommand('kill 100 200', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
         expect(result.reason).toContain('200');
       });
 
       it('blocks pkill (name-based, fail-closed)', () => {
-        const result = guardBashCommand('pkill -f "old-server"', { agentId: 'wren' });
+        const result = guardBashCommand('pkill -f "old-server"', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
         expect(result.reason).toContain('pkill/killall');
       });
 
       it('blocks kill with variable expansion', () => {
-        const result = guardBashCommand('kill $PPID', { agentId: 'wren' });
+        const result = guardBashCommand('kill $PPID', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
         expect(result.reason).toContain('variable/dynamic');
       });
 
       it('blocks kill 0 (process group)', () => {
-        const result = guardBashCommand('kill 0', { agentId: 'wren' });
+        const result = guardBashCommand('kill 0', { sbSlug: 'wren' });
         expect(result.allowed).toBe(false);
         expect(result.reason).toContain('process group');
       });
 
       it('can be disabled', () => {
         const result = guardBashCommand('kill 1234', {
-          agentId: 'wren',
+          sbSlug: 'wren',
           enforceKillScope: false,
         });
         expect(result.allowed).toBe(true);

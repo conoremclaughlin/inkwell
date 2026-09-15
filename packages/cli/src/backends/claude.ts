@@ -163,7 +163,7 @@ export class ClaudeAdapter implements BackendAdapter {
 
   prepare(config: BackendConfig): PreparedBackend {
     const identityPrompt = buildIdentityPrompt(
-      config.agentId,
+      config.sbSlug,
       undefined,
       config.systemPromptOverride
     );
@@ -345,7 +345,7 @@ export class ClaudeAdapter implements BackendAdapter {
     const contextToken = encodeContextToken({
       sessionId: config.pcpSessionId || '',
       studioId: config.studioId || '',
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       cliAttached: true,
       runtime: 'claude',
     });
@@ -371,7 +371,8 @@ export class ClaudeAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
-        AGENT_ID: config.agentId,
+        SB_SLUG: config.sbSlug,
+        AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),

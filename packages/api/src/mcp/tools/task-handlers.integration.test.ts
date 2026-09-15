@@ -48,12 +48,12 @@ const canRun = !!SUPABASE_URL && !!SUPABASE_KEY;
 
 // Bypass auth helpers that require request context in a server
 vi.mock('../../auth/enforce-identity', () => ({
-  getEffectiveAgentId: vi.fn().mockReturnValue('wren'),
+  getEffectiveSlug: vi.fn().mockReturnValue('wren'),
 }));
 vi.mock('../../utils/request-context', () => ({
   setSessionContext: vi.fn(),
   pinSessionAgent: vi.fn(),
-  getPinnedAgentId: vi.fn().mockReturnValue(null),
+  getPinnedSlug: vi.fn().mockReturnValue(null),
   getRequestContext: vi.fn().mockReturnValue(undefined),
 }));
 // resolveUser is normally called via OAuth context; short-circuit it.

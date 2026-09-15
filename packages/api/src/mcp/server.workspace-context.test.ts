@@ -1,14 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
+    ...(await import('../test/fake-env')).fakeEnv,
     MCP_TRANSPORT: 'http',
     MCP_HTTP_PORT: 0,
     MCP_REQUIRE_OAUTH: false,
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
     SUPABASE_ANON_KEY: 'test-anon',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
   },
 }));
 
@@ -121,7 +119,7 @@ describe('MCPServer workspace context resolution', () => {
     const result = await (server as any).resolveWorkspaceContextForMcpRequest(req, {
       userId: 'user-1',
       email: 'user@example.com',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
     });
 
     expect(result).toEqual({ workspaceId: 'ws-header', workspaceSource: 'header' });
@@ -140,7 +138,7 @@ describe('MCPServer workspace context resolution', () => {
       (server as any).resolveWorkspaceContextForMcpRequest(req, {
         userId: 'user-1',
         email: 'user@example.com',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
       })
     ).rejects.toThrow('Workspace not found or not accessible');
   });
@@ -159,7 +157,7 @@ describe('MCPServer workspace context resolution', () => {
     const result = await (server as any).resolveWorkspaceContextForMcpRequest(req, {
       userId: 'user-1',
       email: 'user@example.com',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
     });
 
     expect(result).toEqual({ workspaceId: 'ws-derived', workspaceSource: 'derived' });

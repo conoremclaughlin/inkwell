@@ -15,11 +15,14 @@ import {
   ListTodo,
   MessageSquare,
   MonitorDot,
+  Send,
   ShieldCheck,
   Workflow,
   Wrench,
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
+import { ReplyComposer, senderLabel } from '@/components/threads/reply-composer';
+import { ReopenThreadButton } from '@/components/threads/reopen-button';
 import clsx from 'clsx';
 
 // ─── Types mirroring GET /api/admin/threads ───
@@ -33,7 +36,7 @@ interface SpineIdentity {
 
 interface SpineSession {
   id: string;
-  agentId: string | null;
+  sbSlug: string | null;
   lifecycle: string | null;
   status: string | null;
   phase: string | null;
@@ -46,9 +49,9 @@ interface SpineStudio {
   id: string;
   slug: string | null;
   branch: string;
-  agentId: string;
+  sbSlug: string;
   relation: 'affinity' | 'lease' | 'both';
-  leaseAgentId: string | null;
+  leaseSlug: string | null;
   updatedAt: string;
 }
 
@@ -67,7 +70,7 @@ interface ThreadSpine {
   thread: {
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     participants: string[];
     closedAt: string | null;
   } | null;
@@ -112,16 +115,23 @@ interface ThreadMessagesResponse {
     threadKey: string;
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     createdAt: string;
     closedAt: string | null;
   } | null;
   messages: Array<{
     id: string;
-    senderAgentId: string;
+    senderSlug: string;
     content: string;
     messageType: string;
     priority: string;
+    /**
+     * A person's reply carries { sentBy: 'user' } here while its sender slot
+     * says 'unknown' (see POST /threads/reply). Until the principal columns
+     * of spec inkmail-thread-scope §3 land, this marker is how the page tells
+     * a person from a genuinely unattributed sender.
+     */
+    metadata?: Record<string, unknown> | null;
     createdAt: string;
   }>;
   meta?: FeedMeta;
@@ -596,6 +606,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
               no thread yet
             </Badge>
           )}
+          {spine.thread?.status === 'closed' && <ReopenThreadButton threadKey={spine.key} />}
         </div>
         {displayTitle(spine) && <div className="mt-1 text-sm">{displayTitle(spine)}</div>}
         <div className="mt-1 text-xs text-muted-foreground">
@@ -679,7 +690,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                       : 'bg-muted-foreground/40'
                   )}
                 />
-                <span className="font-medium">{s.agentId ?? 'unknown'}</span>
+                <span className="font-medium">{s.sbSlug ?? 'unknown'}</span>
                 {s.phase && <span className="truncate text-muted-foreground">{s.phase}</span>}
                 <span className="rounded bg-muted px-1 py-0.5 text-[10px]" title={RELATION_TOOLTIP}>
                   {RELATION_LABELS[s.relation]}
@@ -707,7 +718,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                 <span className="ml-auto shrink-0 rounded bg-muted px-1 py-0.5 text-[10px]">
                   {st.relation === 'affinity'
                     ? 'dedicated'
-                    : `leased by ${st.leaseAgentId ?? st.agentId}`}
+                    : `leased by ${st.leaseSlug ?? st.sbSlug}`}
                 </span>
               </div>
             ))}
@@ -774,7 +785,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                   )}
                   <div className="rounded-md border px-3 py-2">
                     <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                      <span className="font-medium text-foreground">{m.senderAgentId}</span>
+                      <span className="font-medium text-foreground">{senderLabel(m)}</span>
                       {m.messageType !== 'message' && (
                         <span className="rounded bg-muted px-1 py-0.5">{m.messageType}</span>
                       )}
@@ -792,6 +803,16 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
           </div>
         )}
       </section>
+
+      {spine.sources.includes('thread') && (
+        <section>
+          <SectionLabel icon={Send} label="Reply" />
+          <ReplyComposer
+            threadKey={spine.key}
+            closed={messagesData?.thread?.status === 'closed' || !!messagesData?.thread?.closedAt}
+          />
+        </section>
+      )}
     </div>
   );
 }

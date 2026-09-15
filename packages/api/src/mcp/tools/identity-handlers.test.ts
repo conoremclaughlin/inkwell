@@ -65,7 +65,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'wren',
+          sbSlug: 'wren',
           name: 'Wren',
           role: 'Development collaborator',
           description: 'Claude Code assistant',
@@ -79,7 +79,7 @@ describe('Identity Handlers', () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
       expect(parsed.message).toBe('Identity created');
-      expect(parsed.identity.agentId).toBe('wren');
+      expect(parsed.identity.sbSlug).toBe('wren');
       expect(parsed.identity.name).toBe('Wren');
       expect(parsed.identity.version).toBe(1);
       expect(mockSupabase.from).toHaveBeenCalledWith('agent_identities');
@@ -109,7 +109,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'wren',
+          sbSlug: 'wren',
           name: 'Wren',
           role: 'Development collaborator',
           heartbeat: '# Heartbeat\n\nOperational notes...',
@@ -120,7 +120,7 @@ describe('Identity Handlers', () => {
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
-      expect(parsed.identity.agentId).toBe('wren');
+      expect(parsed.identity.sbSlug).toBe('wren');
     });
 
     it('should update an existing identity', async () => {
@@ -145,7 +145,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'wren',
+          sbSlug: 'wren',
           name: 'Wren Updated',
           role: 'Development collaborator',
         },
@@ -167,7 +167,7 @@ describe('Identity Handlers', () => {
         handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'wren',
+            sbSlug: 'wren',
             name: 'Wren',
             role: 'Development collaborator',
           },
@@ -208,7 +208,7 @@ describe('Identity Handlers', () => {
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra',
             role: 'Updated role',
           },
@@ -237,7 +237,7 @@ describe('Identity Handlers', () => {
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra',
             role: 'Messaging bridge',
             soul: newSoul,
@@ -261,7 +261,7 @@ describe('Identity Handlers', () => {
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra',
             role: 'Messaging bridge',
             heartbeat: newHeartbeat,
@@ -283,7 +283,7 @@ describe('Identity Handlers', () => {
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'newagent',
+            sbSlug: 'newagent',
             name: 'New Agent',
             role: 'Test role',
           },
@@ -305,7 +305,7 @@ describe('Identity Handlers', () => {
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra Updated',
             role: 'Messaging bridge',
           },
@@ -348,13 +348,13 @@ describe('Identity Handlers', () => {
       mockSupabase._setReturnData(mockIdentityRow);
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
-      expect(parsed.identity.agentId).toBe('wren');
+      expect(parsed.identity.sbSlug).toBe('wren');
       expect(parsed.identity.name).toBe('Wren');
       expect(parsed.identity.values).toEqual(['collaboration']);
     });
@@ -381,7 +381,7 @@ describe('Identity Handlers', () => {
       mockSupabase._setReturnData(mockIdentityRow);
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
@@ -395,7 +395,7 @@ describe('Identity Handlers', () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'nonexistent' },
+        { userId: 'user-123', sbSlug: 'nonexistent' },
         mockDataComposer as never
       );
 
@@ -447,8 +447,8 @@ describe('Identity Handlers', () => {
       expect(parsed.success).toBe(true);
       expect(parsed.identities).toHaveLength(2);
       expect(parsed.count).toBe(2);
-      expect(parsed.identities[0].agentId).toBe('benson');
-      expect(parsed.identities[1].agentId).toBe('wren');
+      expect(parsed.identities[0].sbSlug).toBe('benson');
+      expect(parsed.identities[1].sbSlug).toBe('wren');
     });
 
     it('should return hasHeartbeat and hasSoul flags', async () => {
@@ -543,13 +543,13 @@ describe('Identity Handlers', () => {
       mockSupabase._queueReturnData(mockHistory); // history rows
 
       const result = await handleGetIdentityHistory(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
-      expect(parsed.agentId).toBe('wren');
+      expect(parsed.sbSlug).toBe('wren');
       expect(parsed.history).toHaveLength(1);
       expect(parsed.history[0].version).toBe(1);
       expect(parsed.history[0].changeType).toBe('update');
@@ -599,7 +599,7 @@ describe('Identity Handlers', () => {
       mockSupabase._queueReturnData(mockHistory); // history rows
 
       const result = await handleGetIdentityHistory(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
@@ -621,7 +621,7 @@ describe('Identity Handlers', () => {
       });
 
       const result = await handleGetIdentityHistory(
-        { userId: 'user-123', agentId: 'nonexistent' },
+        { userId: 'user-123', sbSlug: 'nonexistent' },
         mockDataComposer as never
       );
 
@@ -671,7 +671,7 @@ describe('Identity Handlers', () => {
       });
 
       const result = await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -689,7 +689,7 @@ describe('Identity Handlers', () => {
 
       await expect(
         handleRestoreIdentity(
-          { userId: 'user-123', agentId: 'nonexistent', version: 1 },
+          { userId: 'user-123', sbSlug: 'nonexistent', version: 1 },
           mockDataComposer as never
         )
       ).rejects.toThrow('No identity found for agent: nonexistent');
@@ -710,7 +710,7 @@ describe('Identity Handlers', () => {
 
       await expect(
         handleRestoreIdentity(
-          { userId: 'user-123', agentId: 'wren', version: 999 },
+          { userId: 'user-123', sbSlug: 'wren', version: 999 },
           mockDataComposer as never
         )
       ).rejects.toThrow('Version 999 not found in history');
@@ -756,7 +756,7 @@ describe('Identity Handlers', () => {
       });
 
       await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -808,7 +808,7 @@ describe('Identity Handlers', () => {
       });
 
       await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -860,7 +860,7 @@ describe('Identity Handlers', () => {
       });
 
       await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -902,7 +902,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'myra',
+          sbSlug: 'myra',
           name: 'Myra',
           role: 'Front-line AI being',
           soul: 'SOUL v12 + reflection',
@@ -935,7 +935,7 @@ describe('Identity Handlers', () => {
       });
 
       const result = await handleSaveIdentity(
-        { userId: 'user-123', agentId: 'newbie', name: 'Newbie', role: 'New SB' },
+        { userId: 'user-123', sbSlug: 'newbie', name: 'Newbie', role: 'New SB' },
         mockDataComposer as never
       );
 
@@ -953,7 +953,7 @@ describe('Identity Handlers', () => {
       mockSupabase._setArrayData([unscopedTwin, scopedRow]);
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'myra' },
+        { userId: 'user-123', sbSlug: 'myra' },
         mockDataComposer as never
       );
 
@@ -969,7 +969,7 @@ describe('Identity Handlers', () => {
       ]);
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'myra' },
+        { userId: 'user-123', sbSlug: 'myra' },
         mockDataComposer as never
       );
 
@@ -983,7 +983,7 @@ describe('Identity Handlers', () => {
 
     it('the resolver reads the whole candidate set — it never asks the database for a truncated page (PR #595 P1)', async () => {
       mockSupabase._setArrayData([unscopedTwin, scopedRow]);
-      await handleGetIdentity({ userId: 'user-123', agentId: 'myra' }, mockDataComposer as never);
+      await handleGetIdentity({ userId: 'user-123', sbSlug: 'myra' }, mockDataComposer as never);
       const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
       expect(qb.limit).not.toHaveBeenCalled();
     });
@@ -998,7 +998,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'myra',
+          sbSlug: 'myra',
           name: 'Myra',
           role: 'Front-line AI being',
           workspaceId: 'ws-b',
@@ -1024,7 +1024,7 @@ describe('Identity Handlers', () => {
 
       await expect(
         handleSaveIdentity(
-          { userId: 'user-123', agentId: 'myra', name: 'Myra', role: 'Front-line AI being' },
+          { userId: 'user-123', sbSlug: 'myra', name: 'Myra', role: 'Front-line AI being' },
           mockDataComposer as never
         )
       ).rejects.toThrow('Multiple rows found');
@@ -1037,7 +1037,7 @@ describe('Identity Handlers', () => {
       mockSupabase._setArrayData([unscopedTwin, scopedRow]);
 
       const result = await handleGetIdentityHistory(
-        { userId: 'user-123', agentId: 'myra' },
+        { userId: 'user-123', sbSlug: 'myra' },
         mockDataComposer as never
       );
 

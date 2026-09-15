@@ -26,6 +26,7 @@ import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { resolveInkCli, inkCliSpawn } from '../ink-cli.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
 // Absolute wall-clock backstop for a single ink turn — a final safety net for a
@@ -296,8 +297,8 @@ export class InkRunner implements IRunner {
       args.push('--require-bootstrap');
     }
 
-    if (config.agentId) {
-      args.push('--agent', config.agentId);
+    if (config.sbSlug) {
+      args.push('--agent', config.sbSlug);
     }
 
     args.push('--session-id', sessionId);
@@ -367,13 +368,20 @@ export class InkRunner implements IRunner {
     finalTextResponse?: string;
     toolCalls: ToolCall[];
   }> {
-    const inkBin = await resolveBinaryPath('ink');
+    // This checkout's own CLI (or INK_CLI_PATH), run through this server's
+    // node. Never the global link. Only a checkout with no CLI build falls
+    // back to whatever `ink` the server's PATH provides.
+    const ownCli = resolveInkCli();
+    const launch = ownCli
+      ? inkCliSpawn(ownCli)
+      : { command: await resolveBinaryPath('ink'), args: [] as string[] };
+    const inkBin = launch.command;
 
     if (config.pcpSessionId && config.workingDirectory) {
       writeRuntimeSessionHint(
         config.workingDirectory,
         config.pcpSessionId,
-        config.agentId || 'unknown',
+        config.sbSlug || 'unknown',
         'ink',
         randomUUID(),
         config.studioId
@@ -391,20 +399,21 @@ export class InkRunner implements IRunner {
         : null;
 
     // Pass --message via args (not stdin) so ink chat gets it directly
-    const fullArgs = [...args, '--message', message];
+    const fullArgs = [...launch.args, ...args, '--message', message];
 
     const spawnPath = buildSpawnPath(inkBin);
     const sessionEnv = buildSessionEnv({
       pcpSessionId: config.pcpSessionId,
       studioId: config.studioId,
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
     });
 
     const env: Record<string, string> = {
       ...process.env,
       ...sessionEnv,
       PATH: spawnPath,
-      AGENT_ID: config.agentId || '',
+      SB_SLUG: config.sbSlug || '',
+      AGENT_ID: config.sbSlug || '',
       // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
       NODE_ENV: 'production',
       // Server-minted access token so the ink CLI's PcpClient can call /mcp

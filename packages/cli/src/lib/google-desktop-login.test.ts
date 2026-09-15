@@ -224,7 +224,7 @@ describe('credential files', () => {
 
     const path = writeDesktopCredential(dir, credential);
 
-    expect(path).toBe(join(dir, 'me@example.com.json'));
+    expect(path).toBe(join(dir, 'me@example.com' + '.json'));
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(statSync(dir).mode & 0o777).toBe(0o700);
     expect(parseDesktopGoogleCredential(JSON.parse(readFileSync(path, 'utf-8')))).toEqual({

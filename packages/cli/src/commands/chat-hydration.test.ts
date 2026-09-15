@@ -39,7 +39,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
           eid: 2,
           type: 'local_tool_call',
           tool: 'send_response',
-          args: { channel: 'telegram', conversationId: '726555973', content: 'heads-up!' },
+          args: { channel: 'telegram', conversationId: '100200300', content: 'heads-up!' },
           status: 'executed',
           result: { success: true, messageId: 'tg-401' },
         },
@@ -77,7 +77,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     // result included (Ctrl+T is the drill-down for the scrollback teaser)
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls[0].tool).toBe('send_response');
-    expect(result.toolCalls[0].args).toContain('726555973');
+    expect(result.toolCalls[0].args).toContain('100200300');
     expect(result.toolCalls[0].result).toContain('tg-401');
   });
 
@@ -97,7 +97,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
           eid: 2,
           type: 'local_tool_call',
           tool: 'get_inbox',
-          args: { agentId: 'myra' },
+          args: { sbSlug: 'myra' },
           status: 'error',
           error: 'ECONNREFUSED 127.0.0.1:3001',
         },
@@ -753,7 +753,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         tool: 'send_response',
         args: {
           channel: 'telegram',
-          conversationId: '726555973',
+          conversationId: '100200300',
           content: 'Post-session catch-up',
         },
         status: 'executed',
@@ -764,7 +764,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-1',
         activityType: 'message_out',
-        agentId: 'myra',
+        sbSlug: 'myra',
         platform: 'telegram',
         createdAt: '2026-08-12T22:03:00Z',
         content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
@@ -797,7 +797,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-2',
         activityType: 'message_in',
-        agentId: 'myra',
+        sbSlug: 'myra',
         platform: 'telegram',
         content: 'Therapy finished 45 minutes ago!',
       },
@@ -816,7 +816,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-3',
         activityType: 'message_out',
-        agentId: 'myra',
+        sbSlug: 'myra',
         content: 'sent before platform was persisted',
       },
     ]);
@@ -832,7 +832,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-4',
         activityType: 'tool_call',
-        agentId: 'myra',
+        sbSlug: 'myra',
         content: 'list_emails',
       },
       {
@@ -840,7 +840,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         type: 'activity',
         activityId: 'act-5',
         activityType: 'state_change',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         content: 'phase: reviewing',
       },
     ]);
@@ -873,7 +873,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
     type: 'activity',
     activityId: 'act-send',
     activityType: 'message_out',
-    agentId: 'myra',
+    sbSlug: 'myra',
     platform: 'telegram',
     createdAt: '2026-08-12T22:03:00Z',
     content: 'Post-session catch-up: Ruoshan emailed about the picnic.',

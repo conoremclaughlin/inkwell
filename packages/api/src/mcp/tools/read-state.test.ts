@@ -3,7 +3,7 @@ import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-s
 
 const PARAMS = {
   threadId: 'thread-1',
-  agentId: 'wren',
+  sbSlug: 'wren',
   throughMessageId: 'msg-9',
   source: 'test',
 };
@@ -35,7 +35,7 @@ describe('advanceThreadReadPointer', () => {
 
 const INBOX_PARAMS = {
   userId: 'user-1',
-  agentId: 'myra',
+  sbSlug: 'myra',
   throughMessageId: 'msg-9',
   source: 'test',
 };

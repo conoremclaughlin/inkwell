@@ -410,11 +410,11 @@ export class StudioOverflowService {
    */
   async ensureOverflowStudio(opts: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     parentStudio: Studio;
     threadKey: string;
   }): Promise<Studio | null> {
-    const { userId, agentId, threadKey } = opts;
+    const { userId, sbSlug, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
     // Same-thread ensures in this process take turns END TO END — preflight,
     // worktree, setup (up to the dependency install), row — so the second
@@ -425,13 +425,13 @@ export class StudioOverflowService {
     // from another process are still arbitrated by the live-ownership unique
     // index on the insert.
     return withKeyedLock(`overflow-ensure:${userId}:${parentStudio.id}:${threadKey}`, () =>
-      this.ensureOverflowStudioExclusive(userId, agentId, parentStudio, threadKey)
+      this.ensureOverflowStudioExclusive(userId, sbSlug, parentStudio, threadKey)
     );
   }
 
   private async ensureOverflowStudioExclusive(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     parentStudio: Studio,
     threadKey: string
   ): Promise<Studio | null> {
@@ -454,7 +454,7 @@ export class StudioOverflowService {
 
       const created = await this.createWorktree(parentStudio, s.slug, {
         worktreePath: ephemeralWorktreePath({
-          agentId,
+          sbSlug,
           repoRoot: parentStudio.repoRoot,
           leaf: s.slug,
         }),
@@ -490,7 +490,7 @@ export class StudioOverflowService {
           });
           await this.leases.logEvent(userId, revived.id, 'overflow', {
             threadKey,
-            agentId,
+            sbSlug,
             reason: `revived ephemeral studio; parent ${parentStudio.id} leased`,
           });
           return revived;
@@ -514,7 +514,7 @@ export class StudioOverflowService {
       try {
         const studio = await this.studios.create({
           userId,
-          agentId,
+          sbSlug,
           repoRoot: parentStudio.repoRoot,
           worktreePath: created.worktreePath,
           branch: created.branch,
@@ -536,7 +536,7 @@ export class StudioOverflowService {
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
-          agentId,
+          sbSlug,
           reason: `created ephemeral studio; parent ${parentStudio.id} leased`,
         });
         logger.info('[StudioOverflow] Created ephemeral studio', {
@@ -618,13 +618,13 @@ export class StudioOverflowService {
    */
   async ensureParentStudio(opts: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     repoRoot: string;
     /** Canonical identity UUID — authoritative over the display slug. */
     sbId?: string | null;
   }): Promise<Studio | null> {
-    const { userId, agentId, repoRoot, sbId } = opts;
-    const slug = `${path.basename(repoRoot)}--${agentId}`;
+    const { userId, sbSlug, repoRoot, sbId } = opts;
+    const slug = `${path.basename(repoRoot)}--${sbSlug}`;
 
     const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
     if (existing) {
@@ -644,7 +644,7 @@ export class StudioOverflowService {
         !existing.ephemeral &&
         existing.userId === userId &&
         existing.repoRoot === repoRoot &&
-        (sbId ? existing.sbId === sbId : existing.agentId === agentId) &&
+        (sbId ? existing.sbId === sbId : existing.sbSlug === sbSlug) &&
         (existing.status === 'active' || existing.status === 'idle');
 
       if (reusable) {
@@ -662,7 +662,7 @@ export class StudioOverflowService {
       logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
         slug,
         repoRoot,
-        agentId,
+        sbSlug,
         collidingStudioId: existing.id,
       });
       return null;
@@ -677,20 +677,20 @@ export class StudioOverflowService {
     } as Studio;
 
     const created = await this.createWorktree(parentLike, slug, {
-      branch: `${agentId}/studio/${agentId}`,
+      branch: `${sbSlug}/studio/${sbSlug}`,
     });
     if (!created) return null;
 
     try {
       const studio = await this.studios.create({
         userId,
-        agentId,
+        sbSlug,
         sbId: sbId ?? undefined,
         repoRoot,
         worktreePath: created.worktreePath,
         branch: created.branch,
         baseBranch: parentLike.baseBranch,
-        purpose: `Home studio for ${agentId} on ${path.basename(repoRoot)} (auto-created)`,
+        purpose: `Home studio for ${sbSlug} on ${path.basename(repoRoot)} (auto-created)`,
         ephemeral: false,
         defaultProjectId: seed?.defaultProjectId ?? null,
         metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
@@ -699,7 +699,7 @@ export class StudioOverflowService {
         studioId: studio.id,
         slug: studio.slug,
         repoRoot,
-        agentId,
+        sbSlug,
         worktreePath: created.worktreePath,
       });
       return studio;
@@ -1016,7 +1016,7 @@ export class StudioOverflowService {
           }
         );
         await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
-          agentId: studio.agentId ?? undefined,
+          sbSlug: studio.sbSlug ?? undefined,
           reason: `teardown-aborted-rescue-failed (${opts.reason})`,
           detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
         });
@@ -1057,7 +1057,7 @@ export class StudioOverflowService {
           { studioId: studio.id, worktreePath: studio.worktreePath }
         );
         await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
-          agentId: studio.agentId ?? undefined,
+          sbSlug: studio.sbSlug ?? undefined,
           reason: `teardown-remove-failed (${opts.reason})`,
           detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
         });
@@ -1087,7 +1087,7 @@ export class StudioOverflowService {
       return;
     }
     await this.leases.logEvent(studio.userId, studio.id, 'released', {
-      agentId: studio.agentId ?? undefined,
+      sbSlug: studio.sbSlug ?? undefined,
       reason: opts.reason,
       detail: {
         teardown: true,

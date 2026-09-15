@@ -64,7 +64,7 @@ const MAX_LINE_LENGTH = 998;
  * Split an address-list header into individual address strings.
  *
  * A plain `.split(',')` breaks on quoted display names that contain a
- * comma — `"Shrestha, Sneha" <s@x.com>` is one address, not two — so this
+ * comma — `"Okafor, Ada" <ada@clinic.example>` is one address, not two — so this
  * walks the string tracking quote state and angle-bracket depth and only
  * breaks on top-level commas.
  *

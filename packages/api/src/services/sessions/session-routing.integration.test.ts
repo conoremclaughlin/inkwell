@@ -76,7 +76,7 @@ describe('Session Routing Integration', () => {
     // Create a session with an alias
     const session = await repo.create({
       userId: INTEGRATION_TEST_USER_ID,
-      agentId: INTEGRATION_TEST_AGENT_ID,
+      sbSlug: INTEGRATION_TEST_AGENT_ID,
       backendSessionId: null,
       type: 'primary',
       lifecycle: 'idle',
@@ -120,7 +120,7 @@ describe('Session Routing Integration', () => {
   it('should not find ended sessions by alias', async () => {
     const session = await repo.create({
       userId: INTEGRATION_TEST_USER_ID,
-      agentId: INTEGRATION_TEST_AGENT_ID,
+      sbSlug: INTEGRATION_TEST_AGENT_ID,
       backendSessionId: null,
       type: 'primary',
       lifecycle: 'idle',
@@ -155,7 +155,7 @@ describe('Session Routing Integration', () => {
   it('should update alias on existing session', async () => {
     const session = await repo.create({
       userId: INTEGRATION_TEST_USER_ID,
-      agentId: INTEGRATION_TEST_AGENT_ID,
+      sbSlug: INTEGRATION_TEST_AGENT_ID,
       backendSessionId: null,
       type: 'primary',
       lifecycle: 'idle',
@@ -194,7 +194,7 @@ describe('Session Routing Integration', () => {
     // Create a session to be the default
     const session = await repo.create({
       userId: INTEGRATION_TEST_USER_ID,
-      agentId: INTEGRATION_TEST_AGENT_ID,
+      sbSlug: INTEGRATION_TEST_AGENT_ID,
       backendSessionId: null,
       type: 'primary',
       lifecycle: 'idle',
@@ -275,7 +275,7 @@ describe('Session Routing Integration', () => {
   it('should enforce unique alias per agent among active sessions', async () => {
     const session1 = await repo.create({
       userId: INTEGRATION_TEST_USER_ID,
-      agentId: INTEGRATION_TEST_AGENT_ID,
+      sbSlug: INTEGRATION_TEST_AGENT_ID,
       backendSessionId: null,
       type: 'primary',
       lifecycle: 'idle',
@@ -299,7 +299,7 @@ describe('Session Routing Integration', () => {
     await expect(
       repo.create({
         userId: INTEGRATION_TEST_USER_ID,
-        agentId: INTEGRATION_TEST_AGENT_ID,
+        sbSlug: INTEGRATION_TEST_AGENT_ID,
         backendSessionId: null,
         type: 'primary',
         lifecycle: 'idle',

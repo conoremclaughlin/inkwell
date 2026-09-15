@@ -24,7 +24,7 @@ import clsx from 'clsx';
 interface SessionLogsResponse {
   session: {
     id: string;
-    agentId: string;
+    sbSlug: string;
     status: string;
     currentPhase: string | null;
     backend: string | null;
@@ -418,7 +418,7 @@ export default function SessionLogsPage() {
         <h1 className="text-3xl font-bold text-foreground">Session Log</h1>
         {session && (
           <div className="mt-2 flex flex-wrap items-center gap-2 text-muted-foreground">
-            <span className="font-medium">{session.agentId}</span>
+            <span className="font-medium">{session.sbSlug}</span>
             <span>·</span>
             <span>{session.backend || 'unknown backend'}</span>
             {statusBadge ? (

@@ -13,10 +13,10 @@
       "placeholder": "eyJhbGciOi...",
       "help": "PCP access token (from ~/.ink/auth.json or 'sb login')"
     },
-    "agentId": {
-      "label": "Agent ID",
+    "sbSlug": {
+      "label": "SB Slug",
       "placeholder": "wren",
-      "help": "Your PCP agent identity. If omitted, reads from ~/.ink/config.json agentMapping."
+      "help": "Your SB's slug. If omitted, reads from ~/.ink/config.json sbMapping."
     },
     "autoBootstrap": {
       "label": "Auto-Bootstrap",
@@ -38,8 +38,12 @@
       "accessToken": {
         "type": "string"
       },
-      "agentId": {
+      "sbSlug": {
         "type": "string"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Pre-rename name for sbSlug. Still accepted: nothing rewrites a user's OpenClaw config, and additionalProperties is false."
       },
       "autoBootstrap": {
         "type": "boolean",

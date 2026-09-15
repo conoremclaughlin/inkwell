@@ -19,21 +19,21 @@ describe('runtime session linkage', () => {
     upsertRuntimeSession(cwd, {
       pcpSessionId: 'pcp-1',
       backend: 'codex',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       runtimeLinkId: 'link-1',
     });
 
     upsertRuntimeSession(cwd, {
       pcpSessionId: 'pcp-1',
       backend: 'codex',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       backendSessionId: 'backend-a',
     });
 
     upsertRuntimeSession(cwd, {
       pcpSessionId: 'pcp-1',
       backend: 'codex',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       backendSessionId: 'backend-b',
     });
 
@@ -48,13 +48,13 @@ describe('runtime session linkage', () => {
     upsertRuntimeSession(cwd, {
       pcpSessionId: 'pcp-1',
       backend: 'claude',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       backendSessionId: 'sess-1',
     });
     upsertRuntimeSession(cwd, {
       pcpSessionId: 'pcp-1',
       backend: 'claude',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       backendSessionId: 'sess-1',
       backendSessionIds: ['sess-1'],
     });
@@ -68,28 +68,28 @@ describe('runtime session linkage', () => {
     upsertRuntimeSession(cwd, {
       pcpSessionId: 'pcp-1',
       backend: 'codex',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       studioId: 'studio-a',
       runtimeLinkId: 'link-shared',
     });
     upsertRuntimeSession(cwd, {
       pcpSessionId: 'pcp-2',
       backend: 'gemini',
-      agentId: 'aster',
+      sbSlug: 'aster',
       studioId: 'studio-b',
       runtimeLinkId: 'link-shared',
     });
 
     const codex = findRuntimeSessionByLinkId(cwd, 'link-shared', {
       backend: 'codex',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       studioId: 'studio-a',
     });
     expect(codex?.pcpSessionId).toBe('pcp-1');
 
     const gemini = findRuntimeSessionByLinkId(cwd, 'link-shared', {
       backend: 'gemini',
-      agentId: 'aster',
+      sbSlug: 'aster',
     });
     expect(gemini?.pcpSessionId).toBe('pcp-2');
   });

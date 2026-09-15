@@ -40,7 +40,7 @@ export interface ToolPolicyScopeRef {
 }
 
 export interface ToolPolicyContext {
-  agentId?: string;
+  sbSlug?: string;
   workspaceId?: string;
   studioId?: string;
 }
@@ -67,14 +67,14 @@ export interface SessionAccessQuery {
     threadKey?: string;
     studioId?: string;
     workspaceId?: string;
-    agentId?: string;
+    sbSlug?: string;
   };
   target: {
     sessionId?: string;
     threadKey?: string;
     studioId?: string;
     workspaceId?: string;
-    agentId?: string;
+    sbSlug?: string;
   };
   action?: 'list' | 'attach' | 'events' | 'inbox';
 }
@@ -266,7 +266,7 @@ function normalizeStringArray(values: string[] | undefined): string[] {
 
 function cloneContext(context: ToolPolicyContext): ToolPolicyContext {
   return {
-    agentId: context.agentId,
+    sbSlug: context.sbSlug,
     workspaceId: context.workspaceId,
     studioId: context.studioId,
   };
@@ -383,7 +383,7 @@ export class ToolPolicyState {
       scope === 'workspace'
         ? this.context.workspaceId
         : scope === 'agent'
-          ? this.context.agentId
+          ? this.context.sbSlug
           : this.context.studioId;
     if (!raw) return undefined;
     const normalized = normalizeScopeId(raw);
@@ -423,8 +423,8 @@ export class ToolPolicyState {
     const workspaceId = this.resolveContextScopeId('workspace');
     if (workspaceId) refs.push({ scope: 'workspace', id: workspaceId });
 
-    const agentId = this.resolveContextScopeId('agent');
-    if (agentId) refs.push({ scope: 'agent', id: agentId });
+    const sbSlug = this.resolveContextScopeId('agent');
+    if (sbSlug) refs.push({ scope: 'agent', id: sbSlug });
 
     const studioId = this.resolveContextScopeId('studio');
     if (studioId) refs.push({ scope: 'studio', id: studioId });
@@ -757,7 +757,7 @@ export class ToolPolicyState {
     const target = query.target;
     if (visibility === 'all') return true;
     if (visibility === 'agent') {
-      return Boolean(requester.agentId && target.agentId && requester.agentId === target.agentId);
+      return Boolean(requester.sbSlug && target.sbSlug && requester.sbSlug === target.sbSlug);
     }
     if (visibility === 'workspace') {
       // Workspace = parent-level container. Studio = worktree child scope.
@@ -789,7 +789,7 @@ export class ToolPolicyState {
   public setContext(context: ToolPolicyContext): void {
     const studioNorm = context.studioId ? normalizeScopeId(context.studioId) : undefined;
     this.context = {
-      agentId: context.agentId ? normalizeScopeId(context.agentId) : undefined,
+      sbSlug: context.sbSlug ? normalizeScopeId(context.sbSlug) : undefined,
       // Workspace and studio are separate scopes — never derive one from the other.
       workspaceId: context.workspaceId ? normalizeScopeId(context.workspaceId) : undefined,
       studioId: studioNorm,

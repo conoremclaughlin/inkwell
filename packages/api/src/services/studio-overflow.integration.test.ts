@@ -297,11 +297,11 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     const threadKey = `pr:it-exhausted-${RUN}`;
     const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
     const service = new StudioOverflowService(repo, leases);
-    const agentId = `it-agent-${RUN}`;
+    const sbSlug = `it-agent-${RUN}`;
 
     const winner = await service.ensureOverflowStudio({
       userId: USER,
-      agentId,
+      sbSlug,
       parentStudio: parent,
       threadKey,
     });
@@ -330,7 +330,7 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     try {
       const loser = await service.ensureOverflowStudio({
         userId: USER,
-        agentId,
+        sbSlug,
         parentStudio: parent,
         threadKey,
       });
@@ -382,7 +382,7 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       const ensure = () =>
         service.ensureOverflowStudio({
           userId: USER,
-          agentId: `it-agent-${RUN}`,
+          sbSlug: `it-agent-${RUN}`,
           parentStudio: parent,
           threadKey,
         });
@@ -446,7 +446,7 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
 
     const first = await service.ensureOverflowStudio({
       userId: USER,
-      agentId: `it-agent-${RUN}`,
+      sbSlug: `it-agent-${RUN}`,
       parentStudio: parent,
       threadKey,
     });
@@ -460,7 +460,7 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
 
     const second = await service.ensureOverflowStudio({
       userId: USER,
-      agentId: `it-agent-${RUN}`,
+      sbSlug: `it-agent-${RUN}`,
       parentStudio: parent,
       threadKey,
     });

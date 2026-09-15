@@ -27,6 +27,142 @@ refactor(mcp): extract identity resolution into service
 chore: bump typescript to 5.4
 ```
 
+#### Writing the message: use `-F`, never `-m`
+
+**Write the message to a file and commit with `git commit -F <file>`.** Never `-m` — not even
+for a one-line subject.
+
+```bash
+cat > /tmp/msg.txt <<'EOF'     # note the QUOTED delimiter
+fix(cache): honour a `local` flag on the cache entry
+EOF
+git commit -F /tmp/msg.txt
+```
+
+A double-quoted `-m` string is shell input. A backtick or `$(...)` anywhere inside it is
+**executed**, and its output is pasted into the commit. Markdown backticks around an
+identifier — ``a `local` flag`` — are how we normally write, which makes this a trap rather
+than an edge case.
+
+A subject line is **not** a safe exception. It is shell input on exactly the same terms, and a
+subject is where our backticked identifiers most often appear:
+
+```bash
+git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
+```
+
+The example substitutes `pwd` rather than the builtin that actually caused the incident,
+because this snippet is runnable and the real one dumps your environment into a commit. The
+mechanism is identical; only the payload is harmless.
+
+Single-quoting is not the fix either — an apostrophe in a word like `don't` closes the string
+and the remainder of the message is re-parsed as shell.
+
+**How the file gets written matters as much as `-F` does.** `-F` reads bytes and never expands
+them, but the shell still expands whatever _creates_ the file, one step earlier:
+
+```bash
+cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
+cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
+```
+
+Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in
+Claude Code, the `Write` tool).
+
+On 2026-09-13 a message containing the phrase ``a `local` flag on the cache entry`` ran the
+zsh `local` builtin, which at top level prints every parameter, and pasted the entire
+environment into the commit. Ten nonempty credential-bearing assignments reached a public repository. Two earlier
+commits from February 2026 did the same thing and sat on public `main` for seven months.
+Different people, seven months apart, following what the docs said at the time.
+
+Review cannot catch it. The substitution happens between typing the message and the commit
+existing, so the author never reads back what was written, and the diff is unaffected — a
+reviewer looking at the change sees nothing wrong. `-F` never goes through shell expansion
+and has no quoting rules to get wrong.
+
+The enforcing half is `scripts/check-commit-msg.sh`, wired as the `commit-msg` hook (the one
+hook that sees the finished message; a `pre-commit` hook never does). It refuses a message
+carrying named secret assignments, vendor token shapes, or an environment dump, and reports
+variable names and line numbers only, never values, so the hook output does not become the
+next place a secret is written down.
+
+**Check that it is actually on, rather than assuming.** `yarn install` runs Husky, but what
+runs at commit time is `$(git config core.hooksPath)/commit-msg` — and on a machine with
+worktrees that path is one shared directory serving all of them, belonging to whichever
+checkout configured it. A non-empty `core.hooksPath` therefore says nothing about whether
+the guard exists there. `ls "$(git config core.hooksPath)"/commit-msg` is the question worth
+asking; if it is missing, nothing is being checked and nothing will tell you so.
+
+**It is a heuristic backstop, not universal detection, and `-F` is still the actual fix.**
+It recognises the shapes we have actually been burned by: a list of known secret variable
+names, a handful of vendor token formats, and a run of assignment lines that looks like a
+dumped environment. A secret it has never been told to recognise, in a shape it does not
+model, will pass. It is skippable with `--no-verify`, and inactive wherever the hook is not
+installed. Passing it means "nothing matched", never "no credentials here". Do not let it
+become the reason you stop being careful about how the message is written.
+
+If it blocks you, nothing has been committed and your staged changes are untouched. Read the
+draft message it points at before reusing it — if the guard fired on a real substitution, the
+draft contains the leaked values and must not be recycled into the next attempt.
+
+**Writing prose about these variables: name them, do not assign to them.** The guard refuses
+_any_ assignment to a name it knows, whatever follows the `=` — including `<placeholder>`,
+`***`, a quoted value, a three-letter default, and a bare `=` with nothing after it at all.
+That is a deliberate false positive, and it replaced two narrower rules that each tried to
+keep the assignment form writable. Both failed the same way: an exemption defined by what the
+value _looks like_ exempts every real credential that happens to look like that too — one
+starting with `*`, or quoted, or short. Three leaked messages is not a sample that can license
+a rule about what credentials never look like.
+
+So write ``the `JWT_SECRET` value`` rather than `JWT_SECRET=<value>`. It reads no worse and
+has no ambiguity. Every false positive so far has been a commit message _about_ this guard,
+and this is the rewrite that clears it — reach for that before `--no-verify`.
+
+Its regression suite is `scripts/check-commit-msg.test.sh` (synthetic fixtures, runs in CI).
+`scripts/check-commit-msg.history.sh` is the local-only check that replays the three real
+leaking commits by SHA and sweeps `main` for false positives; it is not in CI because a
+shallow clone does not have the history it needs.
+
+That sweep carries a short list of full SHAs whose messages it flags and which have been read
+and confirmed to hold no credential — prose about this guard, written before the guidance above
+existed. They are reported as known prose rather than as findings, so the sweep stays green and
+stays worth running. The list lives only in the history sweep: **the hook itself has no
+exemptions**, a commit already in `main` cannot be made safe by refusing it, and a scan that
+fails to complete is a failure whether or not the commit is listed. Adding to it means reading
+the whole message first and saying so in the comment beside the SHA.
+
+#### Staging and pushing: name the paths, read the messages back
+
+Two more rules sit beside `-F`, set on 2026-09-13 after the leak above. The full list, with
+the reasoning, is in [AGENTS.md](./AGENTS.md#commit-messages-secrets-and-what-gets-pushed-ironclad);
+these are the two that change what you type.
+
+**Stage by naming paths.** `git add <path> [<path>...]`, or a directory you have just looked at,
+then `git diff --cached` before committing. Not `git add -A`, not `git add .`, not `git commit -a`
+or `-am`. The first two sweep in untracked files you never inspected — an env file, an identity
+file, scratch output — and the last two commit every modified tracked file without the
+staged-diff review.
+
+**Read every commit message back before you push, every time, through the guard.**
+
+```bash
+sh scripts/check-push.sh --preview
+```
+
+That replays `origin/main..HEAD` the way the `pre-push` hook will: each message is scanned first
+and printed only if it passes, oldest first; one that fails is withheld and only its value-free
+report is shown. Read the output top to bottom. Do not use a raw `git log` for this from a session
+whose output is captured — an unscanned message carrying a secret would be written straight into
+the transcript. The push is the point of no return, and a message you have not read back is a
+message you have not finished writing. The hook runs the same replay and refuses the push on a
+refusal, but it is a backstop: passing it means nothing matched, not that the messages are clean.
+
+Nothing in a commit message is ever evaluated by the shell. Backticks, `$(...)` and `$VAR` are
+fine as literal text written through a quoted heredoc or the Write tool; they are forbidden
+anywhere the shell would expand them — an `-m` string, an unquoted heredoc, a double-quoted `echo`
+or `printf` argument. Need a computed value in the message? Run the command separately, read its
+output, and paste the literal.
+
 ### Branching
 
 We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/): feature branches off `main`, which must always be stable and deployable.
@@ -79,6 +215,16 @@ Examples:
 // ???: unclear why this timeout is needed — removing it breaks auth
 // Simple explanation needs no prefix
 ```
+
+### Filing issues
+
+Contributors from outside the project: GitHub issues are the right place, and they are read.
+
+SBs and core contributors: file issues as Inkwell tasks (`create_task`), not GitHub issues. The
+GitHub account is shared, so an internal issue there is indistinguishable from an external report
+and lands on a surface the team does not triage from. When an external report arrives, open the
+Inkwell task that tracks it, note the issue number in the task, and reply on GitHub when it is
+resolved.
 
 ## Pull Requests
 
@@ -156,6 +302,19 @@ deleted.
 ### Formatting
 
 Prettier runs automatically on every commit via Husky + lint-staged. You do **not** need to run prettier manually — just commit and it handles formatting for `*.{ts,tsx,js,jsx,json,css,md}` files.
+
+Husky is installed by the `prepare` script, so a plain `yarn install` points `core.hooksPath`
+at a `.husky/` directory — including `commit-msg`, the credential guard described under
+[Commits](#writing-the-message-use--f-never--m). If `git config core.hooksPath` prints nothing,
+hooks are not active in this checkout; run `yarn install` to wire them up.
+
+A path that _does_ print is only half the answer. Hooks run from the checkout that owns that
+directory, not from the one you are committing in, so on a machine with worktrees one stale or
+incomplete `.husky/` serves all of them. Check for the hook itself:
+
+```bash
+ls "$(git config core.hooksPath)"/commit-msg
+```
 
 To format without committing:
 

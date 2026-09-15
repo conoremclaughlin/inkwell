@@ -38,7 +38,7 @@ export interface TurnSignalDeps {
   getSessionId: () => string | undefined;
   /** Live ref — the worktree studio this REPL runs in, for the lease fence. */
   getStudioId?: () => string | undefined;
-  agentId: string;
+  sbSlug: string;
   /** Resolved per post so config changes and lazy imports stay cheap. */
   getServerUrl: () => Promise<string> | string;
   getToken: (serverUrl: string) => Promise<string | null | undefined>;
@@ -175,7 +175,7 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
     sessionId,
     lifecycle: event === 'prompt' ? 'running' : 'idle',
     event,
-    agentId: deps.agentId,
+    sbSlug: deps.sbSlug,
     workingDir: deps.workingDir,
   });
 
@@ -212,7 +212,7 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       if (!sessionId) return true;
       // cliAttached:false is the route's process-proof detach — it clears the
       // marker without needing a lifecycle value.
-      return post('detach', { sessionId, cliAttached: false, agentId: deps.agentId });
+      return post('detach', { sessionId, cliAttached: false, sbSlug: deps.sbSlug });
     },
   };
 }

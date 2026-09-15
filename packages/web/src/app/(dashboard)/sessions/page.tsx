@@ -33,7 +33,7 @@ interface SessionWorkspace {
 interface Session {
   id: string;
   backendSessionId: string | null;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   lifecycle: string | null;
@@ -205,7 +205,7 @@ function SessionCard({ session }: { session: Session }) {
           <div className="flex items-center gap-2 flex-wrap">
             <h3 className="font-semibold text-foreground">{session.agentName}</h3>
             <Badge variant="outline" className="text-xs font-mono">
-              {session.agentId}
+              {session.sbSlug}
             </Badge>
             <Badge className={clsx('text-xs', state.badgeClass)}>{state.label}</Badge>
           </div>

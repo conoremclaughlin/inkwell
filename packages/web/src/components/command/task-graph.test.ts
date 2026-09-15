@@ -202,7 +202,7 @@ function task(overrides: Partial<TaskNode> & { id: string }): TaskNode {
     groupId: null,
     groupTitle: null,
     taskOrder: null,
-    agentId: null,
+    sbSlug: null,
     blockedBy: [],
     taskType: 'work',
     outcome: null,

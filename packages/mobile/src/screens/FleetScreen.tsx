@@ -39,7 +39,7 @@ function SessionCard({ session }: { session: FleetSession }) {
     >
       <View style={styles.cardHeader}>
         <View style={[styles.lifeDot, { backgroundColor: lifecycleColor(session.lifecycle) }]} />
-        <Text style={[styles.agent, { color: agentColor(session.agentId) }]}>
+        <Text style={[styles.agent, { color: agentColor(session.sbSlug) }]}>
           {session.agentName}
         </Text>
         <Text style={styles.meta}>{session.lifecycle}</Text>

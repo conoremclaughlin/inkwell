@@ -134,7 +134,6 @@ const envSchema = z.object({
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
   MCP_HTTP_PORT: z.string().transform(Number).optional(),
   MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://pcp.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
-  MCP_AUTH_TOKEN: optionalString,
   MCP_REQUIRE_OAUTH: z
     .enum(['true', 'false'])
     .default('true')
@@ -172,6 +171,10 @@ const envSchema = z.object({
   GOOGLE_CREDENTIAL_SOURCES: optionalString,
   // Where desktop credential files live. Default: ~/.ink/google
   INK_GOOGLE_CREDENTIALS_DIR: optionalString,
+  // Absolute path of the ink CLI the server invokes for hooks and chat loops.
+  // Default: this checkout's packages/cli/dist/cli.js. The server never uses
+  // the global ~/.ink/bin/ink link (services/ink-cli.ts).
+  INK_CLI_PATH: optionalString,
 
   // Embeddings
   MEMORY_EMBEDDINGS_ENABLED: z

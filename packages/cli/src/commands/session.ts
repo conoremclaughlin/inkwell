@@ -22,7 +22,7 @@ import { getValidAccessToken } from '../auth/tokens.js';
 
 export interface Session {
   id: string;
-  agentId?: string;
+  sbSlug?: string;
   lifecycle?: string;
   status: string;
   currentPhase?: string;
@@ -72,7 +72,7 @@ interface SyncedTranscriptArchiveSummary {
   syncedAt: string;
   session: {
     id: string;
-    agentId?: string | null;
+    sbSlug?: string | null;
     agentName?: string | null;
     agentRole?: string | null;
     backend?: string | null;
@@ -279,7 +279,7 @@ export function renderSyncedTranscriptArchives(
   return archives.flatMap((archive) => {
     const header = `  ${chalk.cyan(archive.sessionId.substring(0, 8))} ${chalk.dim(`(${archive.backend || 'unknown'})`)}`;
     const thread = archive.session.threadKey || '-';
-    const agent = archive.session.agentName || archive.session.agentId || 'Unknown';
+    const agent = archive.session.agentName || archive.session.sbSlug || 'Unknown';
     const lines = [
       header,
       chalk.dim(`      Agent:   ${agent}`),
@@ -425,7 +425,7 @@ function formatSessionLine(session: Session): string[] {
     `  ${statusIcon} ${chalk.cyan(session.id.substring(0, 8))} ${chalk.dim(`(${phase})`)}`,
     chalk.dim(`      Started: ${formatDate(startedAt)}  Duration: ${duration}`),
     chalk.dim(`      Thread:  ${thread}`),
-    chalk.dim(`      Attach:  ink chat -a ${session.agentId || 'wren'} --attach ${session.id}`),
+    chalk.dim(`      Attach:  ink chat -a ${session.sbSlug || 'wren'} --attach ${session.id}`),
   ];
 
   if (session.summary) {
@@ -469,7 +469,7 @@ export function renderSessionsByAgent(sessions: Session[], flat = false): string
 
   const grouped = new Map<string, Session[]>();
   for (const session of sessions) {
-    const key = session.agentId || 'unknown';
+    const key = session.sbSlug || 'unknown';
     const list = grouped.get(key) || [];
     list.push(session);
     grouped.set(key, list);
@@ -506,7 +506,7 @@ async function listCommand(options: {
   try {
     const result = await callPcpTool<SessionListResult>('list_sessions', {
       email: config.email,
-      agentId: options.agent,
+      sbSlug: options.agent,
       limit: parseInt(options.limit || '10', 10),
     });
 
@@ -534,7 +534,7 @@ async function showCommand(sessionId: string): Promise<void> {
     });
 
     console.log(chalk.bold(`\nSession: ${session.id}\n`));
-    console.log(chalk.dim('  Agent:    ') + (session.agentId || 'unknown'));
+    console.log(chalk.dim('  Agent:    ') + (session.sbSlug || 'unknown'));
     console.log(chalk.dim('  Status:   ') + session.status);
     console.log(chalk.dim('  Started:  ') + formatDate(new Date(session.startedAt)));
 

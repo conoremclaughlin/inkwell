@@ -7,8 +7,8 @@ describe('delegation token helpers', () => {
   it('mints + verifies valid token with scope/thread constraints', () => {
     const token = mintDelegationToken(
       {
-        issuerAgentId: 'lumen',
-        delegateeAgentId: 'wren',
+        issuerSlug: 'lumen',
+        delegateeSlug: 'wren',
         scopes: ['send_to_inbox', 'trigger_agent'],
         threadKey: 'pr:999',
         nowSeconds: 1_700_000_000,
@@ -18,8 +18,8 @@ describe('delegation token helpers', () => {
     );
 
     const verified = verifyDelegationToken(token, secret, {
-      expectedIssuerAgentId: 'lumen',
-      expectedDelegateeAgentId: 'wren',
+      expectedIssuerSlug: 'lumen',
+      expectedDelegateeSlug: 'wren',
       expectedThreadKey: 'pr:999',
       requiredScopes: ['send_to_inbox'],
       nowSeconds: 1_700_000_100,
@@ -33,8 +33,8 @@ describe('delegation token helpers', () => {
   it('rejects mismatched delegatee and missing scope', () => {
     const token = mintDelegationToken(
       {
-        issuerAgentId: 'lumen',
-        delegateeAgentId: 'myra',
+        issuerSlug: 'lumen',
+        delegateeSlug: 'myra',
         scopes: ['send_response'],
         nowSeconds: 1_700_000_000,
       },
@@ -42,7 +42,7 @@ describe('delegation token helpers', () => {
     );
 
     const wrongDelegatee = verifyDelegationToken(token, secret, {
-      expectedDelegateeAgentId: 'wren',
+      expectedDelegateeSlug: 'wren',
       nowSeconds: 1_700_000_010,
     });
     expect(wrongDelegatee.valid).toBe(false);
@@ -59,8 +59,8 @@ describe('delegation token helpers', () => {
   it('rejects expired tokens and decodes payload', () => {
     const token = mintDelegationToken(
       {
-        issuerAgentId: 'lumen',
-        delegateeAgentId: 'aster',
+        issuerSlug: 'lumen',
+        delegateeSlug: 'aster',
         scopes: ['remember'],
         nowSeconds: 1_700_000_000,
         ttlSeconds: 60,

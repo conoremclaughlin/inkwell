@@ -34,7 +34,7 @@ import type { Database } from '../data/supabase/types';
 import { TaskGroupsRepository } from '../data/repositories/task-groups.repository';
 import { ActivityStreamRepository } from '../data/repositories/activity-stream.repository';
 import { GraphExecutorService, type GraphEvaluation } from './graph-executor.service';
-import { resolveAgentSlug } from '../auth/resolve-identity';
+import { resolveSbSlug } from '../auth/resolve-identity';
 
 const projectRoot = resolve(__dirname, '../../../../');
 const envLocalPath = resolve(projectRoot, '.env.local');
@@ -72,7 +72,7 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue({ content: [] }),
 }));
 vi.mock('../auth/resolve-identity', () => ({
-  resolveAgentSlug: vi.fn().mockResolvedValue('wren'),
+  resolveSbSlug: vi.fn().mockResolvedValue('wren'),
 }));
 
 d('reconcileInterruptedDispatches (real DB)', () => {
@@ -552,7 +552,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
       .single();
 
     // `other` has no resolvable slug; the group owner does.
-    vi.mocked(resolveAgentSlug).mockImplementation(async (_c: unknown, id: string) =>
+    vi.mocked(resolveSbSlug).mockImplementation(async (_c: unknown, id: string) =>
       id === other ? null : 'wren'
     );
     try {
@@ -577,7 +577,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
       expect(meta.graphDispatchedTo).toBe(reviewer); // who it reached
       expect(meta.graphDispatchedTo).not.toBe(other); // not who it named
     } finally {
-      vi.mocked(resolveAgentSlug).mockResolvedValue('wren');
+      vi.mocked(resolveSbSlug).mockResolvedValue('wren');
     }
   });
 

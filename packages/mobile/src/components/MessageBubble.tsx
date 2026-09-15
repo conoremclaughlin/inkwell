@@ -13,7 +13,7 @@ import { agentColor, colors, spacing, type } from '../ui/theme';
  * markdown renderer's worth of dependencies in v1.
  */
 export function MessageBubble({ message }: { message: ThreadMessage }) {
-  const sender = senderName(message.senderAgentId, message.metadata);
+  const sender = senderName(message.senderSlug, message.metadata);
   const system = message.messageType === 'system' || message.messageType === 'notification';
 
   if (system) {
@@ -32,7 +32,7 @@ export function MessageBubble({ message }: { message: ThreadMessage }) {
         <Text
           style={[
             styles.sender,
-            { color: sender.isUser ? colors.accentBright : agentColor(message.senderAgentId) },
+            { color: sender.isUser ? colors.accentBright : agentColor(message.senderSlug) },
           ]}
         >
           {sender.name}

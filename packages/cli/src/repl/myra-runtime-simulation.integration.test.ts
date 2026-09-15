@@ -15,7 +15,7 @@
  *     packages/cli/src/repl/myra-runtime-simulation.integration.test.ts
  *
  * To also send a Telegram message:
- *   SEND_TELEGRAM=true INK_SERVER_URL=http://localhost:3001 npx vitest run ...
+ *   SEND_TELEGRAM=true SEND_TELEGRAM_CHAT_ID=<chat id> INK_SERVER_URL=http://localhost:3001 npx vitest run ...
  */
 
 import { describe, expect, it } from 'vitest';
@@ -30,6 +30,9 @@ import { handleClientLocalTool, isClientLocalTool } from './context-tools.js';
 
 const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const SEND_TELEGRAM = process.env.SEND_TELEGRAM === 'true';
+// A real chat id is personal data and never belongs in a tracked file: it is
+// supplied by the environment, and Phase 5 skips when it is absent.
+const SEND_TELEGRAM_CHAT_ID = process.env.SEND_TELEGRAM_CHAT_ID;
 const AGENT_ID = 'myra';
 
 let serverAvailable = false;
@@ -53,7 +56,7 @@ async function createPcpClient() {
 describe('Myra simulation: Phase 1 — Bootstrap', () => {
   it.skipIf(!serverAvailable)('bootstraps as Myra with identity and memories', async () => {
     const pcp = await createPcpClient();
-    const result = await pcp.callTool('bootstrap', { agentId: AGENT_ID });
+    const result = await pcp.callTool('bootstrap', { sbSlug: AGENT_ID });
     const parsed = result as Record<string, unknown>;
 
     console.log('\n=== Phase 1: Bootstrap as Myra ===');
@@ -89,7 +92,7 @@ describe('Myra simulation: Phase 1 — Bootstrap', () => {
 describe('Myra simulation: Phase 2 — Inbox', () => {
   it.skipIf(!serverAvailable)('retrieves inbox messages', async () => {
     const pcp = await createPcpClient();
-    const result = await pcp.callTool('get_inbox', { agentId: AGENT_ID });
+    const result = await pcp.callTool('get_inbox', { sbSlug: AGENT_ID });
     const parsed = result as Record<string, unknown>;
 
     console.log('=== Phase 2: Inbox Check ===');
@@ -101,7 +104,7 @@ describe('Myra simulation: Phase 2 — Inbox', () => {
 
     if (messages && messages.length > 0) {
       for (const msg of messages.slice(0, 3)) {
-        const from = msg.senderAgentId || msg.from || 'unknown';
+        const from = msg.senderSlug || msg.from || 'unknown';
         const content = ((msg.content as string) || '').slice(0, 80);
         console.log(`  - from ${from}: "${content}..."`);
       }
@@ -124,7 +127,7 @@ describe('Myra simulation: Phase 3 — Passive Recall', () => {
     const callRecall = async (query: string, limit: number) => {
       const result = await pcp.callTool('recall', {
         query,
-        agentId: AGENT_ID,
+        sbSlug: AGENT_ID,
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -157,7 +160,7 @@ describe('Myra simulation: Phase 3 — Passive Recall', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: AGENT_ID, turnCount: 1, budgetUtilization: 0.2 },
+      runtime: { sbSlug: AGENT_ID, turnCount: 1, budgetUtilization: 0.2 },
       lastTurn: { userInput, assistantResponse, turnIndex: 1 },
     });
 
@@ -190,7 +193,7 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
     const callRecall = async (query: string, limit: number) => {
       const result = await pcp.callTool('recall', {
         query,
-        agentId: AGENT_ID,
+        sbSlug: AGENT_ID,
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -252,7 +255,7 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
       // Fire turn_end
       await registry.fire('turn_end', {
         ledger,
-        runtime: { agentId: AGENT_ID, turnCount: i + 1, budgetUtilization: util },
+        runtime: { sbSlug: AGENT_ID, turnCount: i + 1, budgetUtilization: util },
         lastTurn: {
           userInput: turns[i].user,
           assistantResponse: turns[i].assistant,
@@ -306,19 +309,18 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
 // ─── Phase 5: Send Telegram Message (optional) ──────────────────
 
 describe('Myra simulation: Phase 5 — Telegram Response', () => {
-  it.skipIf(!serverAvailable || !SEND_TELEGRAM)(
-    'sends a real Telegram message to Conor',
+  it.skipIf(!serverAvailable || !SEND_TELEGRAM || !SEND_TELEGRAM_CHAT_ID)(
+    'sends a real Telegram message to the configured chat',
     async () => {
       const pcp = await createPcpClient();
 
       console.log('=== Phase 5: Telegram Response ===');
 
-      // NOTE: conversationId lookup is a gap — we need a user→platform→conversationId
-      // mapping so agents can message users without hardcoding chat IDs.
-      // See PCP task: "Persist conversationId→userId mapping with DB fallback"
+      // conversationId lookup is still a gap (a user→platform→conversationId
+      // mapping would let agents message users without a supplied chat id).
       const result = await pcp.callTool('send_response', {
         channel: 'telegram',
-        conversationId: '726555973',
+        conversationId: SEND_TELEGRAM_CHAT_ID,
         content:
           '🧪 [sb-runtime-test] Myra heartbeat simulation completed on the sb chat runtime.\n\nContext eviction + passive recall pipeline working. 100 tests passing.\n\nThis message was sent from an automated integration test — not a live Myra session.',
       });
@@ -329,10 +331,12 @@ describe('Myra simulation: Phase 5 — Telegram Response', () => {
     }
   );
 
-  it.skipIf(!serverAvailable || SEND_TELEGRAM)(
-    '(skipped — set SEND_TELEGRAM=true to send real messages)',
+  it.skipIf(!serverAvailable || (SEND_TELEGRAM && !!SEND_TELEGRAM_CHAT_ID))(
+    '(skipped — set SEND_TELEGRAM=true and SEND_TELEGRAM_CHAT_ID to send real messages)',
     () => {
-      console.log('\n  Phase 5 skipped: set SEND_TELEGRAM=true to send real Telegram messages\n');
+      console.log(
+        '\n  Phase 5 skipped: set SEND_TELEGRAM=true and SEND_TELEGRAM_CHAT_ID=<chat id> to send real Telegram messages\n'
+      );
     }
   );
 });
@@ -346,7 +350,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     console.log('=== Phase 6: Full Heartbeat Cycle ===');
 
     // 1. Bootstrap
-    const bootstrap = await pcp.callTool('bootstrap', { agentId: AGENT_ID });
+    const bootstrap = await pcp.callTool('bootstrap', { sbSlug: AGENT_ID });
     const bootstrapParsed = bootstrap as Record<string, unknown>;
     expect(bootstrapParsed.user || bootstrapParsed.constitution).toBeTruthy();
     console.log('  1. Bootstrap: OK');
@@ -358,7 +362,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     const callRecall = async (query: string, limit: number) => {
       const result = await pcp.callTool('recall', {
         query,
-        agentId: AGENT_ID,
+        sbSlug: AGENT_ID,
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -387,7 +391,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     console.log('  2. Context initialized');
 
     // 4. Check inbox
-    const inbox = await pcp.callTool('get_inbox', { agentId: AGENT_ID });
+    const inbox = await pcp.callTool('get_inbox', { sbSlug: AGENT_ID });
     const inboxParsed = inbox as Record<string, unknown>;
     const messages = (inboxParsed.messages as Array<Record<string, unknown>>) || [];
     console.log(`  3. Inbox: ${messages.length} messages`);
@@ -395,7 +399,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     // 5. Add inbox content to ledger
     if (messages.length > 0) {
       for (const msg of messages.slice(0, 3)) {
-        const content = `From ${msg.senderAgentId || 'unknown'}: ${((msg.content as string) || '').slice(0, 200)}`;
+        const content = `From ${msg.senderSlug || 'unknown'}: ${((msg.content as string) || '').slice(0, 200)}`;
         ledger.addEntry('inbox', content, 'inkmail');
       }
     }
@@ -409,7 +413,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     // 7. Fire turn_end — passive recall
     const turnResult = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: AGENT_ID, turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: AGENT_ID, turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: { userInput, assistantResponse, turnIndex: 1 },
     });
     console.log(`  4. Passive recall: +${turnResult.injected} memories`);

@@ -17,7 +17,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-123', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
 
       expect(args).toContain('chat');
@@ -33,7 +33,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-mt', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
 
       const idx = args.indexOf('--max-turns');
@@ -45,7 +45,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-mt2', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
         maxTurns: 12,
       });
       const idx = args.indexOf('--max-turns');
@@ -58,7 +58,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const withRouting = (runner as any).buildArgs('session-tr', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
         toolRouting: 'backend',
       });
       const idx = withRouting.indexOf('--tool-routing');
@@ -67,7 +67,7 @@ describe('InkRunner', () => {
 
       const withoutRouting = (runner as any).buildArgs('session-tr2', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
       const defaultIdx = withoutRouting.indexOf('--tool-routing');
       expect(defaultIdx).toBeGreaterThan(-1);
@@ -78,7 +78,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-789', {
         workingDirectory: '/tmp',
-        agentId: 'wren',
+        sbSlug: 'wren',
         model: 'claude-sonnet-4-20250514',
       });
 
@@ -90,7 +90,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const withEffort = (runner as any).buildArgs('session-eff', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
         effort: 'xhigh',
       });
       const idx = withEffort.indexOf('--effort');
@@ -99,12 +99,12 @@ describe('InkRunner', () => {
 
       const without = (runner as any).buildArgs('session-eff2', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
       expect(without).not.toContain('--effort');
     });
 
-    it('omits --agent when agentId is not provided', () => {
+    it('omits --agent when sbSlug is not provided', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-000', {
         workingDirectory: '/tmp',
@@ -119,7 +119,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs(
         'session-media',
-        { workingDirectory: '/tmp', agentId: 'myra' },
+        { workingDirectory: '/tmp', sbSlug: 'myra' },
         [
           { type: 'image', path: '/home/u/.ink/files/telegram/photo.jpg' },
           { type: 'document', path: '/home/u/.ink/files/telegram/report.pdf' },
@@ -144,7 +144,7 @@ describe('InkRunner', () => {
       }));
       const args = (runner as any).buildArgs(
         'session-cap',
-        { workingDirectory: '/tmp', agentId: 'myra' },
+        { workingDirectory: '/tmp', sbSlug: 'myra' },
         media
       );
 
@@ -156,7 +156,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-nomedia', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
 
       expect(args).not.toContain('--attach-file');
@@ -166,7 +166,7 @@ describe('InkRunner', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-policy', {
         workingDirectory: '/tmp',
-        agentId: 'myra',
+        sbSlug: 'myra',
       });
 
       expect(args).toContain('--profile');
@@ -489,7 +489,7 @@ describe('InkRunner — bootstrap-derived content', () => {
   function contextWithEverything() {
     return {
       agent: {
-        agentId: 'myra',
+        sbSlug: 'myra',
         name: 'Myra',
         role: 'messaging',
         soul: 'SOUL-BODY',
@@ -525,7 +525,7 @@ describe('InkRunner — bootstrap-derived content', () => {
 
     await runner.run('hello', {
       injectedContext: contextWithEverything(),
-      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', agentId: 'myra' },
+      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', sbSlug: 'myra' },
     } as never);
 
     expect(sentMessage).toContain('hello');
@@ -555,7 +555,7 @@ describe('InkRunner — bootstrap-derived content', () => {
 
     await runner.run('hello', {
       injectedContext: ctx,
-      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', agentId: 'myra' },
+      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', sbSlug: 'myra' },
     } as never);
 
     expect(sentMessage).toContain('CONTACT-NAME');
@@ -571,7 +571,7 @@ describe('InkRunner — bootstrap failure in the child', () => {
   function ctx() {
     return {
       agent: {
-        agentId: 'myra',
+        sbSlug: 'myra',
         name: 'Myra',
         role: 'messaging',
         soul: 'SOUL-BODY',
@@ -597,7 +597,7 @@ describe('InkRunner — bootstrap failure in the child', () => {
   const cfg = {
     workingDirectory: '/tmp',
     mcpConfigPath: '/tmp/.mcp.json',
-    agentId: 'myra',
+    sbSlug: 'myra',
   } as never;
 
   it('demands the child prove it loaded identity context on a fresh turn', async () => {
@@ -664,7 +664,7 @@ describe('InkRunner — resumed turns are equally exposed', () => {
   function ctx() {
     return {
       agent: {
-        agentId: 'myra',
+        sbSlug: 'myra',
         name: 'Myra',
         role: 'messaging',
         soul: 'SOUL-BODY',
@@ -690,7 +690,7 @@ describe('InkRunner — resumed turns are equally exposed', () => {
   const cfg = {
     workingDirectory: '/tmp',
     mcpConfigPath: '/tmp/.mcp.json',
-    agentId: 'myra',
+    sbSlug: 'myra',
   } as never;
 
   it('requires bootstrap on a resumed turn too', async () => {
@@ -779,7 +779,7 @@ describe('InkRunner — chained failures', () => {
   function ctx() {
     return {
       agent: {
-        agentId: 'myra',
+        sbSlug: 'myra',
         name: 'Myra',
         role: 'messaging',
         soul: 'SOUL-BODY',
@@ -805,7 +805,7 @@ describe('InkRunner — chained failures', () => {
   const cfg = {
     workingDirectory: '/tmp',
     mcpConfigPath: '/tmp/.mcp.json',
-    agentId: 'myra',
+    sbSlug: 'myra',
   } as never;
 
   function stub(runner: InkRunner, outcomes: Array<Record<string, unknown>>) {

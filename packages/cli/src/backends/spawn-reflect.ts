@@ -26,7 +26,7 @@ export type LiveBackend = 'claude' | 'codex' | 'gemini';
 
 export interface ReflectedRequestContext {
   transport: string;
-  pinnedAgentId: string | null;
+  pinnedSlug: string | null;
   requestContext: Record<string, unknown> | null;
   sessionContext: Record<string, unknown> | null;
 }

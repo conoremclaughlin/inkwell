@@ -26,7 +26,7 @@ Inkwell hooks bridge coding agents (Claude Code, Codex, Gemini) with Inkwell's s
 **What it does:**
 
 1. Reads workspace ID from `.ink/identity.json`
-2. Calls `bootstrap` with agentId and workspaceId
+2. Calls `bootstrap` with sbSlug and workspaceId
 3. Calls `get_inbox` for unread messages
 4. Resolves Inkwell session ID (`INK_SESSION_ID` env from launcher, or `start_session` fallback)
 5. Reconciles Inkwell/backend session linkage when backend session ID is available (prefers existing server-side backend-session match)
@@ -39,7 +39,7 @@ Inkwell hooks bridge coding agents (Claude Code, Codex, Gemini) with Inkwell's s
 ```
 ## Session Context
 
-Agent: **{agentId}**
+Agent: **{sbSlug}**
 Workspace: {workspace name}
 
 ### Identity
@@ -97,7 +97,7 @@ This context will be lost after compaction unless you save it now.
 ```
 ## Post-Compaction Context
 
-Agent: {agentId}
+Agent: {sbSlug}
 
 ### Identity
 {bootstrap identity JSON}

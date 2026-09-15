@@ -188,10 +188,10 @@ function noticeContent(
   // not claim a process was running, whatever else we failed to establish
   // (pr:558: a 14-hour-old finished turn was reported as "still running").
   const head = run.runnerSettledAt
-    ? `⚠️ ${run.agentId}'s turn${thread} had already finished when the Inkwell ` +
+    ? `⚠️ ${run.sbSlug}'s turn${thread} had already finished when the Inkwell ` +
       `server shut down — the ${run.backend} process had exited, but its ` +
       `completion was never recorded.`
-    : `⚠️ ${run.agentId}'s turn${thread} was cut short — the Inkwell server shut ` +
+    : `⚠️ ${run.sbSlug}'s turn${thread} was cut short — the Inkwell server shut ` +
       `down while the ${run.backend} process was still running (turn started ` +
       `${age} ago).`;
 
@@ -398,7 +398,7 @@ async function transitionSession(
  */
 export interface InterruptActivityEntry {
   userId: string;
-  agentId: string;
+  sbSlug: string;
   type: string;
   subtype: string;
   content: string;
@@ -461,7 +461,7 @@ export async function interruptActiveRuns(
       try {
         await opts.logActivity({
           userId: run.userId,
-          agentId: run.agentId,
+          sbSlug: run.sbSlug,
           type: 'error',
           subtype: 'turn_interrupted',
           content: `Backend turn interrupted by server shutdown (${run.backend}${
@@ -493,10 +493,10 @@ export async function interruptActiveRuns(
         userId: run.userId,
         // The notice is FOR whoever asked; absent a sender it still belongs in
         // the thread, where every participant sees it.
-        fromAgentId: run.senderAgentId || run.agentId,
-        toAgentId: run.agentId,
+        fromSlug: run.senderSlug || run.sbSlug,
+        toSlug: run.sbSlug,
         threadKey: run.threadKey,
-        subject: `Turn interrupted — ${run.agentId} (${run.backend})`,
+        subject: `Turn interrupted — ${run.sbSlug} (${run.backend})`,
         content: noticeContent(run, outcome),
         metadata: {
           kind: 'session_interrupted',
