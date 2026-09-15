@@ -128,6 +128,9 @@ import {
   handleClientLocalTool,
   globalSignalSink,
   parseCompactContextArgs,
+  computeContextOccupancy,
+  formatContextStamp,
+  type ContextOccupancy,
   type ProviderContextMeasurement,
   type SignalSink,
   getLastSignal,
@@ -3178,11 +3181,65 @@ export function spawnDialogueText(
   return guarded.imitationDiscarded ? spawnSaid.slice(0, guarded.frameIndex ?? 0) : spawnSaid;
 }
 
+/**
+ * The occupancy a turn reasons with — for the hooks that gate on it and for
+ * the stamp the agent reads.
+ *
+ * This was `ledger.totalTokens() / (maxContextTokens - bootstrapReserve)` at
+ * both fire sites: the ledger estimate, which is the number task 480b76f7
+ * exists to stop us acting on. Measured on myra session 64e1eb49 the estimate
+ * read 131,071 against a provider measurement of 383,046 — so a monitor armed
+ * at 80% would not have fired until the real window was long past full, and
+ * the passive-recall ceiling that suppresses injection above 80% was reading
+ * the same wrong number. Both behaviours were calibrated against a figure
+ * roughly 2.9x below the truth.
+ *
+ * Exported so the wiring is testable without standing up a turn: a test that
+ * only checks the hook's reaction to a supplied utilization cannot see which
+ * number the caller computed.
+ */
+export function turnContextOccupancy(
+  ledger: ContextLedger,
+  runtime: ChatRuntime,
+  measured: ProviderContextMeasurement | undefined
+): ContextOccupancy {
+  return computeContextOccupancy(
+    ledger.totalTokens(),
+    runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
+    runtime.maxContextTokens,
+    measured
+  );
+}
+
+/**
+ * The turn body sent to a RESUMED native session: the delta only, because the
+ * session already holds the history.
+ *
+ * Extracted so the stamp's presence on this path is testable. The envelope path
+ * is the easy one to get right and the easy one to test; this is the path a
+ * long-running bridge session actually takes, turn after turn, and the seat
+ * where nobody is watching (task 480b76f7, acceptance 1).
+ */
+export function buildDeltaPrompt(
+  contextStamp: string | undefined,
+  recallDelta: string,
+  userMessage: string
+): string {
+  return [contextStamp, recallDelta, userMessage].filter(Boolean).join('\n\n');
+}
+
 export function buildPromptEnvelope(
   sbSlug: string,
   runtime: ChatRuntime,
   ledger: ContextLedger,
-  userMessage: string
+  userMessage: string,
+  /**
+   * Rendered immediately before the latest user message so it is the freshest
+   * thing in the envelope. Deliberately NOT part of envelopeShapeKey — it
+   * changes every turn, and treating it as envelope shape would invalidate and
+   * reseed the native session on each one.
+   */
+  contextStamp?: string
 ): string {
   // Reserve bootstrap context budget (not counted against transcript budget)
   const bootstrapTokens = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
@@ -3230,6 +3287,7 @@ export function buildPromptEnvelope(
       ? `\nSkill instructions:${renderActiveSkills(runtime.activeSkills)}`
       : '',
     '',
+    contextStamp ?? '',
     'Latest user message:',
     userMessage,
   ]
@@ -6657,12 +6715,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await maybeCompactContext('pre-turn budget check');
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
-    // Budget utilization must account for bootstrap tokens — the ledger only
-    // holds transcript, but bootstrap is reserved from the total budget.
-    const bootstrapReserve = runtime.bootstrapContext
-      ? estimateTokens(runtime.bootstrapContext)
-      : 0;
-    const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
+    // Occupancy comes from turnContextOccupancy, which prefers the provider's
+    // own measurement over ink's estimate. The estimate cannot see the identity
+    // envelope or what a resumed native session accumulated, and every hook
+    // gating on this number — the budget monitor, the passive-recall ceiling —
+    // was calibrated against it.
+    const turnOccupancy = turnContextOccupancy(ledger, runtime, providerContextMeasurement());
+    const contextStamp = formatContextStamp(turnOccupancy);
 
     const promptHookResult = await hookRegistry.fire('prompt_build', {
       ledger,
@@ -6670,7 +6729,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: runtime.sessionId,
         sbSlug,
         backend: runtime.backend,
-        budgetUtilization: ledger.totalTokens() / effectiveBudget,
+        budgetUtilization: turnOccupancy.utilization,
         turnCount: hookTurnCount,
       },
       // Pass user input so passive recall can surface memories BEFORE the backend responds
@@ -6732,10 +6791,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
 
       if (budgetEntries.length > 0) {
-        const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
+        // Same occupancy the hook gated on and the stamp reported. This line
+        // used to recompute it from the ledger estimate, so the human at the
+        // terminal could read a different percentage than the agent was given.
+        const util = Math.round(turnOccupancy.utilization * 100);
+        const split = turnOccupancy.splitKnown
+          ? `${turnOccupancy.ledgerTokens.toLocaleString()} evictable + ${turnOccupancy.providerOnlyTokens.toLocaleString()} provider-only`
+          : 'ledger estimate only — provider has not reported';
         printEvent(
           chalk.yellow(
-            `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
+            `  ⚠ Context at ${util}% — ${turnOccupancy.effectiveTokens.toLocaleString()} / ${turnOccupancy.limit.toLocaleString()} tok (${split})`
           )
         );
       }
@@ -6798,9 +6863,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .filter((e) => e.source === 'passive-recall')
         .map((e) => e.content)
         .join('\n\n');
-      prompt = recallDelta ? `${recallDelta}\n\n${raw}` : raw;
+      // The stamp rides the DELTA, not just the envelope. A resumed native
+      // session never re-reads the envelope, so anything that lives only there
+      // is sent once at seed time and is stale for every turn after — and the
+      // long-running resumed session is exactly the seat whose window fills.
+      prompt = buildDeltaPrompt(contextStamp, recallDelta, raw);
     } else {
-      prompt = buildPromptEnvelope(sbSlug, runtime, ledger, raw);
+      prompt = buildPromptEnvelope(sbSlug, runtime, ledger, raw, contextStamp);
     }
 
     const turnStartedAt = Date.now();
@@ -7468,7 +7537,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           sessionId: runtime.sessionId,
           sbSlug,
           backend: runtime.backend,
-          budgetUtilization: ledger.totalTokens() / turnEndEffectiveBudget,
+          budgetUtilization: turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+            .utilization,
           turnCount: hookTurnCount,
         },
         lastTurn: {
