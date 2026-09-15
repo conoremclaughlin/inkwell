@@ -92,6 +92,33 @@ function approvingBrowser(mutate?: (redirect: URL) => void) {
 }
 
 describe('runDesktopGoogleLogin', () => {
+  it('does not reflect error descriptions into the loopback page', async () => {
+    const payload = '<img src=x onerror=alert(1)>';
+    let page: Promise<Response> | undefined;
+    await expect(
+      runDesktopGoogleLogin({
+        client: CLIENT,
+        browser: true,
+        deps: {
+          fetchImpl: fakeGoogle().fetchImpl,
+          timeoutMs: 5000,
+          openUrl: (url) => {
+            const consent = new URL(url);
+            const redirect = new URL(consent.searchParams.get('redirect_uri')!);
+            redirect.searchParams.set('state', consent.searchParams.get('state')!);
+            redirect.searchParams.set('error', 'access_denied');
+            redirect.searchParams.set('error_description', payload);
+            page = fetch(redirect);
+          },
+        },
+      })
+    ).rejects.toThrow(payload);
+    const response = await page!;
+    expect(await response.text()).not.toContain(payload);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('content-security-policy')).toContain("default-src 'none'");
+  });
+
   it('asks for exactly the shared scopes with offline consent, exchanges with PKCE, and returns the bound credential', async () => {
     const google = fakeGoogle();
     const browser = approvingBrowser();

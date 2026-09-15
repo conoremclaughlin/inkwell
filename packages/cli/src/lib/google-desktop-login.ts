@@ -222,6 +222,9 @@ function startLoopbackServer(expectedState: string, timeoutMs: number): Promise<
     });
 
     const server = http.createServer((req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
       const url = new URL(req.url || '/', 'http://127.0.0.1');
       if (url.pathname !== '/callback') {
         res.writeHead(404);
@@ -240,7 +243,7 @@ function startLoopbackServer(expectedState: string, timeoutMs: number): Promise<
       if (error) {
         const description = url.searchParams.get('error_description') || error;
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(ERROR_HTML(description));
+        res.end(ERROR_HTML('Google declined the login. Return to the terminal for details.'));
         rejectCode(new Error(`Google refused the login: ${description}`));
         return;
       }
