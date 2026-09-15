@@ -56,7 +56,9 @@ export const alertPayloadSchema = z.object({
    * one that embeds a changing number — hence the explicit field.
    */
   dedupeKey: z.string().min(1).max(200).optional(),
-  metrics: z.record(z.unknown()).optional(),
+  // Zod v4 requires the key schema explicitly; z.record(value) alone is a
+  // v3 signature and does not type-check here.
+  metrics: z.record(z.string(), z.unknown()).optional(),
   cooldownSeconds: z.number().int().min(0).max(86400).optional(),
   /**
    * 'ok' resolves an open incident for this dedupeKey and sends a recovery

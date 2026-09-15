@@ -22,6 +22,7 @@ import { AlertDispatchService } from '../services/alerts/alert-dispatch.service'
 import { parseAlertPayload, secretsMatch, sourceStaleness } from '../services/alerts/alert-policy';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
+import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 
 /**
  * Resolve the acting user from either credential.
@@ -47,6 +48,27 @@ function resolveAlertUser(
   if (userData) return { userId: userData.userId, via: 'bearer' };
 
   return null;
+}
+
+/**
+ * Read throttle for the alert query routes.
+ *
+ * Both GETs are authenticated, so this is not an anti-guessing measure like
+ * the credential limiter in admin.ts. It bounds cost: each one runs an
+ * unbounded-fanout query against alert_events / alert_sources on behalf of
+ * whoever holds a valid token, and a token that leaks or a client stuck in a
+ * retry loop can turn the alerting tables into the thing taking the database
+ * down — the alerting path becoming the outage again.
+ *
+ * Per (user, ip) so one noisy client cannot exhaust another's budget, using
+ * the same bounded limiter as admin.ts: amortised pruning and a hard cap.
+ */
+const ALERT_READ_WINDOW_MS = 60 * 1000;
+const ALERT_READS_PER_MINUTE = 60;
+const readLimiter = new FixedWindowLimiter(ALERT_READ_WINDOW_MS);
+
+function readRateLimited(userId: string, ip: string): boolean {
+  return readLimiter.hit(`alertread:${userId}|${ip}`, ALERT_READS_PER_MINUTE);
 }
 
 export function createAlertsRouter(dataComposer: DataComposer): Router {
@@ -134,6 +156,11 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
       return;
     }
 
+    if (readRateLimited(userData.userId, req.ip ?? 'unknown')) {
+      res.status(429).json({ success: false, error: 'Too many requests' });
+      return;
+    }
+
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const openOnly = req.query.open === 'true';
 
@@ -160,6 +187,11 @@ export function createAlertsRouter(dataComposer: DataComposer): Router {
     const userData = authProvider.verifyAccessToken(req.headers.authorization);
     if (!userData) {
       res.status(401).json({ success: false, error: 'Authentication required' });
+      return;
+    }
+
+    if (readRateLimited(userData.userId, req.ip ?? 'unknown')) {
+      res.status(429).json({ success: false, error: 'Too many requests' });
       return;
     }
 

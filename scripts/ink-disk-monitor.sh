@@ -248,11 +248,28 @@ ${detail}
 }
 
 check_in() {
-  curl -sS -o /dev/null --max-time 15 -X POST "${INK_ALERT_URL}/checkin" \
+  local code curl_rc
+  # curl exits 0 for 4xx and 5xx. Without reading the status, a rejected
+  # token and a broken server are indistinguishable from a successful
+  # check-in — the caller takes note_reachable, the liveness sweep sees a
+  # fresh last_seen_at, and the monitor reports itself healthy for as long as
+  # the endpoint stays broken. That is the exact failure this script exists to
+  # catch, so it must not be the one failure it cannot see.
+  #
+  # post_alert above already reads the status this way; this did not.
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+    -X POST "${INK_ALERT_URL}/checkin" \
     -H 'content-type: application/json' \
     -H "x-ink-alert-token: ${INK_ALERT_TOKEN}" \
     -d "{\"source\":\"$SOURCE\",\"expectedIntervalSeconds\":$INK_MONITOR_INTERVAL,\"detail\":\"$1\"}" \
-    2>/dev/null
+    2>/dev/null)
+  curl_rc=$?
+
+  if [ $curl_rc -ne 0 ] || [ -z "$code" ] || [ "${code:0:1}" != "2" ]; then
+    log "check-in failed (curl rc=$curl_rc http=${code:-none})"
+    return 1
+  fi
+  return 0
 }
 
 # ── "I ran but could not report" ──────────────────────────────────────────

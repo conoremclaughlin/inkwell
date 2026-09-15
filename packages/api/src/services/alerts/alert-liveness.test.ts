@@ -48,6 +48,14 @@ interface Harness {
   /** What resolve_alert_event should return; [] means "nothing was open". */
   resolveResult: Array<Record<string, unknown>>;
   updateError: { message: string } | null;
+  /**
+   * The alert_events row a deduped raise lands on. last_notified_at is the
+   * whole question: set means a sink really delivered and the cooldown is
+   * earned, null means a live claim is holding and nothing has gone out yet.
+   */
+  events: Array<{ id: string; last_notified_at: string | null }>;
+  /** Forces the alert_events read to fail, to pin the uncertain branch. */
+  eventsError: { message: string } | null;
 }
 
 function makeHarness(sources: SourceRow[]): Harness {
@@ -56,24 +64,31 @@ function makeHarness(sources: SourceRow[]): Harness {
     rpcCalls: [],
     resolveResult: [],
     updateError: null,
+    events: [],
+    eventsError: null,
   };
 
-  const selectBuilder = (rows: unknown[]) => {
+  const selectBuilder = (rows: unknown[], error: { message: string } | null = null) => {
     const builder: Record<string, unknown> = {};
     for (const method of ['select', 'eq', 'not', 'is', 'like']) {
       builder[method] = () => builder;
     }
     // Terminal: awaiting the builder yields the rows.
-    builder.then = (resolve: (v: unknown) => unknown) => resolve({ data: rows, error: null });
-    builder.single = () => Promise.resolve({ data: rows[0] ?? null, error: null });
-    builder.maybeSingle = () => Promise.resolve({ data: rows[0] ?? null, error: null });
+    builder.then = (resolve: (v: unknown) => unknown) =>
+      resolve({ data: error ? null : rows, error });
+    builder.single = () => Promise.resolve({ data: error ? null : (rows[0] ?? null), error });
+    builder.maybeSingle = () => Promise.resolve({ data: error ? null : (rows[0] ?? null), error });
     return builder;
   };
 
   const supabase = {
     from(table: string) {
       return {
-        select: (..._a: unknown[]) => selectBuilder(table === 'alert_sources' ? sources : []),
+        select: (..._a: unknown[]) => {
+          if (table === 'alert_sources') return selectBuilder(sources);
+          if (table === 'alert_events') return selectBuilder(h.events!, h.eventsError!);
+          return selectBuilder([]);
+        },
         update(values: Record<string, unknown>) {
           const chain = {
             eq: (_col: string, id: string) => {
@@ -162,23 +177,62 @@ describe('sweepStaleSources bookkeeping', () => {
     expect(h.updates.filter((u) => 'stale_alerted_at' in u.values)).toHaveLength(0);
   });
 
-  it('treats a deduped raise as handled — someone was already told', async () => {
+  // 'deduped' is two different facts sharing one status, and the earlier
+  // version of this suite asserted the wrong one of them as universal (PR #539
+  // r3, Lumen). should_notify is the AND of a claim gate and a cooldown gate,
+  // so false means EITHER someone was already told OR someone else is holding
+  // an unexpired claim and has told nobody yet. The three tests below are the
+  // two cases and the uncertain one, because only the first is handled.
+  const dedupedRaise = () => ({
+    accepted: true as const,
+    eventId: 'evt-1',
+    status: 'deduped' as const,
+    isNew: false,
+    notified: false,
+    occurrenceCount: 3,
+    deliveries: [],
+  });
+
+  it('treats a deduped raise as handled when a sink really delivered', async () => {
     const h = makeHarness([staleSource()]);
+    // The cooldown is earned: last_notified_at is set only after delivery.
+    h.events = [{ id: 'evt-1', last_notified_at: new Date(Date.now() - 60_000).toISOString() }];
     const service = makeService(h);
-    vi.spyOn(service, 'ingest').mockResolvedValue({
-      accepted: true,
-      eventId: 'evt-1',
-      status: 'deduped',
-      isNew: false,
-      notified: false,
-      occurrenceCount: 3,
-      deliveries: [],
-    });
+    vi.spyOn(service, 'ingest').mockResolvedValue(dedupedRaise());
 
     const result = await service.sweepStaleSources();
 
     expect(result.raised).toBe(1);
     expect(h.updates.filter((u) => 'stale_alerted_at' in u.values)).toHaveLength(1);
+  });
+
+  it('does not stamp a raise deduped onto an incident nobody was told about', async () => {
+    const h = makeHarness([staleSource()]);
+    // A live claim held by another dispatcher: the row exists, nothing was sent.
+    // Stamping here makes the source alreadyAlerted forever, so when that
+    // dispatcher fails and releases its claim the retry never arrives.
+    h.events = [{ id: 'evt-1', last_notified_at: null }];
+    const service = makeService(h);
+    vi.spyOn(service, 'ingest').mockResolvedValue(dedupedRaise());
+
+    const result = await service.sweepStaleSources();
+
+    expect(result.raised).toBe(0);
+    expect(h.updates.filter((u) => 'stale_alerted_at' in u.values)).toHaveLength(0);
+  });
+
+  it('does not stamp when the delivery state cannot be read', async () => {
+    const h = makeHarness([staleSource()]);
+    h.eventsError = { message: 'PostgREST timed out' };
+    const service = makeService(h);
+    vi.spyOn(service, 'ingest').mockResolvedValue(dedupedRaise());
+
+    const result = await service.sweepStaleSources();
+
+    // An unknown delivery state is not a delivery. Unstamped costs a duplicate
+    // alert; stamped costs the alert.
+    expect(result.raised).toBe(0);
+    expect(h.updates.filter((u) => 'stale_alerted_at' in u.values)).toHaveLength(0);
   });
 
   it('does not count a raise whose stamp write failed', async () => {

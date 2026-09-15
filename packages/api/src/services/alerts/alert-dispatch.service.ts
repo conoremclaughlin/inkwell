@@ -65,6 +65,14 @@ export const SINK_TOTAL_TIMEOUT_MS = 12_000;
 export const RECOVERY_FANOUT_TIMEOUT_MS = 5_000;
 
 /**
+ * Budget for the diagnostic delivery write. Small on purpose: it sits between
+ * the fan-out and settleClaim, and the poster's own deadline is 20s. Fan-out
+ * can take SINK_TOTAL_TIMEOUT_MS, so this has to leave settleClaim room inside
+ * that budget rather than consume what is left of it.
+ */
+const DELIVERY_RECORD_TIMEOUT_MS = 3_000;
+
+/**
  * A sink that ran out of time, as distinct from one that failed.
  *
  * The difference matters exactly once, at settle time: a failed fan-out
@@ -477,6 +485,14 @@ export class AlertDispatchService {
           target: channel,
           ok: false,
           detail: error instanceof Error ? error.message : String(error),
+          // A timeout here is NOT a failure, and flattening it into one is how
+          // the uncertainty gets lost. settleClaim reads `timedOut` to decide
+          // between releasing the claim and letting it ride to TTL; without
+          // this flag the inner 5s budget reports a send that is still in
+          // flight as definitely-not-delivered, the claim is released, and the
+          // message can arrive after something else has already been told the
+          // delivery failed.
+          timedOut: error instanceof SinkTimeoutError,
         },
       ];
     }
@@ -538,11 +554,15 @@ export class AlertDispatchService {
       return recipients.map((slug) => ({ sink: 'agents' as const, target: slug, ok: true }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      // Same as the user sink: a timeout is uncertain, not failed. See the
+      // note there for what releasing the claim on an in-flight send costs.
+      const timedOut = error instanceof SinkTimeoutError;
       return recipients.map((slug) => ({
         sink: 'agents' as const,
         target: slug,
         ok: false,
         detail,
+        timedOut,
       }));
     }
   }
@@ -905,9 +925,63 @@ export class AlertDispatchService {
         // something happened when it did not" defect, surviving in the
         // liveness path (PR #539 r2, Lumen).
         //
-        // 'deduped' counts as handled: it means an open incident for this
-        // silence already exists and someone was already told about it.
-        const handled = result.notified || result.status === 'deduped';
+        // 'deduped' does NOT count as handled on its own. It means
+        // should_notify came back false, and that has two causes with opposite
+        // consequences: a cooldown earned by a delivery that really happened
+        // (handled), or another dispatcher holding an unexpired claim which has
+        // not delivered anything yet (emphatically not handled). alert_should_claim
+        // ANDs the claim gate and the cooldown gate, and ingest returns one
+        // boolean for both, so the status alone cannot tell them apart.
+        //
+        // Stamping the second case is the r2 defect wearing a different hat:
+        // the source becomes alreadyAlerted, every later sweep skips it, and if
+        // the in-flight dispatcher then fails and releases its claim, the retry
+        // that release exists to enable never comes. Any sweep interval shorter
+        // than the claim TTL reaches this routinely rather than rarely.
+        //
+        // last_notified_at is the fact instead of the inference: the schema
+        // sets it only after at least one sink actually delivered.
+        let handled = result.notified;
+        if (!handled && result.status === 'deduped') {
+          // eventId is nullable on the result type. A deduped raise without one
+          // is a delivery state we cannot look up, which is the uncertain case
+          // below rather than a delivered one.
+          if (!result.eventId) {
+            logger.warn('Deduped staleness alert carried no event id; leaving source unstamped', {
+              source: row.source,
+            });
+            continue;
+          }
+
+          const { data: existing, error: existingError } = await this.supabase
+            .from('alert_events')
+            .select('last_notified_at')
+            .eq('id', result.eventId)
+            .maybeSingle();
+
+          if (existingError) {
+            // An unknown delivery state must not read as delivered. Leaving the
+            // source unstamped costs a duplicate alert on the next sweep;
+            // stamping it costs the alert entirely.
+            logger.warn('Could not confirm prior delivery for a deduped staleness alert', {
+              source: row.source,
+              error: existingError.message,
+            });
+            continue;
+          }
+
+          handled = Boolean(
+            (existing as { last_notified_at?: string | null } | null)?.last_notified_at
+          );
+          if (!handled) {
+            logger.warn(
+              'Staleness alert deduped onto an incident nobody has been told about yet; leaving source unstamped for retry',
+              { source: row.source, eventId: result.eventId }
+            );
+            continue;
+          }
+        }
+
         if (!handled) {
           logger.warn('Staleness alert reached no sink; leaving source unstamped for retry', {
             source: row.source,
@@ -960,7 +1034,35 @@ export class AlertDispatchService {
     }
   }
 
+  /**
+   * Persist the per-sink record, under its own budget.
+   *
+   * The sink budgets bound the SENDS; they never covered the database awaits
+   * that follow. This write is diagnostic — it answers "why did nobody hear
+   * about this" afterwards — while settleClaim, which runs next, is the one
+   * that must happen, because an unsettled claim suppresses the condition
+   * until TTL expires. Awaiting the diagnostic write unbounded put it in front
+   * of the essential one: a hung PostgREST update held the whole ingest past
+   * the poster's 20s deadline and settleClaim never ran at all (PR #539 r3,
+   * Lumen).
+   *
+   * Bounded here rather than at the call sites because all three of them —
+   * raise, resolve and recovery — had the same unbounded await.
+   */
   private async recordDelivery(eventId: string, deliveries: SinkResult[]): Promise<void> {
+    try {
+      await withTimeout(
+        'delivery record',
+        this.persistDelivery(eventId, deliveries),
+        DELIVERY_RECORD_TIMEOUT_MS
+      );
+    } catch (error) {
+      // Losing the diagnostic is survivable; losing the settlement is not.
+      logger.error('Failed to record alert delivery', { eventId, error });
+    }
+  }
+
+  private async persistDelivery(eventId: string, deliveries: SinkResult[]): Promise<void> {
     try {
       const { error } = await this.supabase
         .from('alert_events')
