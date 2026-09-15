@@ -56,11 +56,9 @@ vi.mock('../data/composer', () => ({
   })),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -68,11 +66,9 @@ vi.mock('../config/env', () => ({
   isProduction: () => false,
   isTest: () => true,
 }));
-
 vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
-
 vi.mock('../utils/request-context', () => ({
   runWithRequestContext: (_ctx: Record<string, unknown>, fn: () => void) => {
     fn();

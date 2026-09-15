@@ -14,15 +14,13 @@ const mockVerifyAccessToken = vi.fn();
 // Mocks — must be declared before importing the module under test
 // ---------------------------------------------------------------------------
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
+    ...(await import('../test/fake-env')).fakeEnv,
     MCP_TRANSPORT: 'http',
     MCP_HTTP_PORT: 0, // will be overridden
     MCP_REQUIRE_OAUTH: false,
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-key',
     SUPABASE_ANON_KEY: 'test-anon-key',
-    JWT_SECRET: 'test-jwt-secret',
   },
 }));
 

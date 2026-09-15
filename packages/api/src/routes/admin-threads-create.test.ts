@@ -39,12 +39,9 @@ vi.mock('../data/composer', () => ({
 vi.mock('../services/authorization', () => ({ getAuthorizationService: vi.fn(() => ({})) }));
 vi.mock('../services/oauth', () => ({ getOAuthService: vi.fn(() => ({})) }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    SUPABASE_PUBLISHABLE_KEY: 'test-publishable',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },

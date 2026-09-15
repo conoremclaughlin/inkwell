@@ -1,14 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
+    ...(await import('../test/fake-env')).fakeEnv,
     MCP_TRANSPORT: 'http',
     MCP_HTTP_PORT: 0,
     MCP_REQUIRE_OAUTH: false,
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
     SUPABASE_ANON_KEY: 'test-anon',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
   },
 }));
 

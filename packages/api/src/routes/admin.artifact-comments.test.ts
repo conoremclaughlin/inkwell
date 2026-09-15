@@ -18,10 +18,9 @@ vi.mock('../services/oauth', () => ({
   getOAuthService: vi.fn(() => ({})),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
+    ...(await import('../test/fake-env')).fakeEnv,
     MCP_HTTP_PORT: 3001,
   },
 }));

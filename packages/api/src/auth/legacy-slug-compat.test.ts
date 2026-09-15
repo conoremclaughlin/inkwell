@@ -8,14 +8,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import jwt from 'jsonwebtoken';
 
-const TEST_JWT_SECRET = 'test-jwt-secret-that-is-at-least-32-characters-long';
+const { JWT_SECRET: TEST_JWT_SECRET } = fakeEnv;
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret-key',
+    ...(await import('../test/fake-env')).fakeEnv,
     // Inlined: vi.mock factories are hoisted above every top-level const.
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
   },
 }));
 vi.mock('../utils/logger', () => ({
@@ -24,6 +22,7 @@ vi.mock('../utils/logger', () => ({
 
 import { verifyPcpAccessToken } from './pcp-tokens';
 import { parseStudioLease } from '../services/studio-lease.service';
+import { fakeEnv, fakeWrongValue } from '../test/fake-env';
 
 const sign = (claims: Record<string, unknown>) =>
   jwt.sign(claims, TEST_JWT_SECRET, { expiresIn: '1h' });
@@ -67,7 +66,7 @@ describe('access tokens minted before the rename', () => {
   it('still rejects a token signed with the wrong secret', () => {
     const forged = jwt.sign(
       { type: 'mcp_access', sub: 'user-1', email: 'a@b.c', scope: 'mcp:tools', agentId: 'wren' },
-      'not-the-secret-at-all-but-long-enough-to-sign'
+      fakeWrongValue
     );
 
     // Control: the compat path must not become a way in.

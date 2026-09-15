@@ -20,10 +20,9 @@ vi.mock('../../utils/logger.js', () => ({
 }));
 
 // ─── Mock: env ───
-vi.mock('../../config/env.js', () => ({
+vi.mock('../../config/env.js', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret-key',
+    ...(await import('../../test/fake-env')).fakeEnv,
   },
 }));
 

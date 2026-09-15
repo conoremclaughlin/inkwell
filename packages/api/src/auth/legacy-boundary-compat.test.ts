@@ -15,11 +15,9 @@ import jwt from 'jsonwebtoken';
 // occurrence of one. jwt only needs >=32 characters, not randomness.
 // (vi.mock factories are hoisted, so this expression must not reference
 // anything outside itself.)
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret-key',
-    JWT_SECRET: 'not-a-real-secret-'.padEnd(40, 'x'),
+    ...(await import('../test/fake-env')).fakeEnv,
   },
 }));
 vi.mock('../utils/logger', () => ({
@@ -37,6 +35,7 @@ import { archivedMetadataSlug } from '../utils/archived-metadata';
 // NOT from '../server': that module ends in an unconditional startServer(...),
 // so importing it starts a real server from inside the test run.
 import { resolveServerSbSlug } from '../config/server-identity';
+import { fakeWrongValue } from '../test/fake-env';
 
 const legacyToken = (extra: Record<string, unknown> = {}) =>
   Buffer.from(
@@ -108,7 +107,7 @@ describe('pending-auth JWTs issued before the rename', () => {
           redirectUri: 'r',
           agentId: 'aster',
         },
-        'not-a-real-secret-'.padEnd(40, 'x')
+        fakeWrongValue
       )
     ) as never;
 
