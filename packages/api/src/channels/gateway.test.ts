@@ -827,10 +827,17 @@ describe('Activity Stream Integration', () => {
       expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith({
         userId: 'user-uuid-123',
+        // No session was threaded through this send, so the author is unknown.
+        // The channel owner's slug is kept for display, but `authorship` marks
+        // the row as unattributed so a reply will never route on it.
         sbSlug: 'myra',
+        sbId: undefined,
+        payload: { authorship: 'unattributed' },
         direction: 'out',
         content: 'Reply message',
+        sessionId: undefined,
         platform: 'telegram',
+        platformMessageId: undefined,
         platformChatId: 'chat123',
         isDm: true,
       });

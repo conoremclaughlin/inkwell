@@ -54,7 +54,7 @@ import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/respon
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteSlug } from './services/routing/resolve-route';
-import { resolveAgentFromMention } from './services/routing/resolve-mention';
+import { resolveInboundAgent } from './services/routing/resolve-inbound-agent';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
@@ -202,62 +202,31 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       return;
     }
 
-    // Resolve agent: mention → channel_routes → AGENT_ID env fallback
-    let routedSlug = sbSlug;
-    let routedIdentityId: string | undefined;
+    // Resolve agent: mention → reply authorship → channel_routes → AGENT_ID env
+    // fallback. The cascade lives in its own module so each tier knows whether
+    // an earlier one MATCHED, rather than inferring it from the selected slug —
+    // a mention of, or a reply to, the default SB is a match, and treating it
+    // as "nothing matched" handed the message to the next tier.
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
-    // For group chats, try mention-based routing first
-    // Always call for group chats — text matching works even without platform mentions
-    // (e.g., WhatsApp has no native @mentions, Slack bot mention excluded from users array)
-    if (isGroupChat) {
-      const mentionMatch = await resolveAgentFromMention(
-        dataComposer!.getClient(),
-        userId,
-        content,
-        metadata?.mentions?.users ?? []
-      );
-      if (mentionMatch) {
-        routedSlug = mentionMatch.sbSlug;
-        routedIdentityId = mentionMatch.sbId;
-        logger.debug(`[Route] Resolved agent from @mention`, {
-          platform: channel,
-          sbSlug: mentionMatch.sbSlug,
-          sbId: mentionMatch.sbId,
-        });
-      }
-    }
+    const resolution = await resolveInboundAgent({
+      supabase: dataComposer!.getClient(),
+      userId,
+      defaultSlug: sbSlug,
+      platform: channel,
+      conversationId,
+      content,
+      isGroupChat,
+      mentionedUserIds: metadata?.mentions?.users ?? [],
+      platformAccountId: metadata?.platformAccountId,
+      replyToMessageId: metadata?.replyToMessageId,
+    });
 
-    // If mention didn't match, try channel_routes specificity cascade
-    let routeStudioHint: string | null = null;
-    let resolvedRouteId: string | null = null;
-    if (routedSlug === sbSlug) {
-      const route = await resolveRouteSlug(
-        dataComposer!.getClient(),
-        userId,
-        channel,
-        metadata?.platformAccountId,
-        conversationId
-      );
-      if (route) {
-        routedSlug = route.sbSlug;
-        routedIdentityId = route.sbId;
-        routeStudioHint = route.studioHint;
-        resolvedRouteId = route.routeId;
-        logger.debug(`[Route] Resolved agent from channel_routes`, {
-          platform: channel,
-          sbSlug: route.sbSlug,
-          sbId: route.sbId,
-          routeId: route.routeId,
-          studioHint: route.studioHint,
-        });
-      } else {
-        logger.warn(
-          `[Route] No channel_route found for ${channel}, falling back to AGENT_ID=${sbSlug}`,
-          { userId, platform: channel, conversationId }
-        );
-      }
-    }
+    const routedSlug = resolution.sbSlug;
+    const routedIdentityId = resolution.sbId;
+    const routeStudioHint = resolution.studioHint;
+    const resolvedRouteId = resolution.routeId;
+    const replyRouting = resolution.replyRouting;
 
     // Resolve contact for per-sender session isolation (only when agent has session_scope: 'per_sender')
     let contactId: string | undefined;
@@ -338,6 +307,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         triggerType: 'message',
         ...(routeStudioHint ? { studioHint: routeStudioHint } : {}),
         ...(contactId ? { contactId } : {}),
+        // Carried so a misroute is diagnosable after the fact. Without it, a
+        // reply that fell through to the channel owner is indistinguishable
+        // from one that was never a reply at all. The cascade withholds this
+        // for a message that was never a reply, so its presence means one was.
+        ...(replyRouting ? { replyRouting } : {}),
       },
     };
 

@@ -81,6 +81,13 @@ export interface LogActivityInput {
 export interface LogMessageInput {
   userId: string;
   sbSlug: string;
+  /**
+   * Canonical identity UUID of the author. Pass it whenever the caller already
+   * holds it: a slug is unique only per workspace, so letting logActivity
+   * re-derive sb_id from `sbSlug` can resolve to a different SB of the same
+   * name. Omit only where the caller genuinely has nothing but a slug.
+   */
+  sbId?: string;
   direction: 'in' | 'out';
   content: string;
   sessionId?: string;
@@ -186,6 +193,7 @@ export class ActivityStreamRepository {
     return this.logActivity({
       userId: input.userId,
       sbSlug: input.sbSlug,
+      sbId: input.sbId,
       type: input.direction === 'in' ? 'message_in' : 'message_out',
       content: input.content,
       sessionId: input.sessionId,
