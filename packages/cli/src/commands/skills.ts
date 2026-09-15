@@ -177,7 +177,11 @@ function injectMcpServers(
 
 /** Validate server-provided names before they reach any filesystem operation. */
 export function assertSkillName(skillName: string): void {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(skillName)) {
+  if (
+    typeof skillName !== 'string' ||
+    !/^[a-zA-Z0-9]/.test(skillName) ||
+    /[^a-zA-Z0-9._-]/.test(skillName)
+  ) {
     throw new Error('Skill name must be a single alphanumeric-led path component');
   }
 }

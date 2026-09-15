@@ -8,9 +8,18 @@ vi.mock('child_process', async (importOriginal) => ({
 }));
 
 describe('doctor repair execution', () => {
-  it.each(['../demo', '/tmp/demo', 'ink demo', 'ink;echo', 'ink$(echo marker)', '--demo', ''])(
-    'rejects unsafe aliases before execution: %s',
-    (name) => expect(() => buildFixArgs(name)).toThrow('CLI alias')
+  it.each([
+    '../demo',
+    '/tmp/demo',
+    'ink demo',
+    'ink;echo',
+    'ink$(echo marker)',
+    '--demo',
+    'ink\n',
+    'ink\r',
+    '',
+  ])('rejects unsafe aliases before execution: %s', (name) =>
+    expect(() => buildFixArgs(name)).toThrow('CLI alias')
   );
 
   it('keeps the alias as a validated argument, not shell text', async () => {

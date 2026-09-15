@@ -101,7 +101,8 @@ export function resolveAllowedMediaPath(
   // operations, rather than hiding it inside an Array.some callback.
   for (const root of allowedRoots) {
     const normalizedRoot = resolve(root);
-    if (absolutePath === normalizedRoot || absolutePath.startsWith(normalizedRoot + sep)) {
+    // A media file must be strictly below a root, not the root directory itself.
+    if (absolutePath.startsWith(normalizedRoot + sep)) {
       const mediaType = mediaTypeForPath(absolutePath);
       return mediaType ? { absolutePath, mediaType } : null;
     }

@@ -23,5 +23,12 @@ export function studioSiblingPath(repoRoot: string, slug: string): string {
     throw new Error('Invalid studio path component');
   }
   const mainRoot = path.resolve(repoRoot);
-  return path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+  const parent = path.dirname(mainRoot);
+  const candidate = path.resolve(parent, `${path.basename(mainRoot)}--${slug}`);
+  // Prove containment on the final normalized absolute path as well as on
+  // its input component. This remains evident if construction changes later.
+  if (!candidate.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep)) {
+    throw new Error('Studio path escaped the selected repository parent');
+  }
+  return candidate;
 }

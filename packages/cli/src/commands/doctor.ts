@@ -224,7 +224,11 @@ function buildFixCommand(binaryName: string): string {
 }
 
 export function buildFixArgs(binaryName: string): string[] {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(binaryName)) {
+  if (
+    typeof binaryName !== 'string' ||
+    !/^[a-zA-Z0-9]/.test(binaryName) ||
+    /[^a-zA-Z0-9_-]/.test(binaryName)
+  ) {
     throw new Error('CLI alias must contain only letters, numbers, underscores, and hyphens');
   }
   return binaryName === 'ink' ? ['studio', 'cli'] : ['studio', 'cli', '--name', binaryName];

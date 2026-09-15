@@ -52,9 +52,16 @@ describe('skill paths and replacement', () => {
     '$(echo marker)',
     'skill;echo',
     '--flag',
+    'demo\n',
+    'demo\r',
   ])('rejects names that are not a single safe component: %s', (name) =>
     expect(() => skills.assertSkillName(name)).toThrow('Skill name')
   );
+
+  it('rejects non-string runtime values at the pure boundary', () => {
+    expect(() => skills.assertSkillName(null as never)).toThrow('Skill name');
+    expect(() => skills.assertSkillName({} as never)).toThrow('Skill name');
+  });
 
   it('writes and links a valid skill idempotently', () => {
     const backend = join(state.home, '.claude', 'skills');
