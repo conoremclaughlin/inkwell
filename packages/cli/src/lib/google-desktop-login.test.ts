@@ -359,3 +359,17 @@ describe('checkDesktopCredential', () => {
     });
   });
 });
+
+it('never includes malformed credential bytes in terminal-bound parse errors', () => {
+  const dir = tempDir();
+  const contents = 'synthetic-private-content is not JSON';
+  const file = join(dir, 'broken.json');
+  writeFileSync(file, contents);
+  expect(listDesktopCredentials(dir).malformed[0].reason).toBe(
+    'Credential file could not be read as JSON'
+  );
+  expect(() => loadDesktopOAuthClient(dir, file)).toThrow(
+    'Desktop OAuth client file could not be read as JSON'
+  );
+  expect(() => loadDesktopOAuthClient(dir, file)).not.toThrow(contents);
+});

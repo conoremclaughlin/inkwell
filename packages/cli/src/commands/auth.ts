@@ -14,7 +14,8 @@ import chalk from 'chalk';
 import ora from 'ora';
 import http from 'http';
 import crypto from 'crypto';
-import { execFile } from 'child_process';
+import { openBrowser } from '../lib/open-browser.js';
+export { openBrowser } from '../lib/open-browser.js';
 import {
   generatePkce,
   loadAuth,
@@ -39,11 +40,6 @@ import {
 
 function getPcpServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
-}
-
-export function openBrowser(url: string): void {
-  // macOS — extend for Linux/Windows later
-  execFile('open', [url]);
 }
 
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
