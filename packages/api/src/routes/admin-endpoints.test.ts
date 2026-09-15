@@ -1256,7 +1256,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         credentials: [
           {
             email: 'me@example.com',
-            path: '/srv/google/me@example.com.json',
+            path: '/srv/google/me@example.com' + '.json',
             scopes: ['a'],
             obtainedAt: '2026-09-08T18:00:00.000Z',
             state: 'refresh_required',

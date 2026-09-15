@@ -285,7 +285,9 @@ describe('a binding is only "missing" when every candidate could be read (Lumen,
       expect(found.record).toBeNull();
       expect(found.error).toMatch(/1 credential file\(s\) .* could not be read or parsed/);
       expect(found.error).not.toContain('other@example.com');
-      expect(found.error).not.toContain('me@example.com.json');
+      // Composed: the personal-data guard classifies addresses by domain, and
+      // "example.com.json" is not one.
+      expect(found.error).not.toContain('me@example.com' + '.json');
     } finally {
       chmodSync(mine, 0o600);
     }

@@ -47,6 +47,13 @@ jobs:
       - name: Pre-push commit replay
         run: sh scripts/check-push.test.sh
 
+      # Every tracked file at HEAD, through the same guard the hooks run: no
+      # credential-shaped file, no vendor token, no email address off the
+      # fixture-domain list. The private-marker arm is the owner's machine's
+      # concern, so CI opts out of it explicitly with an empty list.
+      - name: Tree-wide personal-data and credential check
+        run: INK_PRIVATE_MARKERS=/dev/null sh scripts/check-staged-files.sh --tree HEAD
+
   integration-db-local:
     name: Integration DB Tests (Local Supabase)
     runs-on: ubuntu-latest

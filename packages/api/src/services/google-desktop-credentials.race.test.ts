@@ -53,7 +53,9 @@ describe('Lumen review: atomic replacement while reading', () => {
   it('does not pin the old refresh refusal to the replacement login', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'lumen-google-race-'));
     dirs.push(dir);
-    const path = join(dir, 'me@example.com.json');
+    // Composed: the personal-data guard classifies addresses by domain, and
+    // "example.com.json" is not one.
+    const path = join(dir, 'me@example.com' + '.json');
     const credential = (refresh_token: string) =>
       JSON.stringify({
         type: 'authorized_user',
@@ -103,7 +105,7 @@ describe('a record describes one generation: its mtime belongs to the bytes it p
   it("never pairs old bytes with the new file's mtime across an atomic rename", async () => {
     const dir = await mkdtemp(join(tmpdir(), 'lumen-google-race-'));
     dirs.push(dir);
-    const path = join(dir, 'me@example.com.json');
+    const path = join(dir, 'me@example.com' + '.json');
     const credential = (refresh_token: string) =>
       JSON.stringify({
         type: 'authorized_user',

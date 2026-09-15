@@ -14,7 +14,10 @@
 #              invokes it, so the wiring gets its own tier.
 #
 # Every fixture is SYNTHETIC: values match the vendor shapes and are otherwise
-# nonsense. No real credential appears in this file.
+# nonsense. No real credential appears in this file. The personal-data cases
+# (ADDRESSES, MARKERS, --tree) use an invented marker and assemble any address
+# that must be refused at runtime from a variable, so this file itself passes
+# the tree-wide scan CI runs over every tracked file.
 #
 # Usage:  sh scripts/check-staged-files.test.sh
 #
@@ -66,6 +69,15 @@ printf '#!/bin/sh\nexit 0\n' > "$work/stubs/yarn"
 chmod +x "$work/stubs/npx" "$work/stubs/yarn"
 PATH="$work/stubs:$PATH"
 export PATH
+
+# Every case runs with a private-marker list present, because the guard
+# refuses to run without one (MARKERS in scripts/check-staged-files.sh). The
+# list is synthetic — one nonsense marker, a comment and a blank line — so the
+# comment/blank filter is exercised on every run, not only in its own case.
+markers_fixture="$work/private-markers"
+printf '# synthetic marker list for the suite\n\nCANARYPERSON\n' > "$markers_fixture"
+INK_PRIVATE_MARKERS="$markers_fixture"
+export INK_PRIVATE_MARKERS
 
 nohooks="$work/nohooks"
 mkdir -p "$nohooks"
@@ -385,6 +397,216 @@ cp "$guard" "$work/hollow/check-staged-files.sh"
 printf '#!/bin/sh\nshapes=\n' > "$work/hollow/lib/credential-patterns.sh"
 out=$(cd "$r" && sh "$work/hollow/check-staged-files.sh" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "empty pattern library refuses with exit 2" || bad "empty pattern library refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+echo "ADDRESSES and MARKERS (personal data)"
+
+# Assembled at runtime: a literal address on either of these would make this
+# file fail the tree scan it exists to test.
+realdom=gmail.com
+lookalike=northside-clinic.com
+
+r=$(new_repo scan-addr-reserved "$nohooks")
+stage "$r" src/fixture.ts "const a = 'ada@example.com'; const b = 'x@clinic.example'; const c = 'y@host.test'; const d = 'z@nope.invalid'; const e = 'q@sub.mail.example.org'; const g = 'a@-example.com'; const h = 'a@example..test';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "reserved-domain addresses are allowed (example.*, .test, .invalid, .example, odd example forms)" || bad "reserved-domain addresses are allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# Registrable names that merely contain `example` are not reserved. Both are
+# assembled at runtime so this file passes the tree scan.
+# (The first spelling here left `sub.example.co` readable before the variable, and
+# the guard refused this very file. The whole public suffix is assembled.)
+couk=co.uk
+comtld=com
+r=$(new_repo scan-addr-example-lookalike "$nohooks")
+stage "$r" a.txt "q@sub.example.$couk"
+stage "$r" b.txt "a@example..$comtld"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "example.co.uk and example..com are refused (registrable, not reserved)" || bad "example.co.uk and example..com are refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-legacy "$nohooks")
+stage "$r" src/fixture.ts "const a = 'a@test.com'; const b = 'b@x.com'; const c = 'notify@noreply.github.com'; const d = 'id@mail.gmail.com';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "grandfathered and infrastructure domains are allowed, parents included" || bad "grandfathered and infrastructure domains are allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-real "$nohooks")
+stage "$r" src/fixture.ts "line one
+const who = 'person@$realdom';
+const also = 'desk@$lookalike';
+const fine = 'ok@example.com';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "an address on an unlisted domain is refused" || bad "an address on an unlisted domain is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'src/fixture.ts: line(s) 2,3' && ok "address refusal reports path and both line numbers, not the clean line" || bad "address refusal reports path and both line numbers" "$(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q "$realdom" && bad "address refusal does not print the address" "domain bytes in output" || ok "address refusal does not print the address"
+echo "$out" | grep -q 'fixture-domains.sh' && ok "address refusal points at the list" || bad "address refusal points at the list" "$(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-case "$nohooks")
+stage "$r" a.txt "Person@$(printf '%s' "$realdom" | tr 'a-z' 'A-Z')"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "domain comparison folds case" || bad "domain comparison folds case" "exit $rc"
+
+r=$(new_repo scan-addr-exempt "$nohooks")
+stage "$r" .mailmap "Someone <noreply@pcp.dev> <someone@$realdom>"
+stage "$r" .yarn/releases/yarn.cjs "// hello@$realdom"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok ".mailmap and .yarn/releases/ are exempt from the address arm" || bad ".mailmap and .yarn/releases/ are exempt from the address arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+r=$(new_repo scan-addr-yarn-narrow "$nohooks")
+stage "$r" .yarn/sdks/shim.js "// hello@$realdom"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok ".yarn/sdks and .yarn/patches are not exempt" || bad ".yarn/sdks and .yarn/patches are not exempt" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-nested-mailmap "$nohooks")
+stage "$r" docs/.mailmap "x@$realdom"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "only the root .mailmap is exempt" || bad "only the root .mailmap is exempt" "exit $rc"
+
+r=$(new_repo scan-marker-hit "$nohooks")
+stage "$r" src/notes.md "first line
+mentions canaryperson in lower case"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "a private marker is refused regardless of case" || bad "a private marker is refused regardless of case" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'src/notes.md: line(s) 2' && ok "marker refusal reports path and line" || bad "marker refusal reports path and line" "$(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -qi canaryperson && bad "marker refusal does not print the marker" "marker bytes in output" || ok "marker refusal does not print the marker"
+
+r=$(new_repo scan-marker-exempt "$nohooks")
+stage "$r" .mailmap "CANARYPERSON <x@example.com>"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok ".mailmap is exempt from the marker arm" || bad ".mailmap is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-marker-missing "$nohooks")
+stage "$r" src/x.ts 'clean'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/does-not-exist" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "a missing private-marker list refuses with exit 2 rather than passing" || bad "a missing private-marker list refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'does-not-exist' && ok "the missing-list refusal names the path it looked for" || bad "the missing-list refusal names the path it looked for" "$(echo "$out" | tr '\n' ' ')"
+
+printf '# only a comment\n\n   \n' > "$work/empty-markers"
+r=$(new_repo scan-marker-empty "$nohooks")
+stage "$r" src/x.ts 'clean text'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/empty-markers" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a list of comments and blank lines is the opt-out and matches nothing" || bad "a list of comments and blank lines is the opt-out and matches nothing" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+printf 'CANARYPERSON\r\n' > "$work/crlf-markers"
+r=$(new_repo scan-marker-crlf "$nohooks")
+stage "$r" a.txt 'has canaryperson here'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/crlf-markers" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "a CRLF marker list still matches" || bad "a CRLF marker list still matches" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-tree "$nohooks")
+stage "$r" src/ok.ts 'export {};'
+git -C "$r" commit -q --no-verify -m 'fixture: clean' 2>/dev/null
+out=$(cd "$r" && sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--tree passes a clean tree" || bad "--tree passes a clean tree" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+stage "$r" src/people.ts "const p = 'person@$realdom';"
+git -C "$r" commit -q --no-verify -m 'fixture: carries an address' 2>/dev/null
+out=$(cd "$r" && sh "$guard" --tree 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--tree (default HEAD) refuses a tree carrying an unlisted address" || bad "--tree (default HEAD) refuses a tree carrying an unlisted address" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'Tree check failed' && ok "--tree words the refusal for a tree" || bad "--tree words the refusal for a tree" "$(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'src/people.ts: line(s) 1' && ok "--tree reports path and line" || bad "--tree reports path and line" "$(echo "$out" | tr '\n' ' ')"
+out=$(cd "$r" && sh "$guard" --tree HEAD~1 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--tree scans the named revision, not HEAD" || bad "--tree scans the named revision, not HEAD" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+out=$(cd "$r" && sh "$guard" --tree no-such-rev 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "--tree with an unknown revision fails closed (exit 2)" || bad "--tree with an unknown revision fails closed (exit 2)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# The CI opt-out, VERBATIM. /dev/null is a character device, not a regular
+# file; a -f test refused it and the documented command exited 2 before
+# scanning (Lumen, r1). The marker arm must be off and the other arms on.
+r=$(new_repo scan-ci-optout "$nohooks")
+stage "$r" src/ok.ts 'export {};'
+stage "$r" src/mentions.md 'this file says canaryperson and is fine without a list'
+git -C "$r" commit -q --no-verify -m 'fixture: clean tree with a marker word' 2>/dev/null
+out=$(cd "$r" && INK_PRIVATE_MARKERS=/dev/null sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "INK_PRIVATE_MARKERS=/dev/null --tree HEAD (the exact CI command) scans and passes" || bad "INK_PRIVATE_MARKERS=/dev/null --tree HEAD (the exact CI command) scans and passes" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+stage "$r" src/people.ts "const p = 'person@$realdom';"
+git -C "$r" commit -q --no-verify -m 'fixture: carries an address' 2>/dev/null
+out=$(cd "$r" && INK_PRIVATE_MARKERS=/dev/null sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "with the marker arm opted out, the address arm still refuses" || bad "with the marker arm opted out, the address arm still refuses" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# A directory at the marker path is not a list.
+mkdir -p "$work/markers-dir"
+r=$(new_repo scan-marker-dir "$nohooks")
+stage "$r" src/x.ts 'clean'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/markers-dir" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "a directory at the marker path refuses with exit 2" || bad "a directory at the marker path refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# RFC-strict reservation (Lumen r1 #2). Only example.com/net/org, their
+# subdomains, and the four reserved TLDs are reserved; an `example` label
+# under any other parent is a registrable name. Parents assembled at runtime.
+iotld=io
+r=$(new_repo scan-addr-example-label "$nohooks")
+stage "$r" a.txt "x@example.$iotld"
+stage "$r" b.txt "y@sub.example.$realdom"
+stage "$r" c.txt "z@example.$realdom"
+stage "$r" d.txt "w@sub.example.$iotld"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "an example label under an unreserved parent is refused" || bad "an example label under an unreserved parent is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -E '^\s+[abcd]\.txt: line\(s\) 1$')
+[ "$c" -eq 4 ] && ok "all four example-label forms are listed, sub.example.<tld> included" || bad "all four example-label forms are listed" "listed $c of 4: $(echo "$out" | tr '\n' ' ')"
+
+# No label may follow a reserved name (Lumen r2): example.com.au is a
+# registrable host, and a file named after an address is composed in the
+# fixture rather than blessed here. Suffixes assembled at runtime.
+ext=json
+autld=au
+r=$(new_repo scan-addr-trailing-label "$nohooks")
+stage "$r" a.ts "const f = 'me@example.com.$ext';"
+stage "$r" b.ts "const g = 'x@example.com.$autld';"
+stage "$r" c.ts "const h = 'y@sub.example.org.$autld';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "a reserved name followed by one label is refused (example.com.au, .json)" || bad "a reserved name followed by one label is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -E '^\s+[abc]\.ts: line\(s\) 1$')
+[ "$c" -eq 3 ] && ok "all three one-label forms are listed" || bad "all three one-label forms are listed" "listed $c of 3: $(echo "$out" | tr '\n' ' ')"
+r=$(new_repo scan-addr-two-labels "$nohooks")
+stage "$r" d.ts "const i = 'z@example.com.$realdom';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "a reserved name followed by two labels is refused" || bad "a reserved name followed by two labels is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+r=$(new_repo scan-addr-composed "$nohooks")
+stage "$r" ok.ts "const composed = 'me@example.com' + '.$ext';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "a filename composed from a reserved address and an extension is allowed" || bad "a filename composed from a reserved address and an extension is allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# Working directory (Lumen r1 #3): --tree from a subdirectory listed
+# cwd-relative paths and then read the root's file of the same name.
+r=$(new_repo scan-subdir "$nohooks")
+stage "$r" fixture.txt 'clean at the root'
+stage "$r" sub/fixture.txt 'mentions canaryperson below the root'
+git -C "$r" commit -q --no-verify -m 'fixture: same name at two depths' 2>/dev/null
+out=$(cd "$r/sub" && sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--tree from a subdirectory still refuses a marker below it" || bad "--tree from a subdirectory still refuses a marker below it" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'sub/fixture.txt: line(s) 1' && ok "--tree from a subdirectory reports the root-relative path" || bad "--tree from a subdirectory reports the root-relative path" "$(echo "$out" | tr '\n' ' ')"
+stage "$r" sub/token.ts "const t = 'ghp_$F36';"
+out=$(cd "$r/sub" && sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "index mode from a subdirectory still refuses" || bad "index mode from a subdirectory still refuses" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+printf 'CANARYPERSON\n' > "$r/sub/rel-markers"
+stage "$r" sub/note.txt 'canaryperson again'
+out=$(cd "$r/sub" && INK_PRIVATE_MARKERS=rel-markers sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "a relative INK_PRIVATE_MARKERS resolves against the caller's directory" || bad "a relative INK_PRIVATE_MARKERS resolves against the caller's directory" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# A faulted marker count (Lumen r1 #4): grep -c that prints 0 and exits 2
+# must not read as "no markers". The stub fires only for the three-argument
+# count of the marker file; the path-list count reads stdin and is untouched.
+mkdir -p "$work/grepstub"
+realgrep=$(command -v grep)
+cat > "$work/grepstub/grep" <<'GREPSTUB'
+#!/bin/sh
+if [ "$1" = -c ] && [ "$2" = '' ] && [ $# -eq 3 ]; then
+  printf '0\n'
+  exit 2
+fi
+exec "$REAL_GREP" "$@"
+GREPSTUB
+chmod +x "$work/grepstub/grep"
+r=$(new_repo scan-count-fault "$nohooks")
+stage "$r" a.txt 'has canaryperson in it'
+out=$(cd "$r" && PATH="$work/grepstub:$PATH" REAL_GREP="$realgrep" sh "$guard" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "a faulted marker count never reports clean" || bad "a faulted marker count never reports clean" "exit 0 with a marker staged: $(echo "$out" | tr '\n' ' ')"
+[ "$rc" -eq 2 ] && ok "a faulted marker count fails closed (exit 2)" || bad "a faulted marker count fails closed (exit 2)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# Fail closed: the credential library is present but the domain list is not.
+mkdir -p "$work/nodomains/lib"
+cp "$guard" "$work/nodomains/check-staged-files.sh"
+cp "$patterns" "$work/nodomains/lib/credential-patterns.sh"
+r=$(new_repo scan-nodomains "$nohooks")
+stage "$r" src/x.ts 'clean'
+out=$(cd "$r" && sh "$work/nodomains/check-staged-files.sh" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "missing fixture-domain list refuses with exit 2 rather than passing" || bad "missing fixture-domain list refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 echo "WIRING (.husky/pre-commit)"
 

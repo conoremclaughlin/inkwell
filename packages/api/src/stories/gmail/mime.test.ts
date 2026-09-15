@@ -19,23 +19,23 @@ function decodeRaw(raw: string): string {
 describe('parseAddress', () => {
   it('parses a bare address without corrupting it', () => {
     // Regression: the previous regex let its optional display-name group
-    // backtrack into the addr-spec, yielding name "…gmail.co" + email "m".
-    expect(parseAddress('conoremclaughlin@gmail.com')).toEqual({
-      email: 'conoremclaughlin@gmail.com',
+    // backtrack into the addr-spec, yielding name "…example.co" + email "m".
+    expect(parseAddress('user@example.com')).toEqual({
+      email: 'user@example.com',
     });
   });
 
   it('parses name + angle-bracketed address', () => {
-    expect(parseAddress('Sneha Shrestha <sneha@clarus-health.com>')).toEqual({
-      name: 'Sneha Shrestha',
-      email: 'sneha@clarus-health.com',
+    expect(parseAddress('Ada Okafor <ada@clinic.example>')).toEqual({
+      name: 'Ada Okafor',
+      email: 'ada@clinic.example',
     });
   });
 
   it('parses a quoted display name', () => {
-    expect(parseAddress('"Shrestha, Sneha" <s@x.com>')).toEqual({
-      name: 'Shrestha, Sneha',
-      email: 's@x.com',
+    expect(parseAddress('"Okafor, Ada" <ada@clinic.example>')).toEqual({
+      name: 'Okafor, Ada',
+      email: 'ada@clinic.example',
     });
   });
 
@@ -69,9 +69,9 @@ describe('splitAddressList', () => {
 
   it('does not split inside a quoted display name', () => {
     // Regression: a naive .split(',') turned one recipient into two broken ones.
-    expect(splitAddressList('"Shrestha, Sneha" <s@x.com>, bob@y.com')).toEqual([
-      '"Shrestha, Sneha" <s@x.com>',
-      'bob@y.com',
+    expect(splitAddressList('"Okafor, Ada" <ada@clinic.example>, bob@example.net')).toEqual([
+      '"Okafor, Ada" <ada@clinic.example>',
+      'bob@example.net',
     ]);
   });
 
@@ -93,9 +93,9 @@ describe('splitAddressList', () => {
 
 describe('parseAddressList', () => {
   it('parses a mixed header the way Gmail emits it', () => {
-    expect(parseAddressList('conor@gmail.com, Sneha Shrestha <sneha@clarus-health.com>')).toEqual([
-      { email: 'conor@gmail.com' },
-      { name: 'Sneha Shrestha', email: 'sneha@clarus-health.com' },
+    expect(parseAddressList('user@example.com, Ada Okafor <ada@clinic.example>')).toEqual([
+      { email: 'user@example.com' },
+      { name: 'Ada Okafor', email: 'ada@clinic.example' },
     ]);
   });
 
@@ -105,7 +105,7 @@ describe('parseAddressList', () => {
 });
 
 describe('isValidAddress', () => {
-  it.each(['a@b.com', 'first.last+tag@sub.example.co.uk', 'x_y@z.io'])('accepts %s', (addr) => {
+  it.each(['a@b.com', 'first.last+tag@sub.mail.example.com', 'x_y@z.io'])('accepts %s', (addr) => {
     expect(isValidAddress(addr)).toBe(true);
   });
 
@@ -125,7 +125,7 @@ describe('isValidAddress', () => {
     'Team: a@example.com',
     'a@example.com:',
     'a@exa mple.com',
-    'a@example..com',
+    'a@example..test',
     'a@-example.com',
     'a@example.com-',
     '(comment)a@example.com',

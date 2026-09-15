@@ -454,11 +454,11 @@ describe('create_reminder quiet-hours advisory', () => {
 
   const REMINDER_ROW = {
     id: 'r1',
-    title: 'Spravato prep',
+    title: 'Eat before 9',
     description: null,
     sb_id: null,
     delivery_channel: 'telegram',
-    delivery_target: '726555973',
+    delivery_target: '123456789',
     cron_expression: null,
     next_run_at: '2026-09-02T14:30:00+00:00',
     studio_hint: null,
@@ -481,7 +481,7 @@ describe('create_reminder quiet-hours advisory', () => {
     const result = await handleCreateReminder(
       {
         userId: TEST_USER_ID,
-        title: 'Spravato prep',
+        title: 'Eat before 9',
         runAt: '2026-09-02T14:30:00Z', // 07:30 PDT — held
       } as never,
       mockDataComposer as never

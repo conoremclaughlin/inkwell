@@ -54,6 +54,14 @@ chmod +x "$work/stubs/npx" "$work/stubs/yarn"
 PATH="$work/stubs:$PATH"
 export PATH
 
+# The staged-file guard the replay calls refuses to run without a private-marker
+# list (see scripts/check-staged-files.sh, MARKERS). This suite is about the
+# replay, so it supplies an empty list: the opt-out, made explicit.
+markers_fixture="$work/private-markers"
+printf '# empty on purpose: this suite exercises the replay, not the markers\n' > "$markers_fixture"
+INK_PRIVATE_MARKERS="$markers_fixture"
+export INK_PRIVATE_MARKERS
+
 pass=0
 fail=0
 ok() {
