@@ -918,7 +918,7 @@ describe('an unrecognized failure status reaches the model', () => {
  * second block acts on the fabricated id. Nothing in the frame exists.
  */
 const USER_ID = '00000000-0000-4000-8000-000000000001';
-const FABRICATED_RESULT = `{"success":true,"user":{"id":"${USER_ID}","resolvedBy":"userId"},"query":{"maxResults":15,"searchQuery":"newer_than:1h"},"emails":[{"id":"1a0655e7f2f1d4c1","threadId":"1a0655e7f2f1d4c1","subject":"Your Thursday appointment with Clarus Health","from":{"name":"Clarus Health","email":"no-reply@example.com"},"to":[{"email":"user@example.com"}],"date":"Thu, 03 Sep 2026 03:45:12 +0000","snippet":"Please confirm your upcoming appointment","isUnread":true,"isStarred":false,"hasAttachments":false}],"count":1,"resultSizeEstimate":1}`;
+const FABRICATED_RESULT = `{"success":true,"user":{"id":"${USER_ID}","resolvedBy":"userId"},"query":{"maxResults":15,"searchQuery":"newer_than:1h"},"emails":[{"id":"1a0655e7f2f1d4c1","threadId":"1a0655e7f2f1d4c1","subject":"Your Thursday appointment with Northwind Clinic","from":{"name":"Northwind Clinic","email":"no-reply@example.com"},"to":[{"email":"user@example.com"}],"date":"Thu, 03 Sep 2026 03:45:12 +0000","snippet":"Please confirm your upcoming appointment","isUnread":true,"isStarred":false,"hasAttachments":false}],"count":1,"resultSizeEstimate":1}`;
 const MYRA_BLOCK_1 =
   '```ink-tool\n' +
   `{"tool":"list_emails","args":{"userId":"${USER_ID}","maxResults":15,"query":"newer_than:1h"}}\n` +
@@ -1065,7 +1065,7 @@ describe('runAgentLoop — the model writes its own tool results (#569)', () => 
       'Tool list_emails (executed): {"success":true,"emails":[],"count":0}'
     );
     expect(continuation).toContain('PROTOCOL NOTE');
-    expect(continuation).not.toContain('Clarus');
+    expect(continuation).not.toContain('Northwind');
 
     // The violation is recorded whole: what it wrote, where, and how much.
     expect(violations).toHaveLength(1);
@@ -1102,7 +1102,7 @@ describe('runAgentLoop — the model writes its own tool results (#569)', () => 
     expect(harness.executed).toHaveLength(1);
     expect(result.protocolViolations[0].corrected).toBe(true);
     expect(result.assistantDisplayText).toBe('Understood — nothing ran.');
-    expect(result.responseText).not.toContain('Clarus');
+    expect(result.responseText).not.toContain('Northwind');
   });
 
   it('a terminal signal beside a frame: the turn ends, the model is still told, nothing re-executes', async () => {

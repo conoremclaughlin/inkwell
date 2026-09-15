@@ -1,8 +1,8 @@
 /**
  * Quiet hours: the deferral that looked like lag.
  *
- * Conor's Spravato fasting prep was scheduled 07:30 against a 09:00 deadline
- * and delivered at 08:06 (2026-09-02). The scheduler had not fallen behind —
+ * A reminder to eat before a 09:00 cutoff was set for 07:30 and delivered at
+ * 08:06 (2026-09-02). The scheduler had not fallen behind —
  * it ticked every five minutes and found the reminder due eight consecutive
  * times without delivering, because it was inside quiet hours. Read as lag, it
  * produced the rule "schedule against the lag", which does nothing: a held

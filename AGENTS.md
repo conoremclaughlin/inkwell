@@ -76,7 +76,7 @@ remember(userId: "...", content: "Decided to use X approach because...", agentId
 
 **Note**: Session lifecycle (`start_session`, `end_session`) is managed automatically by hooks — SBs should not call these manually. Use `remember()` for important context and `update_session_state()` for work status.
 
-**Note**: Never commit PII (emails, user IDs) to the repository. Always read from config files.
+**Note**: Your userId and email are read from config files at runtime. Neither goes into a tracked file, and nothing about the user's life does either — see [Personal data is never repo material](#personal-data-is-never-repo-material-ironclad) under Testing.
 
 ## Security (CRITICAL)
 
@@ -704,6 +704,38 @@ Optional:
 
 When adding a new feature, write unit tests for the logic and integration tests for the server round-trip. Live tests are reserved for eval harnesses where the LLM's judgment is part of what's being measured.
 
+### Personal data is never repo material (IRONCLAD)
+
+Personal data is always private. It never goes into a tracked file, a commit message, a PR body, a branch name or a changelog — not the user's own data, not their contacts, doctors, employer, treatments or conversations, and not anyone else's. Not anonymised, not abbreviated, not "just the domain". The repository is public, and a name beside a subject line is a fact about someone's life that git keeps forever.
+
+Fixtures are where this has been broken, by SBs who had read the rule, and the mechanism is always the same: a real message was the fastest way to reproduce a real parser failure, so its headers went into the test as they arrived. The test was correct. The person was real. That is why the rule now has a machine behind it, the way the credential rules do, and why the worked example below is a fixture.
+
+**How to write a fixture (the worked example):**
+
+- People are made up and obviously so. Pick a name that belongs to no colleague, contact or clinic of the user's.
+- Addresses live at `example.com`, `example.net`, `example.org` or under the reserved TLDs `.test`, `.example`, `.invalid` — set aside by RFC 2606 so nothing real can ever live there. `user@example.com`, `ada@clinic.example`.
+- Phone numbers use the 555 range (`+15555550123`). Chat ids, user ids and platform ids are visibly synthetic (`100200300`, `123456789`), never copied from a live row.
+- Subjects, bodies and reminder titles say nothing about a real person: "Eat before 9", not a treatment, a diagnosis, an employer or a relationship.
+- An integration test that must reach a real account reads the id from the environment and skips when it is absent. The id never goes in the file.
+- A doc comment that cites an incident describes the mechanism and may keep the date; it does not name the person or what the reminder was for.
+
+**What the machine checks.** The staged-file guard (`scripts/check-staged-files.sh` — run by `pre-commit`, replayed by `pre-push`, and run over every tracked file by CI as `--tree HEAD`) has two arms for this. Any email address whose domain is neither reserved nor listed in `scripts/lib/fixture-domains.sh` is refused, so pasting a real header needs a visible edit to that list, in the diff, in review. And any string in `~/.ink/private-markers` — a per-machine list outside the repository, one literal per line, case-insensitive — is refused wherever it appears. The list lives outside the tree because a list of your own personal data is itself personal data. A missing list refuses the commit; an empty one is the explicit opt-out. Both arms report path and line numbers and never the value. The domain list carries a frozen set of legacy placeholders (`test.com`, `x.com` and friends) that predate the guard: do not add to it. Passing the guard means nothing matched, never that nothing personal is there — a name in prose has no shape a scanner can see.
+
+**Set up your marker list once per machine.** The guard refuses to run until the list exists, so the first commit on a new machine says so and tells you this. Create it, then put in it the literal strings that would identify you or the people in your life if a pasted message carried them: your addresses and phone numbers, chat and platform ids, and the names and domains of the people and organisations you correspond with. It is read by the same `pre-commit` hook that runs the credential checks; nothing else to install.
+
+```bash
+mkdir -p ~/.ink
+cat > ~/.ink/private-markers <<'EOF'
+# One literal per line, matched anywhere in a staged file, case-insensitive.
+# This file is never tracked. Blank lines and # comments are ignored.
+EOF
+chmod 600 ~/.ink/private-markers
+```
+
+An empty list is a valid opt-out. A missing one is not.
+
+**If it already happened.** A real person in a tracked file is an incident, not a cleanup. Say so to Conor before anything else. Fix it forward on a branch with a sibling review, keep the values out of the commit message and the PR body (the diff will carry them; the prose must not), and do not touch history on your own — that is a separate decision with its own costs.
+
 ### Commands
 
 ```bash
@@ -799,7 +831,7 @@ These rules exist because on 2026-09-13 a commit message pasted 151 shell variab
 3. **Write the message to a file and commit with `git commit -F <file>`.** Create the file with a quoted heredoc or the `Write` tool. Never `-m`, not even for a one-line subject. The mechanism and the runnable example are in the reference below.
 4. **Stage by naming paths, and look at what you staged.** `git add <path> [<path>...]` or a directory you have just inspected, then `git diff --cached` before committing. Never `git add -A`, never `git add .`, never `git commit -a` or `-am`. `.` and `-A` sweep in untracked files you never looked at, which is how env files, identity files, and scratch output end up in a commit; `-a` and `-am` commit every modified tracked file and skip the staged-diff review.
 5. **Read every commit message back before you push. All of them, every time, through the guard.** Run `sh scripts/check-push.sh --preview`: it replays `origin/main..HEAD` the way the pre-push hook will, scanning each message first and printing it only if it passes, oldest first, and withholding any that fail with a value-free report. Read the output top to bottom. Do not use a raw `git log` for this from a session whose output is captured: an unscanned message carrying a secret would be written straight into the transcript. "Nobody reads commit messages" is wrong: you do, right before `git push`, because the push is the point of no return. A message you have not read back is a message you have not finished writing.
-6. **The hooks are a backstop, not the safety.** The `commit-msg` guard, the staged-file guard, and the pre-push replay catch the shapes that have already burned us. Passing them means nothing matched. Rules 1 through 5 are what prevent the leak.
+6. **The hooks are a backstop, not the safety.** The `commit-msg` guard, the staged-file guard (credentials and personal data alike), and the pre-push replay catch the shapes that have already burned us. Passing them means nothing matched. Rules 1 through 5 are what prevent the leak.
 7. **Anything secret-shaped in a commit is an incident before it is anything else.** Do not push. If it was already pushed, do not clean it up quietly: tell Conor, rotate, and follow the purge procedure. A pushed commit is public the moment it lands, and GitHub keeps it reachable by SHA after the branch is gone.
 
 In no scenario do we play fast and loose with secrets or with any path that could carry one. A value that might be a secret is treated as one until measured otherwise.

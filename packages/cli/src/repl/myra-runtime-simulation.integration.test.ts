@@ -15,7 +15,7 @@
  *     packages/cli/src/repl/myra-runtime-simulation.integration.test.ts
  *
  * To also send a Telegram message:
- *   SEND_TELEGRAM=true INK_SERVER_URL=http://localhost:3001 npx vitest run ...
+ *   SEND_TELEGRAM=true SEND_TELEGRAM_CHAT_ID=<chat id> INK_SERVER_URL=http://localhost:3001 npx vitest run ...
  */
 
 import { describe, expect, it } from 'vitest';
@@ -30,6 +30,9 @@ import { handleClientLocalTool, isClientLocalTool } from './context-tools.js';
 
 const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const SEND_TELEGRAM = process.env.SEND_TELEGRAM === 'true';
+// A real chat id is personal data and never belongs in a tracked file: it is
+// supplied by the environment, and Phase 5 skips when it is absent.
+const SEND_TELEGRAM_CHAT_ID = process.env.SEND_TELEGRAM_CHAT_ID;
 const AGENT_ID = 'myra';
 
 let serverAvailable = false;
@@ -306,19 +309,18 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
 // ─── Phase 5: Send Telegram Message (optional) ──────────────────
 
 describe('Myra simulation: Phase 5 — Telegram Response', () => {
-  it.skipIf(!serverAvailable || !SEND_TELEGRAM)(
-    'sends a real Telegram message to Conor',
+  it.skipIf(!serverAvailable || !SEND_TELEGRAM || !SEND_TELEGRAM_CHAT_ID)(
+    'sends a real Telegram message to the configured chat',
     async () => {
       const pcp = await createPcpClient();
 
       console.log('=== Phase 5: Telegram Response ===');
 
-      // NOTE: conversationId lookup is a gap — we need a user→platform→conversationId
-      // mapping so agents can message users without hardcoding chat IDs.
-      // See PCP task: "Persist conversationId→userId mapping with DB fallback"
+      // conversationId lookup is still a gap (a user→platform→conversationId
+      // mapping would let agents message users without a supplied chat id).
       const result = await pcp.callTool('send_response', {
         channel: 'telegram',
-        conversationId: '726555973',
+        conversationId: SEND_TELEGRAM_CHAT_ID,
         content:
           '🧪 [sb-runtime-test] Myra heartbeat simulation completed on the sb chat runtime.\n\nContext eviction + passive recall pipeline working. 100 tests passing.\n\nThis message was sent from an automated integration test — not a live Myra session.',
       });
@@ -329,10 +331,12 @@ describe('Myra simulation: Phase 5 — Telegram Response', () => {
     }
   );
 
-  it.skipIf(!serverAvailable || SEND_TELEGRAM)(
-    '(skipped — set SEND_TELEGRAM=true to send real messages)',
+  it.skipIf(!serverAvailable || (SEND_TELEGRAM && !!SEND_TELEGRAM_CHAT_ID))(
+    '(skipped — set SEND_TELEGRAM=true and SEND_TELEGRAM_CHAT_ID to send real messages)',
     () => {
-      console.log('\n  Phase 5 skipped: set SEND_TELEGRAM=true to send real Telegram messages\n');
+      console.log(
+        '\n  Phase 5 skipped: set SEND_TELEGRAM=true and SEND_TELEGRAM_CHAT_ID=<chat id> to send real Telegram messages\n'
+      );
     }
   );
 });

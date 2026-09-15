@@ -39,7 +39,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
           eid: 2,
           type: 'local_tool_call',
           tool: 'send_response',
-          args: { channel: 'telegram', conversationId: '726555973', content: 'heads-up!' },
+          args: { channel: 'telegram', conversationId: '100200300', content: 'heads-up!' },
           status: 'executed',
           result: { success: true, messageId: 'tg-401' },
         },
@@ -77,7 +77,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     // result included (Ctrl+T is the drill-down for the scrollback teaser)
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls[0].tool).toBe('send_response');
-    expect(result.toolCalls[0].args).toContain('726555973');
+    expect(result.toolCalls[0].args).toContain('100200300');
     expect(result.toolCalls[0].result).toContain('tg-401');
   });
 
@@ -753,7 +753,7 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
         tool: 'send_response',
         args: {
           channel: 'telegram',
-          conversationId: '726555973',
+          conversationId: '100200300',
           content: 'Post-session catch-up',
         },
         status: 'executed',

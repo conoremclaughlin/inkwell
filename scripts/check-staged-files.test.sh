@@ -14,7 +14,10 @@
 #              invokes it, so the wiring gets its own tier.
 #
 # Every fixture is SYNTHETIC: values match the vendor shapes and are otherwise
-# nonsense. No real credential appears in this file.
+# nonsense. No real credential appears in this file. The personal-data cases
+# (ADDRESSES, MARKERS, --tree) use an invented marker and assemble any address
+# that must be refused at runtime from a variable, so this file itself passes
+# the tree-wide scan CI runs over every tracked file.
 #
 # Usage:  sh scripts/check-staged-files.test.sh
 #
@@ -66,6 +69,15 @@ printf '#!/bin/sh\nexit 0\n' > "$work/stubs/yarn"
 chmod +x "$work/stubs/npx" "$work/stubs/yarn"
 PATH="$work/stubs:$PATH"
 export PATH
+
+# Every case runs with a private-marker list present, because the guard
+# refuses to run without one (MARKERS in scripts/check-staged-files.sh). The
+# list is synthetic — one nonsense marker, a comment and a blank line — so the
+# comment/blank filter is exercised on every run, not only in its own case.
+markers_fixture="$work/private-markers"
+printf '# synthetic marker list for the suite\n\nCANARYPERSON\n' > "$markers_fixture"
+INK_PRIVATE_MARKERS="$markers_fixture"
+export INK_PRIVATE_MARKERS
 
 nohooks="$work/nohooks"
 mkdir -p "$nohooks"
@@ -385,6 +397,106 @@ cp "$guard" "$work/hollow/check-staged-files.sh"
 printf '#!/bin/sh\nshapes=\n' > "$work/hollow/lib/credential-patterns.sh"
 out=$(cd "$r" && sh "$work/hollow/check-staged-files.sh" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "empty pattern library refuses with exit 2" || bad "empty pattern library refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+echo "ADDRESSES and MARKERS (personal data)"
+
+# Assembled at runtime: a literal address on either of these would make this
+# file fail the tree scan it exists to test.
+realdom=gmail.com
+lookalike=northside-clinic.com
+
+r=$(new_repo scan-addr-reserved "$nohooks")
+stage "$r" src/fixture.ts "const a = 'ada@example.com'; const b = 'x@clinic.example'; const c = 'y@host.test'; const d = 'z@nope.invalid'; const e = 'q@sub.example.co.uk'; const f = 'me@example.com.json'; const g = 'a@-example.com'; const h = 'a@example..com';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "reserved-domain addresses are allowed (example.*, .test, .invalid, .example, odd example forms)" || bad "reserved-domain addresses are allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-legacy "$nohooks")
+stage "$r" src/fixture.ts "const a = 'a@test.com'; const b = 'b@x.com'; const c = 'notify@noreply.github.com'; const d = 'id@mail.gmail.com';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "grandfathered and infrastructure domains are allowed, parents included" || bad "grandfathered and infrastructure domains are allowed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-real "$nohooks")
+stage "$r" src/fixture.ts "line one
+const who = 'person@$realdom';
+const also = 'desk@$lookalike';
+const fine = 'ok@example.com';"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "an address on an unlisted domain is refused" || bad "an address on an unlisted domain is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'src/fixture.ts: line(s) 2,3' && ok "address refusal reports path and both line numbers, not the clean line" || bad "address refusal reports path and both line numbers" "$(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q "$realdom" && bad "address refusal does not print the address" "domain bytes in output" || ok "address refusal does not print the address"
+echo "$out" | grep -q 'fixture-domains.sh' && ok "address refusal points at the list" || bad "address refusal points at the list" "$(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-case "$nohooks")
+stage "$r" a.txt "Person@$(printf '%s' "$realdom" | tr 'a-z' 'A-Z')"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "domain comparison folds case" || bad "domain comparison folds case" "exit $rc"
+
+r=$(new_repo scan-addr-exempt "$nohooks")
+stage "$r" .mailmap "Someone <noreply@pcp.dev> <someone@$realdom>"
+stage "$r" .yarn/releases/yarn.cjs "// hello@$realdom"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok ".mailmap and .yarn/ are exempt from the address arm" || bad ".mailmap and .yarn/ are exempt from the address arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-addr-nested-mailmap "$nohooks")
+stage "$r" docs/.mailmap "x@$realdom"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "only the root .mailmap is exempt" || bad "only the root .mailmap is exempt" "exit $rc"
+
+r=$(new_repo scan-marker-hit "$nohooks")
+stage "$r" src/notes.md "first line
+mentions canaryperson in lower case"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "a private marker is refused regardless of case" || bad "a private marker is refused regardless of case" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'src/notes.md: line(s) 2' && ok "marker refusal reports path and line" || bad "marker refusal reports path and line" "$(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -qi canaryperson && bad "marker refusal does not print the marker" "marker bytes in output" || ok "marker refusal does not print the marker"
+
+r=$(new_repo scan-marker-exempt "$nohooks")
+stage "$r" .mailmap "CANARYPERSON <x@example.com>"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok ".mailmap is exempt from the marker arm" || bad ".mailmap is exempt from the marker arm" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-marker-missing "$nohooks")
+stage "$r" src/x.ts 'clean'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/does-not-exist" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "a missing private-marker list refuses with exit 2 rather than passing" || bad "a missing private-marker list refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'does-not-exist' && ok "the missing-list refusal names the path it looked for" || bad "the missing-list refusal names the path it looked for" "$(echo "$out" | tr '\n' ' ')"
+
+printf '# only a comment\n\n   \n' > "$work/empty-markers"
+r=$(new_repo scan-marker-empty "$nohooks")
+stage "$r" src/x.ts 'clean text'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/empty-markers" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a list of comments and blank lines is the opt-out and matches nothing" || bad "a list of comments and blank lines is the opt-out and matches nothing" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+printf 'CANARYPERSON\r\n' > "$work/crlf-markers"
+r=$(new_repo scan-marker-crlf "$nohooks")
+stage "$r" a.txt 'has canaryperson here'
+out=$(cd "$r" && INK_PRIVATE_MARKERS="$work/crlf-markers" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "a CRLF marker list still matches" || bad "a CRLF marker list still matches" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r=$(new_repo scan-tree "$nohooks")
+stage "$r" src/ok.ts 'export {};'
+git -C "$r" commit -q --no-verify -m 'fixture: clean' 2>/dev/null
+out=$(cd "$r" && sh "$guard" --tree HEAD 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--tree passes a clean tree" || bad "--tree passes a clean tree" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+stage "$r" src/people.ts "const p = 'person@$realdom';"
+git -C "$r" commit -q --no-verify -m 'fixture: carries an address' 2>/dev/null
+out=$(cd "$r" && sh "$guard" --tree 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--tree (default HEAD) refuses a tree carrying an unlisted address" || bad "--tree (default HEAD) refuses a tree carrying an unlisted address" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'Tree check failed' && ok "--tree words the refusal for a tree" || bad "--tree words the refusal for a tree" "$(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'src/people.ts: line(s) 1' && ok "--tree reports path and line" || bad "--tree reports path and line" "$(echo "$out" | tr '\n' ' ')"
+out=$(cd "$r" && sh "$guard" --tree HEAD~1 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--tree scans the named revision, not HEAD" || bad "--tree scans the named revision, not HEAD" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+out=$(cd "$r" && sh "$guard" --tree no-such-rev 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "--tree with an unknown revision fails closed (exit 2)" || bad "--tree with an unknown revision fails closed (exit 2)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# Fail closed: the credential library is present but the domain list is not.
+mkdir -p "$work/nodomains/lib"
+cp "$guard" "$work/nodomains/check-staged-files.sh"
+cp "$patterns" "$work/nodomains/lib/credential-patterns.sh"
+r=$(new_repo scan-nodomains "$nohooks")
+stage "$r" src/x.ts 'clean'
+out=$(cd "$r" && sh "$work/nodomains/check-staged-files.sh" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "missing fixture-domain list refuses with exit 2 rather than passing" || bad "missing fixture-domain list refuses with exit 2" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
 echo "WIRING (.husky/pre-commit)"
 

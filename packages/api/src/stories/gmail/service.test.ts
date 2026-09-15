@@ -63,11 +63,11 @@ import { GmailService } from './service';
 
 const expectedDir = join(homedir(), '.ink', 'files', 'gmail');
 
-/** Headers of a real message: a bare To address plus a named Cc. */
+/** Headers shaped like the live message that failed: a bare To address plus a named Cc. */
 const ORIGINAL_HEADERS = [
-  { name: 'From', value: 'Sneha Shrestha <sneha@clarus-health.com>' },
-  { name: 'To', value: 'conoremclaughlin@gmail.com' },
-  { name: 'Cc', value: 'Front Desk <desk@clarus-health.com>' },
+  { name: 'From', value: 'Ada Okafor <ada@clinic.example>' },
+  { name: 'To', value: 'user@example.com' },
+  { name: 'Cc', value: 'Front Desk <desk@clinic.example>' },
   { name: 'Subject', value: 'Appointment Thursday' },
   { name: 'Message-ID', value: '<abc123@mail.gmail.com>' },
 ];
@@ -111,13 +111,13 @@ describe('GmailService.replyToEmail', () => {
     vi.clearAllMocks();
     mockMessagesGet.mockImplementation(routeMessagesGet());
     mockMessagesSend.mockResolvedValue({ data: { id: 'sent-1' } });
-    mockGetProfile.mockResolvedValue({ data: { emailAddress: 'conoremclaughlin@gmail.com' } });
+    mockGetProfile.mockResolvedValue({ data: { emailAddress: 'user@example.com' } });
     service = new GmailService();
   });
 
   it('builds a valid Cc when replying all to a bare-address recipient', async () => {
     // Regression for the live failure: the old parser split the bare To
-    // address into name "conoremclaughlin@gmail.co" + email "m", and "m"
+    // address into name "user@example.co" + email "m", and "m"
     // landed in the Cc header, so Gmail returned "Invalid Cc header".
     await service.replyToEmail('user-1', {
       messageId: 'orig-1',
@@ -126,14 +126,14 @@ describe('GmailService.replyToEmail', () => {
     });
 
     const cc = headerOf(sentRaw(), 'Cc');
-    expect(cc).toBe('desk@clarus-health.com');
+    expect(cc).toBe('desk@clinic.example');
     expect(cc).not.toContain('m,');
     expect(cc?.split(', ')).not.toContain('m');
   });
 
   it('addresses the reply to the original sender', async () => {
     await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
-    expect(headerOf(sentRaw(), 'To')).toBe('sneha@clarus-health.com');
+    expect(headerOf(sentRaw(), 'To')).toBe('ada@clinic.example');
   });
 
   it('excludes the user from their own replyAll Cc', async () => {
@@ -142,7 +142,7 @@ describe('GmailService.replyToEmail', () => {
       body: 'ok',
       replyAll: true,
     });
-    expect(headerOf(sentRaw(), 'Cc')).not.toContain('conoremclaughlin@gmail.com');
+    expect(headerOf(sentRaw(), 'Cc')).not.toContain('user@example.com');
   });
 
   it('omits Cc entirely when not replying all', async () => {
@@ -152,11 +152,14 @@ describe('GmailService.replyToEmail', () => {
 
   it('honors Reply-To over From', async () => {
     mockMessagesGet.mockImplementation(
-      routeMessagesGet([...ORIGINAL_HEADERS, { name: 'Reply-To', value: 'billing@clarus.com' }])
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'Reply-To', value: 'billing@clinic-billing.example' },
+      ])
     );
 
     await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
-    expect(headerOf(sentRaw(), 'To')).toBe('billing@clarus.com');
+    expect(headerOf(sentRaw(), 'To')).toBe('billing@clinic-billing.example');
   });
 
   // Reply-To is an address-LIST (RFC 5322 §3.6.2), not a single mailbox.
@@ -285,7 +288,7 @@ describe('GmailService.replyToEmail', () => {
     mockMessagesGet.mockImplementation(
       routeMessagesGet([
         { name: 'From', value: 'sender@x.com' },
-        { name: 'To', value: '"Shrestha, Sneha" <sneha@y.com>, bob@z.com' },
+        { name: 'To', value: '"Okafor, Ada" <ada@clinic.example>, bob@example.net' },
         { name: 'Subject', value: 'Hi' },
       ])
     );
@@ -295,7 +298,7 @@ describe('GmailService.replyToEmail', () => {
       body: 'ok',
       replyAll: true,
     });
-    expect(headerOf(sentRaw(), 'Cc')).toBe('sneha@y.com, bob@z.com');
+    expect(headerOf(sentRaw(), 'Cc')).toBe('ada@clinic.example, bob@example.net');
   });
 
   it('deduplicates a recipient listed in both To and Cc', async () => {

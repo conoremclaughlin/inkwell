@@ -64,7 +64,7 @@ describe('outboundMediaEntrySchema', () => {
 describe('sendResponseSchema media coercion', () => {
   const base = {
     channel: 'telegram' as const,
-    conversationId: '726555973',
+    conversationId: '100200300',
     content: 'And here is the audio version',
   };
 

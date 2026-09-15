@@ -7,8 +7,8 @@
  * deliberate. What was missing is that nothing said so: the reminder simply
  * arrived late, and the lateness looked like scheduler lag.
  *
- * It cost a real near-miss. Conor's Spravato fasting prep was scheduled 07:30
- * against a 09:00 deadline; it delivered at 08:06 (2026-09-02). Myra read the
+ * It cost a real near-miss. A reminder to eat before a 09:00 cutoff was set
+ * for 07:30; it delivered at 08:06 (2026-09-02). Myra read the
  * 36 minutes as lag and drew the rule "schedule against the lag" — which does
  * NOTHING here, because a held reminder releases when the window ends whatever
  * time it was set for. 07:30, 06:00 and 05:00 all deliver at the same moment.
