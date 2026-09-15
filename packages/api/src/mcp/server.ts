@@ -4,6 +4,7 @@ import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import { createHttpRateLimiter } from '../security/http-rate-limit';
 import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
@@ -404,6 +405,12 @@ export class MCPServer {
         credentials: true,
       })
     );
+
+    // Bound work before any authentication, DB lookup, process spawn, or file
+    // read. All routers (including hooks and observer SSE handshakes) inherit
+    // this ceiling. A separate auth bucket cannot starve lifecycle traffic.
+    app.use(createHttpRateLimiter());
+    app.use(['/authorize', '/mcp/auth/callback', '/token', '/register'], createHttpRateLimiter(60));
 
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)
