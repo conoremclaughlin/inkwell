@@ -81,8 +81,9 @@ export function loadDesktopOAuthClient(dir: string, explicitPath?: string): Load
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(source, 'utf-8'));
-  } catch (err) {
-    throw new Error(`Client file ${source} is not valid JSON: ${(err as Error).message}`);
+  } catch {
+    // JSON parse exceptions can quote credential bytes from the file.
+    throw new Error('Desktop OAuth client file could not be read as JSON');
   }
   const parsed = parseDesktopOAuthClient(raw);
   if (!parsed.ok) throw new Error(`Client file ${source}: ${parsed.reason}`);
@@ -143,8 +144,8 @@ export function listDesktopCredentials(dir: string): {
         continue;
       }
       credentials.push({ path, credential: parsed.value, modifiedAt: statSync(path).mtime });
-    } catch (err) {
-      malformed.push({ path, reason: err instanceof Error ? err.message : String(err) });
+    } catch {
+      malformed.push({ path, reason: 'Credential file could not be read as JSON' });
     }
   }
   return { credentials, malformed };
@@ -222,6 +223,9 @@ function startLoopbackServer(expectedState: string, timeoutMs: number): Promise<
     });
 
     const server = http.createServer((req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
       const url = new URL(req.url || '/', 'http://127.0.0.1');
       if (url.pathname !== '/callback') {
         res.writeHead(404);
@@ -240,7 +244,7 @@ function startLoopbackServer(expectedState: string, timeoutMs: number): Promise<
       if (error) {
         const description = url.searchParams.get('error_description') || error;
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(ERROR_HTML(description));
+        res.end(ERROR_HTML('Google declined the login. Return to the terminal for details.'));
         rejectCode(new Error(`Google refused the login: ${description}`));
         return;
       }

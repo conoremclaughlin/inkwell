@@ -2,8 +2,9 @@ import { toNodeHandler } from '@modelcontextprotocol/node';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import express from 'express';
-import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import { createHttpRateLimiter } from '../security/http-rate-limit';
+import { createBrowserCors, requireCookieCsrfHeader } from '../security/cookie-csrf';
 import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
@@ -398,12 +399,13 @@ export class MCPServer {
     const app = express();
 
     // Enable CORS for web portal, MCP clients, and agents
-    app.use(
-      cors({
-        origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'],
-        credentials: true,
-      })
-    );
+    app.use(createBrowserCors());
+
+    // Bound work before any authentication, DB lookup, process spawn, or file
+    // read. All routers (including hooks and observer SSE handshakes) inherit
+    // this ceiling. A separate auth bucket cannot starve lifecycle traffic.
+    app.use(createHttpRateLimiter());
+    app.use(['/authorize', '/mcp/auth/callback', '/token', '/register'], createHttpRateLimiter(60));
 
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)
@@ -956,6 +958,7 @@ export class MCPServer {
     // Admin & Agent routes
     // ============================================================================
     app.use(express.json());
+    app.use(requireCookieCsrfHeader);
     app.use(cookieParser());
     app.use('/api/admin', adminRouter);
     logger.info('Admin API routes registered at /api/admin');

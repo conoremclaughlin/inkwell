@@ -171,3 +171,71 @@ describe('middleware updateSession', () => {
     });
   });
 });
+
+describe('cookie-to-bearer mutation protection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: 'synthetic-supabase-token' } },
+    });
+  });
+
+  it.each(['pcp-admin-token=synthetic-token', 'sb-synthetic-auth=synthetic-session'])(
+    'rejects cross-origin before reading either credential source',
+    async (cookie) => {
+      const response = await updateSession(
+        new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+          method: 'POST',
+          headers: {
+            cookie,
+            origin: 'https://attacker.example',
+            'X-Inkwell-CSRF': '1',
+            authorization: 'Bearer synthetic',
+          },
+        })
+      );
+      expect(response.status).toBe(403);
+      expect(mockGetSession).not.toHaveBeenCalled();
+      expect(mockGetUser).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['pcp-admin-token=synthetic-token', 'sb-synthetic-auth=synthetic-session'])(
+    'adds the non-simple header only after same-origin validation',
+    async (cookie) => {
+      const response = await updateSession(
+        new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+          method: 'POST',
+          headers: { cookie, origin: WEB_ORIGIN },
+        })
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get('x-middleware-request-x-inkwell-csrf')).toBe('1');
+      expect(response.headers.get('x-middleware-request-authorization')).toMatch(
+        /^Bearer synthetic/
+      );
+    }
+  );
+
+  it('rejects ambient cookies without provenance but preserves cookie-free native calls', async () => {
+    const rejected = await updateSession(
+      new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+        method: 'POST',
+        headers: { cookie: 'pcp-admin-token=synthetic-token' },
+      })
+    );
+    expect(rejected.status).toBe(403);
+    mockGetSession.mockResolvedValue({ data: { session: null } });
+    const native = await updateSession(
+      new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer synthetic-native', 'X-Inkwell-CSRF': 'forged' },
+      })
+    );
+    expect(native.status).toBe(200);
+    expect(native.headers.get('x-middleware-request-authorization')).toBe(
+      'Bearer synthetic-native'
+    );
+    expect(native.headers.get('x-middleware-request-x-inkwell-csrf')).toBeNull();
+  });
+});

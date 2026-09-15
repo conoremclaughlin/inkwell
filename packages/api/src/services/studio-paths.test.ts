@@ -36,7 +36,7 @@ describe('ephemeralWorktreePath', () => {
     expect(
       ephemeralWorktreePath({
         sbSlug: 'wren',
-        repoRoot: '/Users/conor/ws/pcp/inkwell',
+        repoRoot: '/home/synthetic/ws/inkwell',
         leaf: 'wren-omega--pr-537',
       })
     ).toBe('/tmp/studios/wren/inkwell/wren-omega--pr-537');
@@ -145,4 +145,24 @@ describe('studioPathSegment', () => {
       expect(b).not.toBe('project');
     });
   });
+});
+
+it('keeps hostile components beneath the normalized configured root', () => {
+  process.env.INK_STUDIOS_ROOT = '/tmp/synthetic-studios/../studio-root';
+  for (const component of [
+    '../../outside',
+    '../studio-root-sibling',
+    '/outside',
+    'nested\\path',
+    '..',
+    'name\n',
+  ]) {
+    const candidate = ephemeralWorktreePath({
+      sbSlug: component,
+      repoRoot: '/synthetic/repository',
+      leaf: component,
+    });
+    expect(candidate.startsWith('/tmp/studio-root/')).toBe(true);
+    expect(path.relative('/tmp/studio-root', candidate).split(path.sep)).toHaveLength(3);
+  }
 });

@@ -12,7 +12,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { exec } from 'child_process';
+import { openBrowser } from '../lib/open-browser.js';
 import { missingGoogleScopes } from '@inklabs/shared';
 import {
   checkDesktopCredential,
@@ -23,11 +23,6 @@ import {
   runDesktopGoogleLogin,
   writeDesktopCredential,
 } from '../lib/google-desktop-login.js';
-
-function openBrowser(url: string): void {
-  // macOS — extend for Linux/Windows later (mirrors `ink auth login`).
-  exec(`open "${url}"`);
-}
 
 const SEVEN_DAY_NOTE =
   'If the OAuth client belongs to a Google Cloud project whose consent screen is still in ' +

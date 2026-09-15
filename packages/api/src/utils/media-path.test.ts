@@ -1,7 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { promises as fsPromises } from 'fs';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { promises as fsPromises, constants as fsConstants } from 'fs';
+import type { FileHandle } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -11,30 +10,28 @@ import {
   resolveAllowedMediaPath,
 } from './media-path';
 
-const execFileAsync = promisify(execFile);
-
-const HOME = '/Users/conor';
-const REPO = '/Users/conor/ws/inkwell';
-const ROOTS = ['/Users/conor/.ink/files', '/Users/conor/ws/inkwell/docs/screenshots'];
+const HOME = '/home/synthetic';
+const REPO = '/home/synthetic/ws/inkwell';
+const ROOTS = ['/home/synthetic/.ink/files', '/home/synthetic/ws/inkwell/docs/screenshots'];
 
 describe('resolveAllowedMediaPath', () => {
   it('serves the three real evidence path shapes: ~, absolute, repo-relative', () => {
     expect(
       resolveAllowedMediaPath('~/.ink/files/wren-screenshots/a.jpeg', ROOTS, HOME, REPO)
     ).toEqual({
-      absolutePath: '/Users/conor/.ink/files/wren-screenshots/a.jpeg',
+      absolutePath: '/home/synthetic/.ink/files/wren-screenshots/a.jpeg',
       mediaType: 'image',
     });
     expect(
-      resolveAllowedMediaPath('/Users/conor/.ink/files/telegram/video.mp4', ROOTS, HOME, REPO)
+      resolveAllowedMediaPath('/home/synthetic/.ink/files/telegram/video.mp4', ROOTS, HOME, REPO)
     ).toEqual({
-      absolutePath: '/Users/conor/.ink/files/telegram/video.mp4',
+      absolutePath: '/home/synthetic/.ink/files/telegram/video.mp4',
       mediaType: 'video',
     });
     expect(
       resolveAllowedMediaPath('docs/screenshots/pr-547/above-fold.jpeg', ROOTS, HOME, REPO)
     ).toEqual({
-      absolutePath: '/Users/conor/ws/inkwell/docs/screenshots/pr-547/above-fold.jpeg',
+      absolutePath: '/home/synthetic/ws/inkwell/docs/screenshots/pr-547/above-fold.jpeg',
       mediaType: 'image',
     });
   });
@@ -52,10 +49,10 @@ describe('resolveAllowedMediaPath', () => {
   it('refuses paths outside every root even without traversal', () => {
     expect(resolveAllowedMediaPath('/etc/passwd.png', ROOTS, HOME, REPO)).toBeNull();
     expect(resolveAllowedMediaPath('~/Desktop/photo.jpeg', ROOTS, HOME, REPO)).toBeNull();
-    // Prefix-sibling directory: /Users/conor/.ink/files-evil must not match
-    // the /Users/conor/.ink/files root by string prefix.
+    // Prefix-sibling directory: /home/synthetic/.ink/files-evil must not match
+    // the /home/synthetic/.ink/files root by string prefix.
     expect(
-      resolveAllowedMediaPath('/Users/conor/.ink/files-evil/a.jpeg', ROOTS, HOME, REPO)
+      resolveAllowedMediaPath('/home/synthetic/.ink/files-evil/a.jpeg', ROOTS, HOME, REPO)
     ).toBeNull();
   });
 
@@ -68,15 +65,15 @@ describe('resolveAllowedMediaPath', () => {
 
 describe('isWithinRoots', () => {
   it('containment is segment-aware, not string-prefix', () => {
-    expect(isWithinRoots('/Users/conor/.ink/files/x.png', ROOTS)).toBe(true);
-    expect(isWithinRoots('/Users/conor/.ink/files', ROOTS)).toBe(true);
-    expect(isWithinRoots('/Users/conor/.ink/files-evil/x.png', ROOTS)).toBe(false);
+    expect(isWithinRoots('/home/synthetic/.ink/files/x.png', ROOTS)).toBe(true);
+    expect(isWithinRoots('/home/synthetic/.ink/files', ROOTS)).toBe(true);
+    expect(isWithinRoots('/home/synthetic/.ink/files-evil/x.png', ROOTS)).toBe(false);
   });
 });
 
 describe('expandHomePath', () => {
   it('expands only a leading tilde segment', () => {
-    expect(expandHomePath('~/.ink/files/a.png', HOME)).toBe('/Users/conor/.ink/files/a.png');
+    expect(expandHomePath('~/.ink/files/a.png', HOME)).toBe('/home/synthetic/.ink/files/a.png');
     expect(expandHomePath('/abs/path.png', HOME)).toBe('/abs/path.png');
     expect(expandHomePath('rel/~x/path.png', HOME)).toBe('rel/~x/path.png');
   });
@@ -138,14 +135,22 @@ describe('openVerifiedMedia (real filesystem fixtures)', () => {
     expect(await openAt(join(root, 'escape.jpeg'))).toBeNull();
   });
 
-  it('refuses a FIFO with a media name — never opens blocking, never serves a non-file', async () => {
-    const fifoPath = join(root, 'pipe.jpeg');
+  it('opens nonblocking and closes a descriptor that is not a regular file', async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+    const open = vi.spyOn(fsPromises, 'open').mockResolvedValue({
+      stat: vi.fn().mockResolvedValue({ isFile: () => false }),
+      close,
+    } as unknown as FileHandle);
     try {
-      await execFileAsync('mkfifo', [fifoPath]);
-    } catch {
-      return; // platform without mkfifo — the guard is still covered by isFile()
+      expect(await openAt(join(root, 'legit.jpeg'))).toBeNull();
+      expect(open).toHaveBeenCalledWith(
+        expect.any(String),
+        fsConstants.O_RDONLY | fsConstants.O_NONBLOCK
+      );
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      open.mockRestore();
     }
-    expect(await openAt(fifoPath)).toBeNull();
   });
 
   it('one missing root never disables the others', async () => {
