@@ -150,6 +150,92 @@ export function effectiveContextTokens(
 }
 
 /**
+ * Where the window actually sits, split by WHAT CAN REACH IT.
+ *
+ * One total is not enough, because the two halves answer to different tools.
+ * `evict_context` edits ink's ledger; the provider session keeps every original
+ * message, so eviction cannot reclaim a token the ledger never held. Only
+ * compaction re-seeds the provider side.
+ *
+ * The gap is not a rounding error and it is not invisible — it is mis-sized.
+ * A tool result enters the ledger as a <=500-char stub (chat.ts compactForLedger)
+ * while the provider reads the whole payload. Measured 2026-09-15: one
+ * `list_tasks` reply put 125 tokens in the ledger and ~145,000 in the window.
+ * An agent that evicts the stub is told `tokensFreed: 125` and has every reason
+ * to believe it acted on the big item. It acted on the receipt, not the parcel.
+ *
+ * So callers get three numbers and a flag, never one number:
+ *   ledgerTokens        reclaimable by evict_context
+ *   providerOnlyTokens  reclaimable only by compact_context
+ *   effectiveTokens     what to budget against
+ *
+ * `splitKnown` is false when the provider has not reported yet. Then the split
+ * is genuinely unknown and the renderer must say so — reporting the estimate
+ * alone implies all of it is actionable, which is the failure this guards.
+ */
+export interface ContextOccupancy {
+  /** ink's estimate of what it packed: transcript plus the identity envelope it reserves. */
+  ledgerTokens: number;
+  /** Occupancy the provider reported that the ledger cannot account for. */
+  providerOnlyTokens: number;
+  /** The number to budget against — the larger of the estimate and the measurement. */
+  effectiveTokens: number;
+  limit: number;
+  /** effectiveTokens / limit, clamped at 0 but NOT at 1 — over-budget must read as over-budget. */
+  utilization: number;
+  /** False when no provider measurement exists; the split is then unknown, not zero. */
+  splitKnown: boolean;
+}
+
+/**
+ * `bootstrapTokens` is added to the estimate rather than subtracted from the
+ * limit. The provider's measurement covers the whole window including the
+ * identity envelope, so comparing it against a transcript-only estimate over a
+ * reduced limit compares two different quantities. Both sides are whole-window
+ * here, which is what makes max() meaningful.
+ */
+export function computeContextOccupancy(
+  ledgerTokens: number,
+  bootstrapTokens: number,
+  limit: number,
+  measured: ProviderContextMeasurement | undefined
+): ContextOccupancy {
+  const accountable = Math.max(0, ledgerTokens) + Math.max(0, bootstrapTokens);
+  const effectiveTokens = effectiveContextTokens(accountable, measured);
+  const safeLimit = limit > 0 ? limit : 1;
+  return {
+    ledgerTokens: accountable,
+    providerOnlyTokens: Math.max(0, effectiveTokens - accountable),
+    effectiveTokens,
+    limit: safeLimit,
+    utilization: effectiveTokens / safeLimit,
+    splitKnown: measured !== undefined,
+  };
+}
+
+/**
+ * The per-turn stamp. Ephemeral by design: it is rendered into the prompt each
+ * turn and never added to the ledger, because an entry per turn would
+ * accumulate one stale occupancy reading per turn — context spent reporting
+ * context, growing with the thing it measures.
+ */
+export function formatContextStamp(occ: ContextOccupancy): string {
+  const pct = Math.round(occ.utilization * 100);
+  const n = (v: number) => v.toLocaleString();
+  const head = `[context] ${n(occ.effectiveTokens)} / ${n(occ.limit)} (${pct}%)`;
+  if (!occ.splitKnown) {
+    return (
+      `${head} — ledger estimate only; the provider has not reported this session, ` +
+      `so how much of this is reclaimable is unknown.`
+    );
+  }
+  return (
+    `${head} — ${n(occ.ledgerTokens)} reclaimable by evict_context, ` +
+    `${n(occ.providerOnlyTokens)} only by compact_context.`
+  );
+}
+
+/**
  * Handle a client-local tool call. Returns the result in PCP tool format,
  * or null if the tool isn't recognized.
  */
