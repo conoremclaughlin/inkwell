@@ -11,6 +11,7 @@ import {
 import { EmbeddingRouter } from '../services/embeddings/router';
 import { getVettedEmbeddingModel } from '../services/embeddings/vetted-models';
 import { env } from '../config/env';
+import { describeBackfillScope } from './backfill-memory-scope';
 
 type MemoryRow = Database['public']['Tables']['memories']['Row'];
 
@@ -87,7 +88,9 @@ async function main() {
   const failures: Array<{ memoryId: string; message: string }> = [];
 
   console.log(
-    `[memory-embedding-backfill] user=${userId} agent=${sbSlug || '*'} memory=${memoryId || '*'} topic=${topic || '*'} ` +
+    // Scope selectors may be private. Report only whether filters are active,
+    // never environment-derived identifiers or topics.
+    `[memory-embedding-backfill] ${describeBackfillScope({ sbSlug, memoryId, topic })} ` +
       `offset=${startOffset} limit=${limit ?? 'all'} batchSize=${batchSize} force=${force} dryRun=${dryRun} ` +
       `continueOnError=${continueOnError} rowAttempts=${maxRowAttempts} ` +
       `mode=${env.MEMORY_EXTRACTION_MODE} chunkVersion=${MEMORY_EMBEDDING_CHUNKS_VERSION}`
