@@ -14,6 +14,7 @@ import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import type { SessionService } from '../services/sessions/session-service';
 import type { SessionRequest } from '../services/sessions/types';
+import { isSafeStudioComponent } from '@inklabs/shared';
 
 /**
  * Create a chat router with access to the session service.
@@ -32,10 +33,10 @@ export function createChatRouter(getSessionService: () => SessionService | null)
   router.post('/message', async (req, res: Response) => {
     try {
       const { userId, userEmail } = req as ChatAuthRequest;
-      const { sbSlug, content } = req.body;
+      const { sbSlug, content } = req.body ?? {};
 
-      if (!sbSlug || !content) {
-        res.status(400).json({ error: 'sbSlug and content are required' });
+      if (!isSafeStudioComponent(sbSlug) || typeof content !== 'string' || !content) {
+        res.status(400).json({ error: 'A valid sbSlug and nonempty text content are required' });
         return;
       }
 
