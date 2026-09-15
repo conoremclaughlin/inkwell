@@ -6,7 +6,42 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveTriggeredAgents, resolveEffectiveFloor, isLaterInstant } from './thread-handlers';
+import {
+  resolveTriggeredAgents,
+  resolveEffectiveFloor,
+  isLaterInstant,
+  threadToolDefinitions,
+  threadTool,
+} from './thread-handlers';
+
+describe('thread tool definitions', () => {
+  // Registration in index.ts used to index this array positionally. Adding
+  // update_thread anywhere but the end silently rebound list_threads,
+  // mark_thread_read and reopen_thread to their neighbours' schemas — no type
+  // error, because the shapes are close enough to compile. This pins the
+  // property that made that possible.
+  it('resolves every tool to its own definition by name', () => {
+    for (const definition of threadToolDefinitions) {
+      expect(threadTool(definition.name).name).toBe(definition.name);
+      expect(threadTool(definition.name).schema).toBe(definition.schema);
+      expect(threadTool(definition.name).handler).toBe(definition.handler);
+    }
+  });
+
+  it('has no duplicate tool names, which would make a name lookup ambiguous', () => {
+    const names = threadToolDefinitions.map((t) => t.name);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it('throws on an unknown tool rather than returning undefined', () => {
+    // A silently unregistered tool is invisible until a caller needs it.
+    expect(() => threadTool('no_such_thread_tool')).toThrow(/Unknown thread tool/);
+  });
+
+  it('exposes update_thread', () => {
+    expect(threadTool('update_thread').name).toBe('update_thread');
+  });
+});
 
 describe('resolveTriggeredAgents', () => {
   describe('1:1 threads (2 participants)', () => {
