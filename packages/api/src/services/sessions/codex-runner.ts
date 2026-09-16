@@ -204,6 +204,9 @@ export class CodexRunner implements IRunner {
       args.push('-m', config.model);
     }
 
+    // Everything following this delimiter is data, never a CLI option or
+    // subcommand selected by remote message text. Resume still gets its ID.
+    args.push('--');
     if (isResume && resumeSessionId) {
       args.push(resumeSessionId);
       args.push(message);
@@ -268,6 +271,7 @@ export class CodexRunner implements IRunner {
       });
 
       const proc = spawn(target.binary, target.args, {
+        shell: false,
         cwd: target.cwd,
         env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
         stdio: ['ignore', 'pipe', 'pipe'],

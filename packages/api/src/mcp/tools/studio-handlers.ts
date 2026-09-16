@@ -8,9 +8,8 @@
 
 import { z } from 'zod';
 import path from 'path';
-import { execFile, execSync } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { existsSync } from 'fs';
 import { access } from 'fs/promises';
 
 const execFileAsync = promisify(execFile);
@@ -18,7 +17,7 @@ import type { DataComposer } from '../../data/composer';
 import type { Json } from '../../data/supabase/types';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import { bootstrapStudio } from '@inklabs/shared';
+import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { resolveCaller, resolveImplicitSession } from './memory-handlers';
@@ -39,21 +38,17 @@ import {
 /**
  * Resolve the main git worktree root from any path (worktree or main repo).
  * If the given path is a linked worktree, returns the main worktree root.
- * Falls back to the original path if git fails or isn't available.
+ * No inferred root on failure: real creation requires a verified repository.
  */
-function resolveMainWorktree(dir: string): string {
-  try {
-    const output = execSync('git worktree list --porcelain', {
-      cwd: dir,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    // First entry in `git worktree list` is always the main worktree
-    const match = output.match(/^worktree\s+(.+)$/m);
-    return match ? match[1] : dir;
-  } catch {
-    return dir;
+async function resolveMainWorktree(dir: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain', '-z'], {
+    cwd: dir,
+  });
+  const first = stdout.split('\0')[0];
+  if (!first.startsWith('worktree ') || !path.isAbsolute(first.slice(9))) {
+    throw new Error('Could not resolve the main repository root');
   }
+  return first.slice(9);
 }
 
 // ============== Constants ==============
@@ -70,10 +65,14 @@ const WORK_TYPE_ABBREV: Record<string, string> = {
 // ============== Schemas ==============
 
 const createStudioSchema = userIdentifierBaseSchema.extend({
-  sbSlug: z.string().describe('SB slug creating the studio (e.g., "wren")'),
+  sbSlug: z
+    .string()
+    .refine(isSafeStudioComponent, 'Invalid SB path component')
+    .describe('SB slug creating the studio (e.g., "wren")'),
   repoRoot: z.string().describe('Absolute path to the main repository root'),
   slug: z
     .string()
+    .refine(isSafeStudioComponent, 'Invalid studio path component')
     .describe('Short slug for the studio (used in branch name and worktree directory)'),
   workType: z
     .enum(['feature', 'bugfix', 'refactor', 'chore', 'experiment', 'other'])
@@ -704,28 +703,41 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   }
 
   // Resolve to the main worktree root (handles case where repoRoot is a linked worktree)
-  const mainRoot = resolveMainWorktree(repoRoot);
+  let mainRoot: string;
+  try {
+    mainRoot = await resolveMainWorktree(repoRoot);
+  } catch {
+    if (!skipGitOperations) return errorResponse('Could not resolve the main repository root');
+    // Explicit metadata-only creation also supports directories without git.
+    mainRoot = path.resolve(repoRoot);
+  }
 
   // Derive branch name and worktree path (sibling of the main repo root)
   const abbrev = WORK_TYPE_ABBREV[workType] || 'other';
   const branch = `${actor.sbSlug}/${abbrev}/${slug}`;
-  const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+  const worktreePath = studioSiblingPath(mainRoot, slug);
 
   // Perform git operations if not skipped
   if (!skipGitOperations) {
     try {
       logger.info('Creating git worktree', { branch, worktreePath, baseBranch, repoRoot });
-      execSync(`git worktree add -b ${branch} ${worktreePath} ${baseBranch}`, {
-        cwd: repoRoot,
-        stdio: 'pipe',
-      });
+      await execFileAsync(
+        'git',
+        ['worktree', 'add', '-b', branch, '--', worktreePath, baseBranch],
+        { cwd: mainRoot }
+      );
 
       // Install dependencies if package.json exists
-      if (existsSync(path.join(worktreePath, 'package.json'))) {
+      if (
+        await access(path.join(worktreePath, 'package.json')).then(
+          () => true,
+          () => false
+        )
+      ) {
         logger.info('Installing dependencies in worktree', { worktreePath });
-        execSync('yarn install', {
+        await execFileAsync('yarn', ['install'], {
           cwd: worktreePath,
-          stdio: 'pipe',
+          maxBuffer: 20 * 1024 * 1024,
         });
       }
 
@@ -796,10 +808,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     if (!skipGitOperations) {
       try {
         logger.warn('DB insert failed, cleaning up worktree', { worktreePath });
-        execSync(`git worktree remove ${worktreePath}`, {
-          cwd: repoRoot,
-          stdio: 'pipe',
-        });
+        await execFileAsync('git', ['worktree', 'remove', '--', worktreePath], { cwd: mainRoot });
       } catch (cleanupError) {
         logger.error('Failed to clean up worktree after DB error', {
           worktreePath,
