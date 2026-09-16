@@ -5,6 +5,9 @@ import {
   reconcileSelection,
   snapshotCalls,
   extractLocalToolCalls,
+  extractToolBlocks,
+  describeMalformedBlock,
+  repairTruncatedJson,
   findImitatedToolResults,
   hasUnseenFailure,
   isErrorPayload,
@@ -2358,5 +2361,177 @@ describe('REGRESSION (Lumen, PR #576 round 5): names are bounded in bytes, not o
     const body = buildContinuationBody(results, [], undefined, { budgetBytes: 600 });
     expect(bytes(body)).toBeLessThanOrEqual(600);
     expect(body).not.toContain('a'.repeat(200));
+  });
+});
+
+/**
+ * A fenced block whose JSON does not parse used to hit `catch { continue }`:
+ * no log, no record, no UI event, and — because reconciliation compares against
+ * what extraction produced — nothing for `dropped` to notice either. The call
+ * simply was not there.
+ *
+ * Myra hit this on 2026-09-15 and could not diagnose it from her own seat,
+ * because a dispatched-and-failed call and a never-extracted one are the same
+ * observation to the caller: absence. Seven consecutive `remember` calls
+ * vanished while a `bash` block in the same response ran normally. The cause
+ * was one missing `}` in each payload.
+ *
+ * The shape below is the measured one: a long single-line payload whose args
+ * object is closed but whose outer object is not, followed by a well-formed
+ * sibling. Across 14 days of transcripts, 27 of 29 lost blocks were exactly
+ * this, and they skewed hard toward tools carrying long prose — `remember` at
+ * 6.3% against `bash` at 0.4%.
+ */
+const LONG_PROSE = 'column names are read from the row, never guessed. '.repeat(12);
+
+/** One `}` short: `args` closes, the outer object does not. */
+function oneBraceShort(tool: string, args: Record<string, unknown>): string {
+  const full = JSON.stringify({ tool, args });
+  return '```ink-tool\n' + full.slice(0, -1) + '\n```';
+}
+
+describe('extractToolBlocks — a block that cannot be parsed is reported, never dropped', () => {
+  it('repairs the measured one-missing-brace payload and runs it', () => {
+    const text =
+      'Saving the note.\n\n' +
+      oneBraceShort('remember', { content: LONG_PROSE, topics: ['a', 'b'], salience: 'high' }) +
+      '\n\n' +
+      inkTool('bash', { command: 'echo ok' });
+
+    const { calls, malformed, repaired } = extractToolBlocks(text);
+
+    expect(calls.map((c) => c.tool)).toEqual(['remember', 'bash']);
+    expect(calls[0]!.args.content).toBe(LONG_PROSE);
+    expect(malformed).toEqual([]);
+    expect(repaired).toHaveLength(1);
+    expect(repaired[0]!.tool).toBe('remember');
+  });
+
+  it('reports an unrepairable block and still runs its well-formed sibling', () => {
+    // Ends inside a string: the missing bytes are CONTENT, so closing brackets
+    // would fabricate an argument rather than complete one.
+    const text =
+      '```ink-tool\n{"tool":"remember","args":{"content":"unterminated\n```\n\n' +
+      inkTool('bash', { command: 'echo ok' });
+
+    const { calls, malformed, repaired } = extractToolBlocks(text);
+
+    expect(calls.map((c) => c.tool)).toEqual(['bash']);
+    expect(repaired).toEqual([]);
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]!.tool).toBe('remember');
+    expect(describeMalformedBlock(malformed[0]!)).toContain('remember');
+    expect(describeMalformedBlock(malformed[0]!)).toContain('Nothing ran and nothing was written');
+  });
+
+  it('refuses to repair a block whose fence never closed', () => {
+    // No closing ```, so the response ended mid-block and the payload may be
+    // missing arguments outright. A syntactically valid call built from half a
+    // payload is a silent corruption — worse than the drop being fixed here.
+    const { calls, malformed } = extractToolBlocks(
+      '```ink-tool\n{"tool":"remember","args":{"content":"half a thought","salience":"high"}'
+    );
+
+    expect(calls).toEqual([]);
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]!.fenceClosed).toBe(false);
+    expect(describeMalformedBlock(malformed[0]!)).toContain('closing ``` fence');
+  });
+
+  it('reports a block that parses but names no tool', () => {
+    const { calls, malformed } = extractToolBlocks('```ink-tool\n{"args":{"a":1}}\n```');
+
+    expect(calls).toEqual([]);
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]!.error).toContain('no "tool" name');
+  });
+});
+
+describe('repairTruncatedJson', () => {
+  it('closes only what is provably open, in stack order', () => {
+    expect(repairTruncatedJson('{"a":{"b":[1,2')).toBe('{"a":{"b":[1,2]}}');
+    expect(repairTruncatedJson('{"tool":"x","args":{"n":1}')).toBe('{"tool":"x","args":{"n":1}}');
+  });
+
+  it('refuses anything that would require inventing content', () => {
+    // Inside a string — the missing text is the argument itself.
+    expect(repairTruncatedJson('{"a":"unterminated')).toBeNull();
+    // Dangling escape.
+    expect(repairTruncatedJson('{"a":"x\\')).toBeNull();
+    // Mismatched brackets are not a miscount, they are a different error.
+    expect(repairTruncatedJson('{"a":[1}')).toBeNull();
+    // Already balanced but invalid: repair must not paper over other faults.
+    expect(repairTruncatedJson('{"a":,}')).toBeNull();
+    // Nothing open: returning the input unchanged would hide a real parse error.
+    expect(repairTruncatedJson('{"a":1} trailing')).toBeNull();
+  });
+
+  it('does not mistake brackets inside strings for structure', () => {
+    // Brackets inside a string are content: the scanner must neither count
+    // them nor be terminated by an ESCAPED quote. Both payloads below are one
+    // `}` short of valid and must be closed exactly once.
+    expect(repairTruncatedJson('{"a":"}{][ literal"')).toBe('{"a":"}{][ literal"}');
+    expect(repairTruncatedJson('{"a":"esc \\" still in string }{"')).toBe(
+      '{"a":"esc \\" still in string }{"}'
+    );
+    // A string left OPEN is still refused, however many brackets it contains.
+    expect(repairTruncatedJson('{"cmd":"echo }}}')).toBeNull();
+  });
+});
+
+describe('runAgentLoop — an unrunnable block reaches the model', () => {
+  it('records a result for a turn whose only block was malformed', async () => {
+    const harness = makePorts([
+      outcome({
+        stdout:
+          'Saving that.\n\n```ink-tool\n{"tool":"remember","args":{"content":"unterminated\n```',
+      }),
+    ]);
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // The invariant: a tool call produces a record — executed, refused or
+    // errored — but never nothing.
+    expect(result.toolResults).toHaveLength(1);
+    expect(result.toolResults[0]!.tool).toBe('remember');
+    expect(result.toolResults[0]!.status).toBe('rejected');
+    expect(String(result.toolResults[0]!.result)).toContain('was discarded');
+    expect(harness.observed).toHaveLength(1);
+    expect(harness.events.join('\n')).toContain('remember');
+  });
+
+  it('relays the rejection to the model rather than ending in silence', async () => {
+    const harness = makePorts([
+      outcome({
+        stdout:
+          'Saving that.\n\n```ink-tool\n{"tool":"remember","args":{"content":"unterminated\n```',
+      }),
+    ]);
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', relayBudgetBytes: () => 4000 },
+      harness.ports
+    );
+
+    const relay = buildFinalRelayBody(result.toolResults, undefined, { budgetBytes: 4000 });
+    expect(relay).toContain('remember');
+    expect(relay).toContain('discarded');
+  });
+
+  it('a malformed block does not make a healthy turn read as all-refused', async () => {
+    const harness = makePorts([
+      outcome({
+        stdout:
+          '```ink-tool\n{"tool":"remember","args":{"content":"unterminated\n```\n\n' +
+          inkTool('bash', { command: 'echo ok' }),
+      }),
+      outcome({ stdout: 'done' }),
+    ]);
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(result.stopReason).not.toBe('all-refused');
+    expect(harness.executed[0]!.map((c) => c.tool)).toEqual(['bash']);
+    expect(result.toolResults.map((r) => r.status)).toEqual(['rejected', 'executed']);
   });
 });

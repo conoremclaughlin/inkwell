@@ -95,6 +95,26 @@ export function snapshotCalls(calls: ReadonlyArray<LocalToolCall>): LocalToolCal
   return calls.map((c) => ({ ...c, args: structuredClone(c.args) }));
 }
 
+/**
+ * What the model is told about a block that could not be run.
+ *
+ * Names the tool, because "a block was dropped" and "your remember block was
+ * dropped" are different messages to an agent that emitted three. Quotes the
+ * parser verbatim rather than paraphrasing, and gives the payload length: when
+ * this recurs, size is the variable that predicts it.
+ */
+export function describeMalformedBlock(block: MalformedToolBlock): string {
+  const subject = block.tool ? `Your ${block.tool} block` : 'An ink-tool block';
+  const cause = block.fenceClosed
+    ? 'it was NOT executed because its JSON could not be parsed'
+    : 'it was NOT executed because the response ended before its closing ``` fence';
+  return (
+    `${subject} (${block.payloadLength} bytes) was discarded: ${cause} — ${block.error}. ` +
+    `Nothing ran and nothing was written. Re-emit it as one balanced JSON object, ` +
+    `checking that every { and [ you opened is closed.`
+  );
+}
+
 /** Same request? Compared by content so a rebuilt object still matches. */
 function sameCall(a: LocalToolCall, b: LocalToolCall): boolean {
   return a.tool === b.tool && JSON.stringify(a.args) === JSON.stringify(b.args);
@@ -826,10 +846,42 @@ export async function runAgentLoop(
     responseText = sanitized.text;
     const imitation = sanitized.imitation;
 
-    const extracted =
-      input.toolRouting === 'local' ? extractLocalToolCalls(responseText) : ([] as LocalToolCall[]);
+    const blocks =
+      input.toolRouting === 'local'
+        ? extractToolBlocks(responseText)
+        : { calls: [] as LocalToolCall[], malformed: [], repaired: [] };
+    const extracted = blocks.calls;
     // Taken before `screen` can touch these objects — see snapshotCalls.
     const emittedSnapshot = snapshotCalls(extracted);
+
+    // A block the model wrote and the runtime could not run is an outcome, and
+    // outcomes are reported. These records ride the normal results channel, so
+    // they reach the continuation body, the transcript and the final relay by
+    // the same route as an executed call — nothing new has to remember to
+    // forward them. Pushed BEFORE the `calls.length === 0` break so a turn
+    // whose ONLY block was malformed still tells the model why nothing ran.
+    const unrunnable: ToolResultRecord[] = [
+      ...blocks.malformed.map((block) => ({
+        tool: block.tool ?? 'unknown',
+        status: 'rejected',
+        result: describeMalformedBlock(block),
+      })),
+      ...blocks.repaired.map((block) => ({
+        tool: block.tool ?? 'unknown',
+        status: 'repaired',
+        result:
+          `Your ${block.tool ?? 'tool'} block was missing one or more closing brackets. ` +
+          `The runtime closed them and RAN the call, so its result below is real. ` +
+          `Emit balanced JSON next time — a block the runtime cannot close is discarded.`,
+      })),
+    ];
+    if (unrunnable.length > 0) {
+      allToolResults.push(...unrunnable);
+      for (const record of unrunnable) {
+        ports.observe?.recordToolCall(record);
+        ports.ui.printEvent(`  ⋯ ${record.status}: ${record.tool} — ${String(record.result)}`);
+      }
+    }
 
     // Screening sees every call the model emitted, before the per-iteration cap
     // discards any — a rule about what may accompany what cannot be enforced on
@@ -978,15 +1030,25 @@ export async function runAgentLoop(
       // turn a host's questionable-but-honest return into a crash, and this PR
       // is about making loss audible, not about adding ways to fail. The relay
       // reports zero results and names what never ran, which is exactly true.
-      if (selection.dropped.length > 0 || selection.unmatched > 0) {
-        stranded = { results: [], selection };
+      //
+      // Unrunnable blocks land here too, and this is the case that matters
+      // most: a turn whose every block was malformed selects nothing, and
+      // without this the model is told nothing at all — which is precisely the
+      // seven-in-a-row silence this fix exists to end.
+      if (unrunnable.length > 0 || selection.dropped.length > 0 || selection.unmatched > 0) {
+        stranded = { results: unrunnable, selection };
       }
       break;
     }
 
-    const results = await ports.tools.execute(calls, { iteration, signal: input.signal });
-    allToolResults.push(...results);
-    for (const r of results) ports.observe?.recordToolCall(r);
+    const executed = await ports.tools.execute(calls, { iteration, signal: input.signal });
+    allToolResults.push(...executed);
+    for (const r of executed) ports.observe?.recordToolCall(r);
+    // What the model is shown for this iteration: the blocks that could not be
+    // run, then the calls that were. `executed` alone still drives the stop
+    // reason below — a malformed block is a reporting obligation, not a
+    // refusal, and must not turn a healthy turn into `all-refused`.
+    const results = unrunnable.length > 0 ? [...unrunnable, ...executed] : executed;
     // Results and drops together, from the same iteration, at the one moment
     // both are known. Every exit below inherits exactly this.
     stranded = { results, selection };
@@ -1003,7 +1065,7 @@ export async function runAgentLoop(
       break;
     }
 
-    const reason = toolLoopStopReason(results, iteration, maxIterations);
+    const reason = toolLoopStopReason(executed, iteration, maxIterations);
     // Everything was refused. Telling the agent so — once, and only where nobody
     // is watching the scrollback for it — is the difference between a clone that
     // routes around its envelope and one that hands back a preamble.
@@ -1053,7 +1115,7 @@ export async function runAgentLoop(
       break;
     }
 
-    const ranTools = Array.from(new Set(results.map((r) => r.tool))).join(', ');
+    const ranTools = Array.from(new Set(executed.map((r) => r.tool))).join(', ');
     ports.ui.printEvent(
       retryAfterRefusal
         ? `  ⋯ ${ranTools} refused — continuing (${iteration}/${maxIterations})…`
@@ -1290,6 +1352,39 @@ interface InkToolBlock {
   end: number;
   /** The payload between the fences (the JSON value when scanned). */
   payload: string;
+  /**
+   * Whether a closing fence was actually found. False means the response ended
+   * mid-block, which is the one case where a payload may be genuinely
+   * incomplete rather than merely miscounted — see `repairTruncatedJson`.
+   */
+  fenceClosed: boolean;
+}
+
+/**
+ * A fence the model wrote that could not be turned into a call.
+ *
+ * This type exists because the alternative was `catch { continue }`: a block
+ * that failed `JSON.parse` vanished with no log, no record, and no way for the
+ * model to learn it had happened. Measured over 14 days of provider
+ * transcripts, 29 of 4,458 emitted blocks were lost that way — 16 `remember`
+ * calls, 3 `send_response` and 3 `send_to_inbox` (messages whose senders then
+ * reported them delivered), 3 `spawn_agent`, 2 `update_session_state`, 2
+ * `bash`. Twenty-seven of the twenty-nine were a single missing `}`.
+ *
+ * The skew is by payload shape, not by tool: `remember` was dropped at 6.3%
+ * against `bash` at 0.4%, because long prose in a one-line JSON string is where
+ * a model loses count of its own braces. Anything carrying a long argument is
+ * exposed.
+ */
+export interface MalformedToolBlock {
+  /** The tool name if the payload was readable enough to find one. */
+  tool?: string;
+  /** What JSON.parse said, verbatim — the model is shown this. */
+  error: string;
+  /** Payload size. The single most diagnostic number when this recurs. */
+  payloadLength: number;
+  /** False when the response ended before the block's closing fence. */
+  fenceClosed: boolean;
 }
 
 export interface ImitatedToolResultsFrame {
@@ -1366,29 +1461,130 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
     if (scanned) {
       const closeMatch = /^[ \t\r\n]*```/.exec(text.slice(scanned.end));
       const end = closeMatch ? scanned.end + closeMatch[0].length : scanned.end;
-      blocks.push({ start: m.index, end, payload: text.slice(scanned.start, scanned.end) });
+      blocks.push({
+        start: m.index,
+        end,
+        payload: text.slice(scanned.start, scanned.end),
+        fenceClosed: !!closeMatch,
+      });
       openRe.lastIndex = end;
       continue;
     }
     const closeIdx = text.indexOf('```', payloadStart);
-    if (closeIdx === -1) break;
+    if (closeIdx === -1) {
+      // The response ended inside the block. Report it rather than walking
+      // away: an unclosed fence is exactly the shape a truncated turn takes,
+      // and `break` used to discard it along with anything after it.
+      blocks.push({
+        start: m.index,
+        end: text.length,
+        payload: text.slice(payloadStart).trim(),
+        fenceClosed: false,
+      });
+      break;
+    }
     blocks.push({
       start: m.index,
       end: closeIdx + 3,
       payload: text.slice(payloadStart, closeIdx).trim(),
+      fenceClosed: true,
     });
     openRe.lastIndex = closeIdx + 3;
   }
   return blocks;
 }
 
-export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
+/**
+ * Close the containers a payload still has open, and nothing else.
+ *
+ * Only ever appends `}` and `]`, in the order the payload's own open stack
+ * requires. It invents no keys, no values and no quotes: a scan that ends
+ * inside a string or on a dangling escape is refused outright, because there
+ * the missing text is content and appending to it would fabricate an argument
+ * rather than complete one.
+ *
+ * Callers must additionally require a CLOSED fence. A model that wrote its
+ * closing ``` finished the block and simply miscounted; a response that ended
+ * mid-block may be missing arguments entirely, and a syntactically valid call
+ * built from half a payload is a silent corruption — strictly worse than the
+ * silent drop this is fixing.
+ */
+export function repairTruncatedJson(payload: string): string | null {
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of payload) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') {
+      if (stack.pop() !== ch) return null;
+    }
+  }
+  if (inString || escaped || stack.length === 0) return null;
+  const repaired = payload + stack.reverse().join('');
+  try {
+    JSON.parse(repaired);
+  } catch {
+    return null;
+  }
+  return repaired;
+}
+
+/**
+ * Everything a response asked for: the calls, and the fences that could not be
+ * read as one.
+ *
+ * `extractLocalToolCalls` returns only the first half and is kept for callers
+ * that genuinely want just the calls. The LOOP must use this one — dropping the
+ * second half is the bug (see MalformedToolBlock).
+ */
+export function extractToolBlocks(responseText: string): {
+  calls: LocalToolCall[];
+  malformed: MalformedToolBlock[];
+  /** Blocks that parsed only after their open containers were closed for them. */
+  repaired: MalformedToolBlock[];
+} {
   const indexed: Array<{ index: number; call: LocalToolCall }> = [];
+  const malformed: MalformedToolBlock[] = [];
+  const repaired: MalformedToolBlock[] = [];
 
   for (const block of findInkToolBlocks(responseText)) {
     if (!block.payload) continue;
+    let payload = block.payload;
+    let wasRepaired = false;
     try {
-      const parsed = JSON.parse(block.payload) as Record<string, unknown>;
+      JSON.parse(payload);
+    } catch (firstError) {
+      // A miscounted brace is by far the most common way a block fails: 27 of
+      // the 29 losses measured were exactly one missing `}`. Close what is
+      // provably open — but only for a block the model finished writing, and
+      // never in silence. The repair is reported to the model alongside the
+      // result, so a persistent miscounter is corrected rather than propped up.
+      const fixed = block.fenceClosed ? repairTruncatedJson(payload) : null;
+      if (fixed === null) {
+        malformed.push({
+          tool: readToolName(payload),
+          error: firstError instanceof Error ? firstError.message : String(firstError),
+          payloadLength: payload.length,
+          fenceClosed: block.fenceClosed,
+        });
+        continue;
+      }
+      payload = fixed;
+      wasRepaired = true;
+    }
+    {
+      // Parseable by now: either it always was, or `repairTruncatedJson`
+      // re-parsed it before returning. No catch is needed and none is wanted —
+      // a swallowed throw here is how this bug looked for a month.
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
       // Strip the MCP namespace HERE, not at dispatch. The bare name has to be
       // canonical for the whole pipeline, because everything downstream of this
       // point branches on `call.tool`: the client-local policy bypass, the
@@ -1404,7 +1600,16 @@ export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
       // rather than against my belief about either.
       const rawName = typeof parsed.tool === 'string' ? parsed.tool.trim() : '';
       const tool = rawName.replace(/^mcp__inkwell__/, '');
-      if (!tool) continue;
+      if (!tool) {
+        // Valid JSON, no tool to run. Still a request the model made and still
+        // owed an answer, so it is reported rather than dropped.
+        malformed.push({
+          error: 'block parsed but carried no "tool" name',
+          payloadLength: payload.length,
+          fenceClosed: block.fenceClosed,
+        });
+        continue;
+      }
       const args =
         parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
           ? (parsed.args as Record<string, unknown>)
@@ -1413,8 +1618,14 @@ export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
         index: block.start,
         call: { tool, args, raw: responseText.slice(block.start, block.end) },
       });
-    } catch {
-      continue;
+      if (wasRepaired) {
+        repaired.push({
+          tool,
+          error: 'unbalanced JSON — closing bracket(s) supplied by the runtime',
+          payloadLength: payload.length,
+          fenceClosed: block.fenceClosed,
+        });
+      }
     }
   }
 
@@ -1444,14 +1655,42 @@ export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
         index: match.index ?? 0,
         call: { tool, args, raw: match[0] || '', variantFormat: true },
       });
-    } catch {
-      continue;
+    } catch (error) {
+      // Same invariant as the fence path. The variant is deprecated, which is
+      // a reason to steer the model off it, not a reason to lose its calls
+      // quietly. No repair here: this format is not one we want to make easier
+      // to emit badly.
+      malformed.push({
+        tool: readToolName(payload, 'name'),
+        error: error instanceof Error ? error.message : String(error),
+        payloadLength: payload.length,
+        fenceClosed: true,
+      });
     }
   }
 
   // Preserve the model's emission order across both formats.
   indexed.sort((a, b) => a.index - b.index);
-  return indexed.map((entry) => entry.call);
+  return { calls: indexed.map((entry) => entry.call), malformed, repaired };
+}
+
+/**
+ * The tool name a broken payload was asking for, read textually.
+ *
+ * `JSON.parse` has already refused this string, so the name cannot be read
+ * structurally — and naming the tool is most of the diagnostic value in the
+ * report ("your remember block was dropped" versus "a block was dropped").
+ * Best-effort by design: an absent name degrades the message, nothing else.
+ */
+function readToolName(payload: string, key: 'tool' | 'name' = 'tool'): string | undefined {
+  const match = new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]{1,120})"`).exec(payload);
+  const raw = match?.[1]?.trim();
+  return raw ? raw.replace(/^mcp__inkwell__/, '') : undefined;
+}
+
+/** Just the runnable calls. The loop uses `extractToolBlocks` instead. */
+export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
+  return extractToolBlocks(responseText).calls;
 }
 
 export function stripLocalToolBlocks(responseText: string): string {
