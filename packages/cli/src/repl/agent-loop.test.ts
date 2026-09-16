@@ -6,6 +6,7 @@ import {
   snapshotCalls,
   extractLocalToolCalls,
   extractToolBlocks,
+  findInkToolBlocks,
   describeMalformedBlock,
   repairTruncatedJson,
   findImitatedToolResults,
@@ -2714,11 +2715,31 @@ describe('REGRESSION (Lumen, PR #646): an unrunnable block is reported, and only
     expect(calls.map((c) => c.tool)).toContain('read');
   });
 
+  it('does not lose the sibling when a BALANCED block’s close is the next opener', () => {
+    // The same mistake on the other branch, found while fixing Lumen's. Here
+    // the payload scans cleanly and the block needs no repair, so the harm is
+    // only the second half: `lastIndex` landed past the opener's backticks and
+    // the following block never matched again. Silent, and pre-existing.
+    const text =
+      '```ink-tool\n{"tool":"remember","args":{"content":"a"}}\n' +
+      '```ink-tool\n{"tool":"read","args":{"path":"x"}}\n```';
+
+    expect(extractToolBlocks(text).calls.map((c) => c.tool)).toEqual(['remember', 'read']);
+  });
+
   it('control: a closed one-brace-short block is still repaired and run', () => {
     const { calls, repaired } = extractToolBlocks(repairableRemember);
 
     expect(calls[0]!.args).toEqual({ content: 'note' });
     expect(repaired).toHaveLength(1);
+  });
+
+  it('control: ordinary adjacent blocks are both closed and both run', () => {
+    const text =
+      '```ink-tool\n{"tool":"a","args":{}}\n```\n```ink-tool\n{"tool":"b","args":{}}\n```';
+
+    expect(extractToolBlocks(text).calls.map((c) => c.tool)).toEqual(['a', 'b']);
+    expect(findInkToolBlocks(text).every((b) => b.fenceClosed)).toBe(true);
   });
 });
 
