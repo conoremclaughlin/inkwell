@@ -581,7 +581,42 @@ describe('MemoryRepository', () => {
 
       expect(refreshSpy).toHaveBeenCalledTimes(1);
       expect(refreshSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 'mem-123', content: 'Corrected content' })
+        expect.objectContaining({ id: 'mem-123', content: 'Corrected content' }),
+        // A content edit invalidates the cached llm_extractions: they describe
+        // the text that was just replaced, and the llm/merged chunk views
+        // embed them verbatim.
+        expect.objectContaining({ dropCachedExtractions: true })
+      );
+    });
+
+    it('keeps cached extractions when only the summary changed', async () => {
+      // The control for the flag above. A summary edit does not replace the
+      // content the extractions were derived from, so recomputing them would
+      // be an LLM call bought for nothing.
+      const refreshSpy = vi
+        .spyOn(repo as unknown as Record<string, unknown>, 'refreshMemoryEmbedding')
+        .mockResolvedValue(undefined);
+
+      mockSupabase._setReturnData({
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Unchanged content',
+        summary: 'New summary',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      });
+
+      await repo.updateMemory('mem-123', 'user-456', { summary: 'New summary' });
+
+      expect(refreshSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ dropCachedExtractions: false })
       );
     });
 
@@ -686,7 +721,13 @@ describe('MemoryRepository', () => {
       expect(result?.embedding).toBeUndefined();
     });
 
-    it('should skip embedding cleanup when the memory never had embeddings', async () => {
+    // This used to assert the opposite — that a memory whose metadata mentions
+    // no embedding is left alone — and that assertion was the bug (Lumen, r2).
+    // remember() upserts chunk rows BEFORE it updates the memory row, so a
+    // failure in between leaves rows behind that no metadata admits to. The
+    // row's opinion of its own embeddings is not evidence about what is in the
+    // chunk table, and the chunk search RPC reads the table.
+    it('cleans chunk rows even when the memory row admits to no embeddings', async () => {
       disableEmbeddings();
 
       const mockUpdatedRow = {
@@ -707,8 +748,8 @@ describe('MemoryRepository', () => {
 
       await repo.updateMemory('mem-123', 'user-456', { content: 'Edited content' });
 
-      expect(mockSupabase.from).not.toHaveBeenCalledWith('memory_embedding_chunks');
-      expect(mockSupabase._queryBuilder.delete).not.toHaveBeenCalled();
+      expect(mockSupabase.from).toHaveBeenCalledWith('memory_embedding_chunks');
+      expect(mockSupabase._queryBuilder.delete).toHaveBeenCalled();
     });
   });
 
