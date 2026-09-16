@@ -1466,3 +1466,128 @@ describe('reopenThreadRow — a failed call is an error, never a silent success'
     ]);
   });
 });
+
+describe('handleUpdateThread — the edit and its attribution trail move together', () => {
+  // Lumen's #641 P2, and the second time this shape has been caught in this
+  // table (the first was reopen, #615). The first cut wrote the edit and then
+  // INSERTed the timeline event as a separate round trip AND discarded that
+  // INSERT's error, so a rejected audit returned success: true with the edit
+  // already committed and nothing recording who made it. In the slug-only
+  // attribution case that event is the only durable record of the editor, so
+  // the response promised a trail it had just failed to write.
+  //
+  // These pin the handler's branches against a fake that mirrors the SQL
+  // function. The real atomicity — a rejected audit rolling the edit back in
+  // Postgres — is in thread-metadata.integration.test.ts, because a fake I
+  // wrote would stay green no matter what the function does.
+  async function setup(opts: { participants?: string[] } = {}) {
+    const { handleUpdateThread } = await import('./thread-handlers');
+    const userResolver = await import('../../services/user-resolver');
+    const { makeFakeSupabase } = await import('../../services/sessions/fake-supabase.js');
+
+    const resolveSpy = vi
+      .spyOn(userResolver, 'resolveUserOrThrow')
+      .mockResolvedValue({ user: { id: 'user-1' } } as never);
+
+    const tables = {
+      inbox_threads: [
+        {
+          id: 't1',
+          user_id: 'user-1',
+          thread_key: 'pr:641',
+          status: 'open',
+          created_by_agent_id: 'wren',
+          title: 'Before',
+          summary: null,
+          title_updated_at: null,
+          summary_updated_at: null,
+        },
+      ],
+      inbox_thread_participants: (opts.participants ?? ['wren', 'lumen']).map((agent_id) => ({
+        thread_id: 't1',
+        agent_id,
+      })),
+      inbox_thread_messages: [] as Array<Record<string, unknown>>,
+    };
+    const supabase = makeFakeSupabase(tables);
+    const dataComposer = { getClient: () => supabase, repositories: {} } as never;
+    const call = async (args: Record<string, unknown>) => {
+      const result = await handleUpdateThread({ threadKey: 'pr:641', ...args }, dataComposer);
+      return JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
+    };
+    return { call, tables, supabase, dataComposer, restore: () => resolveSpy.mockRestore() };
+  }
+
+  it('writes the edit and exactly one timeline event, and reports the stored timestamp', async () => {
+    const { call, tables, restore } = await setup();
+    try {
+      const payload = await call({ sbSlug: 'wren', summary: 'What it is about now' });
+      expect(payload).toMatchObject({ success: true, updatedFields: ['summary'] });
+
+      const thread = tables.inbox_threads[0];
+      expect(thread.summary).toBe('What it is about now');
+      // "Not provided" is not "cleared" — the title must survive a summary edit.
+      expect(thread.title).toBe('Before');
+      expect(thread.title_updated_at).toBeNull();
+
+      expect(tables.inbox_thread_messages).toHaveLength(1);
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        sender_agent_id: 'system',
+        message_type: 'system',
+        metadata: { type: 'thread_metadata_updated', updatedBy: 'wren' },
+      });
+
+      // The instant reported is the one the row was written with, not an
+      // app-side guess at it.
+      expect(payload.updatedAt).toBe(thread.summary_updated_at);
+    } finally {
+      restore();
+    }
+  });
+
+  it('does not report success when the write fails', async () => {
+    const { call, supabase, restore } = await setup();
+    try {
+      // Fault injection at the one boundary that now carries both writes.
+      vi.spyOn(supabase as never, 'rpc' as never).mockResolvedValue({
+        data: null,
+        error: { message: 'audit rejected by test' },
+      } as never);
+
+      await expect(call({ sbSlug: 'wren', title: 'After' })).rejects.toThrow(
+        /audit rejected by test/
+      );
+    } finally {
+      vi.restoreAllMocks();
+      restore();
+    }
+  });
+
+  it('refuses a reply that is not the timestamp the function returns', async () => {
+    const { updateThreadMetadataRow } = await import('./thread-handlers');
+    // An unmigrated or mocked client must not be read as a successful edit.
+    await expect(
+      updateThreadMetadataRow({ rpc: async () => ({ data: null, error: null }) } as never, 't1', {
+        setTitle: true,
+        title: 'After',
+        setSummary: false,
+        summary: null,
+        editorSbId: null,
+        editorSlug: 'wren',
+        attributedBy: 'slug-only',
+      })
+    ).rejects.toThrow('Failed to update thread: unexpected reply null');
+  });
+
+  it('still refuses a non-participant before any write happens', async () => {
+    const { call, tables, restore } = await setup({ participants: ['lumen'] });
+    try {
+      const payload = await call({ sbSlug: 'wren', summary: 'I was never here' });
+      expect(payload).toMatchObject({ success: false });
+      expect(tables.inbox_threads[0].summary).toBeNull();
+      expect(tables.inbox_thread_messages).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+});

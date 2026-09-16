@@ -19,6 +19,7 @@ import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import { advanceThreadReadPointer } from './read-state.js';
+import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX } from './thread-bounds.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -152,14 +153,9 @@ const reopenThreadSchema = userIdentifierBaseSchema.extend({
   sbSlug: sbSlugSchema.describe('SB slug reopening the thread (must be a participant)'),
 });
 
-/**
- * Brevity bounds, mirrored from the CHECK constraints on inbox_threads. Kept in
- * both places deliberately: the schema gives a caller a usable error, the
- * constraint is what actually holds — including for writers that never pass
- * through this tool.
- */
-export const THREAD_TITLE_MAX = 200;
-export const THREAD_SUMMARY_MAX = 280;
+// Bounds live in thread-bounds.ts so findOrCreateThread can reach them without
+// importing this module. Re-exported because callers already import them here.
+export { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX };
 
 const updateThreadSchema = userIdentifierBaseSchema
   .extend({
@@ -1048,6 +1044,61 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
   });
 }
 
+/** What one update_thread call writes: the fields it touches, and who by. */
+export interface ThreadMetadataEdit {
+  setTitle: boolean;
+  title: string | null;
+  setSummary: boolean;
+  summary: string | null;
+  editorSbId: string | null;
+  editorSlug: string;
+  attributedBy: 'identity' | 'slug-only';
+}
+
+/**
+ * Write a title/summary edit AND its timeline event — in ONE transaction, the
+ * `update_inbox_thread_metadata` SQL function (migration 20260916020035).
+ *
+ * The same two-round-trip shape Lumen caught on reopen in #615, and caught
+ * again here in #641: as an UPDATE followed by an INSERT these are two
+ * transactions, so a rejected audit INSERT left the edit standing with nothing
+ * in the timeline recording who made it. The first cut also discarded the
+ * INSERT's error, which turned that into `success: true` — and in the
+ * `slug-only` attribution case the timeline message is the only durable record
+ * of the editor, so the response claimed a trail it had just failed to write.
+ *
+ * Throwing after the fact would have detected the failure without restoring the
+ * trail. One function restores it: either both land or neither does.
+ *
+ * Returns the timestamp the row was written with, so the response reports the
+ * stored instant rather than an app-side guess at it.
+ */
+export async function updateThreadMetadataRow(
+  supabase: SupabaseClient,
+  threadId: string,
+  edit: ThreadMetadataEdit
+): Promise<string> {
+  const { data, error } = await supabase.rpc('update_inbox_thread_metadata', {
+    p_thread_id: threadId,
+    p_set_title: edit.setTitle,
+    p_title: edit.title,
+    p_set_summary: edit.setSummary,
+    p_summary: edit.summary,
+    p_editor_sb_id: edit.editorSbId,
+    p_editor_slug: edit.editorSlug,
+    p_attributed_by: edit.attributedBy,
+  });
+  if (error) {
+    throw new Error(`Failed to update thread: ${error.message}`);
+  }
+  if (typeof data !== 'string' || !data) {
+    // The function returns exactly a timestamptz; anything else means the call
+    // did not reach it (a missing migration, a mocked client).
+    throw new Error(`Failed to update thread: unexpected reply ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
 /**
  * Set or update a thread's title and summary.
  *
@@ -1107,49 +1158,24 @@ export async function handleUpdateThread(args: unknown, dataComposer: DataCompos
     senderSbId() ?? (await resolveSbId(supabase, resolved.user.id, sbSlug)) ?? null;
   const attributedBy = editorSbId ? 'identity' : 'slug-only';
 
-  const now = new Date().toISOString();
-  const update: Record<string, unknown> = { updated_at: now };
-  const changed: string[] = [];
-
   // `undefined` means "not provided" and `null` means "explicitly cleared" —
   // never collapse them, or a caller editing only the summary silently wipes
-  // the title.
-  if (title !== undefined) {
-    update.title = title;
-    update.title_updated_by_sb_id = editorSbId;
-    update.title_updated_at = now;
-    changed.push('title');
-  }
-  if (summary !== undefined) {
-    update.summary = summary;
-    update.summary_updated_by_sb_id = editorSbId;
-    update.summary_updated_at = now;
-    changed.push('summary');
-  }
+  // the title. The two are carried to SQL as a set-flag and a value for the
+  // same reason.
+  const changed: string[] = [];
+  if (title !== undefined) changed.push('title');
+  if (summary !== undefined) changed.push('summary');
 
-  const { error } = await threadTable(supabase, 'inbox_threads').update(update).eq('id', thread.id);
-
-  if (error) {
-    throw new Error(`Failed to update thread: ${error.message}`);
-  }
-
-  // A system message in the timeline, matching close/reopen. This is the
-  // version trail: an edit that silently replaced its predecessor would leave a
-  // record no one can tell has changed.
-  await threadTable(supabase, 'inbox_thread_messages').insert({
-    thread_id: thread.id,
-    sender_agent_id: 'system',
-    content: `Thread ${changed.join(' and ')} updated by ${sbSlug}`,
-    message_type: 'system',
-    metadata: {
-      type: 'thread_metadata_updated',
-      updatedBy: sbSlug,
-      updatedBySbId: editorSbId,
-      attributedBy,
-      updatedFields: changed,
-      ...(title !== undefined ? { title } : {}),
-      ...(summary !== undefined ? { summary } : {}),
-    } as Json,
+  // The edit and its timeline event, in one transaction. See
+  // updateThreadMetadataRow: a failed audit must not leave an edit standing.
+  const now = await updateThreadMetadataRow(supabase, thread.id, {
+    setTitle: title !== undefined,
+    title: title ?? null,
+    setSummary: summary !== undefined,
+    summary: summary ?? null,
+    editorSbId,
+    editorSlug: sbSlug,
+    attributedBy,
   });
 
   logger.info('[Thread] Title/summary updated', {

@@ -11,6 +11,7 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveSbId, resolveSbSlug } from '../../auth/resolve-identity';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
+import { boundThreadTitle } from './thread-bounds.js';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -1112,6 +1113,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
 /**
  * Find or create a thread. Returns the thread row with an `isNew` flag.
+ *
+ * `opts.title` is the first message's subject, which is unbounded, and is
+ * bounded here to fit `inbox_threads.title`. Truncating rather than refusing is
+ * deliberate: the subject survives in full on the message row, and losing a
+ * message because its thread's label was one character too long would be a new
+ * failure introduced by a constraint meant to prevent a cosmetic one.
  */
 export async function findOrCreateThread(
   supabase: ReturnType<DataComposer['getClient']>,
@@ -1144,7 +1151,7 @@ export async function findOrCreateThread(
       thread_key: opts.threadKey,
       user_id: opts.userId,
       created_by_agent_id: opts.creatorSlug,
-      title: opts.title,
+      title: boundThreadTitle(opts.title),
     })
     .select()
     .single();
