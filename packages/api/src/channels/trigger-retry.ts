@@ -9,8 +9,11 @@
  *
  * State is in-memory (Map keyed by a stable trigger identity + setTimeout),
  * mirroring scheduleChannelRetry in channels/gateway.ts. A process restart
- * drops pending retries — acceptable for v1, since the original inbox message
- * is restored to unread when the final attempt fails.
+ * drops pending retries, which is the explicit v1 limitation, so nothing may
+ * depend on a timer surviving: the caller restores an agent_inbox message to
+ * unread BEFORE the retry decision, and a thread-borne failure — which has no
+ * row to restore, only a monotonic read pointer — gets a visible notice on its
+ * first failure instead. Either way the message outlives the timer.
  *
  * Attempt count travels on payload.metadata.triggerAttempt so it survives
  * re-dispatch (each dispatch generates a fresh gateway triggerId, which is

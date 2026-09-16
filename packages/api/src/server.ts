@@ -1649,8 +1649,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
   // 7b. Delayed re-queue for transiently failed triggers (network dips,
   // connect timeouts, stream disconnects). Attempt 2 after ~2min, attempt 3
-  // after ~10min; then the normal failure notification fires. State is
-  // in-memory — a process restart drops pending retries (v1 tradeoff).
+  // after ~10min; then the final failure notification fires, annotated with the
+  // attempt count. State is in-memory — a process restart drops pending
+  // retries (v1 tradeoff), which is why nothing depends on the timer: the
+  // inbox row is restored to unread before the retry decision, and a threaded
+  // failure is announced on its first failure rather than held silently.
   const triggerRetryScheduler = new TriggerRetryScheduler((retryPayload) => {
     logger.info('[TriggerRetry] Re-dispatching trigger', {
       to: retryPayload.toSlug,

@@ -113,12 +113,16 @@ beforeAll(() => {
 
 interface RigOptions {
   planRefusal?: Error;
+  /** Make the terminal hold-clear throw, the way a network dip does. */
+  cleanupThrows?: boolean;
+  /** Refuse from handleMessage's own admission, as a structured result. */
+  resultRefusal?: { threadKey: string; detail: Record<string, unknown> };
 }
 
 function rig(options: RigOptions = {}) {
   let sessionTurns = 0;
   const timers: Timer[] = [];
-  const writes: Array<{ table: string; op: string }> = [];
+  const writes: Array<{ table: string; op: string; value?: Record<string, unknown> }> = [];
   const activities: Array<Record<string, unknown>> = [];
   const redispatched: Array<Record<string, unknown>> = [];
 
@@ -172,7 +176,7 @@ function rig(options: RigOptions = {}) {
         then: (a: (v: unknown) => unknown, b?: (e: unknown) => unknown) => q.run().then(a, b),
         async run() {
           if (q.op !== 'select') {
-            writes.push({ table, op: q.op });
+            writes.push({ table, op: q.op, value: q.value as Record<string, unknown> });
             if (table === 'agent_inbox') Object.assign(row, q.value);
             return { data: null, error: null };
           }
@@ -229,6 +233,14 @@ function rig(options: RigOptions = {}) {
         return { id: 'session-synthetic', messageCount: 1 };
       },
       async handleMessage() {
+        if (options.resultRefusal) {
+          return {
+            success: false,
+            errorCode: 'ROUTING_REFUSED',
+            refusal: options.resultRefusal,
+            error: `Refusing to route "${options.resultRefusal.threadKey}" for agent "recipient-test"`,
+          };
+        }
         sessionTurns += 1;
         return { success: true };
       },
@@ -240,7 +252,10 @@ function rig(options: RigOptions = {}) {
     getUserFromContext: () => ({ userId: 'user-synthetic' }),
     logInkmail: async () => {},
     assignThreadParticipant: async () => ({ stampPersisted: true }),
-    clearRoutingHold: async () => true,
+    clearRoutingHold: async () => {
+      if (options.cleanupThrows) throw new Error('fetch failed');
+      return true;
+    },
     stampRoutingHold: async () => true,
     decideDelivery: () => ({ mode: 'spawn' }),
     storedTriggerMedia: async () => [],
@@ -431,5 +446,95 @@ describe('server.ts wiring', () => {
     expect(
       parent && ts.isFunctionDeclaration(parent) ? parent.name?.text : '(not a declaration)'
     ).toBe('startServer');
+  });
+});
+
+describe('the notice sequence across all three attempts', () => {
+  // The shape of the thread-borne fallback, start to finish. Asserting only
+  // "a notice was written" would pass just as well if every attempt wrote one,
+  // which is the noise the suppression exists to avoid. (Scenario from Lumen's
+  // r2 follow-up probes.)
+  it('announces the first failure, stays quiet on the retry, then reports exhaustion', async () => {
+    const r = rig();
+    const notices = () =>
+      r.writes.filter((w) => w.table === 'inbox_thread_messages' && w.op === 'insert');
+
+    await r.fail();
+    expect(notices()).toHaveLength(1);
+    expect((notices()[0].value?.metadata as Record<string, unknown>).retryPending).toBe(2);
+    expect(notices()[0].value?.content).toMatch(/retrying \(2\/3\) in 120s/);
+
+    // Attempt 2 fails: already announced, so nothing new is said.
+    r.timers[0].fn();
+    await r.fail(r.redispatched[0]);
+    expect(notices()).toHaveLength(1);
+    expect(r.timers).toHaveLength(2);
+
+    // Attempt 3 fails: attempts exhausted, so the final notice lands.
+    r.timers[1].fn();
+    await r.fail(r.redispatched[1]);
+    expect(notices()).toHaveLength(2);
+    const final = notices()[1].value?.metadata as Record<string, unknown>;
+    expect(final.retryPending).toBeNull();
+    expect(final.attempts).toBe(3);
+    expect(notices()[1].value?.content).toMatch(/after 3 attempts/);
+    expect(r.timers, 'nothing is scheduled past the cap').toHaveLength(2);
+  });
+});
+
+describe('a refusal surfacing as a structured result, not a throw from planning', () => {
+  // The other half of the refusal path. The plan-time refusal rethrows the real
+  // error; this one comes back as errorCode ROUTING_REFUSED on a result and used
+  // to be flattened into a bare Error, which is precisely where the code was
+  // lost. Same three thread keys, because the misclassification was the key.
+  for (const threadKey of ['pr:42', 'pr:503', 'debug:timeout']) {
+    it(`carries the code and notifies immediately for ${threadKey}`, async () => {
+      const r = rig({
+        resultRefusal: {
+          threadKey,
+          detail: { triedCallerRepo: false, reason: 'no-route' as const },
+        },
+      });
+      const payload = { ...r.threadPayload, threadKey };
+
+      let thrown: unknown;
+      try {
+        await r.gateway.handler!(payload);
+      } catch (err) {
+        thrown = err;
+      }
+      expect((thrown as { code?: string })?.code).toBe('ROUTING_REFUSED');
+
+      await r.fail(payload, thrown);
+      expect(r.timers).toHaveLength(0);
+      expect(
+        r.writes.filter((w) => w.table === 'inbox_thread_messages' && w.op === 'insert')
+      ).toHaveLength(1);
+    });
+  }
+});
+
+describe('fan-out cancellation is per recipient', () => {
+  // One thread message triggering two recipients gets two independent timers.
+  // A turn completing for one of them must not cancel the other's — and the
+  // cancel has to happen before the terminal cleanup, which can throw.
+  it('cancels only the recipient whose turn completed', async () => {
+    const r = rig({ cleanupThrows: true });
+    await r.fail();
+    await r.fail({ ...r.threadPayload, toSlug: 'other-recipient' });
+    expect(r.timers).toHaveLength(2);
+
+    try {
+      await r.gateway.handler!(structuredClone(r.threadPayload));
+    } catch {
+      // The hold clear throws on purpose; the cancel above it must already have run.
+    }
+
+    expect(r.timers[0].cancelled).toBe(true);
+    expect(r.timers[1].cancelled).toBeUndefined();
+
+    for (const t of r.timers) if (!t.cancelled) t.fn();
+    expect(r.redispatched).toHaveLength(1);
+    expect(r.redispatched[0].toSlug).toBe('other-recipient');
   });
 });
