@@ -16,7 +16,7 @@ interface HistoryResponse {
 }
 
 interface SendMessageInput {
-  agentId: string;
+  sbSlug: string;
   content: string;
 }
 
@@ -28,7 +28,7 @@ interface SendMessageResponse {
 }
 
 export function ChatContainer() {
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [optimisticMessages, setOptimisticMessages] = useState<ChatMessageData[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const queryClient = useQueryClient();
@@ -42,13 +42,13 @@ export function ChatContainer() {
   const agents = agentsData?.agents ?? [];
 
   // Auto-select first agent
-  const effectiveAgentId = selectedAgentId || agents[0]?.agentId || null;
+  const effectiveSlug = selectedSlug || agents[0]?.sbSlug || null;
 
   // Load chat history for selected agent
   const { data: historyData } = useApiQuery<HistoryResponse>(
-    ['chat-history', effectiveAgentId],
-    `/api/chat/history?agentId=${effectiveAgentId}`,
-    { enabled: !!effectiveAgentId }
+    ['chat-history', effectiveSlug],
+    `/api/chat/history?sbSlug=${effectiveSlug}`,
+    { enabled: !!effectiveSlug }
   );
 
   const historyMessages = historyData?.messages ?? [];
@@ -57,14 +57,14 @@ export function ChatContainer() {
   const allMessages = [...historyMessages, ...optimisticMessages];
 
   // Get selected agent name
-  const selectedAgent = agents.find((a) => a.agentId === effectiveAgentId);
+  const selectedAgent = agents.find((a) => a.sbSlug === effectiveSlug);
 
   // Send message mutation
   const sendMutation = useApiPost<SendMessageResponse, SendMessageInput>('/api/chat/message');
 
   const handleSend = useCallback(
     async (content: string) => {
-      if (!effectiveAgentId || isProcessing) return;
+      if (!effectiveSlug || isProcessing) return;
 
       // Add optimistic user message
       const optimisticId = `optimistic-${Date.now()}`;
@@ -72,7 +72,7 @@ export function ChatContainer() {
         id: optimisticId,
         direction: 'in',
         content,
-        agentId: effectiveAgentId,
+        sbSlug: effectiveSlug,
         createdAt: new Date().toISOString(),
       };
       setOptimisticMessages((prev) => [...prev, userMessage]);
@@ -80,7 +80,7 @@ export function ChatContainer() {
 
       try {
         const result = await sendMutation.mutateAsync({
-          agentId: effectiveAgentId,
+          sbSlug: effectiveSlug,
           content,
         });
 
@@ -90,21 +90,21 @@ export function ChatContainer() {
             id: `response-${Date.now()}`,
             direction: 'out',
             content: result.response,
-            agentId: effectiveAgentId,
+            sbSlug: effectiveSlug,
             createdAt: new Date().toISOString(),
           };
           setOptimisticMessages((prev) => [...prev, responseMessage]);
         }
 
         // Invalidate history to sync with server
-        queryClient.invalidateQueries({ queryKey: ['chat-history', effectiveAgentId] });
+        queryClient.invalidateQueries({ queryKey: ['chat-history', effectiveSlug] });
       } catch {
         // Add error message
         const errorMessage: ChatMessageData = {
           id: `error-${Date.now()}`,
           direction: 'out',
           content: 'Failed to send message. Please try again.',
-          agentId: effectiveAgentId,
+          sbSlug: effectiveSlug,
           createdAt: new Date().toISOString(),
         };
         setOptimisticMessages((prev) => [...prev, errorMessage]);
@@ -112,11 +112,11 @@ export function ChatContainer() {
         setIsProcessing(false);
       }
     },
-    [effectiveAgentId, isProcessing, sendMutation, queryClient]
+    [effectiveSlug, isProcessing, sendMutation, queryClient]
   );
 
-  const handleAgentSelect = useCallback((agentId: string) => {
-    setSelectedAgentId(agentId);
+  const handleAgentSelect = useCallback((sbSlug: string) => {
+    setSelectedSlug(sbSlug);
     setOptimisticMessages([]);
   }, []);
 
@@ -139,11 +139,7 @@ export function ChatContainer() {
 
   return (
     <div className="flex h-full flex-col">
-      <AgentPicker
-        agents={agents}
-        selectedAgentId={effectiveAgentId}
-        onSelect={handleAgentSelect}
-      />
+      <AgentPicker agents={agents} selectedSlug={effectiveSlug} onSelect={handleAgentSelect} />
       <ChatMessageList
         messages={allMessages}
         isProcessing={isProcessing}
@@ -151,10 +147,10 @@ export function ChatContainer() {
       />
       <ChatInput
         onSend={handleSend}
-        disabled={isProcessing || !effectiveAgentId}
+        disabled={isProcessing || !effectiveSlug}
         placeholder={
-          effectiveAgentId
-            ? `Message ${selectedAgent?.name || effectiveAgentId}...`
+          effectiveSlug
+            ? `Message ${selectedAgent?.name || effectiveSlug}...`
             : 'Select an agent to start chatting'
         }
       />

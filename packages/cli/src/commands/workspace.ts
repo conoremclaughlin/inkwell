@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { callPcpTool } from '../lib/pcp-mcp.js';
+import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
 interface PcpConfig {
   userId?: string;
@@ -85,7 +86,7 @@ async function listWorkspaces(options: {
 }): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -132,7 +133,7 @@ async function listWorkspaces(options: {
 async function useWorkspace(workspaceRef: string): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -182,7 +183,7 @@ async function createWorkspace(
 ): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -221,7 +222,7 @@ async function inviteWorkspaceMember(
 ): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -261,7 +262,7 @@ async function inviteWorkspaceMember(
 async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -312,7 +313,7 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
 function currentWorkspace(): void {
   const config = getPcpConfig();
   if (!config) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 

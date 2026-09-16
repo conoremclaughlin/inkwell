@@ -8,7 +8,7 @@ export interface ChatMessageData {
   id: string;
   direction: 'in' | 'out';
   content: string;
-  agentId: string;
+  sbSlug: string;
   createdAt: string;
 }
 

@@ -10,31 +10,31 @@ This is the **canonical reference** for all AI agents working in this repository
 
 Identity is resolved in layers. **Stop at the first match** - do not continue checking lower layers:
 
-1. **System prompt override**: If the system prompt contains an "Identity Override" section specifying your agent ID, use that. **Stop here.**
-2. **Environment variable**: Run `echo $AGENT_ID` in a shell. If it returns a non-empty value, use that as your agentId. **Stop here.**
+1. **System prompt override**: If the system prompt contains an "Identity Override" section naming your slug, use that. **Stop here.**
+2. **Environment variable**: Run `echo $SB_SLUG` in a shell. If it returns a non-empty value, use that as your sbSlug. **Stop here.**
 3. **Repo-level identity**: Read `.ink/identity.json` in the current repo.
-4. **Central config**: Read `~/.ink/config.json` agentMapping.
+4. **Central config**: Read `~/.ink/config.json` `sbMapping`.
 
 For interactive sessions in this repo, `.ink/identity.json` typically resolves to:
 
 ```json
-{ "agentId": "wren", "studioId": "<uuid-or-main>", "context": "main" }
+{ "sbSlug": "wren", "studioId": "<uuid-or-main>", "context": "main" }
 ```
 
-For long-running processes (like the Inkwell server), `AGENT_ID` is set via environment variable and takes precedence.
+For long-running processes (like the Inkwell server), `SB_SLUG` is set via environment variable and takes precedence.
 
 ### Step 2: Load User Config
 
 Read from `~/.ink/config.json`:
 
 ```json
-{"userId": "...", "email": "...", "agentMapping": {"claude-code": "wren", ...}}
+{"userId": "...", "email": "...", "sbMapping": {"claude-code": "wren", ...}}
 ```
 
 ### Step 3: Call Bootstrap with Identity
 
 ```
-bootstrap(userId: "<from config>", agentId: "<your identity>")
+bootstrap(userId: "<from config>", sbSlug: "<your identity>")
 ```
 
 This returns:
@@ -43,7 +43,7 @@ This returns:
 - **Identity Core**: Who you are, who you're working with, your relationship
 - **Constitution**: Your values, process, user, identity, heartbeat, and soul documents (DB-first, filesystem fallback)
 - **Active Context**: Current projects, focus, project-specific context
-- **Recent Memories**: High-salience memories filtered by your agentId (plus shared memories)
+- **Recent Memories**: High-salience memories filtered by your sbSlug (plus shared memories)
 - **Active Sessions**: Array of all active sessions (use `studioId` to find yours)
 
 ### Step 4: Start or Resume Session
@@ -51,7 +51,7 @@ This returns:
 Read `studioId` from `.ink/identity.json` (if present) and pass it to `start_session`:
 
 ```
-start_session(userId: "<from config>", agentId: "<your identity>", studioId: "<from identity.json>")
+start_session(userId: "<from config>", sbSlug: "<your identity>", studioId: "<from identity.json>")
 ```
 
 This scopes the session to your studio (worktree). Multiple agents can have active sessions simultaneously in different studios.
@@ -71,12 +71,12 @@ update_session_state(userId: "...", phase: "active:implementing", studioId: "...
 Use `remember` for decisions, insights, and important events:
 
 ```
-remember(userId: "...", content: "Decided to use X approach because...", agentId: "wren")
+remember(userId: "...", content: "Decided to use X approach because...", sbSlug: "wren")
 ```
 
 **Note**: Session lifecycle (`start_session`, `end_session`) is managed automatically by hooks — SBs should not call these manually. Use `remember()` for important context and `update_session_state()` for work status.
 
-**Note**: Never commit PII (emails, user IDs) to the repository. Always read from config files.
+**Note**: Your userId and email are read from config files at runtime. Neither goes into a tracked file, and nothing about the user's life does either — see [Personal data is never repo material](#personal-data-is-never-repo-material-ironclad) under Testing.
 
 ## Security (CRITICAL)
 
@@ -119,11 +119,22 @@ Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths
 
 5. **Never expose the service role key to the client.** It lives in `.env.local` (server only) and must never appear in `NEXT_PUBLIC_*` environment variables.
 
+### Local dashboard test account
+
+A shared SB account exists for local dashboard and auth-flow testing. Its credentials live in `.env.local` (gitignored, present in every worktree) as:
+
+```
+SB_TEST_EMAIL
+SB_TEST_PASSWORD
+```
+
+Use it whenever an SB needs to sign in to the dashboard or exercise the login path. **Never reset, rotate, or reuse a human's password to gain access** — the admin auth API can change any user's password with the service key, and doing so locks the human out. If the test account is missing or its password no longer works, say so and stop; recreating it is the user's call.
+
 ### File Access & Media Isolation (TODO)
 
 Server-spawned Claude sessions currently get `--add-dir ~/.ink/files` for media access (Telegram downloads, Gmail attachments, etc.). This is a shared directory — **all SBs can read all SBs' files**. Future work should consider:
 
-- **Per-agent file namespacing**: `~/.ink/files/<agentId>/telegram/` instead of `~/.ink/files/telegram/`
+- **Per-agent file namespacing**: `~/.ink/files/<sbSlug>/telegram/` instead of `~/.ink/files/telegram/`
 - **Scoped `--add-dir`**: only grant access to the spawned agent's own subdirectory
 - **Cross-agent file sharing**: explicit mechanism for one SB to share a file with another (vs. implicit shared access)
 - **File lifecycle**: cleanup policy for downloaded media (currently accumulates indefinitely)
@@ -179,7 +190,7 @@ The primary mechanism for scope resolution is the **`x-ink-context`** header —
 interface PcpContextToken {
   sessionId: string; // PCP session ID
   studioId: string; // Studio UUID (or "main" for root repo)
-  agentId: string; // Agent identity
+  sbSlug: string; // Agent identity
   cliAttached: boolean; // Whether a human is at the terminal
   runtime: string; // 'claude' | 'codex' | 'gemini'
   repoRoot?: string; // Root repo path
@@ -232,26 +243,35 @@ Tools: `get_identity` / `save_identity` (per-agent), `get_team_constitution` / `
 
 ### Identity References in Code
 
-When referencing agents programmatically — in database columns, API schemas, tool parameters, strategy configs — always use the **identity UUID** (`agent_identities.id`), never the agent slug (`agent_id`).
+Two things name an SB, and they are not interchangeable:
 
-- **Slugs are ambiguous** — the same slug can exist across multiple workspaces
-- **UUIDs are authoritative** — globally unique, no disambiguation needed
-- **Resolve at the boundary** — when a human-readable slug is needed for routing (e.g., `send_to_inbox`), resolve UUID → slug at the last moment, scoped to the correct workspace
+| Name         | What it is                  | Unique within     |
+| ------------ | --------------------------- | ----------------- |
+| **`sbId`**   | The canonical identity UUID | Everywhere        |
+| **`sbSlug`** | The human-readable name     | **One workspace** |
 
-The identity UUID can always be resolved back to a slug via `agent_identities`. The reverse (slug → UUID) requires workspace context and risks ambiguity.
+When referencing an SB programmatically — in database columns, API schemas, tool parameters, strategy configs — always use `sbId`, never `sbSlug`.
+
+- **A slug is unique only within a workspace.** Another workspace may have its own `wren`, and that is intended: **an SB's identity boundary is the workspace**. Studios are work areas inside one.
+- **UUIDs are authoritative** — globally unique, no disambiguation needed.
+- **Resolve at the boundary** — when a human-readable slug is needed for routing (e.g., `send_to_inbox`), resolve UUID → slug at the last moment.
+
+`sbId` → `sbSlug` is always safe: a UUID names exactly one row. The reverse needs a workspace, so `resolveSbId()` takes one (defaulting to the request's) and **refuses rather than guessing** when a slug is ambiguous and no workspace narrows it.
+
+> **One thing you will see in SQL.** The database has not been migrated yet, so raw queries still name the columns `agent_id` (the slug) and `sb_id` (the UUID), in a table called `agent_identities`. That is the _only_ place the old name is correct. Never introduce it into TypeScript, a tool parameter, or a document — there the pair is always `sbId` / `sbSlug`.
 
 ### Memory Attribution
 
-When saving memories, include your agentId:
+When saving memories, include your sbSlug:
 
 ```
-remember(userId: "...", content: "...", agentId: "wren")
+remember(userId: "...", content: "...", sbSlug: "wren")
 ```
 
-When recalling, memories are filtered by agentId but include shared memories (agentId=null):
+When recalling, memories are filtered by sbSlug but include shared memories (sbSlug=null):
 
 ```
-recall(userId: "...", query: "...", agentId: "wren", includeShared: true)
+recall(userId: "...", query: "...", sbSlug: "wren", includeShared: true)
 ```
 
 ## Cross-Agent Communication & threadKey
@@ -272,18 +292,23 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 | `task:<id>`      | PCP task coordination                       | `task:abc123`                |
 | `thread:<slug>`  | Multi-step conversation with no natural key | `thread:perf-audit`          |
 
-### Cross-Project threadKeys
+### Cross-Project threadKeys (MANDATORY outside Inkwell)
 
 When working across multiple repos/projects, prefix the threadKey with the project name to avoid collisions. The format is `<project>:<type>:<identifier>`.
 
-| Context                       | threadKey                 |
-| ----------------------------- | ------------------------- |
-| PR in Inkwell (this repo)     | `pr:389`                  |
-| PR in a different project     | `inktrade:pr:42`          |
-| Issue in another project      | `openclaw:issue:15`       |
-| Cross-project spec discussion | `inktrade:spec:valuation` |
+| Context                       | threadKey                       |
+| ----------------------------- | ------------------------------- |
+| PR in Inkwell (this repo)     | `pr:389`                        |
+| PR in a different project     | `inktrade:pr:42`                |
+| Issue in another project      | `openclaw:issue:15`             |
+| Cross-project spec discussion | `inktrade:spec:valuation`       |
+| Branch in another project     | `inktrade:branch:supabase-auth` |
 
-Within the Inkwell repo, the project prefix is optional — `pr:389` is unambiguous. For any thread that references work in a different repo, always include the project prefix so trigger routing and session matching work correctly across boundaries.
+Within the Inkwell repo, the project prefix is optional — `pr:389` is unambiguous. For any thread that references work in a **different repo, the project prefix is REQUIRED** — `pr:12` in two repos is a routing collision, and studio route patterns (`inktrade:pr:*`) can only target project-scoped keys.
+
+The project goes in the **prefix slot, never the identifier**: `inktrade:pr:42`, not `pr:inktrade-42` or `pr:inktrade-supabase-auth`. Baking the project into the identifier defeats pattern matching and prefix-based routing.
+
+Each repo's AGENTS.md should carry this threadKey section so agents working there natively derive project-prefixed keys.
 
 ### Sender Rules
 
@@ -292,6 +317,7 @@ Within the Inkwell repo, the project prefix is optional — `pr:389` is unambigu
 3. **DERIVE** the key from the most specific reference. If a PR review involves spec changes, use `pr:<number>` (the actionable unit), not `spec:<slug>`.
 4. **Keep identifiers stable** — use PR numbers, not PR titles. Use spec URI slugs, not descriptions.
 5. If no natural key exists for a multi-step conversation, use `thread:<short-slug>` with a descriptive slug.
+6. **Prefix with the project** for any thread about work outside this repo: `<project>:<type>:<identifier>` (see Cross-Project threadKeys above).
 
 ### Recipient Rules
 
@@ -305,7 +331,7 @@ Within the Inkwell repo, the project prefix is optional — `pr:389` is unambigu
 - **Use Inkwell tools** (`mcp__inkwell__*`) over local file operations for memory, tasks, and sessions
 - **Bootstrap first** — always call bootstrap at session start to load your identity and context
 - **Log your work** — use `remember()` for important decisions and insights
-- **Attribute memories** — include your agentId when calling `remember()` so memories are correctly filtered
+- **Attribute memories** — include your sbSlug when calling `remember()` so memories are correctly filtered
 - **Respect identity boundaries** — you are the agent your identity resolves to, not a generic assistant
 - **Embrace your name** — if you have an SB identity, use it. Co-author commits as yourself (e.g., `Co-Authored-By: Wren <noreply@anthropic.com>`), not as a model name. You are not "Claude Opus 4.6" — you are Wren, Lumen, Benson, or whoever your identity resolves to.
 - **Default to action on review requests** — when asked to handle PR review feedback, implement straightforward fixes immediately without waiting for extra permission.
@@ -376,8 +402,8 @@ personal-context-protocol/
 
 ## Key Technologies
 
-- **Runtime**: Node.js 18+, TypeScript
-- **MCP SDK**: `@modelcontextprotocol/sdk`
+- **Runtime**: Node.js 22 (`.nvmrc`; the MCP SDK v2 packages require 20 or newer), TypeScript
+- **MCP SDK**: `@modelcontextprotocol/server` (v2; `/node` for the HTTP transport, `/client` in tests). Protocol revision 2026-07-28; the legacy `@modelcontextprotocol/sdk` 1.x line stopped at 2025-11-25
 - **Database**: Supabase (PostgreSQL + pgvector)
 - **Frontend**: Next.js, React, Tailwind CSS
 - **Validation**: Zod schemas
@@ -401,7 +427,7 @@ ink wait --pending --timeout 300
 
 ```
 # Send review request
-send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:239", ...)
+send_to_inbox(recipientSlug: "lumen", threadKey: "pr:239", ...)
 
 # Hold in background — wakes you up when reply arrives
 run_in_background: ink wait --thread pr:239 --timeout 300
@@ -421,7 +447,7 @@ yarn install
 # Development server (with hot reload)
 yarn dev
 
-# Build for production
+# Build for production (also re-points the global ink link — see "The Global ink CLI Link")
 yarn build
 
 # Type checking
@@ -437,30 +463,69 @@ yarn logs:ink:errors       # Errors only
 
 **Never kill or restart the main dev server.** It runs on the default port (3001) and handles agent communication, triggers, and heartbeats. Disrupting it breaks other SBs' active sessions.
 
-To test API or MCP changes without affecting the main server, run a **separate instance** on a different port using `PCP_PORT_BASE`:
+**Never let a second server process heartbeats or reminders.** A different port does not make a server isolated — every server reads the same database. A second one with heartbeat processing left on does not sit idle: it ticks on its own schedule, sees the same reminders come due, and races the main server to claim each one. Whoever wins spawns the agent, and the loser's spawn would have landed in whatever checkout that server was started from. Coverage becomes a coin flip, and nothing alerts, because every individual beat still looks fine in the log. On 2026-09-11 a test server left up overnight in a worktree took roughly half of Myra's hourly heartbeats for thirteen hours and ran them against an `ink` build dated April 9. We have flags for exactly this — set them.
+
+**Stop your test server when you're done with it.** The 2026-09-11 server had been orphaned since the previous evening: no terminal attached, zero clients on its port, still ticking. A test server is not free to leave running, and the cost does not show up in your own session.
+
+To test API or MCP changes without affecting the main server, run a **separate instance** on a different port using `INK_PORT_BASE`:
 
 ```bash
-# Isolated test server — disable services the main server already handles
-ENABLE_HEARTBEAT_SERVICE=false \
+# Isolated test server — disable services the main server already owns.
+# ENABLE_HEARTBEATS=false is not optional: without it this server races the
+# main one for every due reminder (see above).
+ENABLE_HEARTBEATS=false \
 ENABLE_TELEGRAM=false \
 ENABLE_WHATSAPP=false \
 ENABLE_DISCORD=false \
-PCP_PORT_BASE=4001 \
+ENABLE_GRAPH_SWEEP=false \
+INK_PORT_BASE=4001 \
 yarn dev
 
 # Point the CLI at your test server
 PCP_SERVER_URL=http://localhost:4001 ink mission
 ```
 
-**Disable services you aren't testing.** Telegram, WhatsApp, Discord, and the heartbeat service should stay `false` on isolated servers — the main server already owns those connections. Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
+**Use `INK_PORT_BASE`, not `PCP_PORT_BASE`.** The resolution is `INK_PORT_BASE || PCP_PORT_BASE` (`scripts/dev-concurrently.mjs`), and `INK_PORT_BASE=3001` is exported in the inherited shell environment on this machine — so an explicit `PCP_PORT_BASE=4001` is silently discarded and the "isolated" server starts on the main server's port.
 
-Port derivation from `PCP_PORT_BASE`:
+**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, and the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`) should stay `false` on isolated servers — the main server already owns those connections and the sweep's dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
 
-- **MCP/API**: `PCP_PORT_BASE` (e.g., 4001)
-- **Web**: `PCP_PORT_BASE + 1` (e.g., 4002)
-- **Myra**: `PCP_PORT_BASE + 2` (e.g., 4003)
+**Heartbeats specifically.** Any of `ENABLE_HEARTBEATS`, `ENABLE_REMINDERS`, or `ENABLE_HEARTBEAT_SERVICE` set to a false-like value (`false`, `0`, `off`, `no`) disables reminder processing. A server started from a git worktree also auto-disables, and needs one of those set to `true` to opt back in.
+
+**Verify it rather than assume it.** The startup log line `Heartbeat service flags evaluated` reports `heartbeatServiceEnabled`, the `cwd` it resolved from, and `isWorktree` when it detected one. Both servers write to the same log file, so duplicate ticks read as one chatty process and the `cwd` field is what tells the two apart. If you want the direct check, `grep 'Heartbeat tick' ~/.ink/logs/combined.log | tail` — a timestamp appearing twice means two schedulers are live right now.
+
+Both disable paths failed silently until 2026-09-11, so it is worth knowing why. `ENABLE_HEARTBEAT_SERVICE` — the name this recipe used to give — was read by nothing; the only match in the tree was a line in `dev-concurrently.mjs` that printed it. The worktree auto-disable checked `.git` in `process.cwd()`, but the API server's cwd is `packages/api`, so it never detected a worktree either. The operator who started that server set the documented variable correctly and got a no-op, behind a guard that had never once fired. Both mechanisms work now, and the code honours `ENABLE_HEARTBEAT_SERVICE` as well as the two real names — so the older copies of this recipe still checked out in other worktrees now describe something that actually happens.
+
+Port derivation from `INK_PORT_BASE`:
+
+- **MCP/API**: `INK_PORT_BASE` (e.g., 4001)
+- **Web**: `INK_PORT_BASE + 1` (e.g., 4002)
+- **Myra**: `INK_PORT_BASE + 2` (e.g., 4003)
 
 Both servers share the same Supabase database, so data changes are visible to both. The main server stays untouched on 3001.
+
+## The Global `ink` CLI Link (IMPORTANT)
+
+`~/.ink/bin/ink` (compat alias: `~/.local/bin/ink`) is a symlink to **one** checkout's `packages/cli/dist/cli.js`. Every terminal hook, every server-spawned session, and every `ink wait` on this machine runs whatever that link points at. Which checkout it points at is the OB's decision, not yours.
+
+**NEVER re-point the global `ink` link without explicit permission in the current conversation.** All of these re-point it:
+
+- `yarn workspace @inklabs/cli install:cli` — links to the checkout you run it from
+- root `yarn build` — runs `install:cli` as its last step
+- `ln -s` or editing the symlink by hand
+
+A deploy, a merged CLI fix, a build that looks stale, or "the fix should reach terminals" is not permission. Ask, name the checkout you would point it at, and wait for a yes. Permission for one relink does not carry over to the next.
+
+**To test a CLI change, build it where it lives and call that build directly:**
+
+```bash
+# From your studio (create one with: ink studio create <name> --branch <branch> --agent <you>)
+yarn workspace @inklabs/cli build
+node ./packages/cli/dist/cli.js <subcommand>
+```
+
+The global link stays where it was. Your studio's build is for you to exercise, not for every other session on the machine to run.
+
+**The server never uses the global link.** For the hooks it writes and the chat loops it spawns, it resolves its own checkout's `packages/cli/dist/cli.js` (see `packages/api/src/services/ink-cli.ts`), runs it through node, and takes `INK_CLI_PATH` as an explicit override. A checkout with no CLI build falls back to `ink` on PATH with a one-time warning; build it with `yarn workspace @inklabs/cli build`. A new call site that reaches for `ink` without going through that resolver is a code problem, not a reason to relink: route it through `resolveInkCli` and open a PR.
 
 ## Supabase Project ID
 
@@ -528,11 +593,6 @@ The MCP server exposes 60+ tools. Key categories:
 - `get_memory_history` - View all versions of a memory
 - `get_user_history` - See recent changes (updates/deletes)
 - `restore_memory` - Rollback to a previous version
-
-### Context
-
-- `save_context` - Save context summaries (user, assistant, relationship, project)
-- `get_context` - Retrieve context
 
 ### Projects
 
@@ -635,6 +695,9 @@ Optional:
 - `MCP_TRANSPORT` - `stdio` (default) or `http`
 - `NODE_ENV` - `development` or `production`
 - `SENTRY_DSN` - Error tracking (optional)
+- `SERVER_COMPACTION_ENABLED` - `true` to let the server rotate claude-code sessions at the compaction threshold (default `false`: Claude Code auto-compacts natively via `--autocompact`)
+- `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
+- `INK_CLI_PATH` - absolute path of the ink CLI the server invokes for hooks and chat loops. Default: this checkout's `packages/cli/dist/cli.js`, run through node. The server never uses the global `~/.ink/bin/ink` link.
 
 ## Testing
 
@@ -649,6 +712,38 @@ Optional:
 **Unit tests** use mocks (mock Supabase client, stubbed recall functions) and run in CI with no external dependencies. **Integration tests** hit the running PCP server (default `http://localhost:3001`) and require valid auth (`~/.ink/auth.json`). They skip automatically when the server is unavailable. **Live tests** are the only tier where an LLM actually generates responses — they measure whether the full pipeline (recall → injection → LLM response → curation) produces correct behavior, not just whether individual components work.
 
 When adding a new feature, write unit tests for the logic and integration tests for the server round-trip. Live tests are reserved for eval harnesses where the LLM's judgment is part of what's being measured.
+
+### Personal data is never repo material (IRONCLAD)
+
+Personal data is always private. It never goes into a tracked file, a commit message, a PR body, a branch name or a changelog — not the user's own data, not their contacts, doctors, employer, treatments or conversations, and not anyone else's. Not anonymised, not abbreviated, not "just the domain". The repository is public, and a name beside a subject line is a fact about someone's life that git keeps forever.
+
+Fixtures are where this has been broken, by SBs who had read the rule, and the mechanism is always the same: a real message was the fastest way to reproduce a real parser failure, so its headers went into the test as they arrived. The test was correct. The person was real. That is why the rule now has a machine behind it, the way the credential rules do, and why the worked example below is a fixture.
+
+**How to write a fixture (the worked example):**
+
+- People are made up and obviously so. Pick a name that belongs to no colleague, contact or clinic of the user's.
+- Addresses live at `example.com`, `example.net`, `example.org` or under the reserved TLDs `.test`, `.example`, `.invalid` — set aside by RFC 2606 so nothing real can ever live there. `user@example.com`, `ada@clinic.example`.
+- Phone numbers use the 555 range (`+15555550123`). Chat ids, user ids and platform ids are visibly synthetic (`100200300`, `123456789`), never copied from a live row.
+- Subjects, bodies and reminder titles say nothing about a real person: "Eat before 9", not a treatment, a diagnosis, an employer or a relationship.
+- An integration test that must reach a real account reads the id from the environment and skips when it is absent. The id never goes in the file.
+- A doc comment that cites an incident describes the mechanism and may keep the date; it does not name the person or what the reminder was for.
+
+**What the machine checks.** The staged-file guard (`scripts/check-staged-files.sh` — run by `pre-commit`, replayed by `pre-push`, and run over every tracked file by CI as `--tree HEAD`) has two arms for this. Any email address whose domain is neither reserved nor listed in `scripts/lib/fixture-domains.sh` is refused, so pasting a real header needs a visible edit to that list, in the diff, in review. And any string in `~/.ink/private-markers` — a per-machine list outside the repository, one literal per line, case-insensitive — is refused wherever it appears. The list lives outside the tree because a list of your own personal data is itself personal data. A missing list refuses the commit; an empty one is the explicit opt-out. Both arms report path and line numbers and never the value. Only `.mailmap` and `.yarn/releases/` are exempt. The domain list carries a frozen set of legacy placeholders (`test.com`, `x.com` and friends) that predate the guard: do not add to it. Passing the guard means nothing matched, never that nothing personal is there — a name in prose has no shape a scanner can see.
+
+**Set up your marker list once per machine.** The guard refuses to run until the list exists, so the first commit on a new machine says so and tells you this. Create it, then put in it the literal strings that would identify you or the people in your life if a pasted message carried them: your addresses and phone numbers, chat and platform ids, and the names and domains of the people and organisations you correspond with. It is read by the same `pre-commit` hook that runs the credential checks; nothing else to install.
+
+```bash
+mkdir -p ~/.ink
+cat > ~/.ink/private-markers <<'EOF'
+# One literal per line, matched anywhere in a staged file, case-insensitive.
+# This file is never tracked. Blank lines and # comments are ignored.
+EOF
+chmod 600 ~/.ink/private-markers
+```
+
+An empty list is a valid opt-out. A missing one is not.
+
+**If it already happened.** A real person in a tracked file is an incident, not a cleanup. Say so to Conor before anything else. Fix it forward on a branch with a sibling review, keep the values out of the commit message and the PR body (the diff will carry them; the prose must not), and do not touch history on your own — that is a separate decision with its own costs.
 
 ### Commands
 
@@ -733,9 +828,68 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
 - **Never push directly to main** from a feature branch. Always use PRs. This includes releases, changelog updates, and docs changes.
 - **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
+- **Do not require a re-review solely because a catch-up merge moved the SHA.** Merging `main` into your branch is not a new proposal, and an LGTM does not expire just because the head changed. Behavioural changes you make on top are a different thing and keep the ordinary review boundary.
+
+  This is _not_ because the diff against `main` makes every mistake visible. It does not, and the gap is worth knowing exactly. Resolve a conflict by taking `main` wholesale and you can discard a reviewed branch contribution outright — and a branch-only addition that disappears this way leaves **no trace in either `git diff main HEAD` or `git diff main...HEAD`**, because the merged file now matches `main` exactly. It vanishes as an addition that was never made, rather than as a deletion hunk. Reproduced in a four-commit synthetic repo while reviewing #643, where `git diff <reviewed-sha> HEAD` was the only one of the three that showed the loss.
+
+  So the check sits with the author, who is the one who knows what was reviewed:
+  1. **Diff against the reviewed head, not against `main`.** `git diff <reviewed-sha> HEAD` is the one that can show a reviewed change going missing. Account for what `main` deliberately superseded — an intentional upstream replacement looks identical to an accidental drop, and only you know which it was.
+  2. **Re-run the relevant tests and CI.** A rename on `main` can break your branch with no conflict and no type error. On #539 the branch kept passing `senderAgentId` to `send_to_inbox` after `main` renamed the field to `senderSlug`: different files, so no conflict; `args: unknown` at the handler, so no type error; a non-strict zod schema, so the key was stripped rather than rejected, and every alert would have been sent by `unknown` instead of `system`. Nothing failed anywhere.
+  3. **Disclose behaviour changes on the PR.** "Kept both sides" and "took `main`'s line because ours reinstated a documented footgun" are different events, and only one of them is free.
+
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
-- **Commit messages**: pass multi-line messages directly to `-m "..."` — bash handles literal newlines in double-quoted strings. Do not use `$(cat <<'EOF' ... EOF)` or other command substitution patterns; they add complexity for no benefit.
+
+### Commit messages, secrets, and what gets pushed (IRONCLAD)
+
+These rules exist because on 2026-09-13 a commit message pasted 151 shell variables, including live credentials, into a public repository, and because two commits in February 2026 did the same on `main` and sat there for seven months. They apply to every SB and every OB, in every repo, with no exceptions and no "quick one".
+
+1. **Nothing in a commit message is ever evaluated by the shell.** Backticks, `$(...)` and `$VAR` are fine as literal text in a message written through a quoted heredoc (`<<'EOF'`) or the `Write` tool. They are forbidden anywhere the shell would expand them: an `-m` string, an unquoted heredoc, a double-quoted `echo` or `printf` argument. A commit message is literal text you wrote, and only that.
+2. **If you need a value in the message, get it first, look at it, then paste the literal.** Run the command on its own, read its output, and type what you want into the message file by hand. There is no situation where a variable expanding inside a commit message is the right shortcut.
+3. **Write the message to a file and commit with `git commit -F <file>`.** Create the file with a quoted heredoc or the `Write` tool. Never `-m`, not even for a one-line subject. The mechanism and the runnable example are in the reference below.
+4. **Stage by naming paths, and look at what you staged.** `git add <path> [<path>...]` or a directory you have just inspected, then `git diff --cached` before committing. Never `git add -A`, never `git add .`, never `git commit -a` or `-am`. `.` and `-A` sweep in untracked files you never looked at, which is how env files, identity files, and scratch output end up in a commit; `-a` and `-am` commit every modified tracked file and skip the staged-diff review.
+5. **Read every commit message back before you push. All of them, every time, through the guard.** Run `sh scripts/check-push.sh --preview`: it replays `origin/main..HEAD` the way the pre-push hook will, scanning each message first and printing it only if it passes, oldest first, and withholding any that fail with a value-free report. Read the output top to bottom. Do not use a raw `git log` for this from a session whose output is captured: an unscanned message carrying a secret would be written straight into the transcript. "Nobody reads commit messages" is wrong: you do, right before `git push`, because the push is the point of no return. A message you have not read back is a message you have not finished writing.
+6. **The hooks are a backstop, not the safety.** The `commit-msg` guard, the staged-file guard (credentials and personal data alike), and the pre-push replay catch the shapes that have already burned us. Passing them means nothing matched. Rules 1 through 5 are what prevent the leak.
+7. **Anything secret-shaped in a commit is an incident before it is anything else.** Do not push. If it was already pushed, do not clean it up quietly: tell Conor, rotate, and follow the purge procedure. A pushed commit is public the moment it lands, and GitHub keeps it reachable by SHA after the branch is gone.
+
+In no scenario do we play fast and loose with secrets or with any path that could carry one. A value that might be a secret is treated as one until measured otherwise.
+
+#### Reference: why `-F`, how the file gets written, and what the hook does
+
+**Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m`, not even for a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in it is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten nonempty credential-bearing assignments into a public repository. The diff stays clean, so review cannot catch it.
+
+A subject line is **not** the safe exception it looks like. Backticks in a subject are substituted exactly as they are in a body:
+
+```bash
+git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
+```
+
+That example substitutes `pwd`, not the builtin that caused the incident — the snippet is runnable, and the real one would dump your environment into a commit. Same mechanism, harmless payload.
+
+Single-quoting is not the fix either: an apostrophe in a word like `don't` closes the string, and the remainder of your message is re-parsed as shell.
+
+**How you write the file matters as much as `-F` does.** `-F` reads bytes and never expands them, but the shell still expands whatever you use to _create_ the file:
+
+```bash
+cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
+cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
+```
+
+Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
+
+The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, whichever way the credentials got in. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
+
+**A non-empty `core.hooksPath` does not mean the guard is on.** The hook runs from whichever checkout that path points at, which on a machine with worktrees is one shared directory serving all of them. If that checkout does not carry `.husky/commit-msg`, nothing is checked and nothing says so. To confirm: `ls "$(git config core.hooksPath)"/commit-msg`.
+
+**Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak.
+
+It has one false positive you will meet, and it is deliberate: **any** assignment to a name it knows — `JWT_SECRET=`, `GITHUB_TOKEN=` — is refused, including `=<placeholder>`, `=***` and a bare `=` with nothing after it. Exempting those meant exempting real credentials that happen to start with the same byte, so prose names the variable without assigning to it: "the `JWT_SECRET` value", not `JWT_SECRET=<value>`. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
+
+## Issues Live in Inkwell, Not GitHub
+
+**SBs file issues as Inkwell tasks, never as GitHub issues.** Use `create_task`, or a task group for anything with more than one piece, with the same specificity you would put in a GitHub issue: what happened, how to reproduce it, what you expected, and where in the code. Link the task from the PR or thread that addresses it.
+
+GitHub issues are an **external feed**: the place for people outside the repo to report problems, and the place we track what they report. All SBs share one GitHub account, so an SB-authored GitHub issue is indistinguishable from Conor filing it, and it puts internal triage on a surface the team does not work from. When an external issue arrives, create the Inkwell task that tracks it, put the GitHub issue number in the task, and reply on GitHub when it is resolved.
 
 ## Architecture Notes
 

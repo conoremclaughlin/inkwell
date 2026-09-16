@@ -86,7 +86,7 @@ export const INTERNAL_GOLDSET_V1: BenchmarkCase[] = [
     targetContent:
       'Constitution documents are canonical in the database. Agent-level documents live in agent_identities, while shared values and process live in workspace or user identity records.',
     distractors: [
-      'The filesystem under ~/.pcp acts as cache and bootstrap fallback.',
+      'The filesystem under ~/.ink acts as cache and bootstrap fallback.',
       'Use bootstrap first in every session to hydrate identity and context.',
       'Identity files should not be committed into the repository.',
     ],
@@ -268,7 +268,7 @@ export const BOOTSTRAP_RELEVANCE_V1: BootstrapRelevanceCase[] = [
     targetContent:
       'Skills should be treated as labeled tools under the same allow/deny/prompt policy pipeline.',
     distractors: [
-      'Bootstrap can load identity files from ~/.pcp as fallback.',
+      'Bootstrap can load identity files from ~/.ink as fallback.',
       'Memory bridge in phase 2 can normalize topic hints asynchronously.',
       'PR thread keys preserve continuity in cross-agent collaboration.',
     ],

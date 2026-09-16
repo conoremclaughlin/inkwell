@@ -493,7 +493,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
         `Context injection: ${isResuming ? 'MINIMAL (resuming)' : 'FULL (new session)'}`,
         {
           sessionId: this.sessionId,
-          hasIdentity: !!message.injectedContext.agentIdentity,
+          hasIdentity: !!message.injectedContext.sbIdentity,
         }
       );
       if (isResuming) {
@@ -564,18 +564,18 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     sections.push('<user-context>');
 
     // Agent identity - who am I?
-    if (context.agentIdentity) {
+    if (context.sbIdentity) {
       sections.push('## My Identity');
-      sections.push(`I am **${context.agentIdentity.name}** (${context.agentIdentity.agentId})`);
-      sections.push(`Role: ${context.agentIdentity.role}`);
-      if (context.agentIdentity.description) {
-        sections.push(context.agentIdentity.description);
+      sections.push(`I am **${context.sbIdentity.name}** (${context.sbIdentity.sbSlug})`);
+      sections.push(`Role: ${context.sbIdentity.role}`);
+      if (context.sbIdentity.description) {
+        sections.push(context.sbIdentity.description);
       }
-      if (context.agentIdentity.values && context.agentIdentity.values.length > 0) {
-        sections.push(`Values: ${context.agentIdentity.values.join(', ')}`);
+      if (context.sbIdentity.values && context.sbIdentity.values.length > 0) {
+        sections.push(`Values: ${context.sbIdentity.values.join(', ')}`);
       }
-      if (context.agentIdentity.capabilities && context.agentIdentity.capabilities.length > 0) {
-        sections.push(`Capabilities: ${context.agentIdentity.capabilities.join(', ')}`);
+      if (context.sbIdentity.capabilities && context.sbIdentity.capabilities.length > 0) {
+        sections.push(`Capabilities: ${context.sbIdentity.capabilities.join(', ')}`);
       }
       sections.push('');
     }
@@ -673,8 +673,8 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     parts.push('<context-update>');
 
     // Brief identity reminder (one line)
-    if (context.agentIdentity) {
-      parts.push(`[I am ${context.agentIdentity.name}]`);
+    if (context.sbIdentity) {
+      parts.push(`[I am ${context.sbIdentity.name}]`);
     }
 
     // Current time (always include - it changes!)

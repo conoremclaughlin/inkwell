@@ -14,8 +14,8 @@ const PERMANENT = { category: 'auth' as const, summary: 'HTTP 401', retryable: f
 
 function makePayload(overrides: Partial<AgentTriggerPayload> = {}): AgentTriggerPayload {
   return {
-    fromAgentId: 'wren',
-    toAgentId: 'lumen',
+    fromSlug: 'wren',
+    toSlug: 'lumen',
     triggerType: 'message',
     inboxMessageId: 'inbox-msg-1',
     threadKey: 'pr:42',
@@ -40,7 +40,7 @@ describe('getTriggerAttempt', () => {
 });
 
 describe('getTriggerRetryKey', () => {
-  it('includes toAgentId with source id for fan-out safety', () => {
+  it('includes toSlug with source id for fan-out safety', () => {
     expect(getTriggerRetryKey(makePayload())).toBe('inbox-msg-1::lumen');
     expect(
       getTriggerRetryKey(makePayload({ inboxMessageId: undefined, threadMessageId: 'tm-1' }))
@@ -59,8 +59,8 @@ describe('getTriggerRetryKey', () => {
 
   it('produces distinct keys for fan-out to different recipients', () => {
     const msg = { inboxMessageId: undefined as string | undefined, threadMessageId: 'tm-shared' };
-    const keyLumen = getTriggerRetryKey(makePayload({ ...msg, toAgentId: 'lumen' }));
-    const keyAster = getTriggerRetryKey(makePayload({ ...msg, toAgentId: 'aster' }));
+    const keyLumen = getTriggerRetryKey(makePayload({ ...msg, toSlug: 'lumen' }));
+    const keyAster = getTriggerRetryKey(makePayload({ ...msg, toSlug: 'aster' }));
     expect(keyLumen).toBe('tm-shared::lumen');
     expect(keyAster).toBe('tm-shared::aster');
     expect(keyLumen).not.toBe(keyAster);
@@ -160,8 +160,8 @@ describe('TriggerRetryScheduler', () => {
 
   it('schedules independent retries for fan-out to different recipients', () => {
     const base = { inboxMessageId: undefined as string | undefined, threadMessageId: 'tm-shared' };
-    const toLumen = makePayload({ ...base, toAgentId: 'lumen' });
-    const toAster = makePayload({ ...base, toAgentId: 'aster' });
+    const toLumen = makePayload({ ...base, toSlug: 'lumen' });
+    const toAster = makePayload({ ...base, toSlug: 'aster' });
 
     expect(scheduler.scheduleRetry(toLumen, TRANSIENT).scheduled).toBe(true);
     expect(scheduler.scheduleRetry(toAster, TRANSIENT).scheduled).toBe(true);
@@ -169,8 +169,8 @@ describe('TriggerRetryScheduler', () => {
 
     vi.advanceTimersByTime(TRIGGER_RETRY_DELAYS_MS[0]);
     expect(redispatch).toHaveBeenCalledTimes(2);
-    expect(redispatch.mock.calls[0][0].toAgentId).toBe('lumen');
-    expect(redispatch.mock.calls[1][0].toAgentId).toBe('aster');
+    expect(redispatch.mock.calls[0][0].toSlug).toBe('lumen');
+    expect(redispatch.mock.calls[1][0].toSlug).toBe('aster');
   });
 
   it('respects custom maxAttempts and delays', () => {

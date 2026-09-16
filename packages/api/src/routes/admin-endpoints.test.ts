@@ -70,20 +70,22 @@ vi.mock('../services/authorization', () => ({
 const mockGetConnectedAccounts = vi.fn();
 const mockGetSupportedProviders = vi.fn();
 const mockIsProviderConfigured = vi.fn();
+const mockGetCredentialSources = vi.fn();
+const mockDescribeDesktopCredentials = vi.fn();
 
 vi.mock('../services/oauth', () => ({
   getOAuthService: vi.fn(() => ({
     getConnectedAccounts: mockGetConnectedAccounts,
     getSupportedProviders: mockGetSupportedProviders,
     isProviderConfigured: mockIsProviderConfigured,
+    getCredentialSources: mockGetCredentialSources,
+    describeDesktopCredentials: mockDescribeDesktopCredentials,
   })),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -864,7 +866,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
             syncedAt: '2026-03-11T10:00:00Z',
             session: {
               id: 'session-in-workspace',
-              agentId: 'wren',
+              sbSlug: 'wren',
               agentName: 'Wren',
               agentRole: 'SB',
               backend: 'claude',
@@ -1218,6 +1220,12 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       mockGetConnectedAccounts.mockResolvedValue([]);
       mockGetSupportedProviders.mockReturnValue(['google']);
       mockIsProviderConfigured.mockReturnValue(true);
+      mockGetCredentialSources.mockReturnValue(['cloud', 'desktop']);
+      mockDescribeDesktopCredentials.mockResolvedValue({
+        dir: '/srv/google',
+        email: null,
+        credentials: [],
+      });
 
       const handler = findRouteHandler('get', '/connected-accounts');
       expect(handler).not.toBeNull();
@@ -1229,6 +1237,70 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       expect(res._status).toBe(200);
       expect(res._json).toHaveProperty('accounts');
       expect(res._json).toHaveProperty('providers');
+      expect((res._json as { desktopCredentials: unknown[] }).desktopCredentials).toEqual([]);
+      expect(
+        (res._json as { providers: Array<{ connected: boolean }> }).providers[0].connected
+      ).toBe(false);
+    });
+
+    it('counts a usable desktop credential as a Google connection', async () => {
+      mockGetConnectedAccounts.mockResolvedValue([]);
+      mockGetSupportedProviders.mockReturnValue(['google']);
+      mockIsProviderConfigured.mockReturnValue(true);
+      mockGetCredentialSources.mockReturnValue(['cloud', 'desktop']);
+      mockDescribeDesktopCredentials.mockResolvedValue({
+        dir: '/srv/google',
+        email: 'me@example.com',
+        credentials: [
+          {
+            email: 'me@example.com',
+            path: '/srv/google/me@example.com' + '.json',
+            scopes: ['a'],
+            obtainedAt: '2026-09-08T18:00:00.000Z',
+            state: 'refresh_required',
+            reason: 'The next call must refresh',
+            expiresAt: null,
+          },
+        ],
+      });
+
+      const handler = findRouteHandler('get', '/connected-accounts');
+      const req = createAuthenticatedReq();
+      const res = createMockRes();
+      await handler!(req, res);
+
+      const body = res._json as {
+        credentialSources: string[];
+        desktopCredentials: Array<{ provider: string; email: string; state: string }>;
+        providers: Array<{ name: string; connected: boolean }>;
+      };
+      expect(body.credentialSources).toEqual(['cloud', 'desktop']);
+      expect(body.desktopCredentials).toEqual([
+        expect.objectContaining({
+          provider: 'google',
+          email: 'me@example.com',
+          state: 'refresh_required',
+        }),
+      ]);
+      expect(body.providers[0]).toEqual({ name: 'google', configured: true, connected: true });
+      // Bound by the authenticated user, never by anything the client sent.
+      expect(mockDescribeDesktopCredentials).toHaveBeenCalledWith(req.pcpUserId);
+    });
+
+    it('does not ask about desktop files when the source is not configured', async () => {
+      mockGetConnectedAccounts.mockResolvedValue([]);
+      mockGetSupportedProviders.mockReturnValue(['google']);
+      mockIsProviderConfigured.mockReturnValue(true);
+      mockGetCredentialSources.mockReturnValue(['cloud']);
+      mockDescribeDesktopCredentials.mockReset();
+
+      const handler = findRouteHandler('get', '/connected-accounts');
+      const res = createMockRes();
+      await handler!(createAuthenticatedReq(), res);
+
+      expect(res._status).toBe(200);
+      expect(mockDescribeDesktopCredentials).not.toHaveBeenCalled();
+      expect((res._json as { desktopCredentials: unknown[] }).desktopCredentials).toEqual([]);
     });
   });
 
@@ -1393,7 +1465,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
     });
   });
 
-  describe('PATCH /identities/:agentId/settings', () => {
+  describe('PATCH /identities/:sbSlug/settings', () => {
     it('should update sandbox_bypass on a valid identity', async () => {
       mockSupabaseFrom.mockImplementation((table: string) => {
         if (table === 'agent_identities') {
@@ -1425,9 +1497,9 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         return createQueryChain(null);
       });
 
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
       const req = createAuthenticatedReq({
-        params: { agentId: 'lumen' },
+        params: { sbSlug: 'lumen' },
         body: { sandboxBypass: true },
       });
       const res = createMockRes();
@@ -1451,15 +1523,86 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         }),
       }));
 
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
       const req = createAuthenticatedReq({
-        params: { agentId: 'nonexistent' },
+        params: { sbSlug: 'nonexistent' },
         body: { sandboxBypass: true },
       });
       const res = createMockRes();
       await handler!(req, res);
 
       expect(res._status).toBe(404);
+    });
+
+    // Runtime-config validation: these values feed spawn flags directly
+    // (ink-runner --tool-routing / --max-turns), so junk must be rejected at
+    // the door instead of silently falling back to defaults at spawn time.
+    const mockIdentityFound = () => {
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'agent_identities') {
+          return {
+            select: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                eq: vi.fn().mockReturnValue({
+                  eq: vi.fn().mockReturnValue({
+                    maybeSingle: vi.fn().mockResolvedValue({
+                      data: { id: 'identity-abc', metadata: {} },
+                      error: null,
+                    }),
+                  }),
+                }),
+              }),
+            }),
+            update: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                select: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({
+                    data: {
+                      sandbox_bypass: null,
+                      backend: null,
+                      metadata: { runtimeConfig: { toolRouting: 'local', maxTurns: 5 } },
+                    },
+                    error: null,
+                  }),
+                }),
+              }),
+            }),
+          };
+        }
+        return createQueryChain(null);
+      });
+    };
+
+    const patchSettings = async (body: Record<string, unknown>) => {
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
+      const req = createAuthenticatedReq({ params: { sbSlug: 'myra' }, body });
+      const res = createMockRes();
+      await handler!(req, res);
+      return res;
+    };
+
+    it('rejects an invalid toolRouting value', async () => {
+      mockIdentityFound();
+      const res = await patchSettings({ toolRouting: 'sideways' });
+      expect(res._status).toBe(400);
+      expect(String((res._json as any).error)).toContain('toolRouting');
+    });
+
+    it.each([[0], [26], [2.5], ['five']])('rejects invalid maxTurns %p', async (value) => {
+      mockIdentityFound();
+      const res = await patchSettings({ maxTurns: value });
+      expect(res._status).toBe(400);
+      expect(String((res._json as any).error)).toContain('maxTurns');
+    });
+
+    it('accepts valid toolRouting + maxTurns, and null to clear', async () => {
+      mockIdentityFound();
+      const ok = await patchSettings({ toolRouting: 'local', maxTurns: 5 });
+      expect(ok._status).toBe(200);
+
+      mockIdentityFound();
+      const cleared = await patchSettings({ toolRouting: null, maxTurns: null });
+      expect(cleared._status).toBe(200);
     });
   });
 });

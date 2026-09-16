@@ -17,8 +17,15 @@
 export interface ActivityLike {
   type?: string;
   subtype?: string;
-  agentId?: string;
+  sbSlug?: string;
   platform?: string;
+  /**
+   * Inkmail lifecycle fields (from the activity row's payload): who sent it.
+   * Used to tell the agent's OWN outbound sends (worth showing) from the
+   * delivery mechanics of inbound mail (dispatch/deliver rows that duplicate
+   * the trigger turn the session already renders).
+   */
+  fromSlug?: string;
 }
 
 export type ActivityRenderMode = 'message-in' | 'message-out' | 'bookkeeping' | 'block';
@@ -39,14 +46,30 @@ const BOOKKEEPING_PREFIXES = [
   'agent_complete',
 ];
 
-export function classifyActivity(activity: ActivityLike, selfAgentId: string): ActivityRenderPlan {
+/**
+ * Delivery channels whose inbound "messages" are TRIGGERS, not conversation:
+ * the session already renders the injected prompt as a labeled system turn,
+ * so a message_in block for the same delivery is a duplicate (Conor's
+ * 2026-08-12 screenshot: one heartbeat rendered three times — the system
+ * turn plus two activity blocks).
+ */
+const INTERNAL_MESSAGE_PLATFORMS = new Set(['heartbeat', 'internal']);
+
+export function classifyActivity(activity: ActivityLike, selfSlug: string): ActivityRenderPlan {
   const rawType = activity.subtype
     ? `${activity.type}:${activity.subtype}`
     : activity.type || 'activity';
-  const actor = activity.agentId || 'system';
+  const actor = activity.sbSlug || 'system';
   const platform = activity.platform || 'channel';
 
   if (rawType.startsWith('message_in')) {
+    // Only a genuine external platform (telegram, discord, …) is real
+    // inbound conversation. Trigger deliveries — internal platforms or
+    // platformless routing records — stay dim bookkeeping receipts; their
+    // content already renders as the injected system turn.
+    if (!activity.platform || INTERNAL_MESSAGE_PLATFORMS.has(activity.platform)) {
+      return { mode: 'bookkeeping' };
+    }
     // The human's words arriving via a platform — render as a user message
     return { mode: 'message-in', role: 'user', label: `📨 ${platform} → ${actor}` };
   }
@@ -54,7 +77,23 @@ export function classifyActivity(activity: ActivityLike, selfAgentId: string): A
     // The agent's words leaving via a platform — render as the agent speaking
     return { mode: 'message-out', role: 'assistant', label: `📤 ${actor} → ${platform}` };
   }
-  if (activity.agentId === selfAgentId && BOOKKEEPING_PREFIXES.some((p) => rawType.startsWith(p))) {
+  // Inkmail lifecycle rows. One logical message logs several activity rows
+  // (dispatch — sometimes more than once — deliver, and a message_in trigger
+  // record), and the content ALSO arrives as the injected channel turn: at
+  // 5:30 PM Conor watched one message render three-plus times. Inbound
+  // mechanics demote to dim receipts; the agent's OWN outbound dispatch stays
+  // visible (it is the only record of what the agent sent); failures stay
+  // loud — a dropped delivery must never be a dim line.
+  if (rawType.startsWith('inkmail_fail')) {
+    return { mode: 'block' };
+  }
+  if (rawType.startsWith('inkmail_dispatch') && activity.fromSlug === selfSlug) {
+    return { mode: 'block' };
+  }
+  if (rawType.startsWith('inkmail_dispatch') || rawType.startsWith('inkmail_deliver')) {
+    return { mode: 'bookkeeping' };
+  }
+  if (activity.sbSlug === selfSlug && BOOKKEEPING_PREFIXES.some((p) => rawType.startsWith(p))) {
     return { mode: 'bookkeeping' };
   }
   return { mode: 'block' };

@@ -146,7 +146,7 @@ describe('SessionService Codex backend integration', () => {
   it('routes message handling through codex runner for echo_codex', async () => {
     const result = await sessionService.handleMessage({
       userId: testUserId,
-      agentId: 'echo_codex',
+      sbSlug: 'echo_codex',
       channel: 'agent',
       conversationId: 'integration:echo-codex',
       sender: { id: 'integration-test', name: 'Integration Test' },

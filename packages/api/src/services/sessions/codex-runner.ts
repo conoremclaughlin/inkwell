@@ -20,6 +20,8 @@ import type {
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
+import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
+import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import {
@@ -36,10 +38,24 @@ const PROCESS_TIMEOUT_MS =
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 
+/**
+ * Codex usage is CUMULATIVE for the backend thread, not a per-turn delta.
+ *
+ * `codex exec --json` emits `turn.completed.usage` from `ThreadTokenUsage.total`
+ * (verified against codex-cli 0.146.1). `ThreadTokenUsage` also carries a
+ * `last` field, but the exec JSONL adapter does not export it — so there is no
+ * per-turn figure available on this path and the consumer must diff
+ * successive totals itself. See SessionRepository.updateTokenUsage.
+ */
+const CODEX_USAGE_IS_CUMULATIVE = true;
+
 interface CodexUsageStats {
-  contextTokens: number;
+  /** Absent on the Codex path — no per-turn context measure is emitted. */
+  contextTokens?: number;
   inputTokens: number;
   outputTokens: number;
+  /** Always true for Codex — see CODEX_USAGE_IS_CUMULATIVE. */
+  cumulative: boolean;
 }
 
 export class CodexRunner implements IRunner {
@@ -55,7 +71,9 @@ export class CodexRunner implements IRunner {
     const isResume = !!backendSessionId;
 
     let fullMessage = message;
+    let runConfig = config;
     if (injectedContext && !isResume) {
+      runConfig = { ...config, constitutionInjected: true };
       const contextBlock = formatInjectedContext(injectedContext);
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
@@ -66,6 +84,10 @@ export class CodexRunner implements IRunner {
     );
 
     try {
+      // The --add-dir grant below requires the directory to exist; async so
+      // the event loop is never blocked.
+      await ensureInkStudiosRoot();
+
       // Only pass a session ID to buildArgs when resuming a known backend session.
       // For fresh runs, Codex assigns its own session UUID — we extract it from stdout.
       const argsSessionId = isResume ? backendSessionId! : undefined;
@@ -84,7 +106,7 @@ export class CodexRunner implements IRunner {
         hasPcpAccessToken: !!config.pcpAccessToken,
       });
 
-      const result = await this.spawnProcess(args, config);
+      const result = await this.spawnProcess(args, runConfig);
 
       // Only return a backend session ID if we actually extracted one from
       // the Codex event stream, or if we were resuming an existing session.
@@ -130,6 +152,17 @@ export class CodexRunner implements IRunner {
     const args: string[] = config.sandboxBypass
       ? ['--dangerously-bypass-approvals-and-sandbox', 'exec']
       : ['-a', 'never', 'exec'];
+
+    // Ephemeral-studio root (spec:studio-materialization v8): writable
+    // alongside the primary workspace, on BOTH the fresh and resume shapes —
+    // Codex defaults to workspace-write, so without this a Codex session can
+    // have the host MCP mint a studio it then cannot edit, build, or test
+    // (PR #544 r1 P1). Placement matters: `--add-dir` is valid on `exec` but
+    // NOT on the `exec resume` subcommand ("unexpected argument", r2), so it
+    // must precede `resume` — exec scope applies to the resumed session too.
+    // The run path ensures the directory exists first.
+    args.push('--add-dir', inkStudiosRoot());
+
     if (isResume) {
       args.push('resume');
     }
@@ -137,9 +170,19 @@ export class CodexRunner implements IRunner {
     args.push('--json');
     args.push('-c', `model_instructions_file=${promptPath}`);
 
-    // Ink session headers — Codex resolves env var names to values at runtime.
-    // The server key must match what's in .codex/config.toml (mcp_servers.inkwell).
+    // Ink MCP server — fully defined via -c overrides so the spawn never
+    // depends on the user's ~/.codex/config.toml having (or keeping) the
+    // entry. A partial entry (headers without url) makes Codex fail with
+    // "Error loading config.toml: invalid transport".
+    // Inside a Docker sandbox, loopback resolves to the container, so use
+    // host.docker.internal (matches the orchestrator's .mcp.json rewrite).
     const codexServerKey = 'inkwell';
+    const mcpHost = config.container ? 'host.docker.internal' : 'localhost';
+    args.push(
+      '-c',
+      `mcp_servers.${codexServerKey}.url="http://${mcpHost}:${env.MCP_HTTP_PORT}/mcp"`
+    );
+    // Session headers — Codex resolves env var names to values at runtime.
     args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-context="INK_CONTEXT"`);
     args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-agent-id="AGENT_ID"`);
     args.push(
@@ -150,10 +193,12 @@ export class CodexRunner implements IRunner {
       '-c',
       `mcp_servers.${codexServerKey}.env_http_headers.x-ink-studio-id="INK_STUDIO_ID"`
     );
-    args.push(
-      '-c',
-      `mcp_servers.${codexServerKey}.env_http_headers.Authorization="INK_AUTH_BEARER"`
-    );
+    // Auth via codex's static-bearer mechanism instead of an Authorization
+    // env_http_header. This makes codex authenticate with the raw token AND
+    // skip its own managed OAuth refresh for the inkwell server (whose
+    // independently-cached refresh token can expire → invalid_grant → aborted
+    // MCP init). Codex prepends "Bearer " itself, so point at the raw token.
+    args.push('-c', `mcp_servers.${codexServerKey}.bearer_token_env_var="INK_ACCESS_TOKEN"`);
 
     if (config.model) {
       args.push('-m', config.model);
@@ -186,7 +231,7 @@ export class CodexRunner implements IRunner {
       writeRuntimeSessionHint(
         config.workingDirectory,
         config.pcpSessionId,
-        config.agentId || 'unknown',
+        config.sbSlug || 'unknown',
         'codex',
         runtimeLinkId,
         config.studioId
@@ -199,13 +244,16 @@ export class CodexRunner implements IRunner {
       const spawnEnv: Record<string, string> = {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(codexBin),
-        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
+        // Tells the session-start hook the constitution is already in the
+        // prompt, so it does not inject a second copy.
+        ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
           pcpSessionId: config.pcpSessionId,
           runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
           accessToken: config.pcpAccessToken,
-          agentId: config.agentId,
+          sbSlug: config.sbSlug,
           runtime: 'codex',
           repoRoot: config.repoRoot,
         }),
@@ -523,37 +571,64 @@ export class CodexRunner implements IRunner {
     return undefined;
   }
 
-  private extractUsage(event: Record<string, unknown>): CodexUsageStats | undefined {
-    const queue: unknown[] = [event];
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (!current || typeof current !== 'object') continue;
-      const obj = current as Record<string, unknown>;
-
-      const maybeInput = obj.input_tokens;
-      const maybeOutput = obj.output_tokens;
-      const maybeContext = obj.context_tokens;
-      if (typeof maybeInput === 'number' && typeof maybeOutput === 'number') {
-        const cachedInput =
-          typeof obj.cached_input_tokens === 'number' ? obj.cached_input_tokens : 0;
-        const cacheRead =
-          typeof obj.cache_read_input_tokens === 'number' ? obj.cache_read_input_tokens : 0;
-        const cacheCreate =
-          typeof obj.cache_creation_input_tokens === 'number' ? obj.cache_creation_input_tokens : 0;
-        const totalInput = maybeInput + cachedInput + cacheRead + cacheCreate;
-        return {
-          contextTokens: typeof maybeContext === 'number' ? maybeContext : totalInput,
-          inputTokens: totalInput,
-          outputTokens: maybeOutput,
-        };
-      }
-
-      for (const value of Object.values(obj)) {
-        if (value && typeof value === 'object') queue.push(value);
-      }
+  /**
+   * Parse a single object into usage stats, or undefined if it isn't one.
+   *
+   * Codex's TokenUsage struct is
+   * `{ input_tokens, cached_input_tokens, cache_write_input_tokens,
+   *    output_tokens, reasoning_output_tokens, total_tokens }`
+   * (codex-cli 0.146.1). Both cache figures are already REPRESENTED WITHIN
+   * `input_tokens`, and `reasoning_output_tokens` within `output_tokens`, so
+   * none of them may be added on top — doing so double-counts, and on a long
+   * session that re-sends context every turn the cache figures dominate.
+   *
+   * The Anthropic-style `cache_read_input_tokens` /
+   * `cache_creation_input_tokens` fields do not exist on this path at all.
+   */
+  private parseUsageObject(obj: Record<string, unknown>): CodexUsageStats | undefined {
+    const maybeInput = obj.input_tokens;
+    const maybeOutput = obj.output_tokens;
+    if (typeof maybeInput !== 'number' || typeof maybeOutput !== 'number') {
+      return undefined;
     }
 
-    return undefined;
+    // Context is reported only if a real field carries it. Codex JSONL has no
+    // per-turn context measure — ThreadTokenUsage exposes model_context_window
+    // (the window SIZE, not occupancy). Falling back to the input total, as
+    // this once did, stored a cumulative figure as "context" and produced a
+    // false 1.3-billion-token context reading. Absent means unknown.
+    const maybeContext = obj.context_tokens;
+    return {
+      ...(typeof maybeContext === 'number' ? { contextTokens: maybeContext } : {}),
+      inputTokens: maybeInput,
+      outputTokens: maybeOutput,
+      cumulative: CODEX_USAGE_IS_CUMULATIVE,
+    };
+  }
+
+  /**
+   * Extract usage from a Codex event.
+   *
+   * The returned figures are CUMULATIVE for the backend thread — see
+   * CODEX_USAGE_IS_CUMULATIVE. `SessionRepository.updateTokenUsage` diffs them
+   * against its per-thread checkpoint; it must never simply add them, which is
+   * what grew one session to 3,441,018,986 tokens and overflowed int32.
+   *
+   * Matching is restricted to a known usage container rather than a blind
+   * breadth-first scan for any object carrying `input_tokens`/`output_tokens`:
+   * an untyped deep scan can just as easily consume token stats belonging to
+   * something else entirely in the event stream.
+   */
+  private extractUsage(event: Record<string, unknown>): CodexUsageStats | undefined {
+    // Canonical shape: { type: 'turn.completed', usage: { ... } }
+    const container = event.usage;
+    if (container && typeof container === 'object') {
+      const parsed = this.parseUsageObject(container as Record<string, unknown>);
+      if (parsed) return parsed;
+    }
+
+    // Legacy/flat shape: usage fields on the event itself.
+    return this.parseUsageObject(event);
   }
 
   private extractFinalText(event: Record<string, unknown>): string | undefined {

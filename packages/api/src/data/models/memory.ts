@@ -22,7 +22,7 @@ export interface Memory {
   source: MemorySource;
   salience: Salience;
   topics: string[];
-  agentId?: string; // Which AI being created this memory (wren, benson, etc). Null = shared memory.
+  sbSlug?: string; // Which AI being created this memory (wren, benson, etc). Null = shared memory.
   contactId?: string; // Per-sender memory scoping. Null = owner/system memory.
   embedding?: number[]; // 1024 dimensions for Voyage AI, nullable for now
   metadata: Record<string, unknown>;
@@ -60,7 +60,7 @@ export interface MemoryCreateInput {
   topics?: string[];
   metadata?: Record<string, unknown>;
   expiresAt?: Date;
-  agentId?: string; // Which AI being created this memory
+  sbSlug?: string; // Which AI being created this memory
   contactId?: string; // Per-sender memory scoping
 }
 
@@ -83,8 +83,8 @@ export interface MemorySearchOptions {
   limit?: number;
   offset?: number;
   includeExpired?: boolean;
-  agentId?: string; // Filter by agent
-  includeShared?: boolean; // Include shared memories (agentId=null) when filtering. Default true.
+  sbSlug?: string; // Filter by agent
+  includeShared?: boolean; // Include shared memories (sbSlug=null) when filtering. Default true.
   contactId?: string; // Filter by contact for per-sender isolation
   semanticChunkTypes?: MemorySearchChunkType[];
   semanticQueryStrategy?: MemorySemanticQueryStrategy;
@@ -102,12 +102,27 @@ export type SessionPhase =
   | 'complete'
   | string;
 
-export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+// Keep aligned with services/sessions/types.ts SessionLifecycle.
+export type SessionLifecycle =
+  | 'running'
+  | 'idle'
+  | 'compacting'
+  | 'interrupted'
+  | 'completed'
+  | 'failed';
 
 export interface Session {
   id: string;
   userId: string;
-  agentId?: string;
+  sbSlug?: string;
+  /** Owning identity UUID (agent_identities.id) — canonical; sbSlug is the ambiguous slug. */
+  sbId?: string;
+  /**
+   * Per-sender scope. One SB identity serves many contacts, so identity
+   * ownership alone does not separate two conversations — authorization has to
+   * see this field to keep contact A out of contact B's session.
+   */
+  contactId?: string;
   studioId?: string;
   threadKey?: string;
   activeThreadKey?: string;
@@ -132,7 +147,13 @@ export interface Session {
 export interface SessionCreateInput {
   id?: string;
   userId: string;
-  agentId?: string;
+  sbSlug?: string;
+  /**
+   * Canonical owning identity. Supply the request's verified identity so the
+   * row records who actually created it; without it creation falls back to
+   * re-resolving the slug, which is ambiguous across workspaces.
+   */
+  sbId?: string;
   /**
    * Three-state: UUID = scoped to that studio; null = root-repo session
    * (persisted as `studio_id = NULL`); undefined = column omitted on insert
@@ -203,6 +224,10 @@ export interface SessionRow {
   id: string;
   user_id: string;
   agent_id: string | null;
+  /** Owning identity UUID (agent_identities.id). */
+  sb_id?: string | null;
+  /** Per-sender scope; NULL for owner sessions. */
+  contact_id?: string | null;
   studio_id: string | null;
   thread_key: string | null;
   active_thread_key?: string | null;

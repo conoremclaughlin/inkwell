@@ -4,12 +4,13 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import type { LucideIcon } from 'lucide-react';
 import {
+  Smartphone,
   LogOut,
   Home,
   Bot,
   Bell,
   Link2,
-  FileText,
+  Library,
   Puzzle,
   Plus,
   UserPlus,
@@ -20,6 +21,7 @@ import {
   Activity,
   Route,
   MessageSquare,
+  MessagesSquare,
   ListTodo,
   Swords,
   KeyRound,
@@ -67,7 +69,8 @@ const mainNav: NavGroup[] = [
     items: [
       { name: 'Individuals', href: '/individuals', icon: Bot },
       { name: 'Tasks', href: '/tasks', icon: ListTodo },
-      { name: 'Documents', href: '/artifacts', icon: FileText },
+      { name: 'Threads', href: '/threads', icon: MessagesSquare },
+      { name: 'Library', href: '/artifacts', icon: Library },
       { name: 'Messaging', href: '/messaging', icon: MessageSquare },
       { name: 'Skills', href: '/skills', icon: Puzzle },
     ],
@@ -78,6 +81,7 @@ const mainNav: NavGroup[] = [
       { name: 'Automations', href: '/automations', icon: Workflow },
       { name: 'Reminders', href: '/reminders', icon: Bell },
       { name: 'Connections', href: '/connected-accounts', icon: Link2 },
+      { name: 'Mobile', href: '/mobile', icon: Smartphone },
       { name: 'Routing', href: '/routing', icon: Route },
       { name: 'Sessions', href: '/sessions', icon: Activity },
       { name: 'Policy', href: '/policy', icon: Shield },

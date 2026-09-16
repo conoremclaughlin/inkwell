@@ -13,6 +13,8 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway';
 import { resolveUser } from '../../services/user-resolver';
+import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
+import { getPinnedSlug } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
 type McpResponse = {
@@ -32,8 +34,8 @@ function mcpResponse(data: object, isError = false): McpResponse {
 // ============================================================================
 
 export const triggerAgentSchema = z.object({
-  toAgentId: z.string().describe('Target agent ID to trigger (e.g., "myra", "wren")'),
-  fromAgentId: z.string().describe('Your agent ID (e.g., "claude-code", "wren")'),
+  toSlug: z.string().describe('Target SB slug to trigger (e.g., "myra", "wren")'),
+  fromSlug: z.string().describe('Your SB slug (e.g., "claude-code", "wren")'),
   triggerType: z
     .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
     .describe('Type of trigger - helps recipient know how to handle'),
@@ -53,7 +55,7 @@ export const triggerAgentSchema = z.object({
     .describe('Thread key for session routing on the recipient side (e.g., "pr:32")'),
   studioId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional explicit studio ID for the target agent session'),
   studioHint: z
@@ -64,36 +66,68 @@ export const triggerAgentSchema = z.object({
     ),
   recipientSessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional recipient session ID to inherit studio scope from'),
   metadata: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .optional()
     .describe('Additional context to pass to the target agent'),
 });
 
 export async function handleTriggerAgent(
   args: z.infer<typeof triggerAgentSchema>,
-  _dataComposer: DataComposer
+  dataComposer: DataComposer
 ): Promise<McpResponse> {
   try {
-    logger.info(`trigger_agent called: ${args.fromAgentId} → ${args.toAgentId}`, {
+    logger.info(`trigger_agent called: ${args.fromSlug} → ${args.toSlug}`, {
       type: args.triggerType,
       priority: args.priority,
     });
 
+    // Stamp the AUTHENTICATED user onto the payload (server-side, post-auth —
+    // trustworthy provenance, unlike caller-supplied fields on public trigger
+    // routes). Without it, a bare trigger_agent(threadKey) failure cannot be
+    // routed anywhere: the failure listener has no source row to resolve the
+    // user from, so the notice was silently dropped (PR #487, Lumen).
+    const resolved = await resolveUser({}, dataComposer).catch(() => null);
+
     const gateway = getAgentGateway();
 
     // Check if target has a handler
-    if (!gateway.hasHandler(args.toAgentId)) {
+    if (!gateway.hasHandler(args.toSlug)) {
       // Still attempt - handler might be registered by the time we process
-      logger.warn(`No handler currently registered for ${args.toAgentId}, attempting anyway`);
+      logger.warn(`No handler currently registered for ${args.toSlug}, attempting anyway`);
+    }
+
+    // Resolved before the payload literal and defensively: a composer without
+    // a client (or a lookup failure) must not take down the dispatch — it only
+    // means no bridge exclusion, and routing already fails closed from there.
+    let senderIsBridge = false;
+    try {
+      const client =
+        typeof dataComposer?.getClient === 'function' ? dataComposer.getClient() : null;
+      if (client && resolved?.user?.id) {
+        // Classify the AUTHENTICATED sender, never args.fromSlug — that is
+        // caller-supplied, so a relay could simply claim a non-bridge name and
+        // re-enable the inference this exclusion exists to prevent
+        // (Lumen, PR #514 round 2). Falls back to the declared slug only when
+        // there is no pinned identity, which is the unauthenticated path.
+        const pinned = getPinnedSlug();
+        senderIsBridge = await isBridgeIdentity(
+          client,
+          resolved.user.id,
+          pinned || args.fromSlug,
+          senderSbId()
+        );
+      }
+    } catch {
+      senderIsBridge = false;
     }
 
     const payload: AgentTriggerPayload = {
-      fromAgentId: args.fromAgentId,
-      toAgentId: args.toAgentId,
+      fromSlug: args.fromSlug,
+      toSlug: args.toSlug,
       triggerType: args.triggerType,
       summary: args.summary,
       inboxMessageId: args.inboxMessageId,
@@ -102,6 +136,10 @@ export async function handleTriggerAgent(
       studioId: args.studioId,
       studioHint: args.studioHint,
       recipientSessionId: args.recipientSessionId,
+      // Caller-repo inference degrades silently to refuse-and-hold on any
+      // dispatch path that forgets this (Lumen, PR #514 round 1).
+      ...senderRoutingContext(senderIsBridge),
+      ...(resolved?.user?.id ? { recipientUserId: resolved.user.id } : {}),
       metadata: args.metadata,
     };
 
@@ -115,8 +153,8 @@ export async function handleTriggerAgent(
         processed: result.processed,
         message:
           result.accepted === true
-            ? `Agent ${args.toAgentId} trigger accepted`
-            : `Agent ${args.toAgentId} triggered successfully`,
+            ? `Agent ${args.toSlug} trigger accepted`
+            : `Agent ${args.toSlug} triggered successfully`,
       });
     } else {
       return mcpResponse(
@@ -125,7 +163,7 @@ export async function handleTriggerAgent(
           triggerId: result.triggerId,
           error: result.error,
           hint: result.error?.includes('No handler')
-            ? `Agent "${args.toAgentId}" may not be running or doesn't have a trigger handler registered`
+            ? `Agent "${args.toSlug}" may not be running or doesn't have a trigger handler registered`
             : undefined,
         },
         true
@@ -184,7 +222,7 @@ export async function handleListRegisteredAgents(
         return true;
       })
       .map((row) => ({
-        agentId: row.agent_id,
+        sbSlug: row.agent_id,
         name: row.name,
         backend: row.backend,
       }));
@@ -197,7 +235,7 @@ export async function handleListRegisteredAgents(
       success: true,
       registeredAgents: agents.map((a) => ({
         ...a,
-        hasRuntimeHandler: runtimeHandlers.has(a.agentId),
+        hasRuntimeHandler: runtimeHandlers.has(a.sbSlug),
       })),
       count: agents.length,
     });

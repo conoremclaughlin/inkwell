@@ -58,7 +58,7 @@ describe('resolveAgentFromMention (integration)', () => {
     ]);
 
     expect(result).not.toBeNull();
-    expect(result!.agentId).toBe('test-zephyr');
+    expect(result!.sbSlug).toBe('test-zephyr');
   });
 
   it('resolves agent by mentioned username matching name (case-insensitive)', async () => {
@@ -67,7 +67,7 @@ describe('resolveAgentFromMention (integration)', () => {
     ]);
 
     expect(result).not.toBeNull();
-    expect(result!.agentId).toBe('test-kira');
+    expect(result!.sbSlug).toBe('test-kira');
   });
 
   it('resolves agent by text mention with word boundary', async () => {
@@ -79,7 +79,7 @@ describe('resolveAgentFromMention (integration)', () => {
     );
 
     expect(result).not.toBeNull();
-    expect(result!.agentId).toBe('test-zephyr');
+    expect(result!.sbSlug).toBe('test-zephyr');
   });
 
   it('resolves agent by name in text (case-insensitive)', async () => {
@@ -91,7 +91,7 @@ describe('resolveAgentFromMention (integration)', () => {
     );
 
     expect(result).not.toBeNull();
-    expect(result!.agentId).toBe('test-zephyr');
+    expect(result!.sbSlug).toBe('test-zephyr');
   });
 
   it('returns null when no agents are mentioned', async () => {
@@ -126,7 +126,7 @@ describe('resolveAgentFromMention (integration)', () => {
     );
 
     expect(result).not.toBeNull();
-    expect(result!.agentId).toBe('test-kira');
+    expect(result!.sbSlug).toBe('test-kira');
   });
 
   it('returns a valid sbId that exists in the database', async () => {

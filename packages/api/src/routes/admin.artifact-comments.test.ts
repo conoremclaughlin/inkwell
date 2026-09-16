@@ -18,10 +18,9 @@ vi.mock('../services/oauth', () => ({
   getOAuthService: vi.fn(() => ({})),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
+    ...(await import('../test/fake-env')).fakeEnv,
     MCP_HTTP_PORT: 3001,
   },
 }));
@@ -140,9 +139,9 @@ describe('admin artifact comments routes', () => {
     await handler(req, res);
 
     expect(res._status).toBe(200);
-    const payload = res._json as { comments: Array<{ createdByIdentity: { agentId: string } }> };
+    const payload = res._json as { comments: Array<{ createdByIdentity: { sbSlug: string } }> };
     expect(payload.comments).toHaveLength(1);
-    expect(payload.comments[0].createdByIdentity.agentId).toBe('lumen');
+    expect(payload.comments[0].createdByIdentity.sbSlug).toBe('lumen');
   });
 
   it('POST /artifacts/:id/comments creates comment with canonical identity UUID', async () => {
@@ -198,7 +197,7 @@ describe('admin artifact comments routes', () => {
     const handler = getRouteHandler('/artifacts/:id/comments', 'post');
     const req = createMockReq({
       params: { id: 'artifact-1' } as Record<string, string>,
-      body: { content: 'Adding a review comment', agentId: 'lumen' },
+      body: { content: 'Adding a review comment', sbSlug: 'lumen' },
       pcpUserId: '550e8400-e29b-41d4-a716-446655440000',
     } as unknown as Partial<Request>);
     const res = createMockRes();
@@ -207,10 +206,10 @@ describe('admin artifact comments routes', () => {
 
     expect(res._status).toBe(200);
     const payload = res._json as {
-      comment: { createdBySbId: string; createdByIdentity: { agentId: string } };
+      comment: { createdBySbId: string; createdByIdentity: { sbSlug: string } };
     };
     expect(payload.comment.createdBySbId).toBe('identity-1');
-    expect(payload.comment.createdByIdentity.agentId).toBe('lumen');
+    expect(payload.comment.createdByIdentity.sbSlug).toBe('lumen');
 
     const commentsBuilder = currentSupabaseMock.calls.find(
       (c) => c.table === 'artifact_comments'

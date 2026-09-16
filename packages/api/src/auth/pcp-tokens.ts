@@ -22,9 +22,22 @@ export interface PcpTokenPayload {
   sub: string; // PCP user ID
   email: string;
   scope: string;
-  agentId?: string; // Bound agent identity label (absent for human users)
+  sbSlug?: string; // Bound agent identity label (absent for human users)
   identityId?: string; // Canonical agent_identities UUID (JWT claim — kept as identityId for token compat)
   sbId?: string; // New-style alias for identityId in runner tokens
+  /**
+   * Session and contact this runner token was minted FOR.
+   *
+   * These are the authenticated binding between a runner process and the
+   * conversation it serves. The `x-ink-context` header carries the same two
+   * values, but it is unsigned base64url JSON the caller composes, so it can
+   * only ever be a routing hint. One SB identity serves many contacts, which
+   * means without a signed claim there is no authenticated per-contact
+   * distinction at all — naming another contact's session would pass an
+   * identity check that only compares sbId (Lumen, PR #501 round 3).
+   */
+  sessionId?: string;
+  contactId?: string;
 }
 
 // ============================================================================
@@ -39,6 +52,45 @@ export function signPcpAccessToken(payload: PcpTokenPayload, expiresInSeconds: n
   return jwt.sign(payload, env.JWT_SECRET, {
     expiresIn: expiresInSeconds,
   });
+}
+
+/**
+ * Sign the access token a spawned runner carries.
+ *
+ * Lives here, beside the verifier, because the two have to agree on the claim
+ * names for the contact boundary to hold — a runner issued without
+ * `contactId` looks owner-scoped and is refused its own contact's session.
+ * SessionService used to sign these inline with its own jwt.sign() against
+ * process.env.JWT_SECRET while verification read env.JWT_SECRET; identical
+ * today, but two signing paths for one verifier is a latent way to break that
+ * agreement silently.
+ */
+export function signRunnerAccessToken(
+  claims: {
+    userId: string;
+    email: string;
+    sbSlug?: string;
+    sbId?: string;
+    /** The session this runner was spawned for. */
+    sessionId?: string;
+    /** The contact conversation it serves; absent for owner sessions. */
+    contactId?: string;
+  },
+  expiresInSeconds = 60 * 60
+): string {
+  return signPcpAccessToken(
+    {
+      type: 'mcp_access',
+      sub: claims.userId,
+      email: claims.email,
+      scope: 'mcp:tools',
+      ...(claims.sbSlug ? { sbSlug: claims.sbSlug } : {}),
+      ...(claims.sbId ? { sbId: claims.sbId } : {}),
+      ...(claims.sessionId ? { sessionId: claims.sessionId } : {}),
+      ...(claims.contactId ? { contactId: claims.contactId } : {}),
+    },
+    expiresInSeconds
+  );
 }
 
 // ============================================================================
@@ -60,10 +112,19 @@ export function verifyPcpAccessToken(
     const decoded = jwt.verify(token, env.JWT_SECRET);
     if (typeof decoded === 'string') return null;
 
-    const payload = decoded as PcpTokenPayload;
+    const payload = decoded as PcpTokenPayload & { agentId?: string };
     if (!payload.type || !payload.sub) return null;
 
     if (expectedType && payload.type !== expectedType) return null;
+
+    // Tokens minted before the agentId -> sbSlug rename carry `agentId`, and
+    // stay valid for their full lifetime (an hour for runner tokens, days for
+    // refreshed CLI ones). Normalize here, at the single boundary every
+    // consumer goes through, so a session that authenticated before the deploy
+    // does not silently lose its identity binding mid-flight.
+    if (!payload.sbSlug && payload.agentId) {
+      return { ...payload, sbSlug: payload.agentId };
+    }
 
     return payload;
   } catch {
@@ -85,7 +146,7 @@ export async function createRefreshToken(
   clientId: string,
   scopes: string[],
   lifetimeDays: number,
-  agentId?: string,
+  sbSlug?: string,
   sbId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
   const refreshToken = `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
@@ -98,7 +159,7 @@ export async function createRefreshToken(
     supabase_refresh_token: null,
     scopes,
     expires_at: expiresAt.toISOString(),
-    ...(agentId ? { agent_id: agentId } : {}),
+    ...(sbSlug ? { agent_id: sbSlug } : {}),
     ...(sbId ? { sb_id: sbId } : {}),
   });
 
@@ -126,7 +187,7 @@ export async function exchangeRefreshToken(
   accessToken: string;
   userId: string;
   email: string;
-  agentId?: string;
+  sbSlug?: string;
   identityId?: string;
 } | null> {
   const { data: tokenRecord, error: lookupError } = await supabase
@@ -158,7 +219,7 @@ export async function exchangeRefreshToken(
 
   const scope = tokenRecord.scopes?.join(' ') || 'mcp:tools';
   const tokenAny = tokenRecord as Record<string, unknown>;
-  const agentId = tokenAny.agent_id as string | null;
+  const sbSlug = tokenAny.agent_id as string | null;
   const sbId = tokenAny.sb_id as string | null;
 
   const accessToken = signPcpAccessToken(
@@ -167,7 +228,7 @@ export async function exchangeRefreshToken(
       sub: tokenRecord.user_id,
       email: userEmail,
       scope,
-      ...(agentId ? { agentId } : {}),
+      ...(sbSlug ? { sbSlug } : {}),
       ...(sbId ? { identityId: sbId } : {}),
     },
     accessTokenLifetimeSeconds
@@ -183,7 +244,7 @@ export async function exchangeRefreshToken(
     accessToken,
     userId: tokenRecord.user_id,
     email: userEmail,
-    ...(agentId ? { agentId } : {}),
+    ...(sbSlug ? { sbSlug } : {}),
     ...(sbId ? { identityId: sbId } : {}),
   };
 }

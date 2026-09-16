@@ -3,15 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Inkwell desktop app — a thin Tauri shell over the locally running web dashboard",
+  "description": "Inkwell desktop app — a thin Electron shell over the locally running web dashboard",
+  "main": "main.cjs",
   "scripts": {
-    "dev": "tauri dev",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
-    "tauri": "tauri",
-    "icon:generate": "node scripts/generate-icon.mjs && tauri icon assets/icon-source.png --output src-tauri/icons"
+    "start": "electron .",
+    "dev": "electron .",
+    "icon:generate": "node scripts/generate-icon.mjs"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0"
+    "electron": "^43.0.0"
   }
 }

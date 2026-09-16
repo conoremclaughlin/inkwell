@@ -16,7 +16,7 @@ describe('renderSessionsByAgent', () => {
     const sessions: Session[] = [
       {
         id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         status: 'active',
         currentPhase: 'implementing',
         threadKey: 'pr:61',
@@ -31,7 +31,7 @@ describe('renderSessionsByAgent', () => {
       },
       {
         id: 'ffffffff-1111-2222-3333-444444444444',
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'completed',
         startedAt: new Date('2026-02-17T18:00:00.000Z').toISOString(),
         endedAt: new Date('2026-02-17T19:00:00.000Z').toISOString(),
@@ -59,7 +59,7 @@ describe('renderSessionsByAgent', () => {
         [
           {
             id: '11111111-2222-3333-4444-555555555555',
-            agentId: 'aster',
+            sbSlug: 'aster',
             status: 'active',
             startedAt: new Date('2026-02-18T19:00:00.000Z').toISOString(),
           },
@@ -90,7 +90,7 @@ describe('renderSyncedTranscriptArchives', () => {
           syncedAt: new Date('2026-03-11T20:00:00.000Z').toISOString(),
           session: {
             id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-            agentId: 'lumen',
+            sbSlug: 'lumen',
             agentName: 'Lumen',
             threadKey: 'pr:219',
             startedAt: new Date('2026-03-11T19:00:00.000Z').toISOString(),

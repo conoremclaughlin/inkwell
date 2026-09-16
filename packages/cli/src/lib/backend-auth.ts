@@ -1,4 +1,8 @@
 import { spawn } from 'child_process';
+import chalk from 'chalk';
+import { createInterface } from 'readline/promises';
+import { stdin as input, stdout as output } from 'process';
+import { sbDebugLog } from './sb-debug.js';
 import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
@@ -14,6 +18,16 @@ export type BackendAuthStatus = {
   loginArgs: string[];
   canInteractiveLogin: boolean;
   credentialSource: string;
+  /**
+   * The probe did not answer — it is NOT a negative answer.
+   *
+   * `authenticated: false` covers two very different states: the provider
+   * told us it is logged out, and the provider told us nothing. Collapsing
+   * them means a slow keychain reads as a logout, which killed a heartbeat on
+   * 2026-08-20. A non-interactive caller must treat this as "unknown, proceed
+   * and let the real call fail with a real error" rather than as a refusal.
+   */
+  inconclusive?: boolean;
 };
 
 type CommandResult = {
@@ -23,12 +37,22 @@ type CommandResult = {
   timedOut: boolean;
 };
 
-const AUTH_CHECK_TIMEOUT_MS = 5000;
+const DEFAULT_AUTH_CHECK_TIMEOUT_MS = 5000;
+
+/**
+ * Read per-call, not at module load, so it is settable by tests and by anyone
+ * on a machine where the provider's credential store is slow. Five seconds is
+ * a guess, and a probe that overruns it costs a whole turn.
+ */
+function authCheckTimeoutMs(): number {
+  const raw = Number(process.env.INK_AUTH_CHECK_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AUTH_CHECK_TIMEOUT_MS;
+}
 
 async function runCommand(
   binary: string,
   args: string[],
-  timeoutMs = AUTH_CHECK_TIMEOUT_MS
+  timeoutMs = authCheckTimeoutMs()
 ): Promise<CommandResult> {
   return await new Promise((resolve) => {
     const child = spawn(binary, args, {
@@ -168,6 +192,7 @@ export async function getBackendAuthStatus(
         return {
           backend,
           authenticated: false,
+          inconclusive: true,
           detail: 'auth status check timed out',
           loginCommand: 'claude auth login',
           loginArgs: ['auth', 'login'],
@@ -194,6 +219,7 @@ export async function getBackendAuthStatus(
         return {
           backend,
           authenticated: false,
+          inconclusive: true,
           detail: 'login status check timed out',
           loginCommand: 'codex login',
           loginArgs: ['login'],
@@ -250,4 +276,129 @@ export async function runBackendInteractiveLogin(backend: BackendAuthBackend): P
     child.on('error', () => resolve(1));
     child.on('close', (code) => resolve(code ?? 1));
   });
+}
+
+export function isBackendAuthBackend(value: string): value is BackendAuthBackend {
+  return value === 'claude' || value === 'codex' || value === 'gemini';
+}
+
+/**
+ * Make sure a runtime's provider is logged in before we spend a session on it.
+ *
+ * Shared by `ink chat` and `ink awaken`. Awakening especially: nothing is worse
+ * than composing a being's first words and then dying on an auth prompt the
+ * user could have cleared in ten seconds.
+ *
+ * Offers to run the provider's own login when we can (TTY, interactive), falls
+ * back to printing the command otherwise, and rechecks afterwards rather than
+ * assuming the login worked.
+ */
+export async function ensureBackendAuthReady(
+  backend: string,
+  mode: { nonInteractive: boolean; hasMessage: boolean; verbose: boolean },
+  debugScope = 'chat'
+): Promise<void> {
+  if (process.env.SB_SKIP_BACKEND_AUTH_CHECK === '1') return;
+  // Unit tests must not probe a real provider, but a blanket VITEST bail also
+  // made this function's own behaviour untestable — its tests would pass
+  // without ever reaching a line of it. Opt in explicitly instead.
+  if (process.env.VITEST && process.env.SB_TEST_BACKEND_AUTH !== '1') return;
+  if (!isBackendAuthBackend(backend)) return;
+
+  let status = await getBackendAuthStatus(backend);
+
+  // An inconclusive probe is not a logout. Retry once — a single slow keychain
+  // read should not cost a turn — and if it still will not answer, PROCEED.
+  // Failing closed here means a provider that never replied is reported as
+  // "not authenticated", which is a fabricated verdict: it sends the caller to
+  // `claude auth login` for a session that may be perfectly valid, and it
+  // reads identically in the logs to a genuine logout. Letting the real call
+  // run instead produces a real error from the provider if there is one.
+  if (status.inconclusive) {
+    sbDebugLog(debugScope, 'backend_auth_inconclusive_retry', { backend, detail: status.detail });
+    status = await getBackendAuthStatus(backend);
+  }
+  if (status.inconclusive) {
+    sbDebugLog(debugScope, 'backend_auth_inconclusive_proceeding', {
+      backend,
+      detail: status.detail,
+      mode,
+    });
+    console.log(
+      chalk.yellow(
+        `⚠ Could not determine ${backend} auth status (${status.detail}). Proceeding anyway — ` +
+          `a probe that did not answer is not a logout.`
+      )
+    );
+    return;
+  }
+
+  sbDebugLog(debugScope, 'backend_auth_status', {
+    backend,
+    authenticated: status.authenticated,
+    detail: status.detail,
+    canInteractiveLogin: status.canInteractiveLogin,
+    loginCommand: status.loginCommand || null,
+    mode,
+  });
+  if (status.authenticated) {
+    if (mode.verbose) {
+      console.log(chalk.dim(`Backend auth: ${backend} (${status.detail})`));
+    }
+    return;
+  }
+
+  const guidance = `Backend ${backend} is not authenticated (${status.detail}).`;
+  const loginHint =
+    status.loginCommand ||
+    (backend === 'gemini' ? 'Start `gemini` once and complete login in the Gemini CLI' : null);
+
+  if (mode.nonInteractive || mode.hasMessage) {
+    sbDebugLog(debugScope, 'backend_auth_required_non_interactive', {
+      backend,
+      detail: status.detail,
+      loginCommand: loginHint || null,
+      mode,
+    });
+    throw new Error(
+      `${guidance}${loginHint ? `\nRun: ${loginHint}` : '\nAuthenticate backend CLI and retry.'}`
+    );
+  }
+
+  console.log(chalk.yellow(`⚠ ${guidance}`));
+  if (!status.canInteractiveLogin || !status.loginCommand) {
+    if (loginHint) console.log(chalk.dim(`  Run: ${loginHint}`));
+    return;
+  }
+  if (!input.isTTY || !output.isTTY) {
+    console.log(chalk.dim(`  Run: ${status.loginCommand}`));
+    return;
+  }
+
+  const prompt = createInterface({ input, output });
+  try {
+    const answer = (
+      await prompt.question(chalk.cyan(`Run ${status.loginCommand} now? [Y/n] `))
+    ).trim();
+    if (answer && !['y', 'yes'].includes(answer.toLowerCase())) {
+      console.log(chalk.dim(`  Skipping login. Run manually: ${status.loginCommand}`));
+      return;
+    }
+  } finally {
+    prompt.close();
+  }
+
+  const exitCode = await runBackendInteractiveLogin(backend);
+  if (exitCode !== 0) {
+    throw new Error(
+      `Backend ${backend} login exited with code ${exitCode}. Run \`${status.loginCommand}\` and retry.`
+    );
+  }
+  const recheck = await getBackendAuthStatus(backend);
+  if (!recheck.authenticated) {
+    throw new Error(
+      `Backend ${backend} still appears unauthenticated (${recheck.detail}). Run \`${status.loginCommand}\` and retry.`
+    );
+  }
+  console.log(chalk.green(`✓ Backend ${backend} authenticated (${recheck.detail})`));
 }

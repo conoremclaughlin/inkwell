@@ -43,15 +43,71 @@ export interface MediaAttachment {
  */
 export type SessionType = 'primary' | 'task';
 
-export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+/**
+ * `interrupted`: a backend turn was killed mid-flight (server shutdown) and
+ * the session is resumable with its context intact. Distinct from `idle` so
+ * readers can see "work died here" without inspecting metadata; the DB
+ * trigger `strip_interruption_on_running` clears the interruption breadcrumbs
+ * the moment any writer moves the session back to `running`.
+ *
+ * `compacting` has always been written by the CLI lifecycle hooks
+ * (hook-lifecycle.ts VALID_LIFECYCLES); the union simply failed to mention it.
+ */
+export type SessionLifecycle =
+  | 'running'
+  | 'idle'
+  | 'compacting'
+  | 'interrupted'
+  | 'completed'
+  | 'failed';
 
 /** @deprecated Use SessionLifecycle */
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
 
+/**
+ * Last cumulative usage seen from a backend that reports running thread
+ * totals (Codex `turn.completed.usage` carries `ThreadTokenUsage.total`).
+ *
+ * Scoped to `backendSessionId` because the totals reset whenever the backend
+ * thread changes — resume onto a new thread, compaction, or a fresh run. A
+ * checkpoint from a different thread must never be diffed against.
+ */
+/**
+ * One model's accumulated contribution to a session. `costUSD` is the
+ * backend's own cost figure, which answers the spend question directly
+ * instead of requiring a price table here.
+ */
+export interface ModelUsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /**
+   * The backend's own cost figure. Optional: tokens can be readable while
+   * cost is not reported, and publishing 0 there would make a summed cost
+   * silently under-report (Lumen, PR #500 round 2).
+   */
+  costUSD?: number;
+  /**
+   * True when at least one contribution to `costUSD` did not report a cost, so
+   * the figure is a LOWER BOUND rather than the total. Without this, a mixed
+   * run publishes a subtotal that reads as complete — the same false certainty
+   * as a zero, one level up (Lumen, PR #500 round 3).
+   */
+  costPartial?: boolean;
+  canonicalModel?: string;
+}
+
+export interface UsageCheckpoint {
+  backendSessionId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface Session {
   id: string;
   userId: string;
-  agentId: string;
+  sbSlug: string;
   sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
@@ -74,6 +130,31 @@ export interface Session {
   contextTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+
+  /**
+   * Cache breakdown of `totalInputTokens` — NOT additional tokens. Cached
+   * input bills at a different rate from fresh input (reads 0.1x, writes
+   * 1.25x), so cost attribution needs the split, while context-window math
+   * needs the total. Only backends that report caching populate these.
+   */
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+
+  /**
+   * Per-model totals for this session, keyed exactly as the backend reported
+   * them. Authoritative for "which models actually ran and what did they
+   * cost" — it covers subagents, aliases and mid-session model changes, none
+   * of which the single `model` column can express. Keys are never merged
+   * here; grouping (e.g. by canonicalModel) belongs to the reporting layer.
+   */
+  modelUsage?: Record<string, ModelUsageTotals>;
+
+  /**
+   * Last cumulative usage observed from a backend that reports running
+   * thread totals rather than per-turn deltas (Codex). Used to diff
+   * successive reports; see SessionRepository.updateTokenUsage.
+   */
+  usageCheckpoint?: UsageCheckpoint;
 
   // Aggregate counters (persisted as columns)
   messageCount: number;
@@ -101,6 +182,15 @@ export interface Session {
   // Whether a CLI process with a channel plugin is attached to this session
   cliAttached?: boolean;
 
+  /**
+   * Ownership generation for the current turn (PR #563 rounds 3–5). A real
+   * COLUMN, not metadata: read-modify-write metadata rebuilds must never be
+   * able to replay a stale epoch over a newer owner. Rotated by the caller's
+   * candidate on takeover (trigger fills only when absent) or by the
+   * claim_turn_epoch RPC; every terminal write CASes on it.
+   */
+  turnEpoch?: string | null;
+
   // Flexible metadata
   metadata: Record<string, unknown>;
 }
@@ -121,7 +211,7 @@ export type ContentBlock = { type: 'text'; text: string } | ImageContent;
 export interface SessionRequest {
   // Auth context (required)
   userId: string;
-  agentId: string;
+  sbSlug: string;
 
   // Message context
   channel: ChannelType;
@@ -173,6 +263,13 @@ export interface ChannelResponse {
   metadata?: Record<string, unknown>;
   /** Media attachments (images, videos, documents) to send alongside text */
   media?: import('../../agent/types').OutboundMedia[];
+  /**
+   * The session that produced this response — stamped onto the `message_out`
+   * activity row by the gateway. Runners that synthesise responses from backend
+   * output leave it unset; the server fills it from the turn's session before
+   * routing (see attributeResponses).
+   */
+  sessionId?: string;
 }
 
 export interface SessionResult {
@@ -185,11 +282,26 @@ export interface SessionResult {
 
   // Token usage from this interaction
   usage?: {
-    contextTokens: number;
+    /**
+     * Tokens currently in the backend's context window.
+     *
+     * Omitted when the backend reports no such measure — Codex JSONL carries
+     * none, and aliasing it to a cumulative input total stores a false
+     * reading. Absent means unknown, not zero.
+     */
+    contextTokens?: number;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /** This turn's per-model figures, keyed as the backend reported them. */
+    modelUsage?: Record<string, ModelUsageTotals>;
+    /**
+     * True when the backend reports running thread totals instead of a
+     * per-turn delta (Codex `turn.completed.usage` is `ThreadTokenUsage.total`).
+     * The repository must diff against its checkpoint rather than add.
+     */
+    cumulative?: boolean;
   };
 
   // Session state after processing
@@ -202,6 +314,33 @@ export interface SessionResult {
   // Error info if failed
   error?: string;
   errorCode?: string;
+  /**
+   * Admission evidence (v18 S3): true when routing completed — session
+   * resolved, occupancy rechecked, any provisioning/lease acquisition landed
+   * — regardless of whether the turn then succeeded. A post-admission
+   * failure is a backend outcome, not a routing one: the trigger handler
+   * clears a thread's routingHold on admitted outcomes even when processing
+   * failed, and retains it only for refusals and pre-admission failures.
+   */
+  admitted?: boolean;
+  /**
+   * Present with errorCode 'ROUTING_REFUSED' (v18 S3): the structured refusal
+   * from the spawn path's own resolution. Provisioning is deferred to spawn
+   * admission, so an occupancy refusal can first surface inside handleMessage
+   * — the trigger handler needs the parts to stamp a routing hold, and a
+   * serialized message string cannot carry them.
+   */
+  refusal?: {
+    threadKey: string;
+    detail: {
+      triedCallerRepo: boolean;
+      callerRepoRoot?: string;
+      reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+      anchor?: 'studio' | 'session';
+      occupied?: { studioId: string; holderThreadKey: string };
+      policy?: 'reuse-only';
+    };
+  };
 }
 
 // ─── Tool Call Tracking ───
@@ -215,10 +354,12 @@ export interface ToolCall {
 // ─── Context Injection Types ───
 
 export interface AgentIdentity {
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   description?: string;
+  /** Workspace this identity belongs to — scopes which constitution it reads. */
+  workspaceId?: string;
   backend?: string;
   provider?: string;
   values: string[];
@@ -253,10 +394,30 @@ export interface ContactContext {
   platform?: string;
 }
 
+/**
+ * The constitution documents, resolved from the database.
+ *
+ * Mirrors what `bootstrap` returns as `identityFiles`. Spawned sessions get
+ * this from the server because not every backend runs a session-start hook —
+ * Antigravity has none at all, so without this the agent starts with nothing
+ * but its soul.
+ */
+export interface ConstitutionDocs {
+  /** Shared across the workspace: how the team operates. */
+  values?: string;
+  process?: string;
+  /** Who the human is. */
+  user?: string;
+  /** Per-agent: operational wake-up checklist. */
+  heartbeat?: string;
+}
+
 export interface InjectedContext {
   agent: AgentIdentity;
   user: UserContext;
   temporal: TemporalContext;
+  /** Constitution docs (values/process/user/heartbeat). Soul lives on `agent`. */
+  constitution?: ConstitutionDocs;
   /** Contact identity when in a per-sender session */
   contact?: ContactContext;
   recentMemories: Array<{
@@ -266,6 +427,12 @@ export interface InjectedContext {
     salience: string;
     createdAt: string;
   }>;
+  /**
+   * The same budgeted, topic-grouped digest `bootstrap` returns. Preferred over
+   * rendering `recentMemories` directly — a raw dump of the critical and high
+   * tiers ran past 170KB for an agent with a long history.
+   */
+  knowledgeSummary?: string;
   activeProjects: Array<{
     id: string;
     name: string;
@@ -293,7 +460,7 @@ export interface ISessionService {
    */
   getOrCreateSession(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: {
       type?: SessionType;
       taskDescription?: string;
@@ -303,6 +470,12 @@ export interface ISessionService {
       studioHint?: string;
       recipientSessionId?: string;
       contactId?: string;
+      /**
+       * v18 S3: plan resolution — decide session + placement without taking a
+       * lease or minting a worktree. The result must not be handed to a
+       * runner; the spawn path re-resolves without this flag.
+       */
+      planOnly?: boolean;
     }
   ): Promise<Session>;
 
@@ -317,7 +490,7 @@ export interface ISessionService {
   listSessions(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -356,21 +529,31 @@ export interface ISessionRepository {
 
   findByUserAndAgent(
     userId: string,
-    agentId: string,
-    options?: { status?: SessionStatus; type?: SessionType; studioId?: string; contactId?: string }
+    sbSlug: string,
+    options?: {
+      status?: SessionStatus;
+      type?: SessionType;
+      studioId?: string;
+      contactId?: string;
+      /** Canonical identity UUID — preferred over the ambiguous slug. */
+      sbId?: string | null;
+    }
   ): Promise<Session | null>;
 
   findByThreadKey?(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     threadKey: string,
-    studioId?: string
+    studioId?: string,
+    contactId?: string,
+    /** Canonical identity UUID — preferred over the ambiguous slug. */
+    sbId?: string | null
   ): Promise<Session | null>;
 
   findByUser(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -379,11 +562,45 @@ export interface ISessionRepository {
 
   create(session: Omit<Session, 'id' | 'startedAt' | 'lastActivityAt'>): Promise<Session>;
 
-  update(id: string, updates: Partial<Session>): Promise<Session>;
+  update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session>;
+
+  /**
+   * Turn-epoch fenced terminal write: applies `updates` only while
+   * `turn_epoch` still equals `epoch` (a real column — rotated whenever a
+   * session enters `running`). Returns null when ownership was lost; throws
+   * `Session not found:` when the row is gone. Optional so legacy mocks keep
+   * working — the real repository always provides it, and the service falls
+   * back to the unfenced update() only for epoch-less legacy turns.
+   */
+  updateIfTurnEpoch?(
+    id: string,
+    epoch: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session | null>;
 
   updateTokenUsage(
     id: string,
-    usage: { contextTokens: number; inputTokens: number; outputTokens: number }
+    usage: {
+      /** Omitted when the backend reports no per-turn context measure. */
+      contextTokens?: number;
+      inputTokens: number;
+      outputTokens: number;
+      /** Cache breakdown of `inputTokens`, not additions to it. */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      /** This turn's per-model figures, keyed as the backend reported them. */
+      modelUsage?: Record<string, ModelUsageTotals>;
+      /**
+       * True when the counts are running totals for `backendSessionId`
+       * rather than this turn's delta. The repository diffs them against
+       * its stored checkpoint before accumulating.
+       */
+      cumulative?: boolean;
+    },
+    options?: { backendSessionId?: string | null }
   ): Promise<void>;
 
   markCompacted(id: string, newBackendSessionId: string | null): Promise<void>;
@@ -409,7 +626,7 @@ export interface IContextBuilder {
    * Build the full injected context for an agent message.
    * Queries DB for identity, memories, projects, etc.
    */
-  buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext>;
+  buildContext(userId: string, sbSlug: string, session: Session): Promise<InjectedContext>;
 
   /**
    * Build minimal context for a resumed session.
@@ -417,7 +634,7 @@ export interface IContextBuilder {
    */
   buildMinimalContext(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     session?: Session
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>>;
 
@@ -427,7 +644,7 @@ export interface IContextBuilder {
    */
   getAgentBackend(
     userId: string,
-    agentId: string
+    sbSlug: string
   ): Promise<{ backend: string | null; provider: string | null }>;
 }
 
@@ -437,21 +654,60 @@ export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
   model?: string;
+  /**
+   * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
+   * max). Per-SB from agent_identities.metadata.runtimeConfig.effort;
+   * absent means the provider's own default (or the operator's user-level
+   * setting) applies.
+   */
+  effort?: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
   pcpAccessToken?: string;
   /** PCP session ID for this run — written to runtime hint files so hooks link correctly */
   pcpSessionId?: string;
-  /** Agent ID for this run — written to runtime hint files */
-  agentId?: string;
+  /** SB slug for this run — written to runtime hint files */
+  sbSlug?: string;
   /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
   channel?: string;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
   sandboxBypass?: boolean;
+  /**
+   * Set by a runner when it has already prefixed this turn's message with the
+   * constitution. Surfaces to the child as INK_CONSTITUTION_INJECTED=1 so the
+   * session-start hook skips its own copy instead of duplicating ~9k tokens.
+   * Only ever true on a fresh spawn — a resume carries the original in history.
+   */
+  constitutionInjected?: boolean;
+  /**
+   * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
+   * conversational turns — the delivered message plus continuation prompts
+   * (runUserTurn cycles) — NOT provider subprocess calls, of which one turn's
+   * tool loop may spawn several. Sourced from the SB's dashboard settings
+   * (agent_identities.metadata.runtimeConfig.maxTurns); the runner clamps and
+   * defaults (5) when absent. signal_status is the sanctioned in-loop halt —
+   * this only caps runaway continuations.
+   */
+  maxTurns?: number;
+  /**
+   * Tool routing for InkRunner spawns, from the SB's dashboard settings
+   * (runtimeConfig.toolRouting). Forwarded as `--tool-routing`; when absent
+   * the ink chat loop resolves its own default ('local').
+   */
+  toolRouting?: 'backend' | 'local';
   /** Root repo path — propagated via context token for cross-project 'main' resolution */
   repoRoot?: string;
+  /**
+   * This server's own MCP endpoint, derived from the port it actually bound.
+   *
+   * Needed because a committed `.mcp.json` is not evidence of where the server
+   * is listening: `PCP_PORT_BASE=4001 yarn dev` moves the listener without
+   * rewriting that file. Runners that hand credentials to a subprocess must
+   * target the real endpoint or they leak them to whoever owns the default port.
+   */
+  inkMcpUrl?: string;
   /**
    * Additional permission rules to merge into .claude/settings.local.json
    * before this session's spawn. Restored to the original after the process
@@ -475,6 +731,12 @@ export interface RunnerResult {
   backendSessionId: string | null;
   responses: ChannelResponse[];
   usage?: SessionResult['usage'];
+  /**
+   * The model that served the main conversation, as the backend reported it
+   * on its own top-level assistant messages. Distinct from per-model usage:
+   * that says which models spent tokens, this says which one WAS the agent.
+   */
+  servedModel?: string;
   error?: string;
   /** The final text response from the backend (for auto-routing if no explicit send_response) */
   finalTextResponse?: string;

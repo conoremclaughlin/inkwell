@@ -15,13 +15,13 @@ import type { Json } from '../../data/repositories/activity-stream.repository';
 import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { resolveSbId } from '../../auth/resolve-identity';
 
 const userIdentifierSchema = z.object({
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -57,7 +57,7 @@ function mcpResponse(data: object, isError = false): McpResponse {
 
 export const startStrategySchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to activate strategy on'),
+  groupId: z.string().guid().describe('Task group ID to activate strategy on'),
   strategy: z
     .enum(['persistence', 'review', 'architect', 'parallel', 'swarm'])
     .describe('Strategy preset to use'),
@@ -76,8 +76,8 @@ export const startStrategySchema = z.object({
     .min(1)
     .optional()
     .describe('Post progress check-in every N tasks'),
-  checkInNotify: z.string().optional().describe('Agent ID to notify on check-ins (e.g., "myra")'),
-  approvalNotify: z.string().optional().describe('Agent ID to notify when approval is needed'),
+  checkInNotify: z.string().optional().describe('SB slug to notify on check-ins (e.g., "myra")'),
+  approvalNotify: z.string().optional().describe('SB slug to notify when approval is needed'),
   userNotify: z
     .string()
     .optional()
@@ -100,7 +100,7 @@ export const startStrategySchema = z.object({
     .describe('What must pass before advancing (e.g., ["tests", "build"])'),
   supervisorId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Supervisor agent identity ID (UUID). Gets check-in notifications and a final audit on completion.'
@@ -160,10 +160,10 @@ export async function handleStartStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const agentId = getEffectiveAgentId();
+    const sbSlug = getEffectiveSlug();
 
-    const sbId = agentId
-      ? await resolveIdentityId(dataComposer.getClient(), resolved.user.id, agentId)
+    const sbId = sbSlug
+      ? await resolveSbId(dataComposer.getClient(), resolved.user.id, sbSlug)
       : null;
     if (!sbId) {
       return mcpResponse(
@@ -235,7 +235,7 @@ export async function handleStartStrategy(
 
 export const pauseStrategySchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to pause'),
+  groupId: z.string().guid().describe('Task group ID to pause'),
 });
 
 export async function handlePauseStrategy(
@@ -276,7 +276,7 @@ export async function handlePauseStrategy(
 
 export const resumeStrategySchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to resume'),
+  groupId: z.string().guid().describe('Task group ID to resume'),
 });
 
 export async function handleResumeStrategy(
@@ -322,7 +322,7 @@ export async function handleResumeStrategy(
 
 export const cancelStrategySchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to cancel'),
+  groupId: z.string().guid().describe('Task group ID to cancel'),
   reason: z
     .string()
     .max(500)
@@ -372,15 +372,15 @@ export async function handleCancelStrategy(
 
 export const updateStrategySchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to update strategy config on'),
+  groupId: z.string().guid().describe('Task group ID to update strategy config on'),
   checkInInterval: z
     .number()
     .int()
     .min(1)
     .optional()
     .describe('Post progress check-in every N tasks'),
-  checkInNotify: z.string().optional().describe('Agent ID to notify on check-ins'),
-  approvalNotify: z.string().optional().describe('Agent ID to notify when approval is needed'),
+  checkInNotify: z.string().optional().describe('SB slug to notify on check-ins'),
+  approvalNotify: z.string().optional().describe('SB slug to notify when approval is needed'),
   maxIterationsWithoutApproval: z
     .number()
     .int()
@@ -403,7 +403,7 @@ export const updateStrategySchema = z.object({
     .describe('How task completion is validated'),
   supervisorId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .nullable()
     .describe('Supervisor agent identity ID (UUID). Pass null to clear.'),
@@ -491,11 +491,11 @@ export async function handleUpdateStrategy(
 
     await dataComposer.repositories.taskGroups.update(args.groupId, updatePayload as never);
 
-    const agentId = getEffectiveAgentId(undefined) || 'system';
+    const sbSlug = getEffectiveSlug(undefined) || 'system';
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId,
+        sbSlug,
         type: 'state_change',
         subtype: 'strategy_config_updated',
         content: `Strategy config updated on "${group.title}"`,
@@ -539,7 +539,7 @@ export async function handleUpdateStrategy(
 
 export const getStrategyStatusSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to get status for'),
+  groupId: z.string().guid().describe('Task group ID to get status for'),
 });
 
 export async function handleGetStrategyStatus(

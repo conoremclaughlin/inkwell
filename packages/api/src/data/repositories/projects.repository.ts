@@ -13,6 +13,8 @@ export interface Project {
   tech_stack: string[] | null;
   repository_url: string | null;
   repo_root: string | null;
+  /** Thread-key project prefix (grammar v2). Reserved against type names. */
+  slug: string | null;
   goals: string[] | null;
   metadata: Record<string, unknown>;
   created_at: string;
@@ -27,6 +29,7 @@ export interface ProjectInsert {
   tech_stack?: string[];
   repository_url?: string | null;
   repo_root?: string | null;
+  slug?: string | null;
   goals?: string[];
   metadata?: Record<string, unknown>;
 }
@@ -38,6 +41,7 @@ export interface ProjectUpdate {
   tech_stack?: string[];
   repository_url?: string | null;
   repo_root?: string | null;
+  slug?: string | null;
   goals?: string[];
   metadata?: Record<string, unknown>;
 }
@@ -136,6 +140,8 @@ export class ProjectsRepository extends BaseRepository {
           tech_stack: data.tech_stack,
           repository_url: data.repository_url,
           repo_root: data.repo_root,
+          // Undefined = not provided; only an explicit value touches the slug.
+          ...(data.slug !== undefined ? { slug: data.slug } : {}),
           goals: data.goals,
           metadata: data.metadata,
         });

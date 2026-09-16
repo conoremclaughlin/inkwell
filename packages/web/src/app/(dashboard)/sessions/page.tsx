@@ -33,7 +33,7 @@ interface SessionWorkspace {
 interface Session {
   id: string;
   backendSessionId: string | null;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   lifecycle: string | null;
@@ -153,6 +153,15 @@ function getSessionState(session: Session): {
     };
   }
 
+  if (lifecycle === 'interrupted') {
+    return {
+      label: 'Interrupted',
+      cardClass: 'border-amber-200 bg-amber-50/50 dark:border-amber-800 dark:bg-amber-900/20',
+      badgeClass: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+      phaseClass: 'text-amber-700 dark:text-amber-400',
+    };
+  }
+
   if (lifecycle === 'idle') {
     return {
       label: 'Idle',
@@ -196,7 +205,7 @@ function SessionCard({ session }: { session: Session }) {
           <div className="flex items-center gap-2 flex-wrap">
             <h3 className="font-semibold text-foreground">{session.agentName}</h3>
             <Badge variant="outline" className="text-xs font-mono">
-              {session.agentId}
+              {session.sbSlug}
             </Badge>
             <Badge className={clsx('text-xs', state.badgeClass)}>{state.label}</Badge>
           </div>
@@ -303,11 +312,17 @@ function SessionCard({ session }: { session: Session }) {
           <div className="rounded-md bg-muted/50 p-3 text-xs space-y-3">
             <div>
               <Link
-                href={`/sessions/${session.id}`}
+                href={`/sessions/viewer?id=${session.id}`}
                 className="inline-flex items-center gap-1.5 rounded border border-border bg-card px-2 py-1 text-xs font-medium text-foreground/90 hover:bg-muted"
               >
                 <MessageSquare className="h-3.5 w-3.5" />
-                View full log
+                View conversation
+              </Link>
+              <Link
+                href={`/sessions/${session.id}`}
+                className="inline-flex items-center gap-1.5 rounded border border-border bg-card px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted"
+              >
+                View raw log
               </Link>
             </div>
             {/* Session IDs */}

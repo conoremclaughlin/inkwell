@@ -14,15 +14,13 @@ const mockVerifyAccessToken = vi.fn();
 // Mocks — must be declared before importing the module under test
 // ---------------------------------------------------------------------------
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
+    ...(await import('../test/fake-env')).fakeEnv,
     MCP_TRANSPORT: 'http',
     MCP_HTTP_PORT: 0, // will be overridden
     MCP_REQUIRE_OAUTH: false,
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-key',
     SUPABASE_ANON_KEY: 'test-anon-key',
-    JWT_SECRET: 'test-jwt-secret',
   },
 }));
 
@@ -36,7 +34,27 @@ vi.mock('../utils/logger', () => ({
 }));
 
 vi.mock('./tools', () => ({
-  registerAllTools: vi.fn(),
+  registerAllTools: vi.fn((server: any, _data: unknown, options: any) => {
+    // One probe tool: reports the request context seen before and after an
+    // await, plus which catalog this instance was built for.
+    server.registerTool('echo_request_context', {}, async () => {
+      const { getRequestContext } = await import('../utils/request-context');
+      const before = getRequestContext();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              before,
+              after: getRequestContext(),
+              runtimeCatalog: options?.includeInternalLifecycleTools,
+            }),
+          },
+        ],
+      };
+    });
+  }),
   setMiniAppsRegistry: vi.fn(),
   setTelegramListener: vi.fn(),
 }));
@@ -75,9 +93,21 @@ vi.mock('../channels/agent-gateway', () => ({
   })),
 }));
 
-vi.mock('../utils/request-context', () => ({
-  runWithRequestContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
-}));
+// Only runWithRequestContext is stubbed (it would otherwise need real
+// AsyncLocalStorage plumbing per request); everything else stays real. A
+// factory that listed exports by hand went stale the moment server.ts imported
+// another one — the missing export came back undefined, every request threw,
+// and the whole suite timed out rather than saying so.
+vi.mock('../utils/request-context', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/request-context')>();
+  return {
+    ...actual,
+    // The REAL AsyncLocalStorage runner, spied on so call counts still work.
+    // A no-op stand-in would hide exactly the failure this file must catch:
+    // request context not reaching the SDK's per-request server instance.
+    runWithRequestContext: vi.fn(actual.runWithRequestContext),
+  };
+});
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({
@@ -154,7 +184,7 @@ function parseSSEResult(body: string): unknown {
 function encodeContextHeader(token: {
   sessionId: string;
   studioId: string;
-  agentId: string;
+  sbSlug: string;
   cliAttached: boolean;
   runtime: string;
 }): string {
@@ -291,6 +321,96 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(result.result.protocolVersion).toBe('2025-03-26');
   });
 
+  it('serves protocol 2026-07-28 to a v2 client and still serves 2025-era clients', async () => {
+    // The production symptom behind the SDK v2 migration: Claude Code offers
+    // 2026-07-28 and the 1.x transport answered every follow-up request with
+    // 400 "Unsupported protocol version". The modern revision rides on the
+    // client's envelope probe, so it is pinned through a real client rather
+    // than a hand-built initialize; the bare initialize below is the legacy
+    // leg, which must keep answering from the same tool registry.
+    if (serverUnavailableError) return;
+    const { Client, StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
+    const connect = async (mode: 'auto' | 'legacy') => {
+      const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
+      // 'auto' is what a 2026 client does: probe the modern revision, fall
+      // back to the 2025 handshake. 'legacy' (the SDK default) is a 2025 client.
+      const client = new Client(
+        { name: 'v2-test-client', version: '0.0.0' },
+        { versionNegotiation: { mode } }
+      );
+      await client.connect(transport);
+      const negotiated = transport.protocolVersion;
+      const serverName = client.getServerVersion()?.name;
+      const tools = await client.listTools();
+      await client.close();
+      return { negotiated, toolCount: tools.tools.length, serverName };
+    };
+
+    const modern = await connect('auto');
+    expect(modern.negotiated).toBe('2026-07-28');
+    expect(modern.serverName).toBe('inkwell');
+
+    const legacy = await connect('legacy');
+    expect(legacy.negotiated).toBe('2025-11-25');
+    // Same factory behind both eras: the catalogs cannot differ. (This file
+    // mocks registerAllTools, so the registry's size is asserted elsewhere.)
+    expect(legacy.toolCount).toBe(modern.toolCount);
+
+    // A bare 2025-style initialize naming the modern revision is legacy
+    // traffic (no envelope): it is answered, not refused with a 400.
+    const bare = await mcpPost(baseUrl, {
+      ...INITIALIZE_REQUEST,
+      params: { ...INITIALIZE_REQUEST.params, protocolVersion: '2026-07-28' },
+    });
+    expect(bare.status).toBe(200);
+    expect((parseSSEResult(bare.body) as any).result.protocolVersion).toBe('2025-11-25');
+  });
+
+  it('keeps each request\u2019s identity, session and catalog through real AsyncLocalStorage, concurrently, in both eras', async () => {
+    // Lumen's #598 review: the factory runs inside runWithRequestContext, and
+    // the SDK's per-request dispatch must preserve that store across awaits
+    // and never leak it between concurrent exchanges. Twelve interleaved
+    // clients, alternating modern/legacy negotiation and agent/runtime
+    // catalogs, each authenticated as a different user.
+    if (serverUnavailableError) return;
+    const { Client, StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
+    mockVerifyAccessToken.mockImplementation(async (auth: string) => ({
+      userId: auth.slice('Bearer '.length),
+      email: 'test@example.com',
+    }));
+    const check = async (i: number) => {
+      const mode = i % 2 === 0 ? 'auto' : 'legacy';
+      const runtime = i % 3 === 0;
+      const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer user-${i}`,
+            'x-ink-session-id': `session-${i}`,
+            'x-ink-caller-profile': runtime ? 'runtime' : 'agent',
+          },
+        },
+      });
+      const client = new Client(
+        { name: 'als-probe', version: '0.0.0' },
+        { versionNegotiation: { mode } }
+      );
+      try {
+        await client.connect(transport);
+        const result: any = await client.callTool({ name: 'echo_request_context', arguments: {} });
+        expect(result.isError).not.toBe(true);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.before.userId).toBe(`user-${i}`);
+        expect(payload.before.sessionId).toBe(`session-${i}`);
+        expect(payload.before.callerProfile).toBe(runtime ? 'runtime' : 'agent');
+        expect(payload.after).toEqual(payload.before);
+        expect(payload.runtimeCatalog).toBe(runtime);
+      } finally {
+        await client.close();
+      }
+    };
+    await Promise.all(Array.from({ length: 12 }, (_, i) => check(i)));
+  });
+
   it('should challenge unauthenticated initialize requests when OAuth is required', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
@@ -414,7 +534,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'wren' }),
+      body: JSON.stringify({ sbSlug: 'wren' }),
     });
 
     expect(res.status).toBe(200);
@@ -426,7 +546,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const token = body.access_token as string;
     const payload = verifyPcpAccessToken(token, 'mcp_access');
     expect(payload?.sub).toBe('user-123');
-    expect(payload?.agentId).toBe('wren');
+    expect(payload?.sbSlug).toBe('wren');
     expect(payload?.identityId).toBe('identity-abc');
   });
 
@@ -437,7 +557,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'wren' }),
+      body: JSON.stringify({ sbSlug: 'wren' }),
     });
 
     expect(res.status).toBe(401);
@@ -451,7 +571,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'aster' }),
+      body: JSON.stringify({ sbSlug: 'aster' }),
     });
 
     expect(res.status).toBe(403);
@@ -467,7 +587,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -482,7 +602,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -495,6 +615,86 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(mockGetSession).toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
   });
 
+  it('enriches a user-token request with the context session agent (PR #468)', async () => {
+    if (serverUnavailableError) return;
+    // The normal local auth shape: an unbound USER bearer with no agent
+    // claim. The x-ink-context session must be consulted (server truth)
+    // even though Authorization is present — before this, ink-routed tool
+    // calls ran agent-less and workspace derivation for writes failed.
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+    mockGetSession.mockClear();
+    mockGetSession.mockResolvedValue({
+      id: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
+      userId: 'user-456',
+      sbSlug: 'myra',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-myra-1',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
+      studioId: 'studio-1',
+      sbSlug: 'myra',
+      cliAttached: false,
+      runtime: 'ink',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    // The enrichment path consulted the session row under Authorization —
+    // previously getSession was only reached in the no-auth fallback.
+    expect(mockGetSession).toHaveBeenCalledWith('b2c3d4e5-f6a7-8901-bcde-f23456789012');
+  });
+
+  it('does not fail the request when the context session belongs to a different user', async () => {
+    if (serverUnavailableError) return;
+    // Cross-user session reference: enrichment is refused (identity stays
+    // agent-less) but the request itself proceeds under the valid bearer.
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+    mockGetSession.mockClear();
+    mockGetSession.mockResolvedValue({
+      id: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
+      userId: 'user-999',
+      sbSlug: 'myra',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-myra-1',
+      user_id: 'user-999',
+      users: { email: 'other@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
+      studioId: 'studio-1',
+      sbSlug: 'myra',
+      cliAttached: false,
+      runtime: 'ink',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockGetSession).toHaveBeenCalledWith('c3d4e5f6-a7b8-9012-cdef-345678901234');
+  });
+
   it('should reject forged context with no matching session', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
@@ -504,7 +704,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'forged-session-id',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -525,7 +725,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'not-a-uuid',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -539,14 +739,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     (env as any).MCP_REQUIRE_OAUTH = false;
   });
 
-  it('should reject context when session agentId does not match', async () => {
+  it('should reject context when session sbSlug does not match', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
     mockVerifyAccessToken.mockResolvedValue(null);
     mockGetSession.mockResolvedValue({
       id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       userId: 'user-456',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -556,7 +756,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -576,7 +776,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'completed',
       startedAt: new Date('2026-01-01'),
       endedAt: new Date('2026-01-02'),
@@ -586,7 +786,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -605,7 +805,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -620,7 +820,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -641,14 +841,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockVerifyAccessToken.mockResolvedValue({
       userId: 'oauth-user',
       email: 'oauth@example.com',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'oauth-sb',
     });
 
     const contextHeader = encodeContextHeader({
       sessionId: 'd4e5f6a7-b8c9-0123-defa-234567890123',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -661,5 +861,146 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(res.status).toBe(200);
     // Session lookup should NOT have been called — OAuth was sufficient
     expect(mockGetSession).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// Session-anchored identity enrichment (PR #468) — unit seam.
+// Proves the x-ink-context header actually PRODUCES agent/sb/workspace
+// identity, canonical-first: the session's sb_id resolves by UUID even when
+// the same agent slug exists in multiple workspaces (where slug .single()
+// errors and would break enrichment + artifact writes).
+// ===========================================================================
+describe('enrichIdentityFromContextSession + workspace derivation (canonical identity)', () => {
+  const USER = { userId: 'user-456', email: 'test@example.com' };
+  const SID = 'd4e5f6a7-b8c9-0123-def4-567890123456';
+
+  // Two identities share the slug 'myra' (schema-legal, different
+  // workspaces). Slug .single() over these errors; UUID lookup does not.
+  const identities = [
+    {
+      id: 'sb-uuid-A',
+      agent_id: 'myra',
+      user_id: 'user-456',
+      workspace_id: 'ws-AAAA',
+      users: { email: 'test@example.com' },
+    },
+    {
+      id: 'sb-uuid-B',
+      agent_id: 'myra',
+      user_id: 'user-456',
+      workspace_id: 'ws-BBBB',
+      users: { email: 'test@example.com' },
+    },
+  ];
+
+  const makeServer = (session: Record<string, unknown> | null) => {
+    const composer = {
+      getClient: () => ({
+        from: (table: string) => {
+          const filters: Record<string, string> = {};
+          const query: Record<string, unknown> = {};
+          Object.assign(query, {
+            select: () => query,
+            eq: (field: string, value: string) => {
+              filters[field] = value;
+              return query;
+            },
+            single: async () => {
+              if (table !== 'agent_identities') return { data: null, error: { message: 'nf' } };
+              if (filters.id) {
+                const row = identities.find((i) => i.id === filters.id) ?? null;
+                return row
+                  ? { data: row, error: null }
+                  : { data: null, error: { message: 'not found' } };
+              }
+              // Slug path: duplicate rows → PostgREST .single() errors.
+              const rows = identities.filter(
+                (i) => i.agent_id === filters.agent_id && i.user_id === filters.user_id
+              );
+              return rows.length === 1
+                ? { data: rows[0], error: null }
+                : { data: null, error: { message: 'JSON object requested, multiple rows' } };
+            },
+            maybeSingle: async () => {
+              if (table !== 'agent_identities') return { data: null, error: null };
+              const row = identities.find((i) => i.id === filters.id) ?? null;
+              return { data: row, error: null };
+            },
+          });
+          return query;
+        },
+      }),
+      repositories: {
+        memory: { getSession: vi.fn(async () => session) },
+        workspaces: { findById: vi.fn(async () => null) },
+      },
+    } as never;
+    return new MCPServer(composer);
+  };
+
+  const liveSession = (sbId: string | undefined) => ({
+    id: SID,
+    userId: 'user-456',
+    sbSlug: 'myra',
+    sbId,
+    lifecycle: 'running',
+    startedAt: new Date(),
+    endedAt: undefined,
+    metadata: {},
+  });
+
+  it('resolves identity by session sb_id even with duplicate slugs, then derives workspace by UUID', async () => {
+    const server = makeServer(liveSession('sb-uuid-B')) as never as Record<string, never>;
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ sbSlug?: string; sbId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
+
+    expect(enriched?.sbSlug).toBe('myra');
+    expect(enriched?.sbId).toBe('sb-uuid-B');
+
+    // The header-produced identity flows through to workspace scope,
+    // unambiguously, from the canonical UUID.
+    const ws = await (
+      server as unknown as {
+        resolveWorkspaceContextForMcpRequest: (
+          req: unknown,
+          u: unknown
+        ) => Promise<{ workspaceId?: string }>;
+      }
+    ).resolveWorkspaceContextForMcpRequest({ header: () => undefined }, { ...USER, ...enriched });
+    expect(ws.workspaceId).toBe('ws-BBBB');
+  });
+
+  it('legacy sessions without sb_id fail closed on duplicate slugs instead of guessing', async () => {
+    const server = makeServer(liveSession(undefined));
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ sbSlug?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
+    // Slug fallback hits the duplicate-row error → no enrichment.
+    expect(enriched?.sbSlug).toBeUndefined();
+  });
+
+  it('refuses enrichment when the session belongs to a different user', async () => {
+    const server = makeServer({ ...liveSession('sb-uuid-A'), userId: 'user-999' });
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ sbSlug?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
+    expect(enriched?.sbSlug).toBeUndefined();
   });
 });

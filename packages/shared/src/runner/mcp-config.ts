@@ -73,7 +73,7 @@ export function injectSessionHeaders(
 
   // Missing config file — nothing to inject into. Note: we still inject the
   // other headers (studio, context, authorization) when pcpSessionId is
-  // absent — x-ink-context carries agentId/studioId/runtime which are useful
+  // absent — x-ink-context carries sbSlug/studioId/runtime which are useful
   // independently of session identity.
   if (!mcpConfigPath || !existsSync(mcpConfigPath)) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
@@ -87,9 +87,10 @@ export function injectSessionHeaders(
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
-  // Find the server entry — prefer 'inkwell', fall back to 'pcp' for backward compat
-  const serverKey = config.mcpServers.inkwell ? 'inkwell' : config.mcpServers.pcp ? 'pcp' : null;
-  if (!serverKey) {
+  // Session headers are injected only into the canonical 'inkwell' server. The
+  // legacy 'pcp' server name is retired — no code should create or feed it.
+  const serverKey = 'inkwell';
+  if (!config.mcpServers[serverKey]) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
@@ -168,7 +169,7 @@ export function injectSessionHeaders(
 export interface PcpContextToken {
   sessionId: string;
   studioId: string;
-  agentId: string;
+  sbSlug: string;
   cliAttached: boolean;
   runtime: string; // 'claude' | 'codex' | 'gemini'
   repoRoot?: string; // root repo path for cross-project 'main' resolution
@@ -178,6 +179,9 @@ export interface PcpContextToken {
  * Encode a context token for the `x-ink-context` header.
  */
 export function encodeContextToken(token: PcpContextToken): string {
+  // token.runtime values in the wild: 'claude' | 'codex' | 'gemini' for
+  // provider-backed spawns, plus 'ink' for the ink chat loop's own PcpClient
+  // (PR #468). The server treats it as an opaque string.
   return Buffer.from(JSON.stringify(token)).toString('base64url');
 }
 
@@ -189,10 +193,21 @@ export function decodeContextToken(header: string | undefined | null): PcpContex
   if (!header) return null;
   try {
     const parsed = JSON.parse(Buffer.from(header, 'base64url').toString());
-    if (typeof parsed.sessionId !== 'string' || typeof parsed.agentId !== 'string') {
+    // Tokens minted before the agentId -> sbSlug rename carry `agentId`, and they
+    // live in running processes and already-generated MCP configs that nothing
+    // rewrites. Such a token is otherwise valid: refusing it would discard its
+    // session, studio, runtime and cliAttached together, and take the server's
+    // context-session auth fallback with them (Lumen, PR #635).
+    const sbSlug =
+      typeof parsed.sbSlug === 'string'
+        ? parsed.sbSlug
+        : typeof parsed.agentId === 'string'
+          ? parsed.agentId
+          : undefined;
+    if (typeof parsed.sessionId !== 'string' || sbSlug === undefined) {
       return null;
     }
-    return parsed as PcpContextToken;
+    return { ...parsed, sbSlug } as PcpContextToken;
   } catch {
     return null;
   }
@@ -213,7 +228,7 @@ export function buildSessionEnv(options: {
   runtimeLinkId?: string;
   studioId?: string;
   accessToken?: string;
-  agentId?: string;
+  sbSlug?: string;
   cliAttached?: boolean;
   runtime?: string;
   repoRoot?: string;
@@ -232,16 +247,14 @@ export function buildSessionEnv(options: {
   }
   if (options.accessToken) {
     env.INK_ACCESS_TOKEN = options.accessToken;
-    // Codex env_http_headers maps env var name → full header value
-    env.INK_AUTH_BEARER = `Bearer ${options.accessToken}`;
   }
 
   // Consolidated context token (new — Phase 1)
-  if (options.pcpSessionId && options.agentId) {
+  if (options.pcpSessionId && options.sbSlug) {
     env.INK_CONTEXT = encodeContextToken({
       sessionId: options.pcpSessionId,
       studioId: options.studioId || '',
-      agentId: options.agentId,
+      sbSlug: options.sbSlug,
       cliAttached: options.cliAttached || false,
       runtime: options.runtime || 'claude',
       ...(options.repoRoot ? { repoRoot: options.repoRoot } : {}),

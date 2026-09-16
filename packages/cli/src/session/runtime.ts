@@ -4,7 +4,7 @@ import { join } from 'path';
 export interface RuntimeSessionRecord {
   pcpSessionId: string;
   backend: string;
-  agentId?: string;
+  sbSlug?: string;
   sbId?: string;
   studioId?: string;
   threadKey?: string;
@@ -21,7 +21,7 @@ interface RuntimeSessionState {
   current?: {
     pcpSessionId: string;
     backend: string;
-    agentId?: string;
+    sbSlug?: string;
     sbId?: string;
     studioId?: string;
     updatedAt: string;
@@ -56,6 +56,24 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
 
   try {
     const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as Partial<RuntimeSessionState>;
+    // sessions.json is still version 1 and every record written before the
+    // agentId -> sbSlug rename carries `agentId`. The owner match below keys on
+    // sbSlug, so an un-normalized record never matches and the upsert inserts a
+    // DUPLICATE instead of merging the previous backend-session lineage
+    // (Lumen, PR #635). Normalize on read, current included.
+    const withSlug = (row: unknown): unknown => {
+      if (!row || typeof row !== 'object') return row;
+      const r = row as { sbSlug?: unknown; agentId?: unknown };
+      return r.sbSlug === undefined && typeof r.agentId === 'string'
+        ? { ...r, sbSlug: r.agentId }
+        : row;
+    };
+    if (Array.isArray(parsed.sessions)) {
+      parsed.sessions = parsed.sessions.map(withSlug) as typeof parsed.sessions;
+    }
+    if (parsed.current) {
+      parsed.current = withSlug(parsed.current) as typeof parsed.current;
+    }
     const sessions = Array.isArray(parsed.sessions)
       ? parsed.sessions.filter(
           (s): s is RuntimeSessionRecord =>
@@ -108,7 +126,7 @@ export function upsertRuntimeSession(
     (s) =>
       s.pcpSessionId === next.pcpSessionId &&
       s.backend === next.backend &&
-      s.agentId === next.agentId &&
+      s.sbSlug === next.sbSlug &&
       s.studioId === next.studioId
   );
 
@@ -161,13 +179,13 @@ export function setCurrentRuntimeSession(
   cwd: string,
   pcpSessionId: string,
   backend: string,
-  options?: { agentId?: string; sbId?: string; studioId?: string }
+  options?: { sbSlug?: string; sbId?: string; studioId?: string }
 ): void {
   const state = readRuntimeState(cwd);
   state.current = {
     pcpSessionId,
     backend,
-    ...(options?.agentId ? { agentId: options.agentId } : {}),
+    ...(options?.sbSlug ? { sbSlug: options.sbSlug } : {}),
     ...(options?.sbId ? { sbId: options.sbId } : {}),
     ...(options?.studioId ? { studioId: options.studioId } : {}),
     updatedAt: new Date().toISOString(),
@@ -184,7 +202,7 @@ export function listRuntimeSessions(cwd: string, backend?: string): RuntimeSessi
 export function findRuntimeSessionByLinkId(
   cwd: string,
   runtimeLinkId: string,
-  options?: { backend?: string; agentId?: string; studioId?: string }
+  options?: { backend?: string; sbSlug?: string; studioId?: string }
 ): RuntimeSessionRecord | undefined {
   if (!runtimeLinkId.trim()) return undefined;
 
@@ -192,7 +210,7 @@ export function findRuntimeSessionByLinkId(
   return sessions.find(
     (session) =>
       session.runtimeLinkId === runtimeLinkId &&
-      (!options?.agentId || session.agentId === options.agentId) &&
+      (!options?.sbSlug || session.sbSlug === options.sbSlug) &&
       (!options?.studioId || session.studioId === options.studioId)
   );
 }
@@ -208,7 +226,7 @@ export function getCurrentRuntimeSession(
       (s) =>
         s.pcpSessionId === state.current!.pcpSessionId &&
         s.backend === state.current!.backend &&
-        (!state.current!.agentId || s.agentId === state.current!.agentId) &&
+        (!state.current!.sbSlug || s.sbSlug === state.current!.sbSlug) &&
         (!state.current!.sbId || s.sbId === state.current!.sbId) &&
         (!state.current!.studioId || s.studioId === state.current!.studioId) &&
         (!backend || s.backend === backend)

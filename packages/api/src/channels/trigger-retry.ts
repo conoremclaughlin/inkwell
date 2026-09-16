@@ -47,7 +47,7 @@ export function getTriggerRetryKey(payload: AgentTriggerPayload): string {
     payload.threadId ??
     payload.threadKey ??
     'no-thread';
-  return `${sourceId}::${payload.toAgentId}`;
+  return `${sourceId}::${payload.toSlug}`;
 }
 
 export type ScheduleResult =

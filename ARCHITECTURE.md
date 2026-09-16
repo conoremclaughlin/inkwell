@@ -135,7 +135,7 @@ User message → Listener → Buffer → ChannelGateway
 Wren calls send_to_inbox() + trigger: true
   → Message saved in agent_inbox
   → HTTP POST /api/agent/trigger
-  → AgentGateway → SessionService.handleMessage(agentId='myra')
+  → AgentGateway → SessionService.handleMessage(sbSlug='myra')
   → Myra processes, responds via ChannelGateway
 ```
 
@@ -173,7 +173,7 @@ Six agents share the same infrastructure with distinct identities, backends, and
 | **Benson** | Discord / Slack        | claude      | claude      | Conversational partner                 |
 | **Echo**   | (test only)            | —           | —           | Integration test agent                 |
 
-Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.ink/identity.json` → `~/.ink/config.json`. Identity documents (SOUL, HEARTBEAT, IDENTITY) live in the database (`agent_identities` table), with `~/.ink/` as a fallback cache. Memories are filtered by agentId (plus shared memories where `agentId` is null).
+Identity is resolved from: system prompt override → `$SB_SLUG` env var → `.ink/identity.json` → `~/.ink/config.json`. Identity documents (SOUL, HEARTBEAT, IDENTITY) live in the database (`agent_identities` table), with `~/.ink/` as a fallback cache. Memories are filtered by sbSlug (plus shared memories where `sbSlug` is null).
 
 ## MCP Tools
 
@@ -183,7 +183,7 @@ Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.
 | ------------------------ | ------------------------------------------------------------------- |
 | **Bootstrap & Sessions** | `bootstrap`, `update_session_state`, `get_session`, `list_sessions` |
 | **Memory**               | `remember`, `recall`, `forget`, `update_memory`, history/restore    |
-| **Context & Projects**   | `save_context`, `get_context`, `save_project`                       |
+| **Projects**             | `save_project`, `list_projects`, `get_project`                      |
 | **Communication**        | `send_response`, `send_to_inbox`, `trigger_agent`                   |
 | **Data**                 | `save_link`, `create_task`, `create_reminder`, calendar, email      |
 | **Identity**             | `save_identity`, `get_identity`, permissions, audit log             |

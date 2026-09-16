@@ -7,6 +7,9 @@
  * Docs: https://developers.openai.com/codex/cli/
  */
 
+import { mkdirSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
@@ -19,10 +22,13 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  *
  * x-ink-context is the consolidated token (preferred). Individual headers
  * are kept for backward compat during migration.
+ *
+ * Authorization is intentionally NOT here — it goes through codex's
+ * `bearer_token_env_var` mechanism instead (see prepare()), which also stops
+ * codex from running its own managed OAuth for the server.
  */
 const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
   { header: 'x-ink-context', envVar: 'INK_CONTEXT' },
-  { header: 'Authorization', envVar: 'INK_AUTH_BEARER' },
   { header: 'x-ink-agent-id', envVar: 'AGENT_ID' },
   { header: 'x-ink-session-id', envVar: 'INK_SESSION_ID' },
   { header: 'x-ink-studio-id', envVar: 'INK_STUDIO_ID' },
@@ -31,11 +37,14 @@ const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
 export class CodexAdapter implements BackendAdapter {
   readonly name = 'codex';
   readonly binary = 'codex';
+  // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
+  readonly promptTransport = 'argv' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(
-      config.agentId,
-      config.startupContextBlock
+      config.sbSlug,
+      config.startupContextBlock,
+      config.systemPromptOverride
     );
 
     const args: string[] = [];
@@ -51,11 +60,33 @@ export class CodexAdapter implements BackendAdapter {
     // as root --config and as resume's -c flag)
     args.push('-c', `model_instructions_file=${promptFile}`);
 
+    // Ephemeral-studio root (spec:studio-materialization v8): writable
+    // alongside the workspace. --add-dir exists on both the root command and
+    // the resume subcommand, and this push lands after `resume` when
+    // resuming, so both shapes carry the grant. Created if missing.
+    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    try {
+      mkdirSync(inkStudiosDir, { recursive: true });
+    } catch {
+      // Non-fatal — worst case the grant is a no-op until the dir exists.
+    }
+    args.push('--add-dir', inkStudiosDir);
+
     // Ink session headers — Codex resolves env var names to values at runtime.
     // Server key must match what's in .codex/config.toml (mcp_servers.inkwell).
     for (const { header, envVar } of PCP_ENV_HEADERS) {
       args.push('-c', `mcp_servers.inkwell.env_http_headers.${header}="${envVar}"`);
     }
+
+    // Auth: use codex's static-bearer mechanism, NOT an Authorization
+    // env_http_header. `bearer_token_env_var` makes codex authenticate with the
+    // env var's raw token AND skip its own managed OAuth discovery/refresh for
+    // this server — ink already owns a valid token. Without this, codex tries to
+    // refresh its independently-cached (keychain) OAuth credential on startup;
+    // once that refresh token expires the server returns `invalid_grant` and
+    // codex aborts MCP init, even though ink injected a perfectly good bearer.
+    // Point at INK_ACCESS_TOKEN (raw) — codex prepends "Bearer " itself.
+    args.push('-c', `mcp_servers.inkwell.bearer_token_env_var="INK_ACCESS_TOKEN"`);
 
     // Model (only if explicitly specified by user)
     if (config.model) {
@@ -84,6 +115,23 @@ export class CodexAdapter implements BackendAdapter {
     if (promptParts.length > 0 && promptParts[0]?.toLowerCase() === 'exec') {
       args.push(promptParts[0]);
       args.push(...config.passthroughArgs);
+      // Media injection (spec:provider-media-injection): codex attaches
+      // images to the initial prompt natively — an exec-scoped option, so
+      // it must sit after `exec`. Codex is stateless per spawn, so media is
+      // (re)attached on every spawn of the logical turn. Two parse-safety
+      // measures (Lumen, review 4900120086 — variadic `-i <FILE>...`
+      // swallows the following positional prompt): the single-value
+      // `--image=<path>` binding, plus a `--` options terminator so the
+      // prompt can never be consumed as an option value. Non-image media
+      // stays on the prompt-text path (paths listed in the attachment
+      // block).
+      const imageMedia = (config.media ?? []).filter((m) => m.mimeType?.startsWith('image/'));
+      for (const m of imageMedia) {
+        args.push(`--image=${m.path}`);
+      }
+      if (imageMedia.length > 0) {
+        args.push('--');
+      }
       args.push(...promptParts.slice(1));
     } else {
       // Passthrough flags
@@ -97,20 +145,20 @@ export class CodexAdapter implements BackendAdapter {
     const contextToken = encodeContextToken({
       sessionId: config.pcpSessionId || '',
       studioId: config.studioId || '',
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       cliAttached: true,
       runtime: 'codex',
     });
 
-    // INK_AUTH_BEARER is constructed at the spawn site from INK_ACCESS_TOKEN
-    // (set via authEnv). The adapter declares the header mapping; the spawn
-    // site provides the env var value.
+    // INK_ACCESS_TOKEN (raw token) is provided at the spawn site via authEnv;
+    // the adapter references it by name through bearer_token_env_var above.
 
     return {
       binary: this.binary,
       args,
       env: {
-        AGENT_ID: config.agentId,
+        SB_SLUG: config.sbSlug,
+        AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),

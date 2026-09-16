@@ -22,7 +22,7 @@ describe('resolveWorkspaceScopeForWrite', () => {
         const result = await resolveWorkspaceScopeForWrite({
           rawArgs: { workspaceId: 'ws-arg' },
           explicitWorkspaceId: 'ws-explicit',
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           deriveWorkspaceIdFromAgent: derive,
         });
 
@@ -36,7 +36,7 @@ describe('resolveWorkspaceScopeForWrite', () => {
     const derive = vi.fn().mockResolvedValue('ws-derived');
     const result = await resolveWorkspaceScopeForWrite({
       rawArgs: {},
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       deriveWorkspaceIdFromAgent: derive,
     });
 

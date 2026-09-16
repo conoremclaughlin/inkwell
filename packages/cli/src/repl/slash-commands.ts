@@ -12,6 +12,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'events', description: 'Poll/toggle activity stream' },
   { name: 'session', description: 'Show active session info' },
   { name: 'sessions', description: 'Show active sessions' },
+  { name: 'clones', description: 'List shadow clones, open one by id, or cancel' },
   { name: 'autorun', description: 'Toggle inbox auto-run' },
   { name: 'away', description: 'Toggle remote approval mode' },
   { name: 'tool-routing', description: 'Switch backend/local tool routing' },

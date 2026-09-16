@@ -65,7 +65,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'wren',
+          sbSlug: 'wren',
           name: 'Wren',
           role: 'Development collaborator',
           description: 'Claude Code assistant',
@@ -79,7 +79,7 @@ describe('Identity Handlers', () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
       expect(parsed.message).toBe('Identity created');
-      expect(parsed.identity.agentId).toBe('wren');
+      expect(parsed.identity.sbSlug).toBe('wren');
       expect(parsed.identity.name).toBe('Wren');
       expect(parsed.identity.version).toBe(1);
       expect(mockSupabase.from).toHaveBeenCalledWith('agent_identities');
@@ -109,7 +109,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'wren',
+          sbSlug: 'wren',
           name: 'Wren',
           role: 'Development collaborator',
           heartbeat: '# Heartbeat\n\nOperational notes...',
@@ -120,7 +120,7 @@ describe('Identity Handlers', () => {
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
-      expect(parsed.identity.agentId).toBe('wren');
+      expect(parsed.identity.sbSlug).toBe('wren');
     });
 
     it('should update an existing identity', async () => {
@@ -145,7 +145,7 @@ describe('Identity Handlers', () => {
       const result = await handleSaveIdentity(
         {
           userId: 'user-123',
-          agentId: 'wren',
+          sbSlug: 'wren',
           name: 'Wren Updated',
           role: 'Development collaborator',
         },
@@ -159,21 +159,15 @@ describe('Identity Handlers', () => {
     });
 
     it('should throw on database error', async () => {
-      // First call (fetch existing) succeeds, second call (upsert) fails
-      let callCount = 0;
-      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-        callCount++;
-        if (callCount === 1) {
-          return Promise.resolve({ data: null, error: null });
-        }
-        return Promise.resolve({ data: null, error: { message: 'Database error' } });
-      });
+      // Lookup finds nothing; the insert fails
+      mockSupabase._queueReturnData(null);
+      mockSupabase._queueReturnData(null, { message: 'Database error' });
 
       await expect(
         handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'wren',
+            sbSlug: 'wren',
             name: 'Wren',
             role: 'Development collaborator',
           },
@@ -208,26 +202,20 @@ describe('Identity Handlers', () => {
       };
 
       it('should preserve soul and heartbeat when not provided in update', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSupabase._queueReturnData(existingRecord); // lookup (scope derivation)
+        mockSupabase._queueReturnData(savedResult); // update
 
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra',
             role: 'Updated role',
           },
           mockDataComposer as never
         );
 
-        const upsertCall = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+        const upsertCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
           .calls[0];
         const upsertData = upsertCall[0];
 
@@ -241,21 +229,15 @@ describe('Identity Handlers', () => {
       });
 
       it('should update soul when explicitly provided without wiping heartbeat', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSupabase._queueReturnData(existingRecord); // lookup (scope derivation)
+        mockSupabase._queueReturnData(savedResult); // update
 
         const newSoul = '# SOUL.md\n\nUpdated soul content';
 
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra',
             role: 'Messaging bridge',
             soul: newSoul,
@@ -263,7 +245,7 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+        const upsertData = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
           .calls[0][0];
 
         expect(upsertData.soul).toBe(newSoul);
@@ -271,21 +253,15 @@ describe('Identity Handlers', () => {
       });
 
       it('should update heartbeat when explicitly provided without wiping soul', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSupabase._queueReturnData(existingRecord); // lookup (scope derivation)
+        mockSupabase._queueReturnData(savedResult); // update
 
         const newHeartbeat = '# HEARTBEAT.md\n\nUpdated heartbeat';
 
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra',
             role: 'Messaging bridge',
             heartbeat: newHeartbeat,
@@ -293,7 +269,7 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+        const upsertData = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
           .calls[0][0];
 
         expect(upsertData.heartbeat).toBe(newHeartbeat);
@@ -301,26 +277,20 @@ describe('Identity Handlers', () => {
       });
 
       it('should default optional fields to null/empty when no existing record', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: null, error: { code: 'PGRST116' } });
-          }
-          return Promise.resolve({ data: { ...savedResult, version: 1 }, error: null });
-        });
+        mockSupabase._queueReturnData(null, { code: 'PGRST116' }); // lookup: nothing
+        mockSupabase._queueReturnData({ ...savedResult, version: 1 }); // insert
 
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'newagent',
+            sbSlug: 'newagent',
             name: 'New Agent',
             role: 'Test role',
           },
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+        const upsertData = (mockSupabase._queryBuilder.insert as ReturnType<typeof vi.fn>).mock
           .calls[0][0];
 
         expect(upsertData.soul).toBeNull();
@@ -329,26 +299,20 @@ describe('Identity Handlers', () => {
       });
 
       it('should preserve all optional fields when only updating name', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSupabase._queueReturnData(existingRecord); // lookup (scope derivation)
+        mockSupabase._queueReturnData(savedResult); // update
 
         await handleSaveIdentity(
           {
             userId: 'user-123',
-            agentId: 'myra',
+            sbSlug: 'myra',
             name: 'Myra Updated',
             role: 'Messaging bridge',
           },
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+        const upsertData = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
           .calls[0][0];
 
         expect(upsertData.name).toBe('Myra Updated');
@@ -384,13 +348,13 @@ describe('Identity Handlers', () => {
       mockSupabase._setReturnData(mockIdentityRow);
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
-      expect(parsed.identity.agentId).toBe('wren');
+      expect(parsed.identity.sbSlug).toBe('wren');
       expect(parsed.identity.name).toBe('Wren');
       expect(parsed.identity.values).toEqual(['collaboration']);
     });
@@ -417,7 +381,7 @@ describe('Identity Handlers', () => {
       mockSupabase._setReturnData(mockIdentityRow);
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
@@ -431,7 +395,7 @@ describe('Identity Handlers', () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 
       const result = await handleGetIdentity(
-        { userId: 'user-123', agentId: 'nonexistent' },
+        { userId: 'user-123', sbSlug: 'nonexistent' },
         mockDataComposer as never
       );
 
@@ -483,8 +447,8 @@ describe('Identity Handlers', () => {
       expect(parsed.success).toBe(true);
       expect(parsed.identities).toHaveLength(2);
       expect(parsed.count).toBe(2);
-      expect(parsed.identities[0].agentId).toBe('benson');
-      expect(parsed.identities[1].agentId).toBe('wren');
+      expect(parsed.identities[0].sbSlug).toBe('benson');
+      expect(parsed.identities[1].sbSlug).toBe('wren');
     });
 
     it('should return hasHeartbeat and hasSoul flags', async () => {
@@ -557,17 +521,6 @@ describe('Identity Handlers', () => {
       // First call returns current identity
       const mockCurrent = { id: 'identity-123' };
 
-      // We need to handle two sequential calls
-      let callCount = 0;
-      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-        callCount++;
-        if (callCount === 1) {
-          return Promise.resolve({ data: mockCurrent, error: null });
-        }
-        // This shouldn't be called for history (uses array)
-        return Promise.resolve({ data: null, error: null });
-      });
-
       const mockHistory = [
         {
           id: 'history-1',
@@ -586,21 +539,17 @@ describe('Identity Handlers', () => {
       ];
 
       // Override the thenable for the history query
-      mockSupabase._queryBuilder.then = (
-        resolve: (value: { data: unknown; error: unknown }) => void
-      ) => {
-        resolve({ data: mockHistory, error: null });
-        return Promise.resolve({ data: mockHistory, error: null });
-      };
+      mockSupabase._queueReturnData(mockCurrent); // current identity (resolver)
+      mockSupabase._queueReturnData(mockHistory); // history rows
 
       const result = await handleGetIdentityHistory(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
-      expect(parsed.agentId).toBe('wren');
+      expect(parsed.sbSlug).toBe('wren');
       expect(parsed.history).toHaveLength(1);
       expect(parsed.history[0].version).toBe(1);
       expect(parsed.history[0].changeType).toBe('update');
@@ -608,15 +557,6 @@ describe('Identity Handlers', () => {
 
     it('should include permissions field in history response mapping', async () => {
       const mockCurrent = { id: 'identity-123' };
-
-      let callCount = 0;
-      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-        callCount++;
-        if (callCount === 1) {
-          return Promise.resolve({ data: mockCurrent, error: null });
-        }
-        return Promise.resolve({ data: null, error: null });
-      });
 
       const mockHistory = [
         {
@@ -655,15 +595,11 @@ describe('Identity Handlers', () => {
         },
       ];
 
-      mockSupabase._queryBuilder.then = (
-        resolve: (value: { data: unknown; error: unknown }) => void
-      ) => {
-        resolve({ data: mockHistory, error: null });
-        return Promise.resolve({ data: mockHistory, error: null });
-      };
+      mockSupabase._queueReturnData(mockCurrent); // current identity (resolver)
+      mockSupabase._queueReturnData(mockHistory); // history rows
 
       const result = await handleGetIdentityHistory(
-        { userId: 'user-123', agentId: 'wren' },
+        { userId: 'user-123', sbSlug: 'wren' },
         mockDataComposer as never
       );
 
@@ -685,7 +621,7 @@ describe('Identity Handlers', () => {
       });
 
       const result = await handleGetIdentityHistory(
-        { userId: 'user-123', agentId: 'nonexistent' },
+        { userId: 'user-123', sbSlug: 'nonexistent' },
         mockDataComposer as never
       );
 
@@ -698,18 +634,13 @@ describe('Identity Handlers', () => {
 
   describe('handleRestoreIdentity', () => {
     it('should restore identity from history', async () => {
+      mockSupabase._setReturnData({ id: 'identity-123', workspace_id: null }); // resolver lookup
       let callCount = 0;
 
       // Mock sequential calls
       mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
-          // Current identity lookup
-          return Promise.resolve({
-            data: { id: 'identity-123' },
-            error: null,
-          });
-        } else if (callCount === 2) {
           // History entry lookup
           return Promise.resolve({
             data: {
@@ -740,7 +671,7 @@ describe('Identity Handlers', () => {
       });
 
       const result = await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -758,23 +689,18 @@ describe('Identity Handlers', () => {
 
       await expect(
         handleRestoreIdentity(
-          { userId: 'user-123', agentId: 'nonexistent', version: 1 },
+          { userId: 'user-123', sbSlug: 'nonexistent', version: 1 },
           mockDataComposer as never
         )
       ).rejects.toThrow('No identity found for agent: nonexistent');
     });
 
     it('should throw when version not found in history', async () => {
+      mockSupabase._setReturnData({ id: 'identity-123', workspace_id: null }); // resolver lookup
       let callCount = 0;
 
       mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
         callCount++;
-        if (callCount === 1) {
-          return Promise.resolve({
-            data: { id: 'identity-123' },
-            error: null,
-          });
-        }
         // History lookup returns nothing
         return Promise.resolve({
           data: null,
@@ -784,24 +710,19 @@ describe('Identity Handlers', () => {
 
       await expect(
         handleRestoreIdentity(
-          { userId: 'user-123', agentId: 'wren', version: 999 },
+          { userId: 'user-123', sbSlug: 'wren', version: 999 },
           mockDataComposer as never
         )
       ).rejects.toThrow('Version 999 not found in history');
     });
 
     it('should restore permissions field from history entry', async () => {
+      mockSupabase._setReturnData({ id: 'identity-123', workspace_id: null }); // resolver lookup
       let callCount = 0;
 
       mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
-          // Current identity lookup
-          return Promise.resolve({
-            data: { id: 'identity-123' },
-            error: null,
-          });
-        } else if (callCount === 2) {
           // History entry with permissions
           return Promise.resolve({
             data: {
@@ -835,7 +756,7 @@ describe('Identity Handlers', () => {
       });
 
       await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -848,17 +769,12 @@ describe('Identity Handlers', () => {
     });
 
     it('should fall back to empty object when history permissions is null', async () => {
+      mockSupabase._setReturnData({ id: 'identity-123', workspace_id: null }); // resolver lookup
       let callCount = 0;
 
       mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
-          // Current identity lookup
-          return Promise.resolve({
-            data: { id: 'identity-123' },
-            error: null,
-          });
-        } else if (callCount === 2) {
           // History entry with null permissions
           return Promise.resolve({
             data: {
@@ -892,7 +808,7 @@ describe('Identity Handlers', () => {
       });
 
       await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -905,17 +821,12 @@ describe('Identity Handlers', () => {
     });
 
     it('should fall back to empty object when history permissions is undefined', async () => {
+      mockSupabase._setReturnData({ id: 'identity-123', workspace_id: null }); // resolver lookup
       let callCount = 0;
 
       mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
-          // Current identity lookup
-          return Promise.resolve({
-            data: { id: 'identity-123' },
-            error: null,
-          });
-        } else if (callCount === 2) {
           // History entry without permissions field at all
           return Promise.resolve({
             data: {
@@ -949,7 +860,7 @@ describe('Identity Handlers', () => {
       });
 
       await handleRestoreIdentity(
-        { userId: 'user-123', agentId: 'wren', version: 1 },
+        { userId: 'user-123', sbSlug: 'wren', version: 1 },
         mockDataComposer as never
       );
 
@@ -959,6 +870,179 @@ describe('Identity Handlers', () => {
       const updateData = updateCall[0];
 
       expect(updateData.permissions).toEqual({});
+    });
+  });
+
+  describe('workspace scope safety (Sep 10 incident)', () => {
+    const scopedRow = {
+      id: 'identity-real',
+      user_id: 'user-123',
+      agent_id: 'myra',
+      workspace_id: 'ws-personal',
+      name: 'Myra',
+      role: 'Front-line AI being',
+      description: null,
+      values: [],
+      relationships: {},
+      capabilities: [],
+      metadata: {},
+      heartbeat: 'HB',
+      soul: 'SOUL v12',
+      version: 12,
+      created_at: '2026-01-27T22:47:47Z',
+      updated_at: '2026-09-03T18:24:51Z',
+    };
+    const unscopedTwin = { ...scopedRow, id: 'identity-twin', workspace_id: null, version: 1 };
+
+    it('save without workspaceId UPDATES the existing row by id and carries its workspace_id — no twin insert', async () => {
+      // The lookup (thenable) and the write (.single) share the mock's data;
+      // the assertions are on the write shape, which is what created the twin.
+      mockSupabase._setReturnData(scopedRow);
+
+      const result = await handleSaveIdentity(
+        {
+          userId: 'user-123',
+          sbSlug: 'myra',
+          name: 'Myra',
+          role: 'Front-line AI being',
+          soul: 'SOUL v12 + reflection',
+        },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      expect(qb.update).toHaveBeenCalledTimes(1);
+      expect(qb.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workspace_id: 'ws-personal',
+          soul: 'SOUL v12 + reflection',
+          heartbeat: 'HB',
+        })
+      );
+      expect(qb.eq).toHaveBeenCalledWith('id', 'identity-real');
+      expect(qb.insert).not.toHaveBeenCalled();
+      expect(qb.upsert).not.toHaveBeenCalled();
+    });
+
+    it('save with NO existing row INSERTS with an explicit (null) workspace_id, never an omitted one', async () => {
+      mockSupabase._setReturnData(null);
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      qb.single.mockResolvedValueOnce({
+        data: { ...unscopedTwin, agent_id: 'newbie', version: 1 },
+        error: null,
+      });
+
+      const result = await handleSaveIdentity(
+        { userId: 'user-123', sbSlug: 'newbie', name: 'Newbie', role: 'New SB' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(parsed.message).toBe('Identity created');
+      expect(qb.insert).toHaveBeenCalledTimes(1);
+      const inserted = qb.insert.mock.calls[0][0] as Record<string, unknown>;
+      expect('workspace_id' in inserted).toBe(true);
+      expect(inserted.workspace_id).toBeNull();
+      expect(qb.update).not.toHaveBeenCalled();
+    });
+
+    it('get with a scoped row and an unscoped twin returns the scoped row, not "not found"', async () => {
+      mockSupabase._setArrayData([unscopedTwin, scopedRow]);
+
+      const result = await handleGetIdentity(
+        { userId: 'user-123', sbSlug: 'myra' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(parsed.identity.version).toBe(12);
+    });
+
+    it('get with two scoped rows and no workspaceId reports the ambiguity with its count', async () => {
+      mockSupabase._setArrayData([
+        scopedRow,
+        { ...scopedRow, id: 'identity-other', workspace_id: 'ws-team' },
+      ]);
+
+      const result = await handleGetIdentity(
+        { userId: 'user-123', sbSlug: 'myra' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.ambiguous).toBe(true);
+      expect(parsed.rowCount).toBe(2);
+      expect(parsed.message).toContain('Multiple rows found');
+      expect(parsed.message).not.toContain('No identity found');
+    });
+
+    it('the resolver reads the whole candidate set — it never asks the database for a truncated page (PR #595 P1)', async () => {
+      mockSupabase._setArrayData([unscopedTwin, scopedRow]);
+      await handleGetIdentity({ userId: 'user-123', sbSlug: 'myra' }, mockDataComposer as never);
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      expect(qb.limit).not.toHaveBeenCalled();
+    });
+
+    it('two scoped rows + an explicit workspaceId and no request scope: the argument decides, the save updates that row (PR #595 P2)', async () => {
+      const rowA = { ...scopedRow, id: 'identity-a', workspace_id: 'ws-a' };
+      const rowB = { ...scopedRow, id: 'identity-b', workspace_id: 'ws-b' };
+      mockSupabase._queueReturnData([rowA, rowB]); // unscoped preload → ambiguous → no derivation
+      mockSupabase._queueReturnData([rowB]); // scoped lookup under the explicit ws-b
+      mockSupabase._queueReturnData({ ...rowB, version: 13 }); // update
+
+      const result = await handleSaveIdentity(
+        {
+          userId: 'user-123',
+          sbSlug: 'myra',
+          name: 'Myra',
+          role: 'Front-line AI being',
+          workspaceId: 'ws-b',
+          soul: 'B v13',
+        },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      expect(qb.update).toHaveBeenCalledWith(
+        expect.objectContaining({ workspace_id: 'ws-b', soul: 'B v13' })
+      );
+      expect(qb.eq).toHaveBeenCalledWith('id', 'identity-b');
+      expect(qb.insert).not.toHaveBeenCalled();
+    });
+
+    it('two scoped rows, no explicit workspaceId, no request scope: the save refuses with the ambiguity, it does not insert', async () => {
+      const rowA = { ...scopedRow, id: 'identity-a', workspace_id: 'ws-a' };
+      const rowB = { ...scopedRow, id: 'identity-b', workspace_id: 'ws-b' };
+      mockSupabase._queueReturnData([rowA, rowB]);
+
+      await expect(
+        handleSaveIdentity(
+          { userId: 'user-123', sbSlug: 'myra', name: 'Myra', role: 'Front-line AI being' },
+          mockDataComposer as never
+        )
+      ).rejects.toThrow('Multiple rows found');
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      expect(qb.insert).not.toHaveBeenCalled();
+      expect(qb.update).not.toHaveBeenCalled();
+    });
+
+    it('history resolves the current row through the twin, instead of an empty history', async () => {
+      mockSupabase._setArrayData([unscopedTwin, scopedRow]);
+
+      const result = await handleGetIdentityHistory(
+        { userId: 'user-123', sbSlug: 'myra' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
     });
   });
 });
