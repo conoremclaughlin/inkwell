@@ -165,27 +165,50 @@ COMMENT ON FUNCTION public.swap_memory_embedding IS
 COMMENT ON FUNCTION public.clear_memory_embedding IS
   'Atomically remove a memory''s chunk rows, primary vector and embedding metadata, refusing if the memory was revised since p_expected_version.';
 
--- Stale LLM extractions are a property of the TEXT, so they are invalidated
--- with the text edit rather than with the re-embed that follows it. If they
--- were only dropped as part of a successful swap, a failed or superseded embed
--- would leave them on the row and the next refresh — including a summary-only
--- one — would embed them again. Nothing in the server recomputes them; the
--- offline extract-memory-llm-views script does, from the corrected text.
+-- Stale LLM extractions are a property of the TEXT, so they have to go with
+-- the text, in the same statement — not in a second call afterwards.
 --
--- A single UPDATE using the jsonb `-` operator, so there is no read-modify-
--- write window for a concurrent metadata change to fall into.
-CREATE OR REPLACE FUNCTION public.invalidate_memory_extractions(
-  p_memory_id uuid,
-  p_user_id uuid
-)
-RETURNS void
-LANGUAGE sql
+-- A separate invalidation is a window (Lumen, r3). A edits OldDB -> NewDB; B
+-- edits NewDB -> LaterDB before A's invalidation lands; the archive trigger
+-- has meanwhile snapshotted NewDB carrying OldDB's extractions into
+-- memory_history, and clearing the CURRENT row afterwards cannot reach that
+-- historical pair. A later restore brings the mismatch back. Faulting the
+-- separate call was worse still: the edit reported success and the next embed
+-- indexed OldDB into a memory that reads NewDB.
+--
+-- As a BEFORE UPDATE trigger there is no window at all: the row is never
+-- written carrying extractions of text it no longer has, and the archive
+-- trigger — also BEFORE UPDATE, reading only OLD — still records the previous
+-- revision with the extractions that genuinely described it.
+--
+-- The second condition is what keeps a restore whole: a writer supplying a
+-- DIFFERENT extraction object is stating extractions for the text it is
+-- writing, and those are not stale. Only extractions carried over unchanged
+-- from the previous revision are dropped.
+CREATE OR REPLACE FUNCTION public.strip_stale_memory_extractions()
+RETURNS trigger
+LANGUAGE plpgsql
 SET search_path = public, pg_temp
 AS $$
-  UPDATE public.memories
-  SET metadata = COALESCE(metadata, '{}'::jsonb) - 'llm_extractions'
-  WHERE id = p_memory_id AND user_id = p_user_id;
+BEGIN
+  IF (OLD.content IS DISTINCT FROM NEW.content OR OLD.summary IS DISTINCT FROM NEW.summary)
+     AND NEW.metadata -> 'llm_extractions' IS NOT DISTINCT FROM OLD.metadata -> 'llm_extractions'
+  THEN
+    NEW.metadata := COALESCE(NEW.metadata, '{}'::jsonb) - 'llm_extractions';
+  END IF;
+  RETURN NEW;
+END;
 $$;
 
-COMMENT ON FUNCTION public.invalidate_memory_extractions IS
-  'Drop cached llm_extractions from a memory whose text changed; they describe the superseded revision.';
+-- Named to sort after memory_update_archive so the ordering is deliberate
+-- rather than incidental. Correctness does not depend on it — the archive
+-- trigger reads OLD and this one writes NEW — but a reader should not have to
+-- work that out.
+DROP TRIGGER IF EXISTS memory_update_strip_stale_extractions ON public.memories;
+CREATE TRIGGER memory_update_strip_stale_extractions
+  BEFORE UPDATE ON public.memories
+  FOR EACH ROW
+  EXECUTE FUNCTION public.strip_stale_memory_extractions();
+
+COMMENT ON FUNCTION public.strip_stale_memory_extractions IS
+  'Drop llm_extractions carried unchanged across a text edit; they describe the superseded revision.';

@@ -4552,10 +4552,6 @@ export type Database = {
         };
         Returns: string;
       };
-      invalidate_memory_extractions: {
-        Args: { p_memory_id: string; p_user_id: string };
-        Returns: undefined;
-      };
       advance_agent_inbox_read_pointer: {
         Args: {
           p_agent_id: string;

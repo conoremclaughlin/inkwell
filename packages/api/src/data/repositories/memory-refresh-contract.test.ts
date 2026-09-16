@@ -94,16 +94,6 @@ function harness() {
    */
   const rpc = async (fn: string, args: Record<string, any>) => {
     rpcCalls.push({ fn, args: clone(args) });
-    if (fn === 'invalidate_memory_extractions') {
-      if (memory.id !== args.p_memory_id || memory.user_id !== args.p_user_id) {
-        return { data: null, error: null };
-      }
-      const next = { ...(memory.metadata || {}) };
-      delete next.llm_extractions;
-      memory.metadata = next;
-      return { data: null, error: null };
-    }
-
     const isSwap = fn === 'swap_memory_embedding';
     if (isSwap && faults.swapResult) return { data: faults.swapResult, error: null };
     if (isSwap && faults.swap) return { data: null, error: { message: 'synthetic swap fault' } };
@@ -174,16 +164,29 @@ function harness() {
           if (countOnly) return { data: null, count: matches(memory) ? 1 : 0, error: null };
           if (!matches(memory)) return { data: null, error: null };
           if (op === 'update') {
+            const textChanged =
+              (payload.content !== undefined && payload.content !== memory.content) ||
+              (payload.summary !== undefined && payload.summary !== memory.summary);
             // The archive trigger bumps version on a TEXT change only. A
             // metadata-only write does not move it, which is why the fence
             // alone cannot protect unrelated metadata.
+            if (textChanged) memory.version++;
+            const next = { ...memory, ...clone(payload) };
+            // memory_update_strip_stale_extractions, BEFORE UPDATE: extractions
+            // carried across a text edit unchanged never reach the stored row.
+            // A writer supplying DIFFERENT ones is stating extractions for the
+            // text it is writing, so those survive — that is what keeps a
+            // restore whole.
             if (
-              (payload.content !== undefined && payload.content !== memory.content) ||
-              (payload.summary !== undefined && payload.summary !== memory.summary)
+              textChanged &&
+              JSON.stringify((next.metadata || {}).llm_extractions) ===
+                JSON.stringify((memory.metadata || {}).llm_extractions)
             ) {
-              memory.version++;
+              const stripped = { ...(next.metadata || {}) };
+              delete stripped.llm_extractions;
+              next.metadata = stripped;
             }
-            memory = { ...memory, ...clone(payload) };
+            memory = next;
           }
           return { data: clone(memory), error: null };
         }
@@ -596,5 +599,60 @@ describe('what the repository sends, and what it believes back', () => {
 
     expect(h.rpcCalls.some((c) => c.fn === 'clear_memory_embedding')).toBe(false);
     expect(h.memory.embedding).toBe('[9,9]');
+  });
+});
+
+describe('a silent staleness is worse than a loud failure', () => {
+  it('reports a summary-cache invalidation that did not happen', async () => {
+    // The cache decides freshness by asking whether a memory was CREATED since
+    // it was computed, and an edit creates nothing. So a delete that quietly
+    // failed leaves bootstrap quoting the pre-edit text for as long as the user
+    // writes no new memories — with the edit reported as successful, which is
+    // what makes it undetectable (Lumen, r3).
+    const h = harness();
+    h.faults.cacheDelete = true;
+    await h.repo.setCachedSummary('synthetic-user', undefined, 'Pre-edit summary', 1);
+
+    await expect(
+      h.repo.updateMemory('synthetic-memory', 'synthetic-user', { content: 'New fact' })
+    ).rejects.toThrow(/could not be invalidated/);
+  });
+
+  it('reports it on the restore path too, which shares the helper', async () => {
+    const h = harness();
+    h.faults.cacheDelete = true;
+    await h.repo.setCachedSummary('synthetic-user', undefined, 'Pre-restore summary', 1);
+
+    await expect(h.repo.restoreMemory('synthetic-history', 'synthetic-user')).rejects.toThrow(
+      /could not be invalidated/
+    );
+  });
+
+  it('control: a healthy invalidation does not throw', async () => {
+    // Otherwise "throws on failure" could be satisfied by throwing always.
+    const h = harness();
+    await h.repo.setCachedSummary('synthetic-user', undefined, 'Pre-edit summary', 1);
+    await expect(
+      h.repo.updateMemory('synthetic-memory', 'synthetic-user', { content: 'New fact' })
+    ).resolves.toBeTruthy();
+  });
+
+  it('strips stale extractions inside the write, with no separate call', async () => {
+    // The invalidation used to be a second RPC after the UPDATE committed, and
+    // that gap is a real one: a concurrent edit in between lets the archive
+    // trigger snapshot the new text carrying the OLD extractions into history,
+    // where clearing the current row can never reach it (Lumen, r3).
+    const h = harness();
+    h.memory.metadata = {
+      ...h.memory.metadata,
+      llm_extractions: { durable_fact: 'the project uses OldDB' },
+    };
+
+    await h.repo.updateMemory('synthetic-memory', 'synthetic-user', {
+      content: 'The project uses NewDB',
+    });
+
+    expect(h.memory.metadata.llm_extractions).toBeUndefined();
+    expect(h.rpcCalls.map((c) => c.fn)).not.toContain('invalidate_memory_extractions');
   });
 });

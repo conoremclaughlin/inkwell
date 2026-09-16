@@ -23,6 +23,10 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../composer';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 
+// A second connection, for the one property PostgREST cannot express: a
+// transaction holding a row lock while another statement waits on it.
+const DB_URL = process.env.INTEGRATION_DB_URL;
+
 const VECTOR_DIMENSIONS = 1024;
 
 /** A vector literal the pgvector column will accept. */
@@ -288,21 +292,121 @@ describe('memory embedding swap functions', () => {
     expect(data).toBe('missing');
   });
 
-  it('drops cached extractions and leaves everything else alone', async () => {
+  it.skipIf(!DB_URL)(
+    'waits on a lock held by an in-flight edit, then sees the new revision',
+    async () => {
+      // The sequential cases above compare versions that were already different.
+      // They would pass just as well if the function only SELECTed, because
+      // nothing ever contends. This is the case that needs FOR UPDATE: the
+      // editing transaction is still open when the swap arrives, so the swap
+      // must block rather than read a version that is about to change, and then
+      // recheck against the committed value (Lumen, r3).
+      const memory = await seedMemory();
+      const { Client } = await import('pg');
+      const editor = new Client({ connectionString: DB_URL });
+      await editor.connect();
+
+      try {
+        await editor.query('BEGIN');
+        await editor.query('SELECT version FROM public.memories WHERE id = $1 FOR UPDATE', [
+          memory.id,
+        ]);
+
+        let settled = false;
+        const swap = dataComposer
+          .getClient()
+          .rpc('swap_memory_embedding', {
+            p_memory_id: memory.id,
+            p_user_id: userId,
+            p_expected_version: memory.version,
+            p_chunks: chunkPayload(memory.id, userId, ['Published while locked'], 7),
+            p_embedding: vectorLiteral(7),
+            p_chunks_version: 1,
+            p_chunk_count: 1,
+            p_metadata_patch: { embedding: { model: 'racer' } },
+          })
+          .then((result) => {
+            settled = true;
+            return result;
+          });
+
+        await new Promise((resolve) => setTimeout(resolve, 750));
+        expect(settled, 'the swap must block on the editing transaction, not read past it').toBe(
+          false
+        );
+
+        // The edit commits, bumping version through the archive trigger.
+        await editor.query('UPDATE public.memories SET content = $2 WHERE id = $1', [
+          memory.id,
+          'Corrected content',
+        ]);
+        await editor.query('COMMIT');
+
+        const { data, error } = await swap;
+        expect(error).toBeNull();
+        expect(data).toBe('superseded');
+        expect(await readChunks(memory.id)).toEqual(['Original content', 'Original extra']);
+      } finally {
+        await editor.query('ROLLBACK').catch(() => undefined);
+        await editor.end();
+      }
+    }
+  );
+
+  it('archives the previous text together with the extractions that described it', async () => {
+    // The invalidation used to be a second call after the UPDATE committed, so
+    // a concurrent edit in between let the archive trigger snapshot the NEW
+    // text carrying the OLD extractions — a mismatch in history that clearing
+    // the current row can never reach, and that a restore brings back (Lumen,
+    // r3). Done inside the write, the pairing cannot come apart.
     const memory = await seedMemory({
       llm_extractions: { durable_fact: 'the project uses OldDB' },
-      ownedByCaller: 'keep me',
+    });
+    const client = dataComposer.getClient();
+
+    await client
+      .from('memories')
+      .update({ content: 'The project uses NewDB' })
+      .eq('id', memory.id)
+      .eq('user_id', userId);
+
+    const current = await readMemory(memory.id);
+    expect((current.metadata as Record<string, unknown>).llm_extractions).toBeUndefined();
+
+    const { data: history } = await client
+      .from('memory_history')
+      .select('content, metadata')
+      .eq('memory_id', memory.id)
+      .order('archived_at', { ascending: false })
+      .limit(1);
+
+    const archived = history?.[0];
+    expect(archived?.content).toBe('Original content');
+    // The pair is consistent: old text, old extractions.
+    expect((archived?.metadata as Record<string, unknown>)?.llm_extractions).toEqual({
+      durable_fact: 'the project uses OldDB',
+    });
+  });
+
+  it('keeps extractions a writer supplies for the text it is writing', async () => {
+    // What stops the trigger from breaking restore. A caller stating NEW
+    // extractions is describing the revision it is writing, not carrying stale
+    // ones across — so those survive, and a rollback stays whole.
+    const memory = await seedMemory({
+      llm_extractions: { durable_fact: 'the project uses OldDB' },
     });
 
-    const { error } = await dataComposer.getClient().rpc('invalidate_memory_extractions', {
-      p_memory_id: memory.id,
-      p_user_id: userId,
-    });
-    expect(error).toBeNull();
+    await dataComposer
+      .getClient()
+      .from('memories')
+      .update({
+        content: 'The project uses NewDB',
+        metadata: { llm_extractions: { durable_fact: 'the project uses NewDB' } },
+      })
+      .eq('id', memory.id)
+      .eq('user_id', userId);
 
     const metadata = (await readMemory(memory.id)).metadata as Record<string, unknown>;
-    expect(metadata.llm_extractions).toBeUndefined();
-    expect(metadata.ownedByCaller).toBe('keep me');
-    expect(metadata.embedding).toEqual({ model: 'seed' });
+    expect(metadata.llm_extractions).toEqual({ durable_fact: 'the project uses NewDB' });
   });
 });

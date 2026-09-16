@@ -601,13 +601,16 @@ describe('MemoryRepository', () => {
       );
     });
 
-    it('invalidates cached extractions on a summary-only edit too', async () => {
-      // I first wrote this as a control asserting the opposite — that a summary
-      // edit could keep them, since the content they were derived from had not
-      // changed. That was wrong about what they were derived from (Lumen, r2):
-      // buildSourceBlock feeds the summary into the extraction prompt
-      // alongside the memory text, so an extraction of the old summary
-      // describes a memory that no longer says that either.
+    it('makes no separate call to invalidate extractions', async () => {
+      // It used to, and that second call was the finding (Lumen, r3): between
+      // the UPDATE committing and the invalidation landing, a concurrent edit
+      // lets the archive trigger snapshot the new text carrying the OLD
+      // extractions into history, which clearing the current row can never
+      // reach. A BEFORE UPDATE trigger does it inside the write instead, so
+      // the repository's correct behaviour here is to do nothing.
+      //
+      // The trigger itself is covered against a real database in
+      // memory-embedding-swap.integration.test.ts; a mock cannot run it.
       mockSupabase._setReturnData({
         id: 'mem-123',
         user_id: 'user-456',
@@ -617,7 +620,7 @@ describe('MemoryRepository', () => {
         salience: 'medium',
         topics: [],
         embedding: null,
-        metadata: { llm_extractions: { durable_fact: 'stale' } },
+        metadata: {},
         version: 2,
         created_at: '2026-01-26T12:00:00Z',
         expires_at: null,
@@ -625,10 +628,10 @@ describe('MemoryRepository', () => {
 
       await repo.updateMemory('mem-123', 'user-456', { summary: 'New summary' });
 
-      expect(mockSupabase.rpc).toHaveBeenCalledWith(
-        'invalidate_memory_extractions',
-        expect.objectContaining({ p_memory_id: 'mem-123', p_user_id: 'user-456' })
-      );
+      const rpcNames = (
+        mockSupabase.rpc as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls.map((call) => call[0]);
+      expect(rpcNames).not.toContain('invalidate_memory_extractions');
     });
 
     it('should not touch content/summary or refresh embeddings on salience-only update', async () => {

@@ -374,8 +374,6 @@ type EmbedOutcome =
 interface EmbedOptions {
   /** The `version` this embed was computed from; publication is fenced on it. */
   fenceVersion: number;
-  /** Ignore cached llm_extractions — they describe text that has been replaced. */
-  dropCachedExtractions?: boolean;
 }
 
 /**
@@ -387,7 +385,7 @@ interface EmbedOptions {
  */
 interface MemoryEmbeddingRpcClient {
   rpc(
-    fn: 'swap_memory_embedding' | 'clear_memory_embedding' | 'invalidate_memory_extractions',
+    fn: 'swap_memory_embedding' | 'clear_memory_embedding',
     args: Record<string, unknown>
   ): Promise<{ data: unknown; error: { message: string } | null }>;
 }
@@ -1068,16 +1066,13 @@ export class MemoryRepository {
 
     const config = this.embeddingRouter.getRuntimeConfig();
     const vettedModel = getVettedEmbeddingModel(config.provider, config.model);
-    // Cached LLM extractions describe the text they were extracted FROM. After
-    // a content correction they describe the superseded version, and the
-    // llm/merged chunk views embed them verbatim — so "the project uses OldDB"
-    // stays searchable, attached to a memory whose content now says NewDB
-    // (Lumen, r2). Dropped here and recomputed from the new text.
+    // Whatever the ROW says, which after a text edit is nothing: the
+    // memory_update_strip_stale_extractions trigger removes extractions that
+    // were carried across the edit unchanged, inside the same UPDATE. Reading
+    // the row rather than a caller's flag is the point — a flag is a promise
+    // the caller has to keep on every path, and the row is simply true.
     const llmExtractions =
-      !options.dropCachedExtractions &&
-      memory.metadata &&
-      typeof memory.metadata === 'object' &&
-      'llm_extractions' in memory.metadata
+      memory.metadata && typeof memory.metadata === 'object' && 'llm_extractions' in memory.metadata
         ? (memory.metadata.llm_extractions as Record<string, unknown>)
         : null;
     const chunks = buildMemoryEmbeddingChunks({
@@ -1550,12 +1545,11 @@ export class MemoryRepository {
     // Embeddings index the memory text — refresh them whenever it changes so
     // recall matches the edited content instead of the stale version.
     if (updates.content !== undefined || updates.summary !== undefined) {
-      // Summary counts, not just content (Lumen, r2). buildSourceBlock feeds
-      // the summary into the extraction prompt alongside the memory text, so
-      // extractions derived from the old summary describe a memory that no
-      // longer says that either. My earlier reading — that a summary edit
-      // could keep them — was wrong about what they were extracted from.
-      await this.invalidateExtractions(memory);
+      // Cached llm_extractions are dropped by the memory_update_strip_stale_extractions
+      // trigger, inside the UPDATE above, so there is nothing to do here and no
+      // window in which the row carries extractions of text it no longer has
+      // (Lumen, r3). `memory` is the post-trigger row, so the re-embed below
+      // cannot see them either.
       await this.invalidateCachedSummaries(memory.userId);
       await this.refreshMemoryEmbedding(memory);
     }
@@ -1598,39 +1592,6 @@ export class MemoryRepository {
   }
 
   /**
-   * Drop cached llm_extractions from a memory whose text changed.
-   *
-   * Done with the EDIT, not with the re-embed that follows it (Lumen, r2).
-   * Suppressing them for one embed call leaves the stale object on the row, so
-   * a failed or superseded embed — or simply the next summary-only refresh —
-   * puts "the project uses OldDB" back into the index for a memory that now
-   * says NewDB. Nothing in the server recomputes them; the offline
-   * extract-memory-llm-views script does, from the corrected text. The old
-   * object is still in memory_history, so nothing is lost.
-   */
-  private async invalidateExtractions(memory: Memory): Promise<void> {
-    const rpcClient = this.supabase as unknown as MemoryEmbeddingRpcClient;
-    const { error } = await rpcClient.rpc('invalidate_memory_extractions', {
-      p_memory_id: memory.id,
-      p_user_id: memory.userId,
-    });
-
-    if (error) {
-      logger.warn('Failed to invalidate cached memory extractions after an edit', {
-        memoryId: memory.id,
-        error: normalizeErrorDetails(error),
-      });
-      return;
-    }
-
-    if (memory.metadata && typeof memory.metadata === 'object') {
-      const metadata = { ...memory.metadata };
-      delete metadata.llm_extractions;
-      memory.metadata = metadata;
-    }
-  }
-
-  /**
    * Drop the bootstrap summary cache for a user whose memory text changed.
    *
    * getCachedSummary decides freshness by asking whether any memory was
@@ -1646,12 +1607,22 @@ export class MemoryRepository {
       .delete()
       .eq('user_id', userId);
 
-    if (error) {
-      logger.warn('Failed to invalidate cached memory summaries after an edit', {
-        userId,
-        error: normalizeErrorDetails(error),
-      });
-    }
+    if (!error) return;
+
+    // Not a warning to carry on from (Lumen, r3). The cache's own freshness
+    // check asks whether a memory was CREATED since it was computed, and an
+    // edit creates nothing — so a delete that quietly failed leaves bootstrap
+    // quoting the pre-edit text indefinitely, for as long as the user writes
+    // no new memories. Reporting the edit as successful is what makes that
+    // undetectable.
+    logger.error('Failed to invalidate cached memory summaries after an edit', {
+      userId,
+      error: normalizeErrorDetails(error),
+    });
+    throw new Error(
+      `Memory text changed but the cached summaries for user ${userId} could not be ` +
+        `invalidated; bootstrap may keep quoting the previous text. Cause: ${error.message}`
+    );
   }
 
   /**
