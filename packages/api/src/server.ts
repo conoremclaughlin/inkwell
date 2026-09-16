@@ -1185,11 +1185,16 @@ Type: ${payload.triggerType}`;
       // spans several PRs and specs. Each line carries its age, so a
       // description nobody has touched since the thread opened cannot be read
       // as a current statement of what it is about.
+      //
+      // targetSlug is passed because this text is about to be written into that
+      // SB's prompt, and a trigger may name any threadKey: the loader delivers
+      // nothing unless the recipient is a participant.
       if (dataComposer) {
         const descriptor = await loadThreadDescriptor(
           dataComposer.getClient(),
           userId,
-          payload.threadKey
+          payload.threadKey,
+          targetSlug
         );
         for (const line of formatThreadDescriptorLines(descriptor)) {
           triggerMessage += `\n${line}`;

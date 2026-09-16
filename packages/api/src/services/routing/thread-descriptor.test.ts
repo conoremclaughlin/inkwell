@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { formatEditAge, formatThreadDescriptorLines } from './thread-descriptor';
+import {
+  formatEditAge,
+  formatTitleProvenance,
+  formatThreadDescriptorLines,
+} from './thread-descriptor';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -13,9 +17,7 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
 describe('formatEditAge', () => {
-  it('says nothing when the field has never been edited', () => {
-    // 19.2% of real threads are in this state. Annotating every one of them
-    // would add noise to the line the annotation exists to clarify.
+  it('says nothing when there is no usable instant', () => {
     expect(formatEditAge(null, NOW)).toBe('');
     expect(formatEditAge(undefined, NOW)).toBe('');
   });
@@ -37,6 +39,30 @@ describe('formatEditAge', () => {
   });
 });
 
+describe('formatTitleProvenance', () => {
+  it('dates an edited title by its edit', () => {
+    expect(formatTitleProvenance(ago(4 * DAY), ago(30 * DAY), NOW)).toBe(' (set 4d ago)');
+  });
+
+  it('dates an unedited title by the thread, and says it was never edited', () => {
+    // The case Lumen's review turned around. I originally emitted "" here,
+    // reasoning that the 19.2% of threads that have never been retitled would
+    // be noisy to annotate. Backwards: an unedited title is the one MOST in
+    // need of a date. This feature's own worked example — a title reading
+    // "v1" while the artifact is at v10 — is a creation-time title, and under
+    // the old rule it rendered with nothing at all to distrust it by.
+    expect(formatTitleProvenance(null, ago(21 * DAY), NOW)).toBe(
+      ' (never edited, from the first message 21d ago)'
+    );
+  });
+
+  it('still says the title is unedited when the thread has no usable creation time', () => {
+    // No silent "" fallback: a bare confident `Title:` is the failure mode.
+    expect(formatTitleProvenance(null, null, NOW)).toBe(' (never edited, age unknown)');
+    expect(formatTitleProvenance(null, 'not-a-date', NOW)).toBe(' (never edited, age unknown)');
+  });
+});
+
 describe('formatThreadDescriptorLines', () => {
   it('emits nothing for a thread nobody has described', () => {
     // This is today's behaviour, and it must survive: a trigger for an
@@ -44,7 +70,13 @@ describe('formatThreadDescriptorLines', () => {
     // "Title:" scaffolding.
     expect(
       formatThreadDescriptorLines(
-        { title: null, summary: null, titleUpdatedAt: null, summaryUpdatedAt: null },
+        {
+          title: null,
+          summary: null,
+          titleUpdatedAt: null,
+          summaryUpdatedAt: null,
+          createdAt: ago(3 * DAY),
+        },
         NOW
       )
     ).toEqual([]);
@@ -58,6 +90,7 @@ describe('formatThreadDescriptorLines', () => {
         summary: 'Reply routing shipped in #638; thread titles in progress.',
         titleUpdatedAt: ago(4 * DAY),
         summaryUpdatedAt: ago(30 * MINUTE),
+        createdAt: ago(9 * DAY),
       },
       NOW
     );
@@ -77,6 +110,7 @@ describe('formatThreadDescriptorLines', () => {
         summary: null,
         titleUpdatedAt: ago(21 * DAY),
         summaryUpdatedAt: null,
+        createdAt: ago(40 * DAY),
       },
       NOW
     );
@@ -86,18 +120,24 @@ describe('formatThreadDescriptorLines', () => {
     ]);
   });
 
-  it('emits a title with no age when it still holds its creation-time value', () => {
+  it('never presents a creation-time title as a bare confident line', () => {
+    // Regression for Lumen's #641 finding. All 470 pre-existing titles and
+    // every new thread are in exactly this state — title set, title_updated_at
+    // NULL — and this is the shape a 21-day-stale title arrives in.
     const lines = formatThreadDescriptorLines(
       {
         title: 'Subject from the first message',
         summary: null,
         titleUpdatedAt: null,
         summaryUpdatedAt: null,
+        createdAt: ago(21 * DAY),
       },
       NOW
     );
 
-    expect(lines).toEqual(['Title: Subject from the first message']);
+    expect(lines).toEqual([
+      'Title: Subject from the first message (never edited, from the first message 21d ago)',
+    ]);
   });
 
   it('emits only the summary when there is no title', () => {
@@ -107,10 +147,31 @@ describe('formatThreadDescriptorLines', () => {
         summary: 'Described but never titled',
         titleUpdatedAt: null,
         summaryUpdatedAt: ago(2 * HOUR),
+        createdAt: ago(5 * DAY),
       },
       NOW
     );
 
     expect(lines).toEqual(['Summary of thread: Described but never titled (set 2h ago)']);
+  });
+
+  it('marks a summary whose edit time is missing rather than implying it is fresh', () => {
+    // Only update_thread writes a summary and it always stamps the time, so
+    // this is an anomalous row — written by direct SQL, or by a writer that
+    // forgot. Saying so beats letting it read as current.
+    const lines = formatThreadDescriptorLines(
+      {
+        title: null,
+        summary: 'Written by something that did not stamp the time',
+        titleUpdatedAt: null,
+        summaryUpdatedAt: null,
+        createdAt: ago(5 * DAY),
+      },
+      NOW
+    );
+
+    expect(lines).toEqual([
+      'Summary of thread: Written by something that did not stamp the time (edit time unknown)',
+    ]);
   });
 });
