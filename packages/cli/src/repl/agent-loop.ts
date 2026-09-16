@@ -860,19 +860,35 @@ export async function runAgentLoop(
     // the same route as an executed call — nothing new has to remember to
     // forward them. Pushed BEFORE the `calls.length === 0` break so a turn
     // whose ONLY block was malformed still tells the model why nothing ran.
+    // `malformed`, NOT `rejected`. The status is not a label here, it is the
+    // key the relay gate reads: `rejected` is a member of
+    // WITNESSED_REFUSAL_STATUSES — an outcome somebody AUTHORED and watched —
+    // so `hasUnseenFailure` returns false for it and `relayWorthy` stays shut.
+    // A turn whose only block was malformed therefore selected nothing, stopped
+    // `no-tools`, and told the model nothing at all: the exact silence this
+    // change exists to end, rebuilt inside the fix (Lumen, PR #646). Nobody
+    // authored a miscounted brace and nobody witnessed it, which is precisely
+    // the emergent class that predicate is a denylist for.
     const unrunnable: ToolResultRecord[] = [
       ...blocks.malformed.map((block) => ({
         tool: block.tool ?? 'unknown',
-        status: 'rejected',
+        status: 'malformed',
         result: describeMalformedBlock(block),
       })),
+      // Says only what is known HERE. This record is built at extraction, which
+      // is upstream of the screen, the per-iteration cap and the executor's
+      // policy — so a repaired call may still be dropped or blocked and never
+      // run. Claiming "the runtime RAN the call, so its result below is real"
+      // was therefore false for exactly the turns where it mattered, and it
+      // asserted execution beside a `blocked` record saying the opposite.
       ...blocks.repaired.map((block) => ({
         tool: block.tool ?? 'unknown',
         status: 'repaired',
         result:
           `Your ${block.tool ?? 'tool'} block was missing one or more closing brackets. ` +
-          `The runtime closed them and RAN the call, so its result below is real. ` +
-          `Emit balanced JSON next time — a block the runtime cannot close is discarded.`,
+          `The runtime closed them so the call could be considered at all; what then ` +
+          `happened to it is reported separately. Emit balanced JSON next time — a block ` +
+          `the runtime cannot close is discarded.`,
       })),
     ];
     if (unrunnable.length > 0) {
@@ -902,11 +918,16 @@ export async function runAgentLoop(
       };
       allToolResults.push(record);
       ports.ui.printEvent(`  ⋯ iteration refused — ${screened.rejected}`);
-      // A refusal is this iteration's entire output. Captured here so that if
-      // the cap fires below, the relay carries the rejection that stopped the
-      // loop rather than a previous iteration's leftovers.
+      // The refusal is not this iteration's ENTIRE output when the same
+      // response also carried a block that could not be read. This branch
+      // builds its own continuation body from a hand-written list, so anything
+      // omitted here is omitted from the only message the model receives —
+      // a screened turn swallowed the malformed diagnostic completely (Lumen,
+      // PR #646). Captured here too so that if the cap fires below, the relay
+      // carries both.
+      const refusalResults = [...unrunnable, record];
       stranded = {
-        results: [record],
+        results: refusalResults,
         selection: { emitted: 0, reached: 0, dropped: [], unmatched: 0 },
       };
 
@@ -925,7 +946,7 @@ export async function runAgentLoop(
       try {
         outcome = await ports.backend.runTurn(
           correcting((imitated) =>
-            buildContinuationBody([record], extracted, undefined, {
+            buildContinuationBody(refusalResults, extracted, undefined, {
               imitatedToolResults: imitated,
               budgetBytes: input.relayBudgetBytes?.(),
             })
@@ -1460,28 +1481,44 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
     const scanned = scanJsonValueEnd(text, payloadStart);
     if (scanned) {
       const closeMatch = /^[ \t\r\n]*```/.exec(text.slice(scanned.end));
-      const end = closeMatch ? scanned.end + closeMatch[0].length : scanned.end;
+      const closeAt = closeMatch ? scanned.end + closeMatch[0].length - 3 : -1;
+      const closedHere = closeMatch !== null && !opensAnotherBlock(text, closeAt);
+      const end = closedHere ? scanned.end + closeMatch![0].length : scanned.end;
       blocks.push({
         start: m.index,
         end,
         payload: text.slice(scanned.start, scanned.end),
-        fenceClosed: !!closeMatch,
+        fenceClosed: closedHere,
       });
       openRe.lastIndex = end;
       continue;
     }
     const closeIdx = text.indexOf('```', payloadStart);
-    if (closeIdx === -1) {
-      // The response ended inside the block. Report it rather than walking
-      // away: an unclosed fence is exactly the shape a truncated turn takes,
-      // and `break` used to discard it along with anything after it.
-      blocks.push({
-        start: m.index,
-        end: text.length,
-        payload: text.slice(payloadStart).trim(),
-        fenceClosed: false,
-      });
-      break;
+    // A ``` that OPENS another ink-tool block is not this block's closing
+    // fence, and reading it as one did two harms at once (Lumen, PR #646):
+    // it marked a payload the model never finished as `fenceClosed`, which is
+    // the single gate authorizing repair, and it swallowed the following block
+    // whole — `lastIndex` landed past the opener's backticks, so the sibling
+    // never matched again. A truncated `remember` was closed with invented
+    // brackets and run, and the `read` beneath it vanished.
+    const closedHere = closeIdx !== -1 && !opensAnotherBlock(text, closeIdx);
+    if (!closedHere) {
+      const payloadEnd = closeIdx === -1 ? text.length : closeIdx;
+      const payload = text.slice(payloadStart, payloadEnd).trim();
+      // Only a REQUEST is a block. Prose discussing the protocol — "close the
+      // ```ink-tool block" — matches the opening regex and never closes; when
+      // that counted as a block spanning to end-of-text, `stripLocalToolBlocks`
+      // deleted the rest of the sentence from the displayed answer. A reply
+      // reading "Close the" is a new silent loss, not a fix for one.
+      if (looksLikeToolRequest(payload)) {
+        blocks.push({ start: m.index, end: payloadEnd, payload, fenceClosed: false });
+      }
+      // The response ended inside the block; there is nothing further to scan.
+      if (closeIdx === -1) break;
+      // Resume ON the opener so the block it belongs to is found, rather than
+      // past it.
+      openRe.lastIndex = closeIdx;
+      continue;
     }
     blocks.push({
       start: m.index,
@@ -1492,6 +1529,26 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
     openRe.lastIndex = closeIdx + 3;
   }
   return blocks;
+}
+
+/** True when the ``` at `idx` starts a new ink-tool block rather than ending one. */
+function opensAnotherBlock(text: string, idx: number): boolean {
+  if (idx < 0) return false;
+  const opener = /```ink-tool[ \t]*\r?\n?/iy;
+  opener.lastIndex = idx;
+  return opener.test(text);
+}
+
+/**
+ * Does this payload ask for something, or merely mention the fence token?
+ *
+ * The distinction is the whole difference between reporting a lost call and
+ * inventing one. Prose about the protocol reaches the same code path as a
+ * truncated request; telling the model its block was discarded when it never
+ * wrote one is a different lie from the one being fixed, and just as unhelpful.
+ */
+function looksLikeToolRequest(payload: string): boolean {
+  return /^[[{]/.test(payload) || readToolName(payload) !== undefined;
 }
 
 /**
@@ -1579,15 +1636,11 @@ export function extractToolBlocks(responseText: string): {
       // result, so a persistent miscounter is corrected rather than propped up.
       const fixed = block.fenceClosed ? repairTruncatedJson(payload) : null;
       if (fixed === null) {
-        const tool = readToolName(payload);
-        // Report a REQUEST, not every fence-shaped string. Prose discussing the
-        // protocol — "close the ```ink-tool block" — matches the opening regex
-        // and reaches here with no tool name and no JSON. Telling the model its
-        // block was discarded when it never wrote one is a different lie from
-        // the one being fixed, and just as unhelpful.
-        if (tool || /^[[{]/.test(payload)) {
+        // Report a REQUEST, not every fence-shaped string — see
+        // `looksLikeToolRequest`.
+        if (looksLikeToolRequest(payload)) {
           malformed.push({
-            tool,
+            tool: readToolName(payload),
             error: firstError instanceof Error ? firstError.message : String(firstError),
             payloadLength: payload.length,
             fenceClosed: block.fenceClosed,
@@ -1602,7 +1655,22 @@ export function extractToolBlocks(responseText: string): {
       // Parseable by now: either it always was, or `repairTruncatedJson`
       // re-parsed it before returning. No catch is needed and none is wanted —
       // a swallowed throw here is how this bug looked for a month.
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      //
+      // But "parses" is not "is an object". `null`, a bare number and a string
+      // are all valid JSON, and removing the catch turned `null` from a quiet
+      // skip into a TypeError thrown out of extraction — taking the whole turn
+      // down, including every well-formed sibling in the same response (Lumen,
+      // PR #646). Removing a swallow obliges you to handle what it swallowed.
+      const value = JSON.parse(payload) as unknown;
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        malformed.push({
+          error: 'block parsed but was not a JSON object naming a tool',
+          payloadLength: payload.length,
+          fenceClosed: block.fenceClosed,
+        });
+        continue;
+      }
+      const parsed = value as Record<string, unknown>;
       // Strip the MCP namespace HERE, not at dispatch. The bare name has to be
       // canonical for the whole pipeline, because everything downstream of this
       // point branches on `call.tool`: the client-local policy bypass, the

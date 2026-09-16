@@ -14,6 +14,7 @@ import {
   isPotentialImitationPrefix,
   resolveResponseText,
   runAgentLoop,
+  stripLocalToolBlocks,
   MAX_TOOL_CALLS_PER_ITERATION,
   type AgentLoopPorts,
   type BackendTurnOutcome,
@@ -2498,28 +2499,41 @@ describe('runAgentLoop — an unrunnable block reaches the model', () => {
     // errored — but never nothing.
     expect(result.toolResults).toHaveLength(1);
     expect(result.toolResults[0]!.tool).toBe('remember');
-    expect(result.toolResults[0]!.status).toBe('rejected');
+    expect(result.toolResults[0]!.status).toBe('malformed');
     expect(String(result.toolResults[0]!.result)).toContain('was discarded');
     expect(harness.observed).toHaveLength(1);
     expect(harness.events.join('\n')).toContain('remember');
   });
 
+  /**
+   * Asserts DELIVERY, by reading what the backend was actually sent.
+   *
+   * The first version of this test called `buildFinalRelayBody` on the returned
+   * results itself and asserted the string it got back. That passes whenever
+   * the formatter works — which it did — and says nothing whatever about
+   * whether the loop ever sent it. It was green for the entire life of the
+   * branch while the relay gate was shut and the model received nothing at all
+   * (Lumen, PR #646). A test that builds the artifact it is checking for cannot
+   * observe the step that produces it.
+   */
   it('relays the rejection to the model rather than ending in silence', async () => {
     const harness = makePorts([
       outcome({
         stdout:
           'Saving that.\n\n```ink-tool\n{"tool":"remember","args":{"content":"unterminated\n```',
       }),
+      outcome({ stdout: 'Understood — re-emitting it balanced.' }),
     ]);
 
-    const result = await runAgentLoop(
+    await runAgentLoop(
       { prompt: 'go', toolRouting: 'local', relayBudgetBytes: () => 4000 },
       harness.ports
     );
 
-    const relay = buildFinalRelayBody(result.toolResults, undefined, { budgetBytes: 4000 });
-    expect(relay).toContain('remember');
-    expect(relay).toContain('discarded');
+    const continuations = harness.prompts.filter((p) => p.isContinuation).map((p) => p.body);
+    expect(continuations).toHaveLength(1);
+    expect(continuations[0]).toContain('remember');
+    expect(continuations[0]).toContain('discarded');
   });
 
   it('a malformed block does not make a healthy turn read as all-refused', async () => {
@@ -2536,7 +2550,175 @@ describe('runAgentLoop — an unrunnable block reaches the model', () => {
 
     expect(result.stopReason).not.toBe('all-refused');
     expect(harness.executed[0]!.map((c) => c.tool)).toEqual(['bash']);
-    expect(result.toolResults.map((r) => r.status)).toEqual(['rejected', 'executed']);
+    expect(result.toolResults.map((r) => r.status)).toEqual(['malformed', 'executed']);
+  });
+});
+
+/**
+ * REGRESSIONS (Lumen, PR #646 round 1). Every one of these failed against
+ * e3365b0d, the head that carried the first version of this fix.
+ *
+ * The common shape is worth naming, because it is not seven unrelated bugs: the
+ * fix reported unrunnable blocks by pushing records onto the existing results
+ * channel and assumed that channel delivers. It does not deliver unconditionally
+ * — it is gated, in three separate places, on what the RECORD says about itself.
+ * Choosing `rejected` as the status closed the main gate; the screen-rejection
+ * branch builds its own message and never looked; and the repaired notice made a
+ * claim about execution from a point upstream of everything that decides it.
+ *
+ * "Rides the normal channel, so nothing new has to remember to forward it" was
+ * the design argument in the PR body. The channel had conditions I had read and
+ * not applied to my own records.
+ */
+describe('REGRESSION (Lumen, PR #646): an unrunnable block is reported, and only what is true', () => {
+  const malformedRemember = '```ink-tool\n{"tool":"remember","args":{"content":"unterminated\n```';
+  /** One `}` short and properly fenced: the repairable shape. */
+  const repairableRemember = '```ink-tool\n{"tool":"remember","args":{"content":"note"}\n```';
+
+  it('sends a sole malformed block to the backend instead of stopping silently', async () => {
+    // `rejected` is a WITNESSED refusal, so `hasUnseenFailure` was false, so
+    // `relayWorthy` was false. The turn ended `no-tools` having told the model
+    // nothing — the seven-in-a-row silence, rebuilt inside its own fix.
+    const harness = makePorts([
+      outcome({ stdout: 'Saving that.\n' + malformedRemember }),
+      outcome({ stdout: 'Acknowledged.' }),
+    ]);
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    const continuations = harness.prompts.filter((p) => p.isContinuation).map((p) => p.body);
+    expect(continuations.join('\n')).toContain('remember');
+    expect(continuations.join('\n')).toContain('discarded');
+  });
+
+  it('reports a malformed block emitted beside a terminal signal', async () => {
+    // The heartbeat shape. `signal_status` stops the loop, and the malformed
+    // sibling left with it.
+    const harness = makePorts(
+      [
+        outcome({
+          stdout: malformedRemember + '\n' + inkTool('signal_status', { status: 'completed' }),
+        }),
+        outcome({ stdout: 'Acknowledged.' }),
+      ],
+      (calls) =>
+        calls.map((c) => ({
+          tool: c.tool,
+          status: 'executed',
+          result: { content: [{ type: 'text', text: '{"signal":{"status":"completed"}}' }] },
+        }))
+    );
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(
+      harness.prompts
+        .filter((p) => p.isContinuation)
+        .map((p) => p.body)
+        .join('\n')
+    ).toContain('remember');
+  });
+
+  it('keeps the diagnostic when the screen refuses the whole iteration', async () => {
+    // This branch composes its own continuation body from a hand-written list.
+    // Anything left out of that list is left out of the only message sent.
+    const harness = makePorts([
+      outcome({ stdout: malformedRemember + '\n' + inkTool('spawn_agent', { task: 'x' }) }),
+      outcome({ stdout: 'Acknowledged.' }),
+    ]);
+    harness.ports.tools.screen = () => ({ rejected: 'spawn_agent must be alone' });
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(
+      harness.prompts
+        .filter((p) => p.isContinuation)
+        .map((p) => p.body)
+        .join('\n')
+    ).toContain('remember');
+  });
+
+  it('never claims a repaired call ran when policy blocked it', async () => {
+    // The repaired record is built at EXTRACTION — upstream of the screen, the
+    // cap and the executor's policy. "The runtime closed them and RAN the call,
+    // so its result below is real" therefore sat directly beside a `blocked`
+    // record saying the opposite.
+    const harness = makePorts(
+      [outcome({ stdout: repairableRemember }), outcome({ stdout: 'Acknowledged.' })],
+      (calls) => calls.map((c) => ({ tool: c.tool, status: 'blocked', result: 'policy' }))
+    );
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(result.toolResults.some((r) => r.status === 'blocked')).toBe(true);
+    expect(JSON.stringify(result.toolResults)).not.toContain('RAN the call');
+  });
+
+  it('never claims a repaired call ran when the cap dropped it', async () => {
+    const harness = makePorts([
+      outcome({
+        stdout:
+          ['a', 'b', 'c', 'd', 'e'].map((t) => inkTool(t, {})).join('\n') +
+          '\n' +
+          repairableRemember,
+      }),
+      outcome({ stdout: 'Acknowledged.' }),
+    ]);
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(harness.executed[0]!.map((c) => c.tool)).not.toContain('remember');
+    expect(JSON.stringify(result.toolResults)).not.toContain('RAN the call');
+    expect(harness.prompts.map((p) => p.body).join('\n')).not.toContain('RAN the call');
+  });
+
+  it('does not throw — or lose a well-formed sibling — on a payload of `null`', () => {
+    // `null` is valid JSON. Deleting the `catch { continue }` turned it from a
+    // quiet skip into a TypeError thrown out of extraction, killing the whole
+    // turn including every good block in it. Removing a swallow obliges you to
+    // handle what it swallowed.
+    const text = '```ink-tool\nnull\n```\n' + inkTool('bash', { command: 'echo ok' });
+
+    expect(() => extractToolBlocks(text)).not.toThrow();
+    const { calls, malformed } = extractToolBlocks(text);
+    expect(calls.map((c) => c.tool)).toEqual(['bash']);
+    expect(malformed).toHaveLength(1);
+  });
+
+  it('leaves prose that merely mentions the fence token intact in the reply', async () => {
+    // Recording an unclosed fence as a block spanning to end-of-text made
+    // `stripLocalToolBlocks` delete the rest of the sentence. The answer the
+    // human read was the four words before the backticks.
+    const prose =
+      'Close the ```ink-tool` block explicitly — an unclosed fence used to swallow the rest of the turn.';
+
+    expect(stripLocalToolBlocks(prose)).toBe(prose);
+
+    const harness = makePorts([outcome({ stdout: prose })]);
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(result.assistantDisplayText).toBe(prose);
+  });
+
+  it('does not read the next block’s opener as permission to repair the one above it', () => {
+    // `indexOf('```')` found the FOLLOWING block's opening fence and called it
+    // this block's close. That set `fenceClosed`, which is the sole gate
+    // authorizing repair — so a payload the model never finished was closed
+    // with invented brackets and run — and it swallowed the sibling whole.
+    const text =
+      '```ink-tool\n{"tool":"remember","args":{"content":"partial"}\n' +
+      inkTool('read', { path: 'x' });
+
+    const { calls } = extractToolBlocks(text);
+
+    expect(calls.map((c) => c.tool)).not.toContain('remember');
+    expect(calls.map((c) => c.tool)).toContain('read');
+  });
+
+  it('control: a closed one-brace-short block is still repaired and run', () => {
+    const { calls, repaired } = extractToolBlocks(repairableRemember);
+
+    expect(calls[0]!.args).toEqual({ content: 'note' });
+    expect(repaired).toHaveLength(1);
   });
 });
 
