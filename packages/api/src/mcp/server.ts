@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import { createHttpRateLimiter } from '../security/http-rate-limit';
+import { createHttpRateLimiters } from '../security/http-rate-limit';
 import { createBrowserCors, requireCookieCsrfHeader } from '../security/cookie-csrf';
 import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
@@ -402,10 +402,12 @@ export class MCPServer {
     app.use(createBrowserCors());
 
     // Bound work before any authentication, DB lookup, process spawn, or file
-    // read. All routers (including hooks and observer SSE handshakes) inherit
-    // this ceiling. A separate auth bucket cannot starve lifecycle traffic.
-    app.use(createHttpRateLimiter());
-    app.use(['/authorize', '/mcp/auth/callback', '/token', '/register'], createHttpRateLimiter(60));
+    // read. Direct loopback clients are exempt by default; forwarded requests
+    // are not. The OAuth bucket is additional, not reserved lifecycle capacity:
+    // even OAuth-rejected attempts still count against the ingress bucket.
+    const httpRateLimiters = createHttpRateLimiters(env);
+    app.use(httpRateLimiters.ingress);
+    app.use(['/authorize', '/mcp/auth/callback', '/token', '/register'], httpRateLimiters.oauth);
 
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)

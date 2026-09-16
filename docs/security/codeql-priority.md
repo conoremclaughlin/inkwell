@@ -15,7 +15,7 @@ not a claim that default-branch alerts close before this branch is merged.
 | 60–63      | Render fixed OAuth callback pages; provider/query/error/account strings do not enter HTML. Validate provider-bound state before consumption.                                                                            |
 | 56, 57, 59 | Replace regex HTML filtering with sanitize-html parsing, allowing no tags or attributes. Prompt sanitization is not authorization or execution isolation.                                                               |
 | 58         | Replace partial regex escaping in an attachment test with a literal assertion.                                                                                                                                          |
-| 45–55      | Apply ingress rate limiting before route work, with a separate tighter OAuth budget.                                                                                                                                    |
+| 45–55      | Apply configurable ingress/OAuth rate limits before route work. Direct loopback clients are deliberately exempt by default; requests carrying forwarding indicators are not.                                            |
 | 44         | Use crypto.randomInt for pairing symbols. The old alphabet had 32 symbols and its byte-modulo sampling was already unbiased; this preserves uniformity if the alphabet changes.                                         |
 | 64         | Generate session identifiers using crypto.randomUUID.                                                                                                                                                                   |
 | 4–6        | Bound email validation and replace backtracking suffix normalization with linear/bounded operations.                                                                                                                    |
@@ -80,11 +80,39 @@ provider redirects rather than resolve the protocol's exposure tradeoff.
 
 ## Operational limits and verification
 
-- Rate budgets are per process and socket IP: 1,200 requests/minute aggregate,
-  60/minute on the OAuth endpoints. Existing tighter mobile account/IP limits
-  remain. A reverse proxy or NAT shares a budget; this is not a distributed
-  quota or substitute for authorization. Do not enable blanket trust-proxy to
-  work around it.
+- Rate budgets are in memory, per process and socket IP. The defaults are
+  1,200 requests/minute aggregate and an additional shared 60/minute on the
+  OAuth endpoints. Existing tighter mobile account/IP limits remain unchanged,
+  including for localhost. OAuth-rejected attempts still consume the aggregate
+  budget; no capacity is reserved for lifecycle traffic.
+- Direct loopback clients (127.0.0.0/8, ::1 and mapped IPv4 equivalents) are
+  exempt from these two new budgets by default. This changes neither
+  authentication nor CORS/CSRF. Forwarding indicators (`Forwarded`,
+  `X-Forwarded-*`, `CF-*`, `X-Real-IP`, `True-Client-IP`, `Via`, `CDN-Loop`)
+  remove the exemption even when empty or claiming localhost. Their values
+  are never used to grant an exemption or choose a budget key. Thus a local
+  dashboard proxy can still share a limited bucket with other forwarded traffic.
+- A headerless local proxy is indistinguishable from a direct local client.
+  Disable the loopback exemption for that deployment; do not assume this
+  heuristic proves network provenance. Future explicit proxy trust and client
+  attribution are specified in the shared artifact **ink://specs/http-rate-limiting**.
+  No Cloudflare header trust or blanket Express trust-proxy is enabled here.
+- The following environment variables are validated at startup. Numeric values
+  must be positive decimal integers (zero is not a disable switch); windows
+  are bounded to Node's timer capacity. Invalid values fail startup rather than
+  silently removing protection. Changes require a server restart, not a rebuild:
+
+  | Variable                         | Default | Purpose                                                      |
+  | -------------------------------- | ------- | ------------------------------------------------------------ |
+  | `INK_HTTP_RATE_LIMIT_MAX`        | `1200`  | Aggregate requests per window                                |
+  | `INK_HTTP_RATE_LIMIT_WINDOW_MS`  | `60000` | Aggregate window in milliseconds                             |
+  | `INK_OAUTH_RATE_LIMIT_MAX`       | `60`    | Shared OAuth requests per window                             |
+  | `INK_OAUTH_RATE_LIMIT_WINDOW_MS` | `60000` | OAuth window in milliseconds                                 |
+  | `INK_RATE_LIMIT_EXEMPT_LOOPBACK` | `true`  | Direct-loopback exemption; use `false` to count all requests |
+
+  A reverse proxy or NAT still shares a budget for non-exempt traffic. This is
+  neither a distributed quota nor a concurrency limit or substitute for authorization.
+
 - Studio roots remain operator-selected. Normalized path containment is not
   a general filesystem sandbox against a hostile local process replacing
   symlinks. No tenant or repository authorization policy is broadened.
