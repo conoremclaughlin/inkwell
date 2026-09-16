@@ -1,6 +1,4 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import {
   formatEditAge,
   formatTitleProvenance,
@@ -198,52 +196,22 @@ describe('formatThreadDescriptorLines', () => {
   });
 });
 
-describe('the trigger call site still passes a recipient', () => {
-  /**
-   * A source-text check, and deliberately so. The membership argument is what
-   * keeps a thread's description away from non-participants, and the ONLY
-   * caller is the trigger preamble in server.ts — which cannot be imported
-   * here, because that module ends in an unconditional startServer().
-   *
-   * It exists because of a specific, known hazard rather than as general
-   * belt-and-braces. #641 is stacked on #638, and #638's r1 fix rewrites the
-   * same region of server.ts that this call lives in — 116 lines deleted from
-   * the trigger path. That merge resolution has to re-place this block by hand,
-   * and if it drops the call, or keeps it with the old three arguments, every
-   * behavioural test in this PR stays green: they exercise loadThreadDescriptor
-   * directly, and a caller that no longer exists breaks none of them. A
-   * branch-only addition lost in a merge leaves no hunk in either diff to see.
-   *
-   * What each mutation actually costs, since my commit message for this file
-   * got it wrong and Lumen measured it: dropping the fourth argument fails
-   * CLOSED, not open — `loadThreadDescriptor` returns null on a falsy
-   * recipientSlug, so every thread silently loses its description. It is the
-   * membership JOIN inside the loader that stands between a description and a
-   * non-participant, and that has behavioural tests of its own. This guard is
-   * against the feature quietly ceasing to exist, in either half of its wiring.
-   *
-   * It asserts a call shape, not behaviour. If the call site legitimately moves
-   * to another module, move this check with it rather than deleting it.
-   */
-  const serverSource = readFileSync(join(__dirname, '../../server.ts'), 'utf8');
-
-  it('calls loadThreadDescriptor exactly once, with the trigger target', () => {
-    const calls = serverSource.match(/loadThreadDescriptor\s*\(([^;]*?)\)\s*;/gs) ?? [];
-    expect(calls).toHaveLength(1);
-    // The recipient is the fourth argument; without it the loader returns null
-    // for everyone and the preamble goes back to carrying only the key.
-    expect(calls[0]).toContain('targetSlug');
-  });
-
-  it('renders the descriptor lines it loads', () => {
-    // The other half of the wiring: loading the descriptor and never emitting
-    // it would be a silent no-op, and equally invisible.
-    //
-    // Matching the bare name was not enough — the import statement carries it,
-    // so deleting the render loop outright left all fourteen tests green
-    // (Lumen, #641 round 2). A call has a parenthesis after the name; an
-    // import does not.
-    const calls = serverSource.match(/formatThreadDescriptorLines\s*\(/g) ?? [];
-    expect(calls).toHaveLength(1);
-  });
-});
+/*
+ * The trigger call site used to be guarded here by matching the text of
+ * server.ts. That guard existed for one hazard: this branch is stacked on #638,
+ * whose fix rewrites the same region of server.ts the call lives in, and no test
+ * in this file could see a caller dropped by that merge — they all exercise
+ * loadThreadDescriptor directly.
+ *
+ * The merge has now happened, and it brought the instrument that replaces the
+ * guard. `channels/trigger-retry-listener.test.ts` lifts the real default
+ * handler out of server.ts by its AST and runs that source in a VM, so the
+ * call site can be tested by executing it: see "the thread describes itself in
+ * the prompt the SB actually reads" there, which asserts that the description
+ * is loaded for the RECIPIENT and that its lines reach the prompt.
+ *
+ * Measured on the integrated head before removing this: dropping the recipient
+ * argument, and deleting the render loop, each failed both the old source-text
+ * guard and the new executing tests. Superseded rather than merely duplicated —
+ * a source match cannot tell whether the call runs or what it produces.
+ */

@@ -117,6 +117,8 @@ interface RigOptions {
   cleanupThrows?: boolean;
   /** Refuse from handleMessage's own admission, as a structured result. */
   resultRefusal?: { threadKey: string; detail: Record<string, unknown> };
+  /** What the thread says about itself, as the descriptor loader would answer. */
+  descriptor?: { lines: string[] };
 }
 
 function rig(options: RigOptions = {}) {
@@ -125,6 +127,8 @@ function rig(options: RigOptions = {}) {
   const writes: Array<{ table: string; op: string; value?: Record<string, unknown> }> = [];
   const activities: Array<Record<string, unknown>> = [];
   const redispatched: Array<Record<string, unknown>> = [];
+  const descriptorLoads: unknown[][] = [];
+  const requests: Array<Record<string, unknown>> = [];
 
   const retryModule = loadModule(
     resolve(API_SRC, 'channels/trigger-retry.ts'),
@@ -232,7 +236,8 @@ function rig(options: RigOptions = {}) {
         if (options.planRefusal) throw options.planRefusal;
         return { id: 'session-synthetic', messageCount: 1 };
       },
-      async handleMessage() {
+      async handleMessage(request: Record<string, unknown>) {
+        requests.push(request);
         if (options.resultRefusal) {
           return {
             success: false,
@@ -249,6 +254,19 @@ function rig(options: RigOptions = {}) {
       },
       async endSession() {},
     },
+    // Before writing the prompt, the handler asks the thread what it is about.
+    // The real loader answers null for a thread nobody has described — which is
+    // this synthetic thread — and catches its own query errors rather than
+    // throwing, so these stand-ins are the shipping behaviour and not a softened
+    // version of it. They record their arguments because the recipient slug is
+    // the entire membership check on the reading side: a description is written
+    // into that SB's prompt, and a trigger may name any thread key.
+    loadThreadDescriptor: async (...args: unknown[]) => {
+      descriptorLoads.push(args);
+      return options.descriptor ?? null;
+    },
+    formatThreadDescriptorLines: (descriptor: { lines: string[] } | null) =>
+      descriptor ? descriptor.lines : [],
     getUserFromContext: () => ({ userId: 'user-synthetic' }),
     logInkmail: async () => {},
     assignThreadParticipant: async () => ({ stampPersisted: true }),
@@ -293,6 +311,8 @@ function rig(options: RigOptions = {}) {
     writes,
     activities,
     redispatched,
+    descriptorLoads,
+    requests,
     row,
     threadPayload,
     get sessionTurns() {
@@ -446,6 +466,65 @@ describe('server.ts wiring', () => {
     expect(
       parent && ts.isFunctionDeclaration(parent) ? parent.name?.text : '(not a declaration)'
     ).toBe('startServer');
+  });
+});
+
+describe('the thread describes itself in the prompt the SB actually reads', () => {
+  // This harness runs the handler source that ships, so it can settle by
+  // execution what #641 had been asserting by matching the text of server.ts:
+  // that the description is loaded for the recipient and reaches the prompt.
+  // A source-text guard cannot see either. Removing the render loop, or the
+  // recipient argument, fails here.
+  it('writes the descriptor lines under the thread key', async () => {
+    const r = rig({ descriptor: { lines: ['About: the legibility commission (edited 2h ago)'] } });
+
+    await r.gateway.handler!(r.threadPayload);
+
+    const content = r.requests[0]?.content as string;
+    expect(content, 'the handler must reach handleMessage at all').toBeTruthy();
+    expect(content).toContain('Thread: pr:42');
+    expect(content).toContain('About: the legibility commission (edited 2h ago)');
+    // Order is the point: the description qualifies the key, so it follows it
+    // and precedes the boilerplate about how to fetch the thread.
+    expect(content.indexOf('Thread: pr:42')).toBeLessThan(
+      content.indexOf('About: the legibility commission')
+    );
+    expect(content.indexOf('About: the legibility commission')).toBeLessThan(
+      content.indexOf('IMPORTANT: This is a system trigger')
+    );
+  });
+
+  it('asks for the description as the recipient, not as the sender', async () => {
+    const r = rig();
+
+    await r.gateway.handler!(r.threadPayload);
+
+    expect(r.descriptorLoads, 'the descriptor was never loaded').toHaveLength(1);
+    const [, userId, threadKey, recipientSlug] = r.descriptorLoads[0];
+    expect(userId).toBe('user-synthetic');
+    expect(threadKey).toBe('pr:42');
+    // The argument that makes the membership JOIN mean anything. Dropping it
+    // does not leak — the loader refuses a falsy slug — but it silently costs
+    // every thread its description, which no other test in this file would see.
+    expect(recipientSlug).toBe('recipient-test');
+  });
+
+  it('says nothing extra when the thread has no description', async () => {
+    const r = rig();
+
+    await r.gateway.handler!(r.threadPayload);
+
+    const content = r.requests[0]?.content as string;
+    expect(content).toContain('Thread: pr:42');
+    expect(content).toMatch(/Thread: pr:42\n\n---/);
+  });
+
+  it('loads nothing for a trigger that names no thread', async () => {
+    const r = rig();
+
+    await r.gateway.handler!({ ...r.threadPayload, threadKey: undefined, threadId: undefined });
+
+    expect(r.descriptorLoads).toHaveLength(0);
   });
 });
 
