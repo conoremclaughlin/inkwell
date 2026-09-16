@@ -2460,6 +2460,10 @@ describe('repairTruncatedJson', () => {
     expect(repairTruncatedJson('{"a":"x\\')).toBeNull();
     // Mismatched brackets are not a miscount, they are a different error.
     expect(repairTruncatedJson('{"a":[1}')).toBeNull();
+    // Unbalanced AND invalid: the stack says "one `}` short", so repair
+    // proposes `{"a":,}` — and the re-parse is what refuses it. Exercises the
+    // one check in repairTruncatedJson that is load-bearing.
+    expect(repairTruncatedJson('{"a":,')).toBeNull();
     // Already balanced but invalid: repair must not paper over other faults.
     expect(repairTruncatedJson('{"a":,}')).toBeNull();
     // Nothing open: returning the input unchanged would hide a real parse error.
