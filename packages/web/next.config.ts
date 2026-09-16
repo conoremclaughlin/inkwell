@@ -4,6 +4,10 @@ const pcpPortBase = Number(process.env.INK_PORT_BASE || 3001);
 const apiUrl = process.env.API_URL || `http://localhost:${pcpPortBase}`;
 
 const nextConfig: NextConfig = {
+  // CSRF compares the browser's exact origin against request.url. NextURL
+  // otherwise rewrites loopback IPs to localhost, losing the original host.
+  // Preserve it rather than granting cross-origin equivalence to local aliases.
+  skipMiddlewareUrlNormalize: true,
   // Allow API calls to the backend
   async rewrites() {
     return [

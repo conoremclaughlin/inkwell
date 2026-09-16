@@ -76,6 +76,7 @@ describe('cookie mutation CSRF boundary', () => {
     for (const origin of [
       'https://attacker.example',
       'http://localhost:3002.attacker.example',
+      'http://localhost:4002', // Alternate dashboards use their same-origin proxy, not this CORS grant.
       'null',
     ]) {
       const response = await fetch(test.url, {

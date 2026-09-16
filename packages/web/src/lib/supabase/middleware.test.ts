@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { NextRequest } from 'next/server';
+import nextConfig from '../../../next.config';
 
 const BASE_PORT = Number(process.env.INK_PORT_BASE || 3001);
 const WEB_PORT = BASE_PORT + 1;
@@ -173,11 +174,74 @@ describe('middleware updateSession', () => {
 });
 
 describe('cookie-to-bearer mutation protection', () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     vi.clearAllMocks();
+    // Mirror Next's build-time mapping of the actual application config. If
+    // the flag regresses, the IP-literal origin cases below must fail.
+    vi.stubEnv(
+      '__NEXT_NO_MIDDLEWARE_URL_NORMALIZE',
+      nextConfig.skipMiddlewareUrlNormalize ? '1' : undefined
+    );
     mockGetSession.mockResolvedValue({
       data: { session: { access_token: 'synthetic-supabase-token' } },
     });
+  });
+
+  it.each([
+    'http://localhost:3002',
+    'http://localhost:4002',
+    'http://localhost:5002',
+    'http://127.0.0.1:4002',
+    'http://[::1]:4002',
+  ])('supports same-origin dashboard mutations at %s without a CORS exception', async (origin) => {
+    const response = await updateSession(
+      new NextRequest(`${origin}/api/admin/tasks`, {
+        method: 'POST',
+        headers: {
+          cookie: 'pcp-admin-token=synthetic-token',
+          origin,
+          'sec-fetch-site': 'same-origin',
+        },
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-middleware-request-x-inkwell-csrf')).toBe('1');
+    expect(response.headers.get('x-middleware-request-authorization')).toBe(
+      'Bearer synthetic-token'
+    );
+  });
+
+  it.each([
+    ['http://127.0.0.1:4002', 'http://localhost:4002'],
+    ['http://localhost:4002', 'http://127.0.0.1:4002'],
+    ['http://[::1]:4002', 'http://localhost:4002'],
+  ])('keeps browser origins distinct: request %s, Origin %s', async (target, origin) => {
+    const response = await updateSession(
+      new NextRequest(`${target}/api/admin/tasks`, {
+        method: 'POST',
+        headers: { cookie: 'pcp-admin-token=synthetic-token', origin },
+      })
+    );
+    expect(response.status).toBe(403);
+    expect(mockGetSession).not.toHaveBeenCalled();
+  });
+
+  it('does not treat other localhost ports as the dashboard origin', async () => {
+    const response = await updateSession(
+      new NextRequest('http://localhost:4002/api/admin/tasks', {
+        method: 'POST',
+        headers: {
+          cookie: 'pcp-admin-token=synthetic-token',
+          origin: 'http://localhost:3002',
+          'x-forwarded-host': 'localhost:3002',
+          'X-Inkwell-CSRF': '1',
+        },
+      })
+    );
+    expect(response.status).toBe(403);
+    expect(mockGetSession).not.toHaveBeenCalled();
+    expect(mockGetUser).not.toHaveBeenCalled();
   });
 
   it.each(['pcp-admin-token=synthetic-token', 'sb-synthetic-auth=synthetic-session'])(

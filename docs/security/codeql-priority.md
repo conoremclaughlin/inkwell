@@ -48,6 +48,9 @@ back to a refresh cookie on the API.
   before any credential conversion. Opaque origins and same-site siblings are
   rejected. Target origin comes from the actual request URL, not an untrusted
   forwarded-host header; custom ports and LAN hosts remain supported.
+  Next.js URL normalization is disabled so loopback IP literals retain their
+  actual browser origin instead of being rewritten to localhost. Local host
+  aliases and different ports are still distinct origins, not exemptions.
 - After that check, the proxy supplies `X-Inkwell-CSRF: 1`. This is a
   **non-simple request header**, not a secret token. Incoming copies cannot
   bypass the proxy's origin check.
