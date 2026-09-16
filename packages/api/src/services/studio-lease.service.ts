@@ -244,6 +244,40 @@ export function isLeaseStale(lease: StudioLease, nowMs: number = Date.now()): bo
   return nowMs - heartbeat > LEASE_STALE_MS;
 }
 
+/**
+ * The REAL session and thread a lease record attributes to — never the
+ * record's own identity when that record is itself a claim.
+ *
+ * A quarantined lease IS a claim record: `claimRecord` mints `sessionId` as a
+ * random token and sets `threadKey` to the `__quarantine__` sentinel, so
+ * neither field names a session or a thread. Only what the claim carried
+ * forward — `holderSessionId`, `heldThreadKey` — attributes anything, and a
+ * claim taken over vacancy carried nothing. There the holder is genuinely
+ * unknown, and unknown is the honest answer: `undefined`, not the token.
+ *
+ * Every caller that turns a lease into attribution goes through here. The
+ * `holderSessionId ?? sessionId` idiom this replaces was correct for an
+ * ordinary lease and silently wrong for a claim, and it had been written out
+ * by hand at three sites — including `claimRecord` itself, so a claim of a
+ * claim inherited the earlier token as its "previous holder" and every event
+ * downstream repeated it. Lumen found it feeding a token into
+ * `studio_lease_events.session_id` on PR #650, the column whose whole purpose
+ * is to settle "held by session <uuid>" readings rather than manufacture them.
+ */
+export function leaseAttribution(lease: StudioLease | null | undefined): {
+  sessionId?: string;
+  threadKey?: string;
+} {
+  if (!lease) return {};
+  if (lease.quarantined) {
+    return { sessionId: lease.holderSessionId, threadKey: lease.heldThreadKey };
+  }
+  return {
+    sessionId: lease.holderSessionId ?? lease.sessionId,
+    threadKey: lease.heldThreadKey ?? lease.threadKey,
+  };
+}
+
 export function parseStudioLease(raw: Json | null | undefined): StudioLease | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const obj = raw as Record<string, unknown>;
@@ -834,9 +868,12 @@ export class StudioLeaseService {
       worktreePath,
       hadLease: Boolean(lease),
     });
+    // Attribution, not identity: a STALE quarantine reaches here (the fresh
+    // one returned above), and its own sessionId is a claim token.
+    const retired = leaseAttribution(lease);
     await this.logEvent(req.userId, req.studioId, 'released', {
-      sessionId: lease?.holderSessionId ?? lease?.sessionId,
-      threadKey: lease?.heldThreadKey ?? lease?.threadKey,
+      sessionId: retired.sessionId,
+      threadKey: retired.threadKey,
       sbSlug: lease?.sbSlug ?? req.sbSlug,
       sbId: lease?.sbId,
       reason: 'worktree-absent-retired',
@@ -1016,7 +1053,12 @@ export class StudioLeaseService {
   /**
    * Build a quarantine/claim record. sessionId is a fresh random token —
    * ownership is unforgeable, so concurrent workers can never both believe
-   * they hold the same claim, and event rows always carry a valid uuid.
+   * they hold the same claim.
+   *
+   * The carried-through attribution comes from `leaseAttribution`, so a claim
+   * of a CLAIM inherits only what the earlier claim actually knew. Claiming a
+   * stale quarantine that itself began over vacancy yields no holder at all,
+   * and the record says so rather than adopting the earlier token.
    */
   private claimRecord(
     holder: StudioLease | null,
@@ -1024,11 +1066,12 @@ export class StudioLeaseService {
     reason: string,
     fallbackThreadKey?: string
   ): StudioLease {
+    const prior = leaseAttribution(holder);
     return {
       sessionId: randomUUID(),
       threadKey: QUARANTINE_THREAD_KEY,
-      heldThreadKey: holder?.heldThreadKey ?? holder?.threadKey ?? fallbackThreadKey,
-      holderSessionId: holder?.holderSessionId ?? holder?.sessionId,
+      heldThreadKey: prior.threadKey ?? fallbackThreadKey,
+      holderSessionId: prior.sessionId,
       sbSlug: holder?.sbSlug ?? 'system',
       sbId: holder?.sbId ?? null,
       acquiredAt: holder?.acquiredAt ?? new Date().toISOString(),
@@ -1106,9 +1149,12 @@ export class StudioLeaseService {
           worktreePath,
           previousHolder: { sessionId: holder.sessionId, threadKey: holder.threadKey },
         });
+        // `resolveOccupied` routes a STALE quarantine here, so `holder` may
+        // itself be a claim — attribute through the resolver, not its token.
+        const previous = leaseAttribution(holder);
         await this.logEvent(req.userId, req.studioId, 'released', {
-          sessionId: holder.holderSessionId ?? holder.sessionId,
-          threadKey: holder.heldThreadKey ?? holder.threadKey,
+          sessionId: previous.sessionId,
+          threadKey: previous.threadKey,
           sbSlug: holder.sbSlug,
           sbId: holder.sbId,
           reason: 'worktree-absent-retired',
