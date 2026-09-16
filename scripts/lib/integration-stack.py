@@ -158,7 +158,9 @@ def configuration(root, project, ports):
             line = line[:field.start(3)] + str(replacement) + line[field.start(3) + len(str(default)):]
         lines.append(line)
     if seen != set(expected):
-        raise Refusal("Missing expected ports in config.toml; refusing to start an incompletely isolated stack.")
+        missing = ", ".join("[" + section + "]." + key for section, key in sorted(set(expected) - seen))
+        raise Refusal("Missing expected ports in config.toml: " + missing +
+                      "; refusing to start an incompletely isolated stack.")
     text = "".join(lines)
     if re.search(r"(?m)^project_id\s*=", text):
         text = re.sub(r"(?m)^project_id\s*=.*$", 'project_id = "' + project + '"', text)
@@ -298,6 +300,8 @@ def manage(root, harness, args, env):
         say("Test workdir=" + str(workdir))
         started = False
         ready = False
+        suite_code = 0
+        primary_error = False
         keep = not fresh or env.get("INTEGRATION_KEEP_SUPABASE") == "1"
         try:
             if not existing:
@@ -335,13 +339,26 @@ def manage(root, harness, args, env):
                              INTEGRATION_MANAGED_API_PORT=str(ports[0]),
                              INTEGRATION_MANAGED_DB_PORT=str(ports[1]))
             say("Run focused DB tests sparingly; warm runs retain data. Use --reset for a pristine test DB.")
-            return subprocess.call(["bash", "-c", 'harness=$1; shift; source "$harness"', "integration-db-suite", str(harness), *suite_args], env=suite_env, pass_fds=lock_fds)
+            suite_code = subprocess.call(["bash", "-c", 'harness=$1; shift; source "$harness"', "integration-db-suite", str(harness), *suite_args], env=suite_env, pass_fds=lock_fds)
+            return suite_code
+        except BaseException:
+            # Include signal exits, but not a handled exception in our caller.
+            primary_error = True
+            raise
         finally:
             if started and (not keep or not ready):
                 say("Stopping test stack; if cleanup fails, preserve this workdir for recovery: " + str(workdir))
-                subprocess.check_call(["supabase", "stop", "--workdir", str(workdir), "--no-backup"],
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                shutil.rmtree(workdir)
+                try:
+                    subprocess.check_call(["supabase", "stop", "--workdir", str(workdir), "--no-backup"],
+                                          stdout=subprocess.DEVNULL)
+                except (OSError, subprocess.CalledProcessError):
+                    say("Cleanup failed; workdir preserved for manual recovery: " + str(workdir))
+                    # Cleanup must fail an otherwise successful run, but must
+                    # not replace a startup exception, signal, or suite status.
+                    if not primary_error and suite_code == 0:
+                        raise
+                else:
+                    shutil.rmtree(workdir)
             elif keep:
                 say("Retained test stack; workdir=" + str(workdir))
                 if fresh:

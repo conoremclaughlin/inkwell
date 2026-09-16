@@ -464,7 +464,10 @@ Project IDs must be `pcp-integration` or `pcp-integration-<suffix>`. `--reuse` e
 selects retained mode (including in a CI-marked shell). The legacy
 `INTEGRATION_KEEP_SUPABASE=1` with `--fresh` retains a temporary inspection stack;
 release it with the printed `supabase stop --workdir ... --no-backup` command before
-using the same project again.
+using the same project again. If that output is lost, inspect `pcp-supabase-it-*`
+directories under `INTEGRATION_SUPABASE_WORKDIR_BASE` (or the system temp directory
+when unset). Verify `supabase/config.toml` names your test project before selecting
+a workdir; the prefix alone does not establish ownership.
 
 ## Key Technologies
 

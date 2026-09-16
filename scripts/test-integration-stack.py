@@ -307,6 +307,15 @@ class LifecycleTests(unittest.TestCase):
             expected = expected.replace("PORT_" + str(index), str(port))
         self.assertEqual(self.state()["config"], 'project_id = "pcp-integration"\n' + expected)
 
+    def test_missing_port_diagnostic_names_each_missing_section_and_key(self):
+        config = TEST_CONFIG.replace("port = 54321\n", "").replace("smtp_port = 54325\n", "")
+        (self.root / "supabase/config.toml").write_text(config)
+        with self.assertRaises(stack.Refusal) as error:
+            self.run_stack()
+        self.assertIn("[api].port", str(error.exception))
+        self.assertIn("[inbucket].smtp_port", str(error.exception))
+        self.assertEqual(self.count("supabase", "start"), 0)
+
     def test_real_checkout_port_config_and_inline_comments_are_supported(self):
         repo = Path(__file__).resolve().parent.parent
         config = stack.configuration(repo, self.project, list(range(55421, 55427)))
@@ -372,6 +381,45 @@ class LifecycleTests(unittest.TestCase):
             self.run_stack("--fresh")
         workdir = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"])
         self.assertTrue((workdir / "supabase/config.toml").exists())
+
+    def test_cleanup_failure_preserves_primary_suite_status_and_reports_recovery(self):
+        self.fail_command = "stop"
+        self.suite_code = 7
+        with mock.patch.object(stack, "say") as output:
+            self.assertEqual(self.run_stack("--fresh"), 7)
+        self.assertTrue(any("Cleanup failed" in call.args[0] for call in output.call_args_list))
+        self.assertTrue(Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]).exists())
+
+    def test_cleanup_failure_preserves_primary_start_exception(self):
+        original_command = self.command
+        stop_kwargs = []
+        def fail_start_and_stop(args, **kwargs):
+            if args[:2] in (["supabase", "start"], ["supabase", "stop"]):
+                if args[1] == "stop":
+                    stop_kwargs.append(kwargs)
+                raise subprocess.CalledProcessError(9 if args[1] == "start" else 8, args)
+            return original_command(args, **kwargs)
+        with mock.patch.object(stack.subprocess, "check_call", fail_start_and_stop):
+            with self.assertRaises(subprocess.CalledProcessError) as error:
+                self.run_stack("--fresh")
+        self.assertEqual(error.exception.cmd[:2], ["supabase", "start"])
+        self.assertEqual(error.exception.returncode, 9)
+        self.assertNotIn("stderr", stop_kwargs[0], "cleanup diagnostics must remain visible")
+
+    def test_cleanup_failure_preserves_primary_signal_exit(self):
+        self.fail_command = "stop"
+        with mock.patch.object(stack.subprocess, "call", side_effect=SystemExit(143)):
+            with self.assertRaises(SystemExit) as error:
+                self.run_stack("--fresh")
+        self.assertEqual(error.exception.code, 143)
+
+    def test_cleanup_failure_after_handled_caller_exception_still_fails(self):
+        self.fail_command = "stop"
+        try:
+            raise ValueError("already handled fixture exception")
+        except ValueError:
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.run_stack("--fresh")
 
     def test_removed_migration_is_removed_from_reset_copy(self):
         self.run_stack()
