@@ -63,6 +63,26 @@ describe('formatTitleProvenance', () => {
     expect(formatTitleProvenance(null, null, NOW)).toBe(' (never edited, age unknown)');
     expect(formatTitleProvenance(null, 'not-a-date', NOW)).toBe(' (never edited, age unknown)');
   });
+
+  it('never claims an edit it cannot date did not happen', () => {
+    // Lumen's #641 round 2. A future-dated or unparseable title_updated_at
+    // made ageLabel return null, and the first cut read that as "no edit" and
+    // fell through to the creation-time branch — telling the reader the title
+    // had never been edited, with a confident age attached, on a row that
+    // records an edit. The row's evidence for "never edited" is the column
+    // being unset, and nothing else.
+    const lines = (titleUpdatedAt: string) =>
+      formatTitleProvenance(titleUpdatedAt, ago(21 * DAY), NOW);
+    expect(lines(new Date(NOW + MINUTE).toISOString())).toBe(' (edited, edit time unknown)');
+    expect(lines(new Date(NOW + 30 * DAY).toISOString())).toBe(' (edited, edit time unknown)');
+    expect(lines('not-a-date')).toBe(' (edited, edit time unknown)');
+    // The control: a datable edit still reports its age, and an absent one
+    // still reaches the creation-time branch.
+    expect(lines(ago(2 * DAY))).toBe(' (set 2d ago)');
+    expect(formatTitleProvenance(null, ago(21 * DAY), NOW)).toBe(
+      ' (never edited, from the first message 21d ago)'
+    );
+  });
 });
 
 describe('formatThreadDescriptorLines', () => {
@@ -194,6 +214,14 @@ describe('the trigger call site still passes a recipient', () => {
    * directly, and a caller that no longer exists breaks none of them. A
    * branch-only addition lost in a merge leaves no hunk in either diff to see.
    *
+   * What each mutation actually costs, since my commit message for this file
+   * got it wrong and Lumen measured it: dropping the fourth argument fails
+   * CLOSED, not open — `loadThreadDescriptor` returns null on a falsy
+   * recipientSlug, so every thread silently loses its description. It is the
+   * membership JOIN inside the loader that stands between a description and a
+   * non-participant, and that has behavioural tests of its own. This guard is
+   * against the feature quietly ceasing to exist, in either half of its wiring.
+   *
    * It asserts a call shape, not behaviour. If the call site legitimately moves
    * to another module, move this check with it rather than deleting it.
    */
@@ -202,14 +230,20 @@ describe('the trigger call site still passes a recipient', () => {
   it('calls loadThreadDescriptor exactly once, with the trigger target', () => {
     const calls = serverSource.match(/loadThreadDescriptor\s*\(([^;]*?)\)\s*;/gs) ?? [];
     expect(calls).toHaveLength(1);
-    // The recipient is the fourth argument; without it the loader cannot test
-    // membership and the preamble goes back to leaking to any triggered SB.
+    // The recipient is the fourth argument; without it the loader returns null
+    // for everyone and the preamble goes back to carrying only the key.
     expect(calls[0]).toContain('targetSlug');
   });
 
   it('renders the descriptor lines it loads', () => {
     // The other half of the wiring: loading the descriptor and never emitting
-    // it would be a silent no-op rather than a leak, and equally invisible.
-    expect(serverSource).toContain('formatThreadDescriptorLines');
+    // it would be a silent no-op, and equally invisible.
+    //
+    // Matching the bare name was not enough — the import statement carries it,
+    // so deleting the render loop outright left all fourteen tests green
+    // (Lumen, #641 round 2). A call has a parenthesis after the name; an
+    // import does not.
+    const calls = serverSource.match(/formatThreadDescriptorLines\s*\(/g) ?? [];
+    expect(calls).toHaveLength(1);
   });
 });

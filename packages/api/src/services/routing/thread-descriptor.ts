@@ -68,14 +68,23 @@ export function formatEditAge(at: string | null | undefined, now: number = Date.
  *
  * So the rule is now the one the feature was always for: no description reaches
  * an SB's prompt without something to date it by.
+ *
+ * "Never edited" is a claim about the row, so it is made from the row's own
+ * evidence — whether `title_updated_at` is set — and never from whether that
+ * instant could be turned into an age. A future-dated or unparseable stamp
+ * still means somebody edited the title; the first cut fell through to the
+ * creation-time branch and told the reader the opposite, with a confident age
+ * attached (Lumen, #641 round 2). An edit we cannot date says so.
  */
 export function formatTitleProvenance(
   titleUpdatedAt: string | null | undefined,
   createdAt: string | null | undefined,
   now: number = Date.now()
 ): string {
-  const edited = ageLabel(titleUpdatedAt, now);
-  if (edited) return ` (set ${edited} ago)`;
+  if (titleUpdatedAt) {
+    const edited = ageLabel(titleUpdatedAt, now);
+    return edited ? ` (set ${edited} ago)` : ' (edited, edit time unknown)';
+  }
   const opened = ageLabel(createdAt, now);
   if (opened) return ` (never edited, from the first message ${opened} ago)`;
   return ' (never edited, age unknown)';
