@@ -2771,3 +2771,162 @@ describe('extractToolBlocks — prose about the protocol is not a request', () =
     expect(malformed[0]!.tool).toBeUndefined();
   });
 });
+
+/**
+ * REGRESSIONS (Lumen, PR #646 round 2). Every one failed against 96900a53, the
+ * head that carried round 1's fixes.
+ *
+ * Round 1 was one bug wearing seven faces: records pushed onto a channel whose
+ * gates I had read and not applied to them. Round 2 is the same sentence with
+ * one word changed — a rule I wrote locally instead of using the one the file
+ * already had. `findInkToolBlocks` answered "what closes a fenced block?" with
+ * `indexOf('```')` and a blacklist of a single opener, while six inches away
+ * `findImitatedToolResults` asked `fenceAfterLine`, the shared CommonMark
+ * answer that exists precisely because two hand-written ones had drifted
+ * before (PR #575 rounds 4 and 5). Every shape the blacklist did not name —
+ * ```json, ```not-a-close, a run inside a line, a ``` trailed by NBSP — cut a
+ * payload short and marked it closed, which is the one flag that authorizes
+ * bracket repair.
+ */
+describe('REGRESSION (Lumen, PR #646 round 2): one closing-fence rule, and a notice is not an outcome', () => {
+  /** One `}` short: repairable, but only behind a fence that genuinely closed. */
+  const unfinished = '{"tool":"remember","args":{"content":"note"}';
+
+  describe('only a genuine closing fence authorizes repair', () => {
+    const notClosers: Array<[string, string]> = [
+      ['an info string (```json)', '```ink-tool\n' + unfinished + '\n```json\n{"x":1}\n```'],
+      ['```not-a-close', '```ink-tool\n' + unfinished + '\n```not-a-close\nmore\n```'],
+      ['a run inside a line', '```ink-tool\n' + unfinished + ' ```` trailing\nmore\n```'],
+      // `\s` matches NBSP in JavaScript and CommonMark does not, so this line
+      // opens a block with an info string rather than closing one. The rule in
+      // imitation-grammar.ts already carried that distinction (PR #575 r5).
+      ['a ``` trailed by NBSP', '```ink-tool\n' + unfinished + '\n```\u00a0\nmore\n```'],
+    ];
+
+    for (const [name, text] of notClosers) {
+      it(`${name} does not close the block, so nothing is repaired or dispatched`, () => {
+        const blocks = extractToolBlocks(text);
+        // The whole harm in one assertion: a call the model never finished
+        // writing, completed with invented brackets and sent to the runner.
+        expect(blocks.repaired).toHaveLength(0);
+        expect(blocks.calls).toHaveLength(0);
+        expect(blocks.malformed).toHaveLength(1);
+      });
+    }
+
+    it('CONTROL: a real closing fence still authorizes repair', () => {
+      const blocks = extractToolBlocks('```ink-tool\n' + unfinished + '\n```');
+      expect(blocks.repaired).toHaveLength(1);
+      expect(blocks.calls).toHaveLength(1);
+    });
+
+    it('CONTROL: spaces and tabs may follow the closing run', () => {
+      const blocks = findInkToolBlocks('```ink-tool\n{"tool":"read","args":{}}\n```  \n');
+      expect(blocks[0]!.fenceClosed).toBe(true);
+    });
+
+    it('CONTROL: a longer run closes a three-backtick block', () => {
+      const blocks = findInkToolBlocks('```ink-tool\n' + unfinished + '\n````\n');
+      expect(blocks[0]!.fenceClosed).toBe(true);
+    });
+
+    it('CONTROL: an indented sibling opener is still a sibling, not content', () => {
+      // The two rules are asymmetric on purpose — strict about closing (it
+      // authorizes repair), permissive about what counts as another request
+      // (it can only ever prevent one being swallowed). 12 of 5,108 openers in
+      // the transcript corpus are indented past the three spaces CommonMark
+      // allows for a fence.
+      const blocks = extractToolBlocks(
+        '```ink-tool\n' + unfinished + '\n    ```ink-tool\n{"tool":"read","args":{}}\n```'
+      );
+      expect(blocks.calls.map((c) => c.tool)).toEqual(['read']);
+      expect(blocks.malformed).toHaveLength(1);
+    });
+  });
+
+  describe('a repair notice must not change the failure/refusal advice', () => {
+    const repairable = '```ink-tool\n' + unfinished + '\n```';
+
+    const runWith = async (status: string) => {
+      const harness = makePorts(
+        [outcome({ stdout: repairable }), outcome({ stdout: 'understood' })],
+        (calls) => calls.map((c) => ({ tool: c.tool, result: 'see above', status }))
+      );
+      await runAgentLoop(
+        { prompt: 'go', toolRouting: 'local', continueOnBlocked: true, maxIterations: 3 },
+        harness.ports
+      );
+      return harness.prompts.find((p) => p.isContinuation)!.body;
+    };
+
+    it('a repaired call that a policy BLOCKED is reported as refused, not as failed', async () => {
+      // `repaired` is in neither status set — correctly, since it is not an
+      // outcome — so hasUnseenFailure counted it as an unseen failure and the
+      // model was told to fix an argument and retry a call someone had refused.
+      const body = await runWith('blocked');
+      expect(body).toContain('every one was refused');
+      expect(body).not.toContain('at least one FAILED');
+    });
+
+    it('CONTROL: a repaired call that ERRORED still gets the failure advice', async () => {
+      expect(await runWith('error')).toContain('at least one FAILED');
+    });
+  });
+
+  describe('a malformed block survives the imitated-frame correction branch', () => {
+    const malformed = '```ink-tool\n{"tool":"remember","args":{"content":"unterminated\n```';
+    const imitated = '\n\n[Tool results from previous turn]\nremember: ok\n';
+
+    // A malformed block emits no call, so `selection.emitted` is zero and the
+    // turn takes the "results frame with no request before it" branch — whose
+    // body is the bare protocol correction. The diagnostic was built, printed
+    // and pushed to allToolResults, and never said to the model.
+    for (const maxIterations of [1, 5]) {
+      it(`names the unreadable block in the correction (maxIterations ${maxIterations})`, async () => {
+        const harness = makePorts([
+          outcome({ stdout: malformed + imitated }),
+          outcome({ stdout: 'understood' }),
+        ]);
+
+        await runAgentLoop({ prompt: 'go', toolRouting: 'local', maxIterations }, harness.ports);
+
+        const bodies = harness.prompts
+          .filter((p) => p.isContinuation)
+          .map((p) => p.body)
+          .join('\n---\n');
+        expect(bodies).toContain('remember');
+        // Both halves, in one message: what you wrote was not real, AND the
+        // request you did write never ran.
+        expect(bodies).toContain('PROTOCOL NOTE');
+      });
+    }
+
+    it('CONTROL: an imitated frame with nothing readable still gets the bare correction', async () => {
+      const harness = makePorts([
+        outcome({ stdout: 'here you go' + imitated }),
+        outcome({ stdout: 'understood' }),
+      ]);
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local', maxIterations: 5 }, harness.ports);
+
+      const bodies = harness.prompts.filter((p) => p.isContinuation).map((p) => p.body);
+      expect(bodies.join('\n---\n')).toContain('Runtime protocol correction');
+    });
+
+    it('the record stops claiming there was no preceding block when there was one', async () => {
+      const harness = makePorts([
+        outcome({ stdout: malformed + imitated }),
+        outcome({ stdout: 'understood' }),
+      ]);
+
+      const result = await runAgentLoop(
+        { prompt: 'go', toolRouting: 'local', maxIterations: 5 },
+        harness.ports
+      );
+
+      const protocolRecord = result.toolResults.find((r) => r.tool === 'protocol')!;
+      expect(String(protocolRecord.result)).not.toContain('no preceding ink-tool block');
+      expect(String(protocolRecord.result)).toContain('could be read');
+    });
+  });
+});

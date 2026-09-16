@@ -37,6 +37,32 @@ export interface ToolResultRecord {
   result: unknown;
   status: string;
   args?: unknown;
+  /**
+   * This record says how a call was READ, not what happened to it.
+   *
+   * A repair notice is the only one today: the runtime closed the model's
+   * brackets, and whether the call then ran, was blocked or was dropped is a
+   * SEPARATE record. It rides the results channel because the model must see
+   * it, and for no other reason — the predicates that decide what happened to
+   * an iteration skip it (`hasUnseenFailure`, and `nothingRan` in
+   * `buildContinuationBody`).
+   *
+   * The flag exists because the alternative was naming each such status in
+   * each predicate, and that is the shape this PR has now been wrong in twice:
+   * `rejected` closed the relay gate in round 1, `repaired` turned a blocked
+   * call into "at least one FAILED — fix it and try again" in round 2 (Lumen).
+   * Both times a record that was not an outcome was read as one. A new status
+   * added later is an outcome unless its author says otherwise, which is the
+   * loud default the rest of this file argues for.
+   */
+  advisory?: boolean;
+}
+
+/** The records that report an OUTCOME — advisory notices describe how a call was read. */
+function outcomesOnly<T extends { advisory?: boolean }>(
+  results: ReadonlyArray<T>
+): ReadonlyArray<T> {
+  return results.filter((r) => r.advisory !== true);
 }
 
 /**
@@ -544,7 +570,20 @@ export function buildContinuationBody(
   // again is exactly right. Telling a model "every one was refused, do not
   // retry them" when a validation error named the offending field talks it out
   // of the one move that would work.
-  const nothingRan = results.length > 0 && !results.some((r) => RAN_STATUSES.has(r.status));
+  // Asked of the OUTCOMES. A repair notice is not one: with a repaired call
+  // that a policy then blocked, counting the notice made "nothing ran" true
+  // and "something failed" true as well, and the model was told to fix an
+  // argument and retry a call that had been refused.
+  //
+  // Only `hasUnseenFailure` is load-bearing there, and measured rather than
+  // argued: reverting THIS line alone to the unfiltered list leaves all 2,024
+  // repl tests green, because an advisory record never arrives without an
+  // outcome beside it — the repair notice and the call's real result are built
+  // from the same block. It reads the same list anyway, so the two predicates
+  // cannot disagree about what an iteration contained, which is the failure
+  // that produced this fix in the first place.
+  const outcomes = outcomesOnly(results);
+  const nothingRan = outcomes.length > 0 && !outcomes.some((r) => RAN_STATUSES.has(r.status));
   const refusalNote = !nothingRan
     ? ''
     : hasUnseenFailure(results)
@@ -884,6 +923,8 @@ export async function runAgentLoop(
       ...blocks.repaired.map((block) => ({
         tool: block.tool ?? 'unknown',
         status: 'repaired',
+        // Provenance, not an outcome — see ToolResultRecord.advisory.
+        advisory: true,
         result:
           `Your ${block.tool ?? 'tool'} block was missing one or more closing brackets. ` +
           `The runtime closed them so the call could be considered at all; what then ` +
@@ -1005,10 +1046,27 @@ export async function runAgentLoop(
         iteration++;
         const record: ToolResultRecord = {
           tool: 'protocol',
-          result: 'imitated tool results with no preceding ink-tool block; discarded',
+          result:
+            unrunnable.length > 0
+              ? 'imitated tool results; no ink-tool block in this response could be read, so nothing ran; discarded'
+              : 'imitated tool results with no preceding ink-tool block; discarded',
           status: 'rejected',
         };
         allToolResults.push(record);
+        // A malformed block reaches THIS branch, not the stranded path below:
+        // it produces no call, so `emitted` is zero and "no preceding block" is
+        // the branch that fires — and its body is the bare protocol correction,
+        // which names nothing that happened. The diagnostic was built, printed,
+        // pushed to allToolResults, and never said to the model, at every
+        // iteration cap (Lumen, PR #646 round 2). Same failure as the screened
+        // rejection in round 1: a branch that writes its own message omits
+        // whatever it was not told to carry.
+        //
+        // Captured here too, so that if the cap fires below the final relay
+        // carries the diagnostic AND the protocol correction rides with it.
+        if (unrunnable.length > 0) {
+          stranded = { results: unrunnable, selection };
+        }
         // The charge lands BEFORE the correction's response can run anything
         // — same shape as a screened rejection at the cap. With the budget
         // gone, the final correction below still tells the model; its output
@@ -1021,7 +1079,18 @@ export async function runAgentLoop(
         const stopWaitingAfterCorrection = ports.ui.startWaiting();
         try {
           outcome = await ports.backend.runTurn(
-            correcting(() => buildProtocolCorrectionBody()),
+            // With nothing readable in the response there are no results to
+            // report and the bare correction is the whole truth. With a block
+            // that could not be read, the model needs both halves: what it
+            // wrote was not real, AND the request it did write never ran.
+            correcting((imitated) =>
+              unrunnable.length > 0
+                ? buildContinuationBody(unrunnable, [], selection, {
+                    imitatedToolResults: imitated,
+                    budgetBytes: input.relayBudgetBytes?.(),
+                  })
+                : buildProtocolCorrectionBody()
+            ),
             {
               iteration,
               isContinuation: true,
@@ -1037,6 +1106,8 @@ export async function runAgentLoop(
           stopReason = 'backend-failure';
           break;
         }
+        // The continuation carried the diagnostic; nothing is stranded.
+        stranded = null;
         continue;
       }
       stopReason = 'no-tools';
@@ -1480,10 +1551,15 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
     const payloadStart = m.index + m[0].length;
     const scanned = scanJsonValueEnd(text, payloadStart);
     if (scanned) {
-      const closeMatch = /^[ \t\r\n]*```/.exec(text.slice(scanned.end));
-      const closeAt = closeMatch ? scanned.end + closeMatch[0].length - 3 : -1;
-      const closedHere = closeMatch !== null && !opensAnotherBlock(text, closeAt);
-      const end = closedHere ? scanned.end + closeMatch![0].length : scanned.end;
+      // The value parsed, so repair is not at stake here; what a closing fence
+      // decides on this path is only how much text the block covers. Anything
+      // other than whitespace between the value and the fence means the model
+      // wrote something after its JSON, and the block does not cover it.
+      const boundary = findBlockEnd(text, nextLineStart(text, scanned.end));
+      const closedHere =
+        boundary.closeEnd !== null &&
+        /^[ \t\r\n]*$/.test(text.slice(scanned.end, boundary.payloadEnd));
+      const end = closedHere ? boundary.closeEnd! : scanned.end;
       blocks.push({
         start: m.index,
         end,
@@ -1493,50 +1569,102 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
       openRe.lastIndex = end;
       continue;
     }
-    const closeIdx = text.indexOf('```', payloadStart);
-    // A ``` that OPENS another ink-tool block is not this block's closing
-    // fence, and reading it as one did two harms at once (Lumen, PR #646):
-    // it marked a payload the model never finished as `fenceClosed`, which is
-    // the single gate authorizing repair, and it swallowed the following block
-    // whole — `lastIndex` landed past the opener's backticks, so the sibling
-    // never matched again. A truncated `remember` was closed with invented
-    // brackets and run, and the `read` beneath it vanished.
-    const closedHere = closeIdx !== -1 && !opensAnotherBlock(text, closeIdx);
-    if (!closedHere) {
-      const payloadEnd = closeIdx === -1 ? text.length : closeIdx;
-      const payload = text.slice(payloadStart, payloadEnd).trim();
-      // Only a REQUEST is a block. Prose discussing the protocol — "close the
-      // ```ink-tool block" — matches the opening regex and never closes; when
-      // that counted as a block spanning to end-of-text, `stripLocalToolBlocks`
-      // deleted the rest of the sentence from the displayed answer. A reply
-      // reading "Close the" is a new silent loss, not a fix for one.
-      if (looksLikeToolRequest(payload)) {
-        blocks.push({ start: m.index, end: payloadEnd, payload, fenceClosed: false });
-      }
-      // The response ended inside the block; there is nothing further to scan.
-      if (closeIdx === -1) break;
-      // Resume ON the opener so the block it belongs to is found, rather than
-      // past it.
-      openRe.lastIndex = closeIdx;
+    const boundary = findBlockEnd(text, payloadStart);
+    if (boundary.closeEnd !== null) {
+      blocks.push({
+        start: m.index,
+        end: boundary.closeEnd,
+        payload: text.slice(payloadStart, boundary.payloadEnd).trim(),
+        fenceClosed: true,
+      });
+      openRe.lastIndex = boundary.closeEnd;
       continue;
     }
-    blocks.push({
-      start: m.index,
-      end: closeIdx + 3,
-      payload: text.slice(payloadStart, closeIdx).trim(),
-      fenceClosed: true,
-    });
-    openRe.lastIndex = closeIdx + 3;
+    const payload = text.slice(payloadStart, boundary.payloadEnd).trim();
+    // Only a REQUEST is a block. Prose discussing the protocol — "close the
+    // ```ink-tool block" — matches the opening regex and never closes; when
+    // that counted as a block spanning to end-of-text, `stripLocalToolBlocks`
+    // deleted the rest of the sentence from the displayed answer. A reply
+    // reading "Close the" is a new silent loss, not a fix for one.
+    if (looksLikeToolRequest(payload)) {
+      blocks.push({ start: m.index, end: boundary.payloadEnd, payload, fenceClosed: false });
+    }
+    // The response ended inside the block; there is nothing further to scan.
+    if (!boundary.sibling) break;
+    // Resume ON the sibling opener so the block it belongs to is found, rather
+    // than past it.
+    openRe.lastIndex = boundary.payloadEnd;
   }
   return blocks;
 }
 
-/** True when the ``` at `idx` starts a new ink-tool block rather than ending one. */
-function opensAnotherBlock(text: string, idx: number): boolean {
-  if (idx < 0) return false;
-  const opener = /```ink-tool[ \t]*\r?\n?/iy;
-  opener.lastIndex = idx;
-  return opener.test(text);
+/**
+ * A line that opens another ink-tool block — the one boundary that is not a
+ * closer. Deliberately as permissive as the opener regex that finds blocks in
+ * the first place (any indent, anything after the token), because the two rules
+ * here are asymmetric on purpose: what CLOSES a block is strict, since it
+ * authorizes repair, and being wrong there fabricates a call. What counts as a
+ * sibling REQUEST is permissive, since it can only ever prevent one from being
+ * swallowed. Measured over 5,108 real openers: 12 are indented past the three
+ * spaces CommonMark allows, and a strict rule here would swallow them.
+ */
+const INK_TOOL_OPENER_LINE = /^[ \t]*```ink-tool/i;
+/** The backtick run at the start of a fence line, indent included. */
+const FENCE_RUN = /^ {0,3}`{3,}/;
+
+/**
+ * Where the ```ink-tool block whose payload starts at `from` ends.
+ *
+ * The closing rule is `fenceAfterLine` — the same CommonMark closer the
+ * imitation detector and the paragraph buffer already share (see the header of
+ * imitation-grammar.ts, where two hand-written answers had drifted). This was
+ * the third place in this file to decide what closes a fenced block, and it
+ * decided with `indexOf('```')` plus a blacklist of one opener. Every shape
+ * that blacklist does not name ended a block on a line CommonMark treats as
+ * content: ```json, ```not-a-close, a run inside a line, a ``` trailed by NBSP
+ * (which `\s` matches and CommonMark does not).
+ *
+ * Ending a block early there is not a cosmetic error. It cut the payload short
+ * AND marked it `fenceClosed` — the single gate authorizing bracket repair —
+ * so half a request the model never finished was closed with invented brackets
+ * and dispatched as a call. That is the silent corruption `repairTruncatedJson`
+ * is documented as refusing, arriving through the one door nobody checked
+ * (Lumen, PR #646 round 2).
+ *
+ * A following ```ink-tool opener is the exception, and it is not a closer: it
+ * ends this block UNCLOSED — no repair — and hands scanning back so the sibling
+ * block is found rather than swallowed whole (round 1, finding 7).
+ */
+function findBlockEnd(
+  text: string,
+  from: number
+): { payloadEnd: number; closeEnd: number | null; sibling: boolean } {
+  const opened: OpenFence = { char: '`', length: 3 };
+  let lineStart = from;
+  while (lineStart <= text.length) {
+    const nl = text.indexOf('\n', lineStart);
+    const lineEnd = nl === -1 ? text.length : nl;
+    const line = text.slice(lineStart, lineEnd);
+    if (fenceAfterLine(opened, line) === null) {
+      return {
+        payloadEnd: lineStart,
+        closeEnd: lineStart + FENCE_RUN.exec(line)![0].length,
+        sibling: false,
+      };
+    }
+    if (INK_TOOL_OPENER_LINE.test(line)) {
+      return { payloadEnd: lineStart, closeEnd: null, sibling: true };
+    }
+    if (nl === -1) break;
+    lineStart = nl + 1;
+  }
+  return { payloadEnd: text.length, closeEnd: null, sibling: false };
+}
+
+/** Start of the line after the one containing `from`; end of text if there is none. */
+function nextLineStart(text: string, from: number): number {
+  const nl = text.indexOf('\n', from);
+  return nl === -1 ? text.length : nl + 1;
 }
 
 /**
@@ -1867,9 +1995,14 @@ const WITNESSED_REFUSAL_STATUSES: ReadonlySet<string> = new Set(['blocked', 'den
  * predicate. What makes a refusal swallowable is its provenance, not its name.
  */
 export function hasUnseenFailure(
-  iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'status' | 'result'>>
+  iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'status' | 'result' | 'advisory'>>
 ): boolean {
-  return iterationResults.some(
+  // Advisory records are skipped HERE, not at the call sites, so that every
+  // caller — including one added later — inherits the distinction. A repair
+  // notice is in neither status set by design, and counting it as an unseen
+  // failure made a turn whose only real outcome was a policy BLOCK tell the
+  // model to fix its arguments and try again (Lumen, PR #646 round 2).
+  return outcomesOnly(iterationResults).some(
     (r) =>
       (!RAN_STATUSES.has(r.status) && !WITNESSED_REFUSAL_STATUSES.has(r.status)) ||
       (RAN_STATUSES.has(r.status) && isErrorPayload(r.result))
