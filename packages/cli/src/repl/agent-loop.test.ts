@@ -2847,14 +2847,61 @@ describe('REGRESSION (Lumen, PR #646 round 2): one closing-fence rule, and a not
     it('CONTROL: an indented sibling opener is still a sibling, not content', () => {
       // The two rules are asymmetric on purpose — strict about closing (it
       // authorizes repair), permissive about what counts as another request
-      // (it can only ever prevent one being swallowed). 12 of 5,108 openers in
-      // the transcript corpus are indented past the three spaces CommonMark
-      // allows for a fence.
+      // (it can only ever prevent one being swallowed). This comment used to
+      // cite "12 of 5,108 openers" as the reason; that count was every role,
+      // no window, and thirteen replays of two strings (round 5). The reason
+      // is structural and pinned below: CommonMark indents a fence relative to
+      // its container, so ` {0,3}` loses a list-nested block outright.
       const blocks = extractToolBlocks(
         '```ink-tool\n' + unfinished + '\n    ```ink-tool\n{"tool":"read","args":{}}\n```'
       );
       expect(blocks.calls.map((c) => c.tool)).toEqual(['read']);
       expect(blocks.malformed).toHaveLength(1);
+    });
+  });
+
+  /**
+   * REGRESSION (round 5): what the permissive INDENT actually buys.
+   *
+   * Round 4 justified `[ \t]*` over ` {0,3}` with a count of indented openers
+   * in the corpus. Recounting dissolved the count — every role, no window, two
+   * strings replayed thirteen times — leaving the regex right and its stated
+   * reason empty. A comment asserting a contract is not the contract, so the
+   * real reason is pinned here: CommonMark measures fence indent RELATIVE TO
+   * ITS CONTAINER, so a block nested in a list item carries four or more spaces
+   * in the raw text this module parses, and ` {0,3}` finds no opener in it at
+   * all. Each case below fails against that narrower rule.
+   */
+  describe('a block nested in a list item is a request, not a silent drop', () => {
+    const nested = (payload: string) =>
+      `1. Save it:\n\n    \`\`\`ink-tool\n    ${payload}\n    \`\`\`\n`;
+    const whole = '{"tool":"remember","args":{"content":"nested in a list item"}}';
+
+    it('dispatches a well-formed nested block', () => {
+      // Under ` {0,3}`: calls [], malformed [], repaired 0 — no record, which is
+      // precisely the defect this module exists to prevent.
+      const blocks = extractToolBlocks(nested(whole));
+      expect(blocks.calls.map((c) => c.tool)).toEqual(['remember']);
+    });
+
+    it('never leaves a nested payload in the displayed message', () => {
+      expect(stripLocalToolBlocks(nested(whole))).not.toContain('"tool"');
+    });
+
+    it('REPORTS a nested block one brace short, and does not repair it', () => {
+      // Loud either way is the contract. The indented closing fence is not a
+      // closer under the strict rule, so repair stays unavailable — the block
+      // is reported rather than completed with invented brackets.
+      const blocks = extractToolBlocks(nested(unfinished));
+      expect(blocks.calls).toHaveLength(0);
+      expect(blocks.repaired).toHaveLength(0);
+      expect(blocks.malformed).toHaveLength(1);
+      expect(blocks.malformed[0]!.fenceClosed).toBe(false);
+    });
+
+    it('CONTROL: three spaces is inside what CommonMark allows, and dispatches under either rule', () => {
+      const blocks = extractToolBlocks(`   \`\`\`ink-tool\n   ${whole}\n   \`\`\`\n`);
+      expect(blocks.calls.map((c) => c.tool)).toEqual(['remember']);
     });
   });
 

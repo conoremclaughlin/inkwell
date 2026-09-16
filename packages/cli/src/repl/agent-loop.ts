@@ -1660,14 +1660,38 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
  * The asymmetry with the closing rule survives, and it is about indent, not
  * about position. What CLOSES a block is strict CommonMark (`fenceAfterLine`),
  * because being wrong there authorizes bracket repair and fabricates a call.
- * What OPENS one allows any indent, because of the 12.
+ * What OPENS one allows any indent — though not for the reason this comment
+ * gave until round 5 (Lumen).
  *
- * Measured over 4,948 assistant-authored openers in 14 days: 12 are indented
- * past the three spaces CommonMark allows — hence `[ \t]*` rather than
- * ` {0,3}` — and 11 appear mid-line, all of them prose about the protocol
- * rather than requests. So nothing in 14 days of traffic asks to be read as a
- * mid-line opener, and one thing per every sixteen `remember` calls asks not
- * to be.
+ * It said "12 are indented past the three spaces CommonMark allows, hence
+ * `[ \t]*`". Recounting dissolved that. The 12 are 13 occurrences of TWO
+ * strings, both in user-role messages: a memory about the 2026-09-10 silent
+ * no-op, replayed into twelve sessions by recall injection, and one tool result
+ * quoting this comment back. None is an agent emitting an indented block. In
+ * the population this finder actually parses — assistant-authored text — the
+ * count of openers indented past three spaces is 0, over 14 days and over the
+ * whole corpus alike. The old script filtered by neither role nor date, so
+ * "assistant-authored" and "in 14 days" each described something it had not
+ * computed, and one string counted thirteen times read as twelve events.
+ *
+ * `[ \t]*` stays, resting on the failure modes instead of on that count.
+ * CommonMark measures fence indent RELATIVE TO ITS CONTAINER, so a block nested
+ * in a list item legitimately carries four or more spaces in the raw text this
+ * module sees. Against one, ` {0,3}` matches no opener at all: probed both
+ * ways, it yields `calls [] malformed [] repaired 0` and leaks the raw JSON
+ * into the display — no record, which is this module's own defect arriving in
+ * the shape it exists to repair. `[ \t]*` returns the call, and when the nested
+ * payload is a brace short it reports it with `fenceClosed: false`, so repair
+ * stays unavailable and the failure is loud. The price is that an indented
+ * block written as an example runs; unindented it runs under either rule, so
+ * indent was never what separated an example from a request.
+ *
+ * Measured 2026-09-16 over the assistant-authored text of the whole corpus
+ * (3,309 messages carrying the token, 4,989 openers): 15 openers appear
+ * mid-line and every one is prose about the protocol rather than a request —
+ * the differential across both finders returns an identical call list for every
+ * message. Nothing in the corpus asks to be read as a mid-line opener, while
+ * one `remember` in sixteen asks not to be.
  */
 const INK_TOOL_OPENER = /^[ \t]*```ink-tool/i;
 /** The backtick run at the start of a fence line, indent included. */
