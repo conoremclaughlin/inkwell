@@ -4,14 +4,14 @@
 #
 # These exports used to fall back to whatever the calling shell already had:
 # `${SUPABASE_URL:-${API_URL:-}}` for the API and `${DB_URL:-...}` for direct
-# Postgres. Every dev shell here carries the main local stack's SUPABASE_URL
-# (it is in .env.local), so the fallback fired, and the two targets came apart:
-# PostgREST traffic went to the SHARED database on :54321 while the direct
-# connection went to the isolated one. Fixture writes, and the deletes that
-# clean them up, landed on the shared stack; the banner still named the
-# isolated one, and the hostname-locality guard in integration-setup.ts passes
-# either way because both are 127.0.0.1. CI has no ambient value, so CI stayed
-# green while local runs failed (Lumen, #621/#623).
+# Postgres. A shell that already carries a Supabase URL for some other local
+# stack fires that fallback, and the two targets come apart: PostgREST traffic
+# addresses the inherited stack while the direct connection addresses the
+# isolated one. Nothing downstream catches the split — the banner reports the
+# isolated stack, and the hostname-locality guard in integration-setup.ts
+# accepts either, since both are loopback. An environment with no ambient
+# value is unaffected, so the failure mode does not reproduce in CI
+# (#621/#623).
 #
 # So: unset every name that could have been inherited BEFORE reading the
 # stack's output, and derive both endpoints from the stack alone. Whatever is
@@ -62,7 +62,31 @@ derive_isolated_supabase_env() {
   fi
 
   unset "${INHERITABLE_SUPABASE_NAMES[@]}"
-  eval "${_dise_status_env}"
+
+  # `eval` is how the stack's output becomes variables, and it is also a hole
+  # in the redaction below. A line bash cannot parse makes bash echo that line
+  # — value included — to its own stderr, upstream of any redactor we run. So
+  # its output is discarded rather than reported, and the names are reported
+  # from the payload instead.
+  #
+  # Its result has to be checked explicitly too. bash evaluates a multi-line
+  # string command by command, so a malformed line only stops the lines after
+  # it: a payload whose required fields all landed before the error satisfies
+  # every check below and returns 0. `set -e` does not intervene, because the
+  # harness calls this function as `... || exit 1` and errexit is suppressed
+  # for the whole body of a function called in an OR-list. A status payload
+  # that did not evaluate cleanly is refused whole — never accepted on the
+  # assignments that happened to land first (Lumen, #645).
+  local _dise_eval_rc=0
+  eval "${_dise_status_env}" 2>/dev/null || _dise_eval_rc=$?
+  if ((_dise_eval_rc != 0)); then
+    echo "[integration-db] Refusing to run: supabase status output did not evaluate cleanly (exit ${_dise_eval_rc})." >&2
+    echo "[integration-db] Names emitted by status (values redacted):" >&2
+    printf '%s\n' "${_dise_status_env}" | redact_env_assignments >&2
+    # Whatever the partial evaluation set is not the stack's answer.
+    unset "${INHERITABLE_SUPABASE_NAMES[@]}"
+    return 1
+  fi
 
   export SUPABASE_URL="${API_URL:-}"
   export SUPABASE_PUBLISHABLE_KEY="${PUBLISHABLE_KEY:-${ANON_KEY:-}}"

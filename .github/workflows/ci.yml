@@ -53,9 +53,9 @@ jobs:
 
       # The integration-DB harness's endpoint isolation. Mock-only: synthetic
       # `supabase status` payloads, no Docker and no database. CI has no
-      # ambient Supabase env, so the contamination this covers cannot occur
-      # here — which is exactly why it went unseen until it was measured on a
-      # dev shell, and why the coverage has to be synthetic to run at all.
+      # ambient Supabase env, so the contamination this covers cannot arise
+      # here — which is why it has to be reproduced from synthetic payloads
+      # rather than by running the harness.
       - name: Integration-DB harness endpoint isolation
         run: sh scripts/test-integration-db-local.test.sh
 

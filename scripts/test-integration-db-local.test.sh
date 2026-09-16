@@ -7,9 +7,9 @@
 #   - an ambient SUPABASE_URL does not survive into the derived API endpoint
 #   - ambient keys (secret, publishable, JWT) do not survive either
 #   - an ambient DB_URL does not survive into INTEGRATION_DB_URL
-#   - both endpoints land on the SAME stack — the split-target bug that sent
-#     PostgREST traffic to the shared database while direct PG went to the
-#     isolated one (#621/#623)
+#   - both endpoints land on the SAME stack — the split-target bug in which
+#     PostgREST traffic addresses an inherited stack while direct PG addresses
+#     the isolated one (#621/#623)
 #   - a status output missing required fields fails instead of running
 #   - the API URL is accepted only as an exact loopback endpoint on the
 #     reserved port: no foreign host, no fragment, no path, no credentials
@@ -50,8 +50,8 @@ bad() {
   [ $# -gt 1 ] && echo "         $2"
 }
 
-# Ports the harness reserves for the isolated stack, and the shared local
-# stack's ports that a dev shell's .env.local actually carries.
+# Ports the harness reserves for the isolated stack, and the Supabase CLI's
+# default local ports — the ones an inherited value would most likely name.
 API_PORT=55421
 DB_PORT=55422
 SHARED_API=54321
@@ -99,8 +99,8 @@ field() { echo "$1" | cut -d'|' -f"$2"; }
 
 echo "ENV DERIVATION (scripts/lib/derive-isolated-supabase-env.sh)"
 
-# The measured contamination: a dev shell that sourced .env.local carries the
-# SHARED stack's URL. This is the assertion that fails against main.
+# The contamination shape: a shell that already carries another local stack's
+# URL and keys. This is the assertion that fails against main.
 ambient_full="export SUPABASE_URL=http://127.0.0.1:$SHARED_API
 export SUPABASE_SECRET_KEY=ambient-secret-key
 export SUPABASE_PUBLISHABLE_KEY=ambient-publishable-key
@@ -215,7 +215,7 @@ echo ""
 echo "MISSING STATUS FIELDS"
 
 # A status output missing the API URL must fail — and must not be rescued by
-# an ambient one, which is precisely how the shared stack got addressed.
+# an ambient one, which is the path by which a foreign stack gets addressed.
 err=$(derive_err "$ambient_full" "SERVICE_ROLE_KEY=\"fixture-service-role-key\"
 JWT_SECRET=\"fixture-jwt-secret\"")
 rc=$?
@@ -276,6 +276,55 @@ echo "$err" | grep -q 'unexpected banner text' &&
   bad "a non-assignment status line is not echoed" "$(echo "$err" | tr '\n' ' ')" ||
   ok "a non-assignment status line is not echoed"
 
+# The redactor above only sees what we hand it. `eval` has a mouth of its own:
+# a line bash cannot parse is echoed by bash, value and all, before any
+# redactor runs.
+err=$(derive_err "true" "SERVICE_ROLE_KEY=zneval )")
+echo "$err" | grep -q 'zneval' &&
+  bad "a status line bash cannot parse is not echoed by eval" "$(echo "$err" | tr '\n' ' ')" ||
+  ok "a status line bash cannot parse is not echoed by eval"
+
+echo ""
+echo "PARTIAL EVALUATION"
+
+# bash evaluates a multi-line string command by command, so a malformed line
+# only stops what follows it. When the required fields all land BEFORE the
+# error, every check downstream is satisfied and the payload passes — on a
+# status output that did not evaluate. The call shape is the harness's own:
+# `... || exit 1` under `set -euo pipefail`, which is exactly the shape that
+# suppresses errexit for the function body.
+derive_harness_shape() { # status_env -> stderr, sets rc
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
+    set -euo pipefail
+    source "$1"
+    derive_isolated_supabase_env "$2" "$3" "$4" || exit 1
+  ' _ "$env_lib" "$1" "$API_PORT" "$DB_PORT" 2>&1 >/dev/null
+}
+
+err=$(derive_harness_shape "$status_env_current
+UNUSED_KEY=znlate )")
+rc=$?
+[ "$rc" -ne 0 ] &&
+  ok "a malformed line AFTER the required fields is refused, not accepted" ||
+  bad "a malformed line AFTER the required fields is refused, not accepted" \
+    "accepted — the suite would have run on a status output that did not evaluate"
+
+echo "$err" | grep -q 'znlate' &&
+  bad "the late-malformed refusal prints no value" "$(echo "$err" | tr '\n' ' ')" ||
+  ok "the late-malformed refusal prints no value"
+
+# Control: a value containing the same character, properly quoted, is valid
+# status output and must still be accepted. Without this, refusing everything
+# would pass the two assertions above.
+err=$(derive_harness_shape "API_URL=\"http://127.0.0.1:$API_PORT\"
+SERVICE_ROLE_KEY=\"fixture-key-with-)-inside\"
+JWT_SECRET=\"fixture-jwt-secret\"")
+rc=$?
+[ "$rc" -eq 0 ] &&
+  ok "a quoted value containing ')' is still accepted (control)" ||
+  bad "a quoted value containing ')' is still accepted (control)" \
+    "exit $rc: $(echo "$err" | tr '\n' ' ')"
+
 echo ""
 echo "EXACT ENDPOINT CHECK (scripts/lib/assert-isolated-supabase-url.sh)"
 
@@ -316,31 +365,52 @@ rc=$?
   ok "a non-numeric reserved port is rejected" ||
   bad "a non-numeric reserved port is rejected" "accepted"
 
-# The rejection diagnostic runs on a URL that can carry userinfo and a query
-# key. It must name the endpoint without reprinting either.
-out=$(assert_url "http://fixtureuser:fixturepw@127.0.0.1:$SHARED_API/path?apikey=fixturekey#frag" "$API_PORT")
-leaked=""
-for v in fixtureuser fixturepw fixturekey; do
-  echo "$out" | grep -q -- "$v" && leaked="$leaked $v"
-done
-[ -z "$leaked" ] &&
-  ok "the rejection prints no credential from the URL it refused" ||
-  bad "the rejection prints no credential from the URL it refused" "leaked:$leaked"
-
-echo "$out" | grep -q "127.0.0.1:$SHARED_API" &&
-  ok "the rejection still names the host and port it got" ||
-  bad "the rejection still names the host and port it got" "$(echo "$out" | tr '\n' ' ')"
-
+out=$(assert_url "http://fixtureuser:fixturepw@127.0.0.1:$SHARED_API/p?apikey=fixturekey" "$API_PORT")
 echo "$out" | grep -q "expected exactly: http://127.0.0.1:$API_PORT" &&
   ok "the rejection names the endpoint it wanted" ||
   bad "the rejection names the endpoint it wanted" "$(echo "$out" | tr '\n' ' ')"
 
-# A fragment must not be able to disguise a foreign host as loopback in the
-# redacted output.
-out=$(assert_url "http://foreign.invalid:$SHARED_API/#@127.0.0.1:$API_PORT" "$API_PORT")
-echo "$out" | grep -q 'foreign.invalid' &&
-  ok "the redacted form reports the real host, not one hidden in a fragment" ||
-  bad "the redacted form reports the real host" "$(echo "$out" | tr '\n' ' ')"
+# THE CONTRACT: no part of a rejected URL reaches the diagnostic.
+#
+# This replaces a set of per-component assertions that pinned the previous
+# design — a sanitiser that printed scheme://host:port and named the parts it
+# had dropped. Each component got its own case, and each case used a word that
+# also appeared in a component the same case was not testing, so a component
+# escaping through the wrong branch still satisfied the assertion. Every case
+# below tags EVERY component with a sentinel unique to it, and the assertion
+# is a property over all of them: whatever the parse does, none of these
+# strings may appear in the output.
+#
+# Cases 1, 6 and 7 pass against the previous design too. They are controls:
+# they show the battery can pass, so the four that go red are the finding and
+# not the harness refusing everything.
+hostile_urls="\
+1|http://znuser:znpw@127.0.0.1:$SHARED_API/znpath?k=znquery#znfrag
+2|http://127.0.0.1:$SHARED_API/path@znpath
+3|http://znuser@znpw@127.0.0.1:$API_PORT
+4|znscheme://127.0.0.1:$API_PORT
+5|http://znhost:$API_PORT
+6|http://127.0.0.1:$API_PORT#@znfrag
+7|znpath"
+
+echo "$hostile_urls" | while IFS='|' read -r n url; do
+  [ -z "$url" ] && continue
+  out=$(assert_url "$url" "$API_PORT")
+  rc=$?
+  [ "$rc" -eq 0 ] && echo "ACCEPTED|$n"
+  for v in znuser znpw znhost znpath znquery znfrag znscheme; do
+    echo "$out" | grep -q -- "$v" && echo "LEAK|$n|$v"
+  done
+done >"${TMPDIR:-/tmp}/zn_url_leaks.$$"
+
+leaks=$(wc -l <"${TMPDIR:-/tmp}/zn_url_leaks.$$" | tr -d ' ')
+if [ "$leaks" -eq 0 ]; then
+  ok "no component of a rejected URL appears in the refusal (7 hostile shapes)"
+else
+  bad "no component of a rejected URL appears in the refusal (7 hostile shapes)" \
+    "$(tr '\n' ' ' <"${TMPDIR:-/tmp}/zn_url_leaks.$$")"
+fi
+rm -f "${TMPDIR:-/tmp}/zn_url_leaks.$$"
 
 echo ""
 echo "HARNESS WIRING (scripts/test-integration-db-local.sh)"

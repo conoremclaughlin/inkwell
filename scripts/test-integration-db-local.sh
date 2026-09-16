@@ -92,7 +92,7 @@ echo "[integration-db] Exporting local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
 
 # Both endpoints come from the stack this script started, and from nothing the
-# calling shell already had. See the library for what inheriting them cost.
+# calling shell already had. See the library for why inheriting them is unsafe.
 # shellcheck source=lib/derive-isolated-supabase-env.sh
 source "${ROOT_DIR}/scripts/lib/derive-isolated-supabase-env.sh"
 derive_isolated_supabase_env "${STATUS_ENV}" "${API_PORT}" "${DB_PORT}" || exit 1
