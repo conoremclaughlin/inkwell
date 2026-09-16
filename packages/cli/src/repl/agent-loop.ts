@@ -1547,7 +1547,18 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
   // Derived from INK_TOOL_OPENER so the finder and the sibling-boundary rule
   // cannot disagree about what an opener is. The trailing run is about where
   // the PAYLOAD starts, not about what an opener is, so it lives here.
-  const openRe = new RegExp(`${INK_TOOL_OPENER.source}[ \\t]*\\r?\\n?`, 'gi');
+  //
+  // The flags come from the constant too, plus the two this use adds: `g` to
+  // walk the text and `m` so the constant's `^` anchors at each line rather
+  // than only at offset zero. Carrying `.source` and hard-coding the flags left
+  // exactly one dimension free to drift — change the literal's
+  // case-sensitivity and the sibling check would follow while this would not
+  // (Myra, PR #646 round 4). Deduplicated so adding a flag to the constant
+  // cannot produce an invalid repetition here.
+  const openRe = new RegExp(
+    `${INK_TOOL_OPENER.source}[ \\t]*\\r?\\n?`,
+    [...new Set(`${INK_TOOL_OPENER.flags}gm`)].join('')
+  );
   let m: RegExpExecArray | null;
   while ((m = openRe.exec(text))) {
     const payloadStart = m.index + m[0].length;
@@ -1611,27 +1622,54 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
  * consumed as the previous block's content, its closing fence closes the block
  * above it, and the call inside it is gone with no record.
  *
- * That is round 3 of this review (Lumen), and it is the same mistake as round
- * 2 with the other rule: I wrote `/^[ \t]*```ink-tool/` here — line-anchored —
- * while the finder six inches up matched the token ANYWHERE in a line. `Now
- * ```ink-tool` is an opener to one and content to the other. Round 2 was a
- * third local answer beside a shared closing rule; this is a second local
+ * That is round 3 of this review (Lumen): a hand-written sibling rule here sat
+ * beside a finder six inches up that matched the token ANYWHERE in a line, so
+ * `Now ```ink-tool` was an opener to one and content to the other. Round 2 was
+ * a third local answer beside a shared closing rule; that was a second local
  * answer beside the opener rule. Hence one definition, in one place, rather
  * than a third correct-looking regex.
  *
- * Deliberately permissive — any indent, anything before or after the token —
- * and asymmetric with the closing rule ON PURPOSE. What CLOSES a block is
- * strict CommonMark (`fenceAfterLine`), because being wrong there authorizes
- * bracket repair and fabricates a call. What counts as another REQUEST is
- * permissive, because being wrong there can only end a block early and
- * UNCLOSED, which reports rather than invents.
+ * What that finding fixes is the DISAGREEMENT. Which of the two rules the
+ * survivor should be is a separate question, and round 3 answered it wrong.
+ *
+ * An opener BEGINS ITS LINE. Permissive about indent, strict about that.
+ *
+ * Round 3 resolved the disagreement above in the other direction — it widened
+ * both rules to match the token anywhere in a line — and the justification
+ * written here was that being wrong about a sibling "can only end a block early
+ * and UNCLOSED, which reports rather than invents". That is false, and round 4
+ * (Lumen) is the measurement: a one-brace-short `remember` whose content string
+ * contains the literal token ends the outer block AT the token, mid-line. The
+ * outer payload is then the empty string, `looksLikeToolRequest` says an empty
+ * payload is not a request, and the call is dropped with NO record — while the
+ * text before the token leaks into the displayed message as raw JSON. Both
+ * defects this module exists to prevent, arriving together, in the precise
+ * shape it repairs: long prose in a one-line JSON string, which is where the
+ * measured losses are (`remember` at 6.3% against `bash` at 0.4%).
+ *
+ * Three ways to settle opener-vs-sibling, and only one has no silent path:
+ *
+ *   sibling narrower than the finder — the finder resumes past a block it
+ *   never found, and the call inside it is gone with no record (round 3).
+ *   both permissive — a token inside a payload's own string truncates that
+ *   payload, and what is left is not a request, so nothing is reported (this).
+ *   both line-anchored — a mid-line token is CONTENT. Inside a JSON string it
+ *   reads correctly; outside one the payload cannot parse, so the block is
+ *   reported malformed. Loud either way.
+ *
+ * The asymmetry with the closing rule survives, and it is about indent, not
+ * about position. What CLOSES a block is strict CommonMark (`fenceAfterLine`),
+ * because being wrong there authorizes bracket repair and fabricates a call.
+ * What OPENS one allows any indent, because of the 12.
  *
  * Measured over 4,948 assistant-authored openers in 14 days: 12 are indented
- * past the three spaces CommonMark allows, and 11 appear mid-line. All 11 are
- * prose about the protocol rather than requests, so this defect's live firing
- * rate is zero — a corruption window, not an active corruption.
+ * past the three spaces CommonMark allows — hence `[ \t]*` rather than
+ * ` {0,3}` — and 11 appear mid-line, all of them prose about the protocol
+ * rather than requests. So nothing in 14 days of traffic asks to be read as a
+ * mid-line opener, and one thing per every sixteen `remember` calls asks not
+ * to be.
  */
-const INK_TOOL_OPENER = /```ink-tool/i;
+const INK_TOOL_OPENER = /^[ \t]*```ink-tool/i;
 /** The backtick run at the start of a fence line, indent included. */
 const FENCE_RUN = /^ {0,3}`{3,}/;
 

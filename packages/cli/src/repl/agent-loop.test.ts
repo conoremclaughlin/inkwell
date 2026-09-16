@@ -36,8 +36,19 @@ function outcome(partial: Partial<BackendTurnOutcome> = {}): BackendTurnOutcome 
   return { success: true, stdout: '', stderr: '', ...partial };
 }
 
+/**
+ * A block, and — since round 4 — one that BEGINS ITS LINE.
+ *
+ * The leading newline is the whole change. Six fixtures here interpolated this
+ * straight onto prose (`` `working${inkTool('read')}` ``), which is not a code
+ * fence in any markdown reading and is not a shape the model emits: measured
+ * over 3,303 assistant messages carrying the token, 12 of 4,975 openers are
+ * mid-line and every one of them is prose about the protocol. Those six were
+ * the only tests that depended on a mid-line opener being honoured, and they
+ * depended on it incidentally — none of them is about opener position.
+ */
 function inkTool(tool: string, args: Record<string, unknown> = {}): string {
-  return '```ink-tool\n' + JSON.stringify({ tool, args }) + '\n```';
+  return '\n```ink-tool\n' + JSON.stringify({ tool, args }) + '\n```';
 }
 
 function signalResult(status: string) {
@@ -1312,8 +1323,11 @@ describe('a correction counts only once the backend accepted it (Lumen, round 2)
     expect(result.stopReason).toBe('backend-failure');
     expect(result.protocolViolations).toHaveLength(1);
     expect(result.protocolViolations[0].corrected).toBe(false);
-    // The loop's answer is still the last SUCCESSFUL text, not the failed spawn's.
-    expect(result.responseText).toBe(inkTool('x'));
+    // The loop's answer is still the last SUCCESSFUL text, not the failed
+    // spawn's. Trimmed because `inkTool` now leads with the newline that makes
+    // its fence begin a line, and the pipeline trims; which turn's text
+    // survives is what this asserts.
+    expect(result.responseText).toBe(inkTool('x').trim());
   });
 
   it('maxIterations: 0 behaves as 1 — the first request always runs (final rounds are not iterations)', async () => {
@@ -2959,10 +2973,14 @@ describe('REGRESSION (Lumen, PR #646 round 3): one opener rule, and undelivered 
     // Each prefix is a shape `openRe` matches as an opener. Whatever the finder
     // will resume on, findBlockEnd must hand back at — a narrower rule there
     // means the finder's own next match is never reached.
+    //
+    // Round 4 removed the two mid-line prefixes this list used to carry, and
+    // that is a deliberate narrowing, not a convenience: see the round-4 block
+    // below, where the same shapes are asserted to be CONTENT. The invariant
+    // this loop tests — the two rules recognize the same thing — is untouched.
     const prefixes: Array<[string, string]> = [
-      ['mid-line after prose', 'Now '],
-      ['mid-line after a backtick', 'the model emits ` '],
       ['deeply indented', '      '],
+      ['indented with a tab', '\t'],
       ['at line start', ''],
     ];
 
@@ -2991,9 +3009,10 @@ describe('REGRESSION (Lumen, PR #646 round 3): one opener rule, and undelivered 
     }
 
     it('CONTROL: backticks inside a COMPLETE JSON string are still content', () => {
-      // The permissive opener rule must not reach inside a payload that parsed.
-      // `scanJsonValueEnd` decides the value's extent first; findBlockEnd only
-      // ever looks at lines AFTER it.
+      // The bucket round 3 tested. `scanJsonValueEnd` decides the value's
+      // extent first, so findBlockEnd only ever looks at lines AFTER a payload
+      // that PARSED — which is why this passed while the one-brace-short twin
+      // below did not. The parameter that mattered was never varied.
       const blocks = findInkToolBlocks(
         '```ink-tool\n{"tool":"remember","args":{"content":"see ```ink-tool blocks"}}\n```'
       );
@@ -3008,6 +3027,125 @@ describe('REGRESSION (Lumen, PR #646 round 3): one opener rule, and undelivered 
       );
       expect(blocks.repaired).toHaveLength(1);
       expect(blocks.calls).toHaveLength(1);
+    });
+  });
+
+  /**
+   * REGRESSION (Lumen, PR #646 round 4). Round 3 settled opener-vs-sibling by
+   * widening BOTH rules to match the token anywhere in a line. This is what
+   * that costs, and it is the defect the PR exists to remove, reintroduced by
+   * the commit that fixed the previous one.
+   *
+   * A one-brace-short `remember` whose content string contains the literal
+   * token ends its own block AT the token. The outer payload is then the empty
+   * string; `looksLikeToolRequest` says an empty payload is not a request; the
+   * call is dropped with NO record. Measured at 3942ed0d: calls [], malformed
+   * [], repaired [] — and `stripLocalToolBlocks` leaves
+   * `​```ink-tool\n{"tool":"remember","args":{"content":"Example` in the
+   * displayed message, so the raw-JSON leak from Myra's IRA spec comes back
+   * with it. Both defects this module documents, together, in the shape it
+   * repairs: long prose in a one-line JSON string is where the measured losses
+   * are (`remember` 6.3%, `bash` 0.4%).
+   *
+   * The justification round 3 wrote for permissiveness was that being wrong
+   * about a sibling "can only end a block early and UNCLOSED, which reports
+   * rather than invents". These tests are that sentence's counterexample.
+   */
+  describe('REGRESSION (Lumen, PR #646 round 4): an opener begins its line', () => {
+    const short = (content: string) =>
+      JSON.stringify({ tool: 'remember', args: { content } }).slice(0, -1);
+    const wrap = (payload: string) => '```ink-tool\n' + payload + '\n```\n';
+
+    const contents: Array<[string, string]> = [
+      ['the literal token', 'Example ```ink-tool blocks'],
+      ['the token in another case', 'Example ```INK-TOOL blocks'],
+      // A real quote in the content, so the JSON carries a genuine `\"` before
+      // the token — the escape state a scanner has to be in to read it right.
+      ['an escaped quote before the token', 'He said "hi" then ```ink-tool blocks'],
+      ['the token twice', 'both ```ink-tool and ```ink-tool again'],
+    ];
+
+    for (const [name, content] of contents) {
+      it(`a one-brace-short remember survives ${name} in its content`, () => {
+        const text = wrap(short(content));
+        const blocks = findInkToolBlocks(text);
+        // One block, covering the whole payload — not one starting inside it.
+        expect(blocks).toHaveLength(1);
+        expect(blocks[0]!.start).toBe(0);
+        expect(blocks[0]!.payload).toBe(short(content));
+        expect(blocks[0]!.fenceClosed).toBe(true);
+
+        const ext = extractToolBlocks(text);
+        expect(ext.calls.map((c) => c.tool)).toEqual(['remember']);
+        // The content arrives whole. Asserting only that a `remember` call
+        // exists would pass on a call rebuilt from the truncated half.
+        expect(ext.calls[0]!.args.content).toBe(content);
+        expect(ext.repaired).toHaveLength(1);
+      });
+
+      it(`CONTROL: nothing of ${name} leaks into the displayed message`, () => {
+        expect(stripLocalToolBlocks(wrap(short(content))).trim()).toBe('');
+      });
+    }
+
+    it('a mid-line token is CONTENT, and the block carrying it is reported, not dropped', () => {
+      // The two prefixes removed from the round-3 list. Round 3 read this as an
+      // opener and dispatched the `read`; the block above it then ended empty
+      // and vanished. Now the outer block runs to its closing fence, fails to
+      // parse, and is REPORTED — which is the whole contract. A mid-line
+      // request is not executed, and the model is told its block was malformed.
+      for (const prefix of ['Now ', 'the model emits ` ']) {
+        const text =
+          '```ink-tool\n{"tool":"remember","args":{"content":"oops"\n' +
+          prefix +
+          '```ink-tool\n{"tool":"read","args":{}}\n```';
+        const ext = extractToolBlocks(text);
+        expect(ext.calls).toHaveLength(0);
+        expect(ext.malformed).toHaveLength(1);
+        expect(ext.malformed[0]!.tool).toBe('remember');
+        // Loud, not silent: something is always owed to the model here.
+        expect(ext.malformed.length + ext.calls.length + ext.repaired.length).toBeGreaterThan(0);
+      }
+    });
+
+    it('CONTROL: prose that merely mentions the token mid-line reports nothing', () => {
+      // Measured: the permissive finder's ONLY observable effect across 3,303
+      // real assistant messages was four of these — malformed reports invented
+      // from prose in PR write-ups, telling the model a block it never wrote
+      // was broken. Zero calls differed.
+      const ext = extractToolBlocks(
+        'The LLM emits ` ```ink-tool\n{"tool":"recall","args":{"query":"x"}}\n``` ` and ink runs it.\n'
+      );
+      expect(ext.calls).toHaveLength(0);
+      expect(ext.malformed).toHaveLength(0);
+      expect(ext.repaired).toHaveLength(0);
+    });
+
+    it('the two rules agree about CASE, not just about shape', () => {
+      // Myra's round-4 note, as a test rather than a comment. The derivation
+      // carried `.source` and hard-coded its flags, leaving case-sensitivity
+      // free to drift: change the literal to case-SENSITIVE and the sibling
+      // check follows while the finder does not, which is the round-3 defect
+      // again in the one dimension `.source` does not carry. The finder now
+      // takes the constant's own flags, so this block is 2 or it is neither.
+      const blocks = findInkToolBlocks(
+        '```ink-tool\n{"tool":"remember","args":{"content":"oops"\n```INK-TOOL\n{"tool":"read","args":{}}\n```'
+      );
+      expect(blocks).toHaveLength(2);
+      expect(blocks[0]!.fenceClosed).toBe(false);
+      expect(blocks[1]!.payload).toBe('{"tool":"read","args":{}}');
+    });
+
+    it('CONTROL: the finder and the sibling rule are still one definition', () => {
+      // The round-3 invariant, stated as a property rather than a shape list:
+      // whatever ends a block as a sibling must be found as a block, and the
+      // reverse. Both here are line-anchored; neither is hand-written.
+      const text =
+        '```ink-tool\n{"tool":"remember","args":{"content":"oops"\n  ```ink-tool\n{"tool":"read","args":{}}\n```';
+      const blocks = findInkToolBlocks(text);
+      expect(blocks).toHaveLength(2);
+      expect(blocks[0]!.fenceClosed).toBe(false);
+      expect(blocks[1]!.payload).toBe('{"tool":"read","args":{}}');
     });
   });
 
