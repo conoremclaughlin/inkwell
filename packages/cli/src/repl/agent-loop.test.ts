@@ -2930,3 +2930,146 @@ describe('REGRESSION (Lumen, PR #646 round 2): one closing-fence rule, and a not
     });
   });
 });
+
+/**
+ * REGRESSIONS (Lumen, PR #646 round 3). Both failed against ef39ef4f, the head
+ * that carried round 2's fixes, and both pass against 96900a53 — so both are
+ * regressions round 2 introduced, not pre-existing holes it failed to close.
+ *
+ * They are the same two sentences as rounds 1 and 2, a third time:
+ *
+ *   a local rule beside the shared one — round 2 replaced a hand-written
+ *   CLOSING rule with `fenceAfterLine`, and wrote a hand-written OPENER rule
+ *   next to it. `/^[ \t]*```ink-tool/` is line-anchored; the finder six inches
+ *   up matches the token anywhere in a line. `Now ```ink-tool` is an opener to
+ *   one and content to the other, so the sibling's closing fence closed the
+ *   block above it and the read was swallowed with no record.
+ *
+ *   a predicate answering the wrong question — round 1 read `rejected`
+ *   through a gate about failure; round 2 read `repaired` through a gate about
+ *   failure; round 3's `advisory` fix said "not a failure" and the relay gate
+ *   heard "nothing to deliver". The one record that exists solely to be read
+ *   by the model became the one record the model never saw.
+ */
+describe('REGRESSION (Lumen, PR #646 round 3): one opener rule, and undelivered is not unimportant', () => {
+  describe('the sibling rule recognizes exactly what the finder does', () => {
+    const unfinished = '```ink-tool\n{"tool":"remember","args":{"content":"oops"\n';
+    const sibling = '{"tool":"read","args":{}}';
+
+    // Each prefix is a shape `openRe` matches as an opener. Whatever the finder
+    // will resume on, findBlockEnd must hand back at — a narrower rule there
+    // means the finder's own next match is never reached.
+    const prefixes: Array<[string, string]> = [
+      ['mid-line after prose', 'Now '],
+      ['mid-line after a backtick', 'the model emits ` '],
+      ['deeply indented', '      '],
+      ['at line start', ''],
+    ];
+
+    for (const [name, prefix] of prefixes) {
+      it(`${name}: the sibling request survives the block above it`, () => {
+        const blocks = findInkToolBlocks(
+          `${unfinished}${prefix}\`\`\`ink-tool\n${sibling}\n\`\`\``
+        );
+        expect(blocks).toHaveLength(2);
+        // The sibling is a block of its OWN. Asserting only that some payload
+        // CONTAINS `"tool":"read"` passes against the bug, because the
+        // swallowed text is exactly where the read ends up.
+        expect(blocks[1]!.payload).toBe(sibling);
+        expect(blocks[0]!.payload).not.toContain('read');
+        // And the swallowed opener never authorized repair of the block above.
+        expect(blocks[0]!.fenceClosed).toBe(false);
+      });
+
+      it(`${name}: the call is dispatched, not silently dropped`, () => {
+        const blocks = extractToolBlocks(
+          `${unfinished}${prefix}\`\`\`ink-tool\n${sibling}\n\`\`\``
+        );
+        expect(blocks.calls.map((c) => c.tool)).toEqual(['read']);
+        expect(blocks.malformed).toHaveLength(1);
+      });
+    }
+
+    it('CONTROL: backticks inside a COMPLETE JSON string are still content', () => {
+      // The permissive opener rule must not reach inside a payload that parsed.
+      // `scanJsonValueEnd` decides the value's extent first; findBlockEnd only
+      // ever looks at lines AFTER it.
+      const blocks = findInkToolBlocks(
+        '```ink-tool\n{"tool":"remember","args":{"content":"see ```ink-tool blocks"}}\n```'
+      );
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0]!.payload).toContain('```ink-tool blocks');
+      expect(blocks[0]!.fenceClosed).toBe(true);
+    });
+
+    it('CONTROL: a genuine closing fence still closes, and still authorizes repair', () => {
+      const blocks = extractToolBlocks(
+        '```ink-tool\n{"tool":"remember","args":{"content":"note"}\n```'
+      );
+      expect(blocks.repaired).toHaveLength(1);
+      expect(blocks.calls).toHaveLength(1);
+    });
+  });
+
+  describe('an undelivered repair notice is still owed to the model', () => {
+    const repaired = '```ink-tool\n{"tool":"remember","args":{"content":"a long note"}\n```';
+    const signal = '```ink-tool\n{"tool":"signal_status","args":{"status":"completed"}}\n```';
+
+    const runWith = async (text: string) => {
+      const harness = makePorts(
+        [outcome({ responseText: text }), outcome({ responseText: 'noted' })],
+        (calls) =>
+          calls.map((c) => ({
+            tool: c.tool,
+            result: c.tool === 'signal_status' ? signalResult('completed') : 'saved',
+            status: 'executed',
+          }))
+      );
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+      return { harness, result };
+    };
+
+    it('relays the repair beside a clean terminal signal', async () => {
+      // Everything here SUCCEEDED, which is the point: the only thing the model
+      // has not seen is that the runtime closed its brackets. `hasUnseenFailure`
+      // is correctly false, and that is not an answer to whether this was
+      // delivered.
+      const { harness, result } = await runWith(`${repaired}\n${signal}`);
+      expect(result.stopReason).toBe('terminal-signal');
+      expect(harness.prompts).toHaveLength(2);
+      expect(harness.prompts[1]!.body).toContain('closing brackets');
+      expect(harness.prompts[1]!.body).toContain('FINAL');
+      // Terminal semantics hold: the relay is not extracted, so the signal
+      // cannot be multiplied.
+      expect(harness.executed).toHaveLength(1);
+    });
+
+    it('CONTROL: a clean terminal iteration earns no extra round-trip', async () => {
+      const balanced = '```ink-tool\n{"tool":"remember","args":{"content":"a long note"}}\n```';
+      const { harness } = await runWith(`${balanced}\n${signal}`);
+      expect(harness.prompts).toHaveLength(1);
+    });
+
+    it('CONTROL: a repair already carried by a continuation is not re-relayed', async () => {
+      // `stranded` clears on a successful continuation, so the obligation is
+      // discharged by delivery rather than by the record disappearing.
+      const harness = makePorts(
+        [
+          outcome({ responseText: repaired }),
+          outcome({ responseText: signal }),
+          outcome({ responseText: 'unreachable' }),
+        ],
+        (calls) =>
+          calls.map((c) => ({
+            tool: c.tool,
+            result: c.tool === 'signal_status' ? signalResult('completed') : 'saved',
+            status: 'executed',
+          }))
+      );
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local', maxIterations: 5 }, harness.ports);
+      // Opening turn + the continuation that carried the repair. No third.
+      expect(harness.prompts).toHaveLength(2);
+      expect(harness.prompts[1]!.body).toContain('closing brackets');
+    });
+  });
+});

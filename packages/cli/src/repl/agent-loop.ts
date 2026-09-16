@@ -1287,12 +1287,11 @@ export async function runAgentLoop(
   // relay's output is not extracted, so nothing re-executes and no signal is
   // multiplied. The agent knows what it signaled; it does not know what the cap
   // ate underneath the signal.
-  const relayWorthy =
-    stranded !== null &&
-    (stranded.selection.dropped.length > 0 ||
-      stranded.selection.unmatched > 0 ||
-      stopReason === 'iteration-cap' ||
-      hasUnseenFailure(stranded.results));
+  //
+  // The obligations themselves are enumerated in `isOwedToModel`, next to
+  // `hasUnseenFailure` — the two are a pair, and reading them apart is what
+  // produced three rounds of the same defect (round 3).
+  const relayWorthy = stranded !== null && isOwedToModel(stranded, stopReason);
   //
   // A protocol break the loop stopped on before any continuation could answer
   // it — a fabricated frame beside a terminal signal, an all-refused
@@ -1545,7 +1544,10 @@ export function findImitatedToolResults(responseText: string): ImitatedToolResul
  */
 export function findInkToolBlocks(text: string): InkToolBlock[] {
   const blocks: InkToolBlock[] = [];
-  const openRe = /```ink-tool[ \t]*\r?\n?/gi;
+  // Derived from INK_TOOL_OPENER so the finder and the sibling-boundary rule
+  // cannot disagree about what an opener is. The trailing run is about where
+  // the PAYLOAD starts, not about what an opener is, so it lives here.
+  const openRe = new RegExp(`${INK_TOOL_OPENER.source}[ \\t]*\\r?\\n?`, 'gi');
   let m: RegExpExecArray | null;
   while ((m = openRe.exec(text))) {
     const payloadStart = m.index + m[0].length;
@@ -1599,16 +1601,37 @@ export function findInkToolBlocks(text: string): InkToolBlock[] {
 }
 
 /**
- * A line that opens another ink-tool block — the one boundary that is not a
- * closer. Deliberately as permissive as the opener regex that finds blocks in
- * the first place (any indent, anything after the token), because the two rules
- * here are asymmetric on purpose: what CLOSES a block is strict, since it
- * authorizes repair, and being wrong there fabricates a call. What counts as a
- * sibling REQUEST is permissive, since it can only ever prevent one from being
- * swallowed. Measured over 5,108 real openers: 12 are indented past the three
- * spaces CommonMark allows, and a strict rule here would swallow them.
+ * The ```ink-tool opener, and the ONLY definition of one.
+ *
+ * `findInkToolBlocks` builds its scanning regex from this, and `findBlockEnd`
+ * recognizes a sibling boundary with it, because those two must agree
+ * exactly. `findBlockEnd` hands scanning back at a sibling and `openRe` is
+ * what resumes there — so a sibling rule NARROWER than the finder means the
+ * finder's own next match is never reached. The block it would have found is
+ * consumed as the previous block's content, its closing fence closes the block
+ * above it, and the call inside it is gone with no record.
+ *
+ * That is round 3 of this review (Lumen), and it is the same mistake as round
+ * 2 with the other rule: I wrote `/^[ \t]*```ink-tool/` here — line-anchored —
+ * while the finder six inches up matched the token ANYWHERE in a line. `Now
+ * ```ink-tool` is an opener to one and content to the other. Round 2 was a
+ * third local answer beside a shared closing rule; this is a second local
+ * answer beside the opener rule. Hence one definition, in one place, rather
+ * than a third correct-looking regex.
+ *
+ * Deliberately permissive — any indent, anything before or after the token —
+ * and asymmetric with the closing rule ON PURPOSE. What CLOSES a block is
+ * strict CommonMark (`fenceAfterLine`), because being wrong there authorizes
+ * bracket repair and fabricates a call. What counts as another REQUEST is
+ * permissive, because being wrong there can only end a block early and
+ * UNCLOSED, which reports rather than invents.
+ *
+ * Measured over 4,948 assistant-authored openers in 14 days: 12 are indented
+ * past the three spaces CommonMark allows, and 11 appear mid-line. All 11 are
+ * prose about the protocol rather than requests, so this defect's live firing
+ * rate is zero — a corruption window, not an active corruption.
  */
-const INK_TOOL_OPENER_LINE = /^[ \t]*```ink-tool/i;
+const INK_TOOL_OPENER = /```ink-tool/i;
 /** The backtick run at the start of a fence line, indent included. */
 const FENCE_RUN = /^ {0,3}`{3,}/;
 
@@ -1652,7 +1675,7 @@ function findBlockEnd(
         sibling: false,
       };
     }
-    if (INK_TOOL_OPENER_LINE.test(line)) {
+    if (INK_TOOL_OPENER.test(line)) {
       return { payloadEnd: lineStart, closeEnd: null, sibling: true };
     }
     if (nl === -1) break;
@@ -2006,6 +2029,52 @@ export function hasUnseenFailure(
     (r) =>
       (!RAN_STATUSES.has(r.status) && !WITNESSED_REFUSAL_STATUSES.has(r.status)) ||
       (RAN_STATUSES.has(r.status) && isErrorPayload(r.result))
+  );
+}
+
+/**
+ * Does the model still need to SEE something from an iteration that never
+ * reached it?
+ *
+ * This is a question about DELIVERY, and it is not the same question as
+ * `hasUnseenFailure`, which asks whether something went wrong that nobody
+ * watched. Three rounds of this review have now been one mistake with two
+ * names: a record that is not an ordinary success gets read through a
+ * predicate asking the OTHER question, and the answer closes the gate.
+ *
+ *   round 1 — `rejected` is a witnessed refusal, so `hasUnseenFailure` said
+ *             no, and a turn whose only block was malformed relayed nothing.
+ *   round 2 — `repaired` was counted as a failure, so a repaired call a policy
+ *             then BLOCKED was told to fix its arguments and try again.
+ *   round 3 — `advisory` correctly said "not a failure", and this gate read
+ *             that as "nothing to deliver" (Lumen). A repaired `remember`
+ *             beside a clean terminal signal produced one backend prompt and
+ *             the model was never told its brackets had been closed for it.
+ *
+ * The third time is the design, not the predicate. So the obligations are
+ * enumerated here, each naming what is owed, and "it did not fail" is no
+ * longer an answer to "has it been delivered". An advisory is the clearest
+ * case in the set: it exists for no reason other than to be read by the model
+ * (see ToolResultRecord.advisory), and an iteration that ends with no
+ * continuation is the only place left to read it. Silently dropping the one
+ * record whose entire purpose is to be seen is the defect this PR is about,
+ * rebuilt inside the fix for it — for the second time.
+ *
+ * `stranded` is non-null only while an iteration's results have NOT reached the
+ * model; a successful continuation clears it. So this asks about delivery
+ * without having to track it separately.
+ */
+function isOwedToModel(stranded: StrandedIteration, stopReason: AgentLoopStopReason): boolean {
+  return (
+    // Calls the model made that never ran, and it cannot tell.
+    stranded.selection.dropped.length > 0 ||
+    stranded.selection.unmatched > 0 ||
+    // The cap ate the rest of the turn.
+    stopReason === 'iteration-cap' ||
+    // Something failed where nobody was watching.
+    hasUnseenFailure(stranded.results) ||
+    // A notice that exists only to be read — undelivered is undelivered.
+    stranded.results.some((r) => r.advisory === true)
   );
 }
 
