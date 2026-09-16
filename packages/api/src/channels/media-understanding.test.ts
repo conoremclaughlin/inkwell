@@ -1,3 +1,4 @@
+import { existsSync } from 'fs';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -72,5 +73,54 @@ describe('MediaUnderstandingService', () => {
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+// Call-site coverage for the CLI provider. The substitution helper has its own
+// suite; these prove this class reaches it and forwards `env` to the child.
+describe('MediaUnderstandingService — CLI provider wiring', () => {
+  function cliService(imageCommand: string) {
+    return new MediaUnderstandingService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4.1-mini',
+      timeoutMs: 5000,
+      maxBytes: 1024 * 1024,
+      maxChars: 500,
+      providers: ['cli'],
+      imageCliCommand: imageCommand,
+    });
+  }
+
+  it('delivers the input path and mime type to the command', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-cli-'));
+    const filePath = path.join(tmpDir, 'an image.png');
+    await writeFile(filePath, Buffer.from('fake image bytes'));
+
+    const result = await cliService('printf "%s|%s" {input} {mime}').analyze({
+      type: 'image',
+      filePath,
+      contentType: 'image/png',
+    });
+
+    expect(result).toBe(`${filePath}|image/png`);
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('treats a hostile content type as text, not as a command', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-cli-'));
+    const filePath = path.join(tmpDir, 'image.png');
+    const marker = path.join(tmpDir, 'executed');
+    await writeFile(filePath, Buffer.from('fake image bytes'));
+
+    const result = await cliService('printf %s {mime}').analyze({
+      type: 'image',
+      filePath,
+      contentType: `$(printf pwned > ${marker})`,
+    });
+
+    expect(existsSync(marker)).toBe(false);
+    expect(result).toBe(`$(printf pwned > ${marker})`);
+    await rm(tmpDir, { recursive: true, force: true });
   });
 });
