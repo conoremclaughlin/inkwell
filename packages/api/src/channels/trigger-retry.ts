@@ -52,7 +52,34 @@ export function getTriggerRetryKey(payload: AgentTriggerPayload): string {
 
 export type ScheduleResult =
   | { scheduled: true; attempt: number; delayMs: number }
-  | { scheduled: false; reason: 'not_transient' | 'exhausted' | 'already_pending' };
+  | {
+      scheduled: false;
+      reason: 'not_transient' | 'exhausted' | 'already_pending' | 'routing_refused';
+    };
+
+/**
+ * A routing refusal is a decision, not a fault, and it must never be retried.
+ *
+ * It has to be recognised from the error OBJECT because it cannot be
+ * recognised from the error TEXT. A refusal's prose names the thread it
+ * refused, and classifyError matches prose: `pr:503` hits the capacity rule's
+ * /\b503\b/ and `debug:timeout` hits the timeout rule, so two ordinary thread
+ * keys classify as retryable and schedule a re-dispatch of a message that was
+ * deliberately held. Read as a category the answer is confident and wrong,
+ * which is why the type is checked first (Lumen, r2).
+ *
+ * Duck-typed on the code rather than imported from session-service: the two
+ * throw sites there are a RoutingRefusedError and a plain Error re-thrown
+ * after refuseAndHold, and importing the class would pull the session service
+ * into this module for an instanceof that the second site would fail anyway.
+ */
+export function isRoutingRefusal(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'ROUTING_REFUSED'
+  );
+}
 
 export interface TriggerRetrySchedulerOptions {
   maxAttempts?: number;
@@ -83,7 +110,17 @@ export class TriggerRetryScheduler {
    * maxAttempts total. Returns whether a retry was scheduled so the caller
    * can decide between "wait for retry" and "send failure notification now".
    */
-  scheduleRetry(payload: AgentTriggerPayload, classification: ErrorClassification): ScheduleResult {
+  scheduleRetry(
+    payload: AgentTriggerPayload,
+    classification: ErrorClassification,
+    error?: unknown
+  ): ScheduleResult {
+    // Before the classification, never after it: the refusal's own prose is
+    // what misclassifies, so consulting the category first is already too late.
+    if (isRoutingRefusal(error)) {
+      return { scheduled: false, reason: 'routing_refused' };
+    }
+
     if (!classification.retryable) {
       return { scheduled: false, reason: 'not_transient' };
     }
@@ -125,7 +162,21 @@ export class TriggerRetryScheduler {
     return { scheduled: true, attempt: nextAttempt, delayMs };
   }
 
-  /** Cancel a pending retry (e.g. message handled through another path). */
+  /**
+   * Cancel the pending retry for whatever message this payload identifies.
+   *
+   * Keyed off the source message, not the payload object, which is the point:
+   * a delivery that succeeds through some other route — a heartbeat scan, a
+   * manual re-send — carries a DIFFERENT payload for the SAME message, and its
+   * triggerTurnCompleted marker cannot guard a timer holding the old copy.
+   * The key matches, so the timer dies with the work it was waiting on
+   * (Lumen, r2).
+   */
+  cancelFor(payload: AgentTriggerPayload): boolean {
+    return this.cancel(getTriggerRetryKey(payload));
+  }
+
+  /** Cancel a pending retry by key. */
   cancel(key: string): boolean {
     const timer = this.timers.get(key);
     if (!timer) return false;

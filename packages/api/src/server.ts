@@ -1557,7 +1557,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           detail: result.refusal.detail,
           message: result.error || 'routing refused at spawn admission',
         });
-        throw new Error(result.error || 'routing refused at spawn admission');
+        // A RoutingRefusedError, not a bare Error (Lumen, r2). The two throw
+        // sites above rethrow the real one and carry `code` with them; this
+        // one used to flatten a refusal into prose, and prose is exactly what
+        // the retry scheduler cannot read a refusal from — a message naming
+        // thread "pr:503" classifies as capacity and gets re-dispatched.
+        throw new RoutingRefusedError(result.refusal.threadKey, targetSlug, result.refusal.detail);
       }
 
       // Post-admission failure (Lumen, PR #565 r2): routing completed —
@@ -1578,6 +1583,21 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // and lands in trigger:error, the retry scheduler must NOT re-dispatch —
     // the spawn already produced a successful turn (double-execution guard).
     payload.metadata = { ...(payload.metadata ?? {}), triggerTurnCompleted: true };
+
+    // And kill any retry still waiting on this message (Lumen, r2). The marker
+    // above only protects THIS payload; a delivery that arrives by another
+    // route — a heartbeat scan, a manual re-send — is a different payload
+    // object, and the pending timer holds a copy made before it existed. The
+    // timer would fire into an already-answered message and run a second
+    // session turn. cancelFor keys off the source message, which both payloads
+    // agree on.
+    //
+    // triggerRetryScheduler is declared further down this function on purpose:
+    // hoisting it above the handler re-indented 666 lines and, on the way,
+    // swallowed this registration into the scheduler's own callback. The
+    // binding is initialised long before any trigger arrives, so the closure
+    // is the cheaper half of that trade.
+    triggerRetryScheduler.cancelFor(payload);
 
     // Terminal for spawn: admission actually succeeded — occupancy was
     // rechecked, provisioning and acquisition landed, a process ran. Only now
@@ -1751,8 +1771,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // Guard: never retry if the spawn already produced a successful session
       // turn (triggerTurnCompleted is set post-success in the default handler).
       const turnCompleted = payload.metadata?.triggerTurnCompleted === true;
+      let pendingRetry: { attempt: number; delayMs: number } | undefined;
       if (!turnCompleted) {
-        const retry = triggerRetryScheduler.scheduleRetry(payload, classification);
+        const retry = triggerRetryScheduler.scheduleRetry(payload, classification, error);
         if (retry.scheduled) {
           logger.warn(
             `[TriggerRetry] attempt ${retry.attempt} in ${Math.round(retry.delayMs / 1000)}s, category=${classification.category}`,
@@ -1794,7 +1815,29 @@ When you complete a task_request, mark it as completed using update_inbox_messag
               });
             }
           }
-          return;
+
+          // Whether the notification may be suppressed depends on whether
+          // anything durable survives this process (Lumen, r2).
+          //
+          // An agent_inbox trigger has been restored to unread above, so the
+          // row IS the fallback: a restart mid-backoff loses the timer and the
+          // message is still sitting there unread for the next heartbeat scan.
+          // Staying quiet costs nothing.
+          //
+          // A thread-borne trigger has no such row. Thread read state is a
+          // monotonic inbox_thread_read_status.last_read_at, and rewinding it
+          // would resurface every message after that point rather than this
+          // one, so there is nothing to restore. Suppressing the notice would
+          // mean a restart during the backoff drops the message with no timer,
+          // no row and nothing said — strictly worse than the behaviour this
+          // PR replaces, which at least always told the sender.
+          //
+          // So a threaded failure still speaks once: on the first failure
+          // (attempt 1) the notice says a retry is pending, and the retry's own
+          // failure stays quiet because the sender has already been told.
+          if (payload.inboxMessageId) return;
+          if (attempt > 1) return;
+          pendingRetry = { attempt: retry.attempt, delayMs: retry.delayMs };
         }
       }
 
@@ -1815,7 +1858,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const categoryLabel =
         classification.category !== 'unknown' ? ` (${classification.category})` : '';
       const attemptsLabel = attempt > 1 ? ` after ${attempt} attempts` : '';
-      const notificationContent = `Trigger to ${payload.toSlug} failed${attemptsLabel}${categoryLabel}: ${classification.summary}`;
+      const retryLabel = pendingRetry
+        ? ` — retrying (${pendingRetry.attempt}/${TRIGGER_MAX_ATTEMPTS}) in ${Math.round(pendingRetry.delayMs / 1000)}s`
+        : '';
+      const notificationContent = `Trigger to ${payload.toSlug} failed${attemptsLabel}${categoryLabel}${retryLabel}: ${classification.summary}`;
 
       // Thread-borne trigger → notice joins the thread (participants and
       // session stamps already exist; stamped-only delivery lands it in
@@ -1836,6 +1882,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           errorDetail: errorText.slice(0, 4000),
           retryable: classification.retryable,
           attempts: attempt,
+          retryPending: pendingRetry ? pendingRetry.attempt : null,
           originalInboxMessageId: payload.inboxMessageId || null,
         },
       });

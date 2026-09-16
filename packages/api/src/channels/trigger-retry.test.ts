@@ -7,6 +7,7 @@ import {
   TRIGGER_RETRY_DELAYS_MS,
   getTriggerAttempt,
   getTriggerRetryKey,
+  isRoutingRefusal,
 } from './trigger-retry';
 
 const TRANSIENT = { category: 'network' as const, summary: 'fetch failed', retryable: true };
@@ -215,5 +216,73 @@ describe('TriggerRetryScheduler', () => {
       const result = scheduler.scheduleRetry(makePayload(), classification);
       expect(result).toEqual({ scheduled: false, reason: 'not_transient' });
     });
+  });
+});
+
+describe('isRoutingRefusal', () => {
+  // Duck-typed, so the shapes that are NOT a refusal matter as much as the one
+  // that is: a stray `code` on an unrelated error, or anything not an object,
+  // must not silence a retry that should happen.
+  it('recognises a refusal by its code, whatever the class', () => {
+    class Refused extends Error {
+      readonly code = 'ROUTING_REFUSED';
+    }
+    expect(isRoutingRefusal(new Refused('held'))).toBe(true);
+    expect(isRoutingRefusal(Object.assign(new Error('held'), { code: 'ROUTING_REFUSED' }))).toBe(
+      true
+    );
+  });
+
+  it('does not mistake another coded error for a refusal', () => {
+    expect(isRoutingRefusal(Object.assign(new Error('nope'), { code: 'ECONNRESET' }))).toBe(false);
+    expect(isRoutingRefusal(new Error('plain'))).toBe(false);
+  });
+
+  it('survives the values an error variable can actually hold', () => {
+    for (const value of [null, undefined, 'ROUTING_REFUSED', 42]) {
+      expect(isRoutingRefusal(value)).toBe(false);
+    }
+  });
+});
+
+describe('scheduleRetry with a refusal', () => {
+  it('refuses before the classification, not after it', () => {
+    // The whole point: the classification here says retryable, because the
+    // refusal's prose names thread "pr:503". Reading the category first gives a
+    // confident wrong answer, so the type has to be consulted first.
+    const scheduler = new TriggerRetryScheduler(vi.fn());
+    const refusal = Object.assign(new Error('Refusing to route "pr:503" for agent "wren"'), {
+      code: 'ROUTING_REFUSED',
+    });
+    const classification = classifyError({ errorText: refusal.message });
+    expect(classification.retryable).toBe(true);
+
+    const result = scheduler.scheduleRetry(makePayload(), classification, refusal);
+    expect(result).toEqual({ scheduled: false, reason: 'routing_refused' });
+    expect(scheduler.pendingCount).toBe(0);
+  });
+});
+
+describe('cancelFor', () => {
+  it('cancels a timer held for the same message but a different payload object', () => {
+    const redispatch = vi.fn();
+    const scheduler = new TriggerRetryScheduler(redispatch);
+    const payload = makePayload({ inboxMessageId: 'inbox-1' });
+
+    expect(scheduler.scheduleRetry(payload, TRANSIENT).scheduled).toBe(true);
+    expect(scheduler.pendingCount).toBe(1);
+
+    // A separate delivery of the same message: same identity, different object,
+    // and no shared metadata to carry a completion marker across.
+    expect(scheduler.cancelFor(makePayload({ inboxMessageId: 'inbox-1' }))).toBe(true);
+    expect(scheduler.pendingCount).toBe(0);
+  });
+
+  it("leaves a different message's retry alone", () => {
+    const scheduler = new TriggerRetryScheduler(vi.fn());
+    scheduler.scheduleRetry(makePayload({ inboxMessageId: 'inbox-1' }), TRANSIENT);
+
+    expect(scheduler.cancelFor(makePayload({ inboxMessageId: 'inbox-2' }))).toBe(false);
+    expect(scheduler.pendingCount).toBe(1);
   });
 });
