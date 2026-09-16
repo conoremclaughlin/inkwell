@@ -28,8 +28,9 @@ export const THREAD_SUMMARY_MAX = 280;
  * a message lost to a bound on its thread's label, while the same subject on an
  * existing thread went through fine (Lumen, #641 review).
  *
- * So creation truncates rather than refuses. The full subject is still stored
- * on the message row; it is only the thread's label that is bounded, which is
+ * So creation truncates rather than refuses, and the untruncated subject is
+ * kept on the message row by `threadMessageSubject` below — a bound on a label
+ * must not edit what someone sent. Only the thread's label is bounded, which is
  * what the bound was for. The ellipsis is part of the budget, so the result is
  * never longer than the column allows.
  *
@@ -42,4 +43,29 @@ export function boundThreadTitle(subject: string | null | undefined): string | n
   const chars = [...subject];
   if (chars.length <= THREAD_TITLE_MAX) return subject;
   return `${chars.slice(0, THREAD_TITLE_MAX - 1).join('')}…`;
+}
+
+/**
+ * Read a thread message's subject back out of its metadata.
+ *
+ * `inbox_thread_messages` has no subject column, so send_to_inbox stores the
+ * sender's subject at `metadata.pcp.subject` — the namespace the server already
+ * owns on that blob, and the only place on the thread path where a subject is
+ * kept whole. `inbox_threads.title` is bounded and holds the first message's
+ * subject only; a 240-character subject was truncated there and stored nowhere
+ * else, and a reply's was dropped entirely (Lumen, #641 round 2).
+ *
+ * Reader and writer are one round trip apart and would rot independently, so
+ * the test that covers this sends through the real handler and feeds what it
+ * wrote back through here, rather than asserting a shape at each end.
+ *
+ * Returns null for anything that is not a non-empty string, including a blob
+ * shaped differently by a caller who put their own `pcp` key in metadata.
+ */
+export function threadMessageSubject(metadata: unknown): string | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const pcp = (metadata as Record<string, unknown>).pcp;
+  if (!pcp || typeof pcp !== 'object') return null;
+  const subject = (pcp as Record<string, unknown>).subject;
+  return typeof subject === 'string' && subject.length > 0 ? subject : null;
 }

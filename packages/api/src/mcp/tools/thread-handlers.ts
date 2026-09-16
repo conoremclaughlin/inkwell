@@ -19,7 +19,7 @@ import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import { advanceThreadReadPointer } from './read-state.js';
-import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX } from './thread-bounds.js';
+import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -682,15 +682,25 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
                   'read-pointer advance failed — read state is stale; messages may re-deliver',
               }
             : {}),
-          messages: (messages || []).map((m: Record<string, unknown>) => ({
-            id: m.id,
-            senderSlug: m.sender_agent_id,
-            content: m.content,
-            messageType: m.message_type,
-            priority: m.priority,
-            metadata: m.metadata,
-            createdAt: m.created_at,
-          })),
+          messages: (messages || []).map((m: Record<string, unknown>) => {
+            // The sender's subject, whole. send_to_inbox stores it under
+            // metadata.pcp so a bounded thread title is never the only copy
+            // (#641 round 2); lifted to the top level here because that is
+            // where every other reader of a message expects to find it, and
+            // digging it out of a metadata blob is not something a caller
+            // should have to know to do. Omitted when there was no subject.
+            const subject = threadMessageSubject(m.metadata);
+            return {
+              id: m.id,
+              senderSlug: m.sender_agent_id,
+              content: m.content,
+              messageType: m.message_type,
+              priority: m.priority,
+              ...(subject ? { subject } : {}),
+              metadata: m.metadata,
+              createdAt: m.created_at,
+            };
+          }),
         }),
       },
     ],

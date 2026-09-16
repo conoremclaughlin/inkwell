@@ -13,6 +13,7 @@ import {
   threadToolDefinitions,
   threadTool,
 } from './thread-handlers';
+import { THREAD_TITLE_MAX, threadMessageSubject } from './thread-bounds';
 
 describe('thread tool definitions', () => {
   // Registration in index.ts used to index this array positionally. Adding
@@ -792,6 +793,7 @@ interface GuardMsg {
   message_type: string;
   sender_agent_id: string;
   content: string;
+  metadata?: unknown;
 }
 
 const hoursAgo = (h: number) => new Date(Date.now() - h * 3600 * 1000).toISOString();
@@ -1589,5 +1591,135 @@ describe('handleUpdateThread — the edit and its attribution trail move togethe
     } finally {
       restore();
     }
+  });
+});
+
+// =====================================================
+// The subject a sender wrote survives the bound on the thread's label
+// =====================================================
+
+describe('send_to_inbox keeps the whole subject on the message row', () => {
+  // Lumen's #641 round 2, measured on the real send handler rather than
+  // predicted. `inbox_thread_messages` has no subject column, so before this
+  // the thread path's only copy of a subject was `inbox_threads.title` — and
+  // only for the first message, since a reply's subject went nowhere at all.
+  // Bounding that title at 200 characters therefore truncated the one durable
+  // copy a 240-character subject had. A bound on a label is not licence to
+  // edit what someone sent.
+  //
+  // These go through handleSendToInbox and read the write back through
+  // threadMessageSubject — the reader get_thread_messages uses — because the
+  // two are one round trip apart and would rot independently. Asserting a
+  // shape at each end would let them disagree and still pass.
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Re-establish the module-level resolver stub. An earlier describe in this
+    // file spies on it and calls mockRestore(), which leaves the module mock
+    // without its resolved value — and every handler here dereferences
+    // resolved.user immediately, so the failure is a TypeError rather than
+    // anything about subjects.
+    const userResolver = await import('../../services/user-resolver');
+    vi.mocked(userResolver.resolveUserOrThrow).mockResolvedValue({
+      user: { id: 'user-123' },
+      resolvedBy: 'userId',
+    } as never);
+  });
+
+  async function sendWithSubject(subject: string) {
+    const client = createThreadMockSupabase();
+    // Force creation: the harness's inbox_threads.select returns null only on
+    // the first call, and the send path looks the thread up twice (the
+    // existing-thread probe, then findOrCreateThread). Left alone, the second
+    // lookup finds a thread and this measures the reply path instead of the
+    // creation path the bound lives on.
+    const threads = client._getTable('inbox_threads');
+    const absent = threads.select();
+    threads.select.mockReturnValue(absent);
+    const result = await handleSendToInbox(
+      {
+        userId: '00000000-0000-4000-8000-000000000641',
+        senderSlug: 'wren',
+        recipientSlug: 'lumen',
+        threadKey: 'pcp:thread:subject-retention',
+        subject,
+        content: 'The body is independent of the subject.',
+        trigger: false,
+      },
+      createMockDataComposer(client) as never
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    // Measure the creation path or measure nothing: no insert means the send
+    // took the reply branch and the assertions below would be vacuous.
+    expect(threads.insert).toHaveBeenCalledTimes(1);
+    const titleWritten = threads.insert.mock.calls[0][0].title as string | null;
+    const messageWritten = client._getTable('inbox_thread_messages').insert.mock
+      .calls[0][0] as Record<string, unknown>;
+    return { titleWritten, messageWritten };
+  }
+
+  it.each([200, 240])(
+    'a %i-character subject is recoverable in full after the title is bounded',
+    async (length) => {
+      const subject = `${'S'.repeat(length - 8)}END-MARK`;
+      expect([...subject].length).toBe(length);
+
+      const { titleWritten, messageWritten } = await sendWithSubject(subject);
+
+      // The reader's answer, not a hand-read of the blob: whatever
+      // get_thread_messages would surface is what has to be whole.
+      expect(threadMessageSubject(messageWritten.metadata)).toBe(subject);
+      // The label is still bounded — this fix must not have undone the bound.
+      expect([...(titleWritten ?? '')].length).toBeLessThanOrEqual(THREAD_TITLE_MAX);
+      // The body is the body; the subject did not leak into it.
+      expect(messageWritten.content).toBe('The body is independent of the subject.');
+    }
+  );
+
+  it('keeps the sender context that already lived in that metadata namespace', async () => {
+    const { messageWritten } = await sendWithSubject('Short enough for the title');
+    const meta = messageWritten.metadata as {
+      pcp: { sender: { sbSlug: string }; subject: string };
+    };
+    expect(meta.pcp.sender.sbSlug).toBe('wren');
+    expect(meta.pcp.subject).toBe('Short enough for the title');
+  });
+
+  it('writes no subject key at all when the sender sent none', async () => {
+    const client = createThreadMockSupabase();
+    const threads = client._getTable('inbox_threads');
+    const absent = threads.select();
+    threads.select.mockReturnValue(absent);
+    await handleSendToInbox(
+      {
+        userId: '00000000-0000-4000-8000-000000000641',
+        senderSlug: 'wren',
+        recipientSlug: 'lumen',
+        threadKey: 'pcp:thread:subject-retention',
+        content: 'No subject on this one.',
+        trigger: false,
+      },
+      createMockDataComposer(client) as never
+    );
+    const meta = client._getTable('inbox_thread_messages').insert.mock.calls[0][0]
+      .metadata as Record<string, Record<string, unknown>>;
+    expect('subject' in meta.pcp).toBe(false);
+    expect(threadMessageSubject(meta)).toBeNull();
+  });
+
+  it('get_thread_messages surfaces the subject the writer stored', async () => {
+    // The other end of the round trip. The row carries exactly what
+    // handleSendToInbox writes; the reader must lift it to the top level,
+    // where a caller looks for it, without anyone having to know it lives in
+    // a metadata blob.
+    const subject = `${'S'.repeat(232)}END-MARK`;
+    const rows: GuardMsg[] = [
+      { ...guardMsg('with-subject', 2), metadata: { pcp: { subject } } },
+      { ...guardMsg('without-subject', 1), metadata: { pcp: {} } },
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), { fullHistory: true });
+    const messages = parsed.messages as Array<{ id: string; subject?: string }>;
+    expect(messages.find((m) => m.id === 'with-subject')?.subject).toBe(subject);
+    // Absent, not empty: a message with no subject must not grow the key.
+    expect(messages.find((m) => m.id === 'without-subject')).not.toHaveProperty('subject');
   });
 });
