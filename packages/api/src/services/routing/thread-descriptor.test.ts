@@ -1,4 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import {
   formatEditAge,
   formatTitleProvenance,
@@ -173,5 +175,41 @@ describe('formatThreadDescriptorLines', () => {
     expect(lines).toEqual([
       'Summary of thread: Written by something that did not stamp the time (edit time unknown)',
     ]);
+  });
+});
+
+describe('the trigger call site still passes a recipient', () => {
+  /**
+   * A source-text check, and deliberately so. The membership argument is what
+   * keeps a thread's description away from non-participants, and the ONLY
+   * caller is the trigger preamble in server.ts — which cannot be imported
+   * here, because that module ends in an unconditional startServer().
+   *
+   * It exists because of a specific, known hazard rather than as general
+   * belt-and-braces. #641 is stacked on #638, and #638's r1 fix rewrites the
+   * same region of server.ts that this call lives in — 116 lines deleted from
+   * the trigger path. That merge resolution has to re-place this block by hand,
+   * and if it drops the call, or keeps it with the old three arguments, every
+   * behavioural test in this PR stays green: they exercise loadThreadDescriptor
+   * directly, and a caller that no longer exists breaks none of them. A
+   * branch-only addition lost in a merge leaves no hunk in either diff to see.
+   *
+   * It asserts a call shape, not behaviour. If the call site legitimately moves
+   * to another module, move this check with it rather than deleting it.
+   */
+  const serverSource = readFileSync(join(__dirname, '../../server.ts'), 'utf8');
+
+  it('calls loadThreadDescriptor exactly once, with the trigger target', () => {
+    const calls = serverSource.match(/loadThreadDescriptor\s*\(([^;]*?)\)\s*;/gs) ?? [];
+    expect(calls).toHaveLength(1);
+    // The recipient is the fourth argument; without it the loader cannot test
+    // membership and the preamble goes back to leaking to any triggered SB.
+    expect(calls[0]).toContain('targetSlug');
+  });
+
+  it('renders the descriptor lines it loads', () => {
+    // The other half of the wiring: loading the descriptor and never emitting
+    // it would be a silent no-op rather than a leak, and equally invisible.
+    expect(serverSource).toContain('formatThreadDescriptorLines');
   });
 });
