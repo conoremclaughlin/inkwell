@@ -1073,8 +1073,10 @@ export class StudioOverflowService {
     // ONE user+exact-claim-guarded CAS records cleaned + clears the claim
     // together (round 7) — a claim replaced mid-teardown fails here and the
     // sweep reconciles instead of us reporting a phantom success.
+    // Opts out of the default terminator: the `released` event below already
+    // closes this teardown window under the caller's own reason.
     const finalized = await this.leases
-      .finalizeTeardown(studio.id, studio.userId, claim)
+      .finalizeTeardown(studio.id, studio.userId, claim, { closeReason: null })
       .catch(() => false);
     if (!finalized) {
       logger.error(

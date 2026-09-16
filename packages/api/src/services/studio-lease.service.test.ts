@@ -2064,6 +2064,177 @@ describe('claimForTeardown ownership (round 3)', () => {
   });
 });
 
+/**
+ * The teardown claim fences the window in which a worktree is removed, and it
+ * was the one lease transition absent from `studio_lease_events`: the vacant
+ * path wrote `studios.lease` directly, the other two went through `casLease`,
+ * and `casLease` is a pure CAS primitive that logs nothing. A timeline ran
+ * from the previous holder's `released` straight to an already-`cleaned`
+ * studio.
+ *
+ * Every assertion here fails against the pre-fix service — not because the
+ * event carries the wrong shape, but because there is no event at all.
+ */
+describe('claimForTeardown lease events (destructive window is on the record)', () => {
+  function claimTables(lease: StudioLease | null): Record<string, Row[]> {
+    return {
+      studios: [{ id: 's-1', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+  }
+
+  const staleAt = () => new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+
+  it('records the claim on the vacant path', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(claim).not.toBeNull();
+
+    expect(tables.studio_lease_events).toHaveLength(1);
+    const event = tables.studio_lease_events[0];
+    expect(event.event).toBe('acquired');
+    expect(event.reason).toBe('teardown-claimed');
+    const detail = event.detail as Record<string, unknown>;
+    expect(detail.claimKind).toBe('teardown');
+    expect(detail.path).toBe('vacant');
+    expect(detail.claimReason).toBe('close_studio');
+  });
+
+  it('names the PREVIOUS HOLDER in session_id and keeps the synthetic token in detail', async () => {
+    // The diagnosability failure this fixes: a claim token is a bare
+    // randomUUID that resolves to no session anywhere. Recording it as the
+    // row's session_id would reproduce, in the event table, exactly the
+    // "held by session <uuid>" misreading the table exists to settle.
+    const holder: StudioLease = {
+      sessionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      threadKey: 'pr:642',
+      sbSlug: 'wren',
+      acquiredAt: staleAt(),
+      heartbeatAt: staleAt(),
+    };
+    const tables = claimTables(holder);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', {
+      reason: 'close_studio',
+      expectedThreadKey: 'pr:642',
+    });
+    expect(claim).not.toBeNull();
+
+    const event = tables.studio_lease_events.find((e) => e.reason === 'teardown-claimed');
+    expect(event).toBeDefined();
+    expect(event!.session_id).toBe(holder.sessionId);
+    expect(event!.session_id).not.toBe(claim!.sessionId);
+    expect(event!.thread_key).toBe('pr:642');
+    expect((event!.detail as Record<string, unknown>).claimToken).toBe(claim!.sessionId);
+    expect((event!.detail as Record<string, unknown>).path).toBe('thread-release');
+  });
+
+  it('records a refusal, so "refused" is distinguishable from "never attempted"', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const first = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(first).not.toBeNull();
+
+    // A second worker reaches for the same studio while the first holds it.
+    const second = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(second).toBeNull();
+
+    const refusal = tables.studio_lease_events.find((e) => e.event === 'conflict');
+    expect(refusal).toBeDefined();
+    expect(refusal!.reason).toBe('teardown-refused-active-claim');
+    expect((refusal!.detail as Record<string, unknown>).blockingToken).toBe(first!.sessionId);
+  });
+
+  it('records a refusal when the lease still multiplexes other live threads', async () => {
+    const holder: StudioLease = {
+      sessionId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      threadKey: 'pr:1',
+      threadKeys: ['pr:1', 'pr:2'],
+      sbSlug: 'wren',
+      acquiredAt: staleAt(),
+      heartbeatAt: staleAt(),
+    };
+    const tables = claimTables(holder);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', {
+      reason: 'close_studio',
+      expectedThreadKey: 'pr:1',
+    });
+    expect(claim).toBeNull();
+
+    const refusal = tables.studio_lease_events.find((e) => e.event === 'conflict');
+    expect(refusal).toBeDefined();
+    expect(refusal!.reason).toBe('teardown-refused-multiplexed');
+    expect((refusal!.detail as Record<string, unknown>).remainingThreadKeys).toEqual(['pr:2']);
+  });
+
+  it('terminates the window: finalizeTeardown closes what the claim opened', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(await service.finalizeTeardown('s-1', 'u', claim!)).toBe(true);
+
+    // An open with no close is what made an in-flight fence read as a stuck one.
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual([
+      'teardown-claimed',
+      'teardown-finalized',
+    ]);
+  });
+
+  it('lets a caller that logs its own close opt out, so one transition is not double-recorded', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(await service.finalizeTeardown('s-1', 'u', claim!, { closeReason: null })).toBe(true);
+
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual(['teardown-claimed']);
+  });
+
+  it('terminates the window on the abort path too: clearTeardownClaim', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(await service.clearTeardownClaim('s-1', 'u', claim!)).toBe(true);
+
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual([
+      'teardown-claimed',
+      'teardown-claim-cleared',
+    ]);
+    const cleared = tables.studio_lease_events[1];
+    expect(cleared.event).toBe('released');
+    expect((cleared.detail as Record<string, unknown>).claimToken).toBe(claim!.sessionId);
+  });
+
+  it('does not log a terminator for a finalize that did not happen', async () => {
+    // Control for the two tests above: the close event tracks the real
+    // transition, not the call. A stolen claim finalizes nothing and must
+    // leave the window open on the record.
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    tables.studios[0].lease = {
+      ...claim!,
+      sessionId: '33333333-3333-3333-3333-333333333333',
+    } as unknown as Row;
+
+    expect(await service.finalizeTeardown('s-1', 'u', claim!)).toBe(false);
+    expect(await service.clearTeardownClaim('s-1', 'u', claim!)).toBe(false);
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual(['teardown-claimed']);
+  });
+});
+
 // ── captureWorktreeState against a real git repo ──
 
 describe('captureWorktreeState (real git)', () => {

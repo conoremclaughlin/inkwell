@@ -935,7 +935,21 @@ export class StudioLeaseService {
    * end state; separate markCleaned + clear steps can interleave with a claim
    * replacement.
    */
-  async finalizeTeardown(studioId: string, userId: string, claim: StudioLease): Promise<boolean> {
+  /**
+   * `closeReason` terminates the `teardown-claimed` event this finalization
+   * closes. It defaults to a generic reason so a caller cannot silently leave
+   * a destructive window open on the record — close_studio did exactly that,
+   * and its unterminated window is what read as "a close was attempted and is
+   * stuck" during the 2026-09-16 audit. Callers that log their own, more
+   * specific `released` event pass null to opt out rather than double-record
+   * one transition.
+   */
+  async finalizeTeardown(
+    studioId: string,
+    userId: string,
+    claim: StudioLease,
+    opts: { closeReason?: string | null } = {}
+  ): Promise<boolean> {
     const { data, error } = await this.supabase
       .from('studios')
       .update({ status: 'cleaned', cleaned_at: new Date().toISOString(), lease: null })
@@ -950,7 +964,20 @@ export class StudioLeaseService {
       return false;
     }
     const finalized = Boolean(data?.length);
-    if (finalized) await this.repointSessionsOffEphemeral(studioId, userId);
+    if (finalized) {
+      await this.repointSessionsOffEphemeral(studioId, userId);
+      const closeReason = opts.closeReason === undefined ? 'teardown-finalized' : opts.closeReason;
+      if (closeReason !== null) {
+        await this.logEvent(userId, studioId, 'released', {
+          sessionId: claim.holderSessionId,
+          threadKey: claim.heldThreadKey,
+          sbSlug: claim.sbSlug,
+          sbId: claim.sbId,
+          reason: closeReason,
+          detail: { claimKind: 'teardown', claimToken: claim.sessionId },
+        });
+      }
+    }
     return finalized;
   }
 
@@ -1068,7 +1095,11 @@ export class StudioLeaseService {
     // publish it back as vacancy. Retire it — cleaned + lease NULL in one
     // claim-guarded CAS — and refuse; the caller diverts to overflow.
     if (worktreePath && !(await worktreePresent(worktreePath))) {
-      const retired = await this.finalizeTeardown(req.studioId, req.userId, recovery);
+      // Opts out of the default terminator: the `worktree-absent-retired`
+      // event below names this transition more precisely.
+      const retired = await this.finalizeTeardown(req.studioId, req.userId, recovery, {
+        closeReason: null,
+      });
       if (retired) {
         logger.warn('[StudioLease] Retired studio with absent worktree during reclaim', {
           studioId: req.studioId,
@@ -2032,7 +2063,11 @@ export class StudioLeaseService {
       // back as an acquirable vacancy pointing at a nonexistent cwd. Covers
       // interrupted teardowns and externally deleted worktrees alike.
       if (hasPath && !present) {
-        const finalized = await this.finalizeTeardown(row.id, row.user_id, claim);
+        // Opts out of the default terminator — the sweep logs its own
+        // `teardown-finalized-worktree-absent` below.
+        const finalized = await this.finalizeTeardown(row.id, row.user_id, claim, {
+          closeReason: null,
+        });
         if (finalized) {
           logger.warn('[StudioLease] Retired studio with absent worktree', {
             studioId: row.id,
@@ -2120,6 +2155,47 @@ export class StudioLeaseService {
   }
 
   /**
+   * Record one outcome of a teardown claim in `studio_lease_events`.
+   *
+   * The claim fences a DESTRUCTIVE window — the worktree is removed while it
+   * is held — and it was the only lease transition the table never carried.
+   * `claimForTeardown` writes `studios.lease` directly on the vacant path and
+   * through `casLease` on the other two, and `casLease` is a pure CAS
+   * primitive that logs nothing, so no path produced a row. A timeline
+   * therefore ran straight from the previous holder's `released` to a studio
+   * that was already `cleaned`, with the removal absent from it.
+   *
+   * That silence is not cosmetic: reading such a gap on 2026-09-16 cost an
+   * audit a false race theory. A synthetic claim token seen on a studio
+   * mid-close looked like a competing session, and the event table — which
+   * would have shown the claim being taken by the close itself — had nothing
+   * to say either way.
+   *
+   * `sessionId` on the row is the REAL previous holder, never the claim's
+   * unforgeable token; the token belongs in `detail.claimToken`, where it
+   * reads as the synthetic value it is. Event types reuse the existing
+   * vocabulary (`claimAndRescue`'s convention): the transition goes in
+   * `reason`, the structure in `detail`.
+   */
+  private async logTeardownOutcome(
+    studioId: string,
+    userId: string,
+    claim: StudioLease,
+    event: Extract<LeaseEventType, 'acquired' | 'conflict'>,
+    reason: string,
+    detail: Record<string, Json | null>
+  ): Promise<void> {
+    await this.logEvent(userId, studioId, event, {
+      sessionId: claim.holderSessionId,
+      threadKey: claim.heldThreadKey,
+      sbSlug: claim.sbSlug,
+      sbId: claim.sbId,
+      reason,
+      detail: { claimKind: 'teardown', claimReason: claim.reason ?? null, ...detail },
+    });
+  }
+
+  /**
    * Atomically claim a studio for teardown. The claim is a quarantine-style
    * lease with a unique token that `acquire` refuses — closing the
    * acquire-between-check-and-remove race. Returns the claim on success,
@@ -2131,6 +2207,10 @@ export class StudioLeaseService {
    *     mid-rescue or mid-removal RIGHT NOW — stealing it would run two
    *     destructive operations concurrently)
    *   - a lease held by `expectedThreadKey` whose holder process is not live
+   *
+   * Every exit emits a lease event — see `logTeardownOutcome`. A refusal and
+   * a claim that was never attempted are different facts, and only the table
+   * distinguishes them after the fact.
    */
   async claimForTeardown(
     studioId: string,
@@ -2143,6 +2223,28 @@ export class StudioLeaseService {
 
     const claim = this.claimRecord(holder, 'teardown', opts.reason, opts.expectedThreadKey);
 
+    // A lost CAS is the one outcome with no other trace anywhere: the caller
+    // just sees null, and `studios.lease` carries the winner's claim with
+    // nothing to say a second worker reached for it in the same window.
+    const settle = async (won: boolean, path: string): Promise<StudioLease | null> => {
+      if (won) {
+        await this.logTeardownOutcome(studioId, userId, claim, 'acquired', 'teardown-claimed', {
+          path,
+          claimToken: claim.sessionId,
+        });
+        return claim;
+      }
+      await this.logTeardownOutcome(
+        studioId,
+        userId,
+        claim,
+        'conflict',
+        'teardown-claim-lost-race',
+        { path }
+      );
+      return null;
+    };
+
     if (!holder) {
       const { data } = await this.supabase
         .from('studios')
@@ -2151,7 +2253,7 @@ export class StudioLeaseService {
         .eq('user_id', userId)
         .is('lease', null)
         .select('id');
-      return data?.length ? claim : null;
+      return settle(Boolean(data?.length), 'vacant');
     }
 
     if (holder.quarantined) {
@@ -2160,9 +2262,17 @@ export class StudioLeaseService {
           studioId,
           claimKind: holder.claimKind ?? null,
         });
+        await this.logTeardownOutcome(
+          studioId,
+          userId,
+          claim,
+          'conflict',
+          'teardown-refused-active-claim',
+          { blockingClaimKind: holder.claimKind ?? null, blockingToken: holder.sessionId }
+        );
         return null;
       }
-      return (await this.casLease(studioId, userId, holder, claim)) ? claim : null;
+      return settle(await this.casLease(studioId, userId, holder, claim), 'stale-quarantine');
     }
 
     const live = leaseThreadKeys(holder);
@@ -2180,6 +2290,14 @@ export class StudioLeaseService {
           expectedThreadKey: opts.expectedThreadKey,
           remainingThreadKeys: others,
         });
+        await this.logTeardownOutcome(
+          studioId,
+          userId,
+          claim,
+          'conflict',
+          'teardown-refused-multiplexed',
+          { expectedThreadKey: opts.expectedThreadKey, remainingThreadKeys: others }
+        );
         return null;
       }
       // Same release-now proof as everywhere else: a fresh non-terminal
@@ -2189,9 +2307,17 @@ export class StudioLeaseService {
           studioId,
           holderSessionId: holder.sessionId,
         });
+        await this.logTeardownOutcome(
+          studioId,
+          userId,
+          claim,
+          'conflict',
+          'teardown-refused-holder-live',
+          { expectedThreadKey: opts.expectedThreadKey }
+        );
         return null;
       }
-      return (await this.casLease(studioId, userId, holder, claim)) ? claim : null;
+      return settle(await this.casLease(studioId, userId, holder, claim), 'thread-release');
     }
 
     logger.warn('[StudioLease] Teardown claim refused — studio held by another thread', {
@@ -2199,6 +2325,14 @@ export class StudioLeaseService {
       holderThreadKey: holder.threadKey,
       expectedThreadKey: opts.expectedThreadKey ?? null,
     });
+    await this.logTeardownOutcome(
+      studioId,
+      userId,
+      claim,
+      'conflict',
+      'teardown-refused-other-thread',
+      { holderThreadKey: holder.threadKey, expectedThreadKey: opts.expectedThreadKey ?? null }
+    );
     return null;
   }
 
@@ -2212,9 +2346,25 @@ export class StudioLeaseService {
     return current?.lease?.sessionId === claim.sessionId;
   }
 
-  /** Clear a teardown claim (post-removal, or when aborting a claim taken in error). */
+  /**
+   * Clear a teardown claim (post-removal, or when aborting a claim taken in
+   * error). Logged for the same reason the claim is: an open event with no
+   * close reads as a destructive operation still in flight, which is exactly
+   * the misreading the claim event would otherwise invite.
+   */
   async clearTeardownClaim(studioId: string, userId: string, claim: StudioLease): Promise<boolean> {
-    return this.casLease(studioId, userId, claim, null);
+    const cleared = await this.casLease(studioId, userId, claim, null);
+    if (cleared) {
+      await this.logEvent(userId, studioId, 'released', {
+        sessionId: claim.holderSessionId,
+        threadKey: claim.heldThreadKey,
+        sbSlug: claim.sbSlug,
+        sbId: claim.sbId,
+        reason: 'teardown-claim-cleared',
+        detail: { claimKind: 'teardown', claimToken: claim.sessionId },
+      });
+    }
+    return cleared;
   }
 
   /** Null-safe wrapper around the shared resolver: empty slug and thrown errors both mean "unresolved". */
