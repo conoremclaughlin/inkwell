@@ -39,7 +39,7 @@ function makeFs(overrides?: {
 
 describe('analyzeCliLink', () => {
   it('defaults to ink binary name when no identity hint is available', () => {
-    const originalAgentId = process.env.AGENT_ID;
+    const originalSlug = process.env.AGENT_ID;
     delete process.env.AGENT_ID;
     try {
       const fsOps = makeFs();
@@ -48,13 +48,13 @@ describe('analyzeCliLink', () => {
       const linkedBinaryCheck = result.checks.find((check) => check.name === 'Linked binary');
       expect(linkedBinaryCheck?.detail).toContain('run: ink studio cli');
     } finally {
-      if (originalAgentId === undefined) delete process.env.AGENT_ID;
-      else process.env.AGENT_ID = originalAgentId;
+      if (originalSlug === undefined) delete process.env.AGENT_ID;
+      else process.env.AGENT_ID = originalSlug;
     }
   });
 
   it('uses AGENT_ID as fallback binary hint when present', () => {
-    const originalAgentId = process.env.AGENT_ID;
+    const originalSlug = process.env.AGENT_ID;
     process.env.AGENT_ID = 'lumen';
     try {
       const fsOps = makeFs();
@@ -67,8 +67,8 @@ describe('analyzeCliLink', () => {
         expect(linkedBinaryCheck?.detail).toContain('run: ink studio cli');
       }
     } finally {
-      if (originalAgentId === undefined) delete process.env.AGENT_ID;
-      else process.env.AGENT_ID = originalAgentId;
+      if (originalSlug === undefined) delete process.env.AGENT_ID;
+      else process.env.AGENT_ID = originalSlug;
     }
   });
 

@@ -4,7 +4,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import {
   buildChunkMetadataUpdate,
@@ -40,6 +40,19 @@ import type {
 } from '../models/memory';
 
 type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
+
+/**
+ * Lifecycle values that mean the session is over. PostgREST `in` list syntax,
+ * shared by the queries that need to tell live sessions from finished ones.
+ */
+const TERMINAL_LIFECYCLES = '(completed,failed)';
+
+/**
+ * The `status` values `list_sessions` accepts. Mirrors the enum on
+ * `listSessionsSchema` — this is a filter over derived current state, not a
+ * read of the deprecated `sessions.status` column.
+ */
+export type SessionStatusFilter = 'active' | 'paused' | 'resumable' | 'completed' | 'attachable';
 
 export interface KnowledgeMemoryContext {
   threadKey?: string;
@@ -303,6 +316,30 @@ function summarizeChunkPersistenceContext(params: {
   };
 }
 
+/**
+ * How many critical memories to consider, and how many to return. The pool is
+ * wider than the result so the tier can be ranked rather than truncated.
+ */
+const CRITICAL_CANDIDATE_LIMIT = 100;
+const CRITICAL_RETURN_LIMIT = 30;
+
+/**
+ * Relevance of a memory to the work at hand, ignoring age and salience.
+ *
+ * The critical tier ranks on this alone. A memory marked critical is a
+ * statement that it should keep mattering, so letting recency decay decide
+ * which criticals survive the cap re-introduces exactly the forgetting the
+ * salience was meant to prevent. Age is used only to break ties.
+ */
+export function computeRelevanceBoost(
+  memory: Memory,
+  context: KnowledgeMemoryContext = {}
+): number {
+  return (
+    computeThreadBoost(memory, context.threadKey) * computeFocusBoost(memory, context.focusText)
+  );
+}
+
 export function computeKnowledgeMemoryScore(
   memory: Memory,
   context: KnowledgeMemoryContext = {},
@@ -339,8 +376,8 @@ export class MemoryRepository {
    */
   async remember(input: MemoryCreateInput): Promise<Memory> {
     const sbId =
-      input.agentId && input.userId
-        ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
+      input.sbSlug && input.userId
+        ? await resolveSbId(this.supabase, input.userId, input.sbSlug)
         : null;
 
     // If topicKey is provided, ensure it's included in topics array
@@ -361,7 +398,7 @@ export class MemoryRepository {
         topics,
         metadata: input.metadata || {},
         expires_at: input.expiresAt?.toISOString(),
-        agent_id: input.agentId || null,
+        agent_id: input.sbSlug || null,
         contact_id: input.contactId || null,
         sb_id: sbId,
       })
@@ -740,14 +777,14 @@ export class MemoryRepository {
     }
 
     // Filter by agent
-    if (options.agentId) {
+    if (options.sbSlug) {
       const includeShared = options.includeShared !== false; // default true
       if (includeShared) {
         // Include both agent-specific and shared (null) memories
-        queryBuilder = queryBuilder.or(`agent_id.eq.${options.agentId},agent_id.is.null`);
+        queryBuilder = queryBuilder.or(`agent_id.eq.${options.sbSlug},agent_id.is.null`);
       } else {
         // Only agent-specific memories
-        queryBuilder = queryBuilder.eq('agent_id', options.agentId);
+        queryBuilder = queryBuilder.eq('agent_id', options.sbSlug);
       }
     }
 
@@ -835,7 +872,7 @@ export class MemoryRepository {
       p_source: options.source,
       p_salience: options.salience,
       p_topics: options.topics && options.topics.length > 0 ? options.topics : undefined,
-      p_agent_id: options.agentId,
+      p_agent_id: options.sbSlug,
       p_include_shared: options.includeShared !== false,
       p_include_expired: options.includeExpired === true,
       p_chunk_types: chunkTypes && chunkTypes.length > 0 ? chunkTypes : undefined,
@@ -934,7 +971,7 @@ export class MemoryRepository {
       p_source: options.source,
       p_salience: options.salience,
       p_topics: options.topics && options.topics.length > 0 ? options.topics : undefined,
-      p_agent_id: options.agentId,
+      p_agent_id: options.sbSlug,
       p_include_shared: options.includeShared !== false,
       p_include_expired: options.includeExpired === true,
     };
@@ -1168,7 +1205,7 @@ export class MemoryRepository {
    */
   async getKnowledgeMemories(
     userId: string,
-    agentId?: string,
+    sbSlug?: string,
     highLimit: number = 10,
     highWindowDays: number = 7,
     context: KnowledgeMemoryContext = {},
@@ -1184,8 +1221,8 @@ export class MemoryRepository {
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (agentId) {
-        q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+      if (sbSlug) {
+        q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
       }
       if (contactId) {
         q = q.eq('contact_id', contactId);
@@ -1205,8 +1242,8 @@ export class MemoryRepository {
         .order('created_at', { ascending: false })
         .limit(limit);
 
-      if (agentId) {
-        q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+      if (sbSlug) {
+        q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
       }
       if (contactId) {
         q = q.eq('contact_id', contactId);
@@ -1214,9 +1251,11 @@ export class MemoryRepository {
       return q;
     };
 
-    // Fetch critical + two high strategies in parallel
+    // Fetch critical + two high strategies in parallel.
+    // Critical pulls a wider candidate pool than it returns so the tier can be
+    // ranked by relevance rather than truncated by recency alone.
     const [criticalResult, highByCountResult, highByWindowResult] = await Promise.all([
-      buildQuery('critical', 30),
+      buildQuery('critical', CRITICAL_CANDIDATE_LIMIT),
       buildQuery('high', highLimit),
       buildWindowedQuery('high', highWindowDays, 50),
     ]);
@@ -1231,7 +1270,18 @@ export class MemoryRepository {
       logger.error('Failed to fetch high memories (by window):', highByWindowResult.error);
     }
 
-    const criticalMemories = (criticalResult.data || []).map(this.rowToMemory);
+    // Rank within the critical tier by relevance, not recency. Taking the
+    // newest N silently dropped older critical memories once the tier outgrew
+    // the cap — exactly the memories most likely to be durable rather than
+    // situational. Equally-relevant memories still fall back to newest-first.
+    const criticalMemories = (criticalResult.data || [])
+      .map(this.rowToMemory)
+      .map((memory) => ({ memory, score: computeRelevanceBoost(memory, context) }))
+      .sort(
+        (a, b) => b.score - a.score || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+      )
+      .slice(0, CRITICAL_RETURN_LIMIT)
+      .map((entry) => entry.memory);
 
     // Merge the two high strategies — dedupe by ID, keep recency order
     const highById = new Map<string, Memory>();
@@ -1257,8 +1307,9 @@ export class MemoryRepository {
       )
       .map((entry) => entry.memory);
 
-    // Critical first, then high.
-    // Critical remains recency-ordered; high can be boosted by thread/focus relevance.
+    // Critical first, then high. Both tiers are relevance-ranked internally;
+    // the tier boundary itself is never crossed, so a stale critical memory
+    // still outranks a fresh high one.
     return [...criticalMemories, ...scoredHighMemories];
   }
 
@@ -1267,7 +1318,7 @@ export class MemoryRepository {
    * Used after compaction to restore context continuity — the agent
    * likely just saved these via `remember` before compaction hit.
    */
-  async getRecentMemories(userId: string, agentId?: string, limit: number = 10): Promise<Memory[]> {
+  async getRecentMemories(userId: string, sbSlug?: string, limit: number = 10): Promise<Memory[]> {
     let q = this.supabase
       .from('memories')
       .select('*')
@@ -1276,8 +1327,8 @@ export class MemoryRepository {
       .order('created_at', { ascending: false })
       .limit(limit);
 
-    if (agentId) {
-      q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+    if (sbSlug) {
+      q = q.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
     }
 
     const { data, error } = await q;
@@ -1295,9 +1346,9 @@ export class MemoryRepository {
    */
   async getCachedSummary(
     userId: string,
-    agentId?: string
+    sbSlug?: string
   ): Promise<{ summaryText: string; computedAt: Date; memoryCount: number } | null> {
-    const cacheKey = agentId || '__shared__';
+    const cacheKey = sbSlug || '__shared__';
     const { data, error } = await this.supabase
       .from('memory_summary_cache')
       .select('*')
@@ -1314,8 +1365,8 @@ export class MemoryRepository {
       .eq('user_id', userId)
       .gt('created_at', data.computed_at);
 
-    if (agentId) {
-      freshnessQuery = freshnessQuery.or(`agent_id.eq.${agentId},agent_id.is.null`);
+    if (sbSlug) {
+      freshnessQuery = freshnessQuery.or(`agent_id.eq.${sbSlug},agent_id.is.null`);
     }
 
     const { count } = await freshnessQuery;
@@ -1333,11 +1384,11 @@ export class MemoryRepository {
    */
   async setCachedSummary(
     userId: string,
-    agentId: string | undefined,
+    sbSlug: string | undefined,
     summaryText: string,
     memoryCount: number
   ): Promise<void> {
-    const cacheKey = agentId || '__shared__';
+    const cacheKey = sbSlug || '__shared__';
     const { error } = await this.supabase.from('memory_summary_cache').upsert(
       {
         user_id: userId,
@@ -1556,15 +1607,16 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
-    const sbId =
-      input.agentId && input.userId
-        ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
-        : null;
+    // Prefer the caller's verified canonical identity. Re-resolving from the
+    // slug is a fallback for callers that have none: `agent_id` is unique only
+    // per (user_id, workspace_id), so the lookup can land on a same-named
+    // identity in another workspace and stamp the row with the wrong owner.
+    const sbId = await resolveOwnerSbId(this.supabase, input.userId, input.sbSlug, input.sbId);
 
     const insertData: Record<string, unknown> = {
       ...(input.id ? { id: input.id } : {}),
       user_id: input.userId,
-      agent_id: input.agentId,
+      agent_id: input.sbSlug,
       sb_id: sbId,
       metadata: input.metadata || {},
     };
@@ -1633,8 +1685,11 @@ export class MemoryRepository {
       workingDir?: string;
       cliAttached?: boolean;
       cliPollAt?: string;
+      cliTurnAt?: string | null;
+      cliTurnStoppedAt?: string | null;
       alias?: string | null;
       activeThreadKey?: string | null;
+      endedAt?: Date | null;
     }
   ): Promise<Session | null> {
     const dbUpdates: Record<string, unknown> = {};
@@ -1666,11 +1721,20 @@ export class MemoryRepository {
     if (updates.cliPollAt !== undefined) {
       (dbUpdates as Record<string, unknown>).cli_poll_at = updates.cliPollAt;
     }
+    if (updates.cliTurnAt !== undefined) {
+      (dbUpdates as Record<string, unknown>).cli_turn_at = updates.cliTurnAt;
+    }
+    if (updates.cliTurnStoppedAt !== undefined) {
+      (dbUpdates as Record<string, unknown>).cli_turn_stopped_at = updates.cliTurnStoppedAt;
+    }
     if (updates.alias !== undefined) {
       (dbUpdates as Record<string, unknown>).alias = updates.alias;
     }
     if (updates.activeThreadKey !== undefined) {
       (dbUpdates as Record<string, unknown>).active_thread_key = updates.activeThreadKey;
+    }
+    if (updates.endedAt !== undefined) {
+      dbUpdates.ended_at = updates.endedAt ? updates.endedAt.toISOString() : null;
     }
 
     const { data, error } = await this.supabase
@@ -1705,6 +1769,66 @@ export class MemoryRepository {
   }
 
   /**
+   * Active sessions owned by one identity, newest first.
+   *
+   * Unlike getActiveSession this returns candidates rather than a single row,
+   * so callers can tell "exactly one session" apart from "several — refuse to
+   * guess". Picking the newest of several is what let a write land on a peer's
+   * session (see resolveImplicitSession).
+   *
+   * Ownership is scoped by user_id plus a canonical `sbId` when the caller has
+   * one. `sbSlug` is a fallback for rows predating sb_id: the slug is unique
+   * only per (user_id, workspace_id), so two identities in different workspaces
+   * share it and it cannot be an ownership predicate on its own.
+   *
+   * studioId: undefined = any studio, null = only sessions with no studio,
+   * string = that studio.
+   */
+  async findOwnedActiveSessions(params: {
+    userId: string;
+    sbId?: string;
+    sbSlug?: string;
+    studioId?: string | null;
+    contactId?: string;
+    limit?: number;
+  }): Promise<Session[]> {
+    const { userId, sbId, sbSlug, studioId, contactId, limit = 5 } = params;
+
+    let query = this.supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .is('ended_at', null)
+      .neq('lifecycle', 'failed')
+      .order('started_at', { ascending: false })
+      .limit(limit);
+
+    // Prefer the canonical identity; only fall back to the ambiguous slug.
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
+    } else if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
+    }
+
+    if (studioId !== undefined) {
+      query = studioId === null ? query.is('studio_id', null) : query.eq('studio_id', studioId);
+    }
+
+    // Mirrors getActiveSession: contact sessions match their contact, owner
+    // sessions match NULL, so per-sender isolation is never collapsed.
+    query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to find owned active sessions:', error);
+      throw new Error(`Failed to find owned active sessions: ${error.message}`);
+    }
+
+    return (data || []).map((row) => this.rowToSession(row));
+  }
+
+  /**
    * Get active session for a user (most recent without ended_at).
    *
    * studioId behavior:
@@ -1714,9 +1838,15 @@ export class MemoryRepository {
    */
   async getActiveSession(
     userId: string,
-    agentId?: string,
+    sbSlug?: string,
     studioId?: string | null,
-    contactId?: string
+    contactId?: string,
+    /**
+     * Canonical owner. When supplied it REPLACES the slug filter: `agent_id` is
+     * unique only per (user_id, workspace_id), so matching on it alone can
+     * return a same-named identity's session from another workspace.
+     */
+    sbId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
@@ -1727,8 +1857,12 @@ export class MemoryRepository {
       .order('started_at', { ascending: false })
       .limit(1);
 
-    if (agentId) {
-      query = query.eq('agent_id', agentId);
+    // Prefer the canonical owner; the slug is the fallback for callers that
+    // have no canonical identity.
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
+    } else if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
     }
 
     if (studioId !== undefined) {
@@ -1764,21 +1898,26 @@ export class MemoryRepository {
    */
   async getActiveSessionByThreadKey(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     threadKey: string,
     studioId?: string | null,
-    contactId?: string
+    contactId?: string,
+    /** Canonical owner; replaces the slug filter when supplied. */
+    sbId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
       .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+
+    // Prefer the canonical owner; the slug is the fallback for callers that
+    // have no canonical identity.
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
     if (studioId !== undefined) {
       if (studioId === null) {
@@ -1812,7 +1951,7 @@ export class MemoryRepository {
    * Used by bootstrap to return active sessions so the client can pick the right one.
    * Capped to avoid bloating bootstrap response with zombie sessions.
    */
-  async getActiveSessions(userId: string, agentId?: string, limit = 10): Promise<Session[]> {
+  async getActiveSessions(userId: string, sbSlug?: string, limit = 10): Promise<Session[]> {
     let query = this.supabase
       .from('sessions')
       .select('*')
@@ -1822,8 +1961,8 @@ export class MemoryRepository {
       .order('started_at', { ascending: false })
       .limit(limit);
 
-    if (agentId) {
-      query = query.eq('agent_id', agentId);
+    if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
     }
 
     const { data, error } = await query;
@@ -1844,10 +1983,11 @@ export class MemoryRepository {
     options: {
       limit?: number;
       offset?: number;
-      agentId?: string;
+      sbSlug?: string;
       studioId?: string;
       filterNullStudio?: boolean;
       backend?: string;
+      status?: SessionStatusFilter;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -1856,8 +1996,8 @@ export class MemoryRepository {
       .eq('user_id', userId)
       .order('started_at', { ascending: false });
 
-    if (options.agentId) {
-      query = query.eq('agent_id', options.agentId);
+    if (options.sbSlug) {
+      query = query.eq('agent_id', options.sbSlug);
     }
 
     if (options.filterNullStudio) {
@@ -1868,6 +2008,67 @@ export class MemoryRepository {
 
     if (options.backend) {
       query = query.eq('backend', options.backend);
+    }
+
+    if (options.status) {
+      // `status` filters on the session's *current* state, derived from the
+      // authoritative columns rather than from the deprecated `status`
+      // column — which no terminal path keeps in sync. `endSession()` sets
+      // ended_at + lifecycle 'completed' and leaves status at its 'active'
+      // default, and lifecycle-only completions do the same. Filtering the
+      // legacy column therefore handed finished sessions back to every
+      // caller that asked for live ones.
+      //
+      // Terminal lifecycles are excluded by name rather than just
+      // `neq('lifecycle', 'failed')`, so that a 'completed' lifecycle with no
+      // ended_at cannot leak through. Every completion path stamps ended_at
+      // today, so the two forms agree; this one keeps agreeing if one stops.
+      // findByThreadKey in services/sessions/session-repository.ts made the
+      // same move against the same defect — see the note there.
+      //
+      // A NULL lifecycle sorts as non-active here, because SQL's `NOT IN`
+      // yields NULL rather than true. The column has defaulted to 'idle'
+      // since the lifecycle migration and existing rows were backfilled, so
+      // that is unreachable in practice; getActiveSessions has the same
+      // property, so the two agree either way.
+      if (options.status === 'completed') {
+        query = query.or(`ended_at.not.is.null,lifecycle.in.${TERMINAL_LIFECYCLES}`);
+      } else if (options.status === 'attachable') {
+        // 'attachable' is 'active' minus the crash exclusion: a session whose
+        // backend died (lifecycle 'failed') is exactly the one its agent
+        // resumes next, so pickers must still see it. 'active' cannot serve
+        // this — it groups 'failed' with 'completed', which is right for
+        // trigger routing and wrong for attach.
+        query = query.is('ended_at', null).neq('lifecycle', 'completed');
+
+        // The agent-declared terminal markers belong here too, not just in
+        // the client predicate. `update_session_state({ phase: 'complete' })`
+        // writes current_phase alone — no ended_at, no lifecycle change — so
+        // a filter that stops at the authoritative columns hands back rows
+        // the caller is about to discard, and `range()` has already spent the
+        // page on them. That is the same limit-before-filter defect as
+        // filtering entirely client-side, one column further in.
+        //
+        // Each exclusion is paired with an explicit NULL allowance: a session
+        // that never declared a phase is attachable, but SQL's `col <> x`
+        // over NULL yields NULL and would drop it. `ilike` rather than `like`
+        // to match the client predicate's lowercasing; the client also trims,
+        // which SQL does not, so a phase stored with surrounding whitespace
+        // still relies on the backstop.
+        query = query
+          .or('current_phase.is.null,current_phase.not.ilike.complete')
+          .or('current_phase.is.null,current_phase.not.ilike.complete:*')
+          .or('status.is.null,status.not.ilike.completed')
+          .or('status.is.null,status.not.ilike.completed:*');
+      } else {
+        query = query.is('ended_at', null).not('lifecycle', 'in', TERMINAL_LIFECYCLES);
+        // 'paused' and 'resumable' are agent-declared intent with no
+        // authoritative equivalent, so they still read the legacy column —
+        // but only among sessions that are still live.
+        if (options.status !== 'active') {
+          query = query.eq('status', options.status);
+        }
+      }
     }
 
     const limit = options.limit || 20;
@@ -2154,7 +2355,7 @@ export class MemoryRepository {
       source: row.source,
       salience: row.salience,
       topics: row.topics,
-      agentId: row.agent_id || undefined,
+      sbSlug: row.agent_id || undefined,
       contactId: (row as MemoryRow).contact_id || undefined,
       embedding: parseEmbeddingValue(row.embedding),
       metadata: row.metadata,
@@ -2188,7 +2389,9 @@ export class MemoryRepository {
     return {
       id: row.id,
       userId: row.user_id,
-      agentId: row.agent_id || undefined,
+      sbSlug: row.agent_id || undefined,
+      sbId: row.sb_id || undefined,
+      contactId: row.contact_id || undefined,
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,

@@ -8,7 +8,7 @@
 // ── Backends ──────────────────────────────────────────────────────
 
 /** CLI backend names — the canonical short names used in identity.json, CLI flags, etc. */
-export const BACKENDS = ['claude', 'codex', 'gemini'] as const;
+export const BACKENDS = ['claude', 'codex', 'gemini', 'antigravity'] as const;
 export type Backend = (typeof BACKENDS)[number];
 
 /**
@@ -20,6 +20,8 @@ export const BACKEND_ALIASES: Record<string, Backend> = {
   'claude-cli': 'claude',
   'codex-cli': 'codex',
   'gemini-cli': 'gemini',
+  agy: 'antigravity',
+  'antigravity-cli': 'antigravity',
 };
 
 /** Resolve a backend string to its canonical name, or undefined if unknown. */
@@ -35,8 +37,8 @@ export function resolveBackendName(name: string): Backend | undefined {
 export const IDENTITY_CONTEXTS = {
   /** Main repo root (not a studio worktree) */
   MAIN: 'main',
-  /** Studio worktree — format: workspace-{agentId} */
-  workspace: (agentId: string) => `workspace-${agentId}` as const,
+  /** Studio worktree — format: workspace-{sbSlug} */
+  workspace: (sbSlug: string) => `workspace-${sbSlug}` as const,
 } as const;
 
 // ── MCP Server Key ────────────────────────────────────────────────
@@ -51,7 +53,7 @@ export const MCP_SERVER_KEY = 'inkwell';
 
 /** Environment variable names used across CLI, hooks, and runners. */
 export const ENV = {
-  /** Agent ID override */
+  /** SB slug override */
   AGENT_ID: 'AGENT_ID',
   /** Inkwell server URL */
   SERVER_URL: 'INK_SERVER_URL',

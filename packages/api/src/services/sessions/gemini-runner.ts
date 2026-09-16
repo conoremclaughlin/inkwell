@@ -24,6 +24,7 @@ import type {
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
+import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import {
@@ -61,9 +62,11 @@ export class GeminiRunner implements IRunner {
 
     // Build the message with injected context on first turn (same as Claude/Codex)
     let fullMessage = message;
+    let runConfig = config;
     if (injectedContext && !isResume) {
       const contextBlock = formatInjectedContext(injectedContext);
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+      runConfig = { ...config, constitutionInjected: true };
     }
 
     // Optionally write system prompt to a temp policy file
@@ -100,7 +103,7 @@ export class GeminiRunner implements IRunner {
       const contextToken = encodeContextToken({
         sessionId: config.pcpSessionId || '',
         studioId: config.studioId || '',
-        agentId: config.agentId || 'unknown',
+        sbSlug: config.sbSlug || 'unknown',
         cliAttached: false,
         runtime: 'gemini',
       });
@@ -139,6 +142,10 @@ export class GeminiRunner implements IRunner {
     }
 
     try {
+      // The --include-directories grant requires the directory to exist;
+      // async so the event loop is never blocked.
+      await ensureInkStudiosRoot();
+
       const effectivePolicyPath = containerPolicyPath || policyPath;
       const args = this.buildArgs(fullMessage, config, effectivePolicyPath, backendSessionId);
       logger.info('Spawning Gemini CLI', {
@@ -152,7 +159,7 @@ export class GeminiRunner implements IRunner {
 
       const result = await this.spawnProcess(
         args,
-        config,
+        runConfig,
         geminiSettingsEnvPath
           ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsEnvPath }
           : undefined
@@ -201,6 +208,12 @@ export class GeminiRunner implements IRunner {
   ): string[] {
     const args: string[] = ['-p', message, '-o', 'stream-json', '--yolo'];
 
+    // Ephemeral-studio root (spec:studio-materialization v8): Gemini's
+    // workspace-grant equivalent of --add-dir, on both fresh and resume
+    // shapes, so studios minted mid-session stay editable (PR #544 r1 P1).
+    // The run path ensures the directory exists first.
+    args.push('--include-directories', inkStudiosRoot());
+
     if (resumeSessionId) {
       args.push('-r', resumeSessionId);
     }
@@ -234,13 +247,16 @@ export class GeminiRunner implements IRunner {
       const spawnEnv: Record<string, string> = {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(geminiBin),
-        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
+        // Tells the session-start hook the constitution is already in the
+        // prompt, so it does not inject a second copy.
+        ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...(extraEnv || {}),
         ...buildSessionEnv({
           pcpSessionId: config.pcpSessionId,
           studioId: config.studioId,
           accessToken: config.pcpAccessToken,
-          agentId: config.agentId,
+          sbSlug: config.sbSlug,
           runtime: 'gemini',
           repoRoot: config.repoRoot,
         }),

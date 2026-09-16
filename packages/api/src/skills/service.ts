@@ -200,20 +200,35 @@ export class SkillsService {
 let serviceInstance: SkillsService | null = null;
 
 /**
- * Read skills config from ~/.ink/config.json.
- * Returns extraDirs if configured under `skills.extraDirs`.
+ * Read skills extraDirs from ~/.ink/config.json.
+ *
+ * Single source, no legacy fallback. #459 briefly read ~/.pcp/config.json when
+ * the canonical config said nothing, but nothing has written that file since
+ * the rename — it's a dead path that could only ever resurrect stale dirs.
+ *
+ * A malformed config yields no extra dirs rather than throwing: skills are
+ * additive, so loading none degrades gracefully where a crash would not.
  */
-function readSkillsConfig(): SkillLoadOptions {
-  const configPath = join(homedir(), '.pcp', 'config.json');
+export function readSkillsConfig(): SkillLoadOptions {
+  const configPath = join(homedir(), '.ink', 'config.json');
   if (!existsSync(configPath)) return {};
 
+  let parsed: unknown;
   try {
-    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    const extraDirs = config?.skills?.extraDirs as string[] | undefined;
-    return extraDirs?.length ? { extraDirs } : {};
+    parsed = JSON.parse(readFileSync(configPath, 'utf-8'));
   } catch {
     return {};
   }
+
+  const skills = (parsed as { skills?: unknown } | null)?.skills;
+  if (!skills || typeof skills !== 'object') return {};
+
+  const extraDirs = (skills as { extraDirs?: unknown }).extraDirs;
+  if (!Array.isArray(extraDirs) || extraDirs.some((d) => typeof d !== 'string')) {
+    return {};
+  }
+
+  return extraDirs.length ? { extraDirs: extraDirs as string[] } : {};
 }
 
 /**

@@ -75,7 +75,7 @@ async function pcpToolCall(
 async function callRecallForHooks(query: string, limit: number) {
   const result = await pcpToolCall('recall', {
     query,
-    agentId: 'wren',
+    sbSlug: 'wren',
     includeShared: true,
     limit,
     recallMode: 'hybrid',
@@ -93,7 +93,7 @@ async function callRecallForHooks(query: string, limit: number) {
 
 describe('E2E: Bootstrap verification', () => {
   it.skipIf(!serverAvailable)('loads identity and memories for wren', async () => {
-    const result = await pcpToolCall('bootstrap', { agentId: 'wren' });
+    const result = await pcpToolCall('bootstrap', { sbSlug: 'wren' });
 
     // Bootstrap returns data directly (no success wrapper)
     // It should have user info and identity
@@ -110,7 +110,7 @@ describe('E2E: Bootstrap verification', () => {
   });
 
   it.skipIf(!serverAvailable)('returns constitution documents', async () => {
-    const result = await pcpToolCall('bootstrap', { agentId: 'wren' });
+    const result = await pcpToolCall('bootstrap', { sbSlug: 'wren' });
 
     const constitution = result.constitution as Record<string, unknown> | undefined;
     if (constitution) {
@@ -139,7 +139,7 @@ describe('E2E: Hook lifecycle in simulated REPL', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'How does session routing work for triggered agents?',
         assistantResponse: 'The server resolves the studio and spawns a backend session.',
@@ -172,7 +172,7 @@ describe('E2E: Hook lifecycle in simulated REPL', () => {
 
     const result = await registry.fire('prompt_build', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 5, budgetUtilization: 0.85 },
+      runtime: { sbSlug: 'wren', turnCount: 5, budgetUtilization: 0.85 },
     });
 
     expect(result.injected).toBe(1);
@@ -217,7 +217,7 @@ describe('E2E: Hook lifecycle in simulated REPL', () => {
 
     await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'test',
         assistantResponse: 'test',
@@ -305,7 +305,7 @@ describe('E2E: Context tools in simulated REPL', () => {
 describe('E2E: Full session cycle', () => {
   it.skipIf(!serverAvailable)('bootstrap → turn → recall → evict → verify', async () => {
     // Phase 1: Bootstrap
-    const bootstrapResult = await pcpToolCall('bootstrap', { agentId: 'wren' });
+    const bootstrapResult = await pcpToolCall('bootstrap', { sbSlug: 'wren' });
     expect(
       bootstrapResult.user || bootstrapResult.identity || bootstrapResult.constitution
     ).toBeTruthy();
@@ -336,7 +336,7 @@ describe('E2E: Full session cycle', () => {
     // Phase 4: Fire turn_end — passive recall should inject
     const turnResult = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.2 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.2 },
       lastTurn: { userInput, assistantResponse, turnIndex: 1 },
     });
 
@@ -380,7 +380,7 @@ describe('E2E: Full session cycle', () => {
 
     const turnResult2 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.3 },
       lastTurn: { userInput: userInput2, assistantResponse: assistantResponse2, turnIndex: 2 },
     });
 

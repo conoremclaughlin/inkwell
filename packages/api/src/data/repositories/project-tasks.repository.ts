@@ -8,6 +8,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
+import { applyGraphBlockedBy, assertBlockedByWritable } from '../task-graph-read-model';
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'archived';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
@@ -46,6 +47,7 @@ export interface CreateProjectTaskInput {
   created_by?: string;
   task_group_id?: string;
   task_order?: number;
+  due_date?: string | null;
 }
 
 export interface UpdateProjectTaskInput {
@@ -58,13 +60,14 @@ export interface UpdateProjectTaskInput {
   outcome?: string;
   outcome_reason?: string;
   completed_at?: string | null;
+  due_date?: string | null;
   metadata?: Record<string, unknown>;
 }
 
 export interface TaskAssignment {
   sessionId?: string;
   studioId?: string;
-  agentId?: string;
+  sbSlug?: string;
   assignedAt?: string;
 }
 
@@ -75,6 +78,9 @@ export class ProjectTasksRepository {
    * Create a new task
    */
   async create(input: CreateProjectTaskInput): Promise<ProjectTask> {
+    if (input.blocked_by !== undefined) {
+      await assertBlockedByWritable(this.client, input.task_group_id);
+    }
     const insertData: Record<string, unknown> = {
       project_id: input.project_id,
       user_id: input.user_id,
@@ -88,6 +94,7 @@ export class ProjectTasksRepository {
     };
     if (input.task_group_id !== undefined) insertData.task_group_id = input.task_group_id;
     if (input.task_order !== undefined) insertData.task_order = input.task_order;
+    if (input.due_date !== undefined) insertData.due_date = input.due_date;
 
     const { data, error } = await this.client
       .from('tasks')
@@ -111,8 +118,10 @@ export class ProjectTasksRepository {
     if (error && error.code !== 'PGRST116') {
       throw new Error(`Failed to find task: ${error.message}`);
     }
+    if (!data) return null;
 
-    return data as unknown as ProjectTask | null;
+    const [derived] = await applyGraphBlockedBy(this.client, [data as unknown as ProjectTask]);
+    return derived;
   }
 
   /**
@@ -154,7 +163,7 @@ export class ProjectTasksRepository {
       throw new Error(`Failed to list tasks: ${error.message}`);
     }
 
-    return (data || []) as unknown as ProjectTask[];
+    return applyGraphBlockedBy(this.client, (data || []) as unknown as ProjectTask[]);
   }
 
   /**
@@ -201,7 +210,7 @@ export class ProjectTasksRepository {
       throw new Error(`Failed to list tasks: ${error.message}`);
     }
 
-    return (data || []) as unknown as ProjectTask[];
+    return applyGraphBlockedBy(this.client, (data || []) as unknown as ProjectTask[]);
   }
 
   /**
@@ -218,9 +227,38 @@ export class ProjectTasksRepository {
    * Update a task
    */
   async update(id: string, input: UpdateProjectTaskInput): Promise<ProjectTask> {
+    // PostgREST turns an empty payload into an UPDATE that matches no rows, and
+    // .single() then fails with "Cannot coerce the result to a single JSON
+    // object" — an error that points at JSON parsing rather than at the caller
+    // who passed nothing to write. Explicit-undefined values are stripped
+    // FIRST: JSON.stringify drops them from the request body anyway, so
+    // { due_date: undefined } is the same empty payload wearing a key
+    // (Lumen #503 r1 P3) — and every repository caller gets the guard, not
+    // just the MCP handler that happens to pre-filter.
+    const provided = Object.fromEntries(
+      Object.entries(input).filter(([, v]) => v !== undefined)
+    ) as UpdateProjectTaskInput;
+    if (Object.keys(provided).length === 0) {
+      throw new Error('No fields to update');
+    }
+
+    if (provided.blocked_by !== undefined) {
+      const { data: existing, error: lookupError } = await this.client
+        .from('tasks')
+        .select('task_group_id')
+        .eq('id', id)
+        .maybeSingle();
+      if (lookupError) {
+        // Fail closed: an unverifiable task must not skip the guard. (The
+        // enforce_blocked_by_source trigger is the authoritative fence; this
+        // precheck exists for the friendly error and must not fail open.)
+        throw new Error(`Cannot verify task for blocked_by write: ${lookupError.message}`);
+      }
+      await assertBlockedByWritable(this.client, existing?.task_group_id);
+    }
     const { data, error } = await this.client
       .from('tasks')
-      .update(input as never)
+      .update(provided as never)
       .eq('id', id)
       .select()
       .single();
@@ -295,7 +333,7 @@ export class ProjectTasksRepository {
       .order('created_at', { ascending: true });
 
     if (error) throw new Error(`Failed to get group tasks: ${error.message}`);
-    return (data || []) as unknown as ProjectTask[];
+    return applyGraphBlockedBy(this.client, (data || []) as unknown as ProjectTask[]);
   }
 
   /**

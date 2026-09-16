@@ -56,11 +56,9 @@ vi.mock('../data/composer', () => ({
   })),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -68,11 +66,9 @@ vi.mock('../config/env', () => ({
   isProduction: () => false,
   isTest: () => true,
 }));
-
 vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
-
 vi.mock('../utils/request-context', () => ({
   runWithRequestContext: (_ctx: Record<string, unknown>, fn: () => void) => {
     fn();
@@ -326,13 +322,13 @@ describe('POST /approval-requests', () => {
     );
   });
 
-  it('resolves requestingAgentId from the x-ink-context header', async () => {
+  it('resolves requestingSlug from the x-ink-context header', async () => {
     installInsertMock({
       data: { id: 'req-xyz', status: 'pending', expires_at: futureIso() },
       error: null,
     });
 
-    const contextToken = Buffer.from(JSON.stringify({ agentId: 'wren' })).toString('base64url');
+    const contextToken = Buffer.from(JSON.stringify({ sbSlug: 'wren' })).toString('base64url');
     const handler = findRouteHandler('post', '/approval-requests');
     const req = createAuthenticatedReq({
       body: { tool: 'Bash', args: 'ls' },
@@ -343,6 +339,31 @@ describe('POST /approval-requests', () => {
 
     const insertFn = mockSupabaseFrom.mock.results[0].value.insert as ReturnType<typeof vi.fn>;
     expect(insertFn).toHaveBeenCalledWith(expect.objectContaining({ requesting_agent_id: 'wren' }));
+  });
+
+  it('resolves requestingSlug from a PRE-RENAME x-ink-context header', async () => {
+    installInsertMock({
+      data: { id: 'req-legacy', status: 'pending', expires_at: futureIso() },
+      error: null,
+    });
+
+    // A still-running pre-rename CLI sends agentId. This route decodes the
+    // header itself, so it stored 'unknown' — losing attribution, and
+    // collapsing every legacy requester into one approve-all bucket, since
+    // approval-interceptor scopes by this stored field.
+    const contextToken = Buffer.from(JSON.stringify({ agentId: 'aster' })).toString('base64url');
+    const handler = findRouteHandler('post', '/approval-requests');
+    const req = createAuthenticatedReq({
+      body: { tool: 'Bash', args: 'ls' },
+      headers: { authorization: 'Bearer t', 'x-ink-context': contextToken },
+    });
+    const res = createMockRes();
+    await handler!(req as Request, res as unknown as Response);
+
+    const insertFn = mockSupabaseFrom.mock.results[0].value.insert as ReturnType<typeof vi.fn>;
+    expect(insertFn).toHaveBeenCalledWith(
+      expect.objectContaining({ requesting_agent_id: 'aster' })
+    );
   });
 
   it('falls back to "unknown" when x-ink-context is malformed', async () => {

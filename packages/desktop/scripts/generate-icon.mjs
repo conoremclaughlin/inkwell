@@ -7,9 +7,10 @@
  * rounded square. Pure Node — the PNG is encoded by hand with zlib, no
  * image dependencies. Deterministic output.
  *
- * Usage:  node scripts/generate-icon.mjs
- * Then:   npx tauri icon assets/icon-source.png --output src-tauri/icons
- * (or `yarn icon:generate` which does both)
+ * Usage:  node scripts/generate-icon.mjs   (or `yarn icon:generate`)
+ * The Electron shell loads assets/icon-source.png directly for the tray;
+ * packaged-app icon sets (.icns/.ico) can be derived from it when we add
+ * a bundler (electron-builder or similar).
  */
 
 import { deflateSync } from 'node:zlib';

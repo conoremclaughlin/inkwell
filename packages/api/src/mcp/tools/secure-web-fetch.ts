@@ -20,7 +20,7 @@ export const secureWebFetchInputSchema = z.object({
     .optional()
     .default(false)
     .describe('If true, returns extraction prompt instead of wrapped content'),
-  userId: z.string().uuid().optional().describe('User ID for audit logging'),
+  userId: z.string().guid().optional().describe('User ID for audit logging'),
 });
 
 export type SecureWebFetchInput = z.infer<typeof secureWebFetchInputSchema>;

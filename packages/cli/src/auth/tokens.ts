@@ -41,7 +41,7 @@ export interface JwtPayload {
   sub: string; // userId
   email: string;
   scope: string;
-  agentId?: string;
+  sbSlug?: string;
   identityId?: string;
   exp: number;
   iat: number;
@@ -65,15 +65,15 @@ function delegatedAuthDirPath(): string {
   return join(homedir(), '.ink', 'auth', 'agents');
 }
 
-function sanitizeAgentId(agentId: string): string {
-  return agentId
+function sanitizeSlug(sbSlug: string): string {
+  return sbSlug
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, '_');
 }
 
-function delegatedAuthFilePath(agentId: string): string {
-  return join(delegatedAuthDirPath(), `${sanitizeAgentId(agentId)}.json`);
+function delegatedAuthFilePath(sbSlug: string): string {
+  return join(delegatedAuthDirPath(), `${sanitizeSlug(sbSlug)}.json`);
 }
 
 // ============================================================================
@@ -115,8 +115,8 @@ export function clearAuth(): void {
   }
 }
 
-export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
-  const path = delegatedAuthFilePath(agentId);
+export function loadDelegatedAuth(sbSlug: string): StoredDelegatedAuth | null {
+  const path = delegatedAuthFilePath(sbSlug);
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(readFileSync(path, 'utf-8'));
@@ -125,7 +125,7 @@ export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
   }
 }
 
-export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): void {
+export function saveDelegatedAuth(sbSlug: string, auth: StoredDelegatedAuth): void {
   const dir = delegatedAuthDirPath();
   mkdirSync(dir, { recursive: true });
   try {
@@ -134,13 +134,13 @@ export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): v
     // Best-effort only; some environments may not support chmod.
   }
 
-  const path = delegatedAuthFilePath(agentId);
+  const path = delegatedAuthFilePath(sbSlug);
   writeFileSync(path, JSON.stringify(auth, null, 2) + '\n');
   chmodSync(path, 0o600);
 }
 
-export function clearDelegatedAuth(agentId: string): void {
-  const path = delegatedAuthFilePath(agentId);
+export function clearDelegatedAuth(sbSlug: string): void {
+  const path = delegatedAuthFilePath(sbSlug);
   if (existsSync(path)) {
     unlinkSync(path);
   }
@@ -195,6 +195,7 @@ export async function refreshAccessToken(serverUrl: string, auth: StoredAuth): P
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
+    signal: AbortSignal.timeout(30_000),
   });
 
   const data = (await response.json()) as TokenResponse;
@@ -216,6 +217,17 @@ export async function refreshAccessToken(serverUrl: string, auth: StoredAuth): P
 // High-Level: Get Valid Access Token
 // ============================================================================
 
+/**
+ * True when a token is a decodable JWT whose exp is in the past (with buffer).
+ * Opaque/undecodable tokens return false — we only skip tokens we can PROVE
+ * are expired.
+ */
+export function isJwtProvablyExpired(token: string, bufferSeconds = 60): boolean {
+  const payload = decodeJwtPayload(token);
+  if (!payload || typeof payload.exp !== 'number') return false;
+  return payload.exp * 1000 <= Date.now() + bufferSeconds * 1000;
+}
+
 export async function getValidAccessToken(
   serverUrl: string,
   options?: { allowEnvToken?: boolean }
@@ -223,7 +235,12 @@ export async function getValidAccessToken(
   const allowEnvToken = options?.allowEnvToken !== false;
   if (allowEnvToken) {
     const envToken = process.env.INK_ACCESS_TOKEN?.trim();
-    if (envToken) {
+    // Skip a provably-expired env token instead of returning it blindly.
+    // Long-lived agent sessions inherit INK_ACCESS_TOKEN injected at session
+    // start; once it expires, every spawned CLI command would 401 forever —
+    // even after a fresh `ink login` — because the env token short-circuits
+    // the auth.json path below.
+    if (envToken && !isJwtProvablyExpired(envToken)) {
       return envToken;
     }
   }
@@ -248,10 +265,10 @@ export async function getValidAccessToken(
 }
 
 export function getValidDelegatedAccessToken(
-  agentId: string,
+  sbSlug: string,
   options?: { bufferSeconds?: number }
 ): string | null {
-  const auth = loadDelegatedAuth(agentId);
+  const auth = loadDelegatedAuth(sbSlug);
   if (!auth) return null;
   if (isTokenExpired(auth, options?.bufferSeconds ?? 300)) return null;
   return auth.access_token;

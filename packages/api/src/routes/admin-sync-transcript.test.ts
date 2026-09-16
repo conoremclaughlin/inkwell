@@ -61,17 +61,14 @@ vi.mock('../services/oauth', () => ({
   })),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
   isDevelopment: () => true,
 }));
-
 vi.mock('../utils/logger', () => ({
   logger: {
     info: vi.fn(),
@@ -201,7 +198,7 @@ describe('POST /sessions/:id/sync-transcript', () => {
 
     const transcriptFile = path.join(
       process.cwd(),
-      '.pcp',
+      '.ink',
       'runtime',
       'repl',
       'session-1-1700000000000.jsonl'
@@ -236,7 +233,7 @@ describe('POST /sessions/:id/sync-transcript', () => {
     });
 
     mockFsReaddir.mockImplementation(async (dir: string) => {
-      if (dir.endsWith(path.join('.pcp', 'runtime', 'repl'))) {
+      if (dir.endsWith(path.join('.ink', 'runtime', 'repl'))) {
         return [
           {
             name: 'session-1-1700000000000.jsonl',

@@ -134,7 +134,6 @@ const envSchema = z.object({
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
   MCP_HTTP_PORT: z.string().transform(Number).optional(),
   MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://pcp.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
-  MCP_AUTH_TOKEN: optionalString,
   MCP_REQUIRE_OAUTH: z
     .enum(['true', 'false'])
     .default('true')
@@ -166,6 +165,16 @@ const envSchema = z.object({
   GOOGLE_CLIENT_ID: optionalString,
   GOOGLE_CLIENT_SECRET: optionalString,
   OAUTH_REDIRECT_BASE_URL: optionalUrl, // OAuth callback URL - can be origin only (http://localhost:3001) or full URL (http://localhost:3001/api/admin/oauth/google/callback)
+  // Which Google credential sources the server tries, in order: `cloud` (the
+  // connected_accounts row from the dashboard OAuth flow) and/or `desktop`
+  // (authorized_user files written by `ink google login`). Default: cloud,desktop.
+  GOOGLE_CREDENTIAL_SOURCES: optionalString,
+  // Where desktop credential files live. Default: ~/.ink/google
+  INK_GOOGLE_CREDENTIALS_DIR: optionalString,
+  // Absolute path of the ink CLI the server invokes for hooks and chat loops.
+  // Default: this checkout's packages/cli/dist/cli.js. The server never uses
+  // the global ~/.ink/bin/ink link (services/ink-cli.ts).
+  INK_CLI_PATH: optionalString,
 
   // Embeddings
   MEMORY_EMBEDDINGS_ENABLED: z
@@ -216,6 +225,18 @@ const envSchema = z.object({
   DEFAULT_CLAUDE_MODEL: optionalString,
   DEFAULT_CODEX_MODEL: optionalString,
   DEFAULT_GEMINI_MODEL: optionalString,
+  DEFAULT_ANTIGRAVITY_MODEL: optionalString,
+
+  // Server-triggered compaction for claude-code-backend sessions. OPT-IN:
+  // Claude Code auto-compacts natively (--autocompact), and the server's
+  // measured context count is billing-derived and approximate, so the
+  // server-side rotate-at-threshold stays off unless explicitly enabled
+  // (Conor, 2026-08-20).
+  SERVER_COMPACTION_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  COMPACTION_THRESHOLD: optionalNumber,
 });
 
 // Parse and validate environment variables
@@ -288,7 +309,7 @@ const parseEnv = () => {
     };
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const missingVars = error.errors
+      const missingVars = error.issues
         .map((err) => `${err.path.join('.')}: ${err.message}`)
         .join('\n');
       throw new Error(`Environment validation failed:\n${missingVars}`);

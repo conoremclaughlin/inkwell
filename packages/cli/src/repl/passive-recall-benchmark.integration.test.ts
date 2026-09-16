@@ -37,7 +37,7 @@ interface RecallMemory {
   source: string;
   salience: string;
   topics: string[];
-  agentId: string | null;
+  sbSlug: string | null;
   createdAt: string;
 }
 
@@ -49,7 +49,7 @@ interface RecallResponse {
 
 async function pcpRecall(
   query: string,
-  options?: { limit?: number; agentId?: string; recallMode?: string }
+  options?: { limit?: number; sbSlug?: string; recallMode?: string }
 ): Promise<RecallResponse> {
   const authPath = `${process.env.HOME}/.ink/auth.json`;
   let accessToken: string;
@@ -76,7 +76,7 @@ async function pcpRecall(
         name: 'recall',
         arguments: {
           query,
-          agentId: options?.agentId || 'wren',
+          sbSlug: options?.sbSlug || 'wren',
           includeShared: true,
           limit: options?.limit || 5,
           recallMode: options?.recallMode || 'hybrid',
@@ -457,7 +457,7 @@ describe('Passive recall: relevance benchmark', () => {
 
         let recall: RecallResponse;
         try {
-          recall = await pcpRecall(signal, { limit: 3, agentId: 'wren' });
+          recall = await pcpRecall(signal, { limit: 3, sbSlug: 'wren' });
         } catch {
           return;
         }
@@ -490,7 +490,7 @@ describe('Passive recall: relevance benchmark', () => {
 
       const result = await registry.fire('turn_end', {
         ledger,
-        runtime: { agentId: 'wren', turnCount: i + 1, budgetUtilization: 0.3 },
+        runtime: { sbSlug: 'wren', turnCount: i + 1, budgetUtilization: 0.3 },
         lastTurn: { userInput: turn.user, assistantResponse: turn.assistant, turnIndex: i + 1 },
       });
 

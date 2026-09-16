@@ -12,7 +12,7 @@ import { getKindleService } from '../../services/kindle/kindle-service';
 import { logger } from '../../utils/logger';
 
 export const createKindleTokenSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().optional().describe('Parent agent ID whose values will seed the new SB'),
+  sbSlug: z.string().optional().describe('Parent SB slug whose values will seed the new SB'),
   expiresInHours: z
     .number()
     .optional()
@@ -27,7 +27,7 @@ export async function handleCreateKindleToken(args: unknown, dataComposer: DataC
   const kindleService = getKindleService();
   const token = await kindleService.createKindleToken(
     user.id,
-    params.agentId,
+    params.sbSlug,
     params.expiresInHours
   );
 
@@ -36,7 +36,7 @@ export async function handleCreateKindleToken(args: unknown, dataComposer: DataC
 
   logger.info('Kindle token created via MCP', {
     userId: user.id,
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     tokenId: token.id,
   });
 

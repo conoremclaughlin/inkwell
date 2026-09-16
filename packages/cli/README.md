@@ -101,7 +101,7 @@ sb studio create lumen --agent lumen --backend codex
 sb studio create aster --agent aster --backend gemini
 ```
 
-This creates the worktree, writes `.ink/identity.json` with the agent ID and backend, installs hooks, and syncs MCP configs.
+This creates the worktree, writes `.ink/identity.json` with the SB's slug and backend, installs hooks, and syncs MCP configs.
 
 ### 6. Awaken a new SB
 
@@ -270,12 +270,13 @@ echo 'MEMORY_CHUNKED_RECALL_ENABLED=true' >> .env.local
 
 ### Identity Resolution
 
-The agent ID is resolved in order:
+The SB's slug is resolved in order:
 
 1. `-a` / `--agent` flag
-2. `.ink/identity.json` in current directory
-3. `~/.ink/config.json` → `agentMapping.claude-code`
-4. Error — run `sb init` or `sb awaken` to configure identity
+2. `SB_SLUG` environment variable
+3. `.ink/identity.json` in current directory
+4. `~/.ink/config.json` → `sbMapping.claude-code`
+5. Error — run `sb init` or `sb awaken` to configure identity
 
 The backend is resolved similarly:
 
@@ -306,7 +307,7 @@ sb studio cli --unlink          # Remove linked binary
 
 Options for `create`:
 
-- `-a, --agent <agent>` — Agent ID for this studio (default: wren)
+- `-a, --agent <agent>` — SB slug for this studio (default: wren)
 - `-p, --purpose <desc>` — Description
 - `-b, --backend <name>` — Primary backend (claude-code, codex, gemini)
 - `-br, --branch <branch>` — Custom branch (default: `<agent>/studio/main-<studio-name>`)
@@ -476,7 +477,7 @@ Inside REPL:
 | Variable               | Description                                   | Default                            |
 | ---------------------- | --------------------------------------------- | ---------------------------------- |
 | `INK_SERVER_URL`       | PCP server URL                                | `http://localhost:3001`            |
-| `AGENT_ID`             | Override agent identity                       | (from identity resolution)         |
+| `SB_SLUG`              | Override the SB slug                          | (from identity resolution)         |
 | `INK_TOOL_POLICY_PATH` | Override persisted REPL tool-policy JSON path | `~/.ink/security/tool-policy.json` |
 
 ## Development

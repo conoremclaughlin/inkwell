@@ -16,62 +16,57 @@
  *
  * Environment:
  *   INK_SERVER_URL  — Ink server URL (default: http://localhost:3001)
- *   INK_AGENT_ID    — Agent identity (default: from AGENT_ID or .ink/identity.json)
+ *   INK_SB_SLUG     — The SB's slug (default: from SB_SLUG or .ink/identity.json)
  *   INK_POLL_INTERVAL_MS — Poll interval in ms (default: 10000)
+ *   INK_PLUGIN_LOG_LEVEL — debug | info | warn | error (default: info)
+ *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
+ *   INK_PLUGIN_LOG_RETENTION_DAYS — sweep dead processes' logs older than this (default: 7)
  */
-
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'fs';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { Server } from '@modelcontextprotocol/server';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createThreadDrainState, drainThreads, drainLegacyInbox } from './poll-core.js';
+import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
-// Logs to ~/.ink/logs/channel-plugin.log for debugging.
+// Logs to ~/.ink/logs/channel-plugin/<pid>.log for debugging.
 // Cannot use stdout (reserved for MCP stdio transport).
+// Async + level-gated + size-capped — see logger.ts for why each matters.
+//
+// ONE FILE PER PROCESS, not one shared file. Every live Claude Code session
+// runs a plugin, and a shared file put rotation on a concurrent path where it
+// kept losing a generation to races. Per-process files make rotation
+// single-writer again. Tail them together: ~/.ink/logs/channel-plugin/*.log
+//
+// Dead processes' logs are swept at startup so the directory stays bounded.
 
-const LOG_DIR = join(homedir(), '.ink', 'logs');
-const LOG_FILE = join(LOG_DIR, 'channel-plugin.log');
+const LOG_DIR = join(homedir(), '.ink', 'logs', 'channel-plugin');
+const LOG_FILE = join(LOG_DIR, logFileFor());
 
-function log(
-  level: 'info' | 'warn' | 'error' | 'debug',
-  message: string,
-  data?: Record<string, unknown>
-): void {
-  try {
-    mkdirSync(LOG_DIR, { recursive: true });
-    const ts = new Date().toISOString();
-    const line = data
-      ? `${ts} [${level}] ${message} ${JSON.stringify(data)}\n`
-      : `${ts} [${level}] ${message}\n`;
-    appendFileSync(LOG_FILE, line);
-  } catch {
-    // Can't log — don't crash the plugin
-  }
+const configuredLevel = process.env.INK_PLUGIN_LOG_LEVEL;
+const LOG_LEVEL: LogLevel = isLogLevel(configuredLevel) ? configuredLevel : 'info';
+const LOG_MAX_BYTES = parseInt(process.env.INK_PLUGIN_LOG_MAX_BYTES || '10485760', 10);
+const LOG_RETENTION_DAYS = parseInt(process.env.INK_PLUGIN_LOG_RETENTION_DAYS || '7', 10);
+
+const logger = createLogger({
+  dir: LOG_DIR,
+  file: LOG_FILE,
+  level: LOG_LEVEL,
+  maxBytes: Number.isFinite(LOG_MAX_BYTES) && LOG_MAX_BYTES > 0 ? LOG_MAX_BYTES : undefined,
+});
+
+function log(level: LogLevel, message: string, data?: Record<string, unknown>): void {
+  logger.log(level, message, data);
 }
 
 // ─── Config ─────────────────────────────────────────────────
 
+import { resolveSlug } from './identity';
+
 const INK_SERVER_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 10);
-
-function resolveAgentId(): string {
-  if (process.env.INK_AGENT_ID) return process.env.INK_AGENT_ID;
-  if (process.env.AGENT_ID) return process.env.AGENT_ID;
-
-  // Try .ink/identity.json in cwd
-  const identityPath = join(process.cwd(), '.ink', 'identity.json');
-  if (existsSync(identityPath)) {
-    try {
-      const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-      if (identity.agentId) return identity.agentId;
-    } catch {
-      // ignore
-    }
-  }
-
-  return 'wren'; // fallback
-}
 
 function resolveEmail(): string | undefined {
   const configPath = join(homedir(), '.ink', 'config.json');
@@ -110,7 +105,7 @@ function resolveAccessToken(): string | undefined {
 
 // ─── PCP Client ─────────────────────────────────────────────
 
-const agentId = resolveAgentId();
+const sbSlug = resolveSlug();
 const email = resolveEmail();
 const accessToken = resolveAccessToken();
 const studioId = process.env.INK_STUDIO_ID || undefined;
@@ -135,7 +130,7 @@ function isLegacyMessageForThisStudio(msg: Record<string, unknown>): boolean {
 }
 
 log('info', 'Channel plugin starting', {
-  agentId,
+  sbSlug,
   email: email || '(none)',
   hasToken: !!accessToken,
   studioId: studioId || '(none)',
@@ -238,10 +233,19 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 
 // ─── Polling Loop ───────────────────────────────────────────
 
-let lastPollTime = new Date().toISOString();
-const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
-const lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
-const lastThreadMessageId = new Map<string, string>(); // threadKey → id of last delivered message (cursor)
+// Thread cursors, dedup, and cold-start skip accounting live in the drain
+// state (poll-core.ts owns the delivery semantics; unit-tested there).
+const drainState = createThreadDrainState();
+
+// NO takeover claimant here (PR #563 round 26). Pending-takeover markers are
+// written only by backends whose prompt hooks cannot block (codex, gemini) —
+// and those sessions run no channel plugin, while this plugin's own backend
+// (claude-code) blocks the prompt instead of writing a marker. The markers'
+// real consumers are the ink wrapper's takeover watcher and the on-stop
+// hook's adjudication (packages/cli). The round-8 claimant that lived here
+// was unreachable and, being a partial reimplementation of the boundary,
+// drifted from it — it was removed rather than patched again.
+const seenMessageIds = drainState.seenMessageIds; // shared with the legacy loop
 
 async function stampCliPollAt(): Promise<void> {
   if (!sessionId || !accessToken) return;
@@ -260,152 +264,182 @@ async function stampCliPollAt(): Promise<void> {
   }
 }
 
+// One-time fail-closed notice (spec inkmail-read-state §3): a plugin process
+// with no session context gets nothing from channelPoll (server fail-closed).
+// Surface that ONCE so a directly-launched session isn't silently featureless,
+// then stay quiet — recurring warnings are noise.
+let unscopedNoticeSent = false;
+
+// In-flight guard (PR #385 pattern): during a slow/degraded server,
+// interval ticks must SKIP rather than stack concurrent polls — every
+// live Claude Code session runs one of these processes, so stacked
+// polls multiply across the fleet. The interval and the one-shot
+// startup poll are the only entry points (no forced path exists), so
+// a plain boolean cannot be cleared early by an overlapping entrant.
+let pollInFlight = false;
+
 async function pollInbox(): Promise<void> {
   if (!email) return;
-
-  // Stamp cli_poll_at so the trigger handler knows we're alive
-  stampCliPollAt().catch(() => {});
-
+  if (pollInFlight) {
+    log('debug', 'Poll skipped — previous poll still in flight');
+    return;
+  }
+  pollInFlight = true;
   try {
-    const result = await callPcp('get_inbox', {
-      email,
-      agentId,
-      status: 'all',
-      since: lastPollTime,
-      limit: 20,
-      channelPoll: true,
-    });
-
-    if (!result?.success) {
-      log('error', 'Poll failed', { result: JSON.stringify(result).slice(0, 300) });
-      return;
+    if (!sessionId && !unscopedNoticeSent) {
+      unscopedNoticeSent = true;
+      log('warn', 'No session context — InkMail delivery disabled (fail-closed), notifying once');
+      await mcp
+        .notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content:
+              'InkMail delivery disabled for this session: no session context (INK_SESSION_ID). ' +
+              'Launch via the ink wrapper for scoped delivery. Server log: channel_poll_unscoped.',
+            meta: { sender: 'inkmail', message_type: 'notification' },
+          },
+        })
+        .catch(() => {});
     }
-    const threadCount = ((result.threadsWithUnread as unknown[]) || []).length;
-    const msgCount = ((result.messages as unknown[]) || []).length;
-    const totalUnread = (result.totalUnreadCount as number) || 0;
-    log('debug', 'Poll result', { threadCount, msgCount, totalUnread, since: lastPollTime });
 
-    // Check for new thread messages
-    const threads = (result.threadsWithUnread as Array<Record<string, unknown>>) || [];
-    for (const thread of threads) {
-      const threadKey = thread.threadKey as string;
-      const unreadCount = (thread.unreadCount as number) || 0;
-      if (!threadKey || unreadCount === 0) continue;
+    // Stamp cli_poll_at so the trigger handler knows we're alive
+    stampCliPollAt().catch(() => {});
 
-      // Use our own cursor (afterMessageId) to avoid the ASC-sort + small-limit
-      // footgun: without a cursor, get_thread_messages returns the earliest N
-      // messages and a repeat poll keeps returning the same slice, never
-      // reaching new ones. markRead advances the server pointer to whatever
-      // was actually returned — safe now that the server respects that — but
-      // the plugin's own cursor is what guarantees forward progress.
-      const afterMessageId = lastThreadMessageId.get(threadKey);
-      const threadResult = await callPcp('get_thread_messages', {
+    try {
+      // Pointer-based unseen fetch, NOT a wall-clock window (Lumen #504 r2
+      // P1): `since` windows skipped startup backlog, and a truncated newest
+      // page buried the unreturned oldest row forever. status:'unread' with
+      // markRead:false serves the OLDEST unseen batch; only the exact-id ack
+      // below advances delivery state, so truncation/ack failure simply
+      // re-serves the same batch next poll.
+      const result = await callPcp('get_inbox', {
         email,
-        agentId,
-        threadKey,
-        markRead: true,
-        limit: 50,
-        ...(afterMessageId ? { afterMessageId } : {}),
+        sbSlug,
+        status: 'unread',
+        markRead: false,
+        limit: 20,
+        channelPoll: true,
       });
 
-      if (!threadResult?.success) continue;
+      if (!result?.success) {
+        log('error', 'Poll failed', { result: JSON.stringify(result).slice(0, 300) });
+        return;
+      }
+      const threadCount = ((result.threadsWithUnread as unknown[]) || []).length;
+      const msgCount = ((result.messages as unknown[]) || []).length;
+      const totalUnread = (result.totalUnreadCount as number) || 0;
+      log('debug', 'Poll result', { threadCount, msgCount, totalUnread });
 
-      const messages = (threadResult.messages as Array<Record<string, unknown>>) || [];
-      const lastKnownTs = lastThreadTimestamps.get(threadKey);
+      // Drain thread messages through poll-core (unit-tested): always-on
+      // 100/poll budget with budget-bounded per-request limits, cold fetches
+      // markRead:false + exact-id ack after injection, skip accounting with
+      // one drain-time summary per process.
+      const drained = await drainThreads(
+        {
+          callPcp,
+          notify: async (content, meta) => {
+            await mcp.notification({
+              method: 'notifications/claude/channel',
+              params: { content, meta },
+            });
+          },
+          log,
+          sbSlug,
+          email,
+          studioId,
+        },
+        drainState,
+        (result.threadsWithUnread as Array<Record<string, unknown>>) || [],
+        {
+          moreThreadsPending: result.unreadThreadsTruncated === true,
+          pollIncomplete: result.channelPollIncomplete === true,
+        }
+      );
+      if (drained.injected > 0 || drained.ceilingHit || drained.fetchFailures > 0) {
+        // 'info', not 'debug': this fires only on a real delivery (~tens per
+        // day, not per-tick), and it is the line you actually want when
+        // reconstructing what was delivered at the default log level.
+        log('info', 'Thread drain result', { ...drained });
+      }
 
-      for (const msg of messages) {
-        const msgId = msg.id as string;
-        const msgTs = msg.createdAt as string;
-        // Skip own messages UNLESS they came from a different studio (cross-studio self-message)
-        if (msg.senderAgentId === agentId) {
-          if (!studioId) continue; // no studio context — always skip self
+      // Legacy inbox messages (non-threaded), drained through poll-core
+      // (unit-tested) under the same exact-id ack contract as threads: the
+      // mark_inbox_read throughMessageId ack after the batch is the ONLY
+      // consumption, so what this caller injects is what gets consumed —
+      // without it, the pointer never moves for this caller and delivered
+      // task requests stay counted/re-delivered forever (Lumen #504 r1 P1).
+      const classifyLegacy = (msg: Record<string, unknown>) => {
+        // A row routed to ANOTHER studio must stop the ack range — the
+        // pointer is (user, agent)-global (Lumen #504 r2 P1).
+        if (!isLegacyMessageForThisStudio(msg)) return 'foreign' as const;
+        // Own messages are skipped unless cross-studio (same as threads).
+        if (msg.senderSlug === sbSlug) {
+          if (!studioId) return 'skip' as const;
           const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
             | Record<string, unknown>
             | undefined;
           const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
           const msgStudioId = msgSender?.studioId as string | undefined;
-          if (!msgStudioId || msgStudioId === studioId) continue; // same studio or unknown — skip
-          // Different studio — accept (cross-studio self-message)
+          if (!msgStudioId || msgStudioId === studioId) return 'skip' as const;
         }
-        if (msgId && seenMessageIds.has(msgId)) continue;
-        if (lastKnownTs && msgTs && msgTs <= lastKnownTs) continue;
-        if (msgId) seenMessageIds.add(msgId);
-
-        const sender = (msg.senderAgentId as string) || 'unknown';
-        const content = (msg.content as string) || '';
-        const messageType = (msg.messageType as string) || 'message';
-
-        log('info', 'Pushing thread message to channel', { threadKey, sender, msgId, msgTs });
-        await mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content: `From ${sender}: ${content}`,
-            meta: {
-              thread_key: threadKey,
-              sender: sender,
-              message_type: messageType,
-              message_id: (msg.id as string) || '',
-            },
-          },
-        });
-      }
-
-      // Advance cursors (id + timestamp) to the last returned message.
-      // The id cursor is what the next poll passes as afterMessageId to
-      // guarantee forward progress; the timestamp cursor is the legacy
-      // belt-and-suspenders dedup for cases where the id cursor is empty
-      // (first poll for a thread).
-      if (messages.length > 0) {
-        const lastMsg = messages[messages.length - 1];
-        const lastTs = lastMsg.createdAt as string;
-        const lastId = lastMsg.id as string;
-        if (lastTs) lastThreadTimestamps.set(threadKey, lastTs);
-        if (lastId) lastThreadMessageId.set(threadKey, lastId);
-      }
-    }
-
-    // Legacy inbox messages (non-threaded). Since we pass `since: lastPollTime`
-    // to get_inbox, only new messages are returned. seenMessageIds prevents
-    // any edge-case re-emission.
-    const inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
-    for (const msg of inboxMessages) {
-      const msgId = msg.id as string;
-      // Skip own messages unless cross-studio (same logic as thread path above)
-      if (msg.senderAgentId === agentId) {
-        if (!studioId) continue;
-        const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
-          | Record<string, unknown>
-          | undefined;
-        const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
-        const msgStudioId = msgSender?.studioId as string | undefined;
-        if (!msgStudioId || msgStudioId === studioId) continue;
-      }
-      if (msgId && seenMessageIds.has(msgId)) continue;
-      if (!isLegacyMessageForThisStudio(msg)) continue;
-      if (msgId) seenMessageIds.add(msgId);
-
-      const sender = (msg.senderAgentId as string) || 'unknown';
-      const content = (msg.content as string) || '';
-      const messageType = (msg.messageType as string) || 'message';
-      const msgThreadKey = (msg.threadKey as string) || '';
-
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: `From ${sender}: ${content}`,
-          meta: {
-            thread_key: msgThreadKey,
-            sender,
-            message_type: messageType,
-            subject: (msg.subject as string) || '',
-          },
+        return 'deliver' as const;
+      };
+      const legacyDeps = {
+        callPcp,
+        notify: async (content: string, meta: Record<string, unknown>) => {
+          await mcp.notification({
+            method: 'notifications/claude/channel',
+            params: { content, meta },
+          });
         },
-      });
-    }
+        log,
+        sbSlug,
+        email,
+        studioId,
+      };
 
-    lastPollTime = new Date().toISOString();
-  } catch (err) {
-    log('error', 'Poll error', { error: err instanceof Error ? err.message : String(err) });
+      // Contiguity loop (Lumen #504 r2 P1): a truncated backlog drains batch
+      // by batch — after a clean, fully-acked batch, fetch the next oldest
+      // batch immediately. Any failure (emit, ack, foreign-studio stop)
+      // holds; the next poll resumes from the pointer.
+      let inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
+      let legacyTruncated = result.truncated === true;
+      for (let round = 0; round < 5; round++) {
+        const legacyDrained = await drainLegacyInbox(
+          legacyDeps,
+          seenMessageIds,
+          inboxMessages,
+          classifyLegacy
+        );
+        if (legacyDrained.injected > 0 || legacyDrained.ackFailures > 0) {
+          log('info', 'Legacy inbox drain result', { ...legacyDrained, round });
+        }
+        if (
+          !legacyTruncated ||
+          legacyDrained.emitFailures > 0 ||
+          legacyDrained.ackFailures > 0 ||
+          legacyDrained.stoppedAtForeignStudio
+        ) {
+          break;
+        }
+        const next = await callPcp('get_inbox', {
+          email,
+          sbSlug,
+          status: 'unread',
+          markRead: false,
+          limit: 20,
+          channelPoll: true,
+        });
+        if (!next?.success) break;
+        inboxMessages = (next.messages as Array<Record<string, unknown>>) || [];
+        legacyTruncated = next.truncated === true;
+        if (!inboxMessages.length) break;
+      }
+    } catch (err) {
+      log('error', 'Poll error', { error: err instanceof Error ? err.message : String(err) });
+    }
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -433,6 +467,16 @@ async function clearCliAttached(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Bound the log directory: drop dead processes' logs past the retention
+  // window. Fire-and-forget — a sweep failure must never delay startup.
+  const retentionDays =
+    Number.isFinite(LOG_RETENTION_DAYS) && LOG_RETENTION_DAYS > 0 ? LOG_RETENTION_DAYS : 7;
+  void sweepStaleLogs({ dir: LOG_DIR, maxAgeMs: retentionDays * 24 * 60 * 60 * 1000 })
+    .then((removed) => {
+      if (removed.length) log('info', 'Swept stale plugin logs', { count: removed.length });
+    })
+    .catch(() => {});
+
   log('info', 'Connecting MCP stdio transport');
   await mcp.connect(new StdioServerTransport());
   log('info', 'MCP connected, starting poll loop');
@@ -440,20 +484,21 @@ async function main(): Promise<void> {
   // Fire detach cleanup when the host process exits (stdio pipe breaks).
   // This clears cli_attached so future triggers don't skip spawning.
   process.on('exit', () => {
-    // Synchronous — can't await, but the fetch is fire-and-forget.
-    // Use a sync log and kick off the async call (it may or may not complete).
-    log('info', 'Detach: process exiting, clearing cli_attached');
+    // Exit handlers run sync-only: an async stream write here would never
+    // land. This is the one place logSync is correct.
+    logger.logSync('info', 'Detach: process exiting, clearing cli_attached');
   });
-  process.on('SIGTERM', () => {
-    clearCliAttached().finally(() => process.exit(0));
-  });
-  process.on('SIGINT', () => {
-    clearCliAttached().finally(() => process.exit(0));
-  });
+  // Async logging means queued lines are still in flight at shutdown; flush
+  // before exiting or we lose exactly the lines that explain the exit.
+  const shutdown = (code: number) => {
+    clearCliAttached().finally(() => logger.flush().finally(() => process.exit(code)));
+  };
+  process.on('SIGTERM', () => shutdown(0));
+  process.on('SIGINT', () => shutdown(0));
   // Stdio close = Claude Code exited (most reliable signal)
   process.stdin.on('close', () => {
     log('info', 'Detach: stdin closed (host exited)');
-    clearCliAttached().finally(() => process.exit(0));
+    shutdown(0);
   });
 
   // Start polling loop
@@ -466,6 +511,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  log('error', 'Channel plugin crashed', { error: err.message });
-  clearCliAttached().finally(() => process.exit(1));
+  // Sync write: a crash line that loses the race with process.exit is worse
+  // than useless — this is the one line you always want on disk.
+  logger.logSync('error', 'Channel plugin crashed', { error: err.message });
+  clearCliAttached().finally(() => logger.flush().finally(() => process.exit(1)));
 });

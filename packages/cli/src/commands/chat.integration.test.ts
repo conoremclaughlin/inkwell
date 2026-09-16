@@ -18,7 +18,7 @@ vi.mock('../backends/identity.js', async (importOriginal) => {
   const original = await importOriginal<typeof import('../backends/identity.js')>();
   return {
     ...original,
-    resolveAgentId: (agent?: string) => agent || 'lumen',
+    resolveSlug: (agent?: string) => agent || 'lumen',
     readIdentityJson: () => testState.identity,
   };
 });
@@ -165,7 +165,7 @@ describe('runChat integration', () => {
 
     const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
     expect(startCall?.args).toMatchObject({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       threadKey: 'heartbeat:myra',
       studioId: 'studio-test',
     });
@@ -197,6 +197,350 @@ describe('runChat integration', () => {
     expect(backendRequest.prompt).toContain('Latest user message:\nheartbeat pulse');
     // Non-interactive sessions are left resumable (update_session_state, not end_session).
     expect(testState.pcpCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
+  });
+
+  /**
+   * One ink run invokes the provider repeatedly — once per outer turn, again
+   * for local tool-loop subprocesses. Reporting the LAST result as the run's
+   * usage undercounts every invocation but the final one, which is how the
+   * ink path came to record a few hundred input tokens across hundreds of
+   * messages (Lumen, PR #494 round 2).
+   */
+  it('sums usage across every backend invocation in the run, not just the last', async () => {
+    const usageByCall = [
+      { inputTokens: 100, outputTokens: 10, cacheReadTokens: 5_000, cacheWriteTokens: 200 },
+      { inputTokens: 50, outputTokens: 400, cacheReadTokens: 9_000, cacheWriteTokens: 0 },
+    ];
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      const usage = usageByCall[Math.min(call, usageByCall.length - 1)];
+      // First reply asks for a tool, which drives a second backend invocation.
+      const stdout = call === 0 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done';
+      call += 1;
+      return {
+        success: true,
+        stdout,
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: { backend: 'claude', source: 'json', ...usage },
+        model: 'claude-fable-5',
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'sum my usage',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl.mock.calls.length).toBeGreaterThan(1);
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    const invoked = Math.min(testState.runBackendImpl.mock.calls.length, usageByCall.length);
+    const expectedInput = usageByCall.slice(0, invoked).reduce((sum, u) => sum + u.inputTokens, 0);
+    const expectedCacheRead = usageByCall
+      .slice(0, invoked)
+      .reduce((sum, u) => sum + u.cacheReadTokens, 0);
+
+    // The last invocation alone would report 50 input / 9,000 cache-read.
+    expect(resultLine.usage.inputTokens).toBeGreaterThanOrEqual(expectedInput);
+    expect(resultLine.usage.cacheReadTokens).toBeGreaterThanOrEqual(expectedCacheRead);
+    expect(resultLine.usage.inputTokens).toBeGreaterThan(usageByCall[1].inputTokens);
+  });
+
+  /**
+   * `model` on the result line must be evidence from THIS run. runtime.model is
+   * what was requested and runtime.detectedModel can be hydrated from a prior
+   * process's transcript on reattach — reporting either would attribute usage
+   * to a model that may never have served the run (Lumen, PR #494 round 2).
+   */
+  it('omits model when the provider reported none during this run', async () => {
+    testState.runBackendImpl.mockResolvedValue({
+      success: true,
+      stdout: 'no model event here',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 8,
+      command: 'mock',
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      model: 'claude-opus-5', // requested — not evidence of what served the run
+      nonInteractive: true,
+      message: 'who served this?',
+      pollSeconds: '999',
+    });
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    expect(resultLine.model).toBeUndefined();
+  });
+
+  /**
+   * A resumed turn whose provider session has vanished fails, then retries on a
+   * fresh session. The failed attempt still reported usage — those tokens were
+   * spent — and the retry REASSIGNS runResult, so recording once at the end of
+   * the path drops the first attempt entirely (Lumen, PR #494 round 3).
+   */
+  it('counts both the failed resume and the reseed retry', async () => {
+    const sessionId = 'sess-reseed-usage';
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    // A prior provider-native session id makes the next turn a RESUME.
+    writeFileSync(
+      join(replDir, `${sessionId}-1700000000000.jsonl`),
+      [
+        JSON.stringify({
+          ts: '2026-02-25T07:00:00.000Z',
+          type: 'backend_session',
+          id: 'provider-session-gone',
+          routing: 'local',
+        }),
+        JSON.stringify({
+          ts: '2026-02-25T07:00:01.000Z',
+          type: 'user',
+          content: 'earlier message',
+        }),
+        JSON.stringify({
+          ts: '2026-02-25T07:00:02.000Z',
+          type: 'assistant',
+          content: 'earlier reply',
+        }),
+      ].join('\n') + '\n'
+    );
+
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) {
+        // Resume against a provider session that no longer exists — failed,
+        // but tokens were still spent getting there.
+        return {
+          success: false,
+          stdout: '',
+          stderr: 'session not found',
+          exitCode: 1,
+          durationMs: 5,
+          command: 'mock',
+          resumeFailedNoSession: true,
+          usage: {
+            backend: 'claude',
+            source: 'json',
+            inputTokens: 700,
+            outputTokens: 30,
+            cacheReadTokens: 2_000,
+            cacheWriteTokens: 0,
+          },
+        };
+      }
+      return {
+        success: true,
+        stdout: 'recovered reply',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: {
+          backend: 'claude',
+          source: 'json',
+          inputTokens: 300,
+          outputTokens: 90,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+        },
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      sessionId,
+      nonInteractive: true,
+      message: 'resume me',
+      pollSeconds: '999',
+    });
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    // The reseed must actually have happened, or this asserts nothing.
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(2);
+    // Both attempts: 700 + 300 input, 2,000 + 1,000 cache-read. Recording only
+    // after the reseed would report the retry's 300 / 1,000 alone.
+    expect(resultLine.usage.inputTokens).toBe(1_000);
+    expect(resultLine.usage.cacheReadTokens).toBe(3_000);
+    expect(resultLine.usage.outputTokens).toBe(120);
+  });
+
+  /**
+   * Dollar-level attribution for ink sessions. #493 gave direct-claude spawns a
+   * per-model map carrying Claude's own costUSD; the ink path forwarded only
+   * the model name, so ink-backed agents had tokens but no cost.
+   */
+  it('forwards per-model cost, summed across invocations', async () => {
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      call += 1;
+      return {
+        success: true,
+        stdout: call === 1 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: {
+          backend: 'claude',
+          source: 'json',
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+          modelUsage: {
+            'claude-opus-5': {
+              inputTokens: 10,
+              outputTokens: 20,
+              cacheReadTokens: 1_000,
+              cacheWriteTokens: 0,
+              costUSD: 0.01,
+              canonicalModel: 'claude-opus-5',
+            },
+          },
+        },
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'what did this cost?',
+      pollSeconds: '999',
+    });
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    const invocations = testState.runBackendImpl.mock.calls.length;
+    expect(invocations).toBeGreaterThan(1);
+    // Cost accumulates per invocation, like tokens — one call's 0.01 alone
+    // would understate a multi-step run.
+    expect(resultLine.modelUsage['claude-opus-5'].costUSD).toBeCloseTo(0.01 * invocations);
+  });
+
+  /**
+   * A run whose invocations MIX reported and unreported cost must publish its
+   * figure as a lower bound, not as the total (Lumen, PR #500 round 3).
+   */
+  it('marks run cost partial when only some invocations reported it', async () => {
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      call += 1;
+      const modelUsage: Record<string, Record<string, number | string>> = {
+        'claude-opus-5': {
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+          canonicalModel: 'claude-opus-5',
+        },
+      };
+      // Only the FIRST invocation reports a cost.
+      if (call === 1) modelUsage['claude-opus-5'].costUSD = 0.01;
+      return {
+        success: true,
+        stdout: call === 1 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: {
+          backend: 'claude',
+          source: 'json',
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+          modelUsage,
+        },
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'mixed cost reporting',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl.mock.calls.length).toBeGreaterThan(1);
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    const entry = resultLine.modelUsage['claude-opus-5'];
+    // The $0.01 is real, but later invocations reported nothing — publishing
+    // it as the run's cost would understate what was actually spent.
+    expect(entry.costUSD).toBeCloseTo(0.01);
+    expect(entry.costPartial).toBe(true);
   });
 
   it('forwards --attach-file into the turn prompt, transcript, and backend attachment dirs', async () => {
@@ -346,7 +690,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-a111',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'implementing',
                 threadKey: 'pr:61',
@@ -356,7 +700,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-b222',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'reviewing',
                 threadKey: 'spec:cli-session-hooks',
@@ -400,7 +744,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-a111',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'implementing',
                 threadKey: 'pr:61',
@@ -410,7 +754,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-b222',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'reviewing',
                 threadKey: 'spec:cli-session-hooks',
@@ -477,14 +821,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:1',
                 startedAt: '2026-02-18T18:00:00.000Z',
               },
               {
                 id: 'sess-new',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:2',
                 startedAt: '2026-02-18T19:00:00.000Z',
@@ -556,14 +900,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:9',
                 startedAt: '2026-02-18T18:00:00.000Z',
               },
               {
                 id: 'sess-latest',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:10',
                 startedAt: '2026-02-18T19:00:00.000Z',
@@ -601,14 +945,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-wren-latest',
-                agentId: 'wren',
+                sbSlug: 'wren',
                 status: 'active',
                 threadKey: 'pr:99',
                 startedAt: '2026-02-18T20:00:00.000Z',
               },
               {
                 id: 'sess-lumen-older',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:12',
                 startedAt: '2026-02-18T18:00:00.000Z',
@@ -644,7 +988,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-wren-new',
-                agentId: 'wren',
+                sbSlug: 'wren',
                 studioId: 'studio-test',
                 status: 'active',
                 threadKey: 'pr:900',
@@ -652,7 +996,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-lumen-mid',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 studioId: 'studio-2',
                 status: 'active',
                 threadKey: 'pr:901',
@@ -660,7 +1004,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-lumen-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 studioId: 'studio-3',
                 status: 'active',
                 threadKey: 'pr:902',
@@ -726,7 +1070,7 @@ describe('runChat integration', () => {
   });
 
   it('supports gated /pcp tool execution with inline approval', async () => {
-    testState.inputs = ['/pcp send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
+    testState.inputs = ['/pcp send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
       agent: 'lumen',
@@ -735,7 +1079,7 @@ describe('runChat integration', () => {
     });
 
     const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
-    expect(sendCall?.args).toEqual({ recipientAgentId: 'wren' });
+    expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(0);
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
@@ -758,7 +1102,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-1',
                   content: 'please re-review',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'PR #50',
                   threadKey: 'pr:50',
                   createdAt: '2026-02-26T04:03:04.000Z',
@@ -805,13 +1149,13 @@ describe('runChat integration', () => {
                 {
                   id: 'm-2',
                   content: 'second',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   createdAt: '2026-02-26T04:10:05.000Z',
                 },
                 {
                   id: 'm-1',
                   content: 'first',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   createdAt: '2026-02-26T04:10:01.000Z',
                 },
               ],
@@ -856,7 +1200,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-auto-1',
                   content: 'Please handle PR 77 now.',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'Task request',
                   messageType: 'task_request',
                   threadKey: 'pr:77',
@@ -913,7 +1257,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-existing',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 startedAt: '2026-02-26T04:16:00.000Z',
               },
@@ -927,7 +1271,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-hydrated-1',
                   content: 'already hydrated',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'PR #77',
                   createdAt: '2026-02-26T04:15:00.000Z',
                 },
@@ -974,20 +1318,20 @@ describe('runChat integration', () => {
                 {
                   id: 'm-skip-thread',
                   content: 'Wrong thread',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   threadKey: 'pr:999',
                   messageType: 'task_request',
                 },
                 {
                   id: 'm-skip-unscoped',
                   content: 'Missing thread/session metadata',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   messageType: 'task_request',
                 },
                 {
                   id: 'm-run',
                   content: 'Right thread',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   threadKey: 'pr:123',
                   messageType: 'task_request',
                 },
@@ -1273,7 +1617,7 @@ describe('runChat integration', () => {
   });
 
   it('applies policy gate to /mcp call with inline approval', async () => {
-    testState.inputs = ['/mcp call send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
+    testState.inputs = ['/mcp call send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
       agent: 'lumen',
@@ -1282,7 +1626,7 @@ describe('runChat integration', () => {
     });
 
     const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
-    expect(sendCall?.args).toEqual({ recipientAgentId: 'wren' });
+    expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Granted once.');
   });
@@ -1291,7 +1635,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        'Running local tool.\n```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":1}}\n```\nDone.',
+        'Running local tool.\n```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":1}}\n```\nDone.',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1340,7 +1684,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":2}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":2}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1386,7 +1730,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":3}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":3}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1492,7 +1836,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"wren","status":"unread","limit":2}}\n```',
+            '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"wren","status":"unread","limit":2}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -1558,7 +1902,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"wren","status":"unread","limit":1}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"wren","status":"unread","limit":1}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1603,7 +1947,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"wren","content":"ping"}}\n```',
+        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"wren","content":"ping"}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1638,7 +1982,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":1}}\n```',
+            '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":1}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -1696,7 +2040,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"myra","content":"hello"}}\n```',
+        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"myra","content":"hello"}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1728,7 +2072,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"myra","content":"hi"}}\n```',
+            '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"myra","content":"hi"}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -1816,7 +2160,7 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
   }, 10_000);
 
-  it('applies default backend timeout for non-interactive turns', async () => {
+  it('leaves the hard timeout unset and applies the idle timeout for non-interactive turns', async () => {
     await runChat({
       agent: 'lumen',
       backend: 'codex',
@@ -1828,8 +2172,102 @@ describe('runChat integration', () => {
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
     const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
       timeoutMs?: number;
+      idleTimeoutMs?: number;
+      stream?: boolean;
     };
-    expect(backendRequest.timeoutMs).toBe(120_000);
+    // No default hard wall — the turn is governed by token-flow: 15 min of
+    // silence reaps it (below the outer InkRunner 1h inactivity window), and
+    // backend-runner's 4h runaway backstop covers the pathological case.
+    expect(backendRequest.timeoutMs).toBeUndefined();
+    expect(backendRequest.idleTimeoutMs).toBe(900_000);
+    expect(backendRequest.stream).toBe(true);
+  });
+
+  it('ledgers compact backend events with monotonic eids (observer-attach M1)', async () => {
+    await runChat({
+      agent: 'lumen',
+      backend: 'codex',
+      nonInteractive: true,
+      message: 'observe me',
+      pollSeconds: '999',
+    });
+
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      onEvent?: (evt: Record<string, unknown>) => void;
+    };
+    expect(backendRequest.onEvent).toBeDefined();
+
+    // Capture the live stdout feed so the wire events can be compared
+    // against the ledger (spec:observer-attach §4.2: the wire event IS the
+    // appended entry — deep-equal, not merely similar).
+    const stdoutWrites: string[] = [];
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+      stdoutWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+
+    // Drive normalized backend events through the real handler — a tool
+    // lifecycle plus a long text block (must be truncated to a preview).
+    const longText = 'x'.repeat(500);
+    backendRequest.onEvent!({
+      kind: 'tool-use',
+      id: 'toolu_obs1',
+      name: 'WebSearch',
+      input: { q: 'deep' },
+    });
+    backendRequest.onEvent!({ kind: 'text', text: longText });
+    backendRequest.onEvent!({ kind: 'tool-result', id: 'toolu_obs1', isError: false });
+    stdoutSpy.mockRestore();
+
+    // The ledger must reproduce exactly what a live observer saw (no-fork
+    // invariant, spec:observer-attach §3.2) — compact entries, real eids.
+    const replDir = join(process.cwd(), '.ink', 'runtime', 'repl');
+    const transcriptFile = readdirSync(replDir).find((f) => f.endsWith('.jsonl'));
+    expect(transcriptFile).toBeDefined();
+    const events = readFileSync(join(replDir, transcriptFile!), 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((e) => e.type === 'backend_tool' || e.type === 'backend_text');
+
+    expect(events).toHaveLength(3);
+    const [toolStart, text, toolDone] = events;
+
+    expect(toolStart).toMatchObject({
+      type: 'backend_tool',
+      name: 'WebSearch',
+      status: 'running',
+      toolUseId: 'toolu_obs1',
+    });
+    // Compact: tool inputs must NOT be ledgered — full payloads live in the
+    // provider transcript, linked by toolUseId.
+    expect(toolStart).not.toHaveProperty('input');
+
+    expect(text.type).toBe('backend_text');
+    expect((text.preview as string).length).toBeLessThanOrEqual(200);
+    expect(text.preview as string).toContain('…');
+
+    expect(toolDone).toMatchObject({
+      type: 'backend_tool',
+      status: 'done',
+      toolUseId: 'toolu_obs1',
+    });
+
+    // Monotonic eids — the replay ordering contract.
+    const eids = events.map((e) => e.eid as number);
+    expect(eids.every((v) => typeof v === 'number')).toBe(true);
+    expect([...eids].sort((a, b) => a - b)).toEqual(eids);
+    expect(new Set(eids).size).toBe(eids.length);
+
+    // The wire event IS the ledger entry: every `obs` line's entry must
+    // deep-equal the appended transcript line, ts and eid included. Two
+    // independently-shaped writes would let live views fork from replay.
+    const obsEntries = stdoutWrites
+      .join('')
+      .split('\n')
+      .filter((l) => l.trim().startsWith('{"type":"obs"'))
+      .map((l) => (JSON.parse(l) as { entry: Record<string, unknown> }).entry);
+    expect(obsEntries).toEqual(events);
   });
 
   it('applies explicit --backend-timeout-seconds override', async () => {
@@ -1921,8 +2359,8 @@ describe('runChat integration', () => {
     expect(typeof token).toBe('string');
 
     const verified = verifyDelegationToken(String(token), process.env.INK_DELEGATION_SECRET || '', {
-      expectedIssuerAgentId: 'lumen',
-      expectedDelegateeAgentId: 'wren',
+      expectedIssuerSlug: 'lumen',
+      expectedDelegateeSlug: 'wren',
       expectedThreadKey: 'pr:123',
       requiredScopes: ['send_to_inbox', 'trigger_agent'],
     });
@@ -1932,8 +2370,8 @@ describe('runChat integration', () => {
   it('renders delegation metadata label for inbox messages', async () => {
     const delegationToken = mintDelegationToken(
       {
-        issuerAgentId: 'wren',
-        delegateeAgentId: 'lumen',
+        issuerSlug: 'wren',
+        delegateeSlug: 'lumen',
         scopes: ['send_to_inbox'],
         threadKey: 'pr:50',
       },
@@ -1955,7 +2393,7 @@ describe('runChat integration', () => {
                 {
                   id: 'delegated-1',
                   content: 'please take this action',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'Delegated task',
                   threadKey: 'pr:50',
                   metadata: { delegationToken },

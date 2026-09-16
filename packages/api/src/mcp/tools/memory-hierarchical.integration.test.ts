@@ -67,7 +67,7 @@ describe('Hierarchical Memory Integration', () => {
         source: 'session',
         salience: 'high',
         topics: ['auth', 'mcp'],
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
 
       createdMemoryIds.push(memory.id);
@@ -87,7 +87,7 @@ describe('Hierarchical Memory Integration', () => {
         content: 'A plain memory without the new fields',
         source: 'observation',
         salience: 'medium',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
 
       createdMemoryIds.push(memory.id);
@@ -104,7 +104,7 @@ describe('Hierarchical Memory Integration', () => {
         topicKey: 'convention:git',
         source: 'user_stated',
         salience: 'critical',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
 
       createdMemoryIds.push(memory.id);
@@ -140,7 +140,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Core identity',
         topicKey: 'identity:test',
         salience: 'critical',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       criticalMemId = critical.id;
       createdMemoryIds.push(critical.id);
@@ -151,7 +151,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Important decision',
         topicKey: 'decision:test',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       highMemId = high.id;
       createdMemoryIds.push(high.id);
@@ -160,7 +160,7 @@ describe('Hierarchical Memory Integration', () => {
         userId: testUserId,
         content: 'Medium: routine observation',
         salience: 'medium',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       mediumMemId = medium.id;
       createdMemoryIds.push(medium.id);
@@ -280,7 +280,7 @@ describe('Hierarchical Memory Integration', () => {
         userId: testUserId,
         content: 'New memory that invalidates cache',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(newMem.id);
 
@@ -332,7 +332,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Original summary',
         topicKey: 'test:history',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
@@ -365,7 +365,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Delete test summary',
         topicKey: 'test:delete-history',
         salience: 'medium',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
@@ -490,7 +490,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Original restore summary',
         topicKey: 'test:restore',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
@@ -540,7 +540,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Restore from deleted',
         topicKey: 'test:restore-deleted',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       // Don't track in createdMemoryIds yet — it will be deleted
 

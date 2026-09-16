@@ -25,9 +25,11 @@ import {
 import type { AgentResponse, OutboundMedia } from '../agent/types';
 import type { DataComposer } from '../data/composer';
 import { logger } from '../utils/logger';
+import type { Json } from '../data/supabase/types';
 import { env } from '../config/env';
 import { InboundMediaPipeline } from './media-pipeline';
 import { TextToSpeechService } from './text-to-speech';
+import { validateTelegramChatId } from './telegram-chat-id';
 import telegramifyMarkdown from 'telegramify-markdown';
 import type { Platform } from '../types/shared';
 
@@ -550,7 +552,8 @@ export class ChannelGateway extends EventEmitter {
 
     // Forward the combined message. On error, release the processing lock
     // so the conversation isn't permanently deadlocked.
-    // On success, the lock is released by sendResponse → processPendingMessages.
+    // On success, the lock is released by releaseConversation() (called from
+    // server.ts after the full message handler completes) → processPendingMessages.
     try {
       await this.forwardToHandler(
         buffer.channel,
@@ -622,8 +625,8 @@ export class ChannelGateway extends EventEmitter {
 
     // NOTE: inbound messages are NOT logged to the activity stream here.
     // SessionService.handleMessage logs them first thing with the RESOLVED
-    // agentId and full payload (media, threadKey, sender) — this site used
-    // to log a second copy with a hardcoded agentId of 'myra', producing
+    // sbSlug and full payload (media, threadKey, sender) — this site used
+    // to log a second copy with a hardcoded sbSlug of 'myra', producing
     // duplicate message_in rows (double-rendered in attached CLI views).
 
     // Pass resolved userId to message handler so SessionService can persist messages
@@ -686,7 +689,8 @@ export class ChannelGateway extends EventEmitter {
    * Called by the response callback or directly
    */
   async sendResponse(response: AgentResponse): Promise<ResponseResult | void> {
-    const { channel, conversationId, content, format, replyToMessageId, media } = response;
+    const { channel, conversationId, content, format, replyToMessageId, media, sessionId } =
+      response;
 
     // Stop typing indicator when sending response
     this.stopTypingIndicator(conversationId);
@@ -695,25 +699,44 @@ export class ChannelGateway extends EventEmitter {
     let mediaResult: { sent: number; failed: number; errors: string[] } | undefined;
 
     switch (channel) {
-      case 'telegram':
+      case 'telegram': {
         if (!this.telegramListener) {
           throw new Error('Telegram listener not available');
         }
+        // Fail fast on ids Telegram can never accept (symbolic labels guessed
+        // by agents in proactive sessions) — one choke point covers the text,
+        // voice, and media paths below.
+        const chatIdError = validateTelegramChatId(conversationId);
+        if (chatIdError) {
+          throw new Error(chatIdError);
+        }
         if (await this.trySendTelegramVoiceReply(response)) {
           if (this.includeTextAfterVoiceReply) {
-            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+            await this.sendTelegramMessage(conversationId, content, {
+              format,
+              replyToMessageId,
+              sessionId,
+            });
           } else {
-            await this.logOutgoingTelegram(conversationId, content);
+            await this.logOutgoingTelegram(conversationId, content, undefined, sessionId);
           }
           break;
         }
 
         // Send text first (if any meaningful content), then media
         if (content && (!media || media.length === 0)) {
-          await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+          await this.sendTelegramMessage(conversationId, content, {
+            format,
+            replyToMessageId,
+            sessionId,
+          });
         } else if (media && media.length > 0) {
           if (content) {
-            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+            await this.sendTelegramMessage(conversationId, content, {
+              format,
+              replyToMessageId,
+              sessionId,
+            });
           }
           mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
             replyToMessageId,
@@ -724,7 +747,8 @@ export class ChannelGateway extends EventEmitter {
             content
               ? `[+${media.length} media attachment(s)] sent=${mediaResult.sent} failed=${mediaResult.failed}`
               : `[${media.length} media attachment(s)] sent=${mediaResult.sent} failed=${mediaResult.failed}`,
-            media
+            media,
+            sessionId
           );
           if (mediaResult.failed > 0 && mediaResult.sent === 0) {
             throw new Error(
@@ -738,6 +762,7 @@ export class ChannelGateway extends EventEmitter {
           }
         }
         break;
+      }
 
       case 'whatsapp':
         if (!this.whatsappListener) {
@@ -783,13 +808,14 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'myra',
+                sbSlug: 'myra',
                 direction: 'out',
                 content: logContent,
+                sessionId,
                 platform: 'whatsapp',
                 platformChatId: conversationId,
                 isDm: true,
-                payload: Object.keys(payload).length > 0 ? payload : undefined,
+                payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -845,13 +871,14 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'benson',
+                sbSlug: 'benson',
                 direction: 'out',
                 content: logContent,
+                sessionId,
                 platform: 'discord',
                 platformChatId: conversationId,
                 isDm: true,
-                payload: Object.keys(payload).length > 0 ? payload : undefined,
+                payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -903,13 +930,14 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'slack',
+                sbSlug: 'slack',
                 direction: 'out',
                 content: logContent,
+                sessionId,
                 platform: 'slack',
                 platformChatId: conversationId,
                 isDm: true,
-                payload: Object.keys(payload).length > 0 ? payload : undefined,
+                payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -993,11 +1021,15 @@ export class ChannelGateway extends EventEmitter {
   async releaseConversation(
     channel: GatewayChannel,
     conversationId: string,
-    autoResponse?: { content: string; format?: 'text' | 'markdown' }
+    autoResponse?: { content: string; format?: 'text' | 'markdown'; sessionId?: string }
   ): Promise<void> {
     const key = this.getBufferKey(channel, conversationId);
 
-    // If an auto-response was provided, send it first
+    // If an auto-response was provided, send it first. Success or failure, we
+    // MUST fall through to the release below — sendResponse deliberately does
+    // NOT process pending messages (see the NOTE in sendResponse), so an early
+    // return here leaks the processing lock: the lane stays "busy" forever and
+    // every later inbound message queues as pending, never drained.
     if (autoResponse && autoResponse.content) {
       try {
         await this.sendResponse({
@@ -1005,12 +1037,10 @@ export class ChannelGateway extends EventEmitter {
           conversationId,
           content: autoResponse.content,
           format: autoResponse.format,
+          sessionId: autoResponse.sessionId,
         });
-        // sendResponse will call processPendingMessages, so we're done
-        return;
       } catch (error) {
         logger.error(`Failed to send auto-response for ${key}:`, error);
-        // Continue to release the lock even if send fails
       }
     }
 
@@ -1028,7 +1058,7 @@ export class ChannelGateway extends EventEmitter {
   private async sendTelegramMessage(
     conversationId: string,
     content: string,
-    options?: { format?: string; replyToMessageId?: string }
+    options?: { format?: string; replyToMessageId?: string; sessionId?: string }
   ): Promise<void> {
     if (!this.telegramListener) return;
 
@@ -1055,13 +1085,14 @@ export class ChannelGateway extends EventEmitter {
       parseMode,
     });
 
-    await this.logOutgoingTelegram(conversationId, content);
+    await this.logOutgoingTelegram(conversationId, content, undefined, options?.sessionId);
   }
 
   private async logOutgoingTelegram(
     conversationId: string,
     content: string,
-    media?: OutboundMedia[]
+    media?: OutboundMedia[],
+    sessionId?: string
   ): Promise<void> {
     // Log outgoing message to activity stream
     const userId = await this.resolveUserIdForConversation('telegram', conversationId);
@@ -1080,13 +1111,14 @@ export class ChannelGateway extends EventEmitter {
         }
         await this.dataComposer.repositories.activityStream.logMessage({
           userId,
-          agentId: 'myra',
+          sbSlug: 'myra',
           direction: 'out',
           content,
+          sessionId,
           platform: 'telegram',
           platformChatId: conversationId,
           isDm: true, // Will be corrected by context
-          payload: Object.keys(payload).length > 0 ? payload : undefined,
+          payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
         });
       } catch (activityError) {
         logger.warn('Failed to log outgoing message to activity stream:', activityError);

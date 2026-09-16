@@ -17,6 +17,9 @@ import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
+import { getParticipants, reopenThreadRow } from '../mcp/tools/thread-handlers';
+import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
@@ -38,6 +41,7 @@ import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import QRCode from 'qrcode';
 import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
 import {
@@ -47,6 +51,17 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { applyGraphBlockedBy } from '../data/task-graph-read-model';
+import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
+import { ThreadKeyService } from '../services/thread-key/thread-key.service';
+import { parseThreadKey } from '../services/thread-key/parser';
+import {
+  aggregateStudioHistory,
+  mergeThreadSpines,
+  missingThreadKeys,
+} from '../services/thread-key/thread-spines';
+import { groupNodeEvents, type GateEventInput } from '../services/thread-key/graph-evidence';
+import { openVerifiedMedia } from '../utils/media-path';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -100,6 +115,19 @@ type ChannelRouteRow = {
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
+/** Refresh-token client_id for the native app (packages/mobile). */
+const MOBILE_CLIENT_ID = 'mobile';
+/**
+ * Pairing codes let a phone sign in by scanning a QR the dashboard shows.
+ * They live in mcp_tokens under their own client_id so they can never be
+ * mistaken for (or exchanged as) a refresh token, and they are single-use
+ * with a short life: the code is the credential for those ten minutes.
+ */
+const MOBILE_PAIR_CLIENT_ID = 'mobile-pair';
+const MOBILE_PAIR_CODE_LIFETIME_SECONDS = 10 * 60;
+const MOBILE_PAIR_CODE_LENGTH = 12;
+// 32 symbols, none of 0/O/1/I: a code someone reads off a screen and types.
+const MOBILE_PAIR_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
 const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
@@ -142,7 +170,7 @@ type WorkspaceIdentityScope = {
     role: string | null;
   }>;
   sbIds: string[];
-  agentIds: Set<string>;
+  sbSlugs: Set<string>;
 };
 
 type WorkspaceScopedSessionRow = {
@@ -227,7 +255,7 @@ function toRoutingRoute(
     id: route.id,
     sbId: route.sb_id,
     identityId: route.sb_id,
-    agentId: identity?.agent_id ?? null,
+    sbSlug: identity?.agent_id ?? null,
     agentName: identity?.name ?? null,
     agentRole: identity?.role ?? null,
     backend: identity?.backend ?? null,
@@ -654,9 +682,9 @@ async function findGeminiTranscriptFile(backendSessionId: string): Promise<strin
 async function findPcpTranscriptFile(sessionId: string): Promise<string | null> {
   const roots = new Set<string>();
   for (const dir of getAncestorDirs(process.cwd(), 8)) {
-    roots.add(path.join(dir, '.pcp', 'runtime', 'repl'));
+    roots.add(path.join(dir, '.ink', 'runtime', 'repl'));
   }
-  roots.add(path.join(os.homedir(), '.pcp', 'runtime', 'repl'));
+  roots.add(path.join(os.homedir(), '.ink', 'runtime', 'repl'));
 
   const matches: string[] = [];
   for (const root of roots) {
@@ -916,7 +944,7 @@ async function resolveWorkspaceIdentityScope(
     scope: {
       rows,
       sbIds: rows.map((row) => row.id),
-      agentIds: new Set(rows.map((row) => row.agent_id)),
+      sbSlugs: new Set(rows.map((row) => row.agent_id)),
     },
     error: null,
   };
@@ -928,7 +956,7 @@ function isSessionInWorkspace(
 ): boolean {
   if (!session) return false;
   if (session.sb_id && scope.sbIds.includes(session.sb_id)) return true;
-  if (!session.sb_id && session.agent_id && scope.agentIds.has(session.agent_id)) return true;
+  if (!session.sb_id && session.agent_id && scope.sbSlugs.has(session.agent_id)) return true;
   return false;
 }
 
@@ -1264,7 +1292,7 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
         .from('mcp_tokens')
         .delete()
         .eq('refresh_token', refreshToken)
-        .eq('client_id', ADMIN_CLIENT_ID);
+        .in('client_id', [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID]);
     }
 
     // Clear cookies regardless (same options used when setting them)
@@ -1281,8 +1309,511 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
   }
 });
 
+// =============================================================================
+// Mobile Auth (before auth middleware — these routes MINT credentials)
+// =============================================================================
+
+/**
+ * Token-in-body auth for native clients (packages/mobile).
+ *
+ * The dashboard's auth rides on httpOnly cookies, which React Native's fetch
+ * does not manage reliably. These two routes issue the SAME pcp_admin access
+ * JWT the middleware's Tier 1 already verifies — only the transport differs:
+ * tokens are returned in the response body and the client sends them as
+ * `Authorization: Bearer`. A distinct client_id (MOBILE_CLIENT_ID, declared
+ * with the other auth constants) keeps mobile refresh tokens separately
+ * revocable from dashboard ones.
+ */
+
+/**
+ * Attempts on the credential routes. Two buckets per attempt: (ip, account)
+ * blunts guessing at one account, and a per-ip ceiling stops one address
+ * from spraying distinct emails to dodge it. Both live in one bounded
+ * limiter (utils/fixed-window-limiter): amortised pruning and a hard cap, so
+ * a spray can neither grow the map without limit nor make each request scan
+ * it. In-memory is enough — one process, and this only needs to blunt online
+ * guessing, not survive restarts.
+ */
+const AUTH_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_ATTEMPTS_PER_ACCOUNT = 10;
+const AUTH_ATTEMPTS_PER_IP = 30;
+const PAIR_CLAIMS_PER_IP = 10;
+const authLimiter = new FixedWindowLimiter(AUTH_ATTEMPT_WINDOW_MS);
+
+function loginRateLimited(ip: string, email: string): boolean {
+  // Charge both buckets for every attempt, then decide.
+  const overIp = authLimiter.hit(`ip:${ip}`, AUTH_ATTEMPTS_PER_IP);
+  const overAccount = authLimiter.hit(`acct:${ip}|${email}`, AUTH_ATTEMPTS_PER_ACCOUNT);
+  return overIp || overAccount;
+}
+
+function pairClaimRateLimited(ip: string): boolean {
+  return authLimiter.hit(`pair:${ip}`, PAIR_CLAIMS_PER_IP);
+}
+
+/**
+ * POST /api/admin/auth/mobile-login
+ * Body: { email, password } → { accessToken, refreshToken, expiresIn, userId, email }
+ *
+ * Verifies credentials against Supabase server-side (the app never holds
+ * Supabase keys), provisions the PCP user if needed (same contract as the
+ * middleware's Tier 3), and returns a pcp_admin access/refresh token pair.
+ */
+router.post('/auth/mobile-login', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      res.status(400).json({ error: 'email and password are required' });
+      return;
+    }
+
+    if (loginRateLimited(req.ip || 'unknown', email)) {
+      res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+      return;
+    }
+
+    // Dedicated throwaway client for the sign-in: signInWithPassword mutates
+    // the client's internal auth state, so it must never run on a shared
+    // instance (see CLAUDE.md "Supabase Client Footgun").
+    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: signIn, error: signInError } = await authClient.auth.signInWithPassword({
+      email,
+      password,
+    });
+    if (signInError || !signIn.user) {
+      // Same body for wrong-password and unknown-account: no account oracle.
+      res.status(401).json({ error: 'Invalid email or password' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
+    if (!pcpUser) {
+      res.status(500).json({ error: 'Failed to provision user' });
+      return;
+    }
+
+    res.json(await issueMobileTokens(supabase, pcpUser.id, email));
+  } catch (error) {
+    logger.error('Mobile login error:', error);
+    res.status(500).json(errorJson('Login failed', error));
+  }
+});
+
+/**
+ * Look up (or provision) the PCP user for an email Supabase has just
+ * verified — the middleware's Tier 3 contract, shared by every mobile route
+ * that mints credentials so they cannot drift apart.
+ */
+async function findOrProvisionPcpUserByEmail(
+  supabase: SupabaseClient<Database>,
+  email: string
+): Promise<{ id: string } | null> {
+  const nowIso = new Date().toISOString();
+  const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
+  if (existing) {
+    await supabase.from('users').update({ last_login_at: nowIso }).eq('id', existing.id);
+    return existing;
+  }
+
+  const { data: created, error: createError } = await supabase
+    .from('users')
+    .insert({ email, last_login_at: nowIso })
+    .select('id')
+    .single();
+  if (!createError && created) return created;
+
+  // Lost an insert race — the row exists now.
+  const { data: raced } = await supabase.from('users').select('id').eq('email', email).single();
+  if (raced) return raced;
+
+  logger.error('Failed to provision PCP user for mobile auth', { error: createError?.message });
+  return null;
+}
+
+/** The pcp_admin access/refresh pair every mobile sign-in path returns. */
+async function issueMobileTokens(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  email: string
+): Promise<{
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  userId: string;
+  email: string;
+}> {
+  const accessToken = signPcpAccessToken(
+    { type: 'pcp_admin', sub: userId, email, scope: 'admin' },
+    ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+  );
+  const { refreshToken } = await createRefreshToken(
+    supabase,
+    userId,
+    MOBILE_CLIENT_ID,
+    ['admin'],
+    ADMIN_REFRESH_TOKEN_LIFETIME_DAYS
+  );
+  return {
+    accessToken,
+    refreshToken,
+    expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
+    userId,
+    email,
+  };
+}
+
+/** Same rules the dashboard's signup form shows as it types. */
+function passwordPolicyProblem(password: string): string | null {
+  if (password.length < 8) return 'Password must be at least 8 characters';
+  if (!/\d/.test(password)) return 'Password must contain a number';
+  if (!/[a-zA-Z]/.test(password)) return 'Password must contain a letter';
+  return null;
+}
+
+/**
+ * POST /api/admin/auth/mobile-signup
+ * Body: { email, password }
+ *   → { confirmationRequired: true, email }                       (check your inbox)
+ *   → { confirmationRequired: false, accessToken, refreshToken, … } (signed in)
+ *
+ * Whether the second shape is possible depends on the Supabase project: with
+ * email confirmation on (the hosted default) the account is inert until the
+ * link is clicked, and the phone should send the user to Sign in afterwards.
+ * An existing account is deliberately indistinguishable from a new one.
+ */
+router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      res.status(400).json({ error: 'email and password are required' });
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'A valid email address is required' });
+      return;
+    }
+    const policyProblem = passwordPolicyProblem(password);
+    if (policyProblem) {
+      res.status(400).json({ error: policyProblem });
+      return;
+    }
+
+    // Own bucket: a signup spray must not lock a real user out of login.
+    if (loginRateLimited(req.ip || 'unknown', `signup:${email}`)) {
+      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    // Throwaway client — signUp mutates client auth state like signIn does.
+    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: signUp, error: signUpError } = await authClient.auth.signUp({ email, password });
+
+    if (signUpError) {
+      // Supabase names an existing account outright when confirmations are
+      // off. Answer as if the signup went through; the phone's copy tells the
+      // user to sign in if they already have an account.
+      if (/already|exists|registered/i.test(signUpError.message)) {
+        res.json({ confirmationRequired: true, email });
+        return;
+      }
+      res.status(400).json({ error: signUpError.message });
+      return;
+    }
+
+    if (!signUp.session) {
+      res.json({ confirmationRequired: true, email });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
+    if (!pcpUser) {
+      res.status(500).json({ error: 'Failed to provision user' });
+      return;
+    }
+
+    res.json({
+      confirmationRequired: false,
+      ...(await issueMobileTokens(supabase, pcpUser.id, email)),
+    });
+  } catch (error) {
+    logger.error('Mobile signup error:', error);
+    res.status(500).json(errorJson('Signup failed', error));
+  }
+});
+
+// ─── Pairing codes ───
+
+function generatePairingCode(): string {
+  // 32 symbols divide 256 evenly, so a byte mod 32 is unbiased.
+  const bytes = crypto.randomBytes(MOBILE_PAIR_CODE_LENGTH);
+  let code = '';
+  for (let i = 0; i < MOBILE_PAIR_CODE_LENGTH; i += 1) {
+    code += MOBILE_PAIR_CODE_ALPHABET[bytes[i] % MOBILE_PAIR_CODE_ALPHABET.length];
+  }
+  return code;
+}
+
+/** Accepts the code however it was typed: lowercase, with dashes or spaces. */
+function normalizePairingCode(input: string): string {
+  return input.toUpperCase().replace(/[^A-Z2-9]/g, '');
+}
+
+function formatPairingCode(code: string): string {
+  return code.match(/.{1,4}/g)?.join('-') ?? code;
+}
+
+function pairingCodeStorageKey(code: string): string {
+  return `pcp-pair-${code}`;
+}
+
+function isLoopbackHost(hostOrUrl: string): boolean {
+  return /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(hostOrUrl);
+}
+
+/** TLS-terminated upstream, direct TLS, or a same-machine caller. */
+function requestIsSecureOrLocal(req: Request): boolean {
+  const forwardedProto = req.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+  if (req.secure || forwardedProto === 'https') return true;
+  const host = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  return isLoopbackHost(host);
+}
+
+/**
+ * POST /api/admin/auth/mobile-pair/claim
+ * Body: { code } → same token pair as mobile-login.
+ *
+ * The delete IS the claim: returning the deleted row means that of two
+ * racing claimers exactly one gets tokens, with no read-then-write window.
+ */
+router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
+  try {
+    const code = normalizePairingCode(typeof req.body?.code === 'string' ? req.body.code : '');
+    if (code.length !== MOBILE_PAIR_CODE_LENGTH) {
+      res.status(400).json({ error: 'A pairing code is required' });
+      return;
+    }
+
+    // Per-IP: ten guesses per window against a 60-bit code.
+    if (pairClaimRateLimited(req.ip || 'unknown')) {
+      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    // The response is a 90-day admin credential. In production it leaves
+    // this process only over TLS or to this machine — never across a
+    // cleartext LAN hop. (A client that forges x-forwarded-proto only
+    // downgrades its own connection; the header is trusted for exactly that.)
+    if (!isDevelopment() && !requestIsSecureOrLocal(req)) {
+      res.status(403).json({ error: 'Pairing requires HTTPS' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: consumed, error: consumeError } = await supabase
+      .from('mcp_tokens')
+      .delete()
+      .eq('refresh_token', pairingCodeStorageKey(code))
+      .eq('client_id', MOBILE_PAIR_CLIENT_ID)
+      .select('user_id, expires_at')
+      .maybeSingle();
+    if (consumeError) {
+      logger.error('Failed to consume pairing code', { error: consumeError.message });
+      res.status(500).json({ error: 'Pairing failed' });
+      return;
+    }
+    if (!consumed || new Date(consumed.expires_at) < new Date()) {
+      res.status(401).json({ error: 'Invalid or expired pairing code' });
+      return;
+    }
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, email')
+      .eq('id', consumed.user_id)
+      .single();
+    if (!user?.email) {
+      res.status(401).json({ error: 'Invalid or expired pairing code' });
+      return;
+    }
+    await supabase
+      .from('users')
+      .update({ last_login_at: new Date().toISOString() })
+      .eq('id', user.id);
+
+    res.json(await issueMobileTokens(supabase, user.id, user.email));
+  } catch (error) {
+    logger.error('Mobile pairing claim error:', error);
+    res.status(500).json(errorJson('Pairing failed', error));
+  }
+});
+
+/**
+ * POST /api/admin/auth/mobile-refresh
+ * Body: { refreshToken } → { accessToken, expiresIn, userId, email }
+ * The refresh token itself is long-lived (90 days) and stays unchanged.
+ */
+router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
+  try {
+    const refreshToken = typeof req.body?.refreshToken === 'string' ? req.body.refreshToken : '';
+    if (!refreshToken) {
+      res.status(400).json({ error: 'refreshToken is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const result = await exchangeRefreshToken(
+      supabase,
+      refreshToken,
+      MOBILE_CLIENT_ID,
+      'pcp_admin',
+      ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+    );
+    if (!result) {
+      res.status(401).json({ error: 'Invalid or expired refresh token' });
+      return;
+    }
+
+    res.json({
+      accessToken: result.accessToken,
+      expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
+      userId: result.userId,
+      email: result.email,
+    });
+  } catch (error) {
+    logger.error('Mobile token refresh error:', error);
+    res.status(500).json(errorJson('Token refresh failed', error));
+  }
+});
+
 // Apply auth middleware to all subsequent routes
 router.use(adminAuthMiddleware);
+
+/**
+ * Where a phone could reach this server, in the order it should try them.
+ *
+ * Candidates: the configured public URL, the host the dashboard itself was
+ * reached on, every LAN IPv4 address of this machine. Loopback is never
+ * offered — it is the one address guaranteed wrong from another device.
+ *
+ * Production advertises HTTPS only. The claim response carries a 90-day
+ * admin credential, and a cleartext LAN hop is exactly the network path that
+ * could read it. Development keeps the plain-HTTP LAN addresses — that is how
+ * a phone reaches a laptop — and the response says so (`insecureTransport`),
+ * so the dashboard can say so too. TLS candidates sort first either way: a
+ * reachable https address must never lose to a cleartext one.
+ */
+function candidateServerUrls(req: Request): { urls: string[]; insecureTransport: boolean } {
+  const dev = isDevelopment();
+  const isHttps = (url: string) => /^https:\/\//i.test(url);
+  const candidates: string[] = [];
+
+  if (env.MCP_BASE_URL && !isLoopbackHost(env.MCP_BASE_URL)) candidates.push(env.MCP_BASE_URL);
+
+  const forwardedHost = req.get('x-forwarded-host')?.split(',')[0]?.trim();
+  const host = forwardedHost || req.get('host');
+  if (host && !isLoopbackHost(host)) {
+    const proto = req.get('x-forwarded-proto')?.split(',')[0]?.trim() || req.protocol || 'http';
+    candidates.push(`${proto}://${host}`);
+  }
+
+  for (const interfaces of Object.values(os.networkInterfaces())) {
+    for (const iface of interfaces ?? []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        candidates.push(`http://${iface.address}:${env.MCP_HTTP_PORT}`);
+      }
+    }
+  }
+
+  const urls: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\/+$/, '');
+    if (!isHttps(normalized) && !dev) continue;
+    if (!urls.includes(normalized)) urls.push(normalized);
+  }
+  urls.sort((a, b) => Number(isHttps(b)) - Number(isHttps(a)));
+  return { urls, insecureTransport: urls.some((url) => !isHttps(url)) };
+}
+
+/**
+ * POST /api/admin/auth/mobile-pair
+ * → { code, expiresAt, expiresInSeconds, urls, qrDataUrl }
+ *
+ * Mints a single-use pairing code for the signed-in user and renders the QR
+ * the dashboard shows. The QR payload is `{ ink: 1, c: code, u: urls }` —
+ * the phone claims the code against the first URL that answers /health.
+ */
+router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Codes nobody scanned would otherwise accumulate; sweep this user's
+    // expired ones on the way in (best effort — a failure here is not ours to
+    // surface).
+    await supabase
+      .from('mcp_tokens')
+      .delete()
+      .eq('user_id', authReq.pcpUserId)
+      .eq('client_id', MOBILE_PAIR_CLIENT_ID)
+      .lt('expires_at', new Date().toISOString());
+
+    const code = generatePairingCode();
+    const expiresAt = new Date(Date.now() + MOBILE_PAIR_CODE_LIFETIME_SECONDS * 1000);
+    const { error: insertError } = await supabase.from('mcp_tokens').insert({
+      user_id: authReq.pcpUserId,
+      client_id: MOBILE_PAIR_CLIENT_ID,
+      refresh_token: pairingCodeStorageKey(code),
+      supabase_refresh_token: null,
+      scopes: ['admin'],
+      expires_at: expiresAt.toISOString(),
+    });
+    if (insertError) {
+      logger.error('Failed to store pairing code', { error: insertError.message });
+      res.status(500).json({ error: 'Failed to create pairing code' });
+      return;
+    }
+
+    const { urls, insecureTransport } = candidateServerUrls(req);
+    const qrDataUrl = await QRCode.toDataURL(JSON.stringify({ ink: 1, c: code, u: urls }), {
+      margin: 1,
+      width: 320,
+      errorCorrectionLevel: 'M',
+    });
+
+    res.json({
+      code: formatPairingCode(code),
+      expiresAt: expiresAt.toISOString(),
+      expiresInSeconds: MOBILE_PAIR_CODE_LIFETIME_SECONDS,
+      urls,
+      insecureTransport,
+      development: isDevelopment(),
+      qrDataUrl,
+    });
+  } catch (error) {
+    logger.error('Mobile pairing code error:', error);
+    res.status(500).json(errorJson('Failed to create pairing code', error));
+  }
+});
 
 // =============================================================================
 // Workspaces
@@ -1883,7 +2414,7 @@ router.get('/whatsapp/qr', (req: Request, res: Response) => {
 /**
  * GET /api/admin/events
  * Generic SSE stream of activity_stream events for the authenticated user.
- * Filters: ?sessionId= &taskGroupId= &agentId= — optional, ANDed together.
+ * Filters: ?sessionId= &taskGroupId= &sbSlug= — optional, ANDed together.
  * Backfill: ?since=<ISO timestamp> replays persisted rows before going live.
  * Reconnect: Last-Event-ID header (or ?since) — clients pass the last seen
  * activity id/timestamp to resume without gaps.
@@ -1895,7 +2426,7 @@ router.get('/events', async (req: Request, res: Response) => {
   const authReq = req as AdminAuthRequest;
   const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
   const taskGroupId = typeof req.query.taskGroupId === 'string' ? req.query.taskGroupId : undefined;
-  const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : undefined;
+  const sbSlug = typeof req.query.sbSlug === 'string' ? req.query.sbSlug : undefined;
   // Cursor priority: explicit ?since= > Last-Event-ID reconnect header
   // (format "<ISO>|<id>", set by writeEvent below).
   const lastEventId = req.headers['last-event-id'];
@@ -1933,7 +2464,7 @@ router.get('/events', async (req: Request, res: Response) => {
   let heartbeat: ReturnType<typeof setInterval> | undefined;
 
   const unsubscribe = activityBus.subscribe(
-    { userId: authReq.pcpUserId, sessionId, taskGroupId, agentId },
+    { userId: authReq.pcpUserId, sessionId, taskGroupId, sbSlug },
     (activity) => {
       if (closed) return;
       if (backfilling) {
@@ -1962,7 +2493,7 @@ router.get('/events', async (req: Request, res: Response) => {
       const backfill = await activityRepo.getActivity(authReq.pcpUserId, {
         sessionId,
         taskGroupId,
-        agentId,
+        sbSlug,
         since,
         limit: 500,
       });
@@ -2158,7 +2689,7 @@ router.get('/routing', async (req: Request, res: Response) => {
 
     const { enabled: heartbeatProcessingEnabled } = getHeartbeatProcessingConfig();
 
-    const uniqueAgents = new Set(routes.map((route) => route.agentId).filter(Boolean));
+    const uniqueAgents = new Set(routes.map((route) => route.sbSlug).filter(Boolean));
     const uniquePlatforms = new Set(routes.map((route) => route.platform));
 
     res.json({
@@ -2172,7 +2703,7 @@ router.get('/routing', async (req: Request, res: Response) => {
       },
       identities: (identitiesData || []).map((identity) => ({
         id: identity.id,
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         name: identity.name,
         role: identity.role,
         backend: identity.backend,
@@ -2187,12 +2718,12 @@ router.get('/routing', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/routing/agents/:agentId
+ * GET /api/admin/routing/agents/:sbSlug
  * Get routing detail for a specific SB.
  */
-router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
+router.get('/routing/agents/:sbSlug', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const authReq = req as AdminAuthRequest;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
@@ -2205,7 +2736,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
       )
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .single();
 
     if (identityError || !identity) {
@@ -2308,7 +2839,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
       heartbeatProcessingEnabled,
       agent: {
         id: identity.id,
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         name: identity.name,
         role: identity.role,
         description: identity.description,
@@ -2350,14 +2881,14 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 });
 
 /**
- * PATCH /api/admin/identities/:agentId/settings
+ * PATCH /api/admin/identities/:sbSlug/settings
  * Update SB-level settings: sandbox_bypass, session_scope, backend, runtime config
  * (tool profile, tool routing, max turns, passive recall). Admin-only — not exposed via MCP.
  */
-router.patch('/identities/:agentId/settings', async (req: Request, res: Response) => {
+router.patch('/identities/:sbSlug/settings', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
@@ -2368,7 +2899,7 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
       .select('id, metadata')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
 
     if (fetchErr || !identity) {
@@ -2389,6 +2920,27 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
 
     // Runtime config fields → stored in metadata.runtimeConfig
     const { toolProfile, toolRouting, maxTurns, passiveRecall } = body;
+    // These feed spawn flags directly (ink-runner --tool-routing /
+    // --max-turns), so reject junk at the door: an unvalidated value would
+    // silently fall back to defaults at spawn time and the dashboard would
+    // lie about what's in effect.
+    if (
+      toolRouting !== undefined &&
+      toolRouting !== null &&
+      toolRouting !== 'local' &&
+      toolRouting !== 'backend'
+    ) {
+      res.status(400).json({ error: "toolRouting must be 'local', 'backend', or null" });
+      return;
+    }
+    if (
+      maxTurns !== undefined &&
+      maxTurns !== null &&
+      (typeof maxTurns !== 'number' || !Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 25)
+    ) {
+      res.status(400).json({ error: 'maxTurns must be an integer between 1 and 25, or null' });
+      return;
+    }
     if (
       toolProfile !== undefined ||
       toolRouting !== undefined ||
@@ -2433,10 +2985,10 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
     }
 
     const meta = (updated.metadata || {}) as Record<string, unknown>;
-    logger.info('Identity settings updated', { agentId, updates });
+    logger.info('Identity settings updated', { sbSlug, updates });
     res.json({
       success: true,
-      agentId,
+      sbSlug,
       backend: updated.backend || null,
       sandbox_bypass: updated.sandbox_bypass,
       runtimeConfig: (meta.runtimeConfig as Record<string, unknown>) || null,
@@ -2939,7 +3491,7 @@ router.get('/reminders', async (req: Request, res: Response) => {
         runCount: r.run_count,
         maxRuns: r.max_runs,
         studioHint: r.studio_hint ?? null,
-        agentId: r.agent_identities?.agent_id ?? null,
+        sbSlug: r.agent_identities?.agent_id ?? null,
         agentName: r.agent_identities?.name ?? null,
         createdAt: r.created_at,
       })),
@@ -3170,7 +3722,7 @@ router.get('/individuals', async (req: Request, res: Response) => {
         const meta = (identity.metadata || {}) as Record<string, unknown>;
         return {
           id: identity.id,
-          agentId: identity.agent_id,
+          sbSlug: identity.agent_id,
           name: identity.name,
           role: identity.role,
           backend: identity.backend || null,
@@ -3197,12 +3749,12 @@ router.get('/individuals', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/individuals/:agentId/history
+ * GET /api/admin/individuals/:sbSlug/history
  * Get version history for an AI being
  */
-router.get('/individuals/:agentId/history', async (req: Request, res: Response) => {
+router.get('/individuals/:sbSlug/history', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const authReq = req as AdminAuthRequest;
 
@@ -3212,7 +3764,7 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
       .select('id')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .single();
 
     if (!identity) {
@@ -3236,7 +3788,7 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
     }
 
     res.json({
-      agentId,
+      sbSlug,
       history: (data || []).map((h) => ({
         id: h.id,
         version: h.version,
@@ -3280,12 +3832,12 @@ interface TimelineEntry {
 }
 
 /**
- * GET /api/admin/individuals/:agentId/memories/timeline
+ * GET /api/admin/individuals/:sbSlug/memories/timeline
  * Get full memory activity timeline for an AI being
  */
-router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: Response) => {
+router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
     const offset = parseInt(req.query.offset as string) || 0;
     const authReq = req as AdminAuthRequest;
@@ -3297,12 +3849,12 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
       .select('id')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
 
     if (!identity) {
       res.json({
-        agentId,
+        sbSlug,
         timeline: [],
         total: 0,
         limit,
@@ -3362,10 +3914,10 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
         const metadataWorkspaceId =
           (metadata?.workspaceId as string | undefined) ||
           (metadata?.workspace_id as string | undefined);
-        const metadataAgentId = metadata?.agentId as string | undefined;
+        const metadataSlug = archivedMetadataSlug(metadata);
         const hasScopedMetadata =
           metadataIdentityId === identity.id ||
-          (metadataAgentId === agentId && metadataWorkspaceId === authReq.pcpWorkspaceId);
+          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId);
 
         if (isAgentMemory || hasScopedMetadata) {
           timeline.push({
@@ -3392,7 +3944,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('sb_id', identity.id)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
 
     if (sessionsError) {
       logger.error('Failed to fetch sessions:', sessionsError);
@@ -3430,7 +3982,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
     const paginatedTimeline = timeline.slice(offset, offset + limit);
 
     res.json({
-      agentId,
+      sbSlug,
       timeline: paginatedTimeline,
       total: timeline.length,
       limit,
@@ -3443,14 +3995,14 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
 });
 
 /**
- * GET /api/admin/individuals/:agentId/memories/:memoryId/history
+ * GET /api/admin/individuals/:sbSlug/memories/:memoryId/history
  * Get version history for a specific memory
  */
 router.get(
-  '/individuals/:agentId/memories/:memoryId/history',
+  '/individuals/:sbSlug/memories/:memoryId/history',
   async (req: Request, res: Response) => {
     try {
-      const { agentId, memoryId } = req.params;
+      const { sbSlug, memoryId } = req.params;
       const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
       const authReq = req as AdminAuthRequest;
 
@@ -3459,7 +4011,7 @@ router.get(
         .select('id')
         .eq('user_id', authReq.pcpUserId)
         .eq('workspace_id', authReq.pcpWorkspaceId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .maybeSingle();
 
       if (!identity) {
@@ -3497,10 +4049,10 @@ router.get(
         const metadataWorkspaceId =
           (metadata?.workspaceId as string | undefined) ||
           (metadata?.workspace_id as string | undefined);
-        const metadataAgentId = metadata?.agentId as string | undefined;
+        const metadataSlug = archivedMetadataSlug(metadata);
         return (
           metadataIdentityId === identity.id ||
-          (metadataAgentId === agentId && metadataWorkspaceId === authReq.pcpWorkspaceId)
+          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId)
         );
       });
 
@@ -3531,13 +4083,13 @@ router.get(
 // =============================================================================
 
 /**
- * GET /api/admin/individuals/:agentId/inbox
+ * GET /api/admin/individuals/:sbSlug/inbox
  * Get threaded inbox view for an agent, grouped by thread_key.
  * Messages without a thread_key are returned as flat messages (routed to the SB's main process).
  */
-router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) => {
+router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const authReq = req as AdminAuthRequest;
     const status = (req.query.status as string) || 'all';
     const messageType = req.query.messageType as string | undefined;
@@ -3554,7 +4106,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       .select('id')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
 
     if (identityError) {
       logger.error('Failed to resolve inbox identities for workspace scope:', identityError);
@@ -3565,7 +4117,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
     const scopedIdentityIds = (identityRows || []).map((row) => row.id);
     if (scopedIdentityIds.length === 0) {
       res.json({
-        agentId,
+        sbSlug,
         stats: {
           totalMessages: 0,
           unreadCount: 0,
@@ -3590,7 +4142,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       .from('agent_inbox')
       .select('*')
       .eq('recipient_user_id', authReq.pcpUserId)
-      .eq('recipient_agent_id', agentId)
+      .eq('recipient_agent_id', sbSlug)
       .in('recipient_sb_id', scopedIdentityIds)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -3599,7 +4151,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       .from('agent_inbox')
       .select('*')
       .eq('recipient_user_id', authReq.pcpUserId)
-      .eq('sender_agent_id', agentId)
+      .eq('sender_agent_id', sbSlug)
       .in('sender_sb_id', scopedIdentityIds)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -3679,10 +4231,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       messageType: string;
       priority: string;
       status: string;
-      senderAgentId: string | null;
+      senderSlug: string | null;
       senderSbId: string | null;
       senderIdentityId: string | null;
-      recipientAgentId: string;
+      recipientSlug: string;
       recipientSbId: string | null;
       recipientIdentityId: string | null;
       threadKey: string | null;
@@ -3702,10 +4254,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       messageType: m.message_type,
       priority: m.priority,
       status: m.status,
-      senderAgentId: m.sender_agent_id,
+      senderSlug: m.sender_agent_id,
       senderSbId: m.sender_sb_id,
       senderIdentityId: m.sender_sb_id,
-      recipientAgentId: m.recipient_agent_id,
+      recipientSlug: m.recipient_agent_id,
       recipientSbId: m.recipient_sb_id,
       recipientIdentityId: m.recipient_sb_id,
       threadKey: m.thread_key,
@@ -3728,9 +4280,9 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       if (m.thread_key) {
         // Determine the counterpart: the "other" agent in this 1-1 exchange
         let counterpart: string;
-        if (m.sender_agent_id === agentId) {
+        if (m.sender_agent_id === sbSlug) {
           counterpart = m.recipient_agent_id;
-        } else if (m.recipient_agent_id === agentId) {
+        } else if (m.recipient_agent_id === sbSlug) {
           counterpart = m.sender_agent_id || 'unknown';
         } else {
           // Cross-agent message (from two-pass) — group by sender
@@ -3759,7 +4311,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
         unreadCount: sorted.filter((m) => m.status === 'unread').length,
         latestMessage: sorted[sorted.length - 1],
         participants: [
-          ...new Set(sorted.flatMap((m) => [m.senderAgentId, m.recipientAgentId]).filter(Boolean)),
+          ...new Set(sorted.flatMap((m) => [m.senderSlug, m.recipientSlug]).filter(Boolean)),
         ] as string[],
         firstMessageAt: sorted[0].createdAt,
         lastMessageAt: sorted[sorted.length - 1].createdAt,
@@ -3797,7 +4349,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       const { data: threadParticipantRows } = await (supabase as any)
         .from('inbox_thread_participants')
         .select('thread_id')
-        .eq('agent_id', agentId);
+        .eq('agent_id', sbSlug);
 
       const threadIds = (threadParticipantRows || []).map(
         (p: { thread_id: string }) => p.thread_id
@@ -3819,7 +4371,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
           const { data: readStatusRows } = await (supabase as any)
             .from('inbox_thread_read_status')
             .select('thread_id, last_read_at')
-            .eq('agent_id', agentId)
+            .eq('agent_id', sbSlug)
             .in('thread_id', threadIds);
 
           const readStatusMap = new Map<string, string>();
@@ -3859,10 +4411,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
               messageType: m.message_type,
               priority: m.priority,
               status: 'unread', // computed below
-              senderAgentId: m.sender_agent_id,
+              senderSlug: m.sender_agent_id,
               senderSbId: null,
               senderIdentityId: null,
-              recipientAgentId: agentId, // thread messages don't have a single recipient
+              recipientSlug: sbSlug, // thread messages don't have a single recipient
               recipientSbId: null,
               recipientIdentityId: null,
               threadKey: t.thread_key,
@@ -3933,7 +4485,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
     const totalItems = threads.length + flatMessages.length;
 
     res.json({
-      agentId,
+      sbSlug,
       stats: {
         totalMessages: allMessages.length + groupThreads.reduce((s, t) => s + t.messageCount, 0),
         unreadCount: inboxUnreadCount,
@@ -3988,14 +4540,37 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
       authReq.pcpWorkspaceId
     );
 
+    // Desktop credentials (`ink google login` on the server host) bound to this
+    // user by email. They count as a connection: the server will use one when
+    // the cloud row cannot serve, or first when configured that way.
+    const credentialSources = oauthService.getCredentialSources();
+    const desktop = credentialSources.includes('desktop')
+      ? await oauthService.describeDesktopCredentials(authReq.pcpUserId)
+      : { dir: null, email: null, error: null, credentials: [] };
+    const desktopUsable = desktop.credentials.some((c) => c.state !== 'unusable');
+
     // Get supported providers and their configuration status
     const providers = oauthService.getSupportedProviders().map((provider) => ({
       name: provider,
       configured: oauthService.isProviderConfigured(provider),
-      connected: accounts.some((a) => a.provider === provider && a.status === 'active'),
+      connected:
+        accounts.some((a) => a.provider === provider && a.status === 'active') ||
+        (provider === 'google' && desktopUsable),
     }));
 
     res.json({
+      credentialSources,
+      desktopCredentialsError: desktop.error,
+      desktopCredentials: desktop.credentials.map((c) => ({
+        provider: 'google',
+        email: c.email,
+        path: c.path,
+        scopes: c.scopes,
+        obtainedAt: c.obtainedAt,
+        state: c.state,
+        reason: c.reason,
+        expiresAt: c.expiresAt,
+      })),
       accounts: accounts.map((a) => ({
         id: a.id,
         provider: a.provider,
@@ -4635,7 +5210,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
           parentCommentId: comment.parent_comment_id,
           content: comment.content,
           metadata: comment.metadata,
-          createdByAgentId: identity?.agent_id ?? null,
+          createdBySlug: identity?.agent_id ?? null,
           createdByUserId: commentAuthorUserId,
           createdByUser: commentAuthorUser
             ? {
@@ -4649,7 +5224,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
           createdByIdentity: identity
             ? {
                 id: identity.id,
-                agentId: identity.agent_id,
+                sbSlug: identity.agent_id,
                 name: identity.name,
                 backend: identity.backend,
               }
@@ -4672,9 +5247,9 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
 router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { content, agentId, parentCommentId, metadata } = req.body as {
+    const { content, sbSlug, parentCommentId, metadata } = req.body as {
       content?: string;
-      agentId?: string;
+      sbSlug?: string;
       parentCommentId?: string;
       metadata?: Record<string, unknown>;
     };
@@ -4721,20 +5296,20 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
 
     let identity: { id: string; agent_id: string; name: string; backend: string | null } | null =
       null;
-    if (agentId) {
+    if (sbSlug) {
       const { data: identityRow, error: identityError } = await supabase
         .from('agent_identities')
         .select('id, agent_id, name, backend')
         .eq('user_id', pcpUserId)
         .eq('workspace_id', workspaceId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .single();
 
       if (identityError || !identityRow) {
         // Deliberately stricter than MCP tool behavior:
         // dashboard/admin writes should reference a known identity explicitly,
         // while MCP handlers allow slug-only fallback for backward compatibility.
-        res.status(400).json({ error: `Unknown agent identity: ${agentId}` });
+        res.status(400).json({ error: `Unknown agent identity: ${sbSlug}` });
         return;
       }
       identity = identityRow;
@@ -4774,7 +5349,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         parentCommentId: comment.parent_comment_id,
         content: comment.content,
         metadata: comment.metadata,
-        createdByAgentId: identity?.agent_id ?? null,
+        createdBySlug: identity?.agent_id ?? null,
         createdByUserId: comment.created_by_user_id || pcpUserId,
         createdByUser: commentAuthorUser
           ? {
@@ -4788,7 +5363,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         createdByIdentity: identity
           ? {
               id: identity.id,
-              agentId: identity.agent_id,
+              sbSlug: identity.agent_id,
               name: identity.name,
               backend: identity.backend,
             }
@@ -4915,15 +5490,15 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     const scopedIdentityRows = scopedIdentities || [];
     const scopedIdentityIds = scopedIdentityRows.map((i) => i.id).filter(Boolean);
-    const scopedAgentIds = [
+    const scopedSlugs = [
       ...new Set(
         scopedIdentityRows.map((i) => i.agent_id).filter((id): id is string => Boolean(id))
       ),
     ];
 
-    const identitiesByAgentId = new Map<string, { name: string; role: string | null }>();
+    const identitiesBySlug = new Map<string, { name: string; role: string | null }>();
     for (const identity of scopedIdentityRows) {
-      identitiesByAgentId.set(identity.agent_id, {
+      identitiesBySlug.set(identity.agent_id, {
         name: identity.name,
         role: identity.role,
       });
@@ -4968,13 +5543,13 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     type SessionRow = NonNullable<typeof identityScopedSessions>[number];
     let legacySessions: SessionRow[] = [];
-    if (scopedAgentIds.length > 0) {
+    if (scopedSlugs.length > 0) {
       let legacyQuery = supabase
         .from('sessions')
         .select('*')
         .eq('user_id', authReq.pcpUserId)
         .is('sb_id', null)
-        .in('agent_id', scopedAgentIds)
+        .in('agent_id', scopedSlugs)
         .order('updated_at', { ascending: false })
         .limit(200);
 
@@ -5191,18 +5766,20 @@ router.get('/sessions', async (req: Request, res: Response) => {
     res.json({
       stats,
       sessions: sessionRows.map((s) => {
-        const identity = s.agent_id ? identitiesByAgentId.get(s.agent_id) : null;
+        const identity = s.agent_id ? identitiesBySlug.get(s.agent_id) : null;
         const studio =
           studiosById.get(s.studio_id || '') || workspacesBySessionId.get(s.id) || null;
         return {
           id: s.id,
           backendSessionId: s.backend_session_id || s.claude_session_id || null,
-          agentId: s.agent_id,
+          sbSlug: s.agent_id,
           agentName: identity?.name || s.agent_id || 'Unknown',
           agentRole: identity?.role || null,
           lifecycle: s.lifecycle || 'idle',
           status: s.status,
           currentPhase: s.current_phase,
+          threadKey: s.thread_key || null,
+          activeThreadKey: s.active_thread_key || null,
           summary: s.summary,
           context: s.context,
           backend: s.backend,
@@ -5225,6 +5802,53 @@ router.get('/sessions', async (req: Request, res: Response) => {
     res.status(500).json(errorJson('Failed to list sessions', error));
   }
 });
+
+/**
+ * Shape a raw `studios.lease` jsonb value for the dashboard.
+ *
+ * Returns null for an unoccupied studio so the client can branch on presence
+ * alone. `stale` is derived here rather than in the browser because staleness
+ * is measured against LEASE_STALE_MS, and a client clock that disagrees with
+ * the server's would render a healthy lease as reclaimable — the one piece of
+ * this payload where being wrong invites someone to take a studio out from
+ * under a working agent.
+ *
+ * Note that `stale` means "eligible for reclaim", not "dead": the lease
+ * service still vetoes reclaim on live-process signals. The canvas should
+ * present it as a question, not a verdict.
+ */
+function describeLease(raw: unknown): {
+  sessionId: string;
+  threadKey: string;
+  sbSlug: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  reason?: string;
+  quarantined: boolean;
+  claimKind: string | null;
+  pendingRelease: { reason: string; requestedAt: string } | null;
+  stale: boolean;
+  heartbeatAgeMs: number | null;
+} | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const lease = raw as StudioLease;
+  if (!lease.sessionId) return null;
+
+  const heartbeatMs = Date.parse(lease.heartbeatAt ?? '');
+  return {
+    sessionId: lease.sessionId,
+    threadKey: lease.threadKey,
+    sbSlug: lease.sbSlug,
+    acquiredAt: lease.acquiredAt,
+    heartbeatAt: lease.heartbeatAt,
+    ...(lease.reason ? { reason: lease.reason } : {}),
+    quarantined: lease.quarantined === true,
+    claimKind: lease.claimKind ?? null,
+    pendingRelease: lease.pendingRelease ?? null,
+    stale: isLeaseStale(lease),
+    heartbeatAgeMs: Number.isFinite(heartbeatMs) ? Date.now() - heartbeatMs : null,
+  };
+}
 
 /**
  * GET /api/admin/studios
@@ -5260,13 +5884,18 @@ router.get('/studios', async (req: Request, res: Response) => {
       status: string;
       updated_at: string | null;
       created_at: string | null;
+      lease: StudioLease | null;
+      ephemeral: boolean | null;
+      parent_studio_id: string | null;
+      expires_at: string | null;
+      default_project_id: string | null;
     }> | null = [];
 
     if (sbIds.length > 0) {
       const { data: scopedStudios } = await supabase
         .from('studios')
         .select(
-          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at'
+          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at, lease, ephemeral, parent_studio_id, expires_at, default_project_id'
         )
         .eq('user_id', authReq.pcpUserId)
         .in('sb_id', sbIds)
@@ -5277,7 +5906,7 @@ router.get('/studios', async (req: Request, res: Response) => {
     }
 
     // 3. Fetch latest active session per agent (for status/phase)
-    const agentIds = (identities || []).map((i) => i.agent_id).filter(Boolean);
+    const sbSlugs = (identities || []).map((i) => i.agent_id).filter(Boolean);
     const latestSessionByAgent = new Map<
       string,
       {
@@ -5289,12 +5918,12 @@ router.get('/studios', async (req: Request, res: Response) => {
       }
     >();
 
-    if (agentIds.length > 0) {
+    if (sbSlugs.length > 0) {
       const { data: sessions } = await supabase
         .from('sessions')
         .select('agent_id, lifecycle, current_phase, status, active_thread_key, updated_at')
         .eq('user_id', authReq.pcpUserId)
-        .in('agent_id', agentIds)
+        .in('agent_id', sbSlugs)
         .is('ended_at', null)
         .neq('lifecycle', 'failed')
         .order('updated_at', { ascending: false });
@@ -5326,7 +5955,7 @@ router.get('/studios', async (req: Request, res: Response) => {
       const latestSession = latestSessionByAgent.get(identity.agent_id);
 
       return {
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         agentName: identity.name,
         agentRole: identity.role,
         backend: identity.backend,
@@ -5351,6 +5980,14 @@ router.get('/studios', async (req: Request, res: Response) => {
           slug: s.slug,
           status: s.status,
           updatedAt: s.updated_at,
+          // Occupancy (spec:trigger-studio-routing Phase 5 → spec:studio-canvas
+          // MVP items 2 and 6). Without these the canvas can draw studios but
+          // cannot say whether anyone is in one, which is the whole question.
+          ephemeral: s.ephemeral ?? false,
+          parentStudioId: s.parent_studio_id,
+          expiresAt: s.expires_at,
+          defaultProjectId: s.default_project_id,
+          lease: describeLease(s.lease),
         })),
       };
     });
@@ -5459,7 +6096,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
       }
     }
 
-    const identityByAgentId = new Map(
+    const identityBySlug = new Map(
       scope.rows.map((row) => [row.agent_id, { name: row.name, role: row.role }])
     );
 
@@ -5469,7 +6106,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
         if (!session || !isSessionInWorkspace(session, scope)) return null;
 
         const format = inferTranscriptFormatFromPath(row.source_path);
-        const identity = session.agent_id ? identityByAgentId.get(session.agent_id) : null;
+        const identity = session.agent_id ? identityBySlug.get(session.agent_id) : null;
         return {
           archiveId: row.id,
           sessionId: row.session_id,
@@ -5482,7 +6119,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
           syncedAt: row.synced_at,
           session: {
             id: session.id,
-            agentId: session.agent_id,
+            sbSlug: session.agent_id,
             agentName: identity?.name || session.agent_id || 'Unknown',
             agentRole: identity?.role || null,
             backend: session.backend,
@@ -5585,6 +6222,167 @@ router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to export transcript:', error);
     res.status(500).json(errorJson('Failed to export transcript', error));
+  }
+});
+
+/**
+ * GET /api/admin/sessions/:id/conversation
+ * Returns raw transcript events for the conversation viewer.
+ * Tries synced transcript first, falls back to local.
+ */
+router.get('/sessions/:id/conversation', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.id;
+    const authReq = req as AdminAuthRequest;
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError || !scope || scope.sbIds.length === 0) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: session, error: sessionError } = await supabase
+      .from('sessions')
+      .select(
+        'id, sb_id, agent_id, backend, backend_session_id, lifecycle, current_phase, active_thread_key, started_at, updated_at, ended_at, studio_id'
+      )
+      .eq('id', sessionId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (sessionError || !session || !isSessionInWorkspace(session, scope)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const identity = scope.rows.find(
+      (row) => row.id === session.sb_id || row.agent_id === session.agent_id
+    );
+
+    const sessionInfo = {
+      id: session.id,
+      sbSlug: identity?.agent_id ?? session.agent_id ?? 'unknown',
+      agentName: identity?.name ?? session.agent_id ?? 'Unknown',
+      backend: session.backend,
+      backendSessionId: session.backend_session_id,
+      lifecycle: session.lifecycle,
+      currentPhase: session.current_phase,
+      activeThreadKey: session.active_thread_key ?? null,
+      startedAt: session.started_at,
+      updatedAt: session.updated_at,
+      endedAt: session.ended_at,
+    };
+
+    const backend = session.backend ?? 'claude-code';
+
+    const { data: archive } = await supabase
+      .from('session_transcript_archives')
+      .select('payload')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('session_id', sessionId)
+      .order('synced_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (archive?.payload && typeof archive.payload === 'object') {
+      const payload = archive.payload as Record<string, unknown>;
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      res.json({
+        session: sessionInfo,
+        source: 'synced',
+        backend,
+        transcript: { events },
+        totalEvents: events.length,
+      });
+      return;
+    }
+
+    const localItems = await tryReadLocalTranscript({
+      sessionId: session.id,
+      backendSessionId: session.backend_session_id,
+      backend: session.backend,
+    });
+
+    if (localItems.length > 0) {
+      const descriptor = await resolveLocalTranscriptDescriptor({
+        sessionId: session.id,
+        backend: session.backend,
+        backendSessionId: session.backend_session_id,
+      });
+
+      if (descriptor) {
+        const parsed = await readTranscriptFromDescriptor(descriptor);
+        if (parsed) {
+          res.json({
+            session: sessionInfo,
+            source: 'local',
+            backend,
+            transcript: { events: parsed.events },
+            totalEvents: parsed.events.length,
+          });
+          return;
+        }
+      }
+    }
+
+    // For ink backend: query activity_stream for conversation messages
+    if (backend === 'ink') {
+      const { data: activities, error: actError } = await supabase
+        .from('activity_stream')
+        .select('id, type, direction, content, agent_id, platform, created_at, payload')
+        .eq('user_id', authReq.pcpUserId)
+        .eq('session_id', sessionId)
+        .in('type', [
+          'message_in',
+          'message_out',
+          'message',
+          'agent_spawn',
+          'agent_complete',
+          'error',
+        ])
+        .order('created_at', { ascending: true })
+        .limit(500);
+
+      if (!actError && activities && activities.length > 0) {
+        const events = activities.map((a) => ({
+          type: a.type,
+          direction: a.direction,
+          content: a.content,
+          sbSlug: a.agent_id,
+          platform: a.platform,
+          timestamp: a.created_at,
+          payload: a.payload,
+        }));
+        res.json({
+          session: sessionInfo,
+          source: 'cloud',
+          backend,
+          transcript: { events },
+          totalEvents: events.length,
+        });
+        return;
+      }
+    }
+
+    res.json({
+      session: sessionInfo,
+      source: 'none',
+      backend,
+      transcript: null,
+      totalEvents: 0,
+    });
+  } catch (error) {
+    logger.error('Failed to load conversation:', error);
+    res.status(500).json(errorJson('Failed to load conversation', error));
   }
 });
 
@@ -5751,10 +6549,10 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     }
 
     const scopedIdentityIds = (scopedIdentities || []).map((i) => i.id);
-    const scopedAgentIds = new Set(
+    const scopedSlugs = new Set(
       (scopedIdentities || [])
         .map((i) => i.agent_id)
-        .filter((agentId): agentId is string => Boolean(agentId))
+        .filter((sbSlug): sbSlug is string => Boolean(sbSlug))
     );
 
     if (scopedIdentityIds.length === 0) {
@@ -5779,7 +6577,7 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     const sessionInWorkspace =
       session &&
       ((session.sb_id && scopedIdentityIds.includes(session.sb_id)) ||
-        (!session.sb_id && session.agent_id && scopedAgentIds.has(session.agent_id)));
+        (!session.sb_id && session.agent_id && scopedSlugs.has(session.agent_id)));
 
     if (sessionError || !session || !sessionInWorkspace) {
       res.status(404).json({ error: 'Session not found' });
@@ -5807,7 +6605,7 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     res.json({
       session: {
         id: session.id,
-        agentId: session.agent_id,
+        sbSlug: session.agent_id,
         status: session.status,
         currentPhase: session.current_phase,
         backend: session.backend,
@@ -6305,6 +7103,1017 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
 });
 
 // =============================================================================
+// Thread spines — browse everything by threadKey
+// =============================================================================
+
+/**
+ * GET /api/admin/threads
+ *
+ * One row per threadKey the system knows about, merged across all four
+ * carriers: inbox threads (the conversation), sessions (anchor + active
+ * focus), studios (affinity + live lease), and task groups (workflow
+ * instances). A key that only a session references — work begun, nothing
+ * announced — is a first-class row with `thread: null`, not an absence.
+ * Merge semantics live in services/thread-key/thread-spines.ts.
+ */
+router.get('/threads', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const userId = authReq.pcpUserId;
+
+    // Reported caps, same contract as /tasks and /task-groups: the response
+    // says what was dropped instead of silently truncating.
+    const THREADS_CAP = 500;
+    const SESSIONS_CAP = 500;
+    const GROUPS_CAP = 500;
+
+    const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
+      supabase
+        .from('inbox_threads')
+        .select(
+          'id, thread_key, key_project, key_type, key_id, title, status, created_by_agent_id, updated_at, closed_at',
+          { count: 'exact' }
+        )
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(THREADS_CAP),
+      supabase
+        .from('sessions')
+        .select(
+          'id, agent_id, lifecycle, status, current_phase, thread_key, active_thread_key, updated_at, studio_id',
+          { count: 'exact' }
+        )
+        .eq('user_id', userId)
+        .or('thread_key.not.is.null,active_thread_key.not.is.null')
+        .order('updated_at', { ascending: false })
+        .limit(SESSIONS_CAP),
+      supabase
+        .from('studios')
+        .select('id, slug, branch, agent_id, thread_key, lease, updated_at')
+        .eq('user_id', userId)
+        .neq('status', 'cleaned'),
+      supabase
+        .from('task_groups')
+        .select('id, title, status, thread_key, execution_model, execution_phase, updated_at', {
+          count: 'exact',
+        })
+        .eq('user_id', userId)
+        .not('thread_key', 'is', null)
+        .order('updated_at', { ascending: false })
+        .limit(GROUPS_CAP),
+    ]);
+
+    const failed = [threadsRes, sessionsRes, studiosRes, groupsRes].find((r) => r.error);
+    if (failed?.error) {
+      logger.error('Failed to list thread spines:', failed.error);
+      res.status(500).json(errorJson('Failed to list threads', failed.error));
+      return;
+    }
+
+    // Carrier rows mapped first — their keys drive thread hydration below.
+    const sessionRows = (sessionsRes.data || []).map((s) => ({
+      id: s.id,
+      sbSlug: s.agent_id ?? null,
+      lifecycle: s.lifecycle ?? null,
+      status: s.status ?? null,
+      currentPhase: s.current_phase ?? null,
+      threadKey: s.thread_key ?? null,
+      activeThreadKey: s.active_thread_key ?? null,
+      updatedAt: s.updated_at,
+      studioId: s.studio_id ?? null,
+    }));
+    const studioRows = (studiosRes.data || []).map((st) => {
+      const lease = describeLease(st.lease);
+      return {
+        id: st.id,
+        slug: st.slug ?? null,
+        branch: st.branch,
+        sbSlug: st.agent_id,
+        threadKey: st.thread_key ?? null,
+        leaseThreadKey: lease?.threadKey ?? null,
+        leaseSlug: lease?.sbSlug ?? null,
+        updatedAt: st.updated_at,
+      };
+    });
+    const groupRows = (groupsRes.data || []).map((g) => ({
+      id: g.id,
+      title: g.title,
+      status: g.status ?? null,
+      threadKey: g.thread_key,
+      executionModel: g.execution_model ?? null,
+      executionPhase: g.execution_phase ?? null,
+      updatedAt: g.updated_at,
+    }));
+
+    const threadRows = [...(threadsRes.data || [])];
+
+    // Hydrate thread rows for carrier keys outside the newest-THREADS_CAP
+    // window. Without this, a session referencing an older real thread
+    // merges as thread: null and takes a provisional re-parse — fabricating
+    // "no thread yet" for a key whose identity is already pinned (Lumen,
+    // PR #543 review, P1). Chunked at 50 keys per .in(): 500 UUIDs in one
+    // .in() already exceeded the URL limit live.
+    const missing = missingThreadKeys(
+      threadRows.map((t) => t.thread_key),
+      sessionRows,
+      studioRows,
+      groupRows
+    );
+    for (let i = 0; i < missing.length; i += 50) {
+      const { data: extraRows, error: extraError } = await supabase
+        .from('inbox_threads')
+        .select(
+          'id, thread_key, key_project, key_type, key_id, title, status, created_by_agent_id, updated_at, closed_at'
+        )
+        .eq('user_id', userId)
+        .in('thread_key', missing.slice(i, i + 50));
+      if (extraError) {
+        logger.error('Failed to hydrate thread rows for carrier keys:', extraError);
+        res.status(500).json(errorJson('Failed to list threads', extraError));
+        return;
+      }
+      threadRows.push(...(extraRows || []));
+    }
+
+    // Participants for every thread of the user, filtered through the
+    // thread join rather than .in(threadIds) (500 UUIDs in a .in() is a
+    // ~20KB GET URL — rejected live with "URI too long"), and paginated
+    // past the PostgREST page ceiling: production already returns 992
+    // participant rows, one row-capped page away from silently dropping
+    // participants. The (thread_id, agent_id) PK gives a total order, so
+    // pages never skip or duplicate.
+    const participantsByThreadId = new Map<string, string[]>();
+    const PARTICIPANT_PAGE = 1000;
+    for (let from = 0; ; from += PARTICIPANT_PAGE) {
+      const { data: pageRows, error: participantsError } = await supabase
+        .from('inbox_thread_participants')
+        .select('thread_id, agent_id, inbox_threads!inner(user_id)')
+        .eq('inbox_threads.user_id', userId)
+        .order('thread_id', { ascending: true })
+        .order('agent_id', { ascending: true })
+        .range(from, from + PARTICIPANT_PAGE - 1);
+      if (participantsError) {
+        logger.error('Failed to list thread participants:', participantsError);
+        res.status(500).json(errorJson('Failed to list threads', participantsError));
+        return;
+      }
+      for (const row of pageRows || []) {
+        const list = participantsByThreadId.get(row.thread_id) ?? [];
+        list.push(row.agent_id);
+        participantsByThreadId.set(row.thread_id, list);
+      }
+      if (!pageRows || pageRows.length < PARTICIPANT_PAGE) break;
+    }
+
+    // Provisional identity for keys with no pinned thread row. Fail-closed
+    // per the grammar spec: an unreadable slug registry degrades to
+    // "identity unknown" for those keys, never to a wrong identity parsed
+    // against an empty slug set — and never fails the whole browse.
+    let parse: (key: string) => { project: string | null; type: string; id: string } | null;
+    let parseUnavailable = false;
+    try {
+      const slugLookup = await new ThreadKeyService(
+        supabase as SupabaseClient<Database>
+      ).projectSlugLookup(userId);
+      parse = (key) => parseThreadKey(key, slugLookup);
+    } catch (error) {
+      logger.warn('Thread spine slug lookup failed; provisional identities disabled:', error);
+      parse = () => null;
+      parseUnavailable = true;
+    }
+
+    const spines = mergeThreadSpines({
+      threads: threadRows.map((t) => ({
+        threadKey: t.thread_key,
+        keyProject: t.key_project ?? null,
+        keyType: t.key_type ?? null,
+        keyId: t.key_id ?? null,
+        title: t.title ?? null,
+        status: t.status,
+        createdBySlug: t.created_by_agent_id,
+        updatedAt: t.updated_at,
+        closedAt: t.closed_at ?? null,
+        participants: participantsByThreadId.get(t.id) ?? [],
+      })),
+      sessions: sessionRows,
+      studios: studioRows,
+      groups: groupRows,
+      parse,
+    });
+
+    const capMeta = (fetched: number, total: number | null, cap: number) => ({
+      fetched,
+      total: total ?? fetched,
+      truncated: (total ?? fetched) > cap,
+    });
+
+    res.json({
+      spines,
+      meta: {
+        threads: capMeta(threadRows.length, threadsRes.count, THREADS_CAP),
+        sessions: capMeta((sessionsRes.data || []).length, sessionsRes.count, SESSIONS_CAP),
+        taskGroups: capMeta((groupsRes.data || []).length, groupsRes.count, GROUPS_CAP),
+        parseUnavailable,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to list thread spines:', error);
+    res.status(500).json(errorJson('Failed to list threads', error));
+  }
+});
+
+/**
+ * Studio history for one threadKey, from the lease-event audit trail — the
+ * durable record of where the key's work physically happened. Ephemeral
+ * review studios are closed when a thread finishes, which removes them from
+ * the live studios feed; the events outlive the studio, so "which studio
+ * did Lumen review this in?" stays answerable after cleanup. Throws on
+ * query failure (callers' catch handles it).
+ */
+async function loadThreadStudioHistory(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  threadKey: string
+): Promise<
+  Array<{
+    studioId: string;
+    slug: string | null;
+    branch: string | null;
+    status: string;
+    agents: string[];
+    firstAt: string;
+    lastAt: string;
+    lastEvent: string;
+  }>
+> {
+  // Query-level filter mirrors aggregateStudioHistory's occupancy set —
+  // conflict/overflow rows would otherwise eat into the row cap without
+  // ever qualifying a studio (and `conflict` marks studios that REFUSED
+  // the thread; including them fabricated history — Lumen, PR #547 r1).
+  const { data: leaseEvents, error: leaseEventsError } = await supabase
+    .from('studio_lease_events')
+    .select('studio_id, agent_id, event, created_at')
+    .eq('user_id', userId)
+    .eq('thread_key', threadKey)
+    .in('event', ['acquired', 'released', 'expired', 'reclaimed'])
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (leaseEventsError) {
+    throw new Error(`Failed to load studio lease history: ${leaseEventsError.message}`);
+  }
+
+  const historyEntries = aggregateStudioHistory(
+    (leaseEvents || []).map((ev) => ({
+      studioId: ev.studio_id,
+      sbSlug: ev.agent_id ?? null,
+      event: ev.event,
+      createdAt: ev.created_at,
+    }))
+  );
+
+  const historyStudioIds = historyEntries.map((entry) => entry.studioId);
+  const studioMetaById = new Map<string, { slug: string | null; branch: string; status: string }>();
+  if (historyStudioIds.length > 0) {
+    // Includes cleaned studios deliberately — that is the whole point.
+    const { data: historyStudios, error: historyStudiosError } = await supabase
+      .from('studios')
+      .select('id, slug, branch, status')
+      .in('id', historyStudioIds);
+    if (historyStudiosError) {
+      throw new Error(`Failed to load studio metadata for history: ${historyStudiosError.message}`);
+    }
+    for (const st of historyStudios || []) {
+      studioMetaById.set(st.id, { slug: st.slug ?? null, branch: st.branch, status: st.status });
+    }
+  }
+
+  return historyEntries.map((entry) => {
+    const meta = studioMetaById.get(entry.studioId);
+    return {
+      studioId: entry.studioId,
+      slug: meta?.slug ?? null,
+      branch: meta?.branch ?? null,
+      status: meta?.status ?? 'deleted',
+      agents: entry.agents,
+      firstAt: entry.firstAt,
+      lastAt: entry.lastAt,
+      lastEvent: entry.lastEvent,
+    };
+  });
+}
+
+/**
+ * GET /api/admin/threads/messages?key=<threadKey>
+ *
+ * Conversation for one threadKey. The key rides a query param, not a path
+ * segment — keys contain colons and slashes. A key with no thread row is a
+ * valid answer ({ thread: null }), not a 404: the browse page shows those
+ * keys as "no thread yet". Studio history rides along in both cases — a
+ * key nobody ever messaged about can still have been worked somewhere.
+ */
+router.get('/threads/messages', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.query.key === 'string' ? req.query.key : '';
+    if (!key) {
+      res.status(400).json({ error: 'key query parameter is required' });
+      return;
+    }
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key, title, status, created_by_agent_id, created_at, closed_at')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread:', threadError);
+      res.status(500).json(errorJson('Failed to load thread messages', threadError));
+      return;
+    }
+    const studioHistory = await loadThreadStudioHistory(
+      supabase as SupabaseClient<Database>,
+      authReq.pcpUserId,
+      key
+    );
+
+    if (!thread) {
+      res.json({ thread: null, messages: [], studioHistory });
+      return;
+    }
+
+    // Newest MESSAGES_CAP fetched descending, served ascending for display.
+    // The cap is reported, not silent: production already holds a
+    // 669-message thread, and a viewer must know they are seeing a window.
+    const MESSAGES_CAP = 100;
+    const {
+      data: messageRows,
+      error: messagesError,
+      count: messagesCount,
+    } = await supabase
+      .from('inbox_thread_messages')
+      .select('id, sender_agent_id, content, message_type, priority, metadata, created_at', {
+        count: 'exact',
+      })
+      .eq('thread_id', thread.id)
+      .order('created_at', { ascending: false })
+      .limit(MESSAGES_CAP);
+    if (messagesError) {
+      logger.error('Failed to load thread messages:', messagesError);
+      res.status(500).json(errorJson('Failed to load thread messages', messagesError));
+      return;
+    }
+
+    const fetched = (messageRows || []).length;
+    const total = messagesCount ?? fetched;
+    res.json({
+      studioHistory,
+      thread: {
+        threadKey: thread.thread_key,
+        title: thread.title ?? null,
+        status: thread.status,
+        createdBySlug: thread.created_by_agent_id,
+        createdAt: thread.created_at,
+        closedAt: thread.closed_at ?? null,
+      },
+      messages: (messageRows || [])
+        .map((m) => ({
+          id: m.id,
+          senderSlug: m.sender_agent_id,
+          content: m.content,
+          messageType: m.message_type,
+          priority: m.priority,
+          // Human replies land with sender_agent_id 'unknown' (no agent in the
+          // request context); metadata.sentBy = 'user' is how clients tell a
+          // person's message from a genuinely unattributed one.
+          metadata: (m.metadata as Record<string, unknown> | null) ?? null,
+          createdAt: m.created_at,
+        }))
+        .reverse(),
+      meta: { fetched, total, truncated: total > MESSAGES_CAP },
+    });
+  } catch (error) {
+    logger.error('Failed to load thread messages:', error);
+    res.status(500).json(errorJson('Failed to load thread messages', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads
+ * Body: { key, recipients: string[], content, title?, priority?, studioSlug? }
+ *   → { success, created, messageId, threadId, threadKey }
+ *
+ * Start a thread from the dashboard or phone — or continue one that already
+ * exists under that key. This is the only admin route that CREATES threads;
+ * /threads/reply deliberately refuses to, because a reply that invents a
+ * thread hides typos. Here the recipients are explicit, so the intent is
+ * unambiguous: "open a conversation with these participants".
+ *
+ * The human is the sender (no senderSlug), the title becomes the thread's
+ * title on creation (send_to_inbox stores `subject` there), and every
+ * recipient is woken — a first message nobody is woken for is a thread
+ * nobody knows exists.
+ *
+ * `studioSlug` (single recipient only — the inbox handler's rule) pins the
+ * wake to one of the agent's studios by slug; "main" is their home studio.
+ * A DM keyed chat:<agent> has no route pattern anywhere, so without this the
+ * message is held rather than delivered.
+ */
+router.post('/threads', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
+    const studioSlug = typeof req.body?.studioSlug === 'string' ? req.body.studioSlug.trim() : '';
+    const recipients = Array.isArray(req.body?.recipients)
+      ? (req.body.recipients as unknown[])
+          .filter((r): r is string => typeof r === 'string')
+          .map((r) => r.trim().toLowerCase())
+          .filter((r) => r.length > 0)
+      : [];
+
+    // Grammar: type ":" id, both non-empty (project-prefixed keys have more
+    // segments; the parser sorts that out). Whitespace has no place in a key.
+    if (!/^[^\s:]+:[^\s]+$/.test(key)) {
+      res.status(400).json({ error: 'key must look like <type>:<identifier>, e.g. pr:545' });
+      return;
+    }
+    if (!content) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+    if (content.length > 64 * 1024) {
+      res.status(400).json({ error: 'content is too long (64KB max)' });
+      return;
+    }
+    const uniqueRecipients = [...new Set(recipients)];
+    if (uniqueRecipients.length === 0 || uniqueRecipients.length > 16) {
+      res.status(400).json({ error: 'recipients must name 1 to 16 agents' });
+      return;
+    }
+    if (priority && !['low', 'normal', 'high', 'urgent'].includes(priority)) {
+      res.status(400).json({ error: 'priority must be low, normal, high, or urgent' });
+      return;
+    }
+    if (studioSlug && (uniqueRecipients.length !== 1 || studioSlug.length > 100)) {
+      res.status(400).json({ error: 'studioSlug applies to a single recipient' });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const supabase = dataComposer.getClient();
+    const { data: existing } = await supabase
+      .from('inbox_threads')
+      .select('id')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+
+    const result = await handleSendToInbox(
+      {
+        userId: authReq.pcpUserId,
+        threadKey: key,
+        content,
+        // A studio-pinned send is the handler's single-recipient form; the
+        // group form (recipients[]) cannot carry a studio.
+        ...(studioSlug
+          ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
+          : { recipients: uniqueRecipients, triggerAll: true }),
+        ...(title ? { subject: title } : {}),
+        ...(priority ? { priority } : {}),
+        metadata: { sentBy: 'user', channel: 'admin-api' },
+      },
+      dataComposer
+    );
+
+    const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
+    const parsed = JSON.parse(text) as {
+      success?: boolean;
+      error?: string;
+      messageId?: string;
+      threadId?: string;
+      warning?: string;
+    };
+
+    if (parsed.messageId == null && parsed.success === false) {
+      // Nothing was stored: an unknown recipient, a refused key. That is the
+      // caller's mistake to fix, not a server fault.
+      res.status(400).json({ error: parsed.error || 'Could not start the thread' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      created: !existing,
+      messageId: parsed.messageId ?? null,
+      threadId: parsed.threadId ?? existing?.id ?? null,
+      threadKey: key,
+      warning: parsed.warning ?? null,
+    });
+  } catch (error) {
+    logger.error('Failed to start thread:', error);
+    res.status(500).json(errorJson('Failed to start thread', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reply
+ * Body: { key, content, priority? } → { success, messageId, threadId, triggered }
+ *
+ * A human reply into an existing thread — the dashboard and mobile analogue of
+ * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
+ * dispatch, session routing, and thread bookkeeping stay one code path. The
+ * admin request context carries no sbSlug, so the handler classifies the
+ * sender as non-agent ('unknown'); metadata.sentBy = 'user' carries the real
+ * attribution for display.
+ *
+ * Existing threads only: a reply is "into the conversation I'm following".
+ * Creating threads needs recipient selection, which is a different screen and
+ * a different endpoint when it's wanted.
+ *
+ * A closed thread takes a reply like an open one. Closed is a work-state
+ * signal, not a lock (spec inkmail-thread-scope §2): the reply is stored and
+ * wakes the participants; the thread stays closed.
+ */
+router.post('/threads/reply', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
+    const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
+    if (!key) {
+      res.status(400).json({ error: 'key is required' });
+      return;
+    }
+    if (!content.trim()) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+    if (content.length > 64 * 1024) {
+      res.status(400).json({ error: 'content exceeds 64KB' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread for reply:', threadError);
+      res.status(500).json(errorJson('Failed to send reply', threadError));
+      return;
+    }
+    if (!thread) {
+      res.status(404).json({ error: `No thread with key "${key}"` });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const participants = await getParticipants(dataComposer.getClient(), thread.id);
+    if (participants.length === 0) {
+      // A thread without participants has nobody to wake; refuse loudly
+      // rather than storing a message no agent will ever see.
+      res.status(409).json({ error: 'Thread has no participants to notify' });
+      return;
+    }
+
+    const result = await handleSendToInbox(
+      {
+        userId: authReq.pcpUserId,
+        threadKey: key,
+        content,
+        recipients: participants,
+        // Human reply: wake everyone who is part of the conversation.
+        triggerAll: true,
+        ...(priority ? { priority } : {}),
+        metadata: { sentBy: 'user', channel: 'admin-api' },
+      },
+      dataComposer
+    );
+
+    const parsed = JSON.parse((result.content[0] as { text: string }).text) as Record<
+      string,
+      unknown
+    >;
+    if (parsed.messageId == null) {
+      // Nothing stored — the handler refused (unknown participant, refused
+      // key). A 2xx here would let the client clear a draft that never
+      // landed.
+      const reason = typeof parsed.error === 'string' ? parsed.error : 'Reply was not stored';
+      res.status(400).json({ error: reason });
+      return;
+    }
+
+    res.json({
+      // The handler folds trigger-routing outcomes into its own `success`,
+      // and it can come back false when the message stored but a wake
+      // bounced (observed: fresh user, both participants' triggers failed);
+      // this route's success means what the person asked: "is my reply in
+      // the thread" — the messageId is the proof.
+      success: true,
+      messageId: parsed.messageId,
+      threadId: parsed.threadId ?? thread.id,
+      triggered: parsed.triggered ?? null,
+      warning: parsed.warning ?? null,
+    });
+  } catch (error) {
+    logger.error('Failed to send thread reply:', error);
+    res.status(500).json(errorJson('Failed to send reply', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reopen
+ * Body: { key } → { success, threadKey, reopened, alreadyOpen }
+ *
+ * The owner's recovery path (spec inkmail-thread-scope §2, §6): a participant
+ * reopens through reopen_thread; the workspace owner or admin recovers any
+ * thread. Until the workspace cutover a thread's owner is its user_id, so
+ * that is the scope check here. Idempotent from the caller's side: an
+ * already-open thread answers 200 with reopened: false — the state the person
+ * asked for holds either way.
+ *
+ * Reopening wakes nobody. It says the work is back on; a reply is how the
+ * participants hear about it. A reply never reopens (see /threads/reply).
+ */
+router.post('/threads/reopen', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    if (!key) {
+      res.status(400).json({ error: 'key is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key, status')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread for reopen:', threadError);
+      res.status(500).json(errorJson('Failed to reopen thread', threadError));
+      return;
+    }
+    if (!thread) {
+      res.status(404).json({ error: `No thread with key "${key}"` });
+      return;
+    }
+    if (thread.status !== 'closed') {
+      res.json({ success: true, threadKey: key, reopened: false, alreadyOpen: true });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const { reopened } = await reopenThreadRow(dataComposer.getClient(), thread.id, {
+      kind: 'user',
+    });
+    res.json({ success: true, threadKey: key, reopened, alreadyOpen: !reopened });
+  } catch (error) {
+    logger.error('Failed to reopen thread:', error);
+    res.status(500).json(errorJson('Failed to reopen thread', error));
+  }
+});
+
+/**
+ * GET /api/admin/threads/graph-evidence?key=<threadKey>
+ *
+ * The evidence trail for a threadKey's workflow graphs, straight from the
+ * gate-event ledger: every group on the key, its nodes, and each node's
+ * events grouped by attempt with evidence classified into display fields
+ * (SHAs, links, chips, inline media). Evidence JSONB is free-form by
+ * design — requirements are a checklist, not a bouncer — so the shaping is
+ * heuristic and shape-tolerant (services/thread-key/graph-evidence.ts).
+ * No groups is a valid answer ({ groups: [] }), not a 404.
+ */
+router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.query.key === 'string' ? req.query.key : '';
+    if (!key) {
+      res.status(400).json({ error: 'key query parameter is required' });
+      return;
+    }
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const userId = authReq.pcpUserId;
+
+    // All statuses deliberately: a merged PR's group is 'completed' and its
+    // evidence trail is exactly what the viewer exists to show. GRAPH
+    // groups only — ordinary linear groups default execution_model and
+    // would render whole task lists as "Evidence" while eating the cap
+    // ahead of the real graph (Lumen, PR #551 r1). Newest first so the
+    // current run survives the cap; reversed below for oldest-first
+    // display within the window.
+    const GROUPS_CAP = 10;
+    const {
+      data: cappedGroupRows,
+      error: groupsError,
+      count: groupsCount,
+    } = await supabase
+      .from('task_groups')
+      .select('id, title, status, execution_model, execution_phase, created_at', {
+        count: 'exact',
+      })
+      .eq('user_id', userId)
+      .eq('thread_key', key)
+      .eq('execution_model', 'graph')
+      .order('created_at', { ascending: false })
+      .limit(GROUPS_CAP);
+    if (groupsError) {
+      logger.error('Failed to load task groups for thread evidence:', groupsError);
+      res.status(500).json(errorJson('Failed to load graph evidence', groupsError));
+      return;
+    }
+    const groupRows = [...(cappedGroupRows ?? [])].reverse();
+    if (!groupRows || groupRows.length === 0) {
+      res.json({
+        groups: [],
+        meta: { groups: { fetched: 0, total: groupsCount ?? 0, truncated: false } },
+      });
+      return;
+    }
+
+    const groupIds = groupRows.map((group) => group.id);
+    const { data: taskRows, error: tasksError } = await supabase
+      .from('tasks')
+      .select(
+        'id, task_group_id, title, node_slug, task_type, status, outcome, gate_state, gate_attempt, assignee_identity_id, assignee_user_id, created_at'
+      )
+      .eq('user_id', userId)
+      .in('task_group_id', groupIds)
+      .order('created_at', { ascending: true });
+    if (tasksError) {
+      logger.error('Failed to load graph nodes for thread evidence:', tasksError);
+      res.status(500).json(errorJson('Failed to load graph evidence', tasksError));
+      return;
+    }
+    const nodes = taskRows ?? [];
+
+    // Ledger rows for every node, oldest first. Capped and reported — a
+    // pathological group cannot flood the response silently.
+    const EVENTS_CAP = 500;
+    let eventRows: Array<{
+      task_id: string;
+      event: string;
+      attempt: number;
+      gate_version: number;
+      session_id: string | null;
+      actor_identity_id: string | null;
+      actor_user_id: string | null;
+      evidence: unknown;
+      reason: string | null;
+      created_at: string;
+    }> = [];
+    let eventsTotal = 0;
+    if (nodes.length > 0) {
+      const {
+        data: ledgerRows,
+        error: eventsError,
+        count: eventsCount,
+      } = await supabase
+        .from('task_gate_events')
+        .select(
+          'task_id, event, attempt, gate_version, session_id, actor_identity_id, actor_user_id, evidence, reason, created_at',
+          { count: 'exact' }
+        )
+        .eq('user_id', userId)
+        .in(
+          'task_id',
+          nodes.map((node) => node.id)
+        )
+        .order('created_at', { ascending: true })
+        .limit(EVENTS_CAP);
+      if (eventsError) {
+        logger.error('Failed to load gate events for thread evidence:', eventsError);
+        res.status(500).json(errorJson('Failed to load graph evidence', eventsError));
+        return;
+      }
+      eventRows = ledgerRows ?? [];
+      eventsTotal = eventsCount ?? eventRows.length;
+    }
+
+    // Resolve identity UUIDs and claim sessions to agent slugs so the
+    // viewer names people, not UUIDs. Claim lifecycle rows carry only a
+    // session id — the session's agent is the acting agent.
+    const identityIds = new Set<string>();
+    for (const node of nodes) {
+      if (node.assignee_identity_id) identityIds.add(node.assignee_identity_id);
+    }
+    for (const eventRow of eventRows) {
+      if (eventRow.actor_identity_id) identityIds.add(eventRow.actor_identity_id);
+    }
+    const slugByIdentityId = new Map<string, string>();
+    if (identityIds.size > 0) {
+      const { data: identityRows, error: identitiesError } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id')
+        .in('id', [...identityIds]);
+      if (identitiesError) {
+        logger.error('Failed to resolve identities for thread evidence:', identitiesError);
+        res.status(500).json(errorJson('Failed to load graph evidence', identitiesError));
+        return;
+      }
+      for (const identity of identityRows ?? []) {
+        slugByIdentityId.set(identity.id, identity.agent_id);
+      }
+    }
+    const sessionIds = [
+      ...new Set(
+        eventRows.map((eventRow) => eventRow.session_id).filter((id): id is string => !!id)
+      ),
+    ];
+    const agentBySessionId = new Map<string, string>();
+    for (let chunkStart = 0; chunkStart < sessionIds.length; chunkStart += 50) {
+      const { data: sessionRows, error: sessionsError } = await supabase
+        .from('sessions')
+        .select('id, agent_id')
+        .in('id', sessionIds.slice(chunkStart, chunkStart + 50));
+      if (sessionsError) {
+        logger.error('Failed to resolve sessions for thread evidence:', sessionsError);
+        res.status(500).json(errorJson('Failed to load graph evidence', sessionsError));
+        return;
+      }
+      for (const sessionRow of sessionRows ?? []) {
+        if (sessionRow.agent_id) agentBySessionId.set(sessionRow.id, sessionRow.agent_id);
+      }
+    }
+
+    const eventsByTaskId = new Map<string, GateEventInput[]>();
+    for (const eventRow of eventRows) {
+      const shaped: GateEventInput = {
+        event: eventRow.event,
+        attempt: eventRow.attempt,
+        gateVersion: eventRow.gate_version,
+        sessionId: eventRow.session_id,
+        actorAgentSlug:
+          (eventRow.actor_identity_id && slugByIdentityId.get(eventRow.actor_identity_id)) ||
+          (eventRow.session_id && agentBySessionId.get(eventRow.session_id)) ||
+          null,
+        actorIsUser: !!eventRow.actor_user_id,
+        evidence: eventRow.evidence,
+        reason: eventRow.reason,
+        createdAt: eventRow.created_at,
+      };
+      const list = eventsByTaskId.get(eventRow.task_id) ?? [];
+      list.push(shaped);
+      eventsByTaskId.set(eventRow.task_id, list);
+    }
+
+    res.json({
+      groups: groupRows.map((group) => ({
+        id: group.id,
+        title: group.title,
+        status: group.status,
+        executionModel: group.execution_model,
+        executionPhase: group.execution_phase,
+        nodes: nodes
+          .filter((node) => node.task_group_id === group.id)
+          .map((node) => ({
+            id: node.id,
+            title: node.title,
+            nodeSlug: node.node_slug,
+            taskType: node.task_type,
+            status: node.status,
+            outcome: node.outcome,
+            gateState: node.gate_state,
+            gateAttempt: node.gate_attempt,
+            assigneeAgentSlug:
+              (node.assignee_identity_id && slugByIdentityId.get(node.assignee_identity_id)) ||
+              null,
+            assigneeIsUser: !!node.assignee_user_id,
+            attempts: groupNodeEvents(eventsByTaskId.get(node.id) ?? []),
+          })),
+      })),
+      meta: {
+        groups: {
+          fetched: groupRows.length,
+          total: groupsCount ?? groupRows.length,
+          truncated: (groupsCount ?? groupRows.length) > GROUPS_CAP,
+        },
+        events: {
+          fetched: eventRows.length,
+          total: eventsTotal,
+          truncated: eventsTotal > EVENTS_CAP,
+        },
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to load graph evidence:', error);
+    res.status(500).json(errorJson('Failed to load graph evidence', error));
+  }
+});
+
+/**
+ * The monorepo root, found by walking up to the directory holding
+ * yarn.lock. The server's cwd is packages/api under yarn workspaces, so
+ * cwd-relative "docs/screenshots" would miss the real repo root (caught
+ * live on the preview server). Resolved lazily on the first media request
+ * and memoized — no filesystem work at module load, fully async.
+ */
+async function findWorkspaceRoot(startDirectory: string): Promise<string> {
+  let currentDirectory = startDirectory;
+  for (let depth = 0; depth < 10; depth += 1) {
+    try {
+      await fs.access(path.join(currentDirectory, 'yarn.lock'));
+      return currentDirectory;
+    } catch {
+      // keep walking up
+    }
+    const parentDirectory = path.dirname(currentDirectory);
+    if (parentDirectory === currentDirectory) break;
+    currentDirectory = parentDirectory;
+  }
+  return startDirectory;
+}
+
+let workspaceRootPromise: Promise<string> | null = null;
+function getWorkspaceRoot(): Promise<string> {
+  if (!workspaceRootPromise) workspaceRootPromise = findWorkspaceRoot(process.cwd());
+  return workspaceRootPromise;
+}
+
+/**
+ * Roots the evidence media endpoint may serve from: the shared agent media
+ * directory and the repo's committed review screenshots. Everything else —
+ * including anything a crafted evidence row points at — resolves to null
+ * and 404s without confirming existence.
+ */
+async function evidenceMediaRoots(): Promise<string[]> {
+  const workspaceRoot = await getWorkspaceRoot();
+  return [
+    path.join(os.homedir(), '.ink', 'files'),
+    path.join(workspaceRoot, 'docs', 'screenshots'),
+  ];
+}
+
+/**
+ * GET /api/admin/media?path=<evidence path>
+ *
+ * Streams a media file referenced by evidence (~, absolute, or
+ * repo-relative), allowlist-contained twice: lexically before touching the
+ * filesystem, then again on the realpath so a symlink inside a root cannot
+ * reach outside it. Extension gates the content type; sendFile streams.
+ */
+router.get('/media', async (req: Request, res: Response) => {
+  try {
+    const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
+    // Root containment plus a canonical-target media type; the response
+    // streams from the opened handle with that exact type and `nosniff`,
+    // so a name ending .png that resolves to HTML is never served as HTML
+    // into this origin. See media-path.ts for the threat model — the
+    // untrusted input is the PATH (SBs write it into evidence), not the
+    // caller, and local-actor races are deliberately out of scope.
+    const media = await openVerifiedMedia(
+      requestedPath,
+      await evidenceMediaRoots(),
+      os.homedir(),
+      await getWorkspaceRoot()
+    );
+    if (!media) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    res.status(200);
+    res.setHeader('Content-Type', media.contentType);
+    res.setHeader('Content-Length', String(media.size));
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const mediaStream = media.handle.createReadStream(); // closes the handle on end/destroy
+    mediaStream.on('error', (streamError) => {
+      logger.error('Evidence media stream failed:', streamError);
+      res.destroy();
+    });
+    res.on('close', () => mediaStream.destroy());
+    mediaStream.pipe(res);
+  } catch (error) {
+    logger.error('Failed to serve evidence media:', error);
+    res.status(500).json(errorJson('Failed to serve media', error));
+  }
+});
+
+// =============================================================================
 // Tasks
 // =============================================================================
 
@@ -6321,7 +8130,7 @@ router.get('/tasks', async (req: Request, res: Response) => {
 
     let query = supabase
       .from('tasks')
-      .select('*, projects(name), task_groups(title)')
+      .select('*, projects(name), task_groups(title)', { count: 'exact' })
       .eq('user_id', authReq.pcpUserId);
 
     // Optional filters
@@ -6339,14 +8148,54 @@ router.get('/tasks', async (req: Request, res: Response) => {
       query = query.in('status', ['pending', 'in_progress', 'blocked']);
     }
 
-    const { data, error } = await query.limit(200);
+    // Order before capping: the old unordered .limit(200) silently dropped an
+    // arbitrary third of the active set — whole task groups simply never
+    // appeared on the map, newest work included. The exact count rides along
+    // so truncation is REPORTED, never silent: beyond the cap, an omitted
+    // active blocker would otherwise read as satisfied downstream.
+    const TASKS_CAP = 1000;
+    const {
+      data,
+      error,
+      count: totalMatched,
+    } = await query.order('created_at', { ascending: false }).limit(TASKS_CAP);
 
     if (error) {
       res.status(500).json(errorJson('Failed to list tasks', error));
       return;
     }
+    const fetchedCount = (data || []).length;
+    const meta = {
+      fetched: fetchedCount,
+      total: totalMatched ?? fetchedCount,
+      truncated: (totalMatched ?? fetchedCount) > fetchedCount,
+    };
 
-    const tasks = data || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, data || []);
+
+    // activeOnly hides terminal tasks, but an ARCHIVED predecessor is
+    // unsatisfiable — downstream can never run, and treating it as
+    // satisfied-because-absent would render blocked work as ready (Lumen,
+    // PR #524 round 1). Pull in exactly the archived blockers of the
+    // fetched set so the map can mark them.
+    if (activeOnly === 'true' && tasks.length > 0) {
+      const present = new Set(tasks.map((t) => t.id));
+      const missingBlockers = [
+        ...new Set(tasks.flatMap((t) => t.blocked_by ?? []).filter((depId) => !present.has(depId))),
+      ];
+      if (missingBlockers.length > 0) {
+        const { data: archivedDeps, error: archivedError } = await supabase
+          .from('tasks')
+          .select('*, projects(name), task_groups(title)')
+          .eq('user_id', authReq.pcpUserId)
+          .eq('status', 'archived')
+          .in('id', missingBlockers);
+        if (!archivedError && archivedDeps && archivedDeps.length > 0) {
+          tasks.push(...(await applyGraphBlockedBy(supabase, archivedDeps)));
+        }
+      }
+    }
 
     // Sort: status priority (in_progress, pending, blocked, completed),
     // then by priority (critical, high, medium, low), then by created_at desc
@@ -6392,6 +8241,10 @@ router.get('/tasks', async (req: Request, res: Response) => {
         projectName: (t.projects as { name: string } | null)?.name ?? null,
         taskGroupId: t.task_group_id,
         taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        // Ordering within a group. The dashboard has always typed this field
+        // and the endpoint has never sent it, so every consumer sorting by it
+        // was sorting by undefined — a stable no-op that looked like order.
+        taskOrder: t.task_order ?? null,
         blockedBy: t.blocked_by,
         createdBy: t.created_by,
         completedAt: t.completed_at,
@@ -6399,12 +8252,68 @@ router.get('/tasks', async (req: Request, res: Response) => {
         metadata: t.metadata,
         createdAt: t.created_at,
         updatedAt: t.updated_at,
+        // Workflow graph execution state (spec v10 steps 2-3) — lets the
+        // map render gates, claims, and dwell windows distinctly.
+        taskType: t.task_type ?? 'work',
+        outcome: t.outcome ?? null,
+        gateState: t.gate_state ?? null,
+        gateAttempt: t.gate_attempt ?? null,
+        gateOpenedAt: t.gate_opened_at ?? null,
+        eligibleAt: t.eligible_at ?? null,
+        claimedBySessionId: t.claimed_by_session_id ?? null,
+        assigneeIdentityId: t.assignee_identity_id ?? null,
+        assigneeUserId: t.assignee_user_id ?? null,
       })),
       stats,
+      meta,
     });
   } catch (error) {
     logger.error('Failed to list tasks:', error);
     res.status(500).json(errorJson('Failed to list tasks', error));
+  }
+});
+
+/**
+ * GET /api/admin/activity
+ * Recent activity_stream events for the command center feed. Tool telemetry
+ * (tool_call/tool_result) is excluded — it is ~half the stream and narrates
+ * plumbing, not work the operator can act on.
+ */
+router.get('/activity', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+
+    const { data, error } = await supabase
+      .from('activity_stream')
+      .select('id, type, subtype, agent_id, content, status, created_at')
+      .eq('user_id', authReq.pcpUserId)
+      .not('type', 'in', '(tool_call,tool_result)')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to list activity', error));
+      return;
+    }
+
+    res.json({
+      events: (data || []).map((e) => ({
+        id: e.id,
+        type: e.type,
+        subtype: e.subtype,
+        sbSlug: e.agent_id,
+        content: e.content,
+        status: e.status,
+        createdAt: e.created_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list activity:', error);
+    res.status(500).json(errorJson('Failed to list activity', error));
   }
 });
 
@@ -6478,6 +8387,8 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    const [derivedTask] = await applyGraphBlockedBy(supabase, [data]);
+
     res.json({
       task: {
         id: data.id,
@@ -6490,7 +8401,7 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
         projectName: (data.projects as { name: string } | null)?.name ?? null,
         taskGroupId: data.task_group_id,
         taskGroupTitle: (data.task_groups as { title: string } | null)?.title ?? null,
-        blockedBy: data.blocked_by,
+        blockedBy: derivedTask.blocked_by,
         createdBy: data.created_by,
         completedAt: data.completed_at,
         dueDate: data.due_date,
@@ -6520,13 +8431,19 @@ router.get('/task-groups', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
 
-    // Fetch task groups with joined agent identity and project
-    const { data, error } = await supabase
+    // Fetch task groups with joined agent identity and project. Count rides
+    // along so a capped listing says so instead of silently thinning the map.
+    const GROUPS_CAP = 500;
+    const {
+      data,
+      error,
+      count: groupsMatched,
+    } = await supabase
       .from('task_groups')
-      .select('*, agent_identities(agent_id, name), projects(name)')
+      .select('*, agent_identities(agent_id, name), projects(name)', { count: 'exact' })
       .eq('user_id', authReq.pcpUserId)
       .order('created_at', { ascending: false })
-      .limit(200);
+      .limit(GROUPS_CAP);
 
     if (error) {
       res.status(500).json(errorJson('Failed to list task groups', error));
@@ -6574,8 +8491,7 @@ router.get('/task-groups', async (req: Request, res: Response) => {
         projectId: g.project_id,
         projectName: (g.projects as { name: string } | null)?.name ?? null,
         sbId: g.sb_id,
-        agentId:
-          (g.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
+        sbSlug: (g.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
         agentName: (g.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
         taskCount: taskCountMap[g.id] || 0,
         strategy: g.strategy ?? null,
@@ -6583,10 +8499,18 @@ router.get('/task-groups', async (req: Request, res: Response) => {
         strategyStartedAt: g.strategy_started_at ?? null,
         strategyPausedAt: g.strategy_paused_at ?? null,
         planUri: g.plan_uri ?? null,
+        executionModel: g.execution_model ?? 'linear',
+        executionPhase: g.execution_phase ?? 'idle',
+        graphVersion: g.graph_version ?? 0,
         metadata: g.metadata,
         createdAt: g.created_at,
         updatedAt: g.updated_at,
       })),
+      meta: {
+        fetched: groups.length,
+        total: groupsMatched ?? groups.length,
+        truncated: (groupsMatched ?? groups.length) > groups.length,
+      },
     });
   } catch (error) {
     logger.error('Failed to list task groups:', error);
@@ -6641,7 +8565,8 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const tasks = tasksData || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, tasksData || []);
 
     res.json({
       group: {
@@ -6662,7 +8587,7 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
         projectId: group.project_id,
         projectName: (group.projects as { name: string } | null)?.name ?? null,
         sbId: group.sb_id,
-        agentId:
+        sbSlug:
           (group.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
         agentName:
           (group.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
@@ -6749,7 +8674,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
         type: e.type,
         subtype: e.subtype,
         content: e.content,
-        agentId: e.agent_id,
+        sbSlug: e.agent_id,
         sessionId: e.session_id,
         platform: e.platform,
         payload: e.payload,
@@ -6837,13 +8762,13 @@ router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
           taskGroupId: comment.task_group_id,
           commentType: comment.comment_type,
           content: comment.content,
-          agentId: comment.agent_id,
+          sbSlug: comment.agent_id,
           metadata: comment.metadata,
           createdBySbId: comment.created_by_sb_id,
           createdByIdentity: identity
             ? {
                 id: identity.id,
-                agentId: identity.agent_id,
+                sbSlug: identity.agent_id,
                 name: identity.name,
                 backend: identity.backend,
               }
@@ -6923,7 +8848,7 @@ router.get('/tasks/:id/comments', async (req: Request, res: Response) => {
           taskId: c.task_id,
           parentCommentId: c.parent_comment_id,
           content: c.content,
-          authorAgentId: c.created_by_agent_id || identity?.agent_id || null,
+          authorSlug: c.created_by_agent_id || identity?.agent_id || null,
           authorName: identity?.name || c.created_by_agent_id || 'Unknown',
           metadata: c.metadata,
           createdAt: c.created_at,
@@ -6992,7 +8917,7 @@ router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
         taskId: comment.task_id,
         parentCommentId: comment.parent_comment_id,
         content: comment.content,
-        authorAgentId: null,
+        authorSlug: null,
         authorName: 'You',
         metadata: comment.metadata,
         createdAt: comment.created_at,
@@ -7104,6 +9029,31 @@ router.post('/contacts/resolve', async (req: Request, res: Response) => {
  * The server generates the request ID, sends to connected platforms, and returns
  * the ID for polling.
  */
+/**
+ * Accept a clone origin only in the shape we publish.
+ *
+ * The body is agent-supplied, so this keeps a malformed or oversized field from
+ * reaching storage and the notification formatter; anything unrecognised
+ * degrades to "the parent asked", which is the pre-clone behaviour.
+ */
+function normalizeApprovalOrigin(
+  raw: unknown
+): { origin: 'clone'; cloneId?: string; cloneLabel?: string } | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  if (value.origin !== 'clone') return null;
+  const str = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.trim() ? v.trim().slice(0, 120) : undefined;
+  const cloneId = str(value.cloneId);
+  const cloneLabel = str(value.cloneLabel);
+  if (!cloneId && !cloneLabel) return null;
+  return {
+    origin: 'clone',
+    ...(cloneId ? { cloneId } : {}),
+    ...(cloneLabel ? { cloneLabel } : {}),
+  };
+}
+
 router.post('/approval-requests', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -7111,7 +9061,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
 
-    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
+    const { tool, args, reason, studioId, sessionId, origin, timeoutSeconds = 300 } = req.body;
 
     if (!tool) {
       res.status(400).json({ error: 'tool is required' });
@@ -7119,20 +9069,30 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     }
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
+    const cloneOrigin = normalizeApprovalOrigin(origin);
 
     // Resolve requesting agent from x-ink-context header (set by CLI hooks).
     // This is the sole trusted identity channel — agents cannot set it themselves.
     const contextHeader = req.headers['x-ink-context'] as string | undefined;
-    let requestingAgentId = 'unknown';
+    let requestingSlug = 'unknown';
     if (contextHeader) {
       try {
         const decoded = JSON.parse(Buffer.from(contextHeader, 'base64url').toString());
-        requestingAgentId = decoded.agentId || 'unknown';
+        // Read BOTH keys. This route decodes the header itself, so the
+        // normalization inside decodeContextToken never reached it and a
+        // pre-rename CLI stored 'unknown'. That is not only lost attribution —
+        // approval-interceptor scopes approve-all by this stored field, so every
+        // legacy requester collapsed into one bucket (Lumen, PR #635).
+        //
+        // Normalized here rather than delegating to decodeContextToken, because
+        // that decoder also REQUIRES sessionId and this route never did;
+        // delegating would newly reject a slug-only token.
+        requestingSlug = decoded.sbSlug || decoded.agentId || 'unknown';
       } catch {
         // fall through
       }
     }
-    if (requestingAgentId === 'unknown') {
+    if (requestingSlug === 'unknown') {
       logger.warn('Approval request with unknown agent — missing x-ink-context header', {
         tool,
         studioId,
@@ -7153,10 +9113,19 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         user_id: authReq.pcpUserId,
         studio_id: studioIdForInsert,
         session_id: sessionIdForInsert,
-        requesting_agent_id: requestingAgentId,
+        requesting_agent_id: requestingSlug,
         tool,
         args: args || null,
         reason: reason || null,
+        // Which clone asked, when one did. A clone carries its parent's
+        // identity, so requesting_agent_id alone cannot tell them apart — and
+        // the audit trail is the one place that has to.
+        //
+        // Stored under `metadata` rather than a dedicated column: the column
+        // exists for exactly this kind of optional annotation, and a migration
+        // for a field that is absent on most rows buys nothing. Omitted
+        // entirely for parent requests, so existing rows read unchanged.
+        ...(cloneOrigin ? { metadata: { origin: cloneOrigin } } : {}),
         timeout_seconds: timeoutSeconds,
         expires_at: expiresAt,
       })
@@ -7179,7 +9148,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       requestId: data.id,
       tool,
       args,
-      requestingAgentId,
+      requestingSlug,
       studioId,
       expiresAt,
     });
@@ -7191,7 +9160,8 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       tool,
       args,
       reason: req.body.reason,
-      requestingAgentId,
+      requestingSlug,
+      origin: cloneOrigin,
       studioId,
       sessionId,
       expiresAt,
@@ -7282,6 +9252,7 @@ router.get('/approval-requests/:requestId/status', async (req: Request, res: Res
 // ─── Secrets (Keychain) ────────────────────────────────────────
 
 import { listCredentials, saveCredential, deleteCredential } from '../services/keychain.js';
+import { archivedMetadataSlug } from '../utils/archived-metadata';
 
 router.get('/secrets', async (_req: Request, res: Response) => {
   try {

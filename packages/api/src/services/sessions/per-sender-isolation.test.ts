@@ -60,6 +60,7 @@ function createMockSupabase(rows: Record<string, unknown>[] = []) {
     'update',
     'eq',
     'neq',
+    'not',
     'is',
     'or',
     'order',
@@ -293,7 +294,7 @@ describe('Per-Sender Session Isolation', () => {
 
       await repo.create({
         userId: 'user-1',
-        agentId: 'myra',
+        sbSlug: 'myra',
         contactId: 'contact-alice',
         backendSessionId: null,
         type: 'primary',
@@ -325,7 +326,7 @@ describe('Per-Sender Session Isolation', () => {
 
       await repo.create({
         userId: 'user-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         backendSessionId: null,
         type: 'primary',
         lifecycle: 'idle',

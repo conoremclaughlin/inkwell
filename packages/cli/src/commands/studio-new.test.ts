@@ -40,7 +40,7 @@ function initRepo(): string {
   return git('rev-parse --show-toplevel', TEST_REPO);
 }
 
-describe('Branch naming convention: agentId/studio/name', () => {
+describe('Branch naming convention: sbSlug/studio/name', () => {
   let realRepo: string;
 
   beforeEach(() => {
@@ -55,10 +55,10 @@ describe('Branch naming convention: agentId/studio/name', () => {
     }
   });
 
-  it('should use agentId/studio/name as default branch pattern', () => {
-    const agentId = 'wren';
+  it('should use sbSlug/studio/name as default branch pattern', () => {
+    const sbSlug = 'wren';
     const name = 'feature-auth';
-    const expectedBranch = `${agentId}/studio/${name}`;
+    const expectedBranch = `${sbSlug}/studio/${name}`;
 
     const wsPath = join(realDir(realRepo), `test-repo--${name}`);
     git(`worktree add -b "${expectedBranch}" "${wsPath}"`, realRepo);
@@ -83,9 +83,9 @@ describe('Branch naming convention: agentId/studio/name', () => {
   });
 
   it('should produce correct identity.json with new branch format', () => {
-    const agentId = 'benson';
+    const sbSlug = 'benson';
     const name = 'api-v2';
-    const branch = `${agentId}/studio/${name}`;
+    const branch = `${sbSlug}/studio/${name}`;
     const wsPath = join(realDir(realRepo), `test-repo--${name}`);
 
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
@@ -94,7 +94,7 @@ describe('Branch naming convention: agentId/studio/name', () => {
     mkdirSync(pcpDir, { recursive: true });
 
     const identity = {
-      agentId,
+      sbSlug,
       context: `studio-${name}`,
       description: `Studio: ${name}`,
       studio: name,
@@ -106,14 +106,14 @@ describe('Branch naming convention: agentId/studio/name', () => {
 
     const saved = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
     expect(saved.branch).toBe('benson/studio/api-v2');
-    expect(saved.agentId).toBe('benson');
+    expect(saved.sbSlug).toBe('benson');
     expect(saved.studio).toBe('api-v2');
   });
 
   it('should still read legacy identity.json with workspace field', () => {
-    const agentId = 'wren';
+    const sbSlug = 'wren';
     const name = 'legacy-ws';
-    const branch = `${agentId}/workspace/${name}`;
+    const branch = `${sbSlug}/workspace/${name}`;
     const wsPath = join(realDir(realRepo), `test-repo--${name}`);
 
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
@@ -123,7 +123,7 @@ describe('Branch naming convention: agentId/studio/name', () => {
 
     // Old format with workspace field
     const identity = {
-      agentId,
+      sbSlug,
       context: `workspace-${name}`,
       description: `Workspace: ${name}`,
       workspace: name,
@@ -271,7 +271,7 @@ describe('Config directory copying', () => {
     writeFileSync(
       join(srcPcp, 'identity.json'),
       JSON.stringify({
-        agentId: 'wren',
+        sbSlug: 'wren',
         studio: 'main',
         branch: 'main',
       })
@@ -285,7 +285,7 @@ describe('Config directory copying', () => {
     const wsPcp = join(wsPath, '.ink');
     mkdirSync(wsPcp, { recursive: true });
     const freshIdentity = {
-      agentId: 'wren',
+      sbSlug: 'wren',
       context: 'studio-fresh-id',
       studio: 'fresh-id',
       branch: 'wren/studio/fresh-id',
@@ -393,10 +393,10 @@ describe('Studio name defaults', () => {
     expect(resolved).toBe('feature-auth');
   });
 
-  it('should derive correct branch from agentId and name', () => {
-    const agentId = 'myra';
+  it('should derive correct branch from sbSlug and name', () => {
+    const sbSlug = 'myra';
     const name = 'monitoring';
-    const branch = `${agentId}/studio/${name}`;
+    const branch = `${sbSlug}/studio/${name}`;
     expect(branch).toBe('myra/studio/monitoring');
   });
 });

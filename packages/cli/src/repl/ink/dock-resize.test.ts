@@ -7,14 +7,15 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Individual dock sub-components must NOT register their own resize listeners.
- * The Dock wrapper owns the single resize listener that bumps a counter,
- * forcing React to re-render all children with the updated stdout.columns.
+ * ChatApp owns the SINGLE resize listener that bumps a counter — it needs the
+ * fresh width itself for the <Static> width pin, and the Dock re-renders as
+ * its child, so sub-components pick up the updated stdout.columns for free.
  *
  * Without this, Ink's resize handler recalculates Yoga layout but does NOT
  * trigger React reconciliation — text content (separator width) stays stale.
  */
 
-const DOCK_COMPONENTS = ['StatusBar.tsx', 'Separator.tsx', 'InfoBar.tsx'];
+const DOCK_COMPONENTS = ['Separator.tsx', 'InfoBar.tsx'];
 
 const ANTI_PATTERNS = [
   { pattern: /stdout\??\.\s*on\s*\(\s*['"]resize['"]/, label: 'manual resize listener' },
@@ -44,23 +45,28 @@ describe('dock components: no manual resize listeners', () => {
   }
 });
 
-describe('Dock: owns the single resize listener', () => {
+describe('Dock: no resize listener of its own (ChatApp owns it)', () => {
   const source = readFileSync(resolve(__dirname, 'Dock.tsx'), 'utf-8');
 
-  it('should have a resize listener', () => {
-    expect(source).toMatch(/stdout\??\.\s*on\s*\(\s*['"]resize['"]/);
-  });
-
-  it('should use setResizeCounter to trigger re-render', () => {
-    expect(source).toMatch(/setResizeCounter/);
+  it('should not have a resize listener', () => {
+    expect(source).not.toMatch(/stdout\??\.\s*on\s*\(\s*['"]resize['"]/);
   });
 });
 
-describe('ChatApp: uses Dock, no remountKey on Static', () => {
+describe('ChatApp: uses Dock, owns the single resize listener, no remountKey on Static', () => {
   const source = readFileSync(resolve(__dirname, 'ChatApp.tsx'), 'utf-8');
 
   it('should use the Dock component', () => {
     expect(source).toMatch(/<Dock\b/);
+  });
+
+  it('should have THE resize listener', () => {
+    expect(source).toMatch(/stdout\??\.\s*on\s*\(\s*['"]resize['"]/);
+    expect(source).toMatch(/setResizeCounter/);
+  });
+
+  it('should pin the <Static> width (the wrap-overflow fix)', () => {
+    expect(source).toMatch(/<Static[^>]*style=\{\{ width: staticWidth \}\}/);
   });
 
   it('should not use key={remountKey} on Static', () => {

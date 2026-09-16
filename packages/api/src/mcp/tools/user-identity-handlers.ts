@@ -7,7 +7,10 @@
 
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
+import type { Tables } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
+import { withWorkspaceFilter, pickWorkspaceScopedRow } from './workspace-scoped-row';
+import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 
 // User identification fields
@@ -15,7 +18,7 @@ import { resolveUserOrThrow } from '../../services/user-resolver';
 const userIdentifierFields = {
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -32,7 +35,7 @@ const userIdentifierFields = {
     .enum(['telegram', 'whatsapp', 'discord'])
     .optional()
     .describe('Platform name — only needed for platform-based user lookup'),
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
 };
 
 // =====================================================
@@ -75,11 +78,6 @@ export const restoreUserIdentitySchema = z.object({
 // =====================================================
 // HANDLERS
 // =====================================================
-
-function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
-  if (!workspaceId) return query;
-  return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
-}
 
 function resolveIdentityDocs(params: z.infer<typeof saveUserIdentitySchema>) {
   return {
@@ -156,12 +154,24 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
   const docs = resolveIdentityDocs(params);
 
   const supabase = dataComposer.getClient();
-  const workspaceId = params.workspaceId;
+  // Header/derived request scope is authoritative; the argument is a fallback.
+  const workspaceId = (
+    await resolveWorkspaceScopeForWrite({
+      rawArgs: (args ?? {}) as Record<string, unknown>,
+      explicitWorkspaceId: params.workspaceId,
+    })
+  )?.workspaceId;
 
   // Check if identity already exists
+  // Ambiguity-safe (see workspace-scoped-row): an unscoped twin must not make
+  // this lookup fail and turn an update into a duplicate insert.
   let existingQuery = supabase.from('user_identity').select('*').eq('user_id', user.id);
   existingQuery = withWorkspaceFilter(existingQuery, workspaceId);
-  const { data: existing } = await existingQuery.single();
+  const { data: existingRows, error: existingError } = await existingQuery;
+  if (existingError && existingError.code !== 'PGRST116') {
+    throw new Error(`Failed to read user identity: ${existingError.message}`);
+  }
+  const existing = pickWorkspaceScopedRow<Tables<'user_identity'>>(existingRows, 'user identity');
 
   let result;
   if (existing) {
@@ -196,7 +206,8 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
       .from('user_identity')
       .insert({
         user_id: user.id,
-        ...(workspaceId ? { workspace_id: workspaceId } : {}),
+        // Always explicit (Sep 10 incident — see agent_identities).
+        workspace_id: workspaceId ?? null,
         user_profile_md: docs.userProfile || null,
         shared_values_md: docs.sharedValues || null,
         process_md: docs.process || null,

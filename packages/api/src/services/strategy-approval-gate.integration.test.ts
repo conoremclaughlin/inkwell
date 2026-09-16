@@ -18,6 +18,7 @@ import dotenv from 'dotenv';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import { INTEGRATION_TEST_USER_ID } from '../test/integration-fixtures';
 
 // ============================================================================
 // Environment setup
@@ -37,13 +38,41 @@ if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9998';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
 
-const configPath = resolve(process.env.HOME || '', '.ink/config.json');
-const inkConfig = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
-const TEST_USER_ID: string | undefined = inkConfig.userId;
+// Canonical SYNTHETIC integration user (seeded by integration-setup.ts) —
+// never a developer's organic ~/.ink/config.json id. The organic id does not
+// exist on CI, which silently skipped this whole suite there (Lumen, PR #439
+// review), and organic user ids do not belong in test rows.
+const TEST_USER_ID: string | undefined = INTEGRATION_TEST_USER_ID;
 
 let TEST_SB_ID: string | undefined;
 
-const canRun = !!SUPABASE_URL && !!SUPABASE_KEY && !!TEST_USER_ID;
+// INTENTIONAL (Conor, 2026-08-12): this suite is token-free — server/DB
+// round-trips only, no LLM calls — so running it in CI is fine on cost
+// grounds; it is CI-deferred below purely for environment-hermeticity
+// reasons. LIVE suites (*.live.*, gated on INK_LIVE_TESTS=1) consume real
+// LLM tokens and are DELIBERATELY excluded from CI; that is a cost
+// decision, not an oversight — please don't "fix" it.
+// This suite was CI-deferred on 2026-08-12 as "assumes a developer
+// environment — resolvable repoRoot/worktrees". That diagnosis was wrong, and
+// the skip cost ten weeks of signal. startStrategy began requiring a
+// resolvable repoRoot on 2026-06-23 (02f2b58f); these fixtures never supplied
+// one, so the suite failed on Actions AND locally, identically, for the same
+// single reason. Skipping CI hid the breakage instead of working around it —
+// "it runs locally" was never true after June. One fixture field (see
+// FIXTURE_GROUP_METADATA) makes it hermetic, so it runs everywhere again.
+const canRun = !!SUPABASE_URL && !!SUPABASE_KEY;
+
+/**
+ * startStrategy refuses spawn mode without a resolvable repoRoot, and resolves
+ * it from group metadata → project.repo_root → request context (02f2b58f). A
+ * vitest process has no request context and these fixtures have no project, so
+ * metadata is the ONLY branch that can fire. Without it every test here dies in
+ * its first startStrategy call and the rest cascade.
+ *
+ * Pointing it at the real checkout keeps this hermetic: the path exists
+ * wherever the suite runs, CI included.
+ */
+const FIXTURE_GROUP_METADATA = { repoRoot: projectRoot };
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue(undefined),
@@ -74,6 +103,7 @@ async function createTestGroup(
     description: 'Integration test — safe to delete',
     priority: 'low',
     tags: ['__test'],
+    metadata: FIXTURE_GROUP_METADATA,
   });
 
   const taskIds: string[] = [];
@@ -279,6 +309,7 @@ describe.skipIf(!canRun)(
         description: 'Integration test — safe to delete',
         priority: 'low',
         tags: ['__test'],
+        metadata: FIXTURE_GROUP_METADATA,
       });
       groupId = group.id;
 
@@ -388,6 +419,7 @@ describe.skipIf(!canRun)('Strategy Both Gates on Final Task (integration)', () =
       description: 'Integration test — safe to delete',
       priority: 'low',
       tags: ['__test'],
+      metadata: FIXTURE_GROUP_METADATA,
     });
     groupId = group.id;
 

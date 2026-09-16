@@ -27,7 +27,7 @@ type ReadStatusRow = { last_read_at: string };
 type ThreadMessagesResult = {
   success: boolean;
   messageCount: number;
-  messages: Array<{ id: string; createdAt: string; senderAgentId: string; content: string }>;
+  messages: Array<{ id: string; createdAt: string; senderSlug: string; content: string }>;
 };
 
 async function parseResult(raw: {
@@ -83,8 +83,8 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
 
   async function createThreadWithMessages(
     threadKey: string,
-    senderAgentId: string,
-    agentId: string,
+    senderSlug: string,
+    sbSlug: string,
     messages: Array<{ sender: string; content: string }>,
     spacingMs = 25
   ): Promise<{ threadId: string; messageIds: string[] }> {
@@ -98,7 +98,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
       .insert({
         thread_key: threadKey,
         user_id: userId,
-        created_by_agent_id: senderAgentId,
+        created_by_agent_id: senderSlug,
         status: 'open',
       })
       .select('id')
@@ -108,8 +108,8 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
 
     // Participants — sender + receiver
     await raw.from('inbox_thread_participants').insert([
-      { thread_id: threadId, agent_id: senderAgentId },
-      { thread_id: threadId, agent_id: agentId },
+      { thread_id: threadId, agent_id: senderSlug },
+      { thread_id: threadId, agent_id: sbSlug },
     ]);
 
     // Insert messages serially so created_at is monotonic
@@ -133,7 +133,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     return { threadId, messageIds };
   }
 
-  async function readPointer(threadId: string, agentId: string): Promise<string | null> {
+  async function readPointer(threadId: string, sbSlug: string): Promise<string | null> {
     const supabase = dataComposer.getClient();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = supabase as any;
@@ -141,7 +141,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
       .from('inbox_thread_read_status')
       .select('last_read_at')
       .eq('thread_id', threadId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
     return (data as ReadStatusRow | null)?.last_read_at ?? null;
   }
@@ -158,7 +158,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
 
     // Fetch only 2 messages — must not advance read pointer past those 2
     const raw = await handleGetThreadMessages(
-      { userId, threadKey, agentId: 'wren', limit: 2, markRead: true },
+      { userId, threadKey, sbSlug: 'wren', limit: 2, markRead: true },
       dataComposer
     );
     const result = await parseResult(raw);
@@ -194,7 +194,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // First fetch — advance the pointer through the first 3 messages
     const first = await parseResult(
       await handleGetThreadMessages(
-        { userId, threadKey, agentId: 'wren', limit: 3, markRead: true },
+        { userId, threadKey, sbSlug: 'wren', limit: 3, markRead: true },
         dataComposer
       )
     );
@@ -204,7 +204,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // only messages after last_read_at, NOT the earliest N from scratch.
     const second = await parseResult(
       await handleGetThreadMessages(
-        { userId, threadKey, agentId: 'wren', limit: 50, markRead: true },
+        { userId, threadKey, sbSlug: 'wren', limit: 50, markRead: true },
         dataComposer
       )
     );
@@ -222,7 +222,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // Simulate push-channel delivery: the trigger pipeline reads the thread
     // and advances last_read_at past everything
     await handleGetThreadMessages(
-      { userId, threadKey, agentId: 'wren', limit: 50, markRead: true },
+      { userId, threadKey, sbSlug: 'wren', limit: 50, markRead: true },
       dataComposer
     );
     const pointerAfterDelivery = await readPointer(threadId, 'wren');
@@ -232,7 +232,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // empty thread (read-state fallback hides everything already read)...
     const raced = await parseResult(
       await handleGetThreadMessages(
-        { userId, threadKey, agentId: 'wren', limit: 50, markRead: false },
+        { userId, threadKey, sbSlug: 'wren', limit: 50, markRead: false },
         dataComposer
       )
     );
@@ -242,7 +242,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // anchor and detect the reply regardless of read state
     const full = await parseResult(
       await handleGetThreadMessages(
-        { userId, threadKey, agentId: 'wren', limit: 50, markRead: false, fullHistory: true },
+        { userId, threadKey, sbSlug: 'wren', limit: 50, markRead: false, fullHistory: true },
         dataComposer
       )
     );
@@ -264,7 +264,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // No markRead writes here — caller has never read this thread
     const result = await parseResult(
       await handleGetThreadMessages(
-        { userId, threadKey, agentId: 'wren', limit: 50, markRead: false },
+        { userId, threadKey, sbSlug: 'wren', limit: 50, markRead: false },
         dataComposer
       )
     );
@@ -284,7 +284,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // Advance the pointer to message 4
     await parseResult(
       await handleGetThreadMessages(
-        { userId, threadKey, agentId: 'wren', limit: 4, markRead: true },
+        { userId, threadKey, sbSlug: 'wren', limit: 4, markRead: true },
         dataComposer
       )
     );
@@ -299,7 +299,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
         {
           userId,
           threadKey,
-          agentId: 'wren',
+          sbSlug: 'wren',
           afterMessageId: messageIds[0],
           limit: 2,
           markRead: true,
@@ -323,7 +323,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // Advance pointer to message 3
     await parseResult(
       await handleGetThreadMessages(
-        { userId, threadKey, agentId: 'wren', limit: 3, markRead: true },
+        { userId, threadKey, sbSlug: 'wren', limit: 3, markRead: true },
         dataComposer
       )
     );
@@ -335,7 +335,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
         {
           userId,
           threadKey,
-          agentId: 'wren',
+          sbSlug: 'wren',
           afterMessageId: messageIds[0],
           limit: 50,
           markRead: false,
