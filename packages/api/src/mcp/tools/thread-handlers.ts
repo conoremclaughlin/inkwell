@@ -13,11 +13,13 @@ import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { resolveSbId } from '../../auth/resolve-identity';
 import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import { advanceThreadReadPointer } from './read-state.js';
+import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -151,6 +153,38 @@ const reopenThreadSchema = userIdentifierBaseSchema.extend({
   sbSlug: sbSlugSchema.describe('SB slug reopening the thread (must be a participant)'),
 });
 
+// Bounds live in thread-bounds.ts so findOrCreateThread can reach them without
+// importing this module. Re-exported because callers already import them here.
+export { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX };
+
+const updateThreadSchema = userIdentifierBaseSchema
+  .extend({
+    threadKey: threadKeySchema,
+    sbSlug: sbSlugSchema.describe('SB slug making the change (must be a participant)'),
+    title: z
+      .string()
+      .max(THREAD_TITLE_MAX)
+      .nullable()
+      .optional()
+      .describe(
+        `Short label for the thread, max ${THREAD_TITLE_MAX} chars. The threadKey identifies the thread; this describes it. Pass null to clear.`
+      ),
+    summary: z
+      .string()
+      .max(THREAD_SUMMARY_MAX)
+      .nullable()
+      .optional()
+      .describe(
+        `Brief, concise description of what the thread is about NOW, max ${THREAD_SUMMARY_MAX} chars. Rewrite it as the discussion moves on. Pass null to clear.`
+      ),
+  })
+  // Distinguishing "not provided" from "explicitly cleared" is the whole point
+  // of allowing null, so a call that provides neither is a caller error rather
+  // than a silent no-op that reports success.
+  .refine((v) => v.title !== undefined || v.summary !== undefined, {
+    message: 'Provide at least one of title or summary',
+  });
+
 const listThreadsSchema = userIdentifierBaseSchema.extend({
   sbSlug: sbSlugSchema.describe('SB slug to list threads for'),
   status: z.enum(['open', 'closed', 'all']).optional().default('open'),
@@ -177,6 +211,16 @@ interface ThreadRow {
   user_id: string;
   created_by_agent_id: string;
   title: string | null;
+  summary: string | null;
+  /**
+   * NULL means the field still holds its creation-time value. That is the
+   * signal a reader needs: it distinguishes a description someone has kept
+   * current from one that has never been touched since the thread opened.
+   */
+  title_updated_at: string | null;
+  title_updated_by_sb_id: string | null;
+  summary_updated_at: string | null;
+  summary_updated_by_sb_id: string | null;
   status: string;
   metadata: Json;
   created_at: string;
@@ -698,6 +742,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           threadKey,
           threadId: thread.id,
           title: thread.title,
+          summary: thread.summary ?? null,
+          titleUpdatedAt: thread.title_updated_at ?? null,
+          summaryUpdatedAt: thread.summary_updated_at ?? null,
           status: thread.status,
           createdBy: thread.created_by_agent_id,
           participants,
@@ -758,15 +805,25 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
                   'read-pointer advance failed — read state is stale; messages may re-deliver',
               }
             : {}),
-          messages: (messages || []).map((m: Record<string, unknown>) => ({
-            id: m.id,
-            senderSlug: m.sender_agent_id,
-            content: m.content,
-            messageType: m.message_type,
-            priority: m.priority,
-            metadata: m.metadata,
-            createdAt: m.created_at,
-          })),
+          messages: (messages || []).map((m: Record<string, unknown>) => {
+            // The sender's subject, whole. send_to_inbox stores it under
+            // metadata.pcp so a bounded thread title is never the only copy
+            // (#641 round 2); lifted to the top level here because that is
+            // where every other reader of a message expects to find it, and
+            // digging it out of a metadata blob is not something a caller
+            // should have to know to do. Omitted when there was no subject.
+            const subject = threadMessageSubject(m.metadata);
+            return {
+              id: m.id,
+              senderSlug: m.sender_agent_id,
+              content: m.content,
+              messageType: m.message_type,
+              priority: m.priority,
+              ...(subject ? { subject } : {}),
+              metadata: m.metadata,
+              createdAt: m.created_at,
+            };
+          }),
         }),
       },
     ],
@@ -1120,6 +1177,164 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
   });
 }
 
+/** What one update_thread call writes: the fields it touches, and who by. */
+export interface ThreadMetadataEdit {
+  setTitle: boolean;
+  title: string | null;
+  setSummary: boolean;
+  summary: string | null;
+  editorSbId: string | null;
+  editorSlug: string;
+  attributedBy: 'identity' | 'slug-only';
+}
+
+/**
+ * Write a title/summary edit AND its timeline event — in ONE transaction, the
+ * `update_inbox_thread_metadata` SQL function (migration 20260916020035).
+ *
+ * The same two-round-trip shape Lumen caught on reopen in #615, and caught
+ * again here in #641: as an UPDATE followed by an INSERT these are two
+ * transactions, so a rejected audit INSERT left the edit standing with nothing
+ * in the timeline recording who made it. The first cut also discarded the
+ * INSERT's error, which turned that into `success: true` — and in the
+ * `slug-only` attribution case the timeline message is the only durable record
+ * of the editor, so the response claimed a trail it had just failed to write.
+ *
+ * Throwing after the fact would have detected the failure without restoring the
+ * trail. One function restores it: either both land or neither does.
+ *
+ * Returns the timestamp the row was written with, so the response reports the
+ * stored instant rather than an app-side guess at it.
+ */
+export async function updateThreadMetadataRow(
+  supabase: SupabaseClient,
+  threadId: string,
+  edit: ThreadMetadataEdit
+): Promise<string> {
+  const { data, error } = await supabase.rpc('update_inbox_thread_metadata', {
+    p_thread_id: threadId,
+    p_set_title: edit.setTitle,
+    p_title: edit.title,
+    p_set_summary: edit.setSummary,
+    p_summary: edit.summary,
+    p_editor_sb_id: edit.editorSbId,
+    p_editor_slug: edit.editorSlug,
+    p_attributed_by: edit.attributedBy,
+  });
+  if (error) {
+    throw new Error(`Failed to update thread: ${error.message}`);
+  }
+  if (typeof data !== 'string' || !data) {
+    // The function returns exactly a timestamptz; anything else means the call
+    // did not reach it (a missing migration, a mocked client).
+    throw new Error(`Failed to update thread: unexpected reply ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+/**
+ * Set or update a thread's title and summary.
+ *
+ * The threadKey is a stable identifier by design, and that stability is what
+ * makes it useless as a description: one thread routinely spans several PRs,
+ * specs and incidents. So the descriptive layer is mutable precisely because
+ * the key is not.
+ *
+ * Any participant may edit. A thread is collaborative — restricting edits to
+ * the creator would mean a thread Myra opened can never be retitled by the SB
+ * actually doing the work, which is the common case.
+ *
+ * Each field carries its own editor and timestamp. The timestamp is the load
+ * bearing part: a summary without one is read as current no matter how old it
+ * is, which is the failure this feature exists to fix rather than reproduce.
+ */
+export async function handleUpdateThread(args: unknown, dataComposer: DataComposer) {
+  const supabase = dataComposer.getClient();
+  const parsed = updateThreadSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
+  const { threadKey, title, summary } = parsed;
+
+  const reply = (payload: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
+  });
+
+  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  if (!thread) {
+    return reply({ success: false, error: `Thread not found: ${threadKey}` });
+  }
+
+  // Closed threads stay editable. Closed is a work-state signal, not a lock
+  // (spec inkmail-thread-scope §2), and a finished thread is exactly the one
+  // whose summary is most worth correcting for whoever reads it later.
+  if (!(await isParticipant(supabase, thread.id, sbSlug))) {
+    return reply({
+      success: false,
+      error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
+    });
+  }
+
+  // Attribution by canonical UUID. Prefer the server-side request context over
+  // anything derived from the slug: a slug is unique only per workspace, so
+  // re-deriving it can name a different SB of the same name — and that is not
+  // hypothetical here, the fixture user carries two `echo` identities, one of
+  // them workspace-less, which makes the slug lookup correctly return nothing.
+  //
+  // A provenance field is not an authorization field, so this does NOT fail
+  // closed the way resolveOwnerSbId does: refusing a title edit because of a
+  // duplicate identity row elsewhere would cost the description and buy no
+  // safety. Instead the edit lands and the response says which it got, so a
+  // caller can tell "attributed to an identity" from "attributed to a slug
+  // only" rather than reading null as either.
+  const editorSbId =
+    senderSbId() ?? (await resolveSbId(supabase, resolved.user.id, sbSlug)) ?? null;
+  const attributedBy = editorSbId ? 'identity' : 'slug-only';
+
+  // `undefined` means "not provided" and `null` means "explicitly cleared" —
+  // never collapse them, or a caller editing only the summary silently wipes
+  // the title. The two are carried to SQL as a set-flag and a value for the
+  // same reason.
+  const changed: string[] = [];
+  if (title !== undefined) changed.push('title');
+  if (summary !== undefined) changed.push('summary');
+
+  // The edit and its timeline event, in one transaction. See
+  // updateThreadMetadataRow: a failed audit must not leave an edit standing.
+  const now = await updateThreadMetadataRow(supabase, thread.id, {
+    setTitle: title !== undefined,
+    title: title ?? null,
+    setSummary: summary !== undefined,
+    summary: summary ?? null,
+    editorSbId,
+    editorSlug: sbSlug,
+    attributedBy,
+  });
+
+  logger.info('[Thread] Title/summary updated', {
+    threadKey,
+    sbSlug,
+    fields: changed,
+    attributedBy,
+  });
+
+  return reply({
+    success: true,
+    message: `Thread ${threadKey} ${changed.join(' and ')} updated`,
+    threadKey,
+    updatedBy: sbSlug,
+    // 'identity' = a canonical UUID was recorded. 'slug-only' = the slug could
+    // not be resolved to one identity, so the column is null and the timeline
+    // message carries the slug. Stated rather than left to be inferred from a
+    // null column, which cannot distinguish "unresolvable" from "never tried".
+    attributedBy,
+    updatedFields: changed,
+    ...(title !== undefined ? { title } : {}),
+    ...(summary !== undefined ? { summary } : {}),
+    updatedAt: now,
+  });
+}
+
 export async function handleListThreads(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = listThreadsSchema.parse(args);
@@ -1204,6 +1419,12 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
       return {
         threadKey: t.thread_key,
         title: t.title,
+        summary: t.summary ?? null,
+        // Ages travel with the text. A summary shown without one is read as
+        // current however old it is — the exact misread this feature exists to
+        // prevent, so omitting these would reproduce it on a new surface.
+        titleUpdatedAt: t.title_updated_at ?? null,
+        summaryUpdatedAt: t.summary_updated_at ?? null,
         status: t.status,
         createdBy: t.created_by_agent_id,
         participants,
@@ -1415,4 +1636,30 @@ export const threadToolDefinitions = [
     schema: reopenThreadSchema,
     handler: handleReopenThread,
   },
+  {
+    name: 'update_thread',
+    description:
+      "Set or update a thread's title and brief summary, so it is clear what the thread is actually about now. The threadKey is a stable identifier, not a description — one thread routinely covers several PRs, specs and incidents, and 'pr:632' says none of it. Keep the summary BRIEF AND CONCISE (bounded at 280 chars) and rewrite it as the discussion moves on; a summary that grows without bound is the thing this replaces. Any participant may edit, including on a closed thread. Each field records who changed it and when, and the age is shown wherever the summary is, so a reader can tell a current description from an old one.",
+    schema: updateThreadSchema,
+    handler: handleUpdateThread,
+  },
 ];
+
+/**
+ * Look up a thread tool definition by name.
+ *
+ * Registration used to index this array positionally (`threadToolDefinitions[3]`),
+ * which silently rebinds every later tool to the wrong schema the moment
+ * anything is inserted rather than appended — a trap that fired immediately
+ * when `update_thread` was first added in the middle. Names do not shift.
+ */
+export function threadTool(name: string): (typeof threadToolDefinitions)[number] {
+  const found = threadToolDefinitions.find((t) => t.name === name);
+  if (!found) {
+    // Throwing beats returning undefined: a missing tool is a programming error
+    // at startup, and a silently unregistered tool is invisible until a caller
+    // needs it.
+    throw new Error(`Unknown thread tool: ${name}`);
+  }
+  return found;
+}

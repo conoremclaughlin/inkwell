@@ -6,7 +6,43 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveTriggeredAgents, resolveEffectiveFloor, isLaterInstant } from './thread-handlers';
+import {
+  resolveTriggeredAgents,
+  resolveEffectiveFloor,
+  isLaterInstant,
+  threadToolDefinitions,
+  threadTool,
+} from './thread-handlers';
+import { THREAD_TITLE_MAX, threadMessageSubject } from './thread-bounds';
+
+describe('thread tool definitions', () => {
+  // Registration in index.ts used to index this array positionally. Adding
+  // update_thread anywhere but the end silently rebound list_threads,
+  // mark_thread_read and reopen_thread to their neighbours' schemas — no type
+  // error, because the shapes are close enough to compile. This pins the
+  // property that made that possible.
+  it('resolves every tool to its own definition by name', () => {
+    for (const definition of threadToolDefinitions) {
+      expect(threadTool(definition.name).name).toBe(definition.name);
+      expect(threadTool(definition.name).schema).toBe(definition.schema);
+      expect(threadTool(definition.name).handler).toBe(definition.handler);
+    }
+  });
+
+  it('has no duplicate tool names, which would make a name lookup ambiguous', () => {
+    const names = threadToolDefinitions.map((t) => t.name);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it('throws on an unknown tool rather than returning undefined', () => {
+    // A silently unregistered tool is invisible until a caller needs it.
+    expect(() => threadTool('no_such_thread_tool')).toThrow(/Unknown thread tool/);
+  });
+
+  it('exposes update_thread', () => {
+    expect(threadTool('update_thread').name).toBe('update_thread');
+  });
+});
 
 describe('resolveTriggeredAgents', () => {
   describe('1:1 threads (2 participants)', () => {
@@ -757,6 +793,7 @@ interface GuardMsg {
   message_type: string;
   sender_agent_id: string;
   content: string;
+  metadata?: unknown;
 }
 
 const hoursAgo = (h: number) => new Date(Date.now() - h * 3600 * 1000).toISOString();
@@ -1705,5 +1742,260 @@ describe('reopenThreadRow — a failed call is an error, never a silent success'
       ['reopen_inbox_thread', { p_thread_id: 't1', p_actor_kind: 'sb', p_actor_agent_id: 'wren' }],
       ['reopen_inbox_thread', { p_thread_id: 't1', p_actor_kind: 'user', p_actor_agent_id: null }],
     ]);
+  });
+});
+
+describe('handleUpdateThread — the edit and its attribution trail move together', () => {
+  // Lumen's #641 P2, and the second time this shape has been caught in this
+  // table (the first was reopen, #615). The first cut wrote the edit and then
+  // INSERTed the timeline event as a separate round trip AND discarded that
+  // INSERT's error, so a rejected audit returned success: true with the edit
+  // already committed and nothing recording who made it. In the slug-only
+  // attribution case that event is the only durable record of the editor, so
+  // the response promised a trail it had just failed to write.
+  //
+  // These pin the handler's branches against a fake that mirrors the SQL
+  // function. The real atomicity — a rejected audit rolling the edit back in
+  // Postgres — is in thread-metadata.integration.test.ts, because a fake I
+  // wrote would stay green no matter what the function does.
+  async function setup(opts: { participants?: string[] } = {}) {
+    const { handleUpdateThread } = await import('./thread-handlers');
+    const userResolver = await import('../../services/user-resolver');
+    const { makeFakeSupabase } = await import('../../services/sessions/fake-supabase.js');
+
+    const resolveSpy = vi
+      .spyOn(userResolver, 'resolveUserOrThrow')
+      .mockResolvedValue({ user: { id: 'user-1' } } as never);
+
+    const tables = {
+      inbox_threads: [
+        {
+          id: 't1',
+          user_id: 'user-1',
+          thread_key: 'pr:641',
+          status: 'open',
+          created_by_agent_id: 'wren',
+          title: 'Before',
+          summary: null,
+          title_updated_at: null,
+          summary_updated_at: null,
+        },
+      ],
+      inbox_thread_participants: (opts.participants ?? ['wren', 'lumen']).map((agent_id) => ({
+        thread_id: 't1',
+        agent_id,
+      })),
+      inbox_thread_messages: [] as Array<Record<string, unknown>>,
+    };
+    const supabase = makeFakeSupabase(tables);
+    const dataComposer = { getClient: () => supabase, repositories: {} } as never;
+    const call = async (args: Record<string, unknown>) => {
+      const result = await handleUpdateThread({ threadKey: 'pr:641', ...args }, dataComposer);
+      return JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
+    };
+    return { call, tables, supabase, dataComposer, restore: () => resolveSpy.mockRestore() };
+  }
+
+  it('writes the edit and exactly one timeline event, and reports the stored timestamp', async () => {
+    const { call, tables, restore } = await setup();
+    try {
+      const payload = await call({ sbSlug: 'wren', summary: 'What it is about now' });
+      expect(payload).toMatchObject({ success: true, updatedFields: ['summary'] });
+
+      const thread = tables.inbox_threads[0];
+      expect(thread.summary).toBe('What it is about now');
+      // "Not provided" is not "cleared" — the title must survive a summary edit.
+      expect(thread.title).toBe('Before');
+      expect(thread.title_updated_at).toBeNull();
+
+      expect(tables.inbox_thread_messages).toHaveLength(1);
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        sender_agent_id: 'system',
+        message_type: 'system',
+        metadata: { type: 'thread_metadata_updated', updatedBy: 'wren' },
+      });
+
+      // The instant reported is the one the row was written with, not an
+      // app-side guess at it.
+      expect(payload.updatedAt).toBe(thread.summary_updated_at);
+    } finally {
+      restore();
+    }
+  });
+
+  it('does not report success when the write fails', async () => {
+    const { call, supabase, restore } = await setup();
+    try {
+      // Fault injection at the one boundary that now carries both writes.
+      vi.spyOn(supabase as never, 'rpc' as never).mockResolvedValue({
+        data: null,
+        error: { message: 'audit rejected by test' },
+      } as never);
+
+      await expect(call({ sbSlug: 'wren', title: 'After' })).rejects.toThrow(
+        /audit rejected by test/
+      );
+    } finally {
+      vi.restoreAllMocks();
+      restore();
+    }
+  });
+
+  it('refuses a reply that is not the timestamp the function returns', async () => {
+    const { updateThreadMetadataRow } = await import('./thread-handlers');
+    // An unmigrated or mocked client must not be read as a successful edit.
+    await expect(
+      updateThreadMetadataRow({ rpc: async () => ({ data: null, error: null }) } as never, 't1', {
+        setTitle: true,
+        title: 'After',
+        setSummary: false,
+        summary: null,
+        editorSbId: null,
+        editorSlug: 'wren',
+        attributedBy: 'slug-only',
+      })
+    ).rejects.toThrow('Failed to update thread: unexpected reply null');
+  });
+
+  it('still refuses a non-participant before any write happens', async () => {
+    const { call, tables, restore } = await setup({ participants: ['lumen'] });
+    try {
+      const payload = await call({ sbSlug: 'wren', summary: 'I was never here' });
+      expect(payload).toMatchObject({ success: false });
+      expect(tables.inbox_threads[0].summary).toBeNull();
+      expect(tables.inbox_thread_messages).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// =====================================================
+// The subject a sender wrote survives the bound on the thread's label
+// =====================================================
+
+describe('send_to_inbox keeps the whole subject on the message row', () => {
+  // Lumen's #641 round 2, measured on the real send handler rather than
+  // predicted. `inbox_thread_messages` has no subject column, so before this
+  // the thread path's only copy of a subject was `inbox_threads.title` — and
+  // only for the first message, since a reply's subject went nowhere at all.
+  // Bounding that title at 200 characters therefore truncated the one durable
+  // copy a 240-character subject had. A bound on a label is not licence to
+  // edit what someone sent.
+  //
+  // These go through handleSendToInbox and read the write back through
+  // threadMessageSubject — the reader get_thread_messages uses — because the
+  // two are one round trip apart and would rot independently. Asserting a
+  // shape at each end would let them disagree and still pass.
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Re-establish the module-level resolver stub. An earlier describe in this
+    // file spies on it and calls mockRestore(), which leaves the module mock
+    // without its resolved value — and every handler here dereferences
+    // resolved.user immediately, so the failure is a TypeError rather than
+    // anything about subjects.
+    const userResolver = await import('../../services/user-resolver');
+    vi.mocked(userResolver.resolveUserOrThrow).mockResolvedValue({
+      user: { id: 'user-123' },
+      resolvedBy: 'userId',
+    } as never);
+  });
+
+  async function sendWithSubject(subject: string) {
+    const client = createThreadMockSupabase();
+    // Force creation: the harness's inbox_threads.select returns null only on
+    // the first call, and the send path looks the thread up twice (the
+    // existing-thread probe, then findOrCreateThread). Left alone, the second
+    // lookup finds a thread and this measures the reply path instead of the
+    // creation path the bound lives on.
+    const threads = client._getTable('inbox_threads');
+    const absent = threads.select();
+    threads.select.mockReturnValue(absent);
+    const result = await handleSendToInbox(
+      {
+        userId: '00000000-0000-4000-8000-000000000641',
+        senderSlug: 'wren',
+        recipientSlug: 'lumen',
+        threadKey: 'pcp:thread:subject-retention',
+        subject,
+        content: 'The body is independent of the subject.',
+        trigger: false,
+      },
+      createMockDataComposer(client) as never
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    // Measure the creation path or measure nothing: no insert means the send
+    // took the reply branch and the assertions below would be vacuous.
+    expect(threads.insert).toHaveBeenCalledTimes(1);
+    const titleWritten = threads.insert.mock.calls[0][0].title as string | null;
+    const messageWritten = client._getTable('inbox_thread_messages').insert.mock
+      .calls[0][0] as Record<string, unknown>;
+    return { titleWritten, messageWritten };
+  }
+
+  it.each([200, 240])(
+    'a %i-character subject is recoverable in full after the title is bounded',
+    async (length) => {
+      const subject = `${'S'.repeat(length - 8)}END-MARK`;
+      expect([...subject].length).toBe(length);
+
+      const { titleWritten, messageWritten } = await sendWithSubject(subject);
+
+      // The reader's answer, not a hand-read of the blob: whatever
+      // get_thread_messages would surface is what has to be whole.
+      expect(threadMessageSubject(messageWritten.metadata)).toBe(subject);
+      // The label is still bounded — this fix must not have undone the bound.
+      expect([...(titleWritten ?? '')].length).toBeLessThanOrEqual(THREAD_TITLE_MAX);
+      // The body is the body; the subject did not leak into it.
+      expect(messageWritten.content).toBe('The body is independent of the subject.');
+    }
+  );
+
+  it('keeps the sender context that already lived in that metadata namespace', async () => {
+    const { messageWritten } = await sendWithSubject('Short enough for the title');
+    const meta = messageWritten.metadata as {
+      pcp: { sender: { sbSlug: string }; subject: string };
+    };
+    expect(meta.pcp.sender.sbSlug).toBe('wren');
+    expect(meta.pcp.subject).toBe('Short enough for the title');
+  });
+
+  it('writes no subject key at all when the sender sent none', async () => {
+    const client = createThreadMockSupabase();
+    const threads = client._getTable('inbox_threads');
+    const absent = threads.select();
+    threads.select.mockReturnValue(absent);
+    await handleSendToInbox(
+      {
+        userId: '00000000-0000-4000-8000-000000000641',
+        senderSlug: 'wren',
+        recipientSlug: 'lumen',
+        threadKey: 'pcp:thread:subject-retention',
+        content: 'No subject on this one.',
+        trigger: false,
+      },
+      createMockDataComposer(client) as never
+    );
+    const meta = client._getTable('inbox_thread_messages').insert.mock.calls[0][0]
+      .metadata as Record<string, Record<string, unknown>>;
+    expect('subject' in meta.pcp).toBe(false);
+    expect(threadMessageSubject(meta)).toBeNull();
+  });
+
+  it('get_thread_messages surfaces the subject the writer stored', async () => {
+    // The other end of the round trip. The row carries exactly what
+    // handleSendToInbox writes; the reader must lift it to the top level,
+    // where a caller looks for it, without anyone having to know it lives in
+    // a metadata blob.
+    const subject = `${'S'.repeat(232)}END-MARK`;
+    const rows: GuardMsg[] = [
+      { ...guardMsg('with-subject', 2), metadata: { pcp: { subject } } },
+      { ...guardMsg('without-subject', 1), metadata: { pcp: {} } },
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), { fullHistory: true });
+    const messages = parsed.messages as Array<{ id: string; subject?: string }>;
+    expect(messages.find((m) => m.id === 'with-subject')?.subject).toBe(subject);
+    // Absent, not empty: a message with no subject must not grow the key.
+    expect(messages.find((m) => m.id === 'without-subject')).not.toHaveProperty('subject');
   });
 });
