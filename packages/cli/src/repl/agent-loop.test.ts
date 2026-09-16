@@ -2539,3 +2539,32 @@ describe('runAgentLoop — an unrunnable block reaches the model', () => {
     expect(result.toolResults.map((r) => r.status)).toEqual(['rejected', 'executed']);
   });
 });
+
+describe('extractToolBlocks — prose about the protocol is not a request', () => {
+  it('does not report a fence-shaped mention that carries no request', () => {
+    // Real text from a review discussing the format. It matches the opening
+    // regex, never closes, and asks for nothing.
+    const { calls, malformed } = extractToolBlocks(
+      'Close the ```ink-tool` block explicitly — an unclosed fence used to swallow the rest of the turn.'
+    );
+
+    expect(calls).toEqual([]);
+    expect(malformed).toEqual([]);
+  });
+
+  it('still reports a truncated block that names a tool', () => {
+    const { malformed } = extractToolBlocks(
+      '```ink-tool\n<br>{"tool":"send_response","args":{"a":1'
+    );
+
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]!.tool).toBe('send_response');
+  });
+
+  it('still reports a truncated block that opens a JSON object without a readable name', () => {
+    const { malformed } = extractToolBlocks('```ink-tool\n{"args":{"a":');
+
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]!.tool).toBeUndefined();
+  });
+});

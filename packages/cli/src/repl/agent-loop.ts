@@ -1579,12 +1579,20 @@ export function extractToolBlocks(responseText: string): {
       // result, so a persistent miscounter is corrected rather than propped up.
       const fixed = block.fenceClosed ? repairTruncatedJson(payload) : null;
       if (fixed === null) {
-        malformed.push({
-          tool: readToolName(payload),
-          error: firstError instanceof Error ? firstError.message : String(firstError),
-          payloadLength: payload.length,
-          fenceClosed: block.fenceClosed,
-        });
+        const tool = readToolName(payload);
+        // Report a REQUEST, not every fence-shaped string. Prose discussing the
+        // protocol — "close the ```ink-tool block" — matches the opening regex
+        // and reaches here with no tool name and no JSON. Telling the model its
+        // block was discarded when it never wrote one is a different lie from
+        // the one being fixed, and just as unhelpful.
+        if (tool || /^[[{]/.test(payload)) {
+          malformed.push({
+            tool,
+            error: firstError instanceof Error ? firstError.message : String(firstError),
+            payloadLength: payload.length,
+            fenceClosed: block.fenceClosed,
+          });
+        }
         continue;
       }
       payload = fixed;
