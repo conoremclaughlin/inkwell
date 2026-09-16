@@ -70,7 +70,7 @@ describe.skipIf(!LIVE)('live: attachment visibility through the backend', () => 
 
     const result = await runBackendTurn({
       backend: 'claude',
-      agentId: 'live-test',
+      sbSlug: 'live-test',
       prompt,
       attachmentDirs: collectAttachmentDirs(attachments),
       timeoutMs: 120_000,

@@ -14,7 +14,7 @@
  * against git itself, not a mock.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { mkdtemp, rm, writeFile, readFile } from 'fs/promises';
@@ -23,13 +23,16 @@ import path from 'path';
 import {
   StudioLeaseService,
   captureWorktreeState,
+  writeCheckoutPin,
   rescueSucceeded,
   isLeaseStale,
+  leaseThreadKeys,
   LEASE_STALE_MS,
   QUARANTINE_THREAD_KEY,
   type StudioLease,
 } from './studio-lease.service';
 import { registerActiveRun, resetActiveRuns } from './sessions/active-runs';
+import { logger } from '../utils/logger';
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +43,12 @@ type Row = Record<string, unknown>;
 interface FakeHooks {
   /** Fires after each select executes on the named table. */
   afterSelect?: (table: string, count: number) => void;
+  /**
+   * Fires BEFORE each update executes on the named table (counted per
+   * table) — the window for interleaving a concurrent write between two
+   * CAS updates, e.g. the sweep's claim and its final clear.
+   */
+  beforeUpdate?: (table: string, count: number) => void;
   /**
    * Fires inside grant_studio_lease / studio_path_conflict AFTER the
    * pre-lock path read and BEFORE the sibling scan + CAS — the r4 P0-2
@@ -75,7 +84,20 @@ class FakeQuery {
   ) {}
 
   eq(col: string, val: unknown) {
-    this.filters.push((r) => getCol(r, col) === val);
+    this.filters.push((r) => {
+      const cur = getCol(r, col);
+      // `->` (not `->>`) path filters compare jsonb structurally: PostgREST
+      // casts the filter value to jsonb. Mirror that for object/array values
+      // (the threadKeys exact-set guard) — order-sensitive, like jsonb arrays.
+      if (cur !== null && typeof cur === 'object' && typeof val === 'string') {
+        try {
+          return JSON.stringify(cur) === JSON.stringify(JSON.parse(val));
+        } catch {
+          return false;
+        }
+      }
+      return cur === val;
+    });
     return this;
   }
 
@@ -111,6 +133,11 @@ class FakeQuery {
     if (this.mode === 'insert') {
       this.rows.push({ ...this.payload });
       return [{ ...this.payload }];
+    }
+    if (this.mode === 'update' && this.hooks?.beforeUpdate && this.counters) {
+      const key = `update:${this.table}`;
+      this.counters[key] = (this.counters[key] ?? 0) + 1;
+      this.hooks.beforeUpdate(this.table, this.counters[key]);
     }
     let matched = this.rows.filter((r) => this.filters.every((f) => f(r)));
     if (this.mode === 'update') {
@@ -229,6 +256,35 @@ function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
             : { data: { conflict: false }, error: null };
         }
 
+        if (fn === 'repoint_sessions_off_ephemeral') {
+          // Mirrors the SQL: FOR UPDATE on the studio; repoint ONLY while
+          // the lease is still NULL (a regrant that won the lock keeps its
+          // sessions bound); ancestor walk skips ephemerals and cleaned rows.
+          if (!target || target.ephemeral !== true) return { data: 0, error: null };
+          if (target.lease != null) return { data: 0, error: null };
+          let ancestorId: string | null = null;
+          const seen = new Set<string>([String(target.id)]);
+          let parentId = (target.parent_studio_id as string | null) ?? null;
+          while (parentId && !seen.has(parentId)) {
+            seen.add(parentId);
+            const parent = studios.find((r) => r.id === parentId && r.user_id === args.p_user_id);
+            if (!parent) break;
+            if (parent.ephemeral !== true && parent.status !== 'cleaned') {
+              ancestorId = String(parent.id);
+              break;
+            }
+            parentId = (parent.parent_studio_id as string | null) ?? null;
+          }
+          let count = 0;
+          for (const sess of tables['sessions'] ?? []) {
+            if (sess.user_id === args.p_user_id && sess.studio_id === args.p_studio_id) {
+              sess.studio_id = ancestorId;
+              count += 1;
+            }
+          }
+          return { data: count, error: null };
+        }
+
         if (fn !== 'grant_studio_lease') {
           return { data: null, error: { message: `no fake for rpc ${fn}` } };
         }
@@ -275,7 +331,7 @@ function freshLease(overrides: Partial<StudioLease> = {}): StudioLease {
   return {
     sessionId: 'session-a',
     threadKey: 'pr:100',
-    agentId: 'wren',
+    sbSlug: 'wren',
     acquiredAt: now,
     heartbeatAt: now,
     ...overrides,
@@ -335,7 +391,7 @@ describe('StudioLeaseService.acquire', () => {
     studioId: 'studio-1',
     sessionId: 'session-b',
     threadKey: 'pr:200',
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: 'user-1',
     reason: 'route-pattern',
   };
@@ -347,6 +403,27 @@ describe('StudioLeaseService.acquire', () => {
     expect((tables.studios[0].lease as StudioLease).reason).toBe('route-pattern');
     expect(tables.studio_lease_events).toHaveLength(1);
     expect(tables.studio_lease_events[0].event).toBe('acquired');
+  });
+
+  it('names the canonical id the caller verified, and resolves the slug only when none is given (PR #605 r3)', async () => {
+    // Slug resolution would answer sb-from-slug; a caller that already holds
+    // the credential's id passes it, and the lease names that identity.
+    tables.agent_identities.push({
+      id: 'sb-from-slug',
+      user_id: 'user-1',
+      agent_id: 'wren',
+      workspace_id: 'ws',
+      updated_at: '2026-09-01T00:00:00Z',
+    });
+    const given = await service.acquire({ ...req, sbId: 'sb-verified' });
+    expect(given.acquired).toBe(true);
+    expect((tables.studios[0].lease as StudioLease).sbId).toBe('sb-verified');
+    expect(tables.studio_lease_events.at(-1)?.sb_id).toBe('sb-verified');
+
+    tables.studios[0].lease = null;
+    const resolved = await service.acquire(req);
+    expect(resolved.acquired).toBe(true);
+    expect((tables.studios[0].lease as StudioLease).sbId).toBe('sb-from-slug');
   });
 
   it('refuses a VACANT row when a sibling row holds the same tree — ANY thread (6b r2)', async () => {
@@ -698,7 +775,7 @@ describe('StudioLeaseService.acquire', () => {
       sessionId: '44444444-4444-4444-4444-444444444444',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:5',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: new Date().toISOString(),
       heartbeatAt: new Date().toISOString(),
       quarantined: true,
@@ -741,7 +818,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-live',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -804,7 +881,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-old',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -898,7 +975,7 @@ describe('StudioLeaseService.acquire', () => {
       studioId: 'studio-1',
       sessionId: 'session-b',
       threadKey: 'pr:200',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'user-1',
     });
     expect(result.acquired).toBe(false);
@@ -1050,7 +1127,7 @@ describe('StudioLeaseService.acquire', () => {
       sessionId: 'session-dead',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:999',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       acquiredAt: staleQuarantineHeartbeat,
       heartbeatAt: staleQuarantineHeartbeat,
       quarantined: true,
@@ -1067,7 +1144,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-live',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1099,7 +1176,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-running',
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1193,7 +1270,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1262,7 +1339,12 @@ describe('StudioLeaseService release paths', () => {
       reason: 'thread-closed',
     });
     // session-a (fresh, non-terminal) deferred; session-b (terminal) released.
-    expect(byThread).toEqual({ released: 1, deferred: 1 });
+    expect(byThread).toEqual({
+      released: 1,
+      deferred: 1,
+      removed: 0,
+      studioIds: ['studio-1', 'studio-2'],
+    });
     const marked = tables.studios[0].lease as StudioLease;
     expect(marked.sessionId).toBe('session-a');
     expect(marked.pendingRelease?.reason).toBe('thread-closed');
@@ -1276,7 +1358,12 @@ describe('StudioLeaseService release paths', () => {
 
   it('releaseByThread clears every studio the thread holds', async () => {
     const result = await service.releaseByThread('user-1', 'pr:100');
-    expect(result).toEqual({ released: 2, deferred: 0 });
+    expect(result).toEqual({
+      released: 2,
+      deferred: 0,
+      removed: 0,
+      studioIds: ['studio-1', 'studio-2'],
+    });
     expect(tables.studios[0].lease).toBeNull();
     expect(tables.studios[1].lease).toBeNull();
   });
@@ -1285,13 +1372,18 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
 
     const result = await service.releaseByThread('user-1', 'pr:100', { reason: 'thread-closed' });
-    expect(result).toEqual({ released: 1, deferred: 1 });
+    expect(result).toEqual({
+      released: 1,
+      deferred: 1,
+      removed: 0,
+      studioIds: ['studio-1', 'studio-2'],
+    });
     // The live holder keeps its lease — marked, not cleared.
     const marked = tables.studios[0].lease as StudioLease;
     expect(marked.sessionId).toBe('session-a');
@@ -1335,7 +1427,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1390,7 +1482,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
     registerActiveRun({
       sessionId: 'sess-3',
       userId: 'u',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1443,7 +1535,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
         studioId: 's-bad',
         sessionId: 'sess-new',
         threadKey: 'pr:7',
-        agentId: 'wren',
+        sbSlug: 'wren',
         userId: 'u',
       });
       expect(acq.acquired).toBe(false);
@@ -1464,7 +1556,7 @@ describe('sweep worktree-absent reconciliation (round 6)', () => {
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:33',
       holderSessionId: 'sess-orig',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: staleIso,
       heartbeatAt: staleIso,
       quarantined: true,
@@ -1673,7 +1765,7 @@ describe('sweep pendingRelease backstop', () => {
     registerActiveRun({
       sessionId: 'sess-p',
       userId: 'u',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1955,7 +2047,7 @@ describe('claimForTeardown ownership (round 3)', () => {
       sessionId: '11111111-1111-1111-1111-111111111111',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:5',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: staleIso,
       heartbeatAt: staleIso,
       quarantined: true,
@@ -2040,5 +2132,1271 @@ describe('captureWorktreeState (real git)', () => {
     const state = await captureWorktreeState(path.join(tmpdir(), 'does-not-exist-xyz'));
     expect(state.error).toBeTruthy();
     expect(rescueSucceeded(state)).toBe(false);
+  });
+
+  /**
+   * Ephemeral studios check out DETACHED (no `eph/` branch litter), which
+   * makes commits made there reachable from nothing once the worktree is
+   * removed. Rescue must anchor them — and must NOT mint anything when the
+   * detached HEAD still sits on a branch-reachable commit.
+   */
+  describe('detached worktrees (ephemeral studios)', () => {
+    let worktree: string;
+
+    beforeEach(async () => {
+      worktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--detached`);
+      await execFileAsync('git', ['worktree', 'add', '--detach', worktree, 'main'], {
+        cwd: repoDir,
+      });
+    });
+
+    afterEach(async () => {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoDir,
+      }).catch(() => undefined);
+      await rm(worktree, { recursive: true, force: true }).catch(() => undefined);
+    });
+
+    it('mints no rescue branch when HEAD is still branch-reachable', async () => {
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:2' });
+      expect(state.branch).toBe('HEAD');
+      expect(state.rescueBranch).toBeUndefined();
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+
+    it('anchors detached commits with an ink-rescue branch before the worktree dies', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed on detached HEAD\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+
+      const state = await captureWorktreeState(worktree, {
+        rescue: true,
+        rescueLabel: 'teardown:pr-2',
+      });
+
+      expect(state.rescueBranch).toMatch(/^ink-rescue\/teardown-pr-2-[0-9a-f]{10}$/);
+      // The branch anchors exactly the detached HEAD commit.
+      const { stdout: anchored } = await execFileAsync('git', ['rev-parse', state.rescueBranch!], {
+        cwd: repoDir,
+      });
+      expect(anchored.trim()).toBe(state.commit);
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+
+    it('re-rescuing the same HEAD is a clean no-op — the first branch already anchors it', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed on detached HEAD\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+
+      const first = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'x' });
+      expect(first.rescueBranch).toMatch(/^ink-rescue\//);
+
+      // HEAD is now reachable from the minted branch, so the second pass has
+      // nothing left to anchor — no duplicate branches, no error.
+      const second = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'x' });
+      expect(second.rescueBranch).toBeUndefined();
+      expect(rescueSucceeded(second)).toBe(true);
+      const { stdout: rescues } = await execFileAsync('git', ['branch', '--list', 'ink-rescue/*'], {
+        cwd: repoDir,
+      });
+      expect(rescues.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    });
+
+    it('leaves a pinned fetched PR head alone, but anchors work committed on top of it', async () => {
+      // The shape a PR review leaves behind: HEAD detached at a commit that
+      // no local branch reaches, published only as origin/pr/9, with the
+      // checkout pin recorded in the worktree's gitdir at creation.
+      const git = (...args: string[]) => execFileAsync('git', args, { cwd: repoDir });
+      await git('checkout', '-q', '-b', 'pr-source');
+      await git('commit', '--allow-empty', '-m', 'pr head');
+      const { stdout: prSha } = await git('rev-parse', 'HEAD');
+      await git('update-ref', 'refs/remotes/origin/pr/9', prSha.trim());
+      await git('checkout', '-q', 'main');
+      await git('branch', '-D', 'pr-source');
+      const prWorktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--pr9`);
+      await git('worktree', 'add', '--detach', prWorktree, 'refs/remotes/origin/pr/9');
+      try {
+        await writeCheckoutPin(prWorktree, {
+          commit: prSha.trim(),
+          ref: 'refs/remotes/origin/pr/9',
+        });
+        const state = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(state.commit).toBe(prSha.trim());
+        // Nothing to anchor: that commit is the review's own input.
+        expect(state.rescueBranch).toBeUndefined();
+        expect(rescueSucceeded(state)).toBe(true);
+
+        // A commit made during the review is new work and IS anchored.
+        await execFileAsync('git', ['commit', '--allow-empty', '-m', 'review fixup'], {
+          cwd: prWorktree,
+        });
+        const after = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(after.rescueBranch).toMatch(/^ink-rescue\/pr-9-[0-9a-f]{10}$/);
+      } finally {
+        await execFileAsync('git', ['worktree', 'remove', '--force', prWorktree], {
+          cwd: repoDir,
+        }).catch(() => undefined);
+      }
+    });
+
+    it("a stale remote-tracking branch does not make a reviewer's own commits safe (Lumen, PR #604 P2)", async () => {
+      // The reviewer commits C on the detached checkout and pushes it to
+      // review-fix; someone else deletes that remote branch. Locally,
+      // origin/review-fix still names C until the next prune. C must be
+      // rescued anyway — the remote no longer has it.
+      await writeFile(path.join(worktree, 'work.txt'), 'reviewer work\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'C'], { cwd: worktree });
+      const { stdout: c } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+      await execFileAsync('git', ['update-ref', 'refs/remotes/origin/review-fix', c.trim()], {
+        cwd: repoDir,
+      });
+
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:2' });
+      expect(state.rescueBranch).toMatch(/^ink-rescue\/pr-2-/);
+      const { stdout: anchored } = await execFileAsync('git', ['rev-parse', state.rescueBranch!], {
+        cwd: repoDir,
+      });
+      expect(anchored.trim()).toBe(c.trim());
+    });
+
+    it('a reviewer who fetched forward to a newer tip of the pinned ref is still on known input', async () => {
+      // Pinned at A with ref origin/pr/9; the PR is force-updated to B and
+      // the reviewer checks B out. B is not the pinned commit, but it is the
+      // current tip of the pinned ref — fetched input, not rescue-worthy work.
+      const git = (...args: string[]) => execFileAsync('git', args, { cwd: repoDir });
+      await git('checkout', '-q', '-b', 'pr-source');
+      await git('commit', '--allow-empty', '-m', 'A');
+      const { stdout: a } = await git('rev-parse', 'HEAD');
+      await git('update-ref', 'refs/remotes/origin/pr/9', a.trim());
+      await git('commit', '--allow-empty', '-m', 'B');
+      const { stdout: b } = await git('rev-parse', 'HEAD');
+      await git('checkout', '-q', 'main');
+      await git('branch', '-D', 'pr-source');
+      const prWorktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--pr9b`);
+      await git('worktree', 'add', '--detach', prWorktree, a.trim());
+      try {
+        await writeCheckoutPin(prWorktree, { commit: a.trim(), ref: 'refs/remotes/origin/pr/9' });
+        // The PR moves; the reviewer follows it.
+        await git('update-ref', 'refs/remotes/origin/pr/9', b.trim());
+        await execFileAsync('git', ['checkout', '-q', '--detach', b.trim()], { cwd: prWorktree });
+        const state = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(state.commit).toBe(b.trim());
+        expect(state.rescueBranch).toBeUndefined();
+        expect(rescueSucceeded(state)).toBe(true);
+      } finally {
+        await execFileAsync('git', ['worktree', 'remove', '--force', prWorktree], {
+          cwd: repoDir,
+        }).catch(() => undefined);
+      }
+    });
+
+    it('stash-rescues a dirty detached tree and anchors its commits in one pass', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+      await writeFile(path.join(worktree, 'work.txt'), 'and then uncommitted\n');
+
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:3' });
+      expect(state.dirty).toBe(true);
+      expect(state.rescueStashSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(state.rescueBranch).toMatch(/^ink-rescue\//);
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+  });
+});
+
+// ── S1 mortality: expired ephemerals held from elsewhere (spec v18) ──
+
+describe('S1: expired ephemeral held from elsewhere (spec v18)', () => {
+  let worktreeDir: string;
+  let elsewhereDir: string;
+
+  beforeEach(async () => {
+    resetActiveRuns();
+    worktreeDir = await mkdtemp(path.join(tmpdir(), 'lease-s1-worktree-'));
+    elsewhereDir = await mkdtemp(path.join(tmpdir(), 'lease-s1-elsewhere-'));
+  });
+
+  afterEach(async () => {
+    resetActiveRuns();
+    await rm(worktreeDir, { recursive: true, force: true });
+    await rm(elsewhereDir, { recursive: true, force: true });
+  });
+
+  const PAST = () => new Date(Date.now() - 60_000).toISOString();
+  const FUTURE = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  function cliSession(overrides: Row = {}): Row {
+    return {
+      id: 'sess-cli',
+      user_id: 'u',
+      working_dir: elsewhereDir,
+      cli_attached: true,
+      cli_poll_at: new Date().toISOString(),
+      cli_turn_at: null,
+      ...overrides,
+    };
+  }
+
+  function ephemeralRow(overrides: Row = {}): Row {
+    return {
+      id: 's-eph',
+      user_id: 'u',
+      status: 'active',
+      ephemeral: true,
+      expires_at: PAST(),
+      parent_studio_id: null,
+      lease: freshLease({ sessionId: 'sess-cli', threadKey: 'pr:545' }),
+      worktree_path: worktreeDir,
+      ...overrides,
+    };
+  }
+
+  function homeRow(overrides: Row = {}): Row {
+    return {
+      id: 's-home',
+      user_id: 'u',
+      status: 'active',
+      ephemeral: false,
+      expires_at: null,
+      parent_studio_id: null,
+      lease: freshLease({ sessionId: 'sess-cli', threadKey: 'pr:538' }),
+      worktree_path: elsewhereDir,
+      ...overrides,
+    };
+  }
+
+  function baseTables(studios: Row[], sessions: Row[] = [cliSession()]): Record<string, Row[]> {
+    return {
+      studios,
+      sessions,
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('renewBySession renews the durable home but not the expired elsewhere-held ephemeral', async () => {
+    const eph = ephemeralRow();
+    const home = homeRow();
+    const ephHeartbeatBefore = (eph.lease as StudioLease).heartbeatAt;
+    const homeHeartbeatBefore = (home.lease as StudioLease).heartbeatAt;
+    const tables = baseTables([eph, home]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    // Deterministic heartbeat comparison: ensure the clock has moved.
+    await new Promise((r) => setTimeout(r, 5));
+    const any = await service.renewBySession('sess-cli', 'u');
+
+    expect(any).toBe(true); // the home studio still renews
+    expect((tables.studios[1].lease as StudioLease).heartbeatAt).not.toBe(homeHeartbeatBefore);
+    // The orphan's freshness is no longer manufactured.
+    expect((tables.studios[0].lease as StudioLease).heartbeatAt).toBe(ephHeartbeatBefore);
+  });
+
+  it('renewal is preserved on every uncertain read (fail closed)', async () => {
+    const cases: Array<{ name: string; studio: Row; session?: Row }> = [
+      { name: 'TTL not yet expired', studio: ephemeralRow({ expires_at: FUTURE() }) },
+      { name: 'durable studio with a past expires_at', studio: ephemeralRow({ ephemeral: false }) },
+      { name: 'no worktree path', studio: ephemeralRow({ worktree_path: null }) },
+      {
+        name: 'holder working_dir unknown',
+        studio: ephemeralRow(),
+        session: cliSession({ working_dir: null }),
+      },
+      {
+        name: 'holder working_dir unresolvable',
+        studio: ephemeralRow(),
+        session: cliSession({ working_dir: path.join(tmpdir(), 'does-not-exist-s1-xyz') }),
+      },
+      {
+        name: 'holder mid-turn',
+        studio: ephemeralRow(),
+        session: cliSession({ cli_turn_at: new Date().toISOString() }),
+      },
+    ];
+
+    for (const c of cases) {
+      const before = (c.studio.lease as StudioLease).heartbeatAt;
+      const tables = baseTables([c.studio], [c.session ?? cliSession()]);
+      const service = new StudioLeaseService(makeFakeSupabase(tables));
+      await new Promise((r) => setTimeout(r, 2));
+      await service.renewBySession('sess-cli', 'u');
+      expect((tables.studios[0].lease as StudioLease).heartbeatAt, c.name).not.toBe(before);
+    }
+  });
+
+  it('renewal is preserved when the holder is INSIDE the worktree (spawned run)', async () => {
+    const inside = path.join(worktreeDir, 'packages', 'api');
+    await execFileAsync('mkdir', ['-p', inside]);
+    const studio = ephemeralRow();
+    const before = (studio.lease as StudioLease).heartbeatAt;
+    const tables = baseTables([studio], [cliSession({ working_dir: inside })]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    await new Promise((r) => setTimeout(r, 2));
+    await service.renewBySession('sess-cli', 'u');
+    expect((tables.studios[0].lease as StudioLease).heartbeatAt).not.toBe(before);
+  });
+
+  it('sweep stamps pendingRelease on a stale live-holder elsewhere-held ephemeral instead of renewing', async () => {
+    const studio = ephemeralRow({
+      lease: staleLease({ sessionId: 'sess-cli', threadKey: 'pr:545' }),
+    });
+    const before = (studio.lease as StudioLease).heartbeatAt;
+    const tables = baseTables([studio]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stats = await service.sweepExpiredLeases();
+
+    const lease = tables.studios[0].lease as StudioLease;
+    expect(lease.pendingRelease?.reason).toBe('expired-elsewhere-held');
+    expect(lease.heartbeatAt).toBe(before); // no synthetic freshness
+    expect(stats.renewed).toBe(0);
+    expect(stats.expired).toBe(0); // never a direct reclaim while the holder is live
+  });
+
+  it('the stamped orphan releases at the holder next real boundary', async () => {
+    const studio = ephemeralRow({
+      lease: staleLease({
+        sessionId: 'sess-cli',
+        threadKey: 'pr:545',
+        pendingRelease: { reason: 'expired-elsewhere-held', requestedAt: new Date().toISOString() },
+      }),
+    });
+    const tables = baseTables([studio]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('sess-cli', {
+      userId: 'u',
+      sessionTerminal: false,
+      reason: 'stop',
+    });
+
+    expect(released).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studio_lease_events.map((e) => e.event)).toContain('released');
+  });
+
+  it('sweep leaves a live same-directory ephemeral alone even when expired', async () => {
+    // The holder genuinely working inside the tree: expiry must not disturb it.
+    const studio = ephemeralRow({
+      lease: staleLease({ sessionId: 'sess-cli', threadKey: 'pr:545' }),
+    });
+    const tables = baseTables([studio], [cliSession({ working_dir: worktreeDir })]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stats = await service.sweepExpiredLeases();
+
+    const lease = tables.studios[0].lease as StudioLease;
+    expect(lease.pendingRelease).toBeUndefined();
+    expect(stats.renewed).toBe(1); // renewed on the holder's behalf, as before
+  });
+});
+
+describe('S1: multi-hold warn dedupe (spec v18)', () => {
+  afterEach(() => {
+    resetActiveRuns();
+    vi.restoreAllMocks();
+  });
+
+  function twoStudios(): Record<string, Row[]> {
+    return {
+      studios: [
+        {
+          id: 's-a',
+          user_id: 'u',
+          ephemeral: false,
+          expires_at: null,
+          lease: freshLease({ sessionId: 'sess-1', threadKey: 'pr:1' }),
+          worktree_path: null,
+        },
+        {
+          id: 's-b',
+          user_id: 'u',
+          ephemeral: false,
+          expires_at: null,
+          lease: freshLease({ sessionId: 'sess-1', threadKey: 'pr:2' }),
+          worktree_path: null,
+        },
+      ],
+      sessions: [],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('warns once per holder-set, re-arms when the set shrinks, warns again on regrowth', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn');
+    const tables = twoStudios();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const multiHoldWarns = () =>
+      warnSpy.mock.calls.filter(([msg]) => String(msg).includes('Session holds multiple studios'))
+        .length;
+
+    await service.renewBySession('sess-1', 'u');
+    await service.renewBySession('sess-1', 'u');
+    await service.renewBySession('sess-1', 'u');
+    expect(multiHoldWarns()).toBe(1); // once per set, not per poll
+
+    // The set shrinks to one — the dedupe re-arms.
+    tables.studios[1].lease = null;
+    await service.renewBySession('sess-1', 'u');
+    expect(multiHoldWarns()).toBe(1);
+
+    // Regrowth is a NEW set and logs again.
+    tables.studios[1].lease = freshLease({ sessionId: 'sess-1', threadKey: 'pr:3' });
+    await service.renewBySession('sess-1', 'u');
+    expect(multiHoldWarns()).toBe(2);
+  });
+});
+
+describe('S1: session repoint on ephemeral release (spec v18)', () => {
+  afterEach(() => resetActiveRuns());
+
+  function repointTables(): Record<string, Row[]> {
+    return {
+      studios: [
+        {
+          id: 's-eph',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: true,
+          expires_at: null,
+          parent_studio_id: 's-mid',
+          lease: freshLease({ sessionId: 'sess-1', threadKey: 'pr:9' }),
+          worktree_path: null,
+        },
+        // An ephemeral ancestor in between: the walk must pass over it.
+        {
+          id: 's-mid',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: true,
+          expires_at: null,
+          parent_studio_id: 's-home',
+          lease: null,
+          worktree_path: null,
+        },
+        {
+          id: 's-home',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: false,
+          expires_at: null,
+          parent_studio_id: null,
+          lease: null,
+          worktree_path: null,
+        },
+      ],
+      sessions: [
+        { id: 'sess-1', user_id: 'u', studio_id: 's-eph', working_dir: null },
+        { id: 'sess-other', user_id: 'u', studio_id: 's-home', working_dir: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('releasing an ephemeral repoints its sessions to the first durable ancestor', async () => {
+    const tables = repointTables();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseBySession('sess-1', { userId: 'u', reason: 'test' });
+
+    expect(released).toBe(true);
+    expect(tables.sessions[0].studio_id).toBe('s-home'); // walked past the ephemeral mid
+    expect(tables.sessions[1].studio_id).toBe('s-home'); // untouched (never pointed at s-eph)
+  });
+
+  it('falls back to NULL when no durable ancestor survives', async () => {
+    const tables = repointTables();
+    (tables.studios[2] as Row).status = 'cleaned'; // the durable home is gone
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    await service.releaseBySession('sess-1', { userId: 'u', reason: 'test' });
+
+    expect(tables.sessions[0].studio_id).toBeNull();
+  });
+
+  it('releasing a durable studio never touches session pointers', async () => {
+    const tables = repointTables();
+    tables.studios[2].lease = freshLease({ sessionId: 'sess-2', threadKey: 'pr:10' });
+    tables.sessions.push({ id: 'sess-2', user_id: 'u', studio_id: 's-home', working_dir: null });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    await service.releaseBySession('sess-2', { userId: 'u', reason: 'test' });
+
+    expect(tables.sessions[2].studio_id).toBe('s-home');
+  });
+});
+
+describe('S1 r1: release/repoint gap regressions (PR #550, Lumen r1)', () => {
+  afterEach(() => resetActiveRuns());
+
+  function retireTables(): Record<string, Row[]> {
+    return {
+      studios: [
+        {
+          id: 's-eph',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: true,
+          expires_at: null,
+          parent_studio_id: 's-home',
+          lease: staleLease({ sessionId: 'sess-gone', threadKey: 'pr:11' }),
+          worktree_path: path.join(tmpdir(), 's1-r1-absent-worktree-xyz'),
+        },
+        {
+          id: 's-home',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: false,
+          expires_at: null,
+          parent_studio_id: null,
+          lease: null,
+          worktree_path: null,
+        },
+      ],
+      sessions: [
+        // Holder gone: row exists, no poll, no open turn.
+        {
+          id: 'sess-gone',
+          user_id: 'u',
+          studio_id: 's-eph',
+          working_dir: null,
+          cli_poll_at: null,
+          cli_turn_at: null,
+        },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('acquire-path retire of an absent-worktree ephemeral repoints its sessions', async () => {
+    const tables = retireTables();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire({
+      studioId: 's-eph',
+      sessionId: 'sess-new',
+      threadKey: 'pr:11',
+      sbSlug: 'wren',
+      userId: 'u',
+    });
+
+    expect(result.acquired).toBe(false);
+    expect(tables.studios[0].status).toBe('cleaned'); // retired, per round 7
+    // The r1 gap: retire is a successful cleaning exit and must repoint too.
+    expect(tables.sessions[0].studio_id).toBe('s-home');
+  });
+
+  it('a lost final sweep clear reports nothing: no expired count, no repoint, no event', async () => {
+    const tables = retireTables();
+    tables.studios[0].worktree_path = null; // skip the absent-worktree retire branch
+    const thief = freshLease({ sessionId: 'thief', threadKey: 'pr:99' });
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        // studios update #1 is the recovery claim; #2 is the final clear.
+        // Replace the lease in between — the clear's exact-claim CAS must
+        // lose, and a lost clear must report NOTHING.
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 2) {
+            tables.studios[0].lease = { ...thief };
+          }
+        },
+      })
+    );
+
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.expired).toBe(0);
+    expect(tables.sessions[0].studio_id).toBe('s-eph'); // no repoint
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('expired');
+    // The concurrent write survived untouched.
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('thief');
+  });
+});
+
+describe('S2: thread multiplexing on the lease (spec v18)', () => {
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  const acquireReq = (threadKey: string, sessionId: string) => ({
+    studioId: 'studio-1',
+    sessionId,
+    threadKey,
+    sbSlug: 'wren',
+    userId: 'user-1',
+    reason: 'route-pattern',
+  });
+
+  const storedLease = () => tables.studios[0].lease as StudioLease;
+
+  it('leaseThreadKeys: scalar fallback for legacy leases, authoritative set otherwise', () => {
+    expect(leaseThreadKeys(freshLease())).toEqual(['pr:100']);
+    expect(leaseThreadKeys(freshLease({ threadKeys: ['pr:100', 'pr:200'] }))).toEqual([
+      'pr:100',
+      'pr:200',
+    ]);
+    // Once the field exists it is authoritative — a removed key must not
+    // resurrect through the scalar.
+    expect(leaseThreadKeys(freshLease({ threadKey: 'pr:A', threadKeys: ['pr:B'] }))).toEqual([
+      'pr:B',
+    ]);
+    expect(leaseThreadKeys(freshLease({ threadKeys: ['a', 'a'] }))).toEqual(['a']);
+  });
+
+  it('same session, new thread — appends the key, bumps the heartbeat, keeps the scalar', async () => {
+    const lease = freshLease({ sessionId: 'session-b', threadKeys: ['pr:100'] });
+    tables.studios[0].lease = lease as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    await new Promise((r) => setTimeout(r, 5));
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+    expect(storedLease().threadKey).toBe('pr:100'); // first-acquisition telemetry
+    expect(storedLease().sessionId).toBe('session-b');
+    expect(storedLease().acquiredAt).toBe(lease.acquiredAt); // no re-grant
+    expect(storedLease().heartbeatAt).not.toBe(lease.heartbeatAt); // holder's own act
+    const appendEvents = tables.studio_lease_events.filter(
+      (e) => e.event === 'acquired' && e.reason === 'multiplex-append'
+    );
+    expect(appendEvents).toHaveLength(1);
+    expect(appendEvents[0].thread_key).toBe('pr:200');
+  });
+
+  it('a legacy scalar-only lease appends from the scalar', async () => {
+    tables.studios[0].lease = freshLease({ sessionId: 'session-b' }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+  });
+
+  it('an append never erases a stamped pendingRelease', async () => {
+    const pending = { reason: 'thread-closed', requestedAt: new Date().toISOString() };
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100'],
+      pendingRelease: pending,
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+    // Protection is never erased by bookkeeping: the boundary still completes it.
+    expect(storedLease().pendingRelease).toEqual(pending);
+  });
+
+  it('append CAS race: a thief replacing the lease mid-append is refused, never clobbered', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100'],
+    }) as unknown as Row;
+    const thief = freshLease({ sessionId: 'thief', threadKey: 'pr:999', threadKeys: ['pr:999'] });
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            tables.studios[0].lease = thief as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(false);
+    if (!result.acquired) expect(result.holder?.sessionId).toBe('thief');
+    // The thief's lease survives exactly as written.
+    expect(storedLease().threadKeys).toEqual(['pr:999']);
+  });
+
+  it('re-acquire of a key already in the set grants without duplicating it', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100', 'pr:200'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+    expect(storedLease().sessionId).toBe('session-b');
+  });
+
+  it('adoption by a successor session on a multiplexed member key carries the whole set', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-dead',
+      threadKeys: ['pr:100', 'pr:200'],
+    }) as unknown as Row;
+    tables.sessions.push({
+      id: 'session-dead',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+      cli_attached: false,
+      cli_poll_at: null,
+      cli_turn_at: null,
+    });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-c'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().sessionId).toBe('session-c');
+    // The studio still serves both threads; their next messages route to the
+    // successor and pass the gate through the set.
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+  });
+
+  it('a fresh foreign multiplexed lease still refuses a non-member thread', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100', 'pr:200'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:999', 'session-z'));
+    expect(result.acquired).toBe(false);
+    expect(storedLease().sessionId).toBe('session-b');
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+  });
+});
+
+describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  const storedLease = () => tables.studios[0].lease as StudioLease | null;
+
+  const liveHolder = () =>
+    registerActiveRun({
+      sessionId: 'session-b',
+      userId: 'user-1',
+      sbSlug: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+
+  it('closing one multiplexed thread removes only its key — even under a LIVE holder', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
+    // The lease, the holder, and the worktree all survive for pr:B.
+    expect(storedLease()?.sessionId).toBe('session-b');
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']);
+    expect(storedLease()?.threadKey).toBe('pr:A'); // scalar = telemetry, untouched
+    expect(storedLease()?.pendingRelease).toBeUndefined();
+  });
+
+  it('closing the LAST key with a live holder defers via pendingRelease, never removes to empty', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 1, removed: 0, studioIds: ['studio-1'] });
+    expect(storedLease()?.threadKeys).toEqual(['pr:A']);
+    expect(storedLease()?.pendingRelease?.reason).toBe('thread-closed');
+  });
+
+  it('closing the LAST surviving key at a real boundary releases the whole lease — even when it is not the scalar', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:B', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 1, deferred: 0, removed: 0, studioIds: ['studio-1'] });
+    expect(storedLease()).toBeNull();
+    expect(tables.studio_lease_events.map((e) => e.event)).toContain('released');
+  });
+
+  it('a scalar key already removed from the set no longer matches its lease', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 0, studioIds: [] });
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']);
+  });
+
+  it("concurrent closes cannot resurrect each other's keys (exact-set CAS guard)", async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            // A concurrent close of pr:B lands between our read and our CAS.
+            const current = tables.studios[0].lease as StudioLease;
+            tables.studios[0].lease = { ...current, threadKeys: ['pr:A'] } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    // Our stale remove (write ['pr:B']) must LOSE: pr:B was already closed and
+    // must stay closed. The re-read finds pr:A is now the last key, and the
+    // live holder defers it — the honest outcome for that state.
+    expect(storedLease()?.threadKeys).toEqual(['pr:A']);
+    expect(result).toEqual({ released: 0, deferred: 1, removed: 0, studioIds: ['studio-1'] });
+    expect(storedLease()?.pendingRelease?.reason).toBe('thread-closed');
+  });
+
+  it('a last-key close racing an APPEND re-decides — the appended thread is never deferred to death (Lumen r1 P1-1)', async () => {
+    // Close A reads [A] and decides "last"; the live holder appends B before
+    // the stamp lands. A blindly-retried whole-lease pendingRelease would
+    // stamp [A,B] and clear live B at the holder's next boundary. The stamp
+    // is a single exact-state CAS: it loses, the re-read sees [A,B], and the
+    // close correctly demotes itself to a key-remove.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            const current = tables.studios[0].lease as StudioLease;
+            tables.studios[0].lease = {
+              ...current,
+              threadKeys: ['pr:A', 'pr:B'],
+              heartbeatAt: new Date(Date.now() + 5).toISOString(),
+            } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']);
+    // The whole lease was NOT marked for release — B lives on undisturbed.
+    expect(storedLease()?.pendingRelease).toBeUndefined();
+  });
+
+  it('a last-key RELEASE racing an APPEND re-decides — closed A never strands in the set (Lumen r1 P1-1)', async () => {
+    // Same race on the not-live path: the clear CAS loses to the append.
+    // Returning 'none' here would leave closed A riding the lease forever;
+    // the re-read demotes the close to a key-remove instead.
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            const current = tables.studios[0].lease as StudioLease;
+            tables.studios[0].lease = {
+              ...current,
+              threadKeys: ['pr:A', 'pr:B'],
+              heartbeatAt: new Date().toISOString(),
+            } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
+    expect(storedLease()?.sessionId).toBe('session-b'); // lease survives for B
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']); // A is gone, not stranded
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('released');
+  });
+
+  it('an append that FOLLOWS the marker is never released underneath — the boundary reconciles (Lumen r2)', async () => {
+    // The sequential race exact-state CAS cannot see: close A stamps the
+    // marker successfully; B then arrives and legitimately appends (the
+    // marker is preserved, pinned elsewhere); the holder's non-terminal
+    // boundary fires. Whole-lease completion here would accept B and then
+    // release it underneath. The marker carries its closing thread, so the
+    // boundary completes exactly that thread's exit and the lease lives on.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const closed = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(closed.deferred).toBe(1);
+    expect(storedLease()?.pendingRelease?.threadKey).toBe('pr:A');
+
+    const appended = await service.acquire({
+      studioId: 'studio-1',
+      sessionId: 'session-b',
+      threadKey: 'pr:B',
+      sbSlug: 'wren',
+      userId: 'user-1',
+      reason: 'route-pattern',
+    });
+    expect(appended.acquired).toBe(true);
+    expect(storedLease()?.threadKeys).toEqual(['pr:A', 'pr:B']);
+    expect(storedLease()?.pendingRelease?.threadKey).toBe('pr:A');
+
+    resetActiveRuns(); // the turn ends — a real stop boundary, session lives
+    const released = await service.releaseAtBoundary('session-b', {
+      userId: 'user-1',
+      sessionTerminal: false,
+      reason: 'run-finalized',
+    });
+
+    expect(released).toBe(false); // reconciled, not released
+    expect(storedLease()?.sessionId).toBe('session-b');
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']); // A exited, B lives
+    expect(storedLease()?.pendingRelease).toBeUndefined();
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('released');
+  });
+
+  it('a thread-scoped marker still completes whole-lease at the boundary when its thread stayed last', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date().toISOString(),
+        threadKey: 'pr:A',
+      },
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('session-b', {
+      userId: 'user-1',
+      sessionTerminal: false,
+      reason: 'run-finalized',
+    });
+    expect(released).toBe(true);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('a TERMINAL boundary releases the whole multiplexed lease — the process left the tree', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date().toISOString(),
+        threadKey: 'pr:A',
+      },
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('session-b', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'session-terminal',
+    });
+    expect(released).toBe(true);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('the sweep completes a thread-scoped marker whole-lease once the holder is provably gone', async () => {
+    // Reconciling for a dead session would leave a dead holder on the tree;
+    // survivors re-acquire vacant on their next message.
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date().toISOString(),
+        threadKey: 'pr:A',
+      },
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stats = await service.sweepExpiredLeases();
+    expect(stats.released).toBe(1);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('teardown claim is refused while another live key remains', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('studio-1', 'user-1', {
+      expectedThreadKey: 'pr:A',
+      reason: 'thread pr:A closed',
+    });
+    expect(claim).toBeNull();
+    expect(storedLease()?.sessionId).toBe('session-b');
+    expect(storedLease()?.threadKeys).toEqual(['pr:A', 'pr:B']);
+  });
+
+  it('teardown claim proceeds once the expected key is the last survivor — even when it is not the scalar', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('studio-1', 'user-1', {
+      expectedThreadKey: 'pr:B',
+      reason: 'thread pr:B closed',
+    });
+    expect(claim).not.toBeNull();
+    expect(storedLease()?.quarantined).toBe(true);
+    expect(storedLease()?.claimKind).toBe('teardown');
+  });
+});
+
+describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
+  // The scenario this closes: turn A's boundary checks the SESSION row's
+  // epoch, passes, and then releases — but successor turn B stamped the
+  // LEASE during routing, before B's running-write touched the session row.
+  // The lease itself now carries its acquiring turn's epoch, and the
+  // boundary compares against it under the release CAS.
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  const storedLease = () => tables.studios[0].lease as StudioLease | null;
+  const acquireReq = (overrides: Record<string, unknown> = {}) => ({
+    studioId: 'studio-1',
+    sessionId: 'session-b',
+    threadKey: 'pr:100',
+    sbSlug: 'wren',
+    userId: 'user-1',
+    reason: 'route-pattern',
+    ...overrides,
+  });
+
+  it('a fresh grant stamps the acquiring turn’s epoch', async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const result = await service.acquire(acquireReq({ turnEpoch: 'epoch-a' }));
+    expect(result.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-a');
+  });
+
+  it('a successor turn’s same-session re-acquire RESTAMPS the lease (append and same-thread rung)', async () => {
+    // Turn A holds; turn B on the SAME session multiplexes a new thread —
+    // the lease now belongs to B's generation and A's boundary must see it.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100'],
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const appended = await service.acquire(
+      acquireReq({ threadKey: 'pr:200', turnEpoch: 'epoch-b' })
+    );
+    expect(appended.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+
+    // Same thread again (heartbeat-bump rung) — the newest turn still wins
+    // the stamp, and an epoch-less re-acquire carries the stamp forward.
+    const rebumped = await service.acquire(acquireReq({ turnEpoch: 'epoch-c' }));
+    expect(rebumped.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-c');
+
+    const unfenced = await service.acquire(acquireReq());
+    expect(unfenced.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-c');
+  });
+
+  it('releaseAtBoundary refuses a lease stamped by a DIFFERENT turn', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('session-a', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'run-terminal',
+      expectedTurnEpoch: 'epoch-a',
+    });
+
+    expect(released).toBe(false);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+  });
+
+  it('releases its own stamp; unstamped leases and unfenced boundaries keep legacy behavior', async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    // Own stamp → releases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+
+    // Unstamped lease (pre-round-9, CLI-claimed) under a fenced boundary →
+    // releases; there is no generation to compare.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-a' }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+
+    // Stamped lease under an UNfenced boundary (legacy caller) → releases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('the release CAS loses to a re-acquire interleaved after the boundary’s read — even in the same millisecond', async () => {
+    // heartbeatAt inequality usually catches the interleaving; this pins the
+    // casLease turnEpoch guard for the same-ms collision where it does not.
+    const lease = freshLease({ sessionId: 'session-a', turnEpoch: 'epoch-a' });
+    tables.studios[0].lease = lease as unknown as Row;
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            // Successor re-acquire lands between read and CAS: same
+            // heartbeatAt (same-ms), new epoch.
+            tables.studios[0].lease = { ...lease, turnEpoch: 'epoch-b' } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const released = await service.releaseAtBoundary('session-a', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'run-terminal',
+      expectedTurnEpoch: 'epoch-a',
+    });
+
+    expect(released).toBe(false);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+  });
+
+  it('renewals carry the stamp forward (parser round-trip)', async () => {
+    // Every rewrite serializes the PARSED lease — a field the parser drops
+    // is a field every renewal silently erases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-a');
+  });
+
+  it('renewals and touches are PURE heartbeats — no code path can rewind a stamp (round 13)', async () => {
+    // The A→B→delayed-A rewind: successor B's claim stamped the lease
+    // epoch-b; a DELAYED turn A's renewal and held-touch land afterwards.
+    // Neither carries a generation anymore, so B's stamp survives both —
+    // and B's own fenced boundary still releases while A's still refuses.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+    expect(await service.touchStudioLeaseForSession('studio-1', 'session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+
+    // Delayed A's fenced boundary refuses B's lease...
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(false);
+    expect(storedLease()).not.toBeNull();
+
+    // ...while B's own releases.
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-b',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
   });
 });

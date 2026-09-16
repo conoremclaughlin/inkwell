@@ -19,7 +19,7 @@ describe('RecallFeedbackRepository', () => {
 
       const saved = await repo.saveFeedback({
         userId: 'user-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         query: 'merge strategy',
         sessionId: 'sess-1',
         entries: [
@@ -128,8 +128,8 @@ describe('RecallFeedbackRepository', () => {
 
       const eqCalls = (mockSupabase._queryBuilder.eq as ReturnType<typeof import('vitest').vi.fn>)
         .mock.calls;
-      const agentIdCalls = eqCalls.filter(([field]: [string]) => field === 'agent_id');
-      expect(agentIdCalls).toHaveLength(0);
+      const sbSlugCalls = eqCalls.filter(([field]: [string]) => field === 'agent_id');
+      expect(sbSlugCalls).toHaveLength(0);
     });
   });
 });

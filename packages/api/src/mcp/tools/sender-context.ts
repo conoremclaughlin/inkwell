@@ -54,17 +54,17 @@ export function senderRoutingContext(isBridge?: boolean): {
 export async function isBridgeIdentity(
   supabase: any,
   userId: string,
-  agentId?: string | null,
+  sbSlug?: string | null,
   sbId?: string | null
 ): Promise<boolean> {
   if (!supabase) return false;
-  if (!sbId && !agentId) return false;
+  if (!sbId && !sbSlug) return false;
   try {
     let query = supabase.from('agent_identities').select('metadata').eq('user_id', userId).limit(2);
     // Prefer the canonical UUID. A slug is ambiguous across workspaces, so
     // slug-only classification can read the WRONG identity's bridge flag
     // (Lumen, PR #514 round 2).
-    query = sbId ? query.eq('id', sbId) : query.eq('agent_id', agentId);
+    query = sbId ? query.eq('id', sbId) : query.eq('agent_id', sbSlug);
     const { data, error } = await query;
 
     if (error) {
@@ -74,7 +74,7 @@ export async function isBridgeIdentity(
       // relay's own worktree silently. Previously this returned false — the
       // dangerous direction — despite the comment claiming otherwise.
       logger.warn('[SenderContext] Bridge lookup failed; skipping caller-repo inference', {
-        agentId: agentId || null,
+        sbSlug: sbSlug || null,
         sbId: sbId || null,
         error: error.message,
       });
@@ -84,7 +84,7 @@ export async function isBridgeIdentity(
     if (!data?.length) return false;
     if (data.length > 1 && !sbId) {
       logger.warn('[SenderContext] Ambiguous sender slug; skipping caller-repo inference', {
-        agentId,
+        sbSlug,
       });
       return true;
     }
@@ -97,7 +97,7 @@ export async function isBridgeIdentity(
     );
   } catch (err) {
     logger.warn('[SenderContext] Bridge lookup threw; skipping caller-repo inference', {
-      agentId: agentId || null,
+      sbSlug: sbSlug || null,
       error: err instanceof Error ? err.message : String(err),
     });
     return true;

@@ -7,6 +7,9 @@
  * Docs: https://developers.openai.com/codex/cli/
  */
 
+import { mkdirSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
@@ -39,7 +42,7 @@ export class CodexAdapter implements BackendAdapter {
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(
-      config.agentId,
+      config.sbSlug,
       config.startupContextBlock,
       config.systemPromptOverride
     );
@@ -56,6 +59,18 @@ export class CodexAdapter implements BackendAdapter {
     // Identity injection via config override (uses -c which works both
     // as root --config and as resume's -c flag)
     args.push('-c', `model_instructions_file=${promptFile}`);
+
+    // Ephemeral-studio root (spec:studio-materialization v8): writable
+    // alongside the workspace. --add-dir exists on both the root command and
+    // the resume subcommand, and this push lands after `resume` when
+    // resuming, so both shapes carry the grant. Created if missing.
+    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    try {
+      mkdirSync(inkStudiosDir, { recursive: true });
+    } catch {
+      // Non-fatal — worst case the grant is a no-op until the dir exists.
+    }
+    args.push('--add-dir', inkStudiosDir);
 
     // Ink session headers — Codex resolves env var names to values at runtime.
     // Server key must match what's in .codex/config.toml (mcp_servers.inkwell).
@@ -130,7 +145,7 @@ export class CodexAdapter implements BackendAdapter {
     const contextToken = encodeContextToken({
       sessionId: config.pcpSessionId || '',
       studioId: config.studioId || '',
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       cliAttached: true,
       runtime: 'codex',
     });
@@ -142,7 +157,8 @@ export class CodexAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
-        AGENT_ID: config.agentId,
+        SB_SLUG: config.sbSlug,
+        AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),

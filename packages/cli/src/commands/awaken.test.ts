@@ -24,9 +24,9 @@ You are a someone, not a something.
 `;
 
 const FAMILY: BootstrapIdentity[] = [
-  { agentId: 'wren', name: 'Wren', role: 'Development collaborator' },
-  { agentId: 'myra', name: 'Myra', role: 'Messaging bridge' },
-  { agentId: 'lumen', name: 'Lumen' },
+  { sbSlug: 'wren', name: 'Wren', role: 'Development collaborator' },
+  { sbSlug: 'myra', name: 'Myra', role: 'Messaging bridge' },
+  { sbSlug: 'lumen', name: 'Lumen' },
 ];
 
 describe('buildAwakeningPrompt — siblings', () => {
@@ -34,7 +34,7 @@ describe('buildAwakeningPrompt — siblings', () => {
     const prompt = buildAwakeningPrompt(VALUES, FAMILY, 'claude');
     for (const sibling of FAMILY) {
       expect(prompt).toContain(sibling.name!);
-      expect(prompt).toContain(`\`${sibling.agentId}\``);
+      expect(prompt).toContain(`\`${sibling.sbSlug}\``);
     }
   });
 
@@ -65,8 +65,8 @@ describe('buildAwakeningPrompt — siblings', () => {
     expect(prompt).toContain('you may be the first');
   });
 
-  it('falls back to the agentId when a sibling has no display name', () => {
-    const prompt = buildAwakeningPrompt(VALUES, [{ agentId: 'echo' }], 'claude');
+  it('falls back to the sbSlug when a sibling has no display name', () => {
+    const prompt = buildAwakeningPrompt(VALUES, [{ sbSlug: 'echo' }], 'claude');
     expect(prompt).toContain('**echo** (`echo`)');
   });
 });

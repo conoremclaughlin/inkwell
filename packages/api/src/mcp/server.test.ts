@@ -14,15 +14,13 @@ const mockVerifyAccessToken = vi.fn();
 // Mocks — must be declared before importing the module under test
 // ---------------------------------------------------------------------------
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
+    ...(await import('../test/fake-env')).fakeEnv,
     MCP_TRANSPORT: 'http',
     MCP_HTTP_PORT: 0, // will be overridden
     MCP_REQUIRE_OAUTH: false,
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-key',
     SUPABASE_ANON_KEY: 'test-anon-key',
-    JWT_SECRET: 'test-jwt-secret',
   },
 }));
 
@@ -36,7 +34,27 @@ vi.mock('../utils/logger', () => ({
 }));
 
 vi.mock('./tools', () => ({
-  registerAllTools: vi.fn(),
+  registerAllTools: vi.fn((server: any, _data: unknown, options: any) => {
+    // One probe tool: reports the request context seen before and after an
+    // await, plus which catalog this instance was built for.
+    server.registerTool('echo_request_context', {}, async () => {
+      const { getRequestContext } = await import('../utils/request-context');
+      const before = getRequestContext();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              before,
+              after: getRequestContext(),
+              runtimeCatalog: options?.includeInternalLifecycleTools,
+            }),
+          },
+        ],
+      };
+    });
+  }),
   setMiniAppsRegistry: vi.fn(),
   setTelegramListener: vi.fn(),
 }));
@@ -84,7 +102,10 @@ vi.mock('../utils/request-context', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/request-context')>();
   return {
     ...actual,
-    runWithRequestContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
+    // The REAL AsyncLocalStorage runner, spied on so call counts still work.
+    // A no-op stand-in would hide exactly the failure this file must catch:
+    // request context not reaching the SDK's per-request server instance.
+    runWithRequestContext: vi.fn(actual.runWithRequestContext),
   };
 });
 
@@ -163,7 +184,7 @@ function parseSSEResult(body: string): unknown {
 function encodeContextHeader(token: {
   sessionId: string;
   studioId: string;
-  agentId: string;
+  sbSlug: string;
   cliAttached: boolean;
   runtime: string;
 }): string {
@@ -300,6 +321,96 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(result.result.protocolVersion).toBe('2025-03-26');
   });
 
+  it('serves protocol 2026-07-28 to a v2 client and still serves 2025-era clients', async () => {
+    // The production symptom behind the SDK v2 migration: Claude Code offers
+    // 2026-07-28 and the 1.x transport answered every follow-up request with
+    // 400 "Unsupported protocol version". The modern revision rides on the
+    // client's envelope probe, so it is pinned through a real client rather
+    // than a hand-built initialize; the bare initialize below is the legacy
+    // leg, which must keep answering from the same tool registry.
+    if (serverUnavailableError) return;
+    const { Client, StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
+    const connect = async (mode: 'auto' | 'legacy') => {
+      const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
+      // 'auto' is what a 2026 client does: probe the modern revision, fall
+      // back to the 2025 handshake. 'legacy' (the SDK default) is a 2025 client.
+      const client = new Client(
+        { name: 'v2-test-client', version: '0.0.0' },
+        { versionNegotiation: { mode } }
+      );
+      await client.connect(transport);
+      const negotiated = transport.protocolVersion;
+      const serverName = client.getServerVersion()?.name;
+      const tools = await client.listTools();
+      await client.close();
+      return { negotiated, toolCount: tools.tools.length, serverName };
+    };
+
+    const modern = await connect('auto');
+    expect(modern.negotiated).toBe('2026-07-28');
+    expect(modern.serverName).toBe('inkwell');
+
+    const legacy = await connect('legacy');
+    expect(legacy.negotiated).toBe('2025-11-25');
+    // Same factory behind both eras: the catalogs cannot differ. (This file
+    // mocks registerAllTools, so the registry's size is asserted elsewhere.)
+    expect(legacy.toolCount).toBe(modern.toolCount);
+
+    // A bare 2025-style initialize naming the modern revision is legacy
+    // traffic (no envelope): it is answered, not refused with a 400.
+    const bare = await mcpPost(baseUrl, {
+      ...INITIALIZE_REQUEST,
+      params: { ...INITIALIZE_REQUEST.params, protocolVersion: '2026-07-28' },
+    });
+    expect(bare.status).toBe(200);
+    expect((parseSSEResult(bare.body) as any).result.protocolVersion).toBe('2025-11-25');
+  });
+
+  it('keeps each request\u2019s identity, session and catalog through real AsyncLocalStorage, concurrently, in both eras', async () => {
+    // Lumen's #598 review: the factory runs inside runWithRequestContext, and
+    // the SDK's per-request dispatch must preserve that store across awaits
+    // and never leak it between concurrent exchanges. Twelve interleaved
+    // clients, alternating modern/legacy negotiation and agent/runtime
+    // catalogs, each authenticated as a different user.
+    if (serverUnavailableError) return;
+    const { Client, StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
+    mockVerifyAccessToken.mockImplementation(async (auth: string) => ({
+      userId: auth.slice('Bearer '.length),
+      email: 'test@example.com',
+    }));
+    const check = async (i: number) => {
+      const mode = i % 2 === 0 ? 'auto' : 'legacy';
+      const runtime = i % 3 === 0;
+      const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer user-${i}`,
+            'x-ink-session-id': `session-${i}`,
+            'x-ink-caller-profile': runtime ? 'runtime' : 'agent',
+          },
+        },
+      });
+      const client = new Client(
+        { name: 'als-probe', version: '0.0.0' },
+        { versionNegotiation: { mode } }
+      );
+      try {
+        await client.connect(transport);
+        const result: any = await client.callTool({ name: 'echo_request_context', arguments: {} });
+        expect(result.isError).not.toBe(true);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.before.userId).toBe(`user-${i}`);
+        expect(payload.before.sessionId).toBe(`session-${i}`);
+        expect(payload.before.callerProfile).toBe(runtime ? 'runtime' : 'agent');
+        expect(payload.after).toEqual(payload.before);
+        expect(payload.runtimeCatalog).toBe(runtime);
+      } finally {
+        await client.close();
+      }
+    };
+    await Promise.all(Array.from({ length: 12 }, (_, i) => check(i)));
+  });
+
   it('should challenge unauthenticated initialize requests when OAuth is required', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
@@ -423,7 +534,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'wren' }),
+      body: JSON.stringify({ sbSlug: 'wren' }),
     });
 
     expect(res.status).toBe(200);
@@ -435,7 +546,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const token = body.access_token as string;
     const payload = verifyPcpAccessToken(token, 'mcp_access');
     expect(payload?.sub).toBe('user-123');
-    expect(payload?.agentId).toBe('wren');
+    expect(payload?.sbSlug).toBe('wren');
     expect(payload?.identityId).toBe('identity-abc');
   });
 
@@ -446,7 +557,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'wren' }),
+      body: JSON.stringify({ sbSlug: 'wren' }),
     });
 
     expect(res.status).toBe(401);
@@ -460,7 +571,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'aster' }),
+      body: JSON.stringify({ sbSlug: 'aster' }),
     });
 
     expect(res.status).toBe(403);
@@ -476,7 +587,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -491,7 +602,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -515,7 +626,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
       userId: 'user-456',
-      agentId: 'myra',
+      sbSlug: 'myra',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -530,7 +641,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
       studioId: 'studio-1',
-      agentId: 'myra',
+      sbSlug: 'myra',
       cliAttached: false,
       runtime: 'ink',
     });
@@ -555,7 +666,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
       userId: 'user-999',
-      agentId: 'myra',
+      sbSlug: 'myra',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -570,7 +681,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
       studioId: 'studio-1',
-      agentId: 'myra',
+      sbSlug: 'myra',
       cliAttached: false,
       runtime: 'ink',
     });
@@ -593,7 +704,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'forged-session-id',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -614,7 +725,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'not-a-uuid',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -628,14 +739,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     (env as any).MCP_REQUIRE_OAUTH = false;
   });
 
-  it('should reject context when session agentId does not match', async () => {
+  it('should reject context when session sbSlug does not match', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
     mockVerifyAccessToken.mockResolvedValue(null);
     mockGetSession.mockResolvedValue({
       id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       userId: 'user-456',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -645,7 +756,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -665,7 +776,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'completed',
       startedAt: new Date('2026-01-01'),
       endedAt: new Date('2026-01-02'),
@@ -675,7 +786,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -694,7 +805,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -709,7 +820,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -730,14 +841,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockVerifyAccessToken.mockResolvedValue({
       userId: 'oauth-user',
       email: 'oauth@example.com',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'oauth-sb',
     });
 
     const contextHeader = encodeContextHeader({
       sessionId: 'd4e5f6a7-b8c9-0123-defa-234567890123',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -831,7 +942,7 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
   const liveSession = (sbId: string | undefined) => ({
     id: SID,
     userId: 'user-456',
-    agentId: 'myra',
+    sbSlug: 'myra',
     sbId,
     lifecycle: 'running',
     startedAt: new Date(),
@@ -846,11 +957,11 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
         enrichIdentityFromContextSession: (
           u: unknown,
           t: unknown
-        ) => Promise<{ agentId?: string; sbId?: string } | null>;
+        ) => Promise<{ sbSlug?: string; sbId?: string } | null>;
       }
-    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
 
-    expect(enriched?.agentId).toBe('myra');
+    expect(enriched?.sbSlug).toBe('myra');
     expect(enriched?.sbId).toBe('sb-uuid-B');
 
     // The header-produced identity flows through to workspace scope,
@@ -873,11 +984,11 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
         enrichIdentityFromContextSession: (
           u: unknown,
           t: unknown
-        ) => Promise<{ agentId?: string } | null>;
+        ) => Promise<{ sbSlug?: string } | null>;
       }
-    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
     // Slug fallback hits the duplicate-row error → no enrichment.
-    expect(enriched?.agentId).toBeUndefined();
+    expect(enriched?.sbSlug).toBeUndefined();
   });
 
   it('refuses enrichment when the session belongs to a different user', async () => {
@@ -887,9 +998,9 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
         enrichIdentityFromContextSession: (
           u: unknown,
           t: unknown
-        ) => Promise<{ agentId?: string } | null>;
+        ) => Promise<{ sbSlug?: string } | null>;
       }
-    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
-    expect(enriched?.agentId).toBeUndefined();
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
+    expect(enriched?.sbSlug).toBeUndefined();
   });
 });

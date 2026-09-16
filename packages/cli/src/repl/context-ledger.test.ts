@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ContextLedger, estimateTokens } from './context-ledger.js';
+import { entryRefHash, ContextLedger, estimateTokens } from './context-ledger.js';
 
 describe('ContextLedger', () => {
   it('estimates tokens from content length', () => {
@@ -170,6 +170,75 @@ describe('ContextLedger', () => {
       expect(summary[0].preview).toBe('a short message');
       expect(summary[1].preview.length).toBeLessThanOrEqual(123); // 120 + "..."
       expect(summary[1].source).toBe('ink-tool');
+    });
+  });
+
+  describe('findEntriesByRefs — a hash beside an eid is enforced (Lumen, PR #582)', () => {
+    it('REGRESSION: two entries sharing an eid; a ref with eid+hash selects only the hashed one', () => {
+      const ledger = new ContextLedger();
+      const target = ledger.addEntry('inbox', 'target', 'inkmail', 7);
+      const neighbour = ledger.addEntry('inbox', 'neighbour', 'inkmail', 7);
+      const ids = ledger.findEntriesByRefs([{ eid: 7, hash: entryRefHash('inbox', 'target') }]);
+      expect(ids).toEqual([target.id]);
+      expect(ids).not.toContain(neighbour.id);
+    });
+
+    it('an eid-only ref (legacy) still matches every entry with that eid; a hash-only ref matches by content', () => {
+      const ledger = new ContextLedger();
+      const a = ledger.addEntry('inbox', 'a', 'inkmail', 7);
+      const b = ledger.addEntry('inbox', 'b', 'inkmail', 7);
+      const c = ledger.addEntry('user', 'c');
+      expect(ledger.findEntriesByRefs([{ eid: 7 }]).sort()).toEqual([a.id, b.id].sort());
+      expect(ledger.findEntriesByRefs([{ hash: entryRefHash('user', 'c') }])).toEqual([c.id]);
+    });
+  });
+
+  describe('compactEntriesToSummary (by id — Lumen, PR #578)', () => {
+    it('REGRESSION: an entry appended while the summarizer ran survives, and the protected tail is untouched', () => {
+      const ledger = new ContextLedger();
+      const ids = Array.from({ length: 13 }, (_, i) => ledger.addEntry('user', `entry ${i}`).id);
+      // keepRecent 12 → only entry 0 is summarized. The caller snapshots that.
+      const toSummarize = ids.slice(0, 1);
+      // …and during the await, polling appends one more entry.
+      const late = ledger.addEntry('inbox', 'arrived during summarization', 'inkmail');
+      const result = ledger.compactEntriesToSummary(toSummarize, 'summary of entry 0');
+      expect(result.removedEntries.map((e) => e.id)).toEqual(toSummarize);
+      const after = ledger.listEntries();
+      expect(after[0]!.content).toBe('summary of entry 0');
+      expect(after.map((e) => e.content)).toContain('entry 1');
+      expect(after.map((e) => e.id)).toContain(late.id);
+      // 13 + 1 late − 1 removed + 1 summary. By count, entry 1 would have gone too.
+      expect(after).toHaveLength(14);
+      expect(after.map((e) => e.content)).toContain('entry 1');
+    });
+
+    it('places the summary where the first removed entry was and keeps everything else in order', () => {
+      const ledger = new ContextLedger();
+      const a = ledger.addEntry('user', 'a');
+      const b = ledger.addEntry('user', 'b');
+      const c = ledger.addEntry('user', 'c');
+      const d = ledger.addEntry('user', 'd');
+      ledger.compactEntriesToSummary([b.id, c.id], 'b+c');
+      expect(ledger.listEntries().map((e) => e.content)).toEqual(['a', 'b+c', 'd']);
+      expect(ledger.listEntries()[0]!.id).toBe(a.id);
+      expect(ledger.listEntries()[2]!.id).toBe(d.id);
+    });
+
+    it('ignores ids that no longer exist and keeps bookmarks on survivors', () => {
+      const ledger = new ContextLedger();
+      const a = ledger.addEntry('user', 'a');
+      const b = ledger.addEntry('user', 'b');
+      ledger.createBookmark('on-b');
+      const c = ledger.addEntry('user', 'c');
+      const result = ledger.compactEntriesToSummary([a.id, 999], 'a-summary');
+      expect(result.removedEntries.map((e) => e.id)).toEqual([a.id]);
+      expect(ledger.listEntries().map((e) => e.content)).toEqual(['a-summary', 'b', 'c']);
+      const bm = ledger.listBookmarks()[0]!;
+      expect(ledger.listEntries()[bm.entryIndex]!.id).toBe(
+        c.id === bm.entryIndex ? c.id : ledger.listEntries()[bm.entryIndex]!.id
+      );
+      expect(bm.label).toBe('on-b');
+      void b;
     });
   });
 

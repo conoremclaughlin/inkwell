@@ -19,12 +19,19 @@ export default defineConfig({
       'packages/create-inkwell/src/**/*.test.ts',
       'packages/shared/src/**/*.test.ts',
       'packages/channel-plugin/**/*.test.ts',
+      // openclaw-plugin ships production code (identity + config resolution) and
+      // had no coverage at all until the rename broke its persisted config key.
+      'packages/openclaw-plugin/**/*.test.ts',
       // packages/web was absent from this list, so its suite only ran if
       // someone happened to invoke vitest from inside packages/web. Six files
       // and 43 assertions — including the auth-flow and key-leak checks — were
       // passing unobserved, which is the same as not having them.
       'packages/web/src/**/*.test.ts',
       'packages/web/src/**/*.test.tsx',
+      // Mobile's tests are the pure modules only (URL resolution, display
+      // formatting) — no React Native imports, so they run in node like
+      // everything else. Screen-level testing happens on a device.
+      'packages/mobile/src/**/*.test.ts',
     ],
     exclude: [
       'node_modules',

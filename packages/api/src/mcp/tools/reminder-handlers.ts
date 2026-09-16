@@ -6,6 +6,8 @@
  */
 
 import { z } from 'zod';
+import { quietHoursDeferralWarning } from '../../services/quiet-hours.js';
+import { isoDateTime } from './schema-primitives.js';
 import { createClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
@@ -17,7 +19,7 @@ import type { Database } from '../../data/supabase/types';
 const userIdentifierSchema = z.object({
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -115,15 +117,15 @@ export const createReminderSchema = z.object({
   ...userIdentifierSchema.shape,
   title: z.string().min(1).max(500).describe('Reminder title/message'),
   description: z.string().optional().describe('Additional details'),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to sb_id.'),
   sbId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
-    .describe('Direct identity UUID from agent_identities. Takes precedence over agentId.'),
+    .describe('Direct identity UUID from agent_identities. Takes precedence over sbSlug.'),
   deliveryChannel: z
     .enum(['telegram', 'whatsapp', 'email'])
     .optional()
@@ -136,9 +138,7 @@ export const createReminderSchema = z.object({
     .string()
     .optional()
     .describe('Cron expression for recurring reminders (e.g., "0 9 * * *" for daily at 9am)'),
-  runAt: z
-    .string()
-    .datetime()
+  runAt: isoDateTime()
     .optional()
     .describe('Specific time to run (ISO 8601). For one-time reminders.'),
   maxRuns: z
@@ -212,7 +212,7 @@ export async function handleCreateReminder(
       );
     }
 
-    // Resolve sb_id from agentId or direct sbId (always scoped to user)
+    // Resolve sb_id from sbSlug or direct sbId (always scoped to user)
     let sbId: string | null = args.sbId || null;
     if (sbId) {
       // Validate direct sbId belongs to this user
@@ -228,11 +228,11 @@ export async function handleCreateReminder(
           true
         );
       }
-    } else if (args.agentId) {
+    } else if (args.sbSlug) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('agent_id', args.agentId)
+        .eq('agent_id', args.sbSlug)
         .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
@@ -242,7 +242,7 @@ export async function handleCreateReminder(
         return mcpResponse(
           {
             success: false,
-            error: `Unknown agent "${args.agentId}" for this user. Check agent_identities table.`,
+            error: `Unknown agent "${args.sbSlug}" for this user. Check agent_identities table.`,
           },
           true
         );
@@ -259,6 +259,49 @@ export async function handleCreateReminder(
       // Default: run in 1 minute (for testing) or immediate
       nextRunAt = new Date();
       nextRunAt.setMinutes(nextRunAt.getMinutes() + 1);
+    }
+
+    // Same predicate the scheduler skips on — see services/quiet-hours.ts. If
+    // the warning computed the window separately the two would drift, and a
+    // warning that disagrees with the behaviour it describes is worse than none.
+    //
+    // Advisory only, and isolated on purpose: creating the reminder must never
+    // fail because the WARNING could not be computed. A lookup that throws, or
+    // a row that isn't there, means we cannot say whether this time will be
+    // honoured — so we say nothing and still create the reminder. The reverse
+    // (refusing to schedule because we couldn't check) would turn a helpful
+    // note into an outage.
+    //
+    // ONE-SHOTS ONLY, and enforced rather than merely described. I claimed this
+    // scope in review and did not guard it: the block ran for cron and for the
+    // default 1-minute path too. That is wrong twice over — a recurring
+    // reminder's SECOND firing is not the one computed here, so the warning
+    // would describe a time that is not the schedule; and calculateNextRun is a
+    // local pattern-switch that silently returns "tomorrow, same time" for any
+    // expression it does not recognise, so the advisory could be derived from a
+    // next-run this server never actually intends (Lumen, PR #568).
+    //
+    // Cron reminders that fire into the window are still held silently. That is
+    // a known gap, not an oversight — recurring semantics need their own answer
+    // about which occurrence to warn on.
+    let quietHoursWarning: ReturnType<typeof quietHoursDeferralWarning> = null;
+    if (args.runAt) {
+      try {
+        const { data: quietState } = await supabase
+          .from('heartbeat_state')
+          .select('quiet_start, quiet_end, timezone')
+          .eq('user_id', resolved.user.id)
+          .maybeSingle();
+        if (quietState) {
+          quietHoursWarning = quietHoursDeferralWarning(nextRunAt, {
+            start: quietState.quiet_start,
+            end: quietState.quiet_end,
+            timezone: quietState.timezone,
+          });
+        }
+      } catch {
+        // Advisory only — see above. Nothing to report and nothing to fail.
+      }
     }
 
     const { data, error } = await supabase
@@ -285,11 +328,19 @@ export async function handleCreateReminder(
 
     return mcpResponse({
       success: true,
+      // Say NOW that the time asked for is not the time it will arrive.
+      //
+      // A reminder due inside quiet hours is skipped before it is claimed and
+      // held until the window ends — correct behaviour, but nothing said so, and
+      // the resulting lateness reads as scheduler lag. It cost a near-miss on a
+      // medical fast (2026-09-02): 07:30 asked, 08:06 delivered, against a 09:00
+      // deadline. Creation time is the only moment the caller can still act.
+      ...(quietHoursWarning ? { quietHours: quietHoursWarning } : {}),
       reminder: {
         id: data.id,
         title: data.title,
         description: data.description,
-        agentId: args.agentId || null,
+        sbSlug: args.sbSlug || null,
         sbId: data.sb_id,
         deliveryChannel: data.delivery_channel,
         deliveryTarget: data.delivery_target,
@@ -301,7 +352,7 @@ export async function handleCreateReminder(
       },
       ...(!sbId
         ? {
-            hint: 'Consider adding agentId (e.g., "myra") to route this reminder to a specific agent.',
+            hint: 'Consider adding sbSlug (e.g., "myra") to route this reminder to a specific agent.',
           }
         : {}),
     });
@@ -322,7 +373,7 @@ export async function handleCreateReminder(
 
 export const listRemindersSchema = z.object({
   ...userIdentifierSchema.shape,
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Filter reminders assigned to a specific agent (e.g., "myra")'),
@@ -346,13 +397,13 @@ export async function handleListReminders(
 
     const supabase = getSupabase();
 
-    // Resolve sb_id filter if agentId provided (scoped to user)
+    // Resolve sb_id filter if sbSlug provided (scoped to user)
     let sbIdFilter: string | undefined;
-    if (args.agentId) {
+    if (args.sbSlug) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('agent_id', args.agentId)
+        .eq('agent_id', args.sbSlug)
         .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
@@ -363,7 +414,7 @@ export async function handleListReminders(
         return mcpResponse({
           success: true,
           reminders: [],
-          hint: `No agent "${args.agentId}" found for this user. No reminders to show.`,
+          hint: `No agent "${args.sbSlug}" found for this user. No reminders to show.`,
         });
       }
     }
@@ -456,15 +507,15 @@ export async function handleListReminders(
 
 export const updateReminderSchema = z.object({
   ...userIdentifierSchema.shape,
-  reminderId: z.string().uuid().describe('Reminder ID to update'),
+  reminderId: z.string().guid().describe('Reminder ID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
-  agentId: z.string().optional().describe('Reassign to a different agent (e.g., "myra")'),
+  sbSlug: z.string().optional().describe('Reassign to a different agent (e.g., "myra")'),
   cronExpression: z
     .string()
     .optional()
     .describe('New cron expression (set to null to make one-time)'),
-  nextRunAt: z.string().datetime().optional().describe('Reschedule to specific time'),
+  nextRunAt: isoDateTime().optional().describe('Reschedule to specific time'),
   status: z.enum(['active', 'paused']).optional().describe('Pause or resume the reminder'),
   studioHint: z
     .string()
@@ -502,11 +553,11 @@ export async function handleUpdateReminder(
     const updates: Record<string, unknown> = {};
     if (args.title !== undefined) updates.title = args.title;
     if (args.description !== undefined) updates.description = args.description;
-    if (args.agentId !== undefined) {
+    if (args.sbSlug !== undefined) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('agent_id', args.agentId)
+        .eq('agent_id', args.sbSlug)
         .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
@@ -514,7 +565,7 @@ export async function handleUpdateReminder(
         updates.sb_id = identity.id;
       } else {
         return mcpResponse(
-          { success: false, error: `Unknown agent "${args.agentId}" for this user.` },
+          { success: false, error: `Unknown agent "${args.sbSlug}" for this user.` },
           true
         );
       }
@@ -568,7 +619,7 @@ export async function handleUpdateReminder(
 
 export const cancelReminderSchema = z.object({
   ...userIdentifierSchema.shape,
-  reminderId: z.string().uuid().describe('Reminder ID to cancel'),
+  reminderId: z.string().guid().describe('Reminder ID to cancel'),
 });
 
 export async function handleCancelReminder(
@@ -634,7 +685,7 @@ export async function handleCancelReminder(
 
 export const getReminderHistorySchema = z.object({
   ...userIdentifierSchema.shape,
-  reminderId: z.string().uuid().describe('Reminder ID to get history for'),
+  reminderId: z.string().guid().describe('Reminder ID to get history for'),
   limit: z.number().min(1).max(100).optional().default(20),
 });
 

@@ -1581,12 +1581,12 @@ describe('resolveStartedSessionFromList', () => {
 describe('buildBackendSessionOwnerIndex', () => {
   const session = (
     id: string,
-    agentId: string | null,
+    sbSlug: string | null,
     backendSessionId: string | null,
     claudeSessionId: string | null = null
   ) => ({
     id,
-    agentId,
+    sbSlug,
     backendSessionId,
     claudeSessionId,
     startedAt: '2026-08-01T00:00:00Z',
@@ -1629,7 +1629,7 @@ describe('buildBackendSessionOwnerIndex', () => {
         {
           pcpSessionId: 'p2',
           backend: 'claude',
-          agentId: 'myra',
+          sbSlug: 'myra',
           backendSessionId: 'b-runtime-only',
           backendSessionIds: ['b-known', 'b-extra'],
           updatedAt: '2026-08-01T00:00:00Z',

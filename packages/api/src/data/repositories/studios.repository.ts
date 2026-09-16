@@ -9,7 +9,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../supabase/types';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveOwnerSbId } from '../../auth/resolve-identity';
 
 type StudiosTable = Database['public']['Tables']['studios'];
 
@@ -19,8 +19,8 @@ export type WorkType = 'feature' | 'bugfix' | 'refactor' | 'chore' | 'experiment
 export interface Studio {
   id: string;
   userId: string;
-  agentId: string | null;
-  /** Canonical identity UUID — authoritative; agentId is a display slug. */
+  sbSlug: string | null;
+  /** Canonical identity UUID — authoritative; sbSlug is a display slug. */
   sbId: string | null;
   sessionId: string | null;
   repoRoot: string;
@@ -49,7 +49,7 @@ export interface Studio {
 
 export interface CreateStudioInput {
   userId: string;
-  agentId?: string;
+  sbSlug?: string;
   sbId?: string;
   sessionId?: string;
   repoRoot: string;
@@ -65,15 +65,26 @@ export interface CreateStudioInput {
   threadKey?: string | null;
   expiresAt?: string | null;
   metadata?: Json;
+  /**
+   * Explicit slug. REQUIRED when the worktree path does not follow the
+   * legacy `<repo>--<slug>` sibling convention (e.g. ephemeral studios under
+   * ~/.ink/studios) — the derived fallback would come back null there and
+   * silently break reuse-by-slug.
+   */
+  slug?: string | null;
 }
 
 export interface UpdateStudioInput {
+  /** Provenance / candidate selection: the thread this studio is for. */
+  threadKey?: string | null;
   status?: StudioStatus;
   sessionId?: string | null;
   purpose?: string;
   workType?: WorkType;
   roleTemplate?: string | null;
   worktreePath?: string;
+  /** What the worktree has checked out — `detached:<base>` for ephemeral studios. */
+  branch?: string;
   slug?: string | null;
   defaultProjectId?: string | null;
   metadata?: Json;
@@ -103,7 +114,7 @@ export class StudiosRepository {
     return {
       id: row.id as string,
       userId: row.user_id as string,
-      agentId: (row.agent_id as string) || null,
+      sbSlug: (row.agent_id as string) || null,
       sbId: (row.sb_id as string) || null,
       sessionId: (row.session_id as string) || null,
       repoRoot: row.repo_root as string,
@@ -130,13 +141,11 @@ export class StudiosRepository {
   }
 
   async create(input: CreateStudioInput): Promise<Studio> {
-    const sbId =
-      input.sbId ||
-      (input.agentId ? await resolveIdentityId(this.client, input.userId, input.agentId) : null);
+    const sbId = await resolveOwnerSbId(this.client, input.userId, input.sbSlug, input.sbId);
 
     const insertData: StudiosTable['Insert'] = {
       user_id: input.userId,
-      agent_id: input.agentId,
+      agent_id: input.sbSlug,
       sb_id: sbId,
       session_id: input.sessionId,
       repo_root: input.repoRoot,
@@ -151,7 +160,7 @@ export class StudiosRepository {
       parent_studio_id: input.parentStudioId ?? null,
       thread_key: input.threadKey ?? null,
       expires_at: input.expiresAt ?? null,
-      slug: deriveStudioSlug(input.worktreePath),
+      slug: input.slug !== undefined ? input.slug : deriveStudioSlug(input.worktreePath),
       status: 'active',
       metadata: input.metadata || {},
     };
@@ -181,11 +190,11 @@ export class StudiosRepository {
 
   async findByBranch(
     branch: string,
-    scope?: { userId?: string; agentId?: string }
+    scope?: { userId?: string; sbSlug?: string }
   ): Promise<Studio | null> {
     let q = this.client.from('studios').select('*').eq('branch', branch);
     if (scope?.userId) q = q.eq('user_id', scope.userId);
-    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    if (scope?.sbSlug) q = q.eq('agent_id', scope.sbSlug);
     q = q.order('updated_at', { ascending: false }).limit(1);
 
     const { data, error } = await q.maybeSingle();
@@ -199,11 +208,11 @@ export class StudiosRepository {
 
   async findByPath(
     worktreePath: string,
-    scope?: { userId?: string; agentId?: string }
+    scope?: { userId?: string; sbSlug?: string }
   ): Promise<Studio | null> {
     let q = this.client.from('studios').select('*').eq('worktree_path', worktreePath);
     if (scope?.userId) q = q.eq('user_id', scope.userId);
-    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    if (scope?.sbSlug) q = q.eq('agent_id', scope.sbSlug);
     q = q.order('updated_at', { ascending: false }).limit(1);
 
     const { data, error } = await q.maybeSingle();
@@ -260,7 +269,7 @@ export class StudiosRepository {
 
   async listByUser(
     userId: string,
-    opts?: { status?: StudioStatus; agentId?: string }
+    opts?: { status?: StudioStatus; sbSlug?: string }
   ): Promise<Studio[]> {
     let query = this.client
       .from('studios')
@@ -272,8 +281,8 @@ export class StudiosRepository {
       query = query.eq('status', opts.status);
     }
 
-    if (opts?.agentId) {
-      query = query.eq('agent_id', opts.agentId);
+    if (opts?.sbSlug) {
+      query = query.eq('agent_id', opts.sbSlug);
     }
 
     const { data, error } = await query;
@@ -361,10 +370,12 @@ export class StudiosRepository {
     if (input.workType !== undefined) updateData.work_type = input.workType;
     if (input.roleTemplate !== undefined) updateData.role_template = input.roleTemplate;
     if (input.worktreePath !== undefined) updateData.worktree_path = input.worktreePath;
+    if (input.branch !== undefined) updateData.branch = input.branch;
     if (input.slug !== undefined) updateData.slug = input.slug;
     if (input.defaultProjectId !== undefined)
       updateData.default_project_id = input.defaultProjectId;
     if (input.metadata !== undefined) updateData.metadata = input.metadata;
+    if (input.threadKey !== undefined) updateData.thread_key = input.threadKey;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
     if (input.cleanedAt !== undefined) updateData.cleaned_at = input.cleanedAt;
     if (input.expiresAt !== undefined) updateData.expires_at = input.expiresAt;

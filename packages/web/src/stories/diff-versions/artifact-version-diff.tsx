@@ -8,7 +8,7 @@ interface ArtifactVersion {
   version: number;
   title: string;
   content: string;
-  changedByAgentId?: string;
+  changedBySlug?: string;
   changedByUserId?: string;
   changeType: string;
   changeSummary?: string;

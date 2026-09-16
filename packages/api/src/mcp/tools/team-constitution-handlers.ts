@@ -19,7 +19,7 @@ import { resolveUserOrThrow } from '../../services/user-resolver';
 const userIdentifierFields = {
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -38,7 +38,7 @@ const userIdentifierFields = {
     .describe('Platform name — only needed for platform-based user lookup'),
   workspaceId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Workspace to update. Defaults to personal workspace if omitted.'),
 };

@@ -41,7 +41,7 @@ function lease(threadKey: string, sessionId: string, heartbeatAt?: string): Stud
   return {
     sessionId,
     threadKey,
-    agentId: 'echo',
+    sbSlug: 'echo',
     acquiredAt: heartbeatAt ?? now,
     heartbeatAt: heartbeatAt ?? now,
   };

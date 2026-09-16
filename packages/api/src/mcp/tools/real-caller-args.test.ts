@@ -17,9 +17,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/client';
+import { McpServer, InMemoryTransport } from '@modelcontextprotocol/server';
 import { registerAllTools } from './index';
 
 /**
@@ -66,9 +65,9 @@ async function expectArgsAccepted(tool: string, args: Record<string, unknown>) {
 
 describe('real caller args survive validation', () => {
   it('list_sessions from ink attach — chat.ts:3218, 3275, 3391, 3796', async () => {
-    await expectArgsAccepted('list_sessions', { agentId: 'wren', status: 'active', limit: 30 });
+    await expectArgsAccepted('list_sessions', { sbSlug: 'wren', status: 'active', limit: 30 });
     await expectArgsAccepted('list_sessions', {
-      agentId: 'wren',
+      sbSlug: 'wren',
       status: 'active',
       backend: 'ink',
       limit: 30,
@@ -81,7 +80,7 @@ describe('real caller args survive validation', () => {
       email: 'someone@example.test',
       status: 'active',
       limit: 40,
-      agentId: 'wren',
+      sbSlug: 'wren',
     });
   });
 
@@ -90,7 +89,7 @@ describe('real caller args survive validation', () => {
     // made the startup idle stamp a silent no-op.
     await expectArgsAccepted('update_session_state', {
       email: 'someone@example.test',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sessionId: '00000000-0000-4000-8000-000000000000',
       lifecycle: 'idle',
       workingDir: '/tmp',
@@ -102,7 +101,7 @@ describe('real caller args survive validation', () => {
   it('update_session_state from claude attach — claude.ts:3381', async () => {
     await expectArgsAccepted('update_session_state', {
       email: 'someone@example.test',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sessionId: '00000000-0000-4000-8000-000000000000',
       backendSessionId: 'abc123',
       status: 'active',
@@ -112,7 +111,7 @@ describe('real caller args survive validation', () => {
 
   it('remember from chat /eject — chat.ts:7162', async () => {
     await expectArgsAccepted('remember', {
-      agentId: 'wren',
+      sbSlug: 'wren',
       sessionId: '00000000-0000-4000-8000-000000000000',
       content: 'Context ejection at bookmark-1.',
       topics: 'repl,context-ejection',

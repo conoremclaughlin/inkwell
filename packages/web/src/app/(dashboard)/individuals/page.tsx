@@ -44,7 +44,7 @@ interface UserIdentityResponse {
 
 interface Identity {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   description?: string;
@@ -63,7 +63,7 @@ interface Identity {
 
 interface Session {
   id: string;
-  agentId: string;
+  sbSlug: string;
   status: string;
   currentPhase: string | null;
   context: string | null;
@@ -224,7 +224,7 @@ function AgentSummaryCard({
                 </div>
               )}
               <Badge variant="outline" className="font-mono text-[10px] text-gray-500">
-                {identity.agentId}
+                {identity.sbSlug}
               </Badge>
             </div>
           </div>
@@ -302,7 +302,7 @@ function AgentSummaryCard({
             className="flex-1 justify-start gap-2 border-gray-200 bg-white hover:bg-purple-50 hover:text-purple-700"
             asChild
           >
-            <Link href={`/individuals/${identity.agentId}`}>
+            <Link href={`/individuals/${identity.sbSlug}`}>
               <User className="h-4 w-4" />
               Profile
             </Link>
@@ -314,7 +314,7 @@ function AgentSummaryCard({
             className="flex-1 justify-start gap-2 border-gray-200 bg-white hover:bg-blue-50 hover:text-blue-700"
             asChild
           >
-            <Link href={`/individuals/${identity.agentId}/inbox`}>
+            <Link href={`/individuals/${identity.sbSlug}/inbox`}>
               <Inbox className="h-4 w-4" />
               Inbox
             </Link>
@@ -326,7 +326,7 @@ function AgentSummaryCard({
             className="flex-1 justify-start gap-2 border-gray-200 bg-white hover:bg-amber-50 hover:text-amber-700"
             asChild
           >
-            <Link href={`/individuals/${identity.agentId}/memories`}>
+            <Link href={`/individuals/${identity.sbSlug}/memories`}>
               <Brain className="h-4 w-4" />
               Memories
             </Link>
@@ -360,9 +360,9 @@ export default function IndividualsPage() {
 
   const agentSessions = new Map<string, Session>();
   sessions.forEach((session) => {
-    const existing = agentSessions.get(session.agentId);
+    const existing = agentSessions.get(session.sbSlug);
     if (!existing || new Date(session.updatedAt) > new Date(existing.updatedAt)) {
-      agentSessions.set(session.agentId, session);
+      agentSessions.set(session.sbSlug, session);
     }
   });
 
@@ -432,7 +432,7 @@ export default function IndividualsPage() {
                 <AgentSummaryCard
                   key={individual.id}
                   identity={individual}
-                  activeSession={agentSessions.get(individual.agentId)}
+                  activeSession={agentSessions.get(individual.sbSlug)}
                 />
               ))}
             </div>

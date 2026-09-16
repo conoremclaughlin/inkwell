@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   clearPinnedAgent,
   clearSessionContext,
-  getPinnedAgentId,
+  getPinnedSlug,
   mergeWithContext,
   pinSessionAgent,
   runWithRequestContext,
@@ -45,18 +45,18 @@ describe('identity pinning in HTTP mode', () => {
     pinSessionAgent('wren');
     pinSessionAgent('lumen');
 
-    expect(getPinnedAgentId()).toBeNull();
+    expect(getPinnedSlug()).toBeNull();
 
     clearPinnedAgent();
     process.env.MCP_TRANSPORT = previous;
   });
 
-  it('returns request-scoped agentId in request context', async () => {
+  it('returns request-scoped sbSlug in request context', async () => {
     const previous = process.env.MCP_TRANSPORT;
     process.env.MCP_TRANSPORT = 'http';
 
-    await runWithRequestContext({ userId: 'user-1', agentId: 'lumen' }, async () => {
-      expect(getPinnedAgentId()).toBe('lumen');
+    await runWithRequestContext({ userId: 'user-1', sbSlug: 'lumen' }, async () => {
+      expect(getPinnedSlug()).toBe('lumen');
     });
 
     process.env.MCP_TRANSPORT = previous;

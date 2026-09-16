@@ -1,8 +1,7 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { z } from 'zod';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/client';
+import { McpServer, InMemoryTransport } from '@modelcontextprotocol/server';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
 import { registerAllTools } from './index';
 
@@ -49,7 +48,7 @@ describe('strictifyInputSchema', () => {
   it('covers every registered tool, with no permissive stragglers', async () => {
     // Lumen's 162/163 finding: one tool slipping through is exactly the kind
     // of gap that a spot check misses, so assert the whole registry.
-    const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+    const { McpServer } = await import('@modelcontextprotocol/server');
     const { registerAllTools } = await import('./index');
 
     const captured: Array<{ name: string; inputSchema: unknown }> = [];
@@ -72,6 +71,32 @@ describe('strictifyInputSchema', () => {
 
     expect(permissive.map((t) => t.name)).toEqual([]);
     expect(captured.length).toBeGreaterThan(150);
+  });
+
+  it('every registration passes a real schema object — raw shapes are deprecated in SDK v2', () => {
+    // With strictify off, the stub sees exactly what each site wrote. The v2
+    // SDK still accepts a raw zod shape but deprecates it, and a shape cannot
+    // carry `~standard.jsonSchema`; keeping the registry uniform means the
+    // SDK's serialization and describe_tool's never diverge.
+    process.env.INK_STRICT_TOOL_ARGS = '0';
+    try {
+      const captured: Array<{ name: string; inputSchema: unknown }> = [];
+      const server: any = {
+        registerTool: (name: string, config: any) =>
+          captured.push({ name, inputSchema: config?.inputSchema }),
+      };
+      const stub: any = new Proxy(function () {} as any, {
+        get: () => stub,
+        apply: () => stub,
+        construct: () => stub,
+      });
+      registerAllTools(server, stub);
+      const rawShapes = captured.filter(({ inputSchema }) => !(inputSchema instanceof z.ZodObject));
+      expect(rawShapes.map((t) => t.name)).toEqual([]);
+      expect(captured.length).toBeGreaterThan(150);
+    } finally {
+      delete process.env.INK_STRICT_TOOL_ARGS;
+    }
   });
 
   it('is idempotent on already-strict schemas', () => {

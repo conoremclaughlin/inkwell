@@ -24,8 +24,8 @@ interface WaitOptions {
   pending?: boolean;
 }
 
-function resolveAgentId(): string {
-  return process.env.AGENT_ID || 'wren';
+function resolveSlug(): string {
+  return process.env.SB_SLUG || process.env.AGENT_ID || 'wren';
 }
 
 export function registerWaitCommand(program: Command): void {
@@ -36,12 +36,12 @@ export function registerWaitCommand(program: Command): void {
     .option('-g, --group <groupId>', 'Watch an autonomous strategy/task group for progress')
     .option('--timeout <seconds>', 'Max wait time in seconds (default: 300)', '300')
     .option('--interval <seconds>', 'Poll interval in seconds (default: 15)', '15')
-    .option('-a, --agent <agentId>', 'Agent ID (default: from env)')
+    .option('-a, --agent <sbSlug>', 'SB slug (default: from env)')
     .option('--pending', 'Also check pending message queue (for CLI-attached sessions)')
     .action(async (options: WaitOptions) => {
       const timeoutSec = Math.max(10, parseInt(options.timeout || '300', 10));
       const intervalSec = Math.max(5, parseInt(options.interval || '15', 10));
-      const agentId = options.agent || resolveAgentId();
+      const sbSlug = options.agent || resolveSlug();
       const threadKey = options.thread;
       const groupId = options.group;
 
@@ -63,7 +63,7 @@ export function registerWaitCommand(program: Command): void {
       const startedAt = new Date().toISOString();
 
       console.log(
-        `[ink wait] Watching ${threadKey ? `thread ${threadKey}` : 'inbox'} for ${agentId} (timeout: ${timeoutSec}s, interval: ${intervalSec}s)`
+        `[ink wait] Watching ${threadKey ? `thread ${threadKey}` : 'inbox'} for ${sbSlug} (timeout: ${timeoutSec}s, interval: ${intervalSec}s)`
       );
 
       // ── Baseline anchors ──
@@ -86,7 +86,7 @@ export function registerWaitCommand(program: Command): void {
           // or descending order in get_thread_messages to fix properly.
           const threadResult = (await pcp.callTool('get_thread_messages', {
             email: config.email,
-            agentId,
+            sbSlug,
             threadKey,
             markRead: false,
             fullHistory: true,
@@ -106,7 +106,7 @@ export function registerWaitCommand(program: Command): void {
         try {
           const inboxResult = (await pcp.callTool('get_inbox', {
             email: config.email,
-            agentId,
+            sbSlug,
             status: 'unread',
             limit: 1,
             // A watcher has no drain authority (spec inkmail-read-state §7):
@@ -186,7 +186,7 @@ export function registerWaitCommand(program: Command): void {
             // trigger the watcher.
             const pollArgs: Record<string, unknown> = {
               email: config.email,
-              agentId,
+              sbSlug,
               threadKey,
               markRead: false,
               fullHistory: true,
@@ -203,11 +203,11 @@ export function registerWaitCommand(program: Command): void {
 
             const allMessages = (threadResult.messages as Array<Record<string, unknown>>) || [];
             // Filter out own messages — we're waiting for someone ELSE to reply
-            const messages = allMessages.filter((m) => m.senderAgentId !== agentId);
+            const messages = allMessages.filter((m) => m.senderSlug !== sbSlug);
             if (messages.length > 0) {
               console.log(`[ink wait] ${messages.length} new message(s) on ${threadKey}`);
               for (const msg of messages) {
-                const sender = msg.senderAgentId || 'unknown';
+                const sender = msg.senderSlug || 'unknown';
                 const preview = typeof msg.content === 'string' ? msg.content.slice(0, 200) : '';
                 console.log(`  from ${sender}: ${preview}`);
               }
@@ -217,7 +217,7 @@ export function registerWaitCommand(program: Command): void {
             // Watch inbox for any new unread
             const inboxResult = (await pcp.callTool('get_inbox', {
               email: config.email,
-              agentId,
+              sbSlug,
               status: 'unread',
               limit: 5,
               // Observe only — see the baseline read above. The poll loop is
@@ -240,7 +240,7 @@ export function registerWaitCommand(program: Command): void {
 
               if (messages?.length) {
                 for (const msg of messages.slice(0, 3)) {
-                  const sender = msg.senderAgentId || 'unknown';
+                  const sender = msg.senderSlug || 'unknown';
                   const preview = typeof msg.content === 'string' ? msg.content.slice(0, 150) : '';
                   console.log(`  inbox: from ${sender}: ${preview}`);
                 }

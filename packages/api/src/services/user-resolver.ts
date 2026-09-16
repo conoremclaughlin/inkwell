@@ -13,7 +13,7 @@ export const userIdentifierFields = {
   // Direct UUID lookup
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
 

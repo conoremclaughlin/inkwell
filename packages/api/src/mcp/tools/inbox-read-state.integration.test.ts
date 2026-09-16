@@ -121,7 +121,7 @@ describe('agent_inbox read state (integration)', () => {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async function getInbox(args: Record<string, unknown> = {}): Promise<any> {
-    const result = await handleGetInbox({ userId, agentId: AGENT, ...args }, dataComposer as never);
+    const result = await handleGetInbox({ userId, sbSlug: AGENT, ...args }, dataComposer as never);
     return JSON.parse(result.content[0].text);
   }
 
@@ -303,8 +303,7 @@ describe('agent_inbox read state (integration)', () => {
     expect(res.unreadCount).toBe(1);
 
     const status = JSON.parse(
-      (await handleGetAgentStatus({ userId, agentId: AGENT }, dataComposer as never)).content[0]
-        .text
+      (await handleGetAgentStatus({ userId, sbSlug: AGENT }, dataComposer as never)).content[0].text
     );
     // get_agent_status is read side by side with get_inbox in mission control;
     // it counted expired mail the inbox would never show.
@@ -318,7 +317,7 @@ describe('agent_inbox read state (integration)', () => {
     await setPointer('2026-08-01T00:00:00Z');
 
     const res = JSON.parse(
-      (await handleMarkInboxRead({ userId, agentId: AGENT }, dataComposer as never)).content[0].text
+      (await handleMarkInboxRead({ userId, sbSlug: AGENT }, dataComposer as never)).content[0].text
     );
 
     expect(res.advanced).toBe(true);
@@ -336,7 +335,7 @@ describe('agent_inbox read state (integration)', () => {
     const res = JSON.parse(
       (
         await handleMarkInboxRead(
-          { userId, agentId: AGENT, before: '2026-07-01T00:00:00Z' },
+          { userId, sbSlug: AGENT, before: '2026-07-01T00:00:00Z' },
           dataComposer as never
         )
       ).content[0].text
@@ -357,7 +356,7 @@ describe('agent_inbox read state (integration)', () => {
     const res = JSON.parse(
       (
         await handleMarkInboxRead(
-          { userId, agentId: AGENT, throughMessageId: older },
+          { userId, sbSlug: AGENT, throughMessageId: older },
           dataComposer as never
         )
       ).content[0].text
@@ -391,7 +390,7 @@ describe('agent_inbox read state (integration)', () => {
     const res = JSON.parse(
       (
         await handleMarkInboxRead(
-          { userId, agentId: AGENT, throughMessageId: foreign.id },
+          { userId, sbSlug: AGENT, throughMessageId: foreign.id },
           dataComposer as never
         )
       ).content[0].text
@@ -408,7 +407,7 @@ describe('agent_inbox read state (integration)', () => {
     const res = JSON.parse(
       (
         await handleMarkInboxRead(
-          { userId, agentId: AGENT, before: '2026-01-01T00:00:00Z' },
+          { userId, sbSlug: AGENT, before: '2026-01-01T00:00:00Z' },
           dataComposer as never
         )
       ).content[0].text
@@ -541,15 +540,15 @@ describe('agent_inbox read state (integration)', () => {
     created.push(bMail.id);
     const seenByA = await insert({ createdAt: '2026-08-16T10:00:00Z' });
     await handleMarkInboxRead(
-      { userId, agentId: AGENT, throughMessageId: seenByA },
+      { userId, sbSlug: AGENT, throughMessageId: seenByA },
       dataComposer as never
     );
 
     const body = JSON.parse(
-      (await handleGetAgentSummaries({ userId, agentIds: [AGENT, agentB] }, dataComposer as never))
+      (await handleGetAgentSummaries({ userId, sbSlugs: [AGENT, agentB] }, dataComposer as never))
         .content[0].text
     );
-    const bRow = body.agents.find((a: { agentId: string }) => a.agentId === agentB);
+    const bRow = body.agents.find((a: { sbSlug: string }) => a.sbSlug === agentB);
     expect(bRow).toBeDefined();
     expect(bRow.inboxUnread).toBeGreaterThanOrEqual(1);
   });
@@ -562,10 +561,10 @@ describe('agent_inbox read state (integration)', () => {
     });
 
     const body = JSON.parse(
-      (await handleGetAgentSummaries({ userId, agentIds: [AGENT] }, dataComposer as never))
+      (await handleGetAgentSummaries({ userId, sbSlugs: [AGENT] }, dataComposer as never))
         .content[0].text
     );
-    const row = body.agents.find((a: { agentId: string }) => a.agentId === AGENT);
+    const row = body.agents.find((a: { sbSlug: string }) => a.sbSlug === AGENT);
     expect(row.inboxUnread).toBe(1);
   });
 
@@ -604,7 +603,7 @@ describe('agent_inbox read state (integration)', () => {
     // AGENT has read through the newer message: with min-over-existing-rows,
     // the aggregate floor would be future(60) and the older row vanishes.
     await handleMarkInboxRead(
-      { userId, agentId: AGENT, throughMessageId: seen },
+      { userId, sbSlug: AGENT, throughMessageId: seen },
       dataComposer as never
     );
 

@@ -305,9 +305,9 @@ async function logoutCommand(): Promise<void> {
 
 async function delegateCommand(options: { agent: string }): Promise<void> {
   const serverUrl = getPcpServerUrl();
-  const agentId = options.agent?.trim().toLowerCase();
-  if (!agentId) {
-    console.log(chalk.red('Missing --agent <agentId>'));
+  const sbSlug = options.agent?.trim().toLowerCase();
+  if (!sbSlug) {
+    console.log(chalk.red('Missing --agent <sbSlug>'));
     process.exitCode = 1;
     return;
   }
@@ -325,7 +325,7 @@ async function delegateCommand(options: { agent: string }): Promise<void> {
       Authorization: `Bearer ${baseToken}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ agentId }),
+    body: JSON.stringify({ sbSlug }),
   });
 
   if (!response.ok) {
@@ -349,19 +349,19 @@ async function delegateCommand(options: { agent: string }): Promise<void> {
     return;
   }
 
-  saveDelegatedAuth(agentId, {
+  saveDelegatedAuth(sbSlug, {
     access_token: payload.access_token,
     expires_in: payload.expires_in,
     issued_at: Date.now(),
     scope: payload.scope,
-    agent_id: payload.delegated_agent_id || agentId,
+    agent_id: payload.delegated_agent_id || sbSlug,
     sb_id: payload.sb_id,
   });
 
   const expiresAt = new Date(Date.now() + payload.expires_in * 1000);
   console.log(
     chalk.green(
-      `Delegated token saved for ${agentId} (expires ${expiresAt.toLocaleString('en-US')}).`
+      `Delegated token saved for ${sbSlug} (expires ${expiresAt.toLocaleString('en-US')}).`
     )
   );
 }
@@ -471,7 +471,7 @@ export function registerAuthCommands(program: Command): void {
   auth
     .command('delegate')
     .description('Mint and store an SB-scoped delegated MCP token')
-    .requiredOption('-a, --agent <agentId>', 'SB agentId (e.g. wren, lumen, aster)')
+    .requiredOption('-a, --agent <sbSlug>', 'SB sbSlug (e.g. wren, lumen, aster)')
     .action(delegateCommand);
 
   const backend = auth

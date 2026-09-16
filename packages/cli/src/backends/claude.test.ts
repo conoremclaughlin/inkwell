@@ -65,7 +65,7 @@ describe('ClaudeAdapter prepare — tool routing', () => {
   it("ink-owned routing ('local') withholds tool servers AND built-ins, pinning the config strictly", () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'hello',
       promptParts: ['hello'],
       passthroughArgs: [],
@@ -90,13 +90,44 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
+  it('threads a per-SB effort to the claude CLI, and sends none when unset (task 7ea6cdf7)', () => {
+    const adapter = new ClaudeAdapter();
+    const withEffort = adapter.prepare({
+      sbSlug: 'myra',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      effort: 'xhigh',
+    });
+    try {
+      const idx = withEffort.args.indexOf('--effort');
+      expect(idx).toBeGreaterThan(-1);
+      expect(withEffort.args[idx + 1]).toBe('xhigh');
+    } finally {
+      withEffort.cleanup();
+    }
+    const without = adapter.prepare({
+      sbSlug: 'myra',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+    });
+    try {
+      expect(without.args).not.toContain('--effort');
+    } finally {
+      without.cleanup();
+    }
+  });
+
   it('local routing exposes native Read ONLY for attachment-bearing sessions (named exception)', () => {
     // The multimodal render path: --attach-file media is read natively
     // (images cannot flow through ink-block tools). This is a documented
     // exception to wholly-in-ink, not the default.
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'what is in this image?',
       promptParts: ['what is in this image?'],
       passthroughArgs: [],
@@ -131,7 +162,7 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     );
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'hello',
       promptParts: ['hello'],
       passthroughArgs: [],
@@ -164,7 +195,7 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     rmSync(join(tmpDir, 'packages'), { recursive: true, force: true });
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'hello',
       promptParts: ['hello'],
       passthroughArgs: [],
@@ -181,7 +212,7 @@ describe('ClaudeAdapter prepare — tool routing', () => {
   it('provider-owned routing (undefined/backend) passes the full config, no strict flag', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       prompt: 'hello',
       promptParts: ['hello'],
       passthroughArgs: [],
@@ -331,7 +362,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
   it('fully-injected media: stream-json stdin envelope, --tools stays empty', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'what is in this image?',
       promptParts: ['what is in this image?'],
       passthroughArgs: [],
@@ -366,7 +397,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
     writeFileSync(pdfPath, 'not really a pdf');
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'summarize these',
       promptParts: ['summarize these'],
       passthroughArgs: [],
@@ -392,7 +423,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
   it('text-only turns keep the plain stdin path', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'hello',
       promptParts: ['hello'],
       passthroughArgs: [],
@@ -413,7 +444,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
     // the same mime classification as the delivery spawn.
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'continue',
       promptParts: ['continue'],
       passthroughArgs: [],
@@ -440,7 +471,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
     const adapter = new ClaudeAdapter();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'look at this',
       promptParts: ['look at this'],
       passthroughArgs: [],
@@ -470,7 +501,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
     // embedding — deliverMedia is the explicit signal.
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
-      agentId: 'myra',
+      sbSlug: 'myra',
       prompt: 'here is a new photo',
       promptParts: ['here is a new photo'],
       passthroughArgs: [],

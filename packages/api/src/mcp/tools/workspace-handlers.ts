@@ -29,7 +29,7 @@ export const createWorkspaceSchema = userIdentifierBaseSchema.extend({
     .default('personal')
     .describe('Workspace type: personal or team'),
   description: z.string().optional().describe('Optional workspace description'),
-  metadata: z.record(z.unknown()).optional().describe('Optional workspace metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Optional workspace metadata'),
 });
 
 export const listWorkspacesSchema = userIdentifierBaseSchema.extend({
@@ -43,22 +43,22 @@ export const listWorkspacesSchema = userIdentifierBaseSchema.extend({
 });
 
 export const getWorkspaceSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().describe('Workspace UUID'),
+  workspaceId: z.string().guid().describe('Workspace UUID'),
   includeMembers: z.boolean().optional().default(false).describe('Include workspace members'),
 });
 
 export const updateWorkspaceSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().describe('Workspace UUID'),
+  workspaceId: z.string().guid().describe('Workspace UUID'),
   name: z.string().min(1).optional(),
   slug: z.string().min(1).optional(),
   type: workspaceTypeSchema.optional(),
   description: z.string().nullable().optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
   archived: z.boolean().optional().describe('Set true to archive, false to unarchive'),
 });
 
 export const addWorkspaceMemberSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().describe('Workspace UUID'),
+  workspaceId: z.string().guid().describe('Workspace UUID'),
   inviteeEmail: z.string().email().describe('Email address of collaborator to add'),
   role: workspaceMemberRoleSchema.optional().default('member'),
 });

@@ -361,6 +361,24 @@ describe('ChannelGateway', () => {
       expect(processingConversations.has('telegram:chat123')).toBe(false);
     });
 
+    it("passes the auto-response's session through to sendResponse", async () => {
+      // The auto-forwarded reply is attributed to the turn that produced it;
+      // dropping the field here would log the message_out row anonymous again.
+      const processingConversations = (gateway as any).processingConversations;
+      processingConversations.add('telegram:chat123');
+      const sendSpy = vi.spyOn(gateway as any, 'sendResponse').mockResolvedValue(undefined);
+
+      await gateway.releaseConversation('telegram', 'chat123', {
+        content: 'auto-routed reply',
+        format: 'markdown',
+        sessionId: 'session-of-the-turn',
+      });
+
+      expect(sendSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ content: 'auto-routed reply', sessionId: 'session-of-the-turn' })
+      );
+    });
+
     it('drains messages that queued during the turn after a successful auto-response', async () => {
       const processingConversations = (gateway as any).processingConversations;
       const pendingBuffers = (gateway as any).pendingBuffers;
@@ -693,7 +711,7 @@ describe('Activity Stream Integration', () => {
   describe('Incoming Messages', () => {
     it('does not log inbound messages itself — SessionService is the canonical logger', async () => {
       // Regression: the gateway used to log message_in with a hardcoded
-      // agentId of 'myra' AND SessionService logged the same message again,
+      // sbSlug of 'myra' AND SessionService logged the same message again,
       // producing duplicate rows that double-rendered in attached CLI views.
       const handler = vi.fn().mockResolvedValue(undefined);
       gateway.setMessageHandler(handler);
@@ -809,7 +827,7 @@ describe('Activity Stream Integration', () => {
       expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith({
         userId: 'user-uuid-123',
-        agentId: 'myra',
+        sbSlug: 'myra',
         direction: 'out',
         content: 'Reply message',
         platform: 'telegram',

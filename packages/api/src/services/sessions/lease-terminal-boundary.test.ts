@@ -29,7 +29,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: 'session-1',
     userId: 'user-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     studioId: 'studio-1',
     backendSessionId: null,
     type: 'primary',
@@ -48,6 +48,10 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     metadata: {},
     createdAt: new Date(),
     updatedAt: new Date(),
+    // The spread was MISSING until PR #563 round 6 — every override in this
+    // file silently no-opped, and the tests passed only because callers
+    // happened to pass values equal to the defaults.
+    ...overrides,
   } as unknown as Session;
 }
 
@@ -91,7 +95,7 @@ describe('fail-closed routing at the lease boundary', () => {
     const foreignHolder: StudioLease = {
       sessionId: 'session-foreign',
       threadKey: 'pr:999',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       acquiredAt: new Date().toISOString(),
       heartbeatAt: new Date().toISOString(),
     };
@@ -190,7 +194,7 @@ describe('terminal-boundary release', () => {
           lease: {
             sessionId,
             threadKey: 'pr:200',
-            agentId: 'wren',
+            sbSlug: 'wren',
             acquiredAt: staleIso(),
             heartbeatAt: new Date().toISOString(),
           } as unknown as Row,
@@ -205,6 +209,39 @@ describe('terminal-boundary release', () => {
       sessions: [{ id: sessionId, user_id: 'user-1', ended_at: new Date().toISOString() }],
     };
   }
+
+  it('round 6 (PR #563): the run-boundary release refuses a stale owner epoch', async () => {
+    const session = makeSession({ turnEpoch: 'owner-epoch' } as never);
+    const { store, repo } = makeMockRepository(session);
+    const tables = leasedTables('session-1');
+    const service = makeService(repo, tables);
+    const svc = service as unknown as {
+      releaseLeaseIfSessionTerminal(id: string, epoch?: string): Promise<void>;
+    };
+
+    // Same shape as the deferred-release test above: end mid-run so the
+    // release defers, then bring the session to its terminal boundary.
+    registerActiveRun({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      sbSlug: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+    await service.endSession('session-1', 'ended mid-turn');
+    expect(tables.studios[0].lease).not.toBeNull();
+    resetActiveRuns();
+    store.session = { ...store.session, endedAt: new Date() } as Session;
+
+    // A boundary that stopped being ours: the same read that establishes
+    // terminality establishes ownership, and a mismatch refuses the release.
+    await svc.releaseLeaseIfSessionTerminal('session-1', 'stale-epoch');
+    expect(tables.studios[0].lease).not.toBeNull();
+
+    // The current owner's boundary releases.
+    await svc.releaseLeaseIfSessionTerminal('session-1', 'owner-epoch');
+    expect(tables.studios[0].lease).toBeNull();
+  });
 
   it('endSession releases immediately when no run is live', async () => {
     const session = makeSession();
@@ -225,7 +262,7 @@ describe('terminal-boundary release', () => {
     registerActiveRun({
       sessionId: 'session-1',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });

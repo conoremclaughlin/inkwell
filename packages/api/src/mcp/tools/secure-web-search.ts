@@ -24,7 +24,7 @@ export const secureWebSearchInputSchema = z.object({
     .optional()
     .default(false)
     .describe('If true, returns extraction prompt instead of wrapped results'),
-  userId: z.string().uuid().optional().describe('User ID for audit logging'),
+  userId: z.string().guid().optional().describe('User ID for audit logging'),
 });
 
 export type SecureWebSearchInput = z.infer<typeof secureWebSearchInputSchema>;

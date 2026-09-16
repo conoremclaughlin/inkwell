@@ -9,11 +9,17 @@ import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { DataComposer } from '../../data/composer';
-import type { Json, TablesInsert } from '../../data/supabase/types';
+import type { Json, Tables, TablesInsert } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import {
+  withWorkspaceFilter,
+  pickWorkspaceScopedRow,
+  WorkspaceRowAmbiguityError,
+} from './workspace-scoped-row';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import { ensureDefaultReminders } from '../../services/heartbeat';
+import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 
 // =====================================================
 // SCHEMAS
@@ -44,8 +50,8 @@ export const chooseNameSchema = userIdentifierBaseSchema.extend({
 });
 
 export const saveIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
-  agentId: z
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
+  sbSlug: z
     .string()
     .describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
   name: z.string().describe('Display name for the agent'),
@@ -53,11 +59,11 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
   description: z.string().optional().describe("Extended description of the agent's nature"),
   values: z.array(z.string()).optional().describe('Core values this agent holds'),
   relationships: z
-    .record(z.string())
+    .record(z.string(), z.string())
     .optional()
-    .describe('Map of agentId to relationship description'),
+    .describe('Map of sbSlug to relationship description'),
   capabilities: z.array(z.string()).optional().describe('What this agent can do'),
-  metadata: z.record(z.unknown()).optional().describe('Additional flexible data'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional flexible data'),
   heartbeat: z
     .string()
     .optional()
@@ -73,7 +79,7 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
         .optional()
         .describe('Default voice name used when no model-specific override matches'),
       voices: z
-        .record(z.string())
+        .record(z.string(), z.string())
         .optional()
         .describe(
           'Model-specific voice overrides keyed by model ID (e.g., "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit": "vivian")'
@@ -84,12 +90,12 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
   syncToFile: z
     .boolean()
     .optional()
-    .describe('Also write to ~/.ink/individuals/{agentId}/IDENTITY.md'),
+    .describe('Also write to ~/.ink/individuals/{sbSlug}/IDENTITY.md'),
 });
 
 export const getIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
-  agentId: z.string().describe('Agent identifier to look up'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
+  sbSlug: z.string().describe('Agent identifier to look up'),
   file: z
     .enum(['heartbeat', 'soul', 'values', 'identity'])
     .optional()
@@ -97,18 +103,18 @@ export const getIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const listIdentitiesSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
 });
 
 export const getIdentityHistorySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
-  agentId: z.string().describe('Agent identifier to get history for'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
+  sbSlug: z.string().describe('Agent identifier to get history for'),
   limit: z.number().min(1).max(50).optional().describe('Max history entries (default: 10)'),
 });
 
 export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
-  agentId: z.string().describe('Agent identifier to restore'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
+  sbSlug: z.string().describe('Agent identifier to restore'),
   version: z.number().describe('Version number to restore to'),
 });
 
@@ -120,7 +126,7 @@ export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
  * Generate identity document content from identity data
  */
 function generateIdentityMarkdown(identity: {
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   description?: string | null;
@@ -181,16 +187,90 @@ function generateIdentityMarkdown(identity: {
   return lines.join('\n');
 }
 
-function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
-  if (!workspaceId) return query;
-  return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
+type AgentIdentityRow = Tables<'agent_identities'>;
+
+/**
+ * The one agent_identities row for (user, agent[, workspace]). Reads EVERY row
+ * for the key — there are at most a handful — so "found two" is never
+ * reported as "not found", and a truncated page can never hide a second
+ * scoped row behind an unscoped twin (Lumen, PR #595 P1: limit(2) returned
+ * [NULL, A] out of {NULL, A, B} and A was taken as unique).
+ */
+async function findAgentIdentityRow(
+  supabase: ReturnType<DataComposer['getClient']>,
+  userId: string,
+  sbSlug: string,
+  workspaceId?: string
+): Promise<AgentIdentityRow | null> {
+  let query = supabase
+    .from('agent_identities')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('agent_id', sbSlug);
+  query = withWorkspaceFilter(query, workspaceId);
+  const { data, error } = await query;
+  if (error) {
+    if (error.code === 'PGRST116') return null;
+    throw new Error(`Failed to read identity: ${error.message}`);
+  }
+  return pickWorkspaceScopedRow<AgentIdentityRow>(data, `agent "${sbSlug}"`);
+}
+
+/**
+ * Workspace scope for identity reads and writes. The request context set by
+ * the CLI hooks / server entry (header, or derived from the caller's own
+ * identity) is authoritative — a caller can never address another workspace
+ * by passing workspaceId. The explicit argument is only a fallback for
+ * callers with no request context (scripts, tests).
+ */
+async function resolveIdentityScope(
+  args: unknown,
+  explicitWorkspaceId: string | undefined,
+  sbSlug: string | undefined,
+  deriveWorkspaceIdFromAgent?: (sbSlug: string) => Promise<string | null>
+): Promise<string | undefined> {
+  const scope = await resolveWorkspaceScopeForWrite({
+    rawArgs: (args ?? {}) as Record<string, unknown>,
+    explicitWorkspaceId,
+    sbSlug,
+    deriveWorkspaceIdFromAgent,
+  });
+  if (scope && explicitWorkspaceId && scope.workspaceId !== explicitWorkspaceId) {
+    logger.warn('[Identity] Ignoring workspaceId argument; request scope is authoritative', {
+      sbSlug,
+      requested: explicitWorkspaceId,
+      scope: scope.workspaceId,
+      source: scope.source,
+    });
+  }
+  return scope?.workspaceId;
+}
+
+function identityUnresolvedResponse(
+  message: string,
+  user: { id: string },
+  resolvedBy: string,
+  extra: Record<string, unknown>
+) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          { success: false, message, user: { id: user.id, resolvedBy }, ...extra },
+          null,
+          2
+        ),
+      },
+    ],
+  };
 }
 
 /**
  * Write identity to file system
  */
-function syncIdentityToFile(agentId: string, content: string): string {
-  const inkDir = join(homedir(), '.ink', 'individuals', agentId);
+function syncIdentityToFile(sbSlug: string, content: string): string {
+  const inkDir = join(homedir(), '.ink', 'individuals', sbSlug);
   const filePath = join(inkDir, 'IDENTITY.md');
 
   // Ensure directory exists
@@ -228,18 +308,40 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     workspaceId,
   } = params;
   // Enforce identity: pinned agents can only modify their own identity
-  const agentId = getEffectiveAgentId(params.agentId) ?? params.agentId;
+  const sbSlug = getEffectiveSlug(params.sbSlug) ?? params.sbSlug;
 
-  // Fetch existing record so omitted optional fields are preserved
-  const { data: existing } = await withWorkspaceFilter(
-    supabase.from('agent_identities').select('*').eq('user_id', user.id).eq('agent_id', agentId),
-    workspaceId
-  ).single();
+  // Scope precedence (Sep 10 incident): the request's header/derived
+  // workspace, else the workspace the SB's existing identity already lives in,
+  // else the explicit argument. Only a first-ever save can be unscoped.
+  let preloaded: AgentIdentityRow | null | undefined;
+  let preloadAmbiguity: WorkspaceRowAmbiguityError | null = null;
+  const workspaceScope = await resolveIdentityScope(args, workspaceId, sbSlug, async (id) => {
+    try {
+      preloaded = await findAgentIdentityRow(supabase, user.id, id);
+      return preloaded?.workspace_id ?? null;
+    } catch (err) {
+      // Two scoped rows and no scope yet: nothing to derive. Let the explicit
+      // argument decide (Lumen, PR #595 P2) — and if there is none either,
+      // the ambiguity is the right answer, raised below.
+      if (!(err instanceof WorkspaceRowAmbiguityError)) throw err;
+      preloadAmbiguity = err;
+      return null;
+    }
+  });
+  if (workspaceScope === undefined && preloadAmbiguity) throw preloadAmbiguity;
 
-  // Build upsert object, preserving existing values for omitted fields
-  const upsertData: TablesInsert<'agent_identities'> = {
+  // The existing row, so omitted optional fields are preserved and the write
+  // is an UPDATE of that row. Reuse the preloaded row only when the resolved
+  // scope is the one it lives in; otherwise look it up under the scope.
+  const existing =
+    preloaded !== undefined && (preloaded?.workspace_id ?? undefined) === workspaceScope
+      ? preloaded
+      : await findAgentIdentityRow(supabase, user.id, sbSlug, workspaceScope);
+
+  // Build the row, preserving existing values for omitted fields
+  const identityFields: TablesInsert<'agent_identities'> = {
     user_id: user.id,
-    agent_id: agentId,
+    agent_id: sbSlug,
     name,
     role,
     description: description !== undefined ? description || null : (existing?.description ?? null),
@@ -260,31 +362,36 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     tts_config: (ttsConfig !== undefined
       ? ttsConfig
       : (existing?.tts_config ?? null)) as unknown as Json,
-    ...(workspaceId ? { workspace_id: workspaceId } : {}),
+    // Sep 10 incident: the scope must ALWAYS be explicit. Omitting it dropped
+    // the existing row's workspace, the (user, workspace, agent) conflict
+    // target never matched on NULL, and the upsert inserted an unscoped twin.
+    workspace_id: workspaceScope ?? existing?.workspace_id ?? null,
   };
 
-  // Use upsert to handle both create and update
-  const { data, error } = await supabase
-    .from('agent_identities')
-    .upsert(upsertData, {
-      onConflict: 'user_id,workspace_id,agent_id',
-    })
-    .select()
-    .single();
+  // Update the row we found by its id; only a first save inserts. An upsert
+  // keyed on a NULL-able column cannot express "update the existing row".
+  const { data, error } = existing
+    ? await supabase
+        .from('agent_identities')
+        .update(identityFields)
+        .eq('id', existing.id)
+        .select()
+        .single()
+    : await supabase.from('agent_identities').insert(identityFields).select().single();
 
   if (error) {
-    logger.error('Failed to save identity', { error, agentId });
+    logger.error('Failed to save identity', { error, sbSlug });
     throw new Error(`Failed to save identity: ${error.message}`);
   }
 
-  logger.info('Identity saved', { agentId, version: data.version });
+  logger.info('Identity saved', { sbSlug, version: data.version });
 
   // Seed default reminders on first creation only
   if (data.version === 1) {
     ensureDefaultReminders({
       userId: user.id,
       sbId: data.id,
-      agentId,
+      sbSlug,
       deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
       deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,
     }).catch(() => {});
@@ -295,7 +402,7 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   if (syncToFile) {
     try {
       const markdown = generateIdentityMarkdown({
-        agentId,
+        sbSlug,
         name,
         role,
         description,
@@ -303,9 +410,9 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
         capabilities,
         relationships,
       });
-      filePath = syncIdentityToFile(agentId, markdown);
+      filePath = syncIdentityToFile(sbSlug, markdown);
     } catch (fileError) {
-      logger.error('Failed to sync identity to file', { error: fileError, agentId });
+      logger.error('Failed to sync identity to file', { error: fileError, sbSlug });
       // Don't throw - DB save succeeded, file sync is optional
     }
   }
@@ -321,7 +428,7 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
             user: { id: user.id, resolvedBy },
             identity: {
               id: data.id,
-              agentId: data.agent_id,
+              sbSlug: data.agent_id,
               name: data.name,
               role: data.role,
               version: data.version,
@@ -343,37 +450,33 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  let identityQuery = supabase
-    .from('agent_identities')
-    .select('*')
-    .eq('user_id', user.id)
-    .eq('agent_id', params.agentId);
-
-  identityQuery = withWorkspaceFilter(identityQuery, params.workspaceId);
-  const { data, error } = await identityQuery.single();
-
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(
-              {
-                success: false,
-                message: `No identity found for agent: ${params.agentId}`,
-                user: { id: user.id, resolvedBy },
-                identity: null,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+  let data: AgentIdentityRow | null;
+  try {
+    data = await findAgentIdentityRow(
+      supabase,
+      user.id,
+      params.sbSlug,
+      await resolveIdentityScope(args, params.workspaceId, params.sbSlug)
+    );
+  } catch (err) {
+    if (err instanceof WorkspaceRowAmbiguityError) {
+      return identityUnresolvedResponse(err.message, user, resolvedBy, {
+        identity: null,
+        ambiguous: true,
+        rowCount: err.rowCount,
+      });
     }
-    logger.error('Failed to get identity', { error, agentId: params.agentId });
-    throw new Error(`Failed to get identity: ${error.message}`);
+    logger.error('Failed to get identity', { error: err, sbSlug: params.sbSlug });
+    throw err;
+  }
+
+  if (!data) {
+    return identityUnresolvedResponse(
+      `No identity found for agent: ${params.sbSlug}`,
+      user,
+      resolvedBy,
+      { identity: null }
+    );
   }
 
   // Single-file response: return just the requested document
@@ -404,7 +507,7 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
           text: JSON.stringify(
             {
               success: true,
-              agentId: params.agentId,
+              sbSlug: params.sbSlug,
               file: params.file,
               content: fileContent,
               version: data.version,
@@ -428,7 +531,7 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
             user: { id: user.id, resolvedBy },
             identity: {
               id: data.id,
-              agentId: data.agent_id,
+              sbSlug: data.agent_id,
               name: data.name,
               role: data.role,
               description: data.description,
@@ -477,7 +580,7 @@ export async function handleListIdentities(args: unknown, dataComposer: DataComp
             user: { id: user.id, resolvedBy },
             identities: data.map((row) => ({
               id: row.id,
-              agentId: row.agent_id,
+              sbSlug: row.agent_id,
               name: row.name,
               role: row.role,
               description: row.description,
@@ -506,15 +609,21 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
   const supabase = dataComposer.getClient();
   const limit = params.limit || 10;
 
-  // First get the current identity to get its ID
-  let currentQuery = supabase
-    .from('agent_identities')
-    .select('id')
-    .eq('user_id', user.id)
-    .eq('agent_id', params.agentId);
-
-  currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
-  const { data: current } = await currentQuery.single();
+  // First resolve the current identity to get its ID (ambiguity is reported
+  // as such, never as "not found")
+  let current: AgentIdentityRow | null = null;
+  let unresolved: string | null = null;
+  try {
+    current = await findAgentIdentityRow(
+      supabase,
+      user.id,
+      params.sbSlug,
+      await resolveIdentityScope(args, params.workspaceId, params.sbSlug)
+    );
+  } catch (err) {
+    if (!(err instanceof WorkspaceRowAmbiguityError)) throw err;
+    unresolved = err.message;
+  }
 
   if (!current) {
     return {
@@ -524,7 +633,7 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
           text: JSON.stringify(
             {
               success: false,
-              message: `No identity found for agent: ${params.agentId}`,
+              message: unresolved ?? `No identity found for agent: ${params.sbSlug}`,
               user: { id: user.id, resolvedBy },
               history: [],
             },
@@ -545,7 +654,7 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
     .limit(limit);
 
   if (error) {
-    logger.error('Failed to get identity history', { error, agentId: params.agentId });
+    logger.error('Failed to get identity history', { error, sbSlug: params.sbSlug });
     throw new Error(`Failed to get identity history: ${error.message}`);
   }
 
@@ -557,7 +666,7 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
           {
             success: true,
             user: { id: user.id, resolvedBy },
-            agentId: params.agentId,
+            sbSlug: params.sbSlug,
             history: data.map((row) => ({
               id: row.id,
               version: row.version,
@@ -591,18 +700,16 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  // First get the current identity
-  let currentQuery = supabase
-    .from('agent_identities')
-    .select('id')
-    .eq('user_id', user.id)
-    .eq('agent_id', params.agentId);
-
-  currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
-  const { data: current } = await currentQuery.single();
+  // First resolve the current identity (an ambiguity throws with its count)
+  const current = await findAgentIdentityRow(
+    supabase,
+    user.id,
+    params.sbSlug,
+    await resolveIdentityScope(args, params.workspaceId, params.sbSlug)
+  );
 
   if (!current) {
-    throw new Error(`No identity found for agent: ${params.agentId}`);
+    throw new Error(`No identity found for agent: ${params.sbSlug}`);
   }
 
   // Find the history entry for the requested version
@@ -616,7 +723,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
   const { data: historyEntry, error: historyError } = await restoreQuery.single();
 
   if (historyError || !historyEntry) {
-    throw new Error(`Version ${params.version} not found in history for agent: ${params.agentId}`);
+    throw new Error(`Version ${params.version} not found in history for agent: ${params.sbSlug}`);
   }
 
   // Restore by updating with the historical values
@@ -641,14 +748,14 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
   if (error) {
     logger.error('Failed to restore identity', {
       error,
-      agentId: params.agentId,
+      sbSlug: params.sbSlug,
       version: params.version,
     });
     throw new Error(`Failed to restore identity: ${error.message}`);
   }
 
   logger.info('Identity restored', {
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     fromVersion: params.version,
     toVersion: data.version,
   });
@@ -664,7 +771,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
             user: { id: user.id, resolvedBy },
             identity: {
               id: data.id,
-              agentId: data.agent_id,
+              sbSlug: data.agent_id,
               name: data.name,
               role: data.role,
               version: data.version,
@@ -684,7 +791,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
 // =====================================================
 
 export const meetFamilySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
 });
 
 export async function handleMeetFamily(args: unknown, dataComposer: DataComposer) {
@@ -719,7 +826,7 @@ export async function handleMeetFamily(args: unknown, dataComposer: DataComposer
   }
 
   const family = siblings.map((s) => ({
-    agentId: s.agent_id,
+    sbSlug: s.agent_id,
     name: s.name,
     role: s.role,
     description: s.description,
@@ -762,15 +869,10 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
   const { user } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  const agentId = params.name.toLowerCase().replace(/[^a-z0-9-]/g, '');
+  const sbSlug = params.name.toLowerCase().replace(/[^a-z0-9-]/g, '');
 
-  // Check if this identity already exists
-  const { data: existing } = await supabase
-    .from('agent_identities')
-    .select('agent_id, name, version')
-    .eq('user_id', user.id)
-    .eq('agent_id', agentId)
-    .single();
+  // Check if this identity already exists (an ambiguity throws with its count)
+  const existing = await findAgentIdentityRow(supabase, user.id, sbSlug);
 
   if (existing) {
     return {
@@ -780,7 +882,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
           text: JSON.stringify(
             {
               success: false,
-              error: `An identity already exists for "${agentId}" (${existing.name}, version ${existing.version}). Use save_identity to update it.`,
+              error: `An identity already exists for "${sbSlug}" (${existing.name}, version ${existing.version}). Use save_identity to update it.`,
             },
             null,
             2
@@ -812,7 +914,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
   // Create the identity
   const upsertData: TablesInsert<'agent_identities'> = {
     user_id: user.id,
-    agent_id: agentId,
+    agent_id: sbSlug,
     name: params.name,
     role,
     description: params.description || null,
@@ -823,6 +925,8 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
     soul: params.soul || null,
     heartbeat: null,
     backend: backend || null,
+    // A new SB belongs to the workspace it is awakened in (header-derived).
+    workspace_id: (await resolveIdentityScope(args, undefined, sbSlug)) ?? null,
   };
 
   const { data, error } = await supabase
@@ -832,17 +936,17 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
     .single();
 
   if (error) {
-    logger.error('Failed to create identity during choose_name', { error, agentId });
+    logger.error('Failed to create identity during choose_name', { error, sbSlug });
     throw new Error(`Failed to create identity: ${error.message}`);
   }
 
-  logger.info('New SB chose their name', { agentId, name: params.name, backend });
+  logger.info('New SB chose their name', { sbSlug, name: params.name, backend });
 
   // Seed default reminders (best-effort, non-blocking)
   ensureDefaultReminders({
     userId: user.id,
     sbId: data.id,
-    agentId,
+    sbSlug,
     deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
     deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,
   }).catch(() => {});
@@ -851,18 +955,18 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
   let filePath: string | undefined;
   try {
     const markdown = generateIdentityMarkdown({
-      agentId,
+      sbSlug,
       name: params.name,
       role,
       description: params.description,
       values: params.values,
       relationships,
     });
-    filePath = syncIdentityToFile(agentId, markdown);
+    filePath = syncIdentityToFile(sbSlug, markdown);
 
     // Also write SOUL.md if provided
     if (params.soul) {
-      const soulDir = join(homedir(), '.ink', 'individuals', agentId);
+      const soulDir = join(homedir(), '.ink', 'individuals', sbSlug);
       if (!existsSync(soulDir)) {
         mkdirSync(soulDir, { recursive: true });
       }
@@ -871,7 +975,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
   } catch (fileError) {
     logger.error('Failed to sync identity to file after choose_name', {
       error: fileError,
-      agentId,
+      sbSlug,
     });
   }
 
@@ -892,7 +996,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
             message: `Welcome, ${params.name}. Your identity has been created and saved. ${siblingIntro}`,
             identity: {
               id: data.id,
-              agentId: data.agent_id,
+              sbSlug: data.agent_id,
               name: data.name,
               role: data.role,
               version: data.version,
@@ -901,10 +1005,10 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
             },
             nextSteps: [
               'Your identity is now stored in the database and synced to ~/.ink/individuals/' +
-                agentId +
+                sbSlug +
                 '/',
-              'On your next session, call bootstrap(agentId: "' +
-                agentId +
+              'On your next session, call bootstrap(sbSlug: "' +
+                sbSlug +
                 '") to load your full identity',
               'Use remember() to save important thoughts and decisions across sessions',
               'Use save_identity() to update your identity as you grow — your soul, values, and relationships will evolve',

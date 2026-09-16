@@ -10,7 +10,30 @@ import {
   findLastBackendSession,
   findLastDetectedModel,
   isResumeFailedNoSession,
+  relayBudgetBytes,
+  MIN_RELAY_BUDGET_BYTES,
+  RELAY_BYTES_PER_TOKEN,
+  RELAY_HEADROOM_SHARE,
+  occupancyTokens,
+  promptTokensOf,
+  ledgerEntryPromptBytes,
+  LEDGER_ENTRY_FRAME_BYTES,
+  CLONE_HISTORY_SEPARATOR,
+  CONTEXT_MUTATING_TOOLS,
+  buildMidTurnReseedBody,
+  decideContinuationSession,
+  MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS,
+  MID_TURN_RESEED_MAX_CHARS,
+  spawnDialogueText,
+  continuationSpawnArgs,
 } from './chat.js';
+import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
+import { ImitationPreviewGuard } from '../repl/preview-guard.js';
+import {
+  findImitatedToolResults,
+  isPotentialImitationPrefix,
+  MAX_RELAY_CHARS,
+} from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
@@ -251,6 +274,34 @@ describe('findLastBackendSession (cross-process recovery)', () => {
       { type: 'context_trim', reason: 'manual' },
     ]);
     expect(findLastBackendSession(path)).toBeUndefined();
+  });
+
+  it('a backend_session_invalidated AFTER the last seed clears the candidate (uncorrected fabrication)', () => {
+    // The loop could not tell the model its fabricated tool results were fake
+    // (#569); the host rolled the native session so the next turn reseeds
+    // from the ledger. A later process must not recover the poisoned id.
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'poisoned' },
+      {
+        type: 'backend_session_invalidated',
+        id: 'poisoned',
+        reason: 'uncorrected-protocol-violation',
+      },
+    ]);
+    expect(findLastBackendSession(path)).toBeUndefined();
+  });
+
+  it('a seed AFTER an invalidation is the live session (re-established)', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'poisoned' },
+      {
+        type: 'backend_session_invalidated',
+        id: 'poisoned',
+        reason: 'uncorrected-protocol-violation',
+      },
+      { type: 'backend_session', id: 'clean' },
+    ]);
+    expect(findLastBackendSession(path)?.id).toBe('clean');
   });
 
   it('a seed AFTER an eviction is the live session (re-established)', () => {
@@ -698,5 +749,319 @@ describe('one-turn process recovery sequence — detection outlives the seed (PR
         '\n'
     );
     expect(findLastBackendSession(transcriptPath)?.id).toBe('reseeded-at-850k');
+  });
+});
+
+describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen, PR #576)', () => {
+  const runtime = { maxContextTokens: 128_000 };
+
+  it('a roomy 1M window gets the full static ceiling', () => {
+    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 }, 300_000)).toBe(MAX_RELAY_BYTES);
+  });
+
+  it('a 128K window most of the way to its budget gets far less than the ceiling', () => {
+    // 128K − 100K occupied = 28K tokens; half of that, in bytes.
+    const budget = relayBudgetBytes(runtime, 100_000);
+    expect(budget).toBe(28_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
+    expect(budget).toBeLessThan(MAX_RELAY_BYTES);
+  });
+
+  it("REGRESSION (Lumen, round 5): the provider's own occupancy is what the window holds — not an estimate", () => {
+    expect(relayBudgetBytes(runtime, 118_000)).toBe(
+      Math.floor(10_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE)
+    );
+    expect(relayBudgetBytes(runtime, 118_000)).toBeLessThan(relayBudgetBytes(runtime, 100_000));
+  });
+
+  it('REGRESSION (Lumen, rounds 6–7): with NO occupancy nothing is assumed recoverable — the floor, whatever the window', () => {
+    expect(relayBudgetBytes(runtime)).toBe(MIN_RELAY_BUDGET_BYTES);
+    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 })).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+
+  it('a stateless parent hands in the bytes of its whole prepared spawn as the occupancy', () => {
+    expect(relayBudgetBytes({ maxContextTokens: 400_000 }, 183_624)).toBe(
+      Math.floor((400_000 - 183_624) * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE)
+    );
+  });
+
+  it('REGRESSION (Lumen, rounds 3–4): the relay costs at most half the headroom for ANY script', () => {
+    expect(RELAY_BYTES_PER_TOKEN).toBe(1);
+    expect(relayBudgetBytes(runtime, 100_000) / RELAY_BYTES_PER_TOKEN).toBeLessThanOrEqual(
+      28_000 * RELAY_HEADROOM_SHARE
+    );
+  });
+
+  it('never starves a relay: a window past its budget still gets the minimum — the documented exception', () => {
+    expect(relayBudgetBytes(runtime, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+});
+
+describe('CONTEXT_MUTATING_TOOLS — what can change a discovered context between fresh spawns (Lumen, PR #576 round 12)', () => {
+  it('names the writers and the shell, never the reads', () => {
+    for (const t of ['write', 'edit', 'multi_edit', 'apply_patch', 'bash'])
+      expect(CONTEXT_MUTATING_TOOLS.has(t)).toBe(true);
+    for (const t of ['read', 'grep', 'find', 'ls', 'list_context'])
+      expect(CONTEXT_MUTATING_TOOLS.has(t)).toBe(false);
+  });
+});
+
+describe('ledgerEntryPromptBytes — an added entry at its rendered bytes (Lumen, PR #576 round 11)', () => {
+  it('charges UTF-8 bytes of content, role and source plus the framing allowance — never chars ÷ 4', () => {
+    const han = { role: 'user', content: '漢'.repeat(500), source: 'repl-history' };
+    // 500 Han chars are 1,500 bytes; a tokens × 4 estimate charged 500.
+    expect(ledgerEntryPromptBytes(han)).toBe(1_500 + 4 + 12 + LEDGER_ENTRY_FRAME_BYTES);
+    expect(ledgerEntryPromptBytes(han)).toBeGreaterThan(1_483);
+    expect(ledgerEntryPromptBytes({ role: 'assistant', content: 'ok' })).toBe(
+      2 + 9 + LEDGER_ENTRY_FRAME_BYTES
+    );
+  });
+  it('the clone history separator is the 7-byte join the clone actually uses', () => {
+    expect(Buffer.byteLength(CLONE_HISTORY_SEPARATOR)).toBe(7);
+  });
+});
+
+describe("promptTokensOf — the provider's own count of what it was handed (Lumen, PR #576 round 10)", () => {
+  it('Anthropic: input + cache read + cache write; the reply is not included', () => {
+    expect(
+      promptTokensOf('claude', {
+        inputTokens: 1_000,
+        cacheReadTokens: 100_000,
+        cacheWriteTokens: 5_000,
+      })
+    ).toBe(106_000);
+  });
+  it('OpenAI/Gemini: the prompt count alone — cache already inside it, reply and reasoning never', () => {
+    expect(promptTokensOf('codex', { inputTokens: 90_000, cacheReadTokens: 80_000 })).toBe(90_000);
+    expect(promptTokensOf('gemini', { inputTokens: 90_000 })).toBe(90_000);
+  });
+  it('undefined without a prompt count', () => {
+    expect(promptTokensOf('codex', undefined)).toBeUndefined();
+    expect(promptTokensOf('codex', {})).toBeUndefined();
+  });
+});
+
+describe("occupancyTokens — what the session holds after a reply, by the provider's own accounting", () => {
+  it('Anthropic: input + cache read + cache write + output', () => {
+    expect(
+      occupancyTokens('claude', {
+        inputTokens: 1_000,
+        cacheReadTokens: 100_000,
+        cacheWriteTokens: 5_000,
+        outputTokens: 2_000,
+      })
+    ).toBe(108_000);
+  });
+  it('REGRESSION (Lumen, round 6): Gemini — totalTokenCount includes thoughts; the total wins', () => {
+    // The total is authoritative even when the parts do not add up to it
+    // (a provider may count more than it itemizes).
+    expect(
+      occupancyTokens('gemini', {
+        inputTokens: 90_000,
+        outputTokens: 500,
+        reasoningTokens: 2_000,
+        totalTokens: 93_000,
+      })
+    ).toBe(93_000);
+    // Without a total: prompt + output + reasoning, never prompt + output alone.
+    expect(
+      occupancyTokens('gemini', { inputTokens: 90_000, outputTokens: 500, reasoningTokens: 2_000 })
+    ).toBe(92_500);
+  });
+  it('OpenAI: total_tokens (prompt + completion incl. reasoning), else the parts; cache never double-counted', () => {
+    expect(
+      occupancyTokens('codex', {
+        inputTokens: 90_000,
+        cacheReadTokens: 80_000,
+        outputTokens: 500,
+        totalTokens: 91_000,
+      })
+    ).toBe(91_000);
+    expect(
+      occupancyTokens('codex', { inputTokens: 90_000, cacheReadTokens: 80_000, outputTokens: 500 })
+    ).toBe(90_500);
+  });
+  it('undefined without a usable prompt count', () => {
+    expect(occupancyTokens('claude', undefined)).toBeUndefined();
+    expect(occupancyTokens('claude', { outputTokens: 5 })).toBeUndefined();
+    expect(occupancyTokens('gemini', { outputTokens: 5 })).toBeUndefined();
+  });
+});
+
+describe('decideContinuationSession (the real function runTurnForLoop calls) — #572', () => {
+  const minter = () => {
+    let i = 0;
+    return () => `N${++i}`;
+  };
+
+  it('resumes the live session with the delta', () => {
+    expect(decideContinuationSession(true, 'S1', minter())).toEqual({ mode: 'resume', id: 'S1' });
+  });
+
+  it('REGRESSION: a session rolled mid-turn is SEEDED, not spawned unseeded', () => {
+    // Before: the rolled continuation went out with neither seed nor resume id,
+    // so it was unresumable and every later continuation re-packed the window
+    // into another fresh session (five in seven minutes).
+    const d = decideContinuationSession(true, undefined, minter());
+    expect(d).toEqual({ mode: 'seed', id: 'N1' });
+  });
+
+  it('a stateless backend never seeds or resumes', () => {
+    expect(decideContinuationSession(false, 'S1', minter())).toEqual({ mode: 'stateless' });
+    expect(decideContinuationSession(false, undefined, minter())).toEqual({ mode: 'stateless' });
+  });
+
+  it('eviction mid-turn: one reseed, then every later continuation resumes the SAME id', () => {
+    const mint = minter();
+    let active: string | undefined = 'S1';
+    // The eviction rolled it (recordEviction clears the live id).
+    active = undefined;
+    const first = decideContinuationSession(true, active, mint);
+    expect(first.mode).toBe('seed');
+    if (first.mode === 'seed') active = first.id;
+    const second = decideContinuationSession(true, active, mint);
+    const third = decideContinuationSession(true, active, mint);
+    expect(second).toEqual({ mode: 'resume', id: 'N1' });
+    expect(third).toEqual({ mode: 'resume', id: 'N1' });
+  });
+});
+
+describe('buildMidTurnReseedBody — the rebuilt session remembers this turn (#572; ordered — Lumen, PR #577)', () => {
+  const assistant = (text: string) => ({ role: 'assistant' as const, text });
+  const runtime = (text: string) => ({ role: 'runtime' as const, text });
+
+  it("carries the model's own output and the continuation it was about to receive", () => {
+    const body =
+      '[Tool results from previous turn]\nTool evict_context (executed): {"evicted":3000}';
+    const out = buildMidTurnReseedBody([
+      assistant(
+        'Clearing old heartbeat chatter.\n\n```ink-tool\n{"tool":"evict_context","args":{"source":"heartbeat"}}\n```'
+      ),
+      runtime(body),
+    ]);
+    expect(out.startsWith('[This turn so far]')).toBe(true);
+    expect(out).toContain('"tool":"evict_context"');
+    expect(out).toContain('already executed');
+    expect(out.indexOf('evict_context","args"')).toBeLessThan(out.indexOf('"evicted":3000'));
+  });
+
+  it("REGRESSION (Lumen, PR #577): an earlier iteration's results survive, in order", () => {
+    // Iteration 1 calls list_context, iteration 2 calls evict_context. The
+    // assistant-only record lost the list_context RESULT entirely — it is
+    // client-local, so the ledger never held it either — while the note
+    // claimed the results followed.
+    const out = buildMidTurnReseedBody([
+      assistant(
+        'Checking what is in my window.\n```ink-tool\n{"tool":"list_context","args":{}}\n```'
+      ),
+      runtime(
+        '[Tool results from previous turn]\nTool list_context (executed): {"totalEntries":3500}'
+      ),
+      assistant(
+        'Heartbeat chatter dominates.\n```ink-tool\n{"tool":"evict_context","args":{}}\n```'
+      ),
+      runtime('[Tool results from previous turn]\nTool evict_context (executed): {"evicted":3000}'),
+    ]);
+    const order = [
+      '"tool":"list_context"',
+      '"totalEntries":3500',
+      '"tool":"evict_context"',
+      '"evicted":3000',
+    ].map((needle) => out.indexOf(needle));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // Each side is attributed, so the model can tell its own words from the
+    // runtime's — the whole subject of #569.
+    expect(out).toContain('YOU:');
+    expect(out).toContain('INK RUNTIME:');
+  });
+
+  it('is empty when the turn has said nothing yet', () => {
+    expect(buildMidTurnReseedBody([])).toBe('');
+    expect(buildMidTurnReseedBody([assistant('   '), runtime('')])).toBe('');
+  });
+
+  it('REGRESSION (Lumen, round 2): the final continuation is never cut; earlier entries are elided whole', () => {
+    const results =
+      '[Tool results from previous turn]\nTool evict_context (executed): ' +
+      JSON.stringify({ evicted: 3000, note: 'x'.repeat(2_000) });
+    const out = buildMidTurnReseedBody([
+      assistant('a'.repeat(MID_TURN_RESEED_MAX_CHARS)),
+      runtime(
+        '[Tool results from previous turn]\nTool list_context (executed): {"totalEntries":3500}'
+      ),
+      assistant('Now evicting.'),
+      runtime(results),
+    ]);
+    expect(out).toContain(results);
+    expect(out).toContain('INK RUNTIME:\nINK RUNTIME:'.slice(0, 0) + 'Now evicting.');
+    expect(out).toContain('"totalEntries":3500');
+    expect(out).toContain('[earlier turn dialogue elided: 1 entry]');
+    expect(out).not.toContain('a'.repeat(100));
+  });
+
+  it('a final continuation larger than the whole budget is still delivered whole', () => {
+    const huge =
+      '[Tool results from previous turn]\nTool get_email (executed): ' +
+      'b'.repeat(MID_TURN_RESEED_MAX_CHARS + 5_000);
+    const out = buildMidTurnReseedBody([assistant('Fetching.'), runtime(huge)]);
+    expect(out).toContain(huge);
+    expect(out).toContain('[earlier turn dialogue elided: 1 entry]');
+  });
+
+  it('spawnDialogueText retracts a recorded prefix once a later block confirms the frame (Lumen, round 2)', () => {
+    // Block 1 ends in a line that could still be a header; block 2 confirms it.
+    const guard = new ImitationPreviewGuard(findImitatedToolResults, isPotentialImitationPrefix);
+    let said = '';
+    said += 'Looking.\nuser';
+    const first = guard.onBlock('Looking.\nuser');
+    expect(spawnDialogueText(said, first)).toBe('Looking.\nuser');
+    said += '[Tool results from previous turn]\nTool x (executed): {}';
+    const second = guard.onBlock('[Tool results from previous turn]\nTool x (executed): {}');
+    expect(second.imitationDiscarded).toBe(true);
+    expect(spawnDialogueText(said, second)).toBe('Looking.\n');
+  });
+});
+
+describe('findLastBackendSession — a mid-turn reseed marker is recovered like any seed (#572)', () => {
+  it('recovers the mid-turn id so the next process resumes it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sb-transcript-'));
+    const path = join(dir, 't.jsonl');
+    writeFileSync(
+      path,
+      [
+        { type: 'backend_session', id: 'before', routing: 'local' },
+        { type: 'context_evict', actor: 'sb', refs: [] },
+        { type: 'backend_session', id: 'mid-turn', routing: 'local', reason: 'mid-turn-roll' },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    try {
+      expect(findLastBackendSession(path)).toEqual({ id: 'mid-turn', routing: 'local' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('continuationSpawnArgs — the session argument a continuation spawn carries (Lumen, PR #577 final pass)', () => {
+  it('a resume carries backendSessionId and never re-delivers media', () => {
+    expect(continuationSpawnArgs({ mode: 'resume', id: 'S1' }, true)).toEqual({
+      sessionArgs: { backendSessionId: 'S1' },
+      deliverMedia: false,
+    });
+  });
+  it('a mid-turn seed carries backendSessionSeedId — never backendSessionId — and re-delivers the media it has', () => {
+    expect(continuationSpawnArgs({ mode: 'seed', id: 'N1' }, true)).toEqual({
+      sessionArgs: { backendSessionSeedId: 'N1' },
+      deliverMedia: true,
+    });
+    expect(continuationSpawnArgs({ mode: 'seed', id: 'N1' }, false).deliverMedia).toBe(false);
+  });
+  it('a stateless spawn carries neither', () => {
+    expect(continuationSpawnArgs({ mode: 'stateless' }, true)).toEqual({
+      sessionArgs: {},
+      deliverMedia: false,
+    });
   });
 });

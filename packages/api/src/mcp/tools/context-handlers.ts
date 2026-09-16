@@ -2,120 +2,6 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
-import type { ContextType } from '../../data/repositories/context.repository';
-
-// Context type enum for validation
-const contextTypeSchema = z.enum(['user', 'assistant', 'project', 'session', 'relationship']);
-
-// =====================================================
-// CONTEXT TOOLS
-// =====================================================
-
-export const saveContextSchema = userIdentifierBaseSchema.extend({
-  contextType: contextTypeSchema,
-  contextKey: z.string().optional().describe('Optional key for sub-context (e.g., project name)'),
-  summary: z.string().describe('The summarized context to save'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-});
-
-export const getContextSchema = userIdentifierBaseSchema.extend({
-  contextType: contextTypeSchema.optional().describe('Filter by context type'),
-  contextKey: z.string().optional().describe('Filter by context key'),
-});
-
-export async function handleSaveContext(args: unknown, dataComposer: DataComposer) {
-  const params = saveContextSchema.parse(args);
-  const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-
-  const context = await dataComposer.repositories.context.upsert({
-    user_id: user.id,
-    context_type: params.contextType as ContextType,
-    context_key: params.contextKey || null,
-    summary: params.summary,
-    metadata: params.metadata || {},
-  });
-
-  logger.info(
-    `Context saved: ${context.context_type}/${context.context_key || 'default'} for user ${user.id}`
-  );
-
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(
-          {
-            success: true,
-            message: 'Context saved successfully',
-            user: { id: user.id, resolvedBy },
-            context: {
-              id: context.id,
-              type: context.context_type,
-              key: context.context_key,
-              version: context.version,
-              updated_at: context.updated_at,
-            },
-          },
-          null,
-          2
-        ),
-      },
-    ],
-  };
-}
-
-export async function handleGetContext(args: unknown, dataComposer: DataComposer) {
-  const params = getContextSchema.parse(args);
-  const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-
-  let contexts;
-  if (params.contextType && params.contextKey !== undefined) {
-    // Get specific context
-    const context = await dataComposer.repositories.context.findByUserAndType(
-      user.id,
-      params.contextType as ContextType,
-      params.contextKey || null
-    );
-    contexts = context ? [context] : [];
-  } else if (params.contextType) {
-    // Get all contexts of a type
-    contexts = await dataComposer.repositories.context.findByType(
-      user.id,
-      params.contextType as ContextType
-    );
-  } else {
-    // Get all contexts
-    contexts = await dataComposer.repositories.context.findAllByUser(user.id);
-  }
-
-  logger.info(`Retrieved ${contexts.length} context(s) for user ${user.id}`);
-
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(
-          {
-            success: true,
-            user: { id: user.id, resolvedBy },
-            count: contexts.length,
-            contexts: contexts.map((c) => ({
-              id: c.id,
-              type: c.context_type,
-              key: c.context_key,
-              summary: c.summary,
-              version: c.version,
-              metadata: c.metadata,
-              updated_at: c.updated_at,
-            })),
-          },
-          null,
-          2
-        ),
-      },
-    ],
-  };
-}
 
 // =====================================================
 // PROJECT TOOLS
@@ -149,7 +35,7 @@ export const listProjectsSchema = userIdentifierBaseSchema.extend({
 
 export const getProjectSchema = userIdentifierBaseSchema.extend({
   name: z.string().optional().describe('Project name'),
-  projectId: z.string().uuid().optional().describe('Project UUID'),
+  projectId: z.string().guid().optional().describe('Project UUID'),
 });
 
 export async function handleSaveProject(args: unknown, dataComposer: DataComposer) {
@@ -322,9 +208,12 @@ export async function handleGetProject(args: unknown, dataComposer: DataComposer
 export const setFocusSchema = userIdentifierBaseSchema.extend({
   sessionId: z.string().optional().describe('Claude Code or channel session ID'),
   projectName: z.string().optional().describe('Name of the project to focus on'),
-  projectId: z.string().uuid().optional().describe('UUID of the project to focus on'),
+  projectId: z.string().guid().optional().describe('UUID of the project to focus on'),
   focusSummary: z.string().optional().describe('What we are currently working on'),
-  contextSnapshot: z.record(z.unknown()).optional().describe('Snapshot of relevant context'),
+  contextSnapshot: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe('Snapshot of relevant context'),
 });
 
 export const getFocusSchema = userIdentifierBaseSchema.extend({

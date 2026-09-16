@@ -43,10 +43,13 @@ export const CLONE_BASELINE_TOOLS: readonly string[] = [
   'grep',
   'find',
   'ls',
+  // Asking what it can call. A clone that must escalate for this learns its
+  // surface by being refused, which is the failure mode this whole area exists
+  // to remove — and unattended, a promptable tool is denied outright.
+  'describe_tool',
   // PCP introspection. Reading the workspace is the point of a clone.
   'bootstrap',
   'recall',
-  'get_context',
   'get_artifact',
   'list_artifacts',
   'search_artifacts',
@@ -90,13 +93,16 @@ export const CLONE_BASELINE_TOOLS: readonly string[] = [
  * damage the parent would never see.
  */
 export const CLONE_DENIED_TOOLS: readonly string[] = [
+  // A clone's ledger is a throwaway; there is no provider session of its own
+  // to re-seed from a summary. The handler refuses it too — the prompt just
+  // does not offer it.
+  'compact_context',
   // Memory belongs to the original. Clones hand work back; the parent decides
   // what was worth remembering. Spec decision #5 — enforced, not conventional.
   'remember',
   'forget',
   'update_memory',
   'restore_memory',
-  'save_context',
   'save_project',
   'save_identity',
   'save_user_identity',

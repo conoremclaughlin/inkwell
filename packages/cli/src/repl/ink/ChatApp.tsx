@@ -32,7 +32,7 @@ export interface ChatMessage extends MessageLineProps {
 }
 
 export interface ChatAppProps {
-  agentId: string;
+  sbSlug: string;
   timezone?: string;
   infoItems: string[];
   fullscreen?: boolean;
@@ -71,7 +71,7 @@ export interface ChatAppHandle {
  */
 export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function ChatApp(
   {
-    agentId,
+    sbSlug,
     timezone,
     infoItems: initialInfoItems,
     fullscreen = false,

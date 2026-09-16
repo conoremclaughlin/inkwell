@@ -15,7 +15,7 @@
     "@inklabs/api": "workspace:*"
   },
   "devDependencies": {
-    "tsx": "^4.20.6",
+    "tsx": "^4.23.13",
     "vitest": "^4.0.18"
   }
 }

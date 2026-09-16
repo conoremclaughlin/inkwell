@@ -31,12 +31,12 @@ export class AmbiguousAliasError extends Error {
 
   constructor(
     readonly alias: string,
-    readonly agentId: string,
+    readonly sbSlug: string,
     readonly candidates: Array<{ sessionId: string; studioId: string | null }>
   ) {
     const studios = candidates.map((c) => c.studioId ?? '(no studio)').join(', ');
     super(
-      `Session alias "${alias}" for agent "${agentId}" is ambiguous — it matches ` +
+      `Session alias "${alias}" for agent "${sbSlug}" is ambiguous — it matches ` +
         `${candidates.length} active sessions across studios: ${studios}. ` +
         `Qualify the address with recipientStudioSlug or recipientStudioId.`
     );
@@ -126,7 +126,7 @@ function mapDbToSession(row: DbSession): Session {
   return {
     id: row.id,
     userId: row.user_id,
-    agentId: row.agent_id || '',
+    sbSlug: row.agent_id || '',
     sbId: row.sb_id || undefined,
     studioId: row.studio_id || undefined,
     contactId: row.contact_id || undefined,
@@ -135,6 +135,7 @@ function mapDbToSession(row: DbSession): Session {
     type: (metadata.type as SessionType) || 'primary',
     lifecycle: (row.lifecycle as SessionLifecycle) || 'idle',
     status: (row.status as SessionStatus) || 'active',
+    turnEpoch: (row as unknown as { turn_epoch?: string | null }).turn_epoch ?? null,
 
     taskDescription: metadata.taskDescription as string | undefined,
     parentSessionId: metadata.parentSessionId as string | undefined,
@@ -185,7 +186,7 @@ function mapSessionToDb(
 ): DbSessionInsert {
   return {
     user_id: session.userId,
-    agent_id: session.agentId,
+    agent_id: session.sbSlug,
     sb_id: session.sbId || null,
     claude_session_id: session.backendSessionId,
     backend_session_id: session.backendSessionId,
@@ -235,7 +236,7 @@ export class SessionRepository implements ISessionRepository {
 
   async findByUserAndAgent(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: {
       status?: SessionStatus;
       type?: SessionType;
@@ -255,7 +256,7 @@ export class SessionRepository implements ISessionRepository {
       .order('started_at', { ascending: false })
       .limit(1);
     // Same-slug siblings must not satisfy general reuse (Lumen, #514 r7).
-    query = options?.sbId ? query.eq('sb_id', options.sbId) : query.eq('agent_id', agentId);
+    query = options?.sbId ? query.eq('sb_id', options.sbId) : query.eq('agent_id', sbSlug);
 
     if (options?.studioId) {
       query = query.eq('studio_id', options.studioId);
@@ -279,7 +280,7 @@ export class SessionRepository implements ISessionRepository {
     if (error) {
       logger.error('Error finding session by user and agent', {
         userId,
-        agentId,
+        sbSlug,
         error,
       });
       throw error;
@@ -319,7 +320,7 @@ export class SessionRepository implements ISessionRepository {
    */
   async findByAlias(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     alias: string,
     studioId?: string,
     sbId?: string | null
@@ -336,7 +337,7 @@ export class SessionRepository implements ISessionRepository {
       .eq('alias', alias)
       .is('ended_at', null)
       .neq('lifecycle', 'failed');
-    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', agentId);
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
     if (studioId !== undefined) {
       query = query.eq('studio_id', studioId);
@@ -348,7 +349,7 @@ export class SessionRepository implements ISessionRepository {
     };
 
     if (error) {
-      logger.error('Error finding session by alias', { userId, agentId, alias, studioId, error });
+      logger.error('Error finding session by alias', { userId, sbSlug, alias, studioId, error });
       throw error;
     }
 
@@ -363,7 +364,7 @@ export class SessionRepository implements ISessionRepository {
     if (distinctStudios.size > 1) {
       throw new AmbiguousAliasError(
         alias,
-        agentId,
+        sbSlug,
         rows.map((r) => ({ sessionId: r.id, studioId: r.studio_id ?? null }))
       );
     }
@@ -373,7 +374,7 @@ export class SessionRepository implements ISessionRepository {
 
   async findByThreadKey(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     threadKey: string,
     studioId?: string,
     contactId?: string,
@@ -396,7 +397,7 @@ export class SessionRepository implements ISessionRepository {
       .not('lifecycle', 'in', '(completed,failed)')
       .order('started_at', { ascending: false })
       .limit(1);
-    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', agentId);
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
     if (studioId) {
       query = query.eq('studio_id', studioId);
@@ -409,7 +410,7 @@ export class SessionRepository implements ISessionRepository {
     const { data, error } = await query;
 
     if (error) {
-      logger.error('Error finding session by thread key', { userId, agentId, threadKey, error });
+      logger.error('Error finding session by thread key', { userId, sbSlug, threadKey, error });
       throw error;
     }
 
@@ -419,7 +420,7 @@ export class SessionRepository implements ISessionRepository {
   async findByUser(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -431,8 +432,8 @@ export class SessionRepository implements ISessionRepository {
       .eq('user_id', userId)
       .order('started_at', { ascending: false });
 
-    if (options?.agentId) {
-      query = query.eq('agent_id', options.agentId);
+    if (options?.sbSlug) {
+      query = query.eq('agent_id', options.sbSlug);
     }
 
     if (options?.status) {
@@ -477,23 +478,23 @@ export class SessionRepository implements ISessionRepository {
     logger.info('Created session', {
       id: data.id,
       userId: session.userId,
-      agentId: session.agentId,
+      sbSlug: session.sbSlug,
       type: session.type,
     });
 
     return mapDbToSession(data);
   }
 
-  async update(
-    id: string,
+  /**
+   * Field mapping + metadata merge shared by update() and updateIfTurnEpoch().
+   * `metadata` is a single JSONB column rebuilt from `current`, which is why
+   * every terminal write needs the turn-epoch fence below: a stale rebuild
+   * replayed late would erase a newer turn's keys.
+   */
+  private buildUpdatePayload(
+    current: Session,
     updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
-  ): Promise<Session> {
-    // First fetch current session to merge metadata
-    const current = await this.findById(id);
-    if (!current) {
-      throw new Error(`Session not found: ${id}`);
-    }
-
+  ): DbSessionUpdate {
     const dbUpdates: DbSessionUpdate = {};
 
     if (updates.backendSessionId !== undefined) {
@@ -536,6 +537,10 @@ export class SessionRepository implements ISessionRepository {
 
     if (updates.cliAttached !== undefined) {
       dbUpdates.cli_attached = updates.cliAttached;
+    }
+
+    if (updates.turnEpoch !== undefined) {
+      (dbUpdates as Record<string, unknown>).turn_epoch = updates.turnEpoch;
     }
 
     if (updates.alias !== undefined) {
@@ -587,6 +592,21 @@ export class SessionRepository implements ISessionRepository {
 
     dbUpdates.metadata = newMetadata;
 
+    return dbUpdates;
+  }
+
+  async update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session> {
+    // First fetch current session to merge metadata
+    const current = await this.findById(id);
+    if (!current) {
+      throw new Error(`Session not found: ${id}`);
+    }
+
+    const dbUpdates = this.buildUpdatePayload(current, updates);
+
     const { data, error } = await this.supabase
       .from('sessions')
       .update(dbUpdates)
@@ -600,6 +620,53 @@ export class SessionRepository implements ISessionRepository {
     }
 
     return mapDbToSession(data);
+  }
+
+  /**
+   * The turn-epoch fenced terminal write (Lumen, PR #563 round 3).
+   *
+   * The `turn_epoch` COLUMN is rotated by the session_running_write DB trigger
+   * every time a session ENTERS `running`, on every write path. Fencing the
+   * update on the epoch this turn captured from its own `running` write means
+   * the predicate is evaluated atomically with the update by Postgres: a
+   * finalize that raced a newer turn's `running` write matches zero rows
+   * instead of clobbering the new turn's state — including writes already in
+   * flight when ownership changed, which no client-side token can stop.
+   *
+   * Returns null when ownership was lost; throws `Session not found:` when
+   * the row is gone (same contract as update(), so isSessionGoneError works).
+   */
+  async updateIfTurnEpoch(
+    id: string,
+    epoch: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session | null> {
+    const current = await this.findById(id);
+    if (!current) {
+      throw new Error(`Session not found: ${id}`);
+    }
+    if (current.turnEpoch !== epoch) {
+      return null;
+    }
+
+    const dbUpdates = this.buildUpdatePayload(current, updates);
+
+    const { data, error } = await this.supabase
+      .from('sessions')
+      .update(dbUpdates)
+      .eq('id', id)
+      .eq('turn_epoch', epoch)
+      .select();
+
+    if (error) {
+      logger.error('Error applying fenced session update', { id, epoch, error });
+      throw error;
+    }
+    if (!data || data.length === 0) {
+      // Lost between the read and the write — the CAS said no.
+      return null;
+    }
+    return mapDbToSession(data[0]);
   }
 
   async updateTokenUsage(

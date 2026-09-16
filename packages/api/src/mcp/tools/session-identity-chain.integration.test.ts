@@ -92,7 +92,7 @@ describe('Session Identity Chain — Integration', () => {
     expect(retrieved).not.toBeNull();
     expect(retrieved!.id).toBe(session!.id);
     expect(retrieved!.studioId).toBe(studioId);
-    expect(retrieved!.agentId).toBe('echo');
+    expect(retrieved!.sbSlug).toBe('echo');
   });
 
   it('should return null studioId for sessions without a studio', async () => {

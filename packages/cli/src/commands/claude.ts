@@ -21,10 +21,11 @@ import {
 } from 'fs';
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
-import { getBackend, resolveAgentId } from '../backends/index.js';
+import { getBackend, resolveSlug } from '../backends/index.js';
 import { classifyError } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import {
@@ -61,7 +62,7 @@ interface BootstrapContextResult {
 
 interface PcpSessionSummary {
   id: string;
-  agentId?: string | null;
+  sbSlug?: string | null;
   studioId?: string | null;
   studio?: { branch?: string | null } | null;
   threadKey?: string | null;
@@ -327,7 +328,7 @@ interface CodexSessionMetaLine {
 
 interface BackendExecutionLogContext {
   pcpConfig: PcpConfig | null;
-  agentId: string;
+  sbSlug: string;
   backend: string;
   binary: string;
   args: string[];
@@ -530,18 +531,18 @@ function buildInjectedStartupContext(
 
 async function resolveCodexStartupContextBlock(options: {
   backend: string;
-  agentId: string;
+  sbSlug: string;
   pcpConfig: PcpConfig | null;
   hasAuthToken: boolean;
   verbose: boolean;
   pcpSessionId?: string;
 }): Promise<string | undefined> {
-  const { backend, agentId, pcpConfig, hasAuthToken, verbose, pcpSessionId } = options;
+  const { backend, sbSlug, pcpConfig, hasAuthToken, verbose, pcpSessionId } = options;
   if (backend !== 'codex') return undefined;
   if (!hasAuthToken) {
     sbDebugLog('sb', 'codex_startup_context_skipped', {
       reason: 'no_auth_token',
-      agentId,
+      sbSlug,
       backend,
       pcpSessionId: pcpSessionId || null,
     });
@@ -553,7 +554,7 @@ async function resolveCodexStartupContextBlock(options: {
       'bootstrap',
       {
         email: pcpConfig?.email,
-        agentId,
+        sbSlug,
       },
       { timeoutMs: 5000, callerProfile: 'runtime' }
     );
@@ -567,7 +568,7 @@ async function resolveCodexStartupContextBlock(options: {
       studioName: ctxStudioName,
     });
     sbDebugLog('sb', 'codex_startup_context_injected', {
-      agentId,
+      sbSlug,
       backend,
       pcpSessionId: pcpSessionId || null,
       bytes: Buffer.byteLength(startupContextBlock, 'utf-8'),
@@ -577,7 +578,7 @@ async function resolveCodexStartupContextBlock(options: {
     return startupContextBlock;
   } catch (error) {
     sbDebugLog('sb', 'codex_startup_context_failed', {
-      agentId,
+      sbSlug,
       backend,
       pcpSessionId: pcpSessionId || null,
       error: error instanceof Error ? error.message : String(error),
@@ -890,13 +891,13 @@ export function buildBackendSessionOwnerIndex(
   const owners = new Map<string, string>();
   for (const session of allAgentSessions) {
     const backendSessionId = getSessionBackendId(session);
-    if (!backendSessionId || !session.agentId) continue;
-    if (!owners.has(backendSessionId)) owners.set(backendSessionId, session.agentId);
+    if (!backendSessionId || !session.sbSlug) continue;
+    if (!owners.has(backendSessionId)) owners.set(backendSessionId, session.sbSlug);
   }
   for (const record of runtimeRecords) {
-    if (!record.agentId) continue;
+    if (!record.sbSlug) continue;
     for (const id of [record.backendSessionId, ...(record.backendSessionIds || [])]) {
-      if (id && !owners.has(id)) owners.set(id, record.agentId);
+      if (id && !owners.has(id)) owners.set(id, record.sbSlug);
     }
   }
   return owners;
@@ -1307,7 +1308,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   backend: string;
   pcpSessionId?: string;
   runtimeLinkId?: string;
-  agentId?: string;
+  sbSlug?: string;
   studioId?: string;
   knownLocalSessionSnapshot?: Map<string, string>;
   fallbackBackendSessionId?: string;
@@ -1317,7 +1318,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
     backend,
     pcpSessionId,
     runtimeLinkId,
-    agentId,
+    sbSlug,
     studioId,
     knownLocalSessionSnapshot,
     fallbackBackendSessionId,
@@ -1337,7 +1338,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   const scopedRecords = listRuntimeSessions(cwd, backend).filter(
     (record) =>
       record.pcpSessionId === pcpSessionId &&
-      (!agentId || record.agentId === agentId) &&
+      (!sbSlug || record.sbSlug === sbSlug) &&
       (!studioId || record.studioId === studioId)
   );
 
@@ -1350,7 +1351,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   const current = getCurrentRuntimeSession(cwd, backend);
   if (
     current?.pcpSessionId === pcpSessionId &&
-    (!agentId || current.agentId === agentId) &&
+    (!sbSlug || current.sbSlug === sbSlug) &&
     (!studioId || current.studioId === studioId)
   ) {
     const currentSessionId = resolveFromRecord(current);
@@ -1380,7 +1381,7 @@ export async function resolveCapturedBackendSessionIdWithRetry(options: {
   backend: string;
   pcpSessionId?: string;
   runtimeLinkId?: string;
-  agentId?: string;
+  sbSlug?: string;
   studioId?: string;
   knownLocalSessionSnapshot?: Map<string, string>;
   fallbackBackendSessionId?: string;
@@ -2284,7 +2285,7 @@ async function logBackendExecutionStart(
 
     const result = await callPcpTool<LogActivityResult>('log_activity', {
       email: context.pcpConfig.email,
-      agentId: context.agentId,
+      sbSlug: context.sbSlug,
       type: 'tool_call',
       subtype: `backend_cli:${context.backend}`,
       status: 'running',
@@ -2329,7 +2330,7 @@ async function logBackendExecutionResult(options: {
   try {
     await callPcpTool('log_activity', {
       email: options.context.pcpConfig.email,
-      agentId: options.context.agentId,
+      sbSlug: options.context.sbSlug,
       type: 'tool_result',
       subtype: `backend_cli:${options.context.backend}`,
       status,
@@ -2438,7 +2439,7 @@ async function persistBackendSessionLink(options: {
   pcpSessionId?: string;
   backendSessionId?: string;
   backend: string;
-  agentId: string;
+  sbSlug: string;
   runtimeLinkId?: string;
   studioId?: string;
   sbId?: string;
@@ -2450,7 +2451,7 @@ async function persistBackendSessionLink(options: {
   upsertRuntimeSession(process.cwd(), {
     pcpSessionId: options.pcpSessionId,
     backend: options.backend,
-    agentId: options.agentId,
+    sbSlug: options.sbSlug,
     ...(options.sbId ? { sbId: options.sbId } : {}),
     ...(options.studioId ? { studioId: options.studioId } : {}),
     ...(options.runtimeLinkId ? { runtimeLinkId: options.runtimeLinkId } : {}),
@@ -2464,12 +2465,12 @@ async function persistBackendSessionLink(options: {
       sessionConflict?: {
         backendSessionId?: string;
         conflictingSessionId?: string;
-        conflictingAgentId?: string;
+        conflictingSlug?: string;
       };
       sessionTrace?: { changedFields?: string[] };
     }>('update_session_state', {
       email: options.email,
-      agentId: options.agentId,
+      sbSlug: options.sbSlug,
       sessionId: options.pcpSessionId,
       backendSessionId: options.backendSessionId,
       status: 'active',
@@ -2479,7 +2480,7 @@ async function persistBackendSessionLink(options: {
     if (updateResult?.sessionConflict) {
       sbDebugLog('claude', 'persist_backend_link_conflict_warning', {
         backend: options.backend,
-        agentId: options.agentId,
+        sbSlug: options.sbSlug,
         pcpSessionId: options.pcpSessionId,
         backendSessionId: options.backendSessionId,
         conflict: updateResult.sessionConflict,
@@ -2497,7 +2498,7 @@ async function persistBackendSessionLink(options: {
 }
 
 async function ensurePcpSessionContext(
-  agentId: string,
+  sbSlug: string,
   backend: string,
   passthroughArgs: string[],
   verbose: boolean,
@@ -2546,7 +2547,7 @@ async function ensurePcpSessionContext(
   const existing = getCurrentRuntimeSession(cwd, backend);
   sbDebugLog('claude', 'ensure_context_start', {
     backend,
-    agentId,
+    sbSlug,
     isTty: process.stdin.isTTY,
     explicitSelection,
     hasSessionOverride,
@@ -2567,7 +2568,7 @@ async function ensurePcpSessionContext(
   ) {
     sbDebugLog('claude', 'ensure_context_fast_path_resume', {
       backend,
-      agentId,
+      sbSlug,
       pcpSessionId: existing.pcpSessionId,
       backendSessionId: existing.backendSessionId || null,
       isTty: process.stdin.isTTY,
@@ -2592,7 +2593,7 @@ async function ensurePcpSessionContext(
       const [listed, allAgentListed] = await Promise.all([
         callPcpTool<ListSessionsResult>('list_sessions', {
           email,
-          agentId,
+          sbSlug,
           ...(studioId ? { studioId } : {}),
           limit: pcpSessionLimit,
         }),
@@ -2619,7 +2620,7 @@ async function ensurePcpSessionContext(
       }
       sbDebugLog('claude', 'active_sessions_loaded', {
         backend,
-        agentId,
+        sbSlug,
         listedCount: (listed.sessions || []).length,
         filteredCount: activeSessions.length,
         filtered: activeSessions.map((session) => ({
@@ -2639,7 +2640,7 @@ async function ensurePcpSessionContext(
   if (!pcpAvailable) {
     sbDebugLog('sb', 'pcp_unavailable', {
       backend,
-      agentId,
+      sbSlug,
       reason: pcpUnavailableReason || 'unknown error',
       studioId: studioId || null,
     });
@@ -2691,7 +2692,7 @@ async function ensurePcpSessionContext(
   // wins (it carries phase/thread context), then the cross-agent index. Null
   // means unknown — render honestly as unlabeled rather than guessing.
   const resolveLocalSessionOwner = (backendSessionId: string): string | null =>
-    pcpSessionByBackendSessionId.get(backendSessionId)?.agentId ||
+    pcpSessionByBackendSessionId.get(backendSessionId)?.sbSlug ||
     ownerAgentByBackendSessionId.get(backendSessionId) ||
     null;
   // Keep the picker de-duplicated: linked locals are rendered through the Inkwell row
@@ -2700,7 +2701,7 @@ async function ensurePcpSessionContext(
   const existingSessionIds = new Set(activeSessions.map((session) => session.id));
   const pcpPreviewBySessionId = new Map<string, string>();
   for (const session of activeSessions) {
-    const preview = getPcpSessionPreviewLabel(session, session.agentId || agentId, cwd);
+    const preview = getPcpSessionPreviewLabel(session, session.sbSlug || sbSlug, cwd);
     if (preview) pcpPreviewBySessionId.set(session.id, preview);
   }
 
@@ -2736,7 +2737,7 @@ async function ensurePcpSessionContext(
           'list_sessions',
           {
             email,
-            agentId,
+            sbSlug,
             ...(studioId ? { studioId } : {}),
             limit: pcpSessionLimit,
           },
@@ -2765,7 +2766,7 @@ async function ensurePcpSessionContext(
         });
         sbDebugLog('sb', 'pcp_start_session_resolve_from_list', {
           backend,
-          agentId,
+          sbSlug,
           studioId: studioId || null,
           mode,
           requestedSessionId: requestedSessionId || null,
@@ -2777,7 +2778,7 @@ async function ensurePcpSessionContext(
       } catch (error) {
         sbDebugLog('sb', 'pcp_start_session_resolve_from_list_failed', {
           backend,
-          agentId,
+          sbSlug,
           studioId: studioId || null,
           mode,
           requestedSessionId: requestedSessionId || null,
@@ -2793,7 +2794,7 @@ async function ensurePcpSessionContext(
         'start_session',
         {
           email,
-          agentId,
+          sbSlug,
           ...(studioId ? { studioId } : {}),
           backend,
           forceNew: true,
@@ -2806,7 +2807,7 @@ async function ensurePcpSessionContext(
         directSession || (await resolveCreatedSessionFromList(newSessionId, 'with_session_id'));
       sbDebugLog('sb', 'pcp_start_session_success', {
         backend,
-        agentId,
+        sbSlug,
         studioId: studioId || null,
         requestedSessionId: newSessionId,
         returnedSessionId: resolvedSession?.id || null,
@@ -2820,7 +2821,7 @@ async function ensurePcpSessionContext(
       // real server-side Inkwell session instead of a synthetic local-only UUID.
       sbDebugLog('sb', 'pcp_start_session_retry_legacy', {
         backend,
-        agentId,
+        sbSlug,
         studioId: studioId || null,
         attemptedSessionId: newSessionId,
         error:
@@ -2834,7 +2835,7 @@ async function ensurePcpSessionContext(
           'start_session',
           {
             email,
-            agentId,
+            sbSlug,
             ...(studioId ? { studioId } : {}),
             backend,
             forceNew: true,
@@ -2847,7 +2848,7 @@ async function ensurePcpSessionContext(
           (await resolveCreatedSessionFromList(undefined, 'legacy_without_session_id'));
         sbDebugLog('sb', 'pcp_start_session_success', {
           backend,
-          agentId,
+          sbSlug,
           studioId: studioId || null,
           requestedSessionId: newSessionId,
           returnedSessionId: resolvedSession?.id || null,
@@ -2857,7 +2858,7 @@ async function ensurePcpSessionContext(
       } catch (legacyError) {
         sbDebugLog('sb', 'pcp_start_session_failed', {
           backend,
-          agentId,
+          sbSlug,
           studioId: studioId || null,
           attemptedSessionId: newSessionId,
           errorWithSessionId:
@@ -2875,7 +2876,7 @@ async function ensurePcpSessionContext(
     if (!overrideBackendSessionId) {
       sbDebugLog('claude', 'ensure_context_override_without_explicit_id', {
         backend,
-        agentId,
+        sbSlug,
       });
       return {};
     }
@@ -2900,14 +2901,14 @@ async function ensurePcpSessionContext(
         pcpSessionId: chosen.id,
         backendSessionId: overrideBackendSessionId,
         backend,
-        agentId,
+        sbSlug,
         studioId,
         sbId,
         email,
       });
       sbDebugLog('claude', 'ensure_context_override_linked', {
         backend,
-        agentId,
+        sbSlug,
         pcpSessionId: chosen.id,
         backendSessionId: overrideBackendSessionId,
         createdNewPcpSession,
@@ -2920,7 +2921,7 @@ async function ensurePcpSessionContext(
 
     sbDebugLog('claude', 'ensure_context_override_link_failed', {
       backend,
-      agentId,
+      sbSlug,
       backendSessionId: overrideBackendSessionId,
     });
     return {};
@@ -2939,17 +2940,17 @@ async function ensurePcpSessionContext(
       const linkedPreviewText = withSessionFileSize(
         withAgentPreviewSpeaker(
           linkedLocalSession?.latestPrompt || linkedLocalSession?.firstPrompt,
-          session.agentId || agentId
+          session.sbSlug || sbSlug
         ),
         linkedLocalSession?.fileSizeBytes
       );
-      const sessionAgentId = session.agentId || null;
+      const sessionSlug = session.sbSlug || null;
       const sortTimestamp = linkedLocalSession?.latestPromptAt || linkedLocalSession?.modified;
       const sortMs = toEpochMs(sortTimestamp || session.startedAt) ?? 0;
       return {
         type: 'pcp' as const,
         id: session.id,
-        sessionAgentId,
+        sessionSlug,
         threadKey: session.threadKey || null,
         phase: getSessionPhaseLabel(session) || null,
         contextPreview: session.context || null,
@@ -2966,14 +2967,14 @@ async function ensurePcpSessionContext(
     });
     const localCandidates = displayLocalBackendSessions.map((session) => {
       const linkedPcpSession = pcpSessionByBackendSessionId.get(session.sessionId);
-      const ownerAgentId = resolveLocalSessionOwner(session.sessionId);
+      const ownerSlug = resolveLocalSessionOwner(session.sessionId);
       // Preview speaker is the resolved owner or nothing — never the
       // requesting agent. Labeling a sibling's transcript with the
       // requester's name fabricates authorship.
       const preview = withSessionFileSize(
         withAgentPreviewSpeaker(
           session.latestPrompt || session.firstPrompt,
-          ownerAgentId || undefined
+          ownerSlug || undefined
         ),
         session.fileSizeBytes
       );
@@ -2986,9 +2987,9 @@ async function ensurePcpSessionContext(
         fileSizeBytes: session.fileSizeBytes || null,
         fileSize: formatFileSize(session.fileSizeBytes) || null,
         gitBranch: session.gitBranch || null,
-        ownerAgentId: ownerAgentId || null,
+        ownerSlug: ownerSlug || null,
         linkedPcpSessionId: linkedPcpSession?.id || null,
-        linkedPcpAgentId: linkedPcpSession?.agentId || null,
+        linkedPcpSlug: linkedPcpSession?.sbSlug || null,
         linkedPcpPhase: linkedPcpSession ? getSessionPhaseLabel(linkedPcpSession) || null : null,
         selectable: !linkedPcpSession,
         sortMs,
@@ -3015,7 +3016,7 @@ async function ensurePcpSessionContext(
         JSON.stringify(
           {
             backend,
-            agentId,
+            sbSlug,
             cwd,
             pcpAvailable,
             pcpUnavailableReason: pcpUnavailableReason || null,
@@ -3038,7 +3039,7 @@ async function ensurePcpSessionContext(
         )
       );
     } else {
-      console.log(chalk.bold(`\nSession candidates for ${agentId}/${backend}:`));
+      console.log(chalk.bold(`\nSession candidates for ${sbSlug}/${backend}:`));
       const backendLabel = backend[0].toUpperCase() + backend.slice(1);
       const rows: SessionCandidateTableRow[] = [
         {
@@ -3053,12 +3054,12 @@ async function ensurePcpSessionContext(
         ...interleavedCandidates.map((entry) => {
           if (entry.kind === 'pcp') {
             const session = entry.candidate;
-            const showOwner = Boolean(session.sessionAgentId && session.sessionAgentId !== agentId);
+            const showOwner = Boolean(session.sessionSlug && session.sessionSlug !== sbSlug);
             const ownerPhase = showOwner
-              ? `${session.sessionAgentId} · ${session.phase || '-'}`
+              ? `${session.sessionSlug} · ${session.phase || '-'}`
               : session.phase || '-';
             return {
-              type: showOwner ? `pcp:${session.sessionAgentId}` : 'pcp',
+              type: showOwner ? `pcp:${session.sessionSlug}` : 'pcp',
               choice: `pcp:${session.id.slice(0, 8)}`,
               updated: formatCandidateTimestamp(session.linkedLocalModified || session.startedAt),
               phase: ownerPhase,
@@ -3071,8 +3072,8 @@ async function ensurePcpSessionContext(
             };
           }
           const localSession = entry.candidate;
-          const localOwner = localSession.linkedPcpAgentId || localSession.ownerAgentId;
-          const showOwner = Boolean(localOwner && localOwner !== agentId);
+          const localOwner = localSession.linkedPcpSlug || localSession.ownerSlug;
+          const showOwner = Boolean(localOwner && localOwner !== sbSlug);
           const ownerPhase = showOwner
             ? `${localOwner} · ${localSession.linkedPcpPhase || '-'}`
             : localSession.linkedPcpPhase || '-';
@@ -3148,7 +3149,7 @@ async function ensurePcpSessionContext(
             chosen = unlinkable;
             sbDebugLog('claude', 'adopting_unlinked_pcp_session', {
               backend,
-              agentId,
+              sbSlug,
               pcpSessionId: unlinkable.id,
               selectedLocalBackendSessionId,
             });
@@ -3191,7 +3192,7 @@ async function ensurePcpSessionContext(
         : undefined;
       const linkedPreviewText = withAgentPreviewSpeaker(
         linkedLocalSession?.latestPrompt || linkedLocalSession?.firstPrompt,
-        session.agentId || agentId
+        session.sbSlug || sbSlug
       );
       const linkedPreviewWithSize = withSessionFileSize(
         linkedPreviewText,
@@ -3199,8 +3200,8 @@ async function ensurePcpSessionContext(
       );
       const linkedAt = linkedLocalSession?.latestPromptAt || linkedLocalSession?.modified;
       const backendLabel = backend[0].toUpperCase() + backend.slice(1);
-      const ownerLabel = session.agentId || null;
-      const showOwner = Boolean(ownerLabel && ownerLabel !== agentId);
+      const ownerLabel = session.sbSlug || null;
+      const showOwner = Boolean(ownerLabel && ownerLabel !== sbSlug);
       const sourceLabel = showOwner ? `Ink/${ownerLabel}` : 'Ink';
       const preview = pcpPreviewBySessionId.get(session.id);
       const phaseLabel = getSessionPhaseLabel(session);
@@ -3239,7 +3240,7 @@ async function ensurePcpSessionContext(
       const backendLabel = localSession.backend[0].toUpperCase() + localSession.backend.slice(1);
       const linkedPcpSession = pcpSessionByBackendSessionId.get(localSession.sessionId);
       const ownerLabel = resolveLocalSessionOwner(localSession.sessionId);
-      const showOwner = Boolean(ownerLabel && ownerLabel !== agentId);
+      const showOwner = Boolean(ownerLabel && ownerLabel !== sbSlug);
       // Speaker prefix comes from the resolved owner only — an unowned
       // transcript keeps its raw "assistant:" prefix instead of being
       // misattributed to whoever happens to be running the picker.
@@ -3284,7 +3285,7 @@ async function ensurePcpSessionContext(
       const { select } = await import('@inquirer/prompts');
       const pageSize = Math.max(12, Math.min(30, (process.stdout.rows || 28) - 6));
       const selection = await select({
-        message: `Session for ${agentId}/${backend}`,
+        message: `Session for ${sbSlug}/${backend}`,
         choices,
         pageSize,
       });
@@ -3312,7 +3313,7 @@ async function ensurePcpSessionContext(
               chosen = unlinkable;
               sbDebugLog('claude', 'adopting_unlinked_pcp_session', {
                 backend,
-                agentId,
+                sbSlug,
                 pcpSessionId: unlinkable.id,
                 selectedLocalBackendSessionId,
               });
@@ -3387,7 +3388,7 @@ async function ensurePcpSessionContext(
     // from the list, they want to resume it.
     sbDebugLog('claude', 'new_session_ignoring_prelinked_backend_session', {
       backend,
-      agentId,
+      sbSlug,
       pcpSessionId: chosen.id,
       ignoredBackendSessionId: backendSessionId,
     });
@@ -3398,7 +3399,7 @@ async function ensurePcpSessionContext(
     resolvedTrackedBackendSessionId = selectedLocalBackendSessionId;
     sbDebugLog('claude', 'using_selected_local_backend_session', {
       backend,
-      agentId,
+      sbSlug,
       selectedLocalBackendSessionId,
       createdNewPcpSession,
     });
@@ -3439,7 +3440,7 @@ async function ensurePcpSessionContext(
   upsertRuntimeSession(cwd, {
     pcpSessionId: chosen.id,
     backend,
-    agentId,
+    sbSlug,
     ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
@@ -3448,7 +3449,7 @@ async function ensurePcpSessionContext(
     startedAt: chosen.startedAt,
   });
   setCurrentRuntimeSession(cwd, chosen.id, backend, {
-    agentId,
+    sbSlug,
     ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
   });
@@ -3464,7 +3465,7 @@ async function ensurePcpSessionContext(
     try {
       await callPcpTool('update_session_state', {
         email,
-        agentId,
+        sbSlug,
         sessionId: chosen.id,
         ...(effectiveBackendSessionId ? { backendSessionId: effectiveBackendSessionId } : {}),
         status: 'active',
@@ -3477,7 +3478,7 @@ async function ensurePcpSessionContext(
 
   sbDebugLog('claude', 'ensure_context_result', {
     backend,
-    agentId,
+    sbSlug,
     pcpSessionId: chosen.id,
     backendSessionId: effectiveBackendSessionId || null,
     backendSessionSeedId: backendSessionSeedId || null,
@@ -3495,6 +3496,132 @@ async function ensurePcpSessionContext(
 }
 
 /**
+ * PR #563 rounds 9–10: codex/gemini prompt hooks cannot block and run no
+ * channel plugin, so the `ink` wrapper — the session's long-lived process —
+ * is the pending-takeover marker's consumer. claude-code joined once its
+ * prompt hook went fail-open (it warns instead of refusing the prompt): a
+ * marker with no consumer is the round-8 bug, so the gate opens with it. Scoped to the wrapper's OWN
+ * session (round 10: a crashed predecessor's marker for a different session
+ * in this checkout belongs to that session's consumer, never this one). A
+ * successful reclaim persists the claimed epoch so the on-stop hook can
+ * identify the turn it is ending at the lease boundary. Shared by the
+ * one-shot AND interactive spawn paths.
+ */
+function startSessionTakeoverWatcher(
+  backend: string,
+  pcpSessionId: string | undefined,
+  studioId?: string,
+  /** Round 18: this wrapper's generation (runtimeLinkId) — markers, records,
+   * and scope finalization bind to it so a stale wrapper can neither consume
+   * nor tombstone a successor's turn on the same session. */
+  generation?: string,
+  /**
+   * Round 15: a PERMANENT lease refusal (revoked thread, retired studio,
+   * another holder) can never converge through the marker — the wrapper is
+   * the only enforcement point for backends whose hooks cannot block, so it
+   * terminates the backend rather than knowingly run in a revoked worktree.
+   */
+  onUnprotected?: () => void
+): { stop: () => void } | undefined {
+  if (backend !== 'codex' && backend !== 'gemini' && backend !== 'claude') return undefined;
+  if (!pcpSessionId) return undefined;
+  const cwd = process.cwd();
+  const postLifecycle = async (body: Record<string, unknown>) => {
+    const serverUrl = getPcpServerUrl();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const token = await getValidAccessToken(serverUrl);
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000),
+    });
+    // Round 18: a boundary write is only a boundary if it was ACKNOWLEDGED —
+    // a 4xx/5xx means the fence did not land, and the caller must keep its
+    // evidence rather than delete it.
+    if (!resp.ok) throw new Error(`lifecycle boundary write refused: ${resp.status}`);
+  };
+  return startTakeoverWatcher({
+    cwd,
+    expectedSessionId: pcpSessionId,
+    generation,
+    onUnprotected,
+    // Round 17: scope end is a real boundary. A turn this watcher claimed is
+    // closed with its FENCED stop (a crashed child sends no stop hook); an
+    // unclaimed scope stamps the stop tombstone so a claim still parked in
+    // the server is refused when it lands.
+    finalizeScope: async (turnEpoch, fenceAttempts) => {
+      await postLifecycle({
+        sessionId: pcpSessionId,
+        lifecycle: 'idle',
+        event: 'stop',
+        ...(turnEpoch
+          ? { turnEpoch }
+          : {
+              turnEpochMissing: true,
+              // Round 21: fence exactly the attempts THIS scope tried —
+              // appended server-side, so every abandoned attempt stays
+              // fenced and no later prompt is ever refused.
+              fenceAttempts,
+            }),
+        sbSlug: 'wrapper-scope-end',
+      });
+    },
+    claim: async (markerSessionId, markerAt, attemptId) => {
+      try {
+        const serverUrl = getPcpServerUrl();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const token = await getValidAccessToken(serverUrl);
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            sessionId: markerSessionId,
+            lifecycle: 'running',
+            event: 'prompt',
+            reclaimOf: markerAt,
+            // Round 21: the reclaim carries its ATTEMPT token so the DB
+            // fence can refuse exactly this attempt after scope end — and
+            // never a later prompt of the same wrapper.
+            ...(attemptId ? { attemptId } : {}),
+            // Round 11: the server exact-CAS-touches OUR studio's lease and
+            // reports whether it is still held under the reclaimed turn.
+            ...(studioId && studioId !== 'main' ? { studioId } : {}),
+          }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (resp.ok) {
+          const body = (await resp.json().catch(() => null)) as {
+            turnEpoch?: string;
+            studioLeaseHeld?: boolean;
+          } | null;
+          // Round 15: NOT HELD is a permanent refusal — surface it so the
+          // wrapper enforces instead of looping.
+          if (body?.studioLeaseHeld === false) return 'unprotected';
+          if (body?.turnEpoch) {
+            writeCliTurnEpoch(cwd, {
+              sessionId: markerSessionId,
+              turnEpoch: body.turnEpoch,
+              ...(generation ? { wrapperGeneration: generation } : {}),
+            });
+          }
+          return 'ok';
+        }
+        if (resp.status === 409) return 'stopped';
+        // Round 16: a cross-tenant 403 is as permanent as a lost lease —
+        // retrying can never converge, so enforce rather than loop.
+        if (resp.status === 403) return 'unprotected';
+        return 'failed';
+      } catch {
+        return 'failed';
+      }
+    },
+  });
+}
+
+/**
  * Run a backend with a prompt (one-shot mode).
  */
 export async function runClaude(
@@ -3503,8 +3630,8 @@ export async function runClaude(
   options: SbOptions,
   passthroughArgs: string[] = []
 ): Promise<void> {
-  const agentId = resolveAgentId(options.agent, options.backend);
-  if (!agentId) {
+  const sbSlug = resolveSlug(options.agent, options.backend);
+  if (!sbSlug) {
     console.error(chalk.red('No agent identity configured.'));
     console.error(
       chalk.dim(
@@ -3517,7 +3644,7 @@ export async function runClaude(
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
     ? await ensurePcpSessionContext(
-        agentId,
+        sbSlug,
         options.backend,
         passthroughArgs,
         options.verbose,
@@ -3538,7 +3665,7 @@ export async function runClaude(
     upsertRuntimeSession(process.cwd(), {
       pcpSessionId: sessionContext.pcpSessionId,
       backend: options.backend,
-      agentId,
+      sbSlug,
       ...(sbId ? { sbId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
@@ -3552,7 +3679,7 @@ export async function runClaude(
 
   if (options.verbose) {
     console.log(chalk.dim(`Backend: ${adapter.name}`));
-    console.log(chalk.dim(`Agent: ${agentId}`));
+    console.log(chalk.dim(`Agent: ${sbSlug}`));
     console.log(chalk.dim(`Model: ${options.model}`));
     console.log(chalk.dim(`Session tracking: ${options.session}`));
     if (passthroughArgs.length) {
@@ -3564,7 +3691,7 @@ export async function runClaude(
   const pcpConfig = getPcpConfig();
   const startupContextBlock = await resolveCodexStartupContextBlock({
     backend: options.backend,
-    agentId,
+    sbSlug,
     pcpConfig,
     hasAuthToken: Boolean(authEnv.INK_ACCESS_TOKEN || process.env.INK_ACCESS_TOKEN),
     verbose: options.verbose,
@@ -3572,7 +3699,7 @@ export async function runClaude(
   });
 
   const prepared = adapter.prepare({
-    agentId,
+    sbSlug,
     model: options.model,
     prompt,
     promptParts,
@@ -3589,7 +3716,7 @@ export async function runClaude(
 
   const executionContext: BackendExecutionLogContext = {
     pcpConfig,
-    agentId,
+    sbSlug,
     backend: options.backend,
     binary: prepared.binary,
     args: prepared.args,
@@ -3648,6 +3775,27 @@ export async function runClaude(
 
   // Adapters that pass the prompt via stdin (Claude — avoids argv E2BIG on
   // large prompts) need a piped stdin we write to; otherwise inherit the TTY.
+  // PR #563 round 9: codex/gemini prompt hooks cannot block and run no
+  // channel plugin, so THIS wrapper is the marker consumer — the long-lived
+  // process that converts a failed takeover's marker into a claim.
+  let takeoverChild: ReturnType<typeof spawn> | undefined;
+  let takeoverEnforced = false;
+  const takeoverWatcher = startSessionTakeoverWatcher(
+    options.backend,
+    sessionContext.pcpSessionId,
+    studioId,
+    runtimeLinkId,
+    () => {
+      takeoverEnforced = true;
+      console.error(
+        chalk.red(
+          '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
+        )
+      );
+      takeoverChild?.kill('SIGTERM');
+    }
+  );
+
   const child = spawn(prepared.binary, prepared.args, {
     stdio: [prepared.stdinData !== undefined ? 'pipe' : 'inherit', 'pipe', 'pipe'],
     env: {
@@ -3660,6 +3808,7 @@ export async function runClaude(
       ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
     },
   });
+  takeoverChild = child;
 
   if (prepared.stdinData !== undefined && child.stdin) {
     child.stdin.on('error', () => {});
@@ -3677,6 +3826,7 @@ export async function runClaude(
   });
 
   child.on('close', async (code) => {
+    await takeoverWatcher?.stop();
     ensureCleanup();
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
@@ -3687,7 +3837,7 @@ export async function runClaude(
         backend: options.backend,
         pcpSessionId: sessionContext.pcpSessionId,
         runtimeLinkId,
-        agentId,
+        sbSlug,
         studioId,
         knownLocalSessionSnapshot,
         fallbackBackendSessionId: capturedBackendSessionId,
@@ -3698,7 +3848,7 @@ export async function runClaude(
       pcpSessionId: sessionContext.pcpSessionId,
       backendSessionId: capturedBackendSessionId,
       backend: options.backend,
-      agentId,
+      sbSlug,
       runtimeLinkId,
       studioId,
       sbId,
@@ -3706,6 +3856,9 @@ export async function runClaude(
     });
     await finalizeExecution(code ?? null);
 
+    // Round 16: an enforced termination (SIGTERM closes with code=null)
+    // must not exit 0 — the turn was killed to protect the checkout.
+    if (takeoverEnforced) process.exit(1);
     if (code !== 0) process.exit(code || 1);
   });
 
@@ -3726,8 +3879,8 @@ export async function runClaudeInteractive(
   options: SbOptions,
   passthroughArgs: string[] = []
 ): Promise<void> {
-  const agentId = resolveAgentId(options.agent, options.backend);
-  if (!agentId) {
+  const sbSlug = resolveSlug(options.agent, options.backend);
+  if (!sbSlug) {
     console.error(chalk.red('No agent identity configured.'));
     console.error(
       chalk.dim(
@@ -3739,19 +3892,12 @@ export async function runClaudeInteractive(
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(
-        agentId,
-        options.backend,
-        passthroughArgs,
-        options.verbose,
-        [],
-        {
-          listCandidates: options.sessionCandidates || options.sessionCandidatesJson,
-          listCandidatesJson: options.sessionCandidatesJson,
-          listCandidatesAll: options.sessionCandidatesAll,
-          selectionOverride: options.sessionChoice,
-        }
-      )
+    ? await ensurePcpSessionContext(sbSlug, options.backend, passthroughArgs, options.verbose, [], {
+        listCandidates: options.sessionCandidates || options.sessionCandidatesJson,
+        listCandidatesJson: options.sessionCandidatesJson,
+        listCandidatesAll: options.sessionCandidatesAll,
+        selectionOverride: options.sessionChoice,
+      })
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const currentGitBranch = getCurrentGitBranch(process.cwd());
@@ -3761,7 +3907,7 @@ export async function runClaudeInteractive(
     upsertRuntimeSession(process.cwd(), {
       pcpSessionId: sessionContext.pcpSessionId,
       backend: options.backend,
-      agentId,
+      sbSlug,
       ...(sbId ? { sbId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
@@ -3775,7 +3921,7 @@ export async function runClaudeInteractive(
 
   if (options.verbose) {
     console.log(chalk.dim(`Backend: ${adapter.name}`));
-    console.log(chalk.dim(`Agent: ${agentId}`));
+    console.log(chalk.dim(`Agent: ${sbSlug}`));
     console.log(chalk.dim(`Model: ${options.model}`));
     if (passthroughArgs.length) {
       console.log(chalk.dim(`Passthrough: ${passthroughArgs.join(' ')}`));
@@ -3786,7 +3932,7 @@ export async function runClaudeInteractive(
   const pcpConfig = getPcpConfig();
   const startupContextBlock = await resolveCodexStartupContextBlock({
     backend: options.backend,
-    agentId,
+    sbSlug,
     pcpConfig,
     hasAuthToken: Boolean(authEnv.INK_ACCESS_TOKEN || process.env.INK_ACCESS_TOKEN),
     verbose: options.verbose,
@@ -3808,7 +3954,7 @@ export async function runClaudeInteractive(
 
   const runAttempt = async (): Promise<{ code: number | null; stderrText: string }> => {
     const prepared = adapter.prepare({
-      agentId,
+      sbSlug,
       model: options.model,
       promptParts: [],
       passthroughArgs,
@@ -3826,7 +3972,7 @@ export async function runClaudeInteractive(
 
     const executionContext: BackendExecutionLogContext = {
       pcpConfig,
-      agentId,
+      sbSlug,
       backend: options.backend,
       binary: prepared.binary,
       args: prepared.args,
@@ -3868,7 +4014,7 @@ export async function runClaudeInteractive(
           backend: options.backend,
           pcpSessionId: sessionContext.pcpSessionId,
           runtimeLinkId,
-          agentId,
+          sbSlug,
           studioId,
           knownLocalSessionSnapshot,
           fallbackBackendSessionId: finalCapturedBackendSessionId,
@@ -3900,6 +4046,34 @@ export async function runClaudeInteractive(
     });
   };
 
+  // Round 10 (Lumen): the INTERACTIVE wrapper is the primary long-lived
+  // process for codex/gemini — the round-9 watcher was wired only into the
+  // one-shot path. One watcher spans every retry attempt (retries continue
+  // the same session's scope); it is stopped before the wrapper exits.
+  const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
+    options.backend,
+    sessionContext.pcpSessionId,
+    studioId,
+    runtimeLinkId,
+    () => {
+      // PR #590: an ATTACHED session is warned, never terminated — for every
+      // backend. A permanent refusal here reaches a human sitting at the
+      // terminal; killing their session to protect the checkout is a harsher
+      // outcome than the prompt block this policy replaced. Each later
+      // prompt's hook re-warns the SB in-context, and the human decides.
+      // One-shot runs (runClaude) keep round-15 termination — nobody is
+      // there to steer them.
+      console.error(
+        chalk.yellow(
+          '\nInkwell: this worktree\u2019s studio lease is held by another session or was revoked. ' +
+            'Prompts still run, but edits here are not fenced against whoever holds the lease; the SB is ' +
+            'warned on every prompt until the lease is reclaimed. Close the other session or wait for its ' +
+            'lease to lapse before changing files here.'
+        )
+      );
+    }
+  );
+
   while (true) {
     const { code, stderrText } = await runAttempt();
     const shouldRetry =
@@ -3928,13 +4102,14 @@ export async function runClaudeInteractive(
       pcpSessionId: sessionContext.pcpSessionId,
       backendSessionId: finalCapturedBackendSessionId,
       backend: options.backend,
-      agentId,
+      sbSlug,
       runtimeLinkId,
       studioId,
       sbId,
       email: pcpConfig?.email,
     });
 
+    await interactiveTakeoverWatcher?.stop();
     process.exit(code || 0);
   }
 }

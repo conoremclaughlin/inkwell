@@ -43,7 +43,23 @@ export interface MediaAttachment {
  */
 export type SessionType = 'primary' | 'task';
 
-export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+/**
+ * `interrupted`: a backend turn was killed mid-flight (server shutdown) and
+ * the session is resumable with its context intact. Distinct from `idle` so
+ * readers can see "work died here" without inspecting metadata; the DB
+ * trigger `strip_interruption_on_running` clears the interruption breadcrumbs
+ * the moment any writer moves the session back to `running`.
+ *
+ * `compacting` has always been written by the CLI lifecycle hooks
+ * (hook-lifecycle.ts VALID_LIFECYCLES); the union simply failed to mention it.
+ */
+export type SessionLifecycle =
+  | 'running'
+  | 'idle'
+  | 'compacting'
+  | 'interrupted'
+  | 'completed'
+  | 'failed';
 
 /** @deprecated Use SessionLifecycle */
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
@@ -91,7 +107,7 @@ export interface UsageCheckpoint {
 export interface Session {
   id: string;
   userId: string;
-  agentId: string;
+  sbSlug: string;
   sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
@@ -166,6 +182,15 @@ export interface Session {
   // Whether a CLI process with a channel plugin is attached to this session
   cliAttached?: boolean;
 
+  /**
+   * Ownership generation for the current turn (PR #563 rounds 3–5). A real
+   * COLUMN, not metadata: read-modify-write metadata rebuilds must never be
+   * able to replay a stale epoch over a newer owner. Rotated by the caller's
+   * candidate on takeover (trigger fills only when absent) or by the
+   * claim_turn_epoch RPC; every terminal write CASes on it.
+   */
+  turnEpoch?: string | null;
+
   // Flexible metadata
   metadata: Record<string, unknown>;
 }
@@ -186,7 +211,7 @@ export type ContentBlock = { type: 'text'; text: string } | ImageContent;
 export interface SessionRequest {
   // Auth context (required)
   userId: string;
-  agentId: string;
+  sbSlug: string;
 
   // Message context
   channel: ChannelType;
@@ -238,6 +263,13 @@ export interface ChannelResponse {
   metadata?: Record<string, unknown>;
   /** Media attachments (images, videos, documents) to send alongside text */
   media?: import('../../agent/types').OutboundMedia[];
+  /**
+   * The session that produced this response — stamped onto the `message_out`
+   * activity row by the gateway. Runners that synthesise responses from backend
+   * output leave it unset; the server fills it from the turn's session before
+   * routing (see attributeResponses).
+   */
+  sessionId?: string;
 }
 
 export interface SessionResult {
@@ -282,6 +314,33 @@ export interface SessionResult {
   // Error info if failed
   error?: string;
   errorCode?: string;
+  /**
+   * Admission evidence (v18 S3): true when routing completed — session
+   * resolved, occupancy rechecked, any provisioning/lease acquisition landed
+   * — regardless of whether the turn then succeeded. A post-admission
+   * failure is a backend outcome, not a routing one: the trigger handler
+   * clears a thread's routingHold on admitted outcomes even when processing
+   * failed, and retains it only for refusals and pre-admission failures.
+   */
+  admitted?: boolean;
+  /**
+   * Present with errorCode 'ROUTING_REFUSED' (v18 S3): the structured refusal
+   * from the spawn path's own resolution. Provisioning is deferred to spawn
+   * admission, so an occupancy refusal can first surface inside handleMessage
+   * — the trigger handler needs the parts to stamp a routing hold, and a
+   * serialized message string cannot carry them.
+   */
+  refusal?: {
+    threadKey: string;
+    detail: {
+      triedCallerRepo: boolean;
+      callerRepoRoot?: string;
+      reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+      anchor?: 'studio' | 'session';
+      occupied?: { studioId: string; holderThreadKey: string };
+      policy?: 'reuse-only';
+    };
+  };
 }
 
 // ─── Tool Call Tracking ───
@@ -295,7 +354,7 @@ export interface ToolCall {
 // ─── Context Injection Types ───
 
 export interface AgentIdentity {
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   description?: string;
@@ -401,7 +460,7 @@ export interface ISessionService {
    */
   getOrCreateSession(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: {
       type?: SessionType;
       taskDescription?: string;
@@ -411,6 +470,12 @@ export interface ISessionService {
       studioHint?: string;
       recipientSessionId?: string;
       contactId?: string;
+      /**
+       * v18 S3: plan resolution — decide session + placement without taking a
+       * lease or minting a worktree. The result must not be handed to a
+       * runner; the spawn path re-resolves without this flag.
+       */
+      planOnly?: boolean;
     }
   ): Promise<Session>;
 
@@ -425,7 +490,7 @@ export interface ISessionService {
   listSessions(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -464,7 +529,7 @@ export interface ISessionRepository {
 
   findByUserAndAgent(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: {
       status?: SessionStatus;
       type?: SessionType;
@@ -477,7 +542,7 @@ export interface ISessionRepository {
 
   findByThreadKey?(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     threadKey: string,
     studioId?: string,
     contactId?: string,
@@ -488,7 +553,7 @@ export interface ISessionRepository {
   findByUser(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -501,6 +566,20 @@ export interface ISessionRepository {
     id: string,
     updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
   ): Promise<Session>;
+
+  /**
+   * Turn-epoch fenced terminal write: applies `updates` only while
+   * `turn_epoch` still equals `epoch` (a real column — rotated whenever a
+   * session enters `running`). Returns null when ownership was lost; throws
+   * `Session not found:` when the row is gone. Optional so legacy mocks keep
+   * working — the real repository always provides it, and the service falls
+   * back to the unfenced update() only for epoch-less legacy turns.
+   */
+  updateIfTurnEpoch?(
+    id: string,
+    epoch: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session | null>;
 
   updateTokenUsage(
     id: string,
@@ -547,7 +626,7 @@ export interface IContextBuilder {
    * Build the full injected context for an agent message.
    * Queries DB for identity, memories, projects, etc.
    */
-  buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext>;
+  buildContext(userId: string, sbSlug: string, session: Session): Promise<InjectedContext>;
 
   /**
    * Build minimal context for a resumed session.
@@ -555,7 +634,7 @@ export interface IContextBuilder {
    */
   buildMinimalContext(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     session?: Session
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>>;
 
@@ -565,7 +644,7 @@ export interface IContextBuilder {
    */
   getAgentBackend(
     userId: string,
-    agentId: string
+    sbSlug: string
   ): Promise<{ backend: string | null; provider: string | null }>;
 }
 
@@ -575,13 +654,20 @@ export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
   model?: string;
+  /**
+   * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
+   * max). Per-SB from agent_identities.metadata.runtimeConfig.effort;
+   * absent means the provider's own default (or the operator's user-level
+   * setting) applies.
+   */
+  effort?: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
   pcpAccessToken?: string;
   /** PCP session ID for this run — written to runtime hint files so hooks link correctly */
   pcpSessionId?: string;
-  /** Agent ID for this run — written to runtime hint files */
-  agentId?: string;
+  /** SB slug for this run — written to runtime hint files */
+  sbSlug?: string;
   /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
   channel?: string;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */

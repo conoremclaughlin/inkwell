@@ -14,7 +14,7 @@ function createChainableMock(terminalResult: unknown) {
 
 describe('resolveMainStudio', () => {
   const userId = 'user-123';
-  const agentId = 'wren';
+  const sbSlug = 'wren';
   const repoRoot = '/Users/test/ws/my-project';
 
   it('returns existing studio id when found', async () => {
@@ -27,7 +27,7 @@ describe('resolveMainStudio', () => {
         ),
     };
 
-    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, agentId, {
+    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, sbSlug, {
       autoCreate: true,
     });
 
@@ -51,7 +51,7 @@ describe('resolveMainStudio', () => {
       }),
     };
 
-    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, agentId, {
+    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, sbSlug, {
       autoCreate: true,
     });
 
@@ -64,7 +64,7 @@ describe('resolveMainStudio', () => {
       from: vi.fn().mockReturnValue(createChainableMock({ data: null })),
     };
 
-    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, agentId);
+    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, sbSlug);
 
     expect(result).toBeUndefined();
     expect(mockSupabase.from).toHaveBeenCalledTimes(1);
@@ -75,7 +75,7 @@ describe('resolveMainStudio', () => {
       from: vi.fn().mockReturnValue(createChainableMock({ data: null })),
     };
 
-    const result = await resolveMainStudio(mockSupabase as never, userId, undefined, agentId, {
+    const result = await resolveMainStudio(mockSupabase as never, userId, undefined, sbSlug, {
       autoCreate: true,
     });
 
@@ -83,7 +83,7 @@ describe('resolveMainStudio', () => {
     expect(mockSupabase.from).toHaveBeenCalledTimes(1);
   });
 
-  it('returns undefined when autoCreate=true but agentId is missing', async () => {
+  it('returns undefined when autoCreate=true but sbSlug is missing', async () => {
     const mockSupabase = {
       from: vi.fn().mockReturnValue(createChainableMock({ data: null })),
     };
@@ -100,7 +100,7 @@ describe('resolveMainStudio', () => {
     const chain = createChainableMock({ data: null });
     const mockSupabase = { from: vi.fn().mockReturnValue(chain) };
 
-    await resolveMainStudio(mockSupabase as never, userId, repoRoot, agentId);
+    await resolveMainStudio(mockSupabase as never, userId, repoRoot, sbSlug);
 
     // Verify worktree_path filter is applied (prevents returning a feature
     // studio that shares repo_root but has a different worktree_path)
@@ -130,7 +130,7 @@ describe('resolveMainStudio', () => {
       }),
     };
 
-    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, agentId, {
+    const result = await resolveMainStudio(mockSupabase as never, userId, repoRoot, sbSlug, {
       autoCreate: true,
     });
 

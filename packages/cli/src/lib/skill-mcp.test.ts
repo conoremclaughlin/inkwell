@@ -119,7 +119,7 @@ describe('buildMergedMcpConfig', () => {
     const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
     try {
       // x-ink-context is now layered unconditionally so the backend runtime
-      // still receives agentId/studioId/runtime even without a session.
+      // still receives sbSlug/studioId/runtime even without a session.
       expect(mcpConfigPath).not.toBe(join(tmpDir, '.mcp.json'));
       const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
       expect(merged.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');

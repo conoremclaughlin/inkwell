@@ -38,7 +38,7 @@ export interface TurnSignalDeps {
   getSessionId: () => string | undefined;
   /** Live ref — the worktree studio this REPL runs in, for the lease fence. */
   getStudioId?: () => string | undefined;
-  agentId: string;
+  sbSlug: string;
   /** Resolved per post so config changes and lazy imports stay cheap. */
   getServerUrl: () => Promise<string> | string;
   getToken: (serverUrl: string) => Promise<string | null | undefined>;
@@ -123,6 +123,14 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
 
   const acked = async (resp: Response): Promise<boolean> => resp.ok;
 
+  // The claimed turn epoch from the last acknowledged open (PR #563 round
+  // 11). The REPL is one long-lived process, so the epoch lives in memory —
+  // immune to the disk failures the hook sidecar file defends against. The
+  // stop sends it back so the server can fence the boundary; when open never
+  // acknowledged, the stop admits `turnEpochMissing` and the server fails
+  // closed instead of treating this modern sender as legacy.
+  let lastTurnEpoch: string | undefined;
+
   // The prompt fence (round four): a 2xx alone is not protection — the
   // server reports whether THIS studio's lease is still held by this session
   // after its synchronous renewal. `studioLeaseHeld: false` means a release
@@ -132,8 +140,10 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
   const ackedAndHeld = async (resp: Response): Promise<boolean> => {
     if (!resp.ok) return false;
     try {
-      const body = (await resp.json()) as { studioLeaseHeld?: boolean };
-      return body.studioLeaseHeld !== false;
+      const body = (await resp.json()) as { studioLeaseHeld?: boolean; turnEpoch?: string };
+      if (body.studioLeaseHeld === false) return false;
+      if (typeof body.turnEpoch === 'string') lastTurnEpoch = body.turnEpoch;
+      return true;
     } catch {
       return false;
     }
@@ -165,7 +175,7 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
     sessionId,
     lifecycle: event === 'prompt' ? 'running' : 'idle',
     event,
-    agentId: deps.agentId,
+    sbSlug: deps.sbSlug,
     workingDir: deps.workingDir,
   });
 
@@ -177,6 +187,7 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       // worktree, and that turn must not slip past the fail-closed gate.
       // turnGateDecision decides whether the missing proof matters.
       if (!sessionId) return false;
+      lastTurnEpoch = undefined;
       const studioId = deps.getStudioId?.();
       const body: PostBody = {
         ...lifecycleBody('prompt', sessionId),
@@ -187,14 +198,21 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
     async close() {
       const sessionId = deps.getSessionId();
       if (!sessionId) return true;
-      return post('close', lifecycleBody('stop', sessionId));
+      // Round 11: name the epoch this stop ends, or admit it is missing —
+      // never masquerade as a legacy sender whose stop releases unfenced.
+      const body: PostBody = {
+        ...lifecycleBody('stop', sessionId),
+        ...(lastTurnEpoch ? { turnEpoch: lastTurnEpoch } : { turnEpochMissing: true }),
+      };
+      lastTurnEpoch = undefined;
+      return post('close', body);
     },
     async detach() {
       const sessionId = deps.getSessionId();
       if (!sessionId) return true;
       // cliAttached:false is the route's process-proof detach — it clears the
       // marker without needing a lifecycle value.
-      return post('detach', { sessionId, cliAttached: false, agentId: deps.agentId });
+      return post('detach', { sessionId, cliAttached: false, sbSlug: deps.sbSlug });
     },
   };
 }

@@ -89,12 +89,12 @@ describe('listAttachableSessions', () => {
 
   it("asks for status 'attachable' when the server supports it", async () => {
     const callTool = vi.fn().mockResolvedValue(payload);
-    const result = await listAttachableSessions({ callTool }, { agentId: 'myra', limit: 50 });
+    const result = await listAttachableSessions({ callTool }, { sbSlug: 'myra', limit: 50 });
 
     expect(result).toEqual(payload);
     expect(callTool).toHaveBeenCalledTimes(1);
     expect(callTool).toHaveBeenCalledWith('list_sessions', {
-      agentId: 'myra',
+      sbSlug: 'myra',
       limit: 50,
       status: 'attachable',
     });
@@ -108,11 +108,11 @@ describe('listAttachableSessions', () => {
       )
       .mockResolvedValueOnce(payload);
 
-    const result = await listAttachableSessions({ callTool }, { agentId: 'myra', limit: 50 });
+    const result = await listAttachableSessions({ callTool }, { sbSlug: 'myra', limit: 50 });
 
     expect(result).toEqual(payload);
     expect(callTool).toHaveBeenNthCalledWith(2, 'list_sessions', {
-      agentId: 'myra',
+      sbSlug: 'myra',
       limit: 50,
     });
   });
@@ -120,7 +120,7 @@ describe('listAttachableSessions', () => {
   it('does not retry on a real failure, so auth errors stay visible', async () => {
     const callTool = vi.fn().mockRejectedValue(new Error('401 unauthorized'));
 
-    const result = await listAttachableSessions({ callTool }, { agentId: 'myra' });
+    const result = await listAttachableSessions({ callTool }, { sbSlug: 'myra' });
 
     expect(result).toBeNull();
     expect(callTool).toHaveBeenCalledTimes(1);
@@ -132,7 +132,7 @@ describe('listAttachableSessions', () => {
       .mockRejectedValueOnce(new Error("invalid_enum_value: 'attachable'"))
       .mockRejectedValueOnce(new Error('network down'));
 
-    expect(await listAttachableSessions({ callTool }, { agentId: 'myra' })).toBeNull();
+    expect(await listAttachableSessions({ callTool }, { sbSlug: 'myra' })).toBeNull();
     expect(callTool).toHaveBeenCalledTimes(2);
   });
 });
@@ -272,8 +272,11 @@ describe('reopenSelectedSession', () => {
     const outcome = await reopenSelectedSession({ callTool }, 'wren', 's1');
 
     expect(outcome.ok).toBe(true);
+    // The key name is the contract, not a detail. update_session_state takes
+    // sbSlug; a payload spelling it agentId is dropped by a non-strict schema
+    // and the reopen runs unattributed, with a green test and a 200 response.
     expect(callTool).toHaveBeenCalledWith('update_session_state', {
-      agentId: 'wren',
+      sbSlug: 'wren',
       sessionId: 's1',
       reopen: true,
       lifecycle: 'idle',

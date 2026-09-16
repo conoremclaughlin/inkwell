@@ -18,12 +18,14 @@ import type { BackendTokenUsage } from '../repl/token-usage.js';
 
 export type BackendTurnEvent =
   /**
-   * Completed assistant-MESSAGE text: all text blocks of one assistant
-   * message concatenated. Identical to what final-response extraction uses,
-   * so consumers can dedupe streamed output against the final text by
-   * equality.
+   * Completed assistant text: the text blocks of one `assistant` stream
+   * event, concatenated. Final-response extraction uses the concatenation of
+   * every text event of the same assistant MESSAGE — Claude Code streams one
+   * event per content block, so a text → thinking → text response is two text
+   * events. `continuesMessage` marks the second and later ones: a consumer
+   * deduping streamed output against the final text must append, not replace.
    */
-  | { kind: 'text'; text: string }
+  | { kind: 'text'; text: string; continuesMessage?: boolean }
   /**
    * Partial-message text fragment (claude: `--include-partial-messages`).
    * Contract: the completed message's `text` event ALWAYS follows its deltas

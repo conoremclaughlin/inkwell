@@ -42,7 +42,7 @@ if (serverAvailable && PERSIST_ENABLED) {
     const auth = JSON.parse(readFileSync(authPath, 'utf-8'));
     const token = auth.accessToken || auth.access_token;
     const resp = execSync(
-      `curl -sf -m 5 ${PCP_URL}/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'Authorization: Bearer ${token}' -d '${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'curate_recall', arguments: { query: 'probe', accepted: [], dismissed: [], agentId: 'wren' } } })}'`,
+      `curl -sf -m 5 ${PCP_URL}/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'Authorization: Bearer ${token}' -d '${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'curate_recall', arguments: { query: 'probe', accepted: [], dismissed: [], sbSlug: 'wren' } } })}'`,
       { encoding: 'utf-8' }
     );
     curateToolAvailable = !resp.includes('Tool curate_recall not found');
@@ -120,7 +120,7 @@ async function mcpCall<T>(toolName: string, args: Record<string, unknown>): Prom
 async function pcpRecallWithScores(query: string, limit: number): Promise<ScoredRecallMemory[]> {
   const parsed = await mcpCall<RecallResponse>('recall', {
     query,
-    agentId: AGENT_ID,
+    sbSlug: AGENT_ID,
     includeShared: true,
     limit,
     recallMode: 'hybrid',
@@ -137,7 +137,7 @@ async function pcpCurateRecall(
     query,
     accepted,
     dismissed,
-    agentId: AGENT_ID,
+    sbSlug: AGENT_ID,
   });
 }
 

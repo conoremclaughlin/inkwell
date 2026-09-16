@@ -51,13 +51,15 @@
  */
 
 import { execFile } from 'child_process';
+import path from 'path';
 import { randomUUID } from 'crypto';
 import { promisify } from 'util';
-import { access } from 'fs/promises';
+import { access, realpath, readFile, writeFile } from 'fs/promises';
+import { sep } from 'path';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
-import { resolveIdentityId } from '../auth/resolve-identity';
+import { resolveSbId } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
 import { grantStudioLease, studioPathConflict, type GrantOutcome } from './lease-grant';
 
@@ -66,13 +68,33 @@ const execFileAsync = promisify(execFile);
 export interface StudioLease {
   sessionId: string;
   threadKey: string;
-  agentId: string;
-  /** Canonical identity UUID (agent_identities.id); agentId is the display slug. */
+  /**
+   * The live multiplex set (v18 S2): every thread currently riding this
+   * lease. Sessions conflict over worktrees; threads never do — one session
+   * shepherding several PRs holds ONE lease whose set carries all their keys.
+   * `threadKey` above stays the first acquisition reason (telemetry and
+   * legacy compatibility, never identity): closing a multiplexed thread
+   * removes its key from this set without touching the scalar. Absent on
+   * leases written before S2 — `leaseThreadKeys()` is the one reader.
+   */
+  threadKeys?: string[];
+  sbSlug: string;
+  /** Canonical identity UUID (agent_identities.id); sbSlug is the display slug. */
   sbId?: string | null;
   acquiredAt: string;
   heartbeatAt: string;
   /** Routing tier that assigned the studio (visibility: "why is someone grabbing it"). */
   reason?: string;
+  /**
+   * Turn-epoch candidate of the TURN that last acquired/renewed this lease
+   * (PR #563 round 9). Routing acquires before the turn's running-write, so
+   * the session row's epoch alone cannot fence the lease: a successor turn's
+   * acquire between a predecessor's epoch check and its release would be
+   * clobbered. The boundary refuses to release a lease stamped by a
+   * DIFFERENT turn (releaseAtBoundary.expectedTurnEpoch); unstamped leases
+   * (pre-round-9, CLI-claimed turns) release as before.
+   */
+  turnEpoch?: string;
   /**
    * Durable quarantine / destructive claim: the worktree is being recovered
    * or torn down. Non-vacant and non-adoptable. For claims, sessionId is a
@@ -91,7 +113,20 @@ export interface StudioLease {
    * (close_thread/close_studio from inside a turn). The run/stop boundary or
    * the sweep completes it once the process has actually left the worktree.
    */
-  pendingRelease?: { reason: string; requestedAt: string };
+  pendingRelease?: {
+    reason: string;
+    requestedAt: string;
+    /**
+     * The closing THREAD that requested this release (v18 S2, Lumen r2).
+     * A thread-close marker authorizes only that thread's exit: an append
+     * that legitimately lands after the stamp but before the boundary must
+     * not be released underneath — the non-terminal boundary reconciles the
+     * marker to a key-removal when other threads have since joined. Absent
+     * on studio-close, sweep-mortality, and legacy markers, which stay
+     * whole-lease.
+     */
+    threadKey?: string;
+  };
 }
 
 /** No heartbeat for this long → the lease is stale and may be reclaimed. */
@@ -130,10 +165,20 @@ export interface AcquireRequest {
   studioId: string;
   sessionId: string;
   threadKey: string;
-  agentId: string;
+  sbSlug: string;
+  /**
+   * Canonical identity of the acquirer (agent_identities.id) when the caller
+   * has already verified it — a studio handler acting on a signed credential
+   * passes the credential's id, and the lease then names the identity that
+   * acted. When absent it is resolved from the slug, which picks the newest of
+   * same-named identities (Lumen, PR #605 round 3).
+   */
+  sbId?: string | null;
   userId: string;
   /** Routing tier / provenance, recorded on the lease and the event. */
   reason?: string;
+  /** Turn-epoch candidate of the acquiring turn — stamped onto the lease. */
+  turnEpoch?: string;
 }
 
 export type AcquireResult =
@@ -149,11 +194,19 @@ export type AcquireResult =
 type AcquireOutcome = AcquireResult | { retry: true };
 
 export interface WorktreeFinalState {
+  /** `git rev-parse --abbrev-ref HEAD` — the literal string 'HEAD' when detached. */
   branch?: string;
   commit?: string;
   dirty?: boolean;
   /** Set when a dirty tree was stashed; the stash commit SHA survives stash drops. */
   rescueStashSha?: string;
+  /**
+   * Set when a DETACHED worktree held commits reachable from no branch —
+   * ephemeral studios check out detached, so removing the worktree would have
+   * left those commits dangling for GC. The minted `ink-rescue/*` branch
+   * anchors them.
+   */
+  rescueBranch?: string;
   error?: string;
 }
 
@@ -174,6 +227,17 @@ export function rescueSucceeded(state: WorktreeFinalState): boolean {
   return true;
 }
 
+/**
+ * The lease's live thread set. A lease that predates multiplexing carries no
+ * `threadKeys`, so its scalar `threadKey` IS the set; once the field exists it
+ * is authoritative — the scalar is first-acquisition telemetry and a removed
+ * key must not resurrect through it. Deduplicated, order preserved.
+ */
+export function leaseThreadKeys(lease: StudioLease): string[] {
+  const set = lease.threadKeys ?? [lease.threadKey];
+  return [...new Set(set)];
+}
+
 export function isLeaseStale(lease: StudioLease, nowMs: number = Date.now()): boolean {
   const heartbeat = Date.parse(lease.heartbeatAt || lease.acquiredAt);
   if (Number.isNaN(heartbeat)) return true;
@@ -191,11 +255,25 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
   return {
     sessionId: obj.sessionId,
     threadKey: obj.threadKey,
-    agentId: typeof obj.agentId === 'string' ? obj.agentId : '',
+    // Every casLease rewrite serializes the PARSED lease, so a field the
+    // parser drops is a field every renewal/touch silently erases.
+    threadKeys: Array.isArray(obj.threadKeys)
+      ? obj.threadKeys.filter((k): k is string => typeof k === 'string')
+      : undefined,
+    // Every lease row written before the agentId -> sbSlug rename carries
+    // `agentId`, and no migration renames it. Read both: a held lease whose
+    // slug parsed as '' would look like a lease nobody holds.
+    sbSlug:
+      typeof obj.sbSlug === 'string'
+        ? obj.sbSlug
+        : typeof obj.agentId === 'string'
+          ? obj.agentId
+          : '',
     sbId: typeof obj.sbId === 'string' ? obj.sbId : null,
     acquiredAt: typeof obj.acquiredAt === 'string' ? obj.acquiredAt : '',
     heartbeatAt: typeof obj.heartbeatAt === 'string' ? obj.heartbeatAt : '',
     reason: typeof obj.reason === 'string' ? obj.reason : undefined,
+    turnEpoch: typeof obj.turnEpoch === 'string' ? obj.turnEpoch : undefined,
     quarantined: obj.quarantined === true,
     claimKind:
       obj.claimKind === 'recovery' || obj.claimKind === 'teardown' ? obj.claimKind : undefined,
@@ -203,9 +281,71 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
     heldThreadKey: typeof obj.heldThreadKey === 'string' ? obj.heldThreadKey : undefined,
     pendingRelease:
       pending && typeof pending.reason === 'string' && typeof pending.requestedAt === 'string'
-        ? { reason: pending.reason, requestedAt: pending.requestedAt }
+        ? {
+            reason: pending.reason,
+            requestedAt: pending.requestedAt,
+            threadKey: typeof pending.threadKey === 'string' ? pending.threadKey : undefined,
+          }
         : undefined,
   };
+}
+
+/**
+ * The checkout pin: what a detached worktree was created FROM, recorded in
+ * the worktree's own gitdir (`.git/worktrees/<name>/ink-checkout-pin.json`)
+ * so it travels with the checkout and dies with it.
+ *
+ * Why a file in the gitdir rather than a studio column: every rescue site
+ * (teardown, close_studio, dead-holder reclaim, the expiry sweep) captures
+ * from a PATH, and several never load the studio row. The pin has to be
+ * where the capture already is.
+ *
+ * `commit` is what HEAD sat on at creation. `ref` names the fetched review
+ * input (`refs/remotes/origin/pr/<n>`) when there was one, so a reviewer
+ * who fetches forward and checks out a newer PR head is still standing on
+ * known fetched input, not on rescue-worthy work. Nothing else is exempt: a
+ * stale remote-tracking branch for some OTHER ref does not make a reviewer's
+ * own commits safe (Lumen, PR #604 P2).
+ */
+export const CHECKOUT_PIN_FILE = 'ink-checkout-pin.json';
+
+export interface CheckoutPin {
+  commit: string;
+  ref?: string;
+}
+
+async function worktreeGitDir(worktreePath: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['rev-parse', '--git-dir'], { cwd: worktreePath });
+  return path.resolve(worktreePath, stdout.trim());
+}
+
+export async function writeCheckoutPin(worktreePath: string, pin: CheckoutPin): Promise<void> {
+  const gitDir = await worktreeGitDir(worktreePath);
+  await writeFile(path.join(gitDir, CHECKOUT_PIN_FILE), JSON.stringify(pin), 'utf8');
+}
+
+/** Null when there is no pin or it is unreadable — never throws. */
+export async function readCheckoutPin(worktreePath: string): Promise<CheckoutPin | null> {
+  try {
+    const gitDir = await worktreeGitDir(worktreePath);
+    const raw = await readFile(path.join(gitDir, CHECKOUT_PIN_FILE), 'utf8');
+    const parsed = JSON.parse(raw) as Partial<CheckoutPin>;
+    if (typeof parsed.commit !== 'string' || !/^[0-9a-f]{40}$/.test(parsed.commit)) return null;
+    return typeof parsed.ref === 'string' && /^refs\/[A-Za-z0-9._/-]+$/.test(parsed.ref)
+      ? { commit: parsed.commit, ref: parsed.ref }
+      : { commit: parsed.commit };
+  } catch {
+    return null;
+  }
+}
+
+/** True when `git rev-parse --verify` resolves the name to a commit. */
+async function commitish(worktreePath: string, name: string): Promise<boolean> {
+  return execFileAsync('git', ['rev-parse', '--verify', '--quiet', `${name}^{commit}`], {
+    cwd: worktreePath,
+  })
+    .then(() => true)
+    .catch(() => false);
 }
 
 /**
@@ -213,10 +353,13 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
  * branch + HEAD always; a stash (with its commit SHA) when the tree is dirty
  * and `rescue` is set. Never throws — a git failure is recorded in the result
  * and callers decide whether it blocks (teardown, reclaim) or not (bookkeeping).
+ *
+ * `knownBases`: extra commits or refs the caller knows are safe elsewhere;
+ * they are excluded from the detached-commit rescue alongside the checkout pin.
  */
 export async function captureWorktreeState(
   worktreePath: string,
-  opts: { rescue?: boolean; rescueLabel?: string } = {}
+  opts: { rescue?: boolean; rescueLabel?: string; knownBases?: string[] } = {}
 ): Promise<WorktreeFinalState> {
   const state: WorktreeFinalState = {};
   try {
@@ -244,6 +387,44 @@ export async function captureWorktreeState(
         stashSha: state.rescueStashSha,
       });
     }
+
+    // Detached worktrees (ephemeral studios) mint no branch, so commits made
+    // there are reachable from nothing once the worktree is removed — GC bait.
+    // Anchor them with an `ink-rescue/*` branch before anyone deletes the
+    // checkout. Named by label + commit so re-rescuing the same HEAD converges
+    // on the same branch instead of erroring; `-f` makes it idempotent.
+    //
+    // What is NOT rescued: the commit the checkout was created from and the
+    // specific fetched review ref it came from (the checkout pin), plus any
+    // `knownBases` the caller supplies. A PR review's own commits already
+    // live on the remote; rescuing them would mint a branch per review. The
+    // exemption is exactly that narrow. `--remotes` as a whole is not safe: a
+    // stale remote-tracking branch can still name a commit the remote has
+    // since deleted, and that commit may be the reviewer's own work (Lumen,
+    // PR #604 P2). Names that no longer resolve are simply not exempt.
+    if (opts.rescue && state.branch === 'HEAD' && state.commit) {
+      const exemptions = ['--branches'];
+      const pin = await readCheckoutPin(worktreePath);
+      for (const name of [...(opts.knownBases ?? []), pin?.commit, pin?.ref]) {
+        if (name && (await commitish(worktreePath, name))) exemptions.push(name);
+      }
+      const { stdout: unreachable } = await execFileAsync(
+        'git',
+        ['rev-list', '-n', '1', 'HEAD', '--not', ...exemptions],
+        { cwd: worktreePath }
+      );
+      if (unreachable.trim()) {
+        const safeLabel = (opts.rescueLabel || 'unknown').replace(/[^a-zA-Z0-9_-]+/g, '-');
+        const rescueBranch = `ink-rescue/${safeLabel}-${state.commit.slice(0, 10)}`;
+        await execFileAsync('git', ['branch', '-f', rescueBranch, 'HEAD'], { cwd: worktreePath });
+        state.rescueBranch = rescueBranch;
+        logger.warn('[StudioLease] Rescue branch minted for detached commits', {
+          worktreePath,
+          rescueBranch,
+          commit: state.commit,
+        });
+      }
+    }
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);
     logger.warn('[StudioLease] Failed to capture worktree state', {
@@ -255,6 +436,14 @@ export async function captureWorktreeState(
 }
 
 export class StudioLeaseService {
+  /**
+   * Last-warned multi-hold set per session (S1, spec v18): the multi-hold
+   * warning is advisory telemetry, so it fires once per (session, holder-set)
+   * change instead of on every poll — re-arming when the set shrinks back to
+   * one so a later recurrence logs again.
+   */
+  private lastWarnedHolderSets = new Map<string, string>();
+
   constructor(private supabase: SupabaseClient<Database>) {}
 
   async getLease(
@@ -465,7 +654,7 @@ export class StudioLeaseService {
    * authorizes a mutation.
    */
   async acquire(req: AcquireRequest): Promise<AcquireResult> {
-    const sbId = await this.resolveSbId(req.userId, req.agentId);
+    const sbId = req.sbId !== undefined ? req.sbId : await this.lookupSbId(req.userId, req.sbSlug);
 
     // Bounded validate→grant ladder. EVERY authoritative read passes through
     // refuseUngrantable() before any grant path runs, and a lost CAS
@@ -483,11 +672,13 @@ export class StudioLeaseService {
       const lease: StudioLease = {
         sessionId: req.sessionId,
         threadKey: req.threadKey,
-        agentId: req.agentId,
+        threadKeys: [req.threadKey],
+        sbSlug: req.sbSlug,
         sbId,
         acquiredAt: now,
         heartbeatAt: now,
         reason: req.reason,
+        turnEpoch: req.turnEpoch,
       };
 
       const holder = current?.lease ?? null;
@@ -504,7 +695,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'acquired', {
           sessionId: req.sessionId,
           threadKey: req.threadKey,
-          agentId: req.agentId,
+          sbSlug: req.sbSlug,
           sbId,
           reason: req.reason,
         });
@@ -519,7 +710,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'conflict', {
           sessionId: req.sessionId,
           threadKey: req.threadKey,
-          agentId: req.agentId,
+          sbSlug: req.sbSlug,
           sbId,
           reason: `path held by sibling studio ${vacant.conflictStudioId} (${vacant.conflictHolder?.threadKey ?? 'unknown thread'})`,
         });
@@ -633,6 +824,11 @@ export class StudioLeaseService {
     const { data } = await query.select('id');
     if (!data?.length) return;
 
+    // Same contract as every other successful release/cleaning exit (S1,
+    // Lumen r1 on PR #550): a retired ephemeral must not stay any session's
+    // thread-continuity address.
+    await this.repointSessionsOffEphemeral(req.studioId, req.userId);
+
     logger.warn('[StudioLease] Retired studio with absent worktree', {
       studioId: req.studioId,
       worktreePath,
@@ -641,7 +837,7 @@ export class StudioLeaseService {
     await this.logEvent(req.userId, req.studioId, 'released', {
       sessionId: lease?.holderSessionId ?? lease?.sessionId,
       threadKey: lease?.heldThreadKey ?? lease?.threadKey,
-      agentId: lease?.agentId ?? req.agentId,
+      sbSlug: lease?.sbSlug ?? req.sbSlug,
       sbId: lease?.sbId,
       reason: 'worktree-absent-retired',
     });
@@ -703,6 +899,27 @@ export class StudioLeaseService {
     query = from.pendingRelease
       ? query.eq('lease->pendingRelease->>requestedAt', from.pendingRelease.requestedAt)
       : query.is('lease->pendingRelease', null);
+    // threadKeys is the SECOND lease mutation with the pendingRelease shape
+    // (v18 S2): a set-REMOVE changes neither session, acquiredAt, heartbeatAt,
+    // nor pendingRelease, so without this guard two concurrent thread-closes
+    // both match, and the later write resurrects the key the earlier one
+    // removed (append is incidentally protected by its heartbeat bump; remove
+    // is not). Guarding the exact prior set makes every rewrite re-read the
+    // winner's state instead of overwriting it. jsonb equality is structural
+    // and array-order-sensitive; the service always rewrites from a parsed
+    // read, so order is stable.
+    query = from.threadKeys
+      ? query.eq('lease->threadKeys', JSON.stringify(from.threadKeys))
+      : query.is('lease->threadKeys', null);
+    // turnEpoch (round 9) is the THIRD such mutation: a successor turn's
+    // same-session re-acquire restamps the epoch while sessionId and
+    // acquiredAt stay put — heartbeatAt inequality usually catches it, but
+    // two writes in the same millisecond collide there. Guarding the exact
+    // epoch read makes the boundary's release CAS lose to any interleaved
+    // re-acquire, whatever the clock did.
+    query = from.turnEpoch
+      ? query.eq('lease->>turnEpoch', from.turnEpoch)
+      : query.is('lease->turnEpoch', null);
     if (opts.requireAcquirableStatus) {
       query = query.in('status', StudioLeaseService.ACQUIRABLE_STATUSES);
     }
@@ -732,7 +949,41 @@ export class StudioLeaseService {
       logger.warn('[StudioLease] finalizeTeardown failed', { studioId, error: error.message });
       return false;
     }
-    return Boolean(data?.length);
+    const finalized = Boolean(data?.length);
+    if (finalized) await this.repointSessionsOffEphemeral(studioId, userId);
+    return finalized;
+  }
+
+  /**
+   * S1 (spec v18): a released or torn-down ephemeral must not remain any
+   * session's address — thread-continuity keeps resolving `sessions.studio_id`
+   * long after the studio stopped serving anyone (the pr:545 orphan was still
+   * its holder's recorded studio five days after the PR merged). Repoint
+   * sessions to the ephemeral's first durable (non-ephemeral, non-cleaned)
+   * ancestor, or NULL when none survives. The `.eq('studio_id', …)` guard is
+   * the CAS: only sessions still pointing at the ephemeral move. Hygiene, not
+   * safety — failures warn and never block the release that already happened.
+   */
+  private async repointSessionsOffEphemeral(studioId: string, userId: string): Promise<void> {
+    try {
+      // One RPC, serialized on the studio row lock (PR #563 round 14): the
+      // release's clear → repoint gap used to admit a reacquire+claim in
+      // between, which this unfenced repoint then pointed off its own
+      // studio. The SQL function takes the studio FOR UPDATE — the same
+      // lock claim_turn_epoch's regrant holds — and repoints ONLY while the
+      // lease is still NULL, so whichever side commits second sees the
+      // other's state.
+      const { error } = await this.supabase.rpc('repoint_sessions_off_ephemeral', {
+        p_studio_id: studioId,
+        p_user_id: userId,
+      } as never);
+      if (error) throw new Error(error.message);
+    } catch (err) {
+      logger.warn('[StudioLease] Failed to repoint sessions off released ephemeral', {
+        studioId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
@@ -751,7 +1002,7 @@ export class StudioLeaseService {
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: holder?.heldThreadKey ?? holder?.threadKey ?? fallbackThreadKey,
       holderSessionId: holder?.holderSessionId ?? holder?.sessionId,
-      agentId: holder?.agentId ?? 'system',
+      sbSlug: holder?.sbSlug ?? 'system',
       sbId: holder?.sbId ?? null,
       acquiredAt: holder?.acquiredAt ?? new Date().toISOString(),
       heartbeatAt: new Date().toISOString(), // rate-limits retries to LEASE_STALE_MS
@@ -827,7 +1078,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'released', {
           sessionId: holder.holderSessionId ?? holder.sessionId,
           threadKey: holder.heldThreadKey ?? holder.threadKey,
-          agentId: holder.agentId,
+          sbSlug: holder.sbSlug,
           sbId: holder.sbId,
           reason: 'worktree-absent-retired',
           detail: { previousHolder: holder as unknown as Json },
@@ -853,7 +1104,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'conflict', {
           sessionId: recovery.holderSessionId,
           threadKey: recovery.heldThreadKey,
-          agentId: holder.agentId,
+          sbSlug: holder.sbSlug,
           sbId: holder.sbId,
           reason: 'rescue-failed-quarantined',
           detail: {
@@ -890,7 +1141,7 @@ export class StudioLeaseService {
       await this.logEvent(req.userId, req.studioId, 'reclaimed', {
         sessionId: req.sessionId,
         threadKey: req.threadKey,
-        agentId: req.agentId,
+        sbSlug: req.sbSlug,
         sbId: lease.sbId,
         reason: eventReason,
         detail: {
@@ -913,7 +1164,7 @@ export class StudioLeaseService {
     await this.logEvent(req.userId, req.studioId, 'reclaimed', {
       sessionId: req.sessionId,
       threadKey: req.threadKey,
-      agentId: req.agentId,
+      sbSlug: req.sbSlug,
       sbId: lease.sbId,
       reason: eventReason,
       detail: { previousHolder: holder as unknown as Json },
@@ -940,12 +1191,59 @@ export class StudioLeaseService {
       return this.claimAndRescue(req, lease, holder, worktreePath, 'quarantine-recovered');
     }
 
+    // 1.5) Same SESSION, new thread (v18 S2) — sessions conflict, threads
+    //    multiplex. The holder IS the requester, so there is no cross-process
+    //    contention to arbitrate: append the key to the live set and bump the
+    //    heartbeat (the holder's own acquire is a genuine liveness signal).
+    //    casLease, not grantLease — no new writer enters the tree, and the
+    //    exact-prior guard (including pendingRelease state) makes the append
+    //    transition-safe: it can never erase a concurrently-stamped release
+    //    request, and a stamped pendingRelease is carried forward untouched —
+    //    an append protects the set, it never re-authorizes a dying lease.
+    if (holder.sessionId === req.sessionId) {
+      const live = leaseThreadKeys(holder);
+      if (!live.includes(req.threadKey)) {
+        const appended: StudioLease = {
+          ...holder,
+          threadKeys: [...live, req.threadKey],
+          heartbeatAt: now,
+          reason: req.reason ?? holder.reason,
+          turnEpoch: req.turnEpoch ?? holder.turnEpoch,
+        };
+        if (!(await this.casLease(req.studioId, req.userId, holder, appended))) {
+          // Lost the CAS — hand control back to acquire()'s validated ladder.
+          return { retry: true };
+        }
+        await this.logEvent(req.userId, req.studioId, 'acquired', {
+          sessionId: req.sessionId,
+          threadKey: req.threadKey,
+          sbSlug: req.sbSlug,
+          sbId: lease.sbId ?? holder.sbId,
+          reason: 'multiplex-append',
+          detail: { threadKeys: appended.threadKeys as unknown as Json },
+        });
+        logger.info('[StudioLease] Thread multiplexed onto holder lease', {
+          studioId: req.studioId,
+          sessionId: req.sessionId,
+          threadKey: req.threadKey,
+          threadKeys: appended.threadKeys,
+        });
+        return { acquired: true, lease: appended };
+      }
+      // Key already in the set — fall through to the same-thread rung, which
+      // grants the holder's own re-acquire (heartbeat bump) as before.
+    }
+
     // 2) Same thread — the lease follows the thread, but only away from a
     //    holder that is provably TERMINAL or STALE-and-not-live. Liveness
     //    probes alone have an admission gap: a session acquires its lease in
     //    getOrCreateSession before its run registers, so "not live right now"
     //    does not mean "not about to run". Presume a fresh lease live.
-    if (holder.threadKey === req.threadKey) {
+    //    v18 S2: membership is against the LIVE SET — a multiplexed key
+    //    follows its thread exactly like the scalar always has, and an
+    //    adoption carries the whole set (the studio still serves those
+    //    threads; their next messages route to the successor).
+    if (leaseThreadKeys(holder).includes(req.threadKey)) {
       if (holder.sessionId !== req.sessionId) {
         // Liveness first: a TERMINAL DB row is not proof the process has left
         // the worktree — end_session stamps terminal state from inside an
@@ -979,10 +1277,11 @@ export class StudioLeaseService {
       const adopted: StudioLease = {
         ...holder,
         sessionId: req.sessionId,
-        agentId: req.agentId,
+        sbSlug: req.sbSlug,
         sbId: lease.sbId ?? holder.sbId,
         heartbeatAt: now,
         reason: req.reason ?? holder.reason,
+        turnEpoch: req.turnEpoch ?? holder.turnEpoch,
       };
       const won = await this.grantLease(req, adopted, holder);
       if (won.outcome === 'granted') {
@@ -1046,11 +1345,18 @@ export class StudioLeaseService {
     sessionId: string,
     userId?: string
   ): Promise<
-    Array<{ id: string; user_id: string; lease: StudioLease; worktree_path: string | null }>
+    Array<{
+      id: string;
+      user_id: string;
+      lease: StudioLease;
+      worktree_path: string | null;
+      ephemeral: boolean;
+      expires_at: string | null;
+    }>
   > {
     let query = this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path')
+      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data } = await query;
@@ -1065,15 +1371,77 @@ export class StudioLeaseService {
         user_id: row.user_id,
         lease,
         worktree_path: row.worktree_path ?? null,
+        ephemeral: row.ephemeral === true,
+        expires_at: (row.expires_at as string | null) ?? null,
       });
     }
     if (held.length > 1) {
-      logger.warn('[StudioLease] Session holds multiple studios — acting on all of them', {
-        sessionId,
-        studioIds: held.map((h) => h.id),
-      });
+      // Advisory telemetry: once per holder-set change, not per poll — an
+      // attached terminal calls this every ~10s and the unchanged multi-hold
+      // was producing ~8.6k identical lines/day (spec v18 S1).
+      const setKey = held
+        .map((h) => h.id)
+        .sort()
+        .join(',');
+      if (this.lastWarnedHolderSets.get(sessionId) !== setKey) {
+        this.lastWarnedHolderSets.set(sessionId, setKey);
+        logger.warn('[StudioLease] Session holds multiple studios — acting on all of them', {
+          sessionId,
+          studioIds: held.map((h) => h.id),
+        });
+      }
+    } else {
+      this.lastWarnedHolderSets.delete(sessionId);
     }
     return held;
+  }
+
+  /**
+   * S1 (spec v18): is this an EXPIRED ephemeral whose holder session is
+   * positively verified to be operating from a different worktree? Only such
+   * a lease may be denied renewal — the poll heartbeat of a terminal that is
+   * not even inside the tree must not manufacture freshness for a studio the
+   * TTL already ended (the pr:545 orphan renewed for five days this way).
+   *
+   * Every uncertain read preserves the lease (fail closed): a durable studio,
+   * an unexpired TTL, a claim/quarantine record, an open turn or in-process
+   * run, a missing session row or working_dir, a canonicalization failure,
+   * and a working_dir inside the studio's tree all report false. This
+   * predicate never authorizes destruction — it only stops synthetic
+   * renewals and lets the sweep stamp pendingRelease, which completes at the
+   * holder's real boundary exactly as v17 requires.
+   */
+  private async isEphemeralHeldElsewhere(
+    row: {
+      ephemeral: boolean;
+      expires_at: string | null;
+      worktree_path: string | null;
+    },
+    lease: StudioLease,
+    userId?: string
+  ): Promise<boolean> {
+    if (!row.ephemeral || !row.worktree_path) return false;
+    if (lease.quarantined || lease.claimKind) return false;
+    const expiresAt = Date.parse(row.expires_at ?? '');
+    if (Number.isNaN(expiresAt) || expiresAt > Date.now()) return false;
+    if (await this.isSessionMidTurn(lease.sessionId, userId)) return false;
+
+    let query = this.supabase.from('sessions').select('working_dir').eq('id', lease.sessionId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.maybeSingle();
+    if (error || !data?.working_dir) return false;
+
+    let holderDir: string;
+    let studioDir: string;
+    try {
+      [holderDir, studioDir] = await Promise.all([
+        realpath(data.working_dir),
+        realpath(row.worktree_path),
+      ]);
+    } catch {
+      return false;
+    }
+    return holderDir !== studioDir && !holderDir.startsWith(studioDir + sep);
   }
 
   /**
@@ -1082,9 +1450,28 @@ export class StudioLeaseService {
    * a live process. Never renews a quarantine record — quarantine heals
    * through rescue, not heartbeats. Returns true if any lease was renewed.
    */
+  /**
+   * A PURE heartbeat — renewals never change any lease's generation (round
+   * 13). The round-10 optional restamp was a rewind hazard: a DELAYED turn's
+   * renewal landing after a successor's claim stamped the lease back to the
+   * old epoch. Restamps happen only inside `claim_turn_epoch`, which stamps
+   * every lease the session holds atomically with the ownership claim.
+   */
   async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, userId)) {
+      // S1 (spec v18): a verified-elsewhere holder must not keep an expired
+      // ephemeral fresh — this is the first of the two renewal paths, and
+      // the sweep's on-behalf renewal funnels through here too, so one gate
+      // covers both. Uncertainty renews as before.
+      if (await this.isEphemeralHeldElsewhere(row, row.lease, userId ?? row.user_id)) {
+        logger.debug('[StudioLease] Skipping renewal — expired ephemeral held from elsewhere', {
+          studioId: row.id,
+          sessionId,
+          threadKey: row.lease.threadKey,
+        });
+        continue;
+      }
       const renewed: StudioLease = { ...row.lease, heartbeatAt: new Date().toISOString() };
       if (await this.casLease(row.id, row.user_id, row.lease, renewed)) any = true;
     }
@@ -1131,14 +1518,74 @@ export class StudioLeaseService {
    */
   async releaseAtBoundary(
     sessionId: string,
-    opts: { userId?: string; sessionTerminal: boolean; reason: string }
+    opts: {
+      userId?: string;
+      sessionTerminal: boolean;
+      reason: string;
+      /**
+       * Turn epoch of the boundary asking to release (PR #563 round 9). A
+       * lease STAMPED by a different turn belongs to that turn — a successor
+       * on the same session re-acquired between this boundary's session-row
+       * epoch check and now, and releasing would strand the successor's
+       * worktree claim. Refusal is per-row; unstamped leases release as
+       * before. The exact-prior casLease inside releaseStudio closes the
+       * remaining read→CAS window: a re-acquire after this check changes the
+       * lease bytes and the release CAS loses.
+       */
+      expectedTurnEpoch?: string;
+    }
   ): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
       if (!opts.sessionTerminal && !row.lease.pendingRelease) continue;
       if (
+        opts.expectedTurnEpoch !== undefined &&
+        row.lease.turnEpoch !== undefined &&
+        row.lease.turnEpoch !== opts.expectedTurnEpoch
+      ) {
+        logger.warn('[StudioLease] Boundary release refused — lease re-acquired by a newer turn', {
+          studioId: row.id,
+          sessionId,
+          leaseTurnEpoch: row.lease.turnEpoch,
+          boundaryTurnEpoch: opts.expectedTurnEpoch,
+          reason: opts.reason,
+        });
+        continue;
+      }
+      // A NON-terminal boundary completes only what the marker still
+      // justifies (Lumen r2): a thread-scoped marker whose lease has since
+      // multiplexed other threads reconciles to a key-removal — the session
+      // lives, keeps the studio, and only the closed thread exits. A
+      // terminal session's process is gone from the tree, so the whole
+      // lease releases regardless of what the set carries.
+      const marker = row.lease.pendingRelease;
+      if (!opts.sessionTerminal && marker?.threadKey) {
+        const others = leaseThreadKeys(row.lease).filter((k) => k !== marker.threadKey);
+        if (others.length > 0) {
+          const reconciled: StudioLease = {
+            ...row.lease,
+            threadKeys: others,
+            pendingRelease: undefined,
+          };
+          if (await this.casLease(row.id, row.user_id, row.lease, reconciled)) {
+            logger.info(
+              '[StudioLease] Thread-close marker reconciled at boundary — lease survives for remaining threads',
+              {
+                studioId: row.id,
+                sessionId,
+                closedThreadKey: marker.threadKey,
+                remaining: others,
+              }
+            );
+          }
+          // A lost CAS leaves the marker for the next boundary or the sweep.
+          continue;
+        }
+      }
+      if (
         await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
-          reason: row.lease.pendingRelease?.reason ?? opts.reason,
+          reason: marker?.reason ?? opts.reason,
+          closingThreadKey: marker?.threadKey,
         })
       ) {
         any = true;
@@ -1217,39 +1664,132 @@ export class StudioLeaseService {
     userId: string,
     threadKey: string,
     opts: { reason?: string } = {}
-  ): Promise<{ released: number; deferred: number }> {
+  ): Promise<{ released: number; deferred: number; removed: number; studioIds: string[] }> {
+    // Membership is against the LIVE SET, not the scalar (v18 S2): a
+    // multiplexed key never appears in `lease->>threadKey`, and a scalar
+    // whose key was already removed from the set must not match again.
+    // Leased studios per user are few — read them all and filter parsed.
     const { data } = await this.supabase
       .from('studios')
       .select('id, user_id, lease, worktree_path')
       .eq('user_id', userId)
-      .eq('lease->>threadKey', threadKey);
-    if (!data?.length) return { released: 0, deferred: 0 };
+      .not('lease', 'is', null);
+    if (!data?.length) return { released: 0, deferred: 0, removed: 0, studioIds: [] };
 
     let released = 0;
     let deferred = 0;
+    let removed = 0;
+    // Every studio whose lease the thread rode, whatever the outcome — the
+    // caller feeds these to ephemeral teardown as candidates, because after a
+    // whole-lease release nothing on the row remembers the closing thread
+    // (`studios.thread_key` is the CREATED-FOR thread, and the last live key
+    // need not be it — Lumen r1 P1-2).
+    const studioIds: string[] = [];
     for (const row of data) {
-      const lease = parseStudioLease(row.lease);
-      if (!lease || lease.quarantined) continue;
+      const initial = parseStudioLease(row.lease);
+      if (!initial || initial.quarantined) continue;
+      if (!leaseThreadKeys(initial).includes(threadKey)) continue;
+      studioIds.push(row.id);
+      const outcome = await this.releaseThreadFromLease(
+        row.id,
+        row.user_id,
+        initial,
+        row.worktree_path,
+        threadKey,
+        opts.reason ?? 'thread-closed'
+      );
+      if (outcome === 'released') released += 1;
+      else if (outcome === 'deferred') deferred += 1;
+      else if (outcome === 'removed') removed += 1;
+    }
+    return { released, deferred, removed, studioIds };
+  }
 
-      // Same conservative rule as adoption: a fresh non-terminal holder is
-      // presumed live (admission gap) — defer, never clear.
-      if (!(await this.canReleaseNow(lease, userId))) {
-        const marked = await this.markPendingRelease(
-          row.id,
-          row.user_id,
-          lease,
-          opts.reason ?? 'thread-closed'
-        );
-        if (marked) deferred += 1;
-        continue;
+  /**
+   * One thread's exit from one lease (v18 S2). The minimal close invariant
+   * (Lumen r2): while any OTHER live key remains, closing this thread
+   * CAS-removes its key from the set and nothing more — the lease, the
+   * holder, and the worktree all survive. Only the LAST key's close reaches
+   * the whole-lease release/defer. The branch is re-decided from a fresh
+   * read after every lost CAS, because which case applies can change under
+   * us — a concurrent close of the sibling key turns "remove mine" into
+   * "mine is now the last key". The scalar `threadKey` is first-acquisition
+   * telemetry and is never rewritten; a stamped pendingRelease is carried
+   * forward untouched (protection is never erased by bookkeeping).
+   */
+  private async releaseThreadFromLease(
+    studioId: string,
+    userId: string,
+    initial: StudioLease,
+    worktreePath: string | null,
+    threadKey: string,
+    reason: string
+  ): Promise<'released' | 'deferred' | 'removed' | 'none'> {
+    let lease = initial;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const remaining = leaseThreadKeys(lease).filter((k) => k !== threadKey);
+
+      if (remaining.length === 0) {
+        // Last key — but "last" is only true until proven by a winning CAS.
+        // An append racing this close turns [A] into [A,B] between our read
+        // and our write; a whole-lease stamp or clear that retried blindly
+        // from the NEW state would defer live B to death at the holder's
+        // boundary, and a plain failure would strand closed A in the set
+        // (Lumen r1 P1-1). So both transitions here are SINGLE exact-state
+        // CASes — a loss falls through to the re-read, which re-decides the
+        // branch from what actually won.
+        // Same conservative rule as adoption: a fresh non-terminal holder is
+        // presumed live (admission gap) — defer, never clear.
+        if (!(await this.canReleaseNow(lease, userId))) {
+          // The marker records WHICH thread's close asked (Lumen r2): an
+          // append landing after this stamp is legitimate, and the boundary
+          // must not release it underneath — it reconciles thread-scoped
+          // markers instead of clearing whole-lease.
+          const marked: StudioLease = {
+            ...lease,
+            pendingRelease: { reason, requestedAt: new Date().toISOString(), threadKey },
+          };
+          if (await this.casLease(studioId, userId, lease, marked)) {
+            logger.info('[StudioLease] Release deferred to holder boundary (pendingRelease)', {
+              studioId,
+              sessionId: lease.sessionId,
+              reason,
+            });
+            return 'deferred';
+          }
+        } else if (
+          await this.releaseStudio(studioId, userId, lease, worktreePath, {
+            reason,
+            closingThreadKey: threadKey,
+          })
+        ) {
+          return 'released';
+        }
+        // Lost the CAS — fall through to re-read and re-decide.
+      } else {
+        const trimmed: StudioLease = { ...lease, threadKeys: remaining };
+        if (await this.casLease(studioId, userId, lease, trimmed)) {
+          logger.info('[StudioLease] Thread key removed from multiplexed lease', {
+            studioId,
+            sessionId: lease.sessionId,
+            threadKey,
+            remaining,
+          });
+          return 'removed';
+        }
       }
 
-      const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
-        reason: opts.reason ?? 'thread-closed',
-      });
-      if (ok) released += 1;
+      const reread = await this.getLease(studioId, userId);
+      if (!reread?.lease || reread.lease.sessionId !== lease.sessionId) return 'none';
+      if (!leaseThreadKeys(reread.lease).includes(threadKey)) return 'none';
+      lease = reread.lease;
     }
-    return { released, deferred };
+    logger.warn('[StudioLease] Failed to remove thread key after retries', {
+      studioId,
+      sessionId: initial.sessionId,
+      threadKey,
+    });
+    return 'none';
   }
 
   /**
@@ -1300,10 +1840,12 @@ export class StudioLeaseService {
     userId: string,
     lease: StudioLease,
     worktreePath: string | null,
-    opts: { reason: string }
+    opts: { reason: string; closingThreadKey?: string }
   ): Promise<boolean> {
     const cleared = await this.casLease(studioId, userId, lease, null);
     if (!cleared) return false;
+
+    await this.repointSessionsOffEphemeral(studioId, userId);
 
     const finalState = worktreePath ? await captureWorktreeState(worktreePath) : undefined;
 
@@ -1311,7 +1853,7 @@ export class StudioLeaseService {
     await this.logEvent(userId, studioId, 'released', {
       sessionId: lease.sessionId,
       threadKey: lease.threadKey,
-      agentId: lease.agentId,
+      sbSlug: lease.sbSlug,
       sbId: lease.sbId,
       reason: opts.reason,
       detail: {
@@ -1320,7 +1862,14 @@ export class StudioLeaseService {
       },
     });
 
-    await this.stampThreadFinalState(userId, lease.threadKey, studioId, finalState);
+    // A thread-close release stamps the CLOSING thread's record — under
+    // multiplexing the last live key need not be the scalar first-acquirer.
+    await this.stampThreadFinalState(
+      userId,
+      opts.closingThreadKey ?? lease.threadKey,
+      studioId,
+      finalState
+    );
     return true;
   }
 
@@ -1359,6 +1908,7 @@ export class StudioLeaseService {
               commit: finalState.commit ?? null,
               dirty: finalState.dirty ?? null,
               rescueStashSha: finalState.rescueStashSha ?? null,
+              rescueBranch: finalState.rescueBranch ?? null,
               releasedAt: new Date().toISOString(),
             },
           } as Json,
@@ -1390,7 +1940,7 @@ export class StudioLeaseService {
   }> {
     const { data, error } = await this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path')
+      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
       .not('lease', 'is', null);
     if (error || !data?.length) return { expired: 0, renewed: 0, quarantined: 0, released: 0 };
 
@@ -1421,8 +1971,13 @@ export class StudioLeaseService {
           // pendingRelease deferred (and renewed below) until its next stop
           // boundary or the terminal closes — delayed, never premature.
           if (await this.canReleaseNow(lease, row.user_id)) {
+            // Whole-lease even for a thread-scoped marker: canReleaseNow
+            // means the holder is provably GONE, so the lease serves nobody
+            // — reconciling here would leave a dead session holding a tree.
+            // Multiplexed survivors re-acquire vacant on their next message.
             const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
               reason: lease.pendingRelease.reason,
+              closingThreadKey: lease.pendingRelease.threadKey,
             });
             if (ok) released += 1;
             continue;
@@ -1433,6 +1988,27 @@ export class StudioLeaseService {
       if (!isLeaseStale(lease)) continue;
 
       if (!lease.quarantined && (await this.isSessionLive(lease.sessionId, row.user_id))) {
+        // S1 (spec v18): the second renewal path. A live holder verifiably
+        // operating elsewhere must not get an expired ephemeral renewed on
+        // its behalf — stamp pendingRelease instead. Protection, never
+        // authorization: completion still happens only at the holder's real
+        // boundary (releaseAtBoundary honors the marker at the next stop
+        // event) or once presence is genuinely lost (canReleaseNow).
+        if (
+          !lease.pendingRelease &&
+          (await this.isEphemeralHeldElsewhere(
+            {
+              ephemeral: row.ephemeral === true,
+              expires_at: row.expires_at ?? null,
+              worktree_path: row.worktree_path,
+            },
+            lease,
+            row.user_id
+          ))
+        ) {
+          await this.markPendingRelease(row.id, row.user_id, lease, 'expired-elsewhere-held');
+          continue;
+        }
         const ok = await this.renewBySession(lease.sessionId, row.user_id);
         if (ok) renewed += 1;
         continue;
@@ -1466,7 +2042,7 @@ export class StudioLeaseService {
           await this.logEvent(row.user_id, row.id, 'released', {
             sessionId: claim.holderSessionId,
             threadKey: claim.heldThreadKey,
-            agentId: lease.agentId,
+            sbSlug: lease.sbSlug,
             sbId: lease.sbId,
             reason:
               lease.claimKind === 'teardown'
@@ -1497,7 +2073,7 @@ export class StudioLeaseService {
         await this.logEvent(row.user_id, row.id, 'conflict', {
           sessionId: claim.holderSessionId,
           threadKey: claim.heldThreadKey,
-          agentId: lease.agentId,
+          sbSlug: lease.sbSlug,
           sbId: lease.sbId,
           reason: 'expiry-rescue-failed-quarantined',
           detail: { rescue: rescue as unknown as Json },
@@ -1505,7 +2081,14 @@ export class StudioLeaseService {
         continue;
       }
 
-      await this.casLease(row.id, row.user_id, claim, null);
+      // The clear must actually WIN before anything is reported (Lumen r1 on
+      // PR #550): a claim replaced underneath — another worker's fresh claim,
+      // a concurrent acquisition — means this expiry did not happen. Falling
+      // through would repoint sessions, emit an 'expired' event, and count a
+      // release that never cleared.
+      const cleared = await this.casLease(row.id, row.user_id, claim, null);
+      if (!cleared) continue;
+      await this.repointSessionsOffEphemeral(row.id, row.user_id);
 
       const heldMs = Date.now() - Date.parse(lease.acquiredAt);
       logger.warn('[StudioLease] Lease expired and was released', {
@@ -1518,7 +2101,7 @@ export class StudioLeaseService {
       await this.logEvent(row.user_id, row.id, 'expired', {
         sessionId: claim.holderSessionId,
         threadKey: claim.heldThreadKey,
-        agentId: lease.agentId,
+        sbSlug: lease.sbSlug,
         sbId: lease.sbId,
         reason: lease.quarantined
           ? 'quarantine-recovered'
@@ -1582,7 +2165,23 @@ export class StudioLeaseService {
       return (await this.casLease(studioId, userId, holder, claim)) ? claim : null;
     }
 
-    if (opts.expectedThreadKey && holder.threadKey === opts.expectedThreadKey) {
+    const live = leaseThreadKeys(holder);
+    if (opts.expectedThreadKey && live.includes(opts.expectedThreadKey)) {
+      // The minimal close invariant (v18 S2, Lumen r2): a lease still
+      // multiplexing OTHER live threads is never torn down — `studios
+      // .thread_key` selected this studio as a candidate, but the empty set
+      // plus a valid holder boundary is what authorizes. Membership is
+      // against the live set: the last surviving key need not be the scalar
+      // first-acquirer.
+      const others = live.filter((k) => k !== opts.expectedThreadKey);
+      if (others.length > 0) {
+        logger.info('[StudioLease] Teardown claim refused — other threads still multiplex lease', {
+          studioId,
+          expectedThreadKey: opts.expectedThreadKey,
+          remainingThreadKeys: others,
+        });
+        return null;
+      }
       // Same release-now proof as everywhere else: a fresh non-terminal
       // holder is presumed live (admission gap) — never torn down under it.
       if (!(await this.canReleaseNow(holder, userId))) {
@@ -1618,10 +2217,11 @@ export class StudioLeaseService {
     return this.casLease(studioId, userId, claim, null);
   }
 
-  private async resolveSbId(userId: string, agentId: string): Promise<string | null> {
-    if (!agentId) return null;
+  /** Null-safe wrapper around the shared resolver: empty slug and thrown errors both mean "unresolved". */
+  private async lookupSbId(userId: string, sbSlug: string): Promise<string | null> {
+    if (!sbSlug) return null;
     try {
-      return await resolveIdentityId(this.supabase, userId, agentId);
+      return await resolveSbId(this.supabase, userId, sbSlug);
     } catch {
       return null;
     }
@@ -1634,7 +2234,7 @@ export class StudioLeaseService {
     opts: {
       sessionId?: string;
       threadKey?: string;
-      agentId?: string;
+      sbSlug?: string;
       sbId?: string | null;
       reason?: string;
       detail?: Record<string, Json | null>;
@@ -1644,15 +2244,15 @@ export class StudioLeaseService {
       const sbId =
         opts.sbId !== undefined
           ? opts.sbId
-          : opts.agentId
-            ? await this.resolveSbId(userId, opts.agentId)
+          : opts.sbSlug
+            ? await this.lookupSbId(userId, opts.sbSlug)
             : null;
       const { error } = await this.supabase.from('studio_lease_events').insert({
         user_id: userId,
         studio_id: studioId,
         session_id: opts.sessionId ?? null,
         thread_key: opts.threadKey ?? null,
-        agent_id: opts.agentId ?? null,
+        agent_id: opts.sbSlug ?? null,
         sb_id: sbId ?? null,
         event,
         reason: opts.reason ?? null,

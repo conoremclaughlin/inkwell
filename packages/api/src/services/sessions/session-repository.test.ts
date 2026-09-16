@@ -175,7 +175,7 @@ describe('SessionRepository', () => {
 
     const session = await repo.create({
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backendSessionId: null,
       type: 'primary',
       lifecycle: 'idle',

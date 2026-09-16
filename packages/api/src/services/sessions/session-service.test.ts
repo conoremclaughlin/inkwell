@@ -5,8 +5,11 @@
  * Uses dependency injection for clean, isolated tests.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { makeFakeSupabase } from './fake-supabase.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { tmpdir } from 'os';
+import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
+import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
@@ -76,7 +79,7 @@ describe('SessionService', () => {
   const createMockSession = (overrides: Partial<Session> = {}): Session => ({
     id: 'session-123',
     userId: 'user-456',
-    agentId: 'myra',
+    sbSlug: 'myra',
     backendSessionId: 'claude-abc',
     type: 'primary',
     status: 'active',
@@ -100,7 +103,7 @@ describe('SessionService', () => {
 
   const createMockRequest = (overrides = {}) => ({
     userId: 'user-456',
-    agentId: 'myra',
+    sbSlug: 'myra',
     channel: 'telegram' as const,
     conversationId: 'chat-123',
     sender: { id: '123456789', name: 'TestUser' },
@@ -111,7 +114,7 @@ describe('SessionService', () => {
 
   const createMockInjectedContext = (): InjectedContext => ({
     agent: {
-      agentId: 'myra',
+      sbSlug: 'myra',
       name: 'Myra',
       role: 'assistant',
       values: [],
@@ -211,6 +214,617 @@ describe('SessionService', () => {
     );
   });
 
+  /**
+   * pr:558 (2026-09-01): the post-run finalization write hit a transient DB
+   * error and the throw rode up through the trigger handler — the sender was
+   * told "Trigger to lumen failed" about a reply that had been delivered 28
+   * minutes earlier, and the unfinalized run sat registered for 14 hours.
+   *
+   * Round 3 (Lumen): these run against a STATEFUL repository — a real row
+   * whose metadata merges like the production RMW, and a fenced write that
+   * enforces the turn epoch — because the round-2 state-free mocks hid a
+   * self-defeating staleness check that made the whole retry dead code.
+   */
+  describe('finalization failure is bookkeeping, not turn failure', () => {
+    function makeStatefulRepo(initial: Partial<Session> = {}) {
+      let row: Session | null = createMockSession({ metadata: {}, ...initial });
+      const fail = { finalize: 0, running: 0, commitThenRejectRunning: 0, findById: 0 };
+      // One-shot gates: hold exactly the NEXT fenced write (or running write)
+      // open mid-flight — the Postgres-side "in flight when ownership
+      // changes" window.
+      let gateOnce: Promise<void> | null = null;
+      let runningGateOnce: Promise<void> | null = null;
+      let findGateOnce: Promise<void> | null = null;
+
+      const merge = (updates: Record<string, unknown>): Session => {
+        const metadata = {
+          ...((row!.metadata as Record<string, unknown>) ?? {}),
+          ...((updates.metadata as Record<string, unknown>) ?? {}),
+        };
+        row = { ...row!, ...updates, metadata } as Session;
+        return row;
+      };
+
+      const repo = {
+        findById: vi.fn(async () => {
+          if (findGateOnce) {
+            const gate = findGateOnce;
+            findGateOnce = null;
+            await gate;
+          }
+          if (fail.findById > 0) {
+            fail.findById -= 1;
+            throw new Error('fetch failed');
+          }
+          return row;
+        }),
+        findByUserAndAgent: vi.fn(async () => row),
+        findByUser: vi.fn(async () => (row ? [row] : [])),
+        create: vi.fn(async () => row),
+        update: vi.fn(async (id: string, updates: Record<string, unknown>) => {
+          if (!row) throw new Error(`Session not found: ${id}`);
+          if (updates.lifecycle === 'running') {
+            if (runningGateOnce) {
+              const gate = runningGateOnce;
+              runningGateOnce = null;
+              await gate;
+            }
+            if (fail.running > 0) {
+              fail.running -= 1;
+              throw new Error('An unexpected error occurred');
+            }
+            if (fail.commitThenRejectRunning > 0) {
+              fail.commitThenRejectRunning -= 1;
+              // The write COMMITS and the response still fails — a rejected
+              // promise is not a rollback (round 4).
+              merge(updates);
+              throw new Error('fetch failed');
+            }
+          }
+          return merge(updates);
+        }),
+        updateIfTurnEpoch: vi.fn(
+          async (id: string, epoch: string, updates: Record<string, unknown>) => {
+            if (!row) throw new Error(`Session not found: ${id}`);
+            if (fail.finalize > 0) {
+              fail.finalize -= 1;
+              throw new Error('An unexpected error occurred');
+            }
+            if (gateOnce) {
+              const gate = gateOnce;
+              gateOnce = null;
+              await gate;
+            }
+            if (!row) throw new Error(`Session not found: ${id}`);
+            if ((row as { turnEpoch?: string | null }).turnEpoch !== epoch) return null;
+            return merge(updates);
+          }
+        ),
+        updateTokenUsage: vi.fn(async () => undefined),
+        markCompacted: vi.fn(async () => undefined),
+        tryAcquireCompactionLock: vi.fn(async () => true),
+        releaseCompactionLock: vi.fn(async () => undefined),
+      };
+
+      return {
+        repo: repo as unknown as ISessionRepository,
+        spies: repo,
+        fail,
+        get row() {
+          return row;
+        },
+        deleteRow: () => {
+          row = null;
+        },
+        holdNextFencedWrite: (gate: Promise<void>) => {
+          gateOnce = gate;
+        },
+        holdNextRunningWrite: (gate: Promise<void>) => {
+          runningGateOnce = gate;
+        },
+        holdNextFindById: (gate: Promise<void>) => {
+          findGateOnce = gate;
+        },
+      };
+    }
+
+    const makeStatefulService = (repo: ISessionRepository) =>
+      new SessionService(
+        repo,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      resetActiveRuns();
+      resetPendingFinalizations();
+    });
+
+    afterEach(async () => {
+      // Drain any detached retry loop past its budget so it cannot leak into
+      // the next test, then drop the fake clock.
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+      vi.useRealTimers();
+      resetActiveRuns();
+      resetPendingFinalizations();
+    });
+
+    it('reports the turn outcome the recipient experienced, not the lost write', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      // This is the exact assertion pr:558 failed: success:false here is what
+      // became the false "Trigger to lumen failed" notice.
+      expect(result.success).toBe(true);
+      expect(result.error).toBeUndefined();
+      expect(result.finalTextResponse).toBe('Hello! How can I help?');
+    });
+
+    it('keeps the run registered (settled) while the write has not landed', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+
+      expect(activeRunCount()).toBe(1);
+      // Settled: shutdown must say "finished, unrecorded", never "still running".
+      expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+    });
+
+    /**
+     * The round-3 P1 regression (Lumen): after a failed inline finalize, the
+     * turn's OWN row necessarily still says `running`. A staleness check on
+     * lifecycle classified the owner as superseded and never retried — the
+     * pr:558 fix was dead code behind state-free mocks. The fence is the
+     * turn epoch, which is still OURS here, so the retry MUST write.
+     */
+    it('the retry fires against its own still-running row and finalizes it', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // inline attempt only
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+      expect(db.row?.lifecycle).toBe('running');
+      expect(activeRunCount()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('abandons and clears when the session row is gone', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+      db.deleteRow();
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      // Nothing to finalize and nothing a shutdown report could say about it.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('a run that never finalizes stays registered for the shutdown report', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+
+      // Exhausted, not cleared: the row still says running, and the registry
+      // is how shutdown finds out and tells someone.
+      expect(activeRunCount()).toBe(1);
+    });
+
+    /**
+     * Interleaving X (Lumen round 3): B supersedes A and B's `running` write
+     * then FAILS. Ownership never transferred — A's recovery must survive.
+     * The ordered handoff (supersede only after the running write lands, and
+     * restore A's registration on failure) is what makes this hold.
+     */
+    it("a failed takeover leaves the previous turn's recovery intact", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; its retry is pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+      expect(activeRunCount()).toBe(1);
+      const aSettledAt = listActiveRuns()[0]?.runnerSettledAt;
+      expect(aSettledAt).toEqual(expect.any(Number));
+
+      db.fail.running = 3; // turn B's running write fails on every attempt
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(false);
+
+      // A's registration is back (settled run, not B's fresh one) …
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBe(aSettledAt);
+
+      // … and A's pending finalization was NOT superseded: it lands.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 4 (Lumen): a rejected promise is not a rollback. The running
+     * write can COMMIT and the response still fail — the takeover happened.
+     * Rolling back would cancel A's recovery while B's epoch owns the row
+     * and no B process runs. The reconcile: retry idempotently (same
+     * candidate), then READ — a row running under our candidate means
+     * proceed.
+     */
+    it('a committed-but-rejected running write is reconciled, not rolled back', async () => {
+      const db = makeStatefulRepo();
+      db.fail.commitThenRejectRunning = 3; // every attempt commits, then rejects
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      expect(result.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 4 (Lumen): A finalizes while B's takeover write is still in
+     * flight. A's clear must be compare-and-act — deleting by session id
+     * alone would remove B's registration.
+     */
+    it("A finalizing mid-takeover does not clear B's registration (B succeeds)", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+      const aSettledAt = listActiveRuns()[0]?.runnerSettledAt;
+
+      // B registers, then parks inside its running write.
+      let releaseB!: () => void;
+      db.holdNextRunningWrite(
+        new Promise<void>((resolve) => {
+          releaseB = resolve;
+        })
+      );
+      const bPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0); // let B reach the gate
+
+      // B's entry has replaced A's (fresh, unsettled).
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+
+      // A's retry fires while B is parked: the row still carries A's epoch,
+      // so A finalizes — and its clear must leave B's entry alone.
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+
+      releaseB();
+      const b = await bPromise;
+      expect(b.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      void aSettledAt;
+    });
+
+    it('a failed takeover after A already finalized clears rather than resurrecting A', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A, retry pending
+      await vi.advanceTimersByTimeAsync(6_000); // A finalizes
+      expect(activeRunCount()).toBe(0);
+
+      // A ghost of A must not come back when B's takeover fails: A's
+      // finalization is no longer pending, so restore would resurrect a
+      // recorded turn as an unrecorded one (round 4).
+      db.fail.running = 3;
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(false);
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 5 (Lumen): an unreadable reconcile is NOT 'not committed'.
+     * Handing the session back while our committed epoch owns the row left a
+     * zombie no actor would ever recover. On unknown: proceed, and let the
+     * fence arbitrate — which also means the previous turn's recovery is NOT
+     * superseded on unconfirmed ownership.
+     */
+    it('proceeds unconfirmed when the takeover cannot be verified either way', async () => {
+      const db = makeStatefulRepo();
+      db.fail.commitThenRejectRunning = 3; // commits, but every response fails
+      db.fail.findById = 1; // ...and the reconcile read fails too
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      // The write actually committed, so the fence lets our terminal write
+      // land and the turn completes normally.
+      expect(result.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 5 (Lumen): the lease/graph boundary effects are session-wide —
+     * they get the same ownership gate as the registry clear. A's late
+     * boundary must not run once B owns the row.
+     */
+    it('skips boundary effects when a newer turn owns the session', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Park A's post-finalize ownership read, so B can land in between.
+      let releaseBoundaryRead!: () => void;
+      const advance = vi.advanceTimersByTimeAsync(6_000); // A's retry finalizes
+      await Promise.resolve();
+      db.holdNextFindById(
+        new Promise<void>((resolve) => {
+          releaseBoundaryRead = resolve;
+        })
+      );
+      await advance;
+
+      // B takes over and completes while A's boundary read is parked.
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+
+      releaseBoundaryRead();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(vi.mocked(logger.warn).mock.calls.map((c) => c[0])).toContain(
+        'Skipping boundary effects; a newer turn owns the session'
+      );
+    });
+
+    /**
+     * Round 6 (Lumen): a fenced-out turn self-clears its own entry — a stale
+     * ActiveRun left registered was a false liveness signal to the lease
+     * sweep and a false shutdown report.
+     */
+    it('a turn fenced out at the inline finalize clears its own entry', async () => {
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      // Someone else takes the row between the running write and the inline
+      // finalize: rotate the epoch under the turn's feet.
+      const originalRun = vi.mocked(mockClaudeRunner.run).getMockImplementation();
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (...args) => {
+        db.row!.turnEpoch = 'someone-else';
+        return createMockClaudeResult();
+      });
+
+      const result = await service.handleMessage(createMockRequest());
+      expect(result.success).toBe(true); // the turn's outcome still stands
+
+      // Its entry stopped claiming liveness the moment the fence said no.
+      expect(activeRunCount()).toBe(0);
+      void originalRun;
+    });
+
+    /**
+     * Round 7 (Lumen): the runner-THROW path's fenced-out failed write must
+     * disown the entry the same way the normal-result path does — it
+     * previously skipped the restore-or-clear and left a settled stale
+     * ActiveRun claiming liveness forever.
+     */
+    it('a fenced-out failed write disowns the entry too', async () => {
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        db.row!.turnEpoch = 'someone-else'; // ownership moves mid-turn
+        throw new Error('runner exploded');
+      });
+
+      const result = await service.handleMessage(createMockRequest());
+      expect(result.success).toBe(false);
+      // No stale settled ghost: the fenced-out turn's entry is gone.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 6 (Lumen): the unknown/uncommitted story end-to-end. B cannot
+     * confirm ownership, so its entry is BLURRED; A's recovery is not
+     * superseded and still lands (the row is A's); B's own fenced writes
+     * stand down; and by the end NOBODY's stale entry lingers.
+     */
+    it('an unconfirmed takeover that never committed leaves no stale entry behind', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Turn B: every running attempt fails WITHOUT committing, and the
+      // reconcile read fails too → unknown → proceed blurred, no supersede.
+      db.fail.running = 3;
+      db.fail.findById = 1;
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+      // B's inline finalize fenced out (the row is A's) and, because A's
+      // recovery is still pending, RESTORED A's registration rather than
+      // leaving A's running row entry-less for shutdown (round 6).
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+
+      // A's recovery was not superseded: it fires and lands (row is A's).
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(db.row?.lifecycle).toBe('idle');
+
+      // ...and A's own finalize cleared its restored entry. Nothing lingers.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 8 (Lumen): when BOTH terminal writes hit the outage, the two
+     * recoveries must coexist — a session-global token let the unconfirmed
+     * newer loop cancel the older valid one, then fence out itself, leaving
+     * a running row with no retry anywhere. The row CAS is the arbiter.
+     */
+    it('candidate recoveries coexist and the row CAS arbitrates', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 2; // A's inline AND B's inline finalize both fail
+      db.fail.commitThenRejectRunning = 3; // B's takeover commits, responses fail
+      db.fail.findById = 1; // ...and B's reconcile read fails → unknown
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A — retry pending
+      const b = await service.handleMessage(createMockRequest()); // turn B — unknown, retry pending
+      expect(b.success).toBe(true);
+
+      // B did NOT cancel A: both recoveries are pending.
+      expect(hasPendingFinalization('session-123')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // The commit actually landed (row carries B's epoch), so B's loop
+      // finalized it and A's fenced out on its own. Nothing lingers.
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      expect(hasPendingFinalization('session-123')).toBe(false);
+    });
+
+    /**
+     * Round 8 (Lumen): a QUEUED next turn renews the lease before the
+     * processing lock — invisible to every DB fence. The boundary consults
+     * the in-process queue/lock instead of a heartbeat cutoff (which had
+     * rejected the turn's OWN mid-turn renewals).
+     */
+    it('boundary effects are skipped when the next turn is queued (inline)', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      // Park A inside its runner so B can queue behind the lock.
+      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseRunner = resolve;
+          })
+      );
+
+      const aPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0); // A reaches the runner
+      const bPromise = service.handleMessage(createMockRequest()); // queues
+      await vi.advanceTimersByTimeAsync(0);
+
+      releaseRunner(createMockClaudeResult());
+      const a = await aPromise;
+      expect(a.success).toBe(true);
+
+      expect(vi.mocked(logger.warn).mock.calls.map((c) => c[0])).toContain(
+        'Skipping boundary effects; a newer turn is queued or running'
+      );
+
+      const bResult = await bPromise;
+      expect(bResult.success).toBe(true);
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('background finalize skips boundary effects while the next turn holds the lock', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Turn B enters and parks inside its runner — it holds the lock.
+      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseRunner = resolve;
+          })
+      );
+      const bPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A's retry fires from the background while B holds the lock. The row
+      // is B's? No — B is parked BEFORE its running write? It wrote running
+      // on entry (lock acquired, pre-turn done, parked in runner) — so A
+      // fences out; the point here is the lock-held path never runs A's
+      // boundary effects either way.
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      releaseRunner(createMockClaudeResult());
+      const b = await bPromise;
+      expect(b.success).toBe(true);
+      expect(activeRunCount()).toBe(0);
+      void logger;
+    });
+
+    /**
+     * Interleaving Y (Lumen round 3): A's fenced write is already in flight
+     * when B takes ownership. No token can stop a write on the wire — the
+     * epoch CAS evaluated at write time is what makes it match zero rows.
+     */
+    it("an in-flight finalize cannot clobber the new turn's state", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline attempt fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Park A's retry attempt mid-flight, after admission, before the
+      // epoch evaluates.
+      let releaseInFlight!: () => void;
+      db.holdNextFencedWrite(
+        new Promise<void>((resolve) => {
+          releaseInFlight = resolve;
+        })
+      );
+      await vi.advanceTimersByTimeAsync(6_000); // retry enters, parks on the gate
+
+      // Turn B runs to completion while A's write is on the wire.
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      const epochAfterB = db.row?.turnEpoch;
+
+      // A's write lands — against B's epoch. Zero rows; nothing changes.
+      releaseInFlight();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(db.row?.turnEpoch).toBe(epochAfterB);
+      // Call order: A-inline (failed), A-retry (parked — this one), B-inline.
+      // Results index by call START, so A's in-flight write is slot 1, and it
+      // must have resolved null: zero rows, fence held.
+      const fencedResults = (db.spies.updateIfTurnEpoch as ReturnType<typeof vi.fn>).mock.results;
+      await expect(fencedResults[1]!.value).resolves.toBeNull();
+      expect(activeRunCount()).toBe(0);
+    });
+  });
+
   describe('the identity pin actually reaches the runner', () => {
     // resolveRuntimeModel's own tests prove the FUNCTION is right; they do not
     // prove `parsed.model` is wired to it. Lumen deleted the assignment at the
@@ -264,6 +878,67 @@ describe('SessionService', () => {
 
       expect(mockClaudeRunner.run).toHaveBeenCalled();
       expect(modelPassedToRunner()).toBe('claude-opus-5');
+    });
+
+    it('passes a pinned effort through to the runner config (task 7ea6cdf7)', async () => {
+      const service = serviceWithIdentity(
+        { runtimeConfig: { model: 'claude-opus-5', effort: 'xhigh' } },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      const call = vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+        string,
+        { config: { effort?: string } },
+      ];
+      expect(call[1].config.effort).toBe('xhigh');
+    });
+
+    it('warns, naming the value, when an invalid effort is dropped (Lumen, PR #579)', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      vi.mocked(logger.warn).mockClear();
+      const service = serviceWithIdentity(
+        { runtimeConfig: { effort: 'ultra' } },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      const warned = vi
+        .mocked(logger.warn)
+        .mock.calls.find(([msg]) => typeof msg === 'string' && msg.includes('invalid effort'));
+      expect(warned).toBeDefined();
+      expect(warned![1]).toMatchObject({ effort: 'ultra' });
+      const call = vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+        string,
+        { config: { effort?: string } },
+      ];
+      expect(call[1].config.effort).toBeUndefined();
+    });
+
+    it('sends no effort when the identity sets none — the provider default applies', async () => {
+      const service = serviceWithIdentity(
+        { runtimeConfig: {} },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      const call = vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+        string,
+        { config: { effort?: string } },
+      ];
+      expect(call[1].config.effort).toBeUndefined();
     });
 
     it('passes the fleet default when the identity pins nothing', async () => {
@@ -412,8 +1087,8 @@ describe('SessionService', () => {
 
     it('should allow parallel processing for different agents', async () => {
       // Two different agents = two different sessions
-      const session1 = createMockSession({ id: 'session-1', agentId: 'myra' });
-      const session2 = createMockSession({ id: 'session-2', agentId: 'wren' });
+      const session1 = createMockSession({ id: 'session-1', sbSlug: 'myra' });
+      const session2 = createMockSession({ id: 'session-2', sbSlug: 'wren' });
 
       vi.mocked(mockRepository.findByUserAndAgent)
         .mockResolvedValueOnce(session1)
@@ -427,8 +1102,8 @@ describe('SessionService', () => {
         return createMockClaudeResult();
       });
 
-      const request1 = createMockRequest({ agentId: 'myra' });
-      const request2 = createMockRequest({ agentId: 'wren' });
+      const request1 = createMockRequest({ sbSlug: 'myra' });
+      const request2 = createMockRequest({ sbSlug: 'wren' });
 
       await Promise.all([
         sessionService.handleMessage(request1),
@@ -630,7 +1305,7 @@ describe('SessionService', () => {
       expect(mockRepository.create).toHaveBeenCalledWith(
         expect.objectContaining({
           userId: 'user-456',
-          agentId: 'myra',
+          sbSlug: 'myra',
           type: 'primary',
           status: 'active',
         })
@@ -862,7 +1537,7 @@ describe('SessionService', () => {
       expect(mockActivityStream.logMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           userId: 'user-456',
-          agentId: 'myra',
+          sbSlug: 'myra',
           direction: 'in',
           content: 'Test message',
           platform: 'telegram',
@@ -1175,8 +1850,10 @@ describe('SessionService', () => {
       expect(result.success).toBe(true);
       // Token usage should still be recorded
       expect(mockRepository.updateTokenUsage).toHaveBeenCalled();
-      // But compaction should NOT be triggered — native backends manage their own context
-      expect(mockRepository.findById).not.toHaveBeenCalled();
+      // But compaction should NOT be triggered — native backends manage their
+      // own context. Asserted directly on the compaction lock: findById is no
+      // longer a usable proxy, since the post-finalize boundary ownership
+      // gate legitimately reads the session once (PR #563 round 5).
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 
@@ -1261,7 +1938,9 @@ describe('SessionService', () => {
       await serviceWithHandler.triggerCompaction('session-123');
 
       // Phase 1: Compaction responses should be routed
-      expect(mockResponseHandler).toHaveBeenCalledWith(compactionResponses);
+      // The compaction turn's session rides along so the routed replies are
+      // attributed to it, not logged anonymous (PR #596).
+      expect(mockResponseHandler).toHaveBeenCalledWith(compactionResponses, 'session-123');
       // Phase 2: Session should be marked as compacted after responses routed
       expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', 'claude-abc');
     });
@@ -1367,12 +2046,12 @@ describe('SessionService', () => {
   });
 
   describe('Lock Key Format', () => {
-    it('should use agentId:sessionId as lock key for debuggability', async () => {
+    it('should use sbSlug:sessionId as lock key for debuggability', async () => {
       // This test verifies the lock key format by checking that messages
       // to the same agent+session are queued, but different agents are parallel
 
-      const sessionMyra = createMockSession({ id: 'session-myra', agentId: 'myra' });
-      const sessionWren = createMockSession({ id: 'session-wren', agentId: 'wren' });
+      const sessionMyra = createMockSession({ id: 'session-myra', sbSlug: 'myra' });
+      const sessionWren = createMockSession({ id: 'session-wren', sbSlug: 'wren' });
 
       vi.mocked(mockRepository.findByUserAndAgent)
         .mockResolvedValueOnce(sessionMyra) // First myra request
@@ -1391,9 +2070,9 @@ describe('SessionService', () => {
       // Send: myra, wren, myra
       // Expected: myra-1 and wren start in parallel, myra-2 waits for myra-1
       const results = await Promise.all([
-        sessionService.handleMessage(createMockRequest({ agentId: 'myra', content: 'M1' })),
-        sessionService.handleMessage(createMockRequest({ agentId: 'wren', content: 'W1' })),
-        sessionService.handleMessage(createMockRequest({ agentId: 'myra', content: 'M2' })),
+        sessionService.handleMessage(createMockRequest({ sbSlug: 'myra', content: 'M1' })),
+        sessionService.handleMessage(createMockRequest({ sbSlug: 'wren', content: 'W1' })),
+        sessionService.handleMessage(createMockRequest({ sbSlug: 'myra', content: 'M2' })),
       ]);
 
       expect(results.every((r) => r.success)).toBe(true);
@@ -1585,7 +2264,7 @@ describe('SessionService', () => {
     it('should route to recipientSession when it exists and is active', async () => {
       const recipientSession = createMockSession({
         id: 'recipient-session-abc',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:210',
         studioId: 'studio-wren',
         endedAt: null,
@@ -1593,7 +2272,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findById).mockResolvedValue(recipientSession);
 
       const request = createMockRequest({
-        agentId: 'wren',
+        sbSlug: 'wren',
         metadata: {
           threadKey: 'pr:210',
           recipientSessionId: 'recipient-session-abc',
@@ -1613,7 +2292,7 @@ describe('SessionService', () => {
     it('should skip recipientSession when it has ended and fall through to threadKey', async () => {
       const endedSession = createMockSession({
         id: 'ended-session',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:210',
         endedAt: new Date(),
       });
@@ -1644,7 +2323,7 @@ describe('SessionService', () => {
       );
 
       const request = createMockRequest({
-        agentId: 'wren',
+        sbSlug: 'wren',
         metadata: {
           threadKey: 'pr:210',
           recipientSessionId: 'ended-session',
@@ -1664,14 +2343,14 @@ describe('SessionService', () => {
     it('should prioritize recipientSession over threadKey match', async () => {
       const recipientSession = createMockSession({
         id: 'recipient-session',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:210',
         studioId: 'studio-wren',
         endedAt: null,
       });
       const differentThreadSession = createMockSession({
         id: 'thread-match-session',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:213',
       });
 
@@ -1695,7 +2374,7 @@ describe('SessionService', () => {
       );
 
       const request = createMockRequest({
-        agentId: 'wren',
+        sbSlug: 'wren',
         metadata: {
           threadKey: 'pr:213',
           recipientSessionId: 'recipient-session',
@@ -2421,6 +3100,12 @@ describe('SessionService', () => {
   // same way. Instead of burning budget processing each one, the
   // queue is flushed immediately. This prevents the 67-message
   // pileup that burned Myra's budget overnight.
+  //
+  // Since PR #565 r3, queued failures RESOLVE with the same structured
+  // failure result as the direct path (handleMessage `return await`s
+  // the queue promise, so rejections ride its catch) — they no longer
+  // reject. The flush semantics are unchanged; only the transport of
+  // the failure to the caller moved.
   // ═══════════════════════════════════════════════════════════════
   describe('Queue flush on non-retryable errors', () => {
     it('should flush remaining queue when a queued message hits a quota error', async () => {
@@ -2455,14 +3140,19 @@ describe('SessionService', () => {
         success: true,
       });
 
-      // Message 2: rejected with quota error (runner threw)
-      expect(results[1].status).toBe('rejected');
-      expect((results[1] as PromiseRejectedResult).reason.message).toContain('session limit');
+      // Message 2: structured failure with the quota error (runner threw;
+      // the rejection rides handleMessage's catch since r3)
+      expect(results[1].status).toBe('fulfilled');
+      const r2 = (results[1] as PromiseFulfilledResult<{ success: boolean; error?: string }>).value;
+      expect(r2.success).toBe(false);
+      expect(r2.error).toContain('session limit');
 
-      // Message 3: rejected with flush error (never processed — queue flushed)
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('quota');
+      // Message 3: structured flush failure (never processed — queue flushed)
+      expect(results[2].status).toBe('fulfilled');
+      const r3 = (results[2] as PromiseFulfilledResult<{ success: boolean; error?: string }>).value;
+      expect(r3.success).toBe(false);
+      expect(r3.error).toContain('Queue flushed');
+      expect(r3.error).toContain('quota');
 
       // Runner should only have been called twice (message 1 + message 2),
       // NOT three times — message 3 was flushed without processing
@@ -2493,11 +3183,17 @@ describe('SessionService', () => {
       // Message 1: succeeded
       expect(results[0].status).toBe('fulfilled');
 
-      // Messages 2 and 3: both rejected with capacity error (NOT flushed —
-      // each was attempted individually because capacity errors are retryable)
-      expect(results[1].status).toBe('rejected');
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('high demand');
+      // Messages 2 and 3: both structured failures with the capacity error
+      // (NOT flushed — each was attempted individually because capacity
+      // errors are retryable)
+      expect(results[1].status).toBe('fulfilled');
+      expect((results[1] as PromiseFulfilledResult<{ success: boolean }>).value.success).toBe(
+        false
+      );
+      const capacity = (results[2] as PromiseFulfilledResult<{ success: boolean; error?: string }>)
+        .value;
+      expect(capacity.success).toBe(false);
+      expect(capacity.error).toContain('high demand');
 
       // All 3 calls to runner should have been attempted
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
@@ -2539,10 +3235,13 @@ describe('SessionService', () => {
         success: false,
       });
 
-      // Message 3: rejected with flush error (queue flushed after message 2's failure)
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('quota');
+      // Message 3: structured flush failure (queue flushed after message 2's failure)
+      expect(results[2].status).toBe('fulfilled');
+      const flushed = (results[2] as PromiseFulfilledResult<{ success: boolean; error?: string }>)
+        .value;
+      expect(flushed.success).toBe(false);
+      expect(flushed.error).toContain('Queue flushed');
+      expect(flushed.error).toContain('quota');
 
       // Runner called twice — message 3 was flushed, not processed
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
@@ -2578,11 +3277,14 @@ describe('SessionService', () => {
         success: false,
       });
 
-      // Messages 2+3: rejected with flush error (queue flushed after message 1's failure)
-      expect(results[1].status).toBe('rejected');
-      expect((results[1] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
+      // Messages 2+3: structured flush failures (queue flushed after message 1's failure)
+      for (const settled of [results[1], results[2]]) {
+        expect(settled.status).toBe('fulfilled');
+        const value = (settled as PromiseFulfilledResult<{ success: boolean; error?: string }>)
+          .value;
+        expect(value.success).toBe(false);
+        expect(value.error).toContain('Queue flushed');
+      }
 
       // Runner called only once — messages 2+3 were flushed before processing
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
@@ -2611,8 +3313,10 @@ describe('SessionService', () => {
       // Unknown errors are NOT flushed — each message is processed individually
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
       expect(results[0].status).toBe('fulfilled');
-      expect(results[1].status).toBe('rejected');
-      expect(results[2].status).toBe('rejected');
+      for (const settled of [results[1], results[2]]) {
+        expect(settled.status).toBe('fulfilled');
+        expect((settled as PromiseFulfilledResult<{ success: boolean }>).value.success).toBe(false);
+      }
     });
   });
 
@@ -4448,7 +5152,7 @@ describe('SessionService', () => {
       const foreign = createMockSession({
         id: 'foreign-session',
         userId: 'SOMEONE-ELSE',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       vi.mocked(mockRepository.findById).mockResolvedValue(foreign);
 
@@ -4498,7 +5202,7 @@ describe('SessionService', () => {
       // all run BEFORE it. A matching fallback therefore satisfied a request
       // whose explicit anchor had just been rejected (Lumen, #514 r8).
       const fallback = repoWithFallback(
-        createMockSession({ id: 'tempting-fallback', userId: 'user-456', agentId: 'wren' })
+        createMockSession({ id: 'tempting-fallback', userId: 'user-456', sbSlug: 'wren' })
       );
 
       const mockSupabase = {
@@ -4540,7 +5244,7 @@ describe('SessionService', () => {
 
     it('ambiguity refuses even though alias/thread reuse would have matched', async () => {
       repoWithFallback(
-        createMockSession({ id: 'sibling-session', userId: 'user-456', agentId: 'wren' })
+        createMockSession({ id: 'sibling-session', userId: 'user-456', sbSlug: 'wren' })
       );
 
       const mockSupabase = {
@@ -4624,7 +5328,7 @@ describe('SessionService', () => {
       const foreign = createMockSession({
         id: 'foreign-identity-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (foreign as unknown as { sbId?: string }).sbId = 'sb-OTHER';
       vi.mocked(mockRepository.findById).mockResolvedValue(foreign);
@@ -4654,7 +5358,7 @@ describe('SessionService', () => {
       const sibling = createMockSession({
         id: 'sibling-general',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(sibling);
 
@@ -4687,7 +5391,7 @@ describe('SessionService', () => {
       const sibling = createMockSession({
         id: 'sibling-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (sibling as unknown as { sbId?: string }).sbId = 'sb-OTHER';
       vi.mocked(mockRepository.findById).mockResolvedValue(sibling);
@@ -4715,7 +5419,7 @@ describe('SessionService', () => {
       const legacy = createMockSession({
         id: 'legacy-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (legacy as unknown as { sbId?: string | null }).sbId = null;
       vi.mocked(mockRepository.findById).mockResolvedValue(legacy);
@@ -4745,7 +5449,7 @@ describe('SessionService', () => {
       const legacy = createMockSession({
         id: 'legacy-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (legacy as unknown as { sbId?: string | null }).sbId = null;
       vi.mocked(mockRepository.findById).mockResolvedValue(legacy);
@@ -4926,7 +5630,7 @@ describe('SessionService', () => {
     });
 
     // Myra tested the escape hatch the message recommended and it doesn't
-    // exist: server.ts resolves `recipientAgentId` with .eq('agent_id', …),
+    // exist: server.ts resolves `recipientSlug` with .eq('agent_id', …),
     // the SLUG column, so a UUID matches zero rows and comes back "Unknown
     // agent for user: <uuid>. Register in agent_identities first." — which
     // flatly contradicts the row she'd just read out of that table. A remedy
@@ -5085,6 +5789,580 @@ describe('SessionService', () => {
       expect(senderLookup).toBeUndefined();
     });
   });
+
+  describe('v18 S2 — same-holder pass-through (sessions conflict, threads multiplex)', () => {
+    /**
+     * The pr:545 incident, both halves:
+     *
+     * ANCHORED replies (recipientSessionId present — thread-history
+     * enrichment) bypass the occupancy gate at tier 3, but withStudioLease's
+     * acquire then met its OWN holder under a different threadKey, hit the
+     * fresh-foreign-refuse rung, and minted an overflow worktree for a
+     * session that was never going to enter it. The same-session append rung
+     * (studio-lease.service resolveOccupied 1.5) kills that.
+     *
+     * UNANCHORED deliveries reach the gate at tiers 5–7; a foreign-thread
+     * conflict whose holder is the thread's HOME session (the durable
+     * participant stamp — origination at send, assignment at dispatch) +
+     * same canonical identity + not terminal now passes through instead of
+     * minting at the gate. (A created candidate can still divert inside
+     * withStudioLease until Stage 3 moves materialization to the spawn
+     * boundary — these tests pin the gate's decision via whether creation
+     * was reached at all.)
+     */
+    function s2Service(mockSupabase: unknown) {
+      return new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+    }
+
+    type LeaseRow = {
+      sessionId: string;
+      threadKey: string;
+      threadKeys?: string[];
+      sbSlug: string;
+      sbId?: string | null;
+      acquiredAt: string;
+      heartbeatAt: string;
+    };
+
+    function holderLease(overrides: Partial<LeaseRow> = {}): LeaseRow {
+      const now = new Date().toISOString();
+      return {
+        sessionId: 'holder-session',
+        threadKey: 'pr:other',
+        threadKeys: ['pr:other'],
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        acquiredAt: now,
+        heartbeatAt: now,
+        ...overrides,
+      };
+    }
+
+    function s2Tables(opts: {
+      lease?: LeaseRow;
+      participantSessionId?: string | null;
+    }): Record<string, Row[]> {
+      const now = new Date().toISOString();
+      return {
+        studios: [
+          {
+            id: 'studio-A',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            sb_id: 'sb-wren',
+            status: 'active',
+            route_patterns: ['pr:*'],
+            lease: (opts.lease ?? holderLease()) as unknown as Row,
+            worktree_path: tmpdir(),
+            ephemeral: false,
+            repo_root: '/repos/inkwell',
+          },
+        ],
+        agent_identities: [
+          {
+            id: 'sb-wren',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            workspace_id: 'ws-1',
+            updated_at: now,
+          },
+        ],
+        inbox_threads: [
+          { id: 'thread-1', user_id: 'user-456', thread_key: 'pr:3200', key_type: 'pr' },
+        ],
+        thread_key_types: [
+          {
+            id: 'tkt-pr',
+            user_id: null,
+            type: 'pr',
+            write_intent: 'write',
+            studio_policy: 'provision',
+            description: null,
+            created_at: now,
+            updated_at: now,
+          },
+        ],
+        inbox_thread_participants:
+          opts.participantSessionId === null
+            ? []
+            : [
+                {
+                  thread_id: 'thread-1',
+                  agent_id: 'wren',
+                  session_id: opts.participantSessionId ?? 'holder-session',
+                },
+              ],
+        sessions: [],
+        studio_lease_events: [],
+      };
+    }
+
+    const holderSession = {
+      id: 'holder-session',
+      userId: 'user-456',
+      sbSlug: 'wren',
+      sbId: 'sb-wren',
+      studioId: 'studio-A',
+      threadKey: 'pr:other',
+      type: 'primary',
+      status: 'active',
+      endedAt: null,
+    };
+
+    it('an anchored reply to the holder session APPENDS the key — no overflow mint (the incident)', async () => {
+      const tables = s2Tables({});
+      mockRepository.findById.mockResolvedValue(holderSession);
+      const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const service = s2Service(makeFakeSupabase(tables));
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:3200',
+        recipientSessionId: 'holder-session',
+      });
+
+      expect(session.id).toBe('holder-session');
+      expect(overflowSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      const lease = tables.studios[0].lease as LeaseRow;
+      expect(lease.sessionId).toBe('holder-session');
+      expect(lease.threadKeys).toEqual(['pr:other', 'pr:3200']);
+      expect(lease.threadKey).toBe('pr:other'); // scalar = first-acquisition telemetry
+      overflowSpy.mockRestore();
+    });
+
+    it('an unanchored delivery whose holder is the thread HOME passes the gate — routing keeps the studio', async () => {
+      const tables = s2Tables({ participantSessionId: 'holder-session' });
+      mockRepository.findById.mockResolvedValue(holderSession);
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const service = s2Service(makeFakeSupabase(tables));
+
+      // No anchor and no thread-scoped session yet: the rungs miss and a
+      // candidate is CREATED — bound to studio-A, because the gate passed
+      // through instead of diverting. (The candidate's own acquire then
+      // verifies the conflict and, with overflow unavailable, holds — the
+      // Stage 3 residual. Pre-S2 the gate refused BEFORE creation, so
+      // "creation reached, with the home studio" is the gate's fingerprint.)
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED', detail: { reason: 'occupied' } });
+
+      expect(mockRepository.create).toHaveBeenCalledTimes(1);
+      expect(mockRepository.create.mock.calls[0][0]).toMatchObject({ studioId: 'studio-A' });
+      overflowSpy.mockRestore();
+    });
+
+    it('a key already in the multiplex set passes the gate as same-thread — whoever holds it', async () => {
+      // Gate-level set membership (not the pass-through branch): the holder
+      // is a FOREIGN identity, so only the live set can let this through.
+      const tables = s2Tables({
+        lease: holderLease({
+          sessionId: 'foreign-session',
+          sbId: 'sb-else',
+          sbSlug: 'else',
+          threadKeys: ['pr:other', 'pr:3200'],
+        }),
+        participantSessionId: null,
+      });
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const service = s2Service(makeFakeSupabase(tables));
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // Creation was reached — the gate treated the member key as same-thread
+      // and kept the studio; the acquire ladder then arbitrated the sessions.
+      expect(mockRepository.create).toHaveBeenCalledTimes(1);
+      expect(mockRepository.create.mock.calls[0][0]).toMatchObject({ studioId: 'studio-A' });
+      overflowSpy.mockRestore();
+    });
+
+    it('every uncertain or failed home proof diverts — never the occupied worktree', async () => {
+      const cases: Array<{
+        name: string;
+        lease?: LeaseRow;
+        participantSessionId?: string | null;
+        holderRow?: typeof holderSession | null;
+      }> = [
+        { name: 'no participant stamp', participantSessionId: null },
+        { name: 'stamp names another session', participantSessionId: 'other-session' },
+        { name: 'lease identity is an imposter', lease: holderLease({ sbId: 'sb-imposter' }) },
+        { name: 'legacy lease carries no identity', lease: holderLease({ sbId: null }) },
+        {
+          name: 'holder session is terminal',
+          holderRow: { ...holderSession, endedAt: new Date().toISOString() },
+        },
+        { name: 'holder session row is missing', holderRow: null },
+      ];
+
+      for (const c of cases) {
+        vi.clearAllMocks();
+        const tables = s2Tables({
+          lease: c.lease,
+          participantSessionId:
+            c.participantSessionId === undefined ? 'holder-session' : c.participantSessionId,
+        });
+        mockRepository.findById.mockResolvedValue(
+          c.holderRow === undefined ? holderSession : c.holderRow
+        );
+        const overflowSpy = vi
+          .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+          .mockResolvedValue(null);
+        const service = s2Service(makeFakeSupabase(tables));
+
+        await expect(
+          service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' }),
+          c.name
+        ).rejects.toMatchObject({ code: 'ROUTING_REFUSED', detail: { reason: 'occupied' } });
+
+        // Refused AT THE GATE: no session row was ever created, and the
+        // holder's lease is untouched.
+        expect(mockRepository.create, c.name).not.toHaveBeenCalled();
+        expect(overflowSpy, c.name).toHaveBeenCalled();
+        const lease = tables.studios[0].lease as LeaseRow;
+        expect(lease.threadKeys, c.name).toEqual((c.lease ?? holderLease()).threadKeys);
+        overflowSpy.mockRestore();
+      }
+    });
+  });
+
+  describe('v18 S3 — plan resolution provisions nothing; spawn admission provisions', () => {
+    /**
+     * The split: PLAN (which session, where would it run — planOnly:true, no
+     * lease, no mint) → DELIVERY DECISION (route-only / inline / spawn) →
+     * SPAWN ADMISSION (handleMessage's own full resolution rechecks occupancy
+     * and atomically provisions + acquires). routeOnly stamps and inline
+     * deliveries run no process, so the S2 residual — a created candidate
+     * minting an overflow worktree inside withStudioLease on a dispatch that
+     * never spawns — dies here.
+     */
+    function s3Service(mockSupabase: unknown) {
+      return new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+    }
+
+    type LeaseRow = {
+      sessionId: string;
+      threadKey: string;
+      threadKeys?: string[];
+      sbSlug: string;
+      sbId?: string | null;
+      acquiredAt: string;
+      heartbeatAt: string;
+    };
+
+    function foreignLease(): LeaseRow {
+      const now = new Date().toISOString();
+      return {
+        sessionId: 'foreign-session',
+        threadKey: 'pr:other',
+        threadKeys: ['pr:other'],
+        sbSlug: 'else',
+        sbId: 'sb-else',
+        acquiredAt: now,
+        heartbeatAt: now,
+      };
+    }
+
+    function s3Tables(
+      opts: { lease?: LeaseRow; studioPolicy?: string } = {}
+    ): Record<string, Row[]> {
+      const now = new Date().toISOString();
+      return {
+        studios: [
+          {
+            id: 'studio-A',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            sb_id: 'sb-wren',
+            status: 'active',
+            route_patterns: ['pr:*'],
+            lease: (opts.lease ?? foreignLease()) as unknown as Row,
+            worktree_path: tmpdir(),
+            ephemeral: false,
+            repo_root: '/repos/inkwell',
+          },
+        ],
+        agent_identities: [
+          {
+            id: 'sb-wren',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            workspace_id: 'ws-1',
+            updated_at: now,
+          },
+        ],
+        inbox_threads: [
+          { id: 'thread-1', user_id: 'user-456', thread_key: 'pr:3200', key_type: 'pr' },
+        ],
+        thread_key_types: [
+          {
+            id: 'tkt-pr',
+            user_id: null,
+            type: 'pr',
+            write_intent: 'write',
+            studio_policy: opts.studioPolicy ?? 'provision',
+            description: null,
+            created_at: now,
+            updated_at: now,
+          },
+        ],
+        inbox_thread_participants: [],
+        sessions: [],
+        studio_lease_events: [],
+      };
+    }
+
+    it('a plan over an occupied studio succeeds WITHOUT minting or taking anything', async () => {
+      // Pre-S3, this exact shape (unanchored, foreign fresh holder, provision
+      // policy) minted an overflow worktree at the gate — for a dispatch that
+      // might deliver inline or only stamp assignment. The plan now binds the
+      // candidate and defers everything: spawn admission diverts if it comes.
+      const tables = s3Tables();
+      const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const service = s3Service(makeFakeSupabase(tables));
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:3200',
+        planOnly: true,
+      });
+
+      expect(session.studioId).toBe('studio-A');
+      expect(overflowSpy).not.toHaveBeenCalled();
+      const lease = tables.studios[0].lease as LeaseRow;
+      expect(lease.sessionId).toBe('foreign-session'); // holder untouched
+      expect(lease.threadKeys).toEqual(['pr:other']); // no append, no steal
+      overflowSpy.mockRestore();
+    });
+
+    it('a plan finds the overflow a previous SPAWN built — placement stays continuous', async () => {
+      // findByThreadKey is a studio-scoped FILTER (S2's finding): if the plan
+      // resolved to the occupied candidate while the thread's session lives in
+      // its overflow, the reuse rung would go blind and a duplicate session
+      // would be created. The read-only lookup keeps the scope pointed at the
+      // existing overflow.
+      const tables = s3Tables();
+      const overflowStudio = {
+        id: 'studio-B',
+        userId: 'user-456',
+        sbSlug: 'wren',
+        ephemeral: true,
+        parentStudioId: 'studio-A',
+        threadKey: 'pr:3200',
+      };
+      const findSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'findOverflowStudio')
+        .mockResolvedValue(overflowStudio as never);
+      const ensureSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const threadSession = createMockSession({
+        id: 'thread-session',
+        sbSlug: 'wren',
+        studioId: 'studio-B',
+      });
+      const findByThreadKey = vi.fn().mockResolvedValue(threadSession);
+      (mockRepository as unknown as Record<string, unknown>).findByThreadKey = findByThreadKey;
+      const service = s3Service(makeFakeSupabase(tables));
+
+      try {
+        const session = await service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:3200',
+          planOnly: true,
+        });
+
+        expect(session.id).toBe('thread-session');
+        // The rung was scoped to the FOUND overflow, not the occupied candidate.
+        expect(findByThreadKey).toHaveBeenCalledWith(
+          'user-456',
+          'wren',
+          'pr:3200',
+          'studio-B',
+          undefined,
+          'sb-wren'
+        );
+        expect(ensureSpy).not.toHaveBeenCalled();
+        expect(mockRepository.create).not.toHaveBeenCalled();
+      } finally {
+        delete (mockRepository as unknown as Record<string, unknown>).findByThreadKey;
+        findSpy.mockRestore();
+        ensureSpy.mockRestore();
+      }
+    });
+
+    it('plan-time refusals still fire — a write-typed reuse-only thread holds, it does not plan', async () => {
+      // Refusals are routing DECISIONS, not provisioning actions: deferring
+      // the mint must not turn "this deploy thread has nowhere safe to write"
+      // into a successful plan.
+      const tables = s3Tables({ studioPolicy: 'reuse-only' });
+      const service = s3Service(makeFakeSupabase(tables));
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200', planOnly: true })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied', policy: 'reuse-only' },
+      });
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('an anchored plan to the holder session never touches the holder set (inline is a deposit)', async () => {
+      // Contrast with S2's append test: the SAME anchored shape WITH planOnly
+      // leaves the lease alone. Inline delivery rides the session's existing
+      // lease (v17 §5); the multiplex append happens at spawn admission, when
+      // the session actually takes the thread into the tree.
+      const now = new Date().toISOString();
+      const tables = s3Tables({
+        lease: {
+          sessionId: 'holder-session',
+          threadKey: 'pr:other',
+          threadKeys: ['pr:other'],
+          sbSlug: 'wren',
+          sbId: 'sb-wren',
+          acquiredAt: now,
+          heartbeatAt: now,
+        },
+      });
+      mockRepository.findById = vi.fn().mockResolvedValue(
+        createMockSession({
+          id: 'holder-session',
+          sbSlug: 'wren',
+          sbId: 'sb-wren',
+          studioId: 'studio-A',
+        })
+      );
+      const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const service = s3Service(makeFakeSupabase(tables));
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:3200',
+        recipientSessionId: 'holder-session',
+        planOnly: true,
+      });
+
+      expect(session.id).toBe('holder-session');
+      expect(overflowSpy).not.toHaveBeenCalled();
+      const lease = tables.studios[0].lease as LeaseRow;
+      expect(lease.threadKeys).toEqual(['pr:other']); // NOT appended — plan, not admission
+      overflowSpy.mockRestore();
+    });
+
+    it('handleMessage carries a routing refusal out structured — the trigger handler stamps holds from it', async () => {
+      // With provisioning deferred, spawn admission is where occupancy is
+      // first ENFORCED — so a refusal can surface inside handleMessage. A
+      // serialized message string cannot drive stampRoutingHold; the parts
+      // must survive the boundary.
+      const tables = s3Tables({ studioPolicy: 'reuse-only' });
+      const service = s3Service(makeFakeSupabase(tables));
+
+      const result = await service.handleMessage({
+        userId: 'user-456',
+        sbSlug: 'wren',
+        channel: 'agent',
+        conversationId: 'trigger:wren:pr:3200',
+        sender: { id: 'lumen', name: 'lumen' },
+        content: 'ping',
+        metadata: { threadKey: 'pr:3200' },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('ROUTING_REFUSED');
+      expect(result.refusal).toMatchObject({
+        threadKey: 'pr:3200',
+        detail: { reason: 'occupied', policy: 'reuse-only' },
+      });
+      // Refusals are pre-admission by construction.
+      expect(result.admitted).toBe(false);
+    });
+
+    it('a runner failure AFTER admission still reports admitted: true (r2 — backend ≠ routing)', async () => {
+      // Routing completed; the turn failed. The trigger handler must be able
+      // to tell this apart from a routing failure — it clears the thread's
+      // routingHold on admitted outcomes so a stale occupied/no-route marker
+      // does not misdiagnose a runner crash. Both post-admission failure
+      // shapes: the runner RETURNS failure (direct return path), and the
+      // runner THROWS (the catch's tracked flag).
+      mockClaudeRunner.run = vi
+        .fn()
+        .mockResolvedValue(createMockClaudeResult({ success: false, error: 'runner crashed' }));
+      const returned = await sessionService.handleMessage(createMockRequest());
+      expect(returned.success).toBe(false);
+      expect(returned.admitted).toBe(true);
+
+      mockClaudeRunner.run = vi.fn().mockRejectedValue(new Error('runner exploded'));
+      const threw = await sessionService.handleMessage(createMockRequest());
+      expect(threw.success).toBe(false);
+      expect(threw.admitted).toBe(true);
+    });
+
+    it('a QUEUED dispatch whose dequeue throws still reports admitted: true (r3 — the promise escape)', async () => {
+      // `return new Promise(...)` handed the queue promise out of the try
+      // block, so a queue-processor rejection bypassed the catch: the caller
+      // got a raw throw, no structured result, no admission evidence — and
+      // the trigger handler could neither clear nor stamp coherently. With
+      // `return await`, the rejection rides the same tracked-admitted catch
+      // as the direct path. (The pre-admission contrast is the test below:
+      // an un-queued resolution failure reports admitted: false.)
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let releaseFirst!: () => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        await new Promise<void>((r) => {
+          releaseFirst = r;
+        });
+        return createMockClaudeResult();
+      });
+
+      const p1 = sessionService.handleMessage(createMockRequest({ content: 'lock holder' }));
+      await new Promise((r) => setTimeout(r, 10));
+      const p2 = sessionService.handleMessage(createMockRequest({ content: 'queued' }));
+      await new Promise((r) => setTimeout(r, 10));
+
+      // The dequeue re-resolution rejects → the queue processor rejects p2.
+      vi.mocked(mockRepository.findByUserAndAgent).mockRejectedValue(
+        new Error('db down at dequeue')
+      );
+      releaseFirst();
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.success).toBe(true);
+      expect(r2.success).toBe(false);
+      expect(r2.errorCode).toBe('INTERNAL_ERROR');
+      // This message's OWN resolution completed at enqueue time — the
+      // dequeue artifact is not a routing outcome, so the hold clears.
+      expect(r2.admitted).toBe(true);
+    });
+
+    it('a PRE-admission failure that is not a refusal reports admitted: false — the hold stays', async () => {
+      // Session creation itself fails — resolution never completes, nothing
+      // was admitted. (getAgentBackend swallows into a fallback, so the
+      // repository is the honest pre-admission failure point.)
+      mockRepository.create = vi.fn().mockRejectedValue(new Error('db down'));
+      const result = await sessionService.handleMessage(createMockRequest());
+
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('INTERNAL_ERROR');
+      expect(result.admitted).toBe(false);
+    });
+  });
 });
 
 describe('summarizeToolArgs', () => {
@@ -5215,6 +6493,36 @@ describe('parseRuntimeConfig (per-SB dashboard settings → spawn flags)', () =>
     expect(parseRuntimeConfig({ runtimeConfig: { toolRouting: 'local' } })).toEqual({
       toolRouting: 'local',
     });
+  });
+
+  it('passes through a per-SB effort, validated against the levels claude accepts', () => {
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: 'xhigh' } })).toEqual({
+      toolRouting: 'local',
+      effort: 'xhigh',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: ' High ' } })).toEqual({
+      toolRouting: 'local',
+      effort: 'high',
+    });
+    for (const level of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      expect(parseRuntimeConfig({ runtimeConfig: { effort: level } }).effort).toBe(level);
+    }
+  });
+
+  it('drops an effort the CLI would reject rather than failing the spawn with it — and says so', () => {
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: 'ultra' } })).toEqual({
+      toolRouting: 'local',
+      effortRejected: 'ultra',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: 3 } })).toEqual({
+      toolRouting: 'local',
+      effortRejected: '3',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: '' } })).toEqual({
+      toolRouting: 'local',
+      effortRejected: '',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: {} }).effortRejected).toBeUndefined();
   });
 
   it('passes through a per-SB model pin, trimmed', () => {

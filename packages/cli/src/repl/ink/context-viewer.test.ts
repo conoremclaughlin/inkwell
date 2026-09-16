@@ -61,7 +61,7 @@ describe('computeSectionJumps', () => {
           tool: 'get_inbox',
           status: 'executed',
           at: new Date().toISOString(),
-          args: '{"agentId":"myra","limit":5}',
+          args: '{"sbSlug":"myra","limit":5}',
           result: '{"success":true,"messages":[{"id":"m1","content":"hello"}]}',
         },
         { tool: 'signal_status', status: 'executed', at: new Date().toISOString() },
@@ -69,7 +69,7 @@ describe('computeSectionJumps', () => {
     });
     const joined = lines.join('\n');
     expect(joined).toContain('• get_inbox (executed)');
-    expect(joined).toContain('    {"agentId":"myra","limit":5}');
+    expect(joined).toContain('    {"sbSlug":"myra","limit":5}');
     expect(joined).toContain('    → {"success":true,"messages":[{"id":"m1","content":"hello"}]}');
     // No result line for calls without one
     expect(joined).toContain('• signal_status (executed)');

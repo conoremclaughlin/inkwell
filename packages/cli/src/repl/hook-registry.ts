@@ -43,7 +43,7 @@ export interface HookContext {
 
 export interface HookRuntimeState {
   sessionId?: string;
-  agentId?: string;
+  sbSlug?: string;
   backend?: string;
   budgetUtilization?: number; // 0-1
   turnCount: number;

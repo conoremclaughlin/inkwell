@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { extractBackendTokenUsage, formatBackendTokenUsage } from './token-usage.js';
+import {
+  extractBackendTokenUsage,
+  formatBackendTokenUsage,
+  providerContextTokens,
+} from './token-usage.js';
 
 describe('extractBackendTokenUsage', () => {
   it('parses JSON usage payloads', () => {
@@ -16,7 +20,8 @@ describe('extractBackendTokenUsage', () => {
   });
 
   it('parses text usage payloads with suffixes', () => {
-    const stderr = 'Input tokens: 1.2k\nOutput tokens: 450\nTotal tokens: 1.65k\nCache read tokens: 300';
+    const stderr =
+      'Input tokens: 1.2k\nOutput tokens: 450\nTotal tokens: 1.65k\nCache read tokens: 300';
     const usage = extractBackendTokenUsage('claude', '', stderr);
 
     expect(usage).toMatchObject({
@@ -60,5 +65,128 @@ describe('formatBackendTokenUsage', () => {
     expect(formatted).toContain('in 1,000');
     expect(formatted).toContain('out 200');
     expect(formatted).toContain('total 1,200');
+  });
+});
+
+describe('Gemini usage fields (Lumen, PR #576 round 6)', () => {
+  it('usageMetadata nesting is read, and a synthesized total keeps the thoughts (Lumen, round 7)', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      JSON.stringify({
+        usageMetadata: {
+          promptTokenCount: 90_000,
+          candidatesTokenCount: 500,
+          thoughtsTokenCount: 2_000,
+        },
+      }),
+      ''
+    );
+    expect(usage?.inputTokens).toBe(90_000);
+    expect(usage?.reasoningTokens).toBe(2_000);
+    expect(usage?.totalTokens).toBe(92_500);
+  });
+
+  it("REGRESSION (Lumen, round 8): OpenAI's reasoning is inside output — a synthesized total never adds it again", () => {
+    const usage = extractBackendTokenUsage(
+      'codex',
+      JSON.stringify({
+        usage: {
+          input_tokens: 1_000,
+          output_tokens: 500,
+          output_tokens_details: { reasoning_tokens: 200 },
+        },
+      }),
+      ''
+    );
+    expect(usage?.reasoningTokens).toBe(200);
+    expect(usage?.totalTokens).toBe(1_500);
+  });
+
+  it('REGRESSION (Lumen, round 8): a Gemini text summary with a thoughts label adds them to the total', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      'prompt tokens: 90000, candidate tokens: 500, thoughts tokens: 2000',
+      ''
+    );
+    expect(usage?.source).toBe('text');
+    expect(usage?.reasoningTokens).toBe(2_000);
+    expect(usage?.totalTokens).toBe(92_500);
+  });
+
+  it('thoughtsTokenCount and totalTokenCount are normalized', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      JSON.stringify({
+        usage: {
+          promptTokenCount: 90_000,
+          candidatesTokenCount: 500,
+          thoughtsTokenCount: 2_000,
+          totalTokenCount: 92_500,
+        },
+      }),
+      ''
+    );
+    expect(usage?.inputTokens).toBe(90_000);
+    expect(usage?.reasoningTokens).toBe(2_000);
+    expect(usage?.totalTokens).toBe(92_500);
+  });
+});
+
+describe('providerContextTokens — the context a request was handed, per backend (Lumen, PR #583)', () => {
+  it('Anthropic reports cache reads and writes DISJOINT from input, so they sum', () => {
+    expect(
+      providerContextTokens('claude', {
+        inputTokens: 1_000,
+        cacheReadTokens: 500_000,
+        cacheWriteTokens: 40_000,
+      })
+    ).toBe(541_000);
+  });
+
+  it('OpenAI input_tokens already includes cached_tokens — never double-counted', () => {
+    const usage = extractBackendTokenUsage(
+      'codex',
+      JSON.stringify({
+        usage: {
+          input_tokens: 120_000,
+          output_tokens: 300,
+          prompt_tokens_details: { cached_tokens: 100_000 },
+        },
+      }),
+      ''
+    );
+    expect(usage?.cacheReadTokens).toBe(100_000);
+    expect(usage?.contextTokens).toBe(120_000);
+    expect(usage?.contextParts).toEqual({ inputTokens: 120_000, cacheReadTokens: 100_000 });
+  });
+
+  it('Gemini promptTokenCount already includes the cache', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      JSON.stringify({ usage: { promptTokenCount: 90_000, candidatesTokenCount: 50 } }),
+      ''
+    );
+    expect(usage?.contextTokens).toBe(90_000);
+  });
+
+  it('a Claude report parsed from stdout sums the same way the stream parser does', () => {
+    const usage = extractBackendTokenUsage(
+      'claude',
+      JSON.stringify({
+        usage: {
+          input_tokens: 1_000,
+          output_tokens: 10,
+          cache_read_tokens: 500_000,
+          cache_write_tokens: 40_000,
+        },
+      }),
+      ''
+    );
+    expect(usage?.contextTokens).toBe(541_000);
+  });
+
+  it('is absent when nothing about the input was reported', () => {
+    expect(providerContextTokens('claude', {})).toBeUndefined();
+    expect(providerContextTokens('codex', { cacheReadTokens: 5 })).toBeUndefined();
   });
 });
