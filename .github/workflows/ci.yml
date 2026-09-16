@@ -51,6 +51,14 @@ jobs:
       - name: Pre-push commit replay
         run: sh scripts/check-push.test.sh
 
+      # The integration-DB harness's endpoint isolation. Mock-only: synthetic
+      # `supabase status` payloads, no Docker and no database. CI has no
+      # ambient Supabase env, so the contamination this covers cannot arise
+      # here — which is why it has to be reproduced from synthetic payloads
+      # rather than by running the harness.
+      - name: Integration-DB harness endpoint isolation
+        run: sh scripts/test-integration-db-local.test.sh
+
       # Every tracked file at HEAD, through the same guard the hooks run: no
       # credential-shaped file, no vendor token, no email address off the
       # fixture-domain list. The private-marker arm is the owner's machine's

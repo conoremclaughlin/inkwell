@@ -60,6 +60,10 @@ import {
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteSlug } from './services/routing/resolve-route';
 import { resolveInboundAgent } from './services/routing/resolve-inbound-agent';
+import {
+  loadThreadDescriptor,
+  formatThreadDescriptorLines,
+} from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
@@ -1108,6 +1112,28 @@ Type: ${payload.triggerType}`;
     }
     if (payload.threadKey) {
       triggerMessage += `\n\nThread: ${payload.threadKey}`;
+
+      // The thread's own description, on the surface an SB reads BEFORE
+      // deciding whether to act. A key alone ("pcp:thread:legibility-commission")
+      // says nothing about what the thread became, and one thread routinely
+      // spans several PRs and specs. Each line carries its age, so a
+      // description nobody has touched since the thread opened cannot be read
+      // as a current statement of what it is about.
+      //
+      // targetSlug is passed because this text is about to be written into that
+      // SB's prompt, and a trigger may name any threadKey: the loader delivers
+      // nothing unless the recipient is a participant.
+      if (dataComposer) {
+        const descriptor = await loadThreadDescriptor(
+          dataComposer.getClient(),
+          userId,
+          payload.threadKey,
+          targetSlug
+        );
+        for (const line of formatThreadDescriptorLines(descriptor)) {
+          triggerMessage += `\n${line}`;
+        }
+      }
     }
     triggerMessage += `
 

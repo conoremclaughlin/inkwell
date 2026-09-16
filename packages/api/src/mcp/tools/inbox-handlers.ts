@@ -11,6 +11,7 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveSbId, resolveSbSlug } from '../../auth/resolve-identity';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
+import { boundThreadTitle } from './thread-bounds.js';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -606,6 +607,20 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           sessionId: senderSessionId,
           studioId: senderStudioId,
         },
+        // The sender's own subject, kept whole on the row it was sent with.
+        //
+        // `inbox_thread_messages` has no subject column, so before this the
+        // thread path's only copy of a subject was `inbox_threads.title` — and
+        // only for the first message, since a reply's subject was dropped
+        // outright. Bounding the title at 200 characters therefore truncated
+        // the one durable copy a 240-character subject had (Lumen, #641
+        // round 2, measured on the real send handler). The bound is about a
+        // thread's label; it was never meant to edit what someone sent.
+        //
+        // Stored for every message, not just the overflowing first one: a rule
+        // that keeps long subjects and discards short ones is the harder thing
+        // to reason about, and the reply case was already losing them.
+        ...(subject ? { subject } : {}),
         ...(selfStudioRecipient ? { recipient: { studioId: resolvedRecipientStudioId } } : {}),
       },
     };
@@ -1112,6 +1127,18 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
 /**
  * Find or create a thread. Returns the thread row with an `isNew` flag.
+ *
+ * `opts.title` is the first message's subject, which is unbounded, and is
+ * bounded here to fit `inbox_threads.title`. Truncating rather than refusing is
+ * deliberate: losing a message because its thread's label was one character too
+ * long would be a new failure introduced by a constraint meant to prevent a
+ * cosmetic one.
+ *
+ * The subject survives in full at `metadata.pcp.subject` on the message row —
+ * which is a thing the caller must do, not something this function arranges. It
+ * was not true when this comment first claimed it: nothing on the thread path
+ * stored a subject anywhere but here, so a 240-character one was truncated into
+ * the title and kept nowhere (Lumen, #641 round 2).
  */
 export async function findOrCreateThread(
   supabase: ReturnType<DataComposer['getClient']>,
@@ -1144,7 +1171,7 @@ export async function findOrCreateThread(
       thread_key: opts.threadKey,
       user_id: opts.userId,
       created_by_agent_id: opts.creatorSlug,
-      title: opts.title,
+      title: boundThreadTitle(opts.title),
     })
     .select()
     .single();

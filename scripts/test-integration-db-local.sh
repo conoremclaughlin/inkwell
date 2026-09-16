@@ -90,29 +90,27 @@ supabase db reset --workdir "${SUPABASE_WORKDIR}" --local >/dev/null
 
 echo "[integration-db] Exporting local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
-eval "${STATUS_ENV}"
 
-export SUPABASE_URL="${SUPABASE_URL:-${API_URL:-}}"
-export SUPABASE_PUBLISHABLE_KEY="${SUPABASE_PUBLISHABLE_KEY:-${ANON_KEY:-}}"
-export SUPABASE_SECRET_KEY="${SUPABASE_SECRET_KEY:-${SERVICE_ROLE_KEY:-}}"
-export JWT_SECRET="${JWT_SECRET:-${AUTH_JWT_SECRET:-}}"
+# Both endpoints come from the stack this script started, and from nothing the
+# calling shell already had. See the library for why inheriting them is unsafe.
+# shellcheck source=lib/derive-isolated-supabase-env.sh
+source "${ROOT_DIR}/scripts/lib/derive-isolated-supabase-env.sh"
+derive_isolated_supabase_env "${STATUS_ENV}" "${API_PORT}" "${DB_PORT}" || exit 1
+
 export NODE_ENV="test"
 export INK_ALLOW_REMOTE_INTEGRATION_DB="0"
 export INTEGRATION_SUPABASE_WORKDIR="${SUPABASE_WORKDIR}"
-# Direct Postgres URL, for the few tests that need a SECOND connection and so
-# cannot go through PostgREST — concurrency regressions where one transaction
-# must hold a row lock while another statement waits on it. PostgREST gives one
-# transaction per request and cannot express that.
-export INTEGRATION_DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:${DB_PORT}/postgres}"
 
-if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SECRET_KEY}" || -z "${JWT_SECRET}" ]]; then
-  echo "[integration-db] Failed to derive required env vars from supabase status output." >&2
-  echo "${STATUS_ENV}" >&2
-  exit 1
-fi
+# Prove the target before a single test runs: the API URL must be exactly the
+# loopback endpoint on the port this script reserved — not merely contain the
+# port (Lumen, #623: a substring test passed foreign hosts and fragments). The
+# check lives in scripts/lib so it can be tested alone.
+# shellcheck source=lib/assert-isolated-supabase-url.sh
+source "${ROOT_DIR}/scripts/lib/assert-isolated-supabase-url.sh"
+assert_isolated_supabase_url "${SUPABASE_URL}" "${API_PORT}" || exit 1
 
 # Non-empty is not the same as service-role. A key that parses but resolves to
-# `anon` sails past the check above and then fails every single test with
+# `anon` sails past the non-empty check and then fails every single test with
 # "permission denied for table users" — 100+ confusing failures for one bad
 # variable. That is exactly how this job stayed red from June to August 2026
 # without anyone being able to read the cause off the log. Probe once, here.
@@ -130,7 +128,7 @@ if [[ "${PROBE_STATUS}" != "200" ]]; then
   echo "[integration-db] CLI version in use:" >&2
   supabase --version >&2 || true
   echo "[integration-db] Keys emitted by status (values redacted):" >&2
-  echo "${STATUS_ENV}" | sed -E 's/=.*/=<redacted>/' >&2
+  printf '%s\n' "${STATUS_ENV}" | redact_env_assignments >&2
   exit 1
 fi
 

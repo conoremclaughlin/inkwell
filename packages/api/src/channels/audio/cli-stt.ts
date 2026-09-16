@@ -1,5 +1,5 @@
 import { logger } from '../../utils/logger';
-import { runShellCommand, shellEscape } from '../provider-utils';
+import { buildTemplatedCommand, runShellCommand } from '../provider-utils';
 import type { AudioTranscriptionProvider, AudioTranscriptionInput } from './stt-provider';
 
 function normalizeMime(value?: string): string {
@@ -16,11 +16,12 @@ export class CliTranscriptionProvider implements AudioTranscriptionProvider {
   ) {}
 
   async transcribe(input: AudioTranscriptionInput): Promise<string | undefined> {
-    const command = this.commandTemplate
-      .replace(/\{input\}/g, shellEscape(input.filePath))
-      .replace(/\{mime\}/g, shellEscape(normalizeMime(input.contentType)));
+    const { command, env } = buildTemplatedCommand(this.commandTemplate, {
+      input: input.filePath,
+      mime: normalizeMime(input.contentType),
+    });
 
-    const result = await runShellCommand(command, this.timeoutMs);
+    const result = await runShellCommand(command, this.timeoutMs, env);
     if (result.timedOut || result.code !== 0) {
       logger.warn('Audio transcription CLI provider failed', {
         code: result.code,

@@ -220,7 +220,8 @@ import {
   handleListThreads,
   handleMarkThreadRead,
   handleReopenThread,
-  threadToolDefinitions,
+  handleUpdateThread,
+  threadTool,
 } from './thread-handlers';
 
 import {
@@ -4446,12 +4447,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       // Description derived from the canonical definition so the MCP catalog
       // can't drift from the handler's documented behavior again
-      description: `${threadToolDefinitions[0].description}
+      description: `${threadTool('get_thread_messages').description}
 
 Use to read conversation history in a group thread before replying.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[0].schema,
+      inputSchema: threadTool('get_thread_messages').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4480,7 +4481,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Add an agent to a thread. Idempotent (no-op if already a participant). Creates an audited system event in the thread. Triggers the new participant by default so they can catch up.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[1].schema,
+      inputSchema: threadTool('add_thread_participant').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4509,7 +4510,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close a thread; reopen_thread puts the work back on.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[2].schema,
+      inputSchema: threadTool('close_thread').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4538,7 +4539,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List threads an agent participates in, with unread counts and last message preview. Useful for heartbeat triage and inbox overview.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[3].schema,
+      inputSchema: threadTool('list_threads').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4567,7 +4568,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Mark a thread as read without fetching messages. Useful when you see thread activity in get_inbox and want to acknowledge it without reading the full history.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[4].schema,
+      inputSchema: threadTool('mark_thread_read').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4593,16 +4594,45 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'reopen_thread',
     {
-      description: `${threadToolDefinitions[5].description}
+      description: `${threadTool('reopen_thread').description}
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[5].schema,
+      inputSchema: threadTool('reopen_thread').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
         return await handleReopenThread(args, dataComposer);
       } catch (error) {
         logger.error('Error in reopen_thread:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_thread',
+    {
+      description: `${threadTool('update_thread').description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadTool('update_thread').schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateThread(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_thread:', error);
         return {
           content: [
             {
