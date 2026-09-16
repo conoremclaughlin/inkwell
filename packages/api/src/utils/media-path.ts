@@ -97,19 +97,17 @@ export function resolveAllowedMediaPath(
   const expanded = expandHomePath(requestedPath, homeDirectory);
   const absolutePath = expanded.startsWith('/') ? resolve(expanded) : resolve(repoRoot, expanded);
 
-  if (
-    !isWithinRoots(
-      absolutePath,
-      allowedRoots.map((root) => resolve(root))
-    )
-  ) {
-    return null;
+  // Keep the containment proof next to the value we release to filesystem
+  // operations, rather than hiding it inside an Array.some callback.
+  for (const root of allowedRoots) {
+    const normalizedRoot = resolve(root);
+    // A media file must be strictly below a root, not the root directory itself.
+    if (absolutePath.startsWith(normalizedRoot + sep)) {
+      const mediaType = mediaTypeForPath(absolutePath);
+      return mediaType ? { absolutePath, mediaType } : null;
+    }
   }
-
-  const mediaType = mediaTypeForPath(absolutePath);
-  if (!mediaType) return null;
-
-  return { absolutePath, mediaType };
+  return null;
 }
 
 export interface VerifiedMedia {

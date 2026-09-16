@@ -5,6 +5,7 @@ import { rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { createInkCodingTools, type InkToolDefinition } from './pi-coding-tools';
 import { resetProcessRegistry, getProcessRegistry } from './bash-guard';
+import * as bashGuard from './bash-guard';
 
 vi.mock('../../utils/logger', () => ({
   logger: {
@@ -26,6 +27,10 @@ describe('Pi Coding Tools Adapter', () => {
     writeFileSync(path.join(testDir, 'subdir', 'nested.txt'), 'nested content\n');
 
     tools = await createInkCodingTools({ cwd: testDir });
+  });
+
+  afterAll(async () => {
+    await rm(testDir, { recursive: true, force: true });
   });
 
   it('loads all 7 coding tools', () => {
@@ -280,42 +285,54 @@ describe('Pi Coding Tools Adapter', () => {
     });
 
     it('blocks fork bombs before execution', async () => {
-      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
-      const result = await bash.execute({ command: ':(){ :|:& };:' });
-      expect(result).toContain('Error');
-      expect(result).toContain('fork bomb');
+      // Dangerous payloads stop at the pure guard, never a real executor.
+      const result = bashGuard.guardBashCommand(':(){ :|:& };:', { sbSlug: 'test-agent' });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('fork bomb');
     });
 
     it('blocks rm -rf / before execution', async () => {
-      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
-      const result = await bash.execute({ command: 'rm -rf /' });
-      expect(result).toContain('Error');
-      expect(result).toContain('recursive delete');
+      // Dangerous payloads stop at the pure guard, never a real executor.
+      const result = bashGuard.guardBashCommand('rm -rf /', { sbSlug: 'test-agent' });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('recursive delete');
     });
 
     it('blocks shutdown before execution', async () => {
-      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
-      const result = await bash.execute({ command: 'shutdown -h now' });
-      expect(result).toContain('Error');
-      expect(result).toContain('shutdown');
+      // Dangerous payloads stop at the pure guard, never a real executor.
+      const result = bashGuard.guardBashCommand('shutdown -h now', { sbSlug: 'test-agent' });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('shutdown');
     });
 
     it('blocks kill targeting unregistered PIDs', async () => {
-      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
-      const result = await bash.execute({ command: 'kill 99999' });
-      expect(result).toContain('Error');
-      expect(result).toContain('not owned by this agent');
+      // Dangerous payloads stop at the pure guard, never a real executor.
+      const result = bashGuard.guardBashCommand('kill 99999', { sbSlug: 'test-agent' });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('not owned by this agent');
     });
 
     it('allows kill targeting own registered PIDs', async () => {
       const registry = getProcessRegistry();
       registry.register('test-agent', 99999999, 'sleep 100');
 
-      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
-      // The kill will execute but fail (PID doesn't exist) — that's fine,
-      // the point is the guard lets it through
-      const result = await bash.execute({ command: 'kill 99999999' });
-      expect(result).not.toContain('not owned by this agent');
+      // A registered synthetic PID is still not permission to signal the host.
+      const result = bashGuard.guardBashCommand('kill 99999999', { sbSlug: 'test-agent' });
+      expect(result.allowed).toBe(true);
+    });
+
+    it('honors a guard refusal at the adapter boundary using only a harmless command', async () => {
+      const refusal = vi
+        .spyOn(bashGuard, 'guardBashCommand')
+        .mockReturnValueOnce({ allowed: false, reason: 'synthetic guard refusal' });
+      try {
+        const bash = guardedTools.find((tool) => tool.schema.name === 'bash')!;
+        expect(await bash.execute({ command: 'echo harmless' })).toBe(
+          'Error: synthetic guard refusal'
+        );
+      } finally {
+        refusal.mockRestore();
+      }
     });
 
     it('allows safe commands with guard enabled', async () => {
@@ -332,17 +349,17 @@ describe('Pi Coding Tools Adapter', () => {
     });
 
     it('blocks pkill (fail-closed, name-based)', async () => {
-      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
-      const result = await bash.execute({ command: 'pkill -f node' });
-      expect(result).toContain('Error');
-      expect(result).toContain('pkill/killall');
+      // Dangerous payloads stop at the pure guard, never a real executor.
+      const result = bashGuard.guardBashCommand('pkill -f node', { sbSlug: 'test-agent' });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('pkill/killall');
     });
 
     it('blocks kill with variable target (fail-closed)', async () => {
-      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
-      const result = await bash.execute({ command: 'kill $PPID' });
-      expect(result).toContain('Error');
-      expect(result).toContain('variable/dynamic');
+      // Dangerous payloads stop at the pure guard, never a real executor.
+      const result = bashGuard.guardBashCommand('kill $PPID', { sbSlug: 'test-agent' });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('variable/dynamic');
     });
 
     it('guard does not interfere with non-bash tools', async () => {

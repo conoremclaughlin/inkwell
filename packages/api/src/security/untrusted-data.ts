@@ -1,11 +1,12 @@
 /**
  * Untrusted Data Handling
  *
- * Utilities for safely wrapping and processing untrusted data from external sources.
- * Uses random boundary UUIDs that attackers cannot predict or escape.
+ * Heuristics for wrapping and processing untrusted data from external sources.
+ * Boundaries label provenance; they are not an authorization or execution sandbox.
  */
 
 import crypto from 'crypto';
+import sanitizeHtml from 'sanitize-html';
 
 export type UntrustedDataSource =
   | 'web_search'
@@ -24,8 +25,8 @@ export type UntrustedDataSource =
  * a closing tag in their payload to escape the boundary - they cannot
  * predict the UUID.
  *
- * This is similar to how SQL prepared statements prevent injection:
- * the boundary is not user-controllable.
+ * This is a prompt convention, not the security guarantee of a prepared
+ * statement. Tool authorization must still enforce the caller's permissions.
  */
 export function wrapUntrustedData(
   data: string,
@@ -122,13 +123,16 @@ export function validateExtractedData(
 
       // Check for code patterns if blocked
       if (options?.blockCode !== false) {
-        const codePatterns = [
-          /```[\s\S]*```/,
-          /<script[\s\S]*<\/script>/i,
-          /eval\s*\(/,
-          /exec\s*\(/,
-          /system\s*\(/,
-        ];
+        let hasMarkup = false;
+        sanitizeHtml(value, {
+          allowedTags: [],
+          allowedAttributes: {},
+          onOpenTag: () => {
+            hasMarkup = true;
+          },
+        });
+        if (hasMarkup) violations.push(`Code pattern found in ${path}`);
+        const codePatterns = [/```[\s\S]*```/, /eval\s*\(/, /exec\s*\(/, /system\s*\(/];
         for (const pattern of codePatterns) {
           if (pattern.test(value)) {
             violations.push(`Code pattern found in ${path}`);
@@ -162,20 +166,19 @@ export function validateExtractedData(
 }
 
 /**
- * Strip potentially dangerous content from extracted data.
- * Use as a last-resort sanitization step.
+ * Reduce markup and obvious code/URL patterns in extracted text. This does
+ * not make text safe to execute or guarantee resistance to prompt injection.
  */
 export function sanitizeExtractedData(data: string): string {
   return (
-    data
+    // Parse HTML before text redaction: removing a tag can join URL fragments.
+    // No tags/attributes survive; script and style contents are discarded by
+    // the sanitizer. Never decode its escaped text back into HTML afterward.
+    sanitizeHtml(data, { allowedTags: [], allowedAttributes: {} })
       // Remove URLs
       .replace(/https?:\/\/[^\s]+/gi, '[URL REMOVED]')
       // Remove potential code blocks
       .replace(/```[\s\S]*?```/g, '[CODE REMOVED]')
-      // Remove script tags
-      .replace(/<script[\s\S]*?<\/script>/gi, '[SCRIPT REMOVED]')
-      // Remove HTML tags
-      .replace(/<[^>]+>/g, '')
       // Remove potential command patterns
       .replace(/\$\([^)]+\)/g, '[COMMAND REMOVED]')
       .replace(/`[^`]+`/g, '[INLINE CODE REMOVED]')

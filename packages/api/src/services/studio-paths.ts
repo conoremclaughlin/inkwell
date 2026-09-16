@@ -105,10 +105,16 @@ export function ephemeralWorktreePath(opts: {
   repoRoot: string;
   leaf: string;
 }): string {
-  return path.join(
-    inkStudiosRoot(),
+  const root = path.resolve(inkStudiosRoot());
+  const candidate = path.resolve(
+    root,
     studioPathSegment(opts.sbSlug, 'agent'),
     studioPathSegment(path.basename(opts.repoRoot), 'project'),
     studioPathSegment(opts.leaf, 'studio')
   );
+  // Check the final normalized path, not just the segment sanitizer.
+  if (!candidate.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) {
+    throw new Error('Ephemeral studio escaped the configured root');
+  }
+  return candidate;
 }

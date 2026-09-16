@@ -7,6 +7,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
 import { logger } from '../../utils/logger';
 import type {
   AgentBackend,
@@ -88,7 +89,7 @@ export class InkBackend extends EventEmitter implements AgentBackend {
     }
 
     this.client = new Anthropic({ apiKey });
-    this.sessionId = `ink-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    this.sessionId = `ink-${randomUUID()}`;
     this.startTime = new Date();
     this.ready = true;
 
