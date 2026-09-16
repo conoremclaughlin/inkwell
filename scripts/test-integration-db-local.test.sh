@@ -397,18 +397,28 @@ echo "$hostile_urls" | while IFS='|' read -r n url; do
   [ -z "$url" ] && continue
   out=$(assert_url "$url" "$API_PORT")
   rc=$?
+  echo "RAN|$n"
   [ "$rc" -eq 0 ] && echo "ACCEPTED|$n"
   for v in znuser znpw znhost znpath znquery znfrag znscheme; do
     echo "$out" | grep -q -- "$v" && echo "LEAK|$n|$v"
   done
 done >"${TMPDIR:-/tmp}/zn_url_leaks.$$"
 
-leaks=$(wc -l <"${TMPDIR:-/tmp}/zn_url_leaks.$$" | tr -d ' ')
+# The loop runs in a subshell behind a pipe, so it cannot report upward except
+# through this file. A battery that silently iterated zero times would leave
+# the file empty and read as a pass — count the cases before trusting the
+# absence of leaks.
+ran=$(grep -c '^RAN|' "${TMPDIR:-/tmp}/zn_url_leaks.$$")
+[ "$ran" -eq 7 ] &&
+  ok "all 7 hostile URL shapes were exercised" ||
+  bad "all 7 hostile URL shapes were exercised" "only $ran ran"
+
+leaks=$(grep -cv '^RAN|' "${TMPDIR:-/tmp}/zn_url_leaks.$$")
 if [ "$leaks" -eq 0 ]; then
   ok "no component of a rejected URL appears in the refusal (7 hostile shapes)"
 else
   bad "no component of a rejected URL appears in the refusal (7 hostile shapes)" \
-    "$(tr '\n' ' ' <"${TMPDIR:-/tmp}/zn_url_leaks.$$")"
+    "$(grep -v '^RAN|' "${TMPDIR:-/tmp}/zn_url_leaks.$$" | tr '\n' ' ')"
 fi
 rm -f "${TMPDIR:-/tmp}/zn_url_leaks.$$"
 
