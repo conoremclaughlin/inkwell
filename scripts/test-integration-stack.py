@@ -3,17 +3,25 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import select
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
-spec = importlib.util.spec_from_file_location("stack", Path(__file__).parent / "lib/integration-stack.py")
+MODULE_PATH = Path(os.environ.get("INTEGRATION_STACK_UNDER_TEST", str(Path(__file__).parent / "lib/integration-stack.py"))).resolve()
+spec = importlib.util.spec_from_file_location("stack", MODULE_PATH)
 stack = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stack)
+
+
+TEST_CONFIG = "[api]\nport = 54321\n[db]\nport = 54322\n[studio]\nport = 54323\n[inbucket]\nport = 54324\nsmtp_port = 54325\npop3_port = 54326\n"
 
 
 class LifecycleTests(unittest.TestCase):
@@ -22,7 +30,7 @@ class LifecycleTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / "supabase/migrations").mkdir(parents=True)
-        (self.root / "supabase/config.toml").write_text("[api]\nport = 54321\n[db]\nport = 54322\n")
+        (self.root / "supabase/config.toml").write_text(TEST_CONFIG)
         (self.root / "supabase/migrations/20260101000000_fixture.sql").write_text("select 1;")
         self.harness = self.root / "scripts/test-integration-db-local.sh"
         self.env = {"INTEGRATION_SUPABASE_CACHE_DIR": str(self.root / "cache"),
@@ -31,7 +39,7 @@ class LifecycleTests(unittest.TestCase):
         self.db = "supabase_db_" + self.project
         self.current = {}
         self.calls = []
-        self.fail = None
+        self.fail_command = None
         self.suite_code = 0
         for target, replacement in (
             ("capture", self.capture), ("containers", lambda _: dict(self.current)),
@@ -42,7 +50,7 @@ class LifecycleTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         for target, replacement in (
-            ("check_call", self.command), ("run", self.command), ("call", self.suite),
+            ("check_call", self.command), ("run", self.run_command), ("call", self.suite),
         ):
             patch = mock.patch.object(stack.subprocess, target, replacement)
             patch.start()
@@ -61,10 +69,10 @@ class LifecycleTests(unittest.TestCase):
         if args[:2] == ["docker", "info"]:
             return 0
         self.assertEqual(args[0], "supabase")
-        if args[1] == self.fail:
+        if args[1] == self.fail_command:
             raise subprocess.CalledProcessError(1, args)
         if args[1] == "start":
-            self.current = {self.db: "fixture-db-id"}
+            self.current = {self.db: "fixture-db-id", "supabase_rest_" + self.project: "fixture-rest-id"}
         elif args[1] == "stop":
             self.current = {}
         else:
@@ -76,6 +84,17 @@ class LifecycleTests(unittest.TestCase):
         self.suite_env = kwargs["env"]
         self.assertTrue(kwargs["pass_fds"], "suite must retain ownership locks if parent exits")
         return self.suite_code
+
+    def run_command(self, args, **kwargs):
+        # run() returns a status by default; unlike check_call(), it does not
+        # raise. A failed stop must not be made safe by the test double itself.
+        try:
+            code = self.command(args, **kwargs)
+        except subprocess.CalledProcessError as error:
+            if kwargs.get("check"):
+                raise
+            code = error.returncode
+        return subprocess.CompletedProcess(args, code, stdout="", stderr="")
 
     def run_stack(self, *args):
         return stack.manage(self.root, self.harness, args, self.env)
@@ -169,7 +188,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_failed_reset_never_marks_schema_ready(self):
         self.run_stack()
-        self.fail = "db"
+        self.fail_command = "db"
         with self.assertRaises(subprocess.CalledProcessError):
             self.run_stack("--reset")
         self.assertIsNone(self.state()["fingerprint"])
@@ -212,11 +231,90 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.current)
 
     def test_failed_start_cleans_up_own_attempt(self):
-        self.fail = "start"
+        self.fail_command = "start"
         with self.assertRaises(subprocess.CalledProcessError):
             self.run_stack()
         self.assertEqual(self.count("supabase", "stop"), 1)
         self.assertEqual(self.count("bash"), 0)
+
+    def test_external_database_loss_can_stop_verified_survivors_after_cold_and_warm_runs(self):
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                self.run_stack()
+                if warm:
+                    self.run_stack()
+                original = dict(self.current)
+                try:
+                    del self.current[self.db]
+                    self.run_stack("--stop")
+                    self.assertFalse(self.current)
+                finally:
+                    # Keep the two probes independent even against the old
+                    # implementation whose stop refuses the missing DB.
+                    if self.current:
+                        self.current = original
+                        self.run_stack("--stop")
+
+    def test_external_database_loss_advice_leads_to_working_stop_and_recreate(self):
+        self.run_stack()
+        self.run_stack()
+        del self.current[self.db]
+        for args in ((), ("--reuse",), ("--reset",), ("--fresh",)):
+            with self.subTest(args=args), self.assertRaisesRegex(stack.Refusal, "DB container is missing.*--stop"):
+                self.run_stack(*args)
+        self.run_stack("--stop")
+        self.run_stack()
+        self.assertEqual(self.count("supabase", "start"), 2)
+        self.assertEqual(self.count("supabase", "db", "reset"), 2)
+
+    def test_missing_database_cannot_adopt_unknown_or_replaced_survivors(self):
+        self.run_stack()
+        del self.current[self.db]
+        original = dict(self.current)
+        for change in ({"supabase_rest_" + self.project: "replacement-id"},
+                       {"supabase_unknown_" + self.project: "new-id"}):
+            self.current = dict(original, **change)
+            for args in (("--stop",), ("--reset",)):
+                with self.subTest(change=change, args=args), self.assertRaises(stack.Refusal):
+                    self.run_stack(*args)
+        self.assertEqual(self.count("supabase", "stop"), 0)
+        self.assertEqual(self.count("supabase", "db", "reset"), 1)
+
+    def test_port_source_drift_missing_duplicate_and_wrong_section_refuse_before_start(self):
+        variants = [TEST_CONFIG.replace(str(port), str(port + 10)) for port in range(54321, 54327)]
+        variants += [TEST_CONFIG.replace("port = 54321\n", ""),
+                     TEST_CONFIG.replace("port = 54321\n", "port = 54321\nport = 54321\n"),
+                     TEST_CONFIG.replace("[api]", "[unrelated]")]
+        for config in variants:
+            self.calls.clear()
+            with self.subTest(config=config):
+                (self.root / "supabase/config.toml").write_text(config)
+                with self.assertRaisesRegex(stack.Refusal, "port"):
+                    self.run_stack("--fresh")
+                self.assertEqual(self.count("supabase", "start"), 0)
+                self.assertEqual(self.count("bash"), 0)
+
+    def test_port_overrides_cannot_cascade_into_other_default_values(self):
+        ports = list(reversed(range(54321, 54327)))
+        self.env.update({"INTEGRATION_SUPABASE_" + name + "_PORT": str(port)
+                         for name, port in zip(stack.PORT_NAMES, ports)})
+        self.run_stack()
+        expected = TEST_CONFIG
+        # Use unique placeholders to build the independent expected result.
+        for index, port in enumerate(range(54321, 54327)):
+            expected = expected.replace(str(port), "PORT_" + str(index))
+        for index, port in enumerate(ports):
+            expected = expected.replace("PORT_" + str(index), str(port))
+        self.assertEqual(self.state()["config"], 'project_id = "pcp-integration"\n' + expected)
+
+    def test_real_checkout_port_config_and_inline_comments_are_supported(self):
+        repo = Path(__file__).resolve().parent.parent
+        config = stack.configuration(repo, self.project, list(range(55421, 55427)))
+        for port in range(55421, 55427):
+            self.assertIn("= " + str(port), config)
+        (self.root / "supabase/config.toml").write_text(TEST_CONFIG.replace("54321", "54321  # fixture comment"))
+        self.run_stack()
+        self.assertIn("port = 55421  # fixture comment", self.state()["config"])
 
     def test_suite_failure_preserves_return_code_and_reusable_schema(self):
         self.suite_code = 7
@@ -263,10 +361,17 @@ class LifecycleTests(unittest.TestCase):
 
     def test_failed_stop_preserves_ownership_record(self):
         self.run_stack()
-        self.fail = "stop"
+        self.fail_command = "stop"
         with self.assertRaises(subprocess.CalledProcessError):
             self.run_stack("--stop")
         self.assertEqual(self.state()["dbId"], "fixture-db-id")
+
+    def test_failed_fresh_cleanup_preserves_workdir_for_recovery(self):
+        self.fail_command = "stop"
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_stack("--fresh")
+        workdir = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"])
+        self.assertTrue((workdir / "supabase/config.toml").exists())
 
     def test_removed_migration_is_removed_from_reset_copy(self):
         self.run_stack()
@@ -275,6 +380,107 @@ class LifecycleTests(unittest.TestCase):
         self.run_stack("--reset")
         copied = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]) / "supabase/migrations" / original.name
         self.assertFalse(copied.exists())
+
+    def test_kept_fresh_stack_advice_names_original_workdir_not_managed_stop(self):
+        self.env["INTEGRATION_KEEP_SUPABASE"] = "1"
+        self.run_stack("--fresh")
+        for args in ((), ("--reuse",), ("--reset",), ("--stop",), ("--fresh",)):
+            with self.subTest(args=args), self.assertRaises(stack.Refusal) as error:
+                self.run_stack(*args)
+            message = str(error.exception)
+            self.assertIn("original workdir", message)
+            self.assertIn("supabase stop --workdir", message)
+            self.assertIn("--stop cannot", message)
+        self.assertEqual(self.count("supabase", "stop"), 0)
+
+    def test_owned_stack_advice_offers_reachable_managed_stop(self):
+        self.run_stack()
+        with self.assertRaises(stack.Refusal) as error:
+            self.run_stack("--fresh")
+        self.assertIn("--stop before --fresh", str(error.exception))
+        self.run_stack("--stop")
+        self.assertFalse(self.current)
+
+    def test_copy_excludes_linked_cloud_metadata(self):
+        for directory in (".temp", ".branches"):
+            source = self.root / "supabase" / directory
+            source.mkdir()
+            (source / "project-ref").write_text("synthetic-cloud-project")
+            (source / "pooler-url").write_text("postgresql://fixture.invalid/fixture")
+        self.run_stack()
+        copied = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]) / "supabase"
+        self.assertFalse((copied / ".temp/project-ref").exists())
+        self.assertFalse((copied / ".temp/pooler-url").exists())
+        self.assertFalse((copied / ".branches").exists())
+
+    def test_pure_migration_rename_is_drift(self):
+        self.run_stack()
+        source = self.root / "supabase/migrations/20260101000000_fixture.sql"
+        source.rename(source.with_name("20260102000000_fixture.sql"))
+        with self.assertRaisesRegex(stack.Refusal, "--reset"):
+            self.run_stack()
+        self.assertEqual(self.count("bash"), 1)
+
+    def test_symlinked_cache_cannot_reach_outside_its_owned_directory(self):
+        self.run_stack()
+        cache = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"])
+        outside = self.root / "outside-cache-but-still-test-tempdir"
+        cache.rename(outside)
+        cache.symlink_to(outside, target_is_directory=True)
+        sentinel = outside / "supabase/must-not-delete"
+        sentinel.write_text("fixture")
+        with self.assertRaisesRegex(stack.Refusal, "symlink"):
+            self.run_stack("--reset")
+        self.assertEqual(sentinel.read_text(), "fixture")
+        self.assertEqual(self.count("supabase", "db", "reset"), 1)
+
+    def test_stop_cannot_be_combined_with_reset_or_filters(self):
+        self.run_stack()
+        for args in (("--stop", "--reset"), ("--stop", "fixture.integration.test.ts")):
+            with self.subTest(args=args), self.assertRaises(stack.Refusal):
+                self.run_stack(*args)
+        self.assertEqual(self.count("supabase", "stop"), 0)
+
+    def test_foreign_state_is_preserved_even_without_live_containers(self):
+        self.run_stack()
+        path = self.root / "cache" / self.project / "state.json"
+        state = self.state()
+        state["project"] = "pcp-integration-sibling"
+        path.write_text(json.dumps(state))
+        self.current = {}
+        with self.assertRaisesRegex(stack.Refusal, "different project"):
+            self.run_stack("--stop")
+        self.assertTrue(path.exists())
+
+    def test_missing_commands_fail_before_any_stack_operation(self):
+        for missing in ("docker", "supabase", "bash", "yarn"):
+            with self.subTest(missing=missing), \
+                 mock.patch.object(stack.shutil, "which", side_effect=lambda name: None if name == missing else "mock"), \
+                 self.assertRaisesRegex(stack.Refusal, missing):
+                self.run_stack()
+        self.assertEqual(self.calls, [])
+
+    def test_docker_daemon_down_explains_how_to_recover(self):
+        def check(args, **kwargs):
+            self.assertEqual(args, ["docker", "info"])
+            raise subprocess.CalledProcessError(1, args)
+        with mock.patch.object(stack.subprocess, "check_call", check):
+            with self.assertRaisesRegex(stack.Refusal, "Docker Desktop"):
+                self.run_stack()
+        self.assertEqual(self.count("supabase"), 0)
+
+    def test_cold_reset_preserves_metadata_written_by_start(self):
+        original_command = self.command
+        def start_writes_metadata(args, **kwargs):
+            result = original_command(args, **kwargs)
+            if args[:2] == ["supabase", "start"]:
+                workdir = Path(args[args.index("--workdir") + 1])
+                (workdir / "supabase/.temp").mkdir()
+                (workdir / "supabase/.temp/runtime-marker").write_text("fixture")
+            return result
+        with mock.patch.object(stack.subprocess, "check_call", start_writes_metadata):
+            self.run_stack()
+        self.assertTrue((Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]) / "supabase/.temp/runtime-marker").exists())
 
 
 class PrimitiveTests(unittest.TestCase):
@@ -296,9 +502,11 @@ class PrimitiveTests(unittest.TestCase):
                     # Harmless child waits on its pipe; no executor, DB, or real suite.
                     child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
                                              stdin=subprocess.PIPE, pass_fds=fds)
-                with self.assertRaises(stack.Refusal):
+                with self.assertRaises(stack.Refusal) as error:
                     with stack.locks(path, "pcp-integration", [55000]):
                         self.fail("child lost the ownership lock")
+                self.assertIn("lsof -nP " + str(path / "port-55000.lock"), str(error.exception))
+                self.assertIn("never delete the lock file", str(error.exception))
                 child.communicate(timeout=5)
                 with stack.locks(path, "pcp-integration", [55000]):
                     pass
@@ -348,6 +556,87 @@ class PrimitiveTests(unittest.TestCase):
             with mock.patch.object(stack.shutil, "which", return_value=None):
                 with self.assertRaisesRegex(stack.Refusal, "owner unavailable.*Wait"):
                     stack.port_preflight([listener.getsockname()[1]])
+
+    def test_owner_report_alone_refuses_without_a_listener(self):
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        with mock.patch.object(stack.shutil, "which", return_value="mock"), \
+             mock.patch.object(stack.subprocess, "run", return_value=mock.Mock(stdout="fixture-owner\n")):
+            with self.assertRaisesRegex(stack.Refusal, "fixture-owner"):
+                stack.port_preflight([port])
+
+    def test_lsof_owner_report_is_readable_without_docker_or_a_listener(self):
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        with mock.patch.object(stack.shutil, "which", side_effect=lambda name: "mock" if name == "lsof" else None), \
+             mock.patch.object(stack.subprocess, "run", return_value=mock.Mock(stdout="p12345\ncfixture-server\n")):
+            with self.assertRaisesRegex(stack.Refusal, r"fixture-server \(PID 12345\)"):
+                stack.port_preflight([port])
+
+    def test_wildcard_listener_refuses_with_silent_owner_tools(self):
+        with socket.socket() as listener:
+            listener.bind(("0.0.0.0", 0))
+            listener.listen()
+            with mock.patch.object(stack.shutil, "which", return_value=None):
+                with self.assertRaises(stack.Refusal):
+                    stack.port_preflight([listener.getsockname()[1]])
+
+    def test_time_wait_is_not_mistaken_for_a_live_listener(self):
+        # Active-close the server end to leave its port in TIME_WAIT. All
+        # traffic is a harmless local connection, without an external executor.
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            with socket.create_connection(("127.0.0.1", port)) as client:
+                accepted, _ = listener.accept()
+                accepted.close()
+                self.assertEqual(client.recv(1), b"")
+        with socket.socket() as control:
+            with self.assertRaises(OSError):
+                control.bind(("127.0.0.1", port))
+        with mock.patch.object(stack.shutil, "which", return_value=None):
+            stack.port_preflight([port])
+
+
+class SignalTests(unittest.TestCase):
+    def test_interrupts_unwind_fresh_cleanup(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            for group in (False, True):
+                with self.subTest(signal=sig.name, group=group), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "supabase").mkdir()
+                    (root / "supabase/config.toml").write_text(TEST_CONFIG)
+                    probe = Path(__file__).parent / "fixtures/integration-stack-signal-probe.py"
+                    child = subprocess.Popen([sys.executable, str(probe), str(MODULE_PATH), str(root)],
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                             start_new_session=True)
+                    output = ""
+                    try:
+                        deadline = time.monotonic() + 5
+                        while "SIGNAL-PROBE-READY" not in output and child.poll() is None and time.monotonic() < deadline:
+                            ready, _, _ = select.select([child.stdout], [], [], 0.1)
+                            if ready:
+                                output += os.read(child.stdout.fileno(), 65536).decode()
+                        self.assertIn("SIGNAL-PROBE-READY", output, "Mock suite never became ready")
+                        if group:
+                            # The group is a single harmless child, captured at
+                            # spawn and verified here; never a process-name kill.
+                            self.assertEqual(os.getpgid(child.pid), child.pid)
+                            os.killpg(child.pid, sig)
+                        else:
+                            child.send_signal(sig)
+                        stdout, stderr = child.communicate(timeout=5)
+                        self.assertTrue((root / "cleanup-ran").exists(), "Interrupt skipped fresh-stack cleanup")
+                        self.assertEqual(child.returncode, 128 + sig)
+                        self.assertNotIn("Traceback", stderr)
+                    finally:
+                        if child.poll() is None:
+                            child.terminate()
+                            child.communicate(timeout=5)
 
 
 if __name__ == "__main__":

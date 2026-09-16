@@ -439,8 +439,28 @@ while iterating. Unmanaged/legacy kept stacks are never automatically adopted.
 
 State lives outside the repository at
 `~/.cache/inkwell/integration-db/<project>`. `INTEGRATION_SUPABASE_CACHE_DIR` can
-override the base. Existing `INTEGRATION_SUPABASE_*_PORT` overrides remain supported;
-project IDs must be `pcp-integration` or `pcp-integration-<suffix>`. `--reuse` explicitly
+override the base. Locks remain machine-wide under `~/.cache/inkwell/integration-db-locks` regardless
+of that override. A descendant process may keep a run's lock after its original
+runner exits; the recorded runner PID is not necessarily the current holder.
+The refusal prints `lsof -nP <lockfile>` to find the actual holders. Normally,
+let them finish. For an orphan, verify its PID, command, and parent process first
+(for example, `ps -p <pid> -o pid,ppid,command`). Only terminate that exact PID if
+it is your own abandoned test process; otherwise ask its owner. Retry after all
+holders exit. **Never delete the lock file or cache to clear a lock**, and never
+kill by process-name pattern: deleting a locked inode can allow overlapping runs.
+
+If the DB container disappears externally but other containers survive, `--stop`
+can recover only when every survivor's name and ID matches the recorded ownership
+snapshot. Reuse/reset refuses with that recovery instruction; stop, then rerun to
+recreate the stack. Unknown or replaced containers remain unmanaged and are never
+stopped by this harness. Use the original owner's workdir/cleanup command only
+after verifying ownership; do not delete the state file to force adoption.
+
+Existing `INTEGRATION_SUPABASE_*_PORT` overrides remain supported;
+the six source config port fields must retain their repository defaults, or the
+harness refuses before starting containers. Use the overrides rather than editing
+`supabase/config.toml` to select integration ports.
+Project IDs must be `pcp-integration` or `pcp-integration-<suffix>`. `--reuse` explicitly
 selects retained mode (including in a CI-marked shell). The legacy
 `INTEGRATION_KEEP_SUPABASE=1` with `--fresh` retains a temporary inspection stack;
 release it with the printed `supabase stop --workdir ... --no-backup` command before

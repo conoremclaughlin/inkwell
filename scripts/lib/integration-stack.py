@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -76,10 +77,13 @@ def locks(directory, project, ports):
                 handle.seek(0)
                 owner = handle.read().strip()
                 raise Refusal("Another integration run holds " + key + " (" + owner + "). "
-                              "Wait for that run to finish and retry; run DB integration tests sparingly.")
+                              "Wait for that run to finish and retry; run DB integration tests sparingly. "
+                              "Find the actual holder (which may be a surviving descendant) with: lsof -nP " +
+                              shlex.quote(str(directory / (key + ".lock"))) + ". "
+                              "See CONTRIBUTING.md for orphan recovery; never delete the lock file.")
             handle.seek(0)
             handle.truncate()
-            handle.write("runner PID " + str(os.getpid()) + ", project " + project)
+            handle.write("runner/descendant lock from PID " + str(os.getpid()) + ", project " + project)
             handle.flush()
             handles.append(handle)
         # Do not unlink lock files: waiters may still reference their inodes.
@@ -96,7 +100,12 @@ def port_preflight(ports):
         if shutil.which("lsof"):
             result = subprocess.run(["lsof", "-nP", "-iTCP:" + str(port),
                                      "-sTCP:LISTEN", "-Fpc"], capture_output=True, text=True)
-            owners.extend(result.stdout.splitlines())
+            pid = "unknown"
+            for field in result.stdout.splitlines():
+                if field.startswith("p") and field[1:].isdigit():
+                    pid = field[1:]
+                elif field.startswith("c"):
+                    owners.append(field[1:] + " (PID " + pid + ")")
         unavailable = bool(owners)
         # REUSEADDR avoids treating a completed client's TIME_WAIT socket as
         # a server. On macOS a wildcard bind can coexist with a loopback bind,
@@ -126,9 +135,31 @@ def port_preflight(ports):
 
 def configuration(root, project, ports):
     text = (root / "supabase/config.toml").read_text()
-    for old, new in zip(range(54321, 54327), ports):
-        text = re.sub(r"(?m)^(\w*port\s*=\s*)" + str(old) + r"$",
-                      lambda match: match[1] + str(new), text)
+    fields = (("api", "port"), ("db", "port"), ("studio", "port"),
+              ("inbucket", "port"), ("inbucket", "smtp_port"), ("inbucket", "pop3_port"))
+    expected = dict(zip(fields, zip(range(54321, 54327), ports)))
+    seen = set()
+    section = ""
+    lines = []
+    # Validate the source shape before starting any containers. Rewrite by
+    # section/key in one pass so overrides cannot cascade through other ports.
+    for line in text.splitlines(keepends=True):
+        header = re.match(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$", line)
+        if header:
+            section = header[1]
+        field = re.match(r"^(\s*(\w+)\s*=\s*)([^#\r\n]*)(.*)$", line)
+        key = (section, field[2]) if field else None
+        if key in expected:
+            default, replacement = expected[key]
+            if key in seen or field[3].strip() != str(default):
+                raise Refusal("Unexpected or duplicate port in [" + section + "]." + key[1] +
+                              "; restore config.toml defaults and use INTEGRATION_SUPABASE_*_PORT overrides.")
+            seen.add(key)
+            line = line[:field.start(3)] + str(replacement) + line[field.start(3) + len(str(default)):]
+        lines.append(line)
+    if seen != set(expected):
+        raise Refusal("Missing expected ports in config.toml; refusing to start an incompletely isolated stack.")
+    text = "".join(lines)
     if re.search(r"(?m)^project_id\s*=", text):
         text = re.sub(r"(?m)^project_id\s*=.*$", 'project_id = "' + project + '"', text)
     else:
@@ -204,7 +235,10 @@ def manage(root, harness, args, env):
         for command in ("docker", "supabase", "bash", "yarn"):
             if not shutil.which(command):
                 raise Refusal(command + " is required.")
-        subprocess.check_call(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.check_call(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            raise Refusal("Docker daemon is unavailable. Start Docker Desktop (or your Docker daemon), then retry.")
         existing = containers(project)
         cache = base / project
         state_path = cache / "state.json"
@@ -220,11 +254,23 @@ def manage(root, harness, args, env):
             if not cached_config.exists() or cached_config.read_text() != state.get("config"):
                 raise Refusal("Retained stack config changed outside the harness; refusing to run or stop it.")
         db_name = "supabase_db_" + project
+        recorded = state.get("containers", {}) if state else {}
+        known_survivors = isinstance(recorded, dict) and all(
+            recorded.get(name) == container_id for name, container_id in existing.items())
         owned = bool(state and state.get("project") == project and existing and (
             (existing.get(db_name) and state.get("dbId") == existing.get(db_name)) or
-            (not existing.get(db_name) and state.get("containers") == existing)
+            (not existing.get(db_name) and known_survivors)
         ))
-        if existing and (not owned or (fresh and not stop)):
+        if existing and not owned:
+            raise Refusal("Project " + project + " already exists but is not owned by this cache: " +
+                          ", ".join(sorted(existing)) + ". Wait for its owner and retry; --stop cannot "
+                          "recover an unmanaged stack. If this is your kept inspection stack, use its "
+                          "original workdir with: supabase stop --workdir <original-workdir> --no-backup. "
+                          "Never stop someone else's run.")
+        if owned and not existing.get(db_name) and not stop:
+            raise Refusal("Owned DB container is missing. Use --stop to remove its verified surviving "
+                          "containers, then retry to recreate the test stack.")
+        if existing and fresh and not stop:
             raise Refusal("Project " + project + " already exists: " + ", ".join(sorted(existing)) +
                           ". Wait and retry. A retained stack owned by this harness can be reused "
                           "with --reuse or stopped with --stop before --fresh. Never stop someone else's run.")
@@ -248,7 +294,8 @@ def manage(root, harness, args, env):
         if not existing:
             port_preflight(ports)
         workdir = Path(tempfile.mkdtemp(prefix="pcp-supabase-it-", dir=env.get("INTEGRATION_SUPABASE_WORKDIR_BASE"))) if fresh else cache
-        workdir.mkdir(parents=True, exist_ok=True)
+        workdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        say("Test workdir=" + str(workdir))
         started = False
         ready = False
         keep = not fresh or env.get("INTEGRATION_KEEP_SUPABASE") == "1"
@@ -263,11 +310,13 @@ def manage(root, harness, args, env):
             else:
                 say("Reusing test stack " + project + " (no container recreation)")
             if not fresh:
-                state = {"project": project, "dbId": containers(project).get(db_name),
+                snapshot = containers(project)
+                state = {"project": project, "dbId": snapshot.get(db_name), "containers": snapshot,
                          "config": config, "exclude": exclude, "version": version, "fingerprint": None}
                 write_state(state_path, state)
             if fresh or reset or not existing:
-                prepare(root, workdir, config)
+                if existing:
+                    prepare(root, workdir, config)
                 say("Resetting test DB (migrations + seed)")
                 try:
                     subprocess.check_call(["supabase", "db", "reset", "--workdir", str(workdir), "--local"],
@@ -289,8 +338,9 @@ def manage(root, harness, args, env):
             return subprocess.call(["bash", "-c", 'harness=$1; shift; source "$harness"', "integration-db-suite", str(harness), *suite_args], env=suite_env, pass_fds=lock_fds)
         finally:
             if started and (not keep or not ready):
-                subprocess.run(["supabase", "stop", "--workdir", str(workdir), "--no-backup"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                say("Stopping test stack; if cleanup fails, preserve this workdir for recovery: " + str(workdir))
+                subprocess.check_call(["supabase", "stop", "--workdir", str(workdir), "--no-backup"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 shutil.rmtree(workdir)
             elif keep:
                 say("Retained test stack; workdir=" + str(workdir))
@@ -304,6 +354,9 @@ def manage(root, harness, args, env):
 
 
 if __name__ == "__main__":
+    # Unlike SIGINT, Python's default SIGTERM action does not unwind finally.
+    # SystemExit preserves the signal exit code while running owned cleanup.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         harness = Path(sys.argv[1]).resolve()
         sys.exit(manage(harness.parent.parent, harness, sys.argv[2:], os.environ))
@@ -311,5 +364,8 @@ if __name__ == "__main__":
         print(PREFIX + str(error), file=sys.stderr)
         sys.exit(75)
     except subprocess.CalledProcessError:
-        print(PREFIX + "Stack command failed; no test suite was started.", file=sys.stderr)
+        print(PREFIX + "Stack command failed; inspect the preceding phase and workdir for recovery.", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        print(PREFIX + "Interrupted; owned cleanup has run (retained mode keeps its stack).", file=sys.stderr)
+        sys.exit(130)
