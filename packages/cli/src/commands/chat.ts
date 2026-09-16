@@ -128,6 +128,9 @@ import {
   handleClientLocalTool,
   globalSignalSink,
   parseCompactContextArgs,
+  computeContextOccupancy,
+  formatContextStamp,
+  type ContextOccupancy,
   type ProviderContextMeasurement,
   type SignalSink,
   getLastSignal,
@@ -1657,6 +1660,115 @@ export function isAttachableSessionSummary(session: SessionSummary): boolean {
 }
 
 /**
+ * Does picking this row require an explicit server-side reopen?
+ *
+ * Exactly the rows the picker shows as history — the ones
+ * {@link isAttachableSessionSummary} rejects. Defined as the negation rather
+ * than as its own list of terminal markers, because two lists of "what counts
+ * as finished" would drift, and the drift would be silent: a row shown as
+ * history but not reopened resumes into a session the server still considers
+ * over, which is the exact defect this repairs.
+ */
+export function sessionNeedsReopen(session: SessionSummary): boolean {
+  return !isAttachableSessionSummary(session);
+}
+
+export interface ReopenOutcome {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * Decide whether a reopen actually took, from the row the server sent back.
+ *
+ * Pure so the decision can be tested without a server, and separate from the
+ * call so the thing being judged is the POST-STATE rather than the response
+ * envelope. `success: true` proves only that the request was accepted — a
+ * server that has never heard of `reopen` strips the unknown field, updates
+ * nothing, and answers exactly that way. The only evidence that counts is a
+ * row which now reads attachable.
+ */
+export function reopenSucceeded(session: SessionSummary | null | undefined): ReopenOutcome {
+  if (!session) return { ok: false, reason: 'the server returned no session' };
+
+  // Absence is not evidence (Lumen, r2). isAttachableSessionSummary answers
+  // "does this row carry a terminal marker", which is the right question for a
+  // LISTING, where every field is present. Here the question is "did the reopen
+  // actually happen", and a server too old to know the field answers by
+  // omitting it: an undefined endedAt reads as cleared and an absent status
+  // reads as non-terminal, so the predicate returns attachable for a row
+  // nothing touched. The response has to STATE the post-state before it can be
+  // believed — a current server always sends both, null when cleared.
+  const unreported = (['endedAt', 'status'] as const).filter((field) => !(field in session));
+  if (unreported.length > 0) {
+    return {
+      ok: false,
+      reason: `the server did not report ${unreported.join(' or ')} (an older server may not support reopen)`,
+    };
+  }
+
+  if (!isAttachableSessionSummary(session)) {
+    // Name the marker still set — "it did not work" sends the reader hunting,
+    // and the usual cause is a server predating the reopen field.
+    const stuck = session.endedAt
+      ? 'ended_at is still set'
+      : session.lifecycle === 'completed'
+        ? "lifecycle is still 'completed'"
+        : `phase/status still reads ${session.currentPhase || session.status}`;
+    return { ok: false, reason: `${stuck} (an older server may not support reopen)` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Ask the server to reopen a finished session, and verify it did.
+ */
+export async function reopenSelectedSession(
+  pcp: { callTool: (tool: string, args: Record<string, unknown>) => Promise<unknown> },
+  sbSlug: string,
+  sessionId: string
+): Promise<ReopenOutcome> {
+  let raw: unknown;
+  try {
+    raw = await pcp.callTool('update_session_state', {
+      sbSlug,
+      sessionId,
+      reopen: true,
+      // Idle, not running: they are back at the prompt, and the on-prompt hook
+      // marks running when they actually type.
+      lifecycle: 'idle',
+    });
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+
+  const payload = raw as { success?: boolean; error?: string; session?: SessionSummary } | null;
+  if (payload?.success === false) {
+    return { ok: false, reason: payload.error || 'the server rejected the reopen' };
+  }
+  return reopenSucceeded(payload?.session);
+}
+
+/**
+ * Union of the attachable list and full history for the interactive picker.
+ *
+ * Sessions are chat history — always resumable unless deleted — so the
+ * picker shows finished ones too. The two lists stay separate fetches so a
+ * flood of completed rows can never push a live session past the history
+ * call's row limit (the limit-before-filter defect from PR #532 r2):
+ * attachable rows are guaranteed a seat first, history fills in around them.
+ * Auto-attach paths keep using the attachable list alone — a non-interactive
+ * launch should never silently resume a finished session.
+ */
+export function mergeSessionsWithHistory(
+  attachable: SessionSummary[],
+  history: SessionSummary[]
+): SessionSummary[] {
+  const seen = new Set(attachable.map((session) => session.id));
+  return [...attachable, ...history.filter((session) => !seen.has(session.id))];
+}
+
+/**
  * List the sessions this agent could attach to.
  *
  * Asks for `status: 'attachable'` so the server excludes finished sessions
@@ -3178,11 +3290,103 @@ export function spawnDialogueText(
   return guarded.imitationDiscarded ? spawnSaid.slice(0, guarded.frameIndex ?? 0) : spawnSaid;
 }
 
+/**
+ * The occupancy a turn reasons with — for the hooks that gate on it and for
+ * the stamp the agent reads.
+ *
+ * This was `ledger.totalTokens() / (maxContextTokens - bootstrapReserve)` at
+ * both fire sites: the ledger estimate, which is the number task 480b76f7
+ * exists to stop us acting on. Measured on myra session 64e1eb49 the estimate
+ * read 131,071 against a provider measurement of 383,046 — so a monitor armed
+ * at 80% would not have fired until the real window was long past full, and
+ * the passive-recall ceiling that suppresses injection above 80% was reading
+ * the same wrong number. Both behaviours were calibrated against a figure
+ * roughly 2.9x below the truth.
+ *
+ * Exported so the wiring is testable without standing up a turn: a test that
+ * only checks the hook's reaction to a supplied utilization cannot see which
+ * number the caller computed.
+ */
+export function turnContextOccupancy(
+  ledger: ContextLedger,
+  runtime: ChatRuntime,
+  measured: ProviderContextMeasurement | undefined
+): ContextOccupancy {
+  return computeContextOccupancy(
+    ledger.totalTokens(),
+    runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
+    runtime.maxContextTokens,
+    measured
+  );
+}
+
+/**
+ * The turn body sent to a RESUMED native session: the delta only, because the
+ * session already holds the history.
+ *
+ * Extracted so the stamp's presence on this path is testable. The envelope path
+ * is the easy one to get right and the easy one to test; this is the path a
+ * long-running bridge session actually takes, turn after turn, and the seat
+ * where nobody is watching (task 480b76f7, acceptance 1).
+ */
+export function buildDeltaPrompt(
+  contextStamp: string | undefined,
+  recallDelta: string,
+  userMessage: string
+): string {
+  return [contextStamp, recallDelta, userMessage].filter(Boolean).join('\n\n');
+}
+
+/**
+ * The body of a TOOL-LOOP CONTINUATION, for each of the three ways one reaches
+ * the provider.
+ *
+ * All three carried no stamp at all until Lumen's #639 review: `resume` sent
+ * the bare tool result, and `seed`/`stateless` called buildPromptEnvelope
+ * without its stamp argument. That left the stamp on the outer opening only —
+ * which is the one request per turn where it is LEAST informative. The provider
+ * measurement for a turn is sampled from each spawn's usage AFTER that spawn
+ * returns, so a fresh run's opening stamp has no measurement to report
+ * (`splitKnown: false`); by the first continuation there is one. A headless run
+ * that does all its work inside one turn's tool loop could therefore finish
+ * without ever seeing a provider-backed reading of its own window.
+ *
+ * So the caller regenerates the stamp per continuation rather than threading
+ * the opening's down: a stamp recomputed after the last spawn is the point of
+ * the thing, and a stale one is what the envelope path already taught us to
+ * avoid.
+ *
+ * Extracted and pure for the same reason buildDeltaPrompt is — the wiring is
+ * the part that was wrong, and a test of the selection logic has to be able to
+ * reach it without standing up a backend.
+ */
+export function buildContinuationPrompt(
+  mode: 'resume' | 'seed' | 'stateless',
+  contextStamp: string | undefined,
+  body: string,
+  renderEnvelope: (promptBody: string, stamp: string | undefined) => string,
+  renderReseedBody: () => string
+): string {
+  if (mode === 'resume') {
+    // The live session already holds the transcript; the stamp is the only
+    // thing it cannot have, since it describes the window as of right now.
+    return buildDeltaPrompt(contextStamp, '', body);
+  }
+  return renderEnvelope(mode === 'seed' ? renderReseedBody() : body, contextStamp);
+}
+
 export function buildPromptEnvelope(
   sbSlug: string,
   runtime: ChatRuntime,
   ledger: ContextLedger,
-  userMessage: string
+  userMessage: string,
+  /**
+   * Rendered immediately before the latest user message so it is the freshest
+   * thing in the envelope. Deliberately NOT part of envelopeShapeKey — it
+   * changes every turn, and treating it as envelope shape would invalidate and
+   * reseed the native session on each one.
+   */
+  contextStamp?: string
 ): string {
   // Reserve bootstrap context budget (not counted against transcript budget)
   const bootstrapTokens = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
@@ -3230,6 +3434,7 @@ export function buildPromptEnvelope(
       ? `\nSkill instructions:${renderActiveSkills(runtime.activeSkills)}`
       : '',
     '',
+    contextStamp ?? '',
     'Latest user message:',
     userMessage,
   ]
@@ -3532,13 +3737,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // so the JSON stays machine-parseable, and before the TUI so a TTY-less
   // invocation exits instead of blocking on stdin forever.
   if (options.sessionCandidates || options.sessionCandidatesJson) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      sbSlug,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        sbSlug,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { sbSlug, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
     const attachable = extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary);
-    const sessions = filterSessionsByPolicy(attachable, runtime, sbSlug, toolPolicy, 'attach');
+    const sessions = filterSessionsByPolicy(
+      mergeSessionsWithHistory(attachable, extractSessionSummaries(historyResult)),
+      runtime,
+      sbSlug,
+      toolPolicy,
+      'attach'
+    );
     const candidates = sessions.map((session) => ({
       type: 'pcp' as const,
       id: session.id,
@@ -3549,6 +3765,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       threadKey: session.threadKey || null,
       studioName: session.studioName || null,
       startedAt: session.startedAt || null,
+      attachable: isAttachableSessionSummary(session),
     }));
     if (options.sessionCandidatesJson) {
       restoreConsoleLog();
@@ -3579,7 +3796,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         console.log(`  ${bits.join('  ·  ')}`);
       }
       if (candidates.length === 0) {
-        console.log(chalk.dim('  (no attachable ink sessions)'));
+        console.log(chalk.dim('  (no ink sessions)'));
       }
     }
     return;
@@ -4313,13 +4530,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !options.attachLatest &&
     !runtime.threadKey
   ) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      sbSlug,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        sbSlug,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { sbSlug, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
+    const attachableSessions = extractSessionSummaries(sessionsResult).filter(
+      isAttachableSessionSummary
+    );
     const sessions = filterSessionsByPolicy(
-      extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
+      mergeSessionsWithHistory(attachableSessions, extractSessionSummaries(historyResult)),
       runtime,
       sbSlug,
       toolPolicy,
@@ -4373,6 +4598,47 @@ export async function runChat(options: ChatOptions): Promise<void> {
         if (selected) {
           attachedSessionSummary = selected;
           runtime.sessionId = selected.id;
+          // A human just chose a FINISHED session out of their history, so it
+          // is not finished any more. Sent here, at the selection, because the
+          // selection is what caused it — the previous behaviour leaned on the
+          // next incidental `update_session_state`, and that call sends
+          // `status: 'active'`, which is and always was a server-side no-op.
+          // The row stayed terminal with `ended_at` set while the chat
+          // generated, invisible to attachable listing, active lookup and
+          // findByThreadKey — so a trigger could open a SECOND session on the
+          // thread the human was already typing into (Lumen, PR #541).
+          //
+          // Only the interactive picker reaches this. Auto-attach filters to
+          // attachable rows before choosing, so it can never revive anything,
+          // and the terminal fence automatic routing relies on stays intact.
+          if (sessionNeedsReopen(selected)) {
+            // FAIL CLOSED. The previous version swallowed everything with
+            // `.catch(() => undefined)` and carried on, which is the failure
+            // this PR exists to remove wearing a different coat: a reopen that
+            // errors, or that lands on a server too old to know the flag and
+            // returns a cheerful success without doing anything, would leave
+            // the human typing into a session the server still considers over
+            // — the exact silent resume-into-a-terminal-row we started from.
+            //
+            // So the RESULT is checked, not the absence of an exception, and
+            // the post-state is checked rather than the acknowledgement: an old
+            // server ignoring an unknown field still answers `success: true`.
+            // Only a row that actually comes back attachable counts.
+            const reopened = await reopenSelectedSession(pcp, sbSlug, selected.id);
+            if (!reopened.ok) {
+              console.log(
+                chalk.yellow(
+                  `Could not reopen session ${selected.id.slice(0, 8)} — ${reopened.reason}`
+                )
+              );
+              console.log(
+                chalk.dim(
+                  '  Not attaching: the server still lists it as finished, so a trigger could open a second session on this thread.'
+                )
+              );
+              return;
+            }
+          }
           if (selected.studioId) {
             runtime.studioId = selected.studioId;
           }
@@ -4389,8 +4655,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       // picked === null means "New session" — fall through to create one
     } else {
-      // Non-interactive or no sessions — auto-attach to latest (existing behavior)
-      const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
+      // Non-interactive or no sessions — auto-attach to latest. Filters back
+      // to attachable: history rows are for the human picker; a headless
+      // launch must not silently resume a finished session.
+      const selected = pickLatestSession(sessions.filter(isAttachableSessionSummary), undefined, {
+        studioId: runtime.studioId,
+      });
       if (selected) {
         attachedSessionSummary = selected;
         runtime.sessionId = selected.id;
@@ -6657,12 +6927,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await maybeCompactContext('pre-turn budget check');
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
-    // Budget utilization must account for bootstrap tokens — the ledger only
-    // holds transcript, but bootstrap is reserved from the total budget.
-    const bootstrapReserve = runtime.bootstrapContext
-      ? estimateTokens(runtime.bootstrapContext)
-      : 0;
-    const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
+    // Occupancy comes from turnContextOccupancy, which prefers the provider's
+    // own measurement over ink's estimate. The estimate cannot see the identity
+    // envelope or what a resumed native session accumulated, and every hook
+    // gating on this number — the budget monitor, the passive-recall ceiling —
+    // was calibrated against it.
+    const turnOccupancy = turnContextOccupancy(ledger, runtime, providerContextMeasurement());
+    const contextStamp = formatContextStamp(turnOccupancy);
 
     const promptHookResult = await hookRegistry.fire('prompt_build', {
       ledger,
@@ -6670,7 +6941,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: runtime.sessionId,
         sbSlug,
         backend: runtime.backend,
-        budgetUtilization: ledger.totalTokens() / effectiveBudget,
+        budgetUtilization: turnOccupancy.utilization,
         turnCount: hookTurnCount,
       },
       // Pass user input so passive recall can surface memories BEFORE the backend responds
@@ -6732,10 +7003,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
 
       if (budgetEntries.length > 0) {
-        const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
+        // Same occupancy the hook gated on and the stamp reported. This line
+        // used to recompute it from the ledger estimate, so the human at the
+        // terminal could read a different percentage than the agent was given.
+        const util = Math.round(turnOccupancy.utilization * 100);
+        // Same three buckets the stamp names, same words. The human reading this
+        // line and the agent reading the stamp must not be given different
+        // accounts of the same turn — and "evictable" here once covered the
+        // identity envelope, which nothing evicts (Lumen, PR #639).
+        const split = turnOccupancy.splitKnown
+          ? `${turnOccupancy.ledgerTokens.toLocaleString()} ledger + ` +
+            `${turnOccupancy.fixedTokens.toLocaleString()} envelope + ` +
+            `${turnOccupancy.unaccountedTokens.toLocaleString()} unaccounted`
+          : 'ledger estimate only — provider has not reported';
         printEvent(
           chalk.yellow(
-            `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
+            `  ⚠ Context at ${util}% — ${turnOccupancy.effectiveTokens.toLocaleString()} / ${turnOccupancy.limit.toLocaleString()} tok (${split})`
           )
         );
       }
@@ -6798,9 +7081,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .filter((e) => e.source === 'passive-recall')
         .map((e) => e.content)
         .join('\n\n');
-      prompt = recallDelta ? `${recallDelta}\n\n${raw}` : raw;
+      // The stamp rides the DELTA, not just the envelope. A resumed native
+      // session never re-reads the envelope, so anything that lives only there
+      // is sent once at seed time and is stale for every turn after — and the
+      // long-running resumed session is exactly the seat whose window fills.
+      prompt = buildDeltaPrompt(contextStamp, recallDelta, raw);
     } else {
-      prompt = buildPromptEnvelope(sbSlug, runtime, ledger, raw);
+      prompt = buildPromptEnvelope(sbSlug, runtime, ledger, raw, contextStamp);
     }
 
     const turnStartedAt = Date.now();
@@ -7088,13 +7375,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '  ⛁ provider session not found on resume — re-seeding a fresh native session'
             )
           );
+          // Regenerated HERE, after the new id is assigned, and never the
+          // opening's contextStamp reused. The stamped resume died before a
+          // model read it; THIS seed is the first request of the turn anything
+          // answers. The reassignment above is what makes the reading honest:
+          // providerScope() keys on activeBackendSessionId, so the failed
+          // session's measurement no longer matches and the stamp falls back to
+          // the estimate instead of describing a window that no longer exists.
+          const reseedStamp = formatContextStamp(
+            turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+          );
           beginSpawn();
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
             sbSlug,
             model: runtime.model,
             effort: runtime.effort,
-            prompt: buildPromptEnvelope(sbSlug, runtime, ledger, raw),
+            prompt: buildPromptEnvelope(sbSlug, runtime, ledger, raw, reseedStamp),
             verbose: runtime.verbose,
             passthroughArgs,
             systemPromptOverride: runtime.systemPromptOverride,
@@ -7201,10 +7498,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         activeBackendSessionId,
         randomUUID
       );
-      let continuationPrompt: string;
-      if (decision.mode === 'resume') {
-        continuationPrompt = body;
-      } else if (decision.mode === 'seed') {
+      if (decision.mode === 'seed') {
         activeBackendSessionId = decision.id;
         // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
         // model init may have changed the budget (applyDetectedModel), and
@@ -7221,15 +7515,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         printEvent(
           chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
         );
-        continuationPrompt = buildPromptEnvelope(
-          sbSlug,
-          runtime,
-          ledger,
-          buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
-        );
-      } else {
-        continuationPrompt = buildPromptEnvelope(sbSlug, runtime, ledger, body);
       }
+      // Regenerated per continuation, never the opening's stamp reused: the
+      // preceding spawn's usage has since been sampled, so THIS is the first
+      // reading of the turn backed by a provider measurement. A run whose whole
+      // job happens inside the tool loop would otherwise never see one.
+      const continuationStamp = formatContextStamp(
+        turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+      );
+      const continuationPrompt = buildContinuationPrompt(
+        decision.mode,
+        continuationStamp,
+        body,
+        (promptBody, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, promptBody, stamp),
+        () => buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
+      );
 
       // Recorded for a later reseed in this same turn; the seed above already
       // rendered this body itself.
@@ -7468,7 +7768,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           sessionId: runtime.sessionId,
           sbSlug,
           backend: runtime.backend,
-          budgetUtilization: ledger.totalTokens() / turnEndEffectiveBudget,
+          budgetUtilization: turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+            .utilization,
           turnCount: hookTurnCount,
         },
         lastTurn: {

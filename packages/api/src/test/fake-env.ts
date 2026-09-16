@@ -12,6 +12,8 @@
  * unmistakably fake to a person, a reviewer and a scanner alike.
  */
 
+import { httpRateLimitEnvSchema } from '../config/http-rate-limit';
+
 /** Short and self-describing. Used wherever the env schema is mocked away. */
 const FAKE = 'test-fake-secret';
 
@@ -30,6 +32,7 @@ if (FAKE_MIN32.length < 32) {
 
 /** Spread into a `vi.mock('.../config/env')` factory; add per-test fields after it. */
 export const fakeEnv = {
+  ...httpRateLimitEnvSchema.parse({}),
   SUPABASE_URL: 'http://localhost:54321',
   SUPABASE_SECRET_KEY: FAKE,
   SUPABASE_PUBLISHABLE_KEY: FAKE,

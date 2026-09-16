@@ -1,5 +1,9 @@
 name: CI
 
+# Test jobs only clone the repository; they never write repository metadata.
+permissions:
+  contents: read
+
 on:
   pull_request:
     branches: [main]

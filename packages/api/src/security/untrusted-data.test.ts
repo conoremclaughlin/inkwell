@@ -190,7 +190,8 @@ describe('sanitizeExtractedData', () => {
     const sanitized = sanitizeExtractedData(data);
 
     expect(sanitized).not.toContain('<script>');
-    expect(sanitized).toContain('[SCRIPT REMOVED]');
+    expect(sanitized).not.toContain('evil()');
+    expect(sanitized).toContain('Normal');
   });
 
   it('should remove command patterns', () => {
@@ -199,6 +200,26 @@ describe('sanitizeExtractedData', () => {
 
     expect(sanitized).not.toContain('$(');
     expect(sanitized).toContain('[COMMAND REMOVED]');
+  });
+
+  it.each([
+    '<script>untrusted()</script >',
+    '<SCRIPT src=x>untrusted()</SCRIPT\n>',
+    '<img src=x onerror=untrusted()>',
+    '<svg><script>untrusted()</script></svg>',
+    '<script>untrusted()',
+  ])('uses a parser for malformed and alternative HTML shapes', (input) => {
+    const output = sanitizeExtractedData(input);
+    expect(output).not.toContain('<');
+    expect(output).not.toContain('untrusted()');
+    expect(validateExtractedData({ input }).valid).toBe(false);
+  });
+
+  it('redacts URLs formed by tag removal and does not recreate markup', () => {
+    const output = sanitizeExtractedData('ht<b></b>tps://example.test <scr<script></script>ipt>');
+    expect(output).not.toContain('https://');
+    expect(output).not.toContain('<');
+    expect(output).toContain('[URL REMOVED]');
   });
 });
 

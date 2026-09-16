@@ -1064,6 +1064,13 @@ export class TelegramListener extends EventEmitter {
   /**
    * Send a message to a Telegram chat
    * conversationId format: "telegram:<chatId>" or just "<chatId>"
+   *
+   * Returns the Telegram message_id of the sent message, which is the
+   * correlation key an inbound reply arrives with (reply_to_message.message_id).
+   * Callers persist it alongside the authoring SB so a reply can be routed back
+   * to whoever actually wrote the message rather than to the channel owner.
+   * Undefined means the send succeeded but Telegram returned no id — the caller
+   * must treat that as "authorship not recorded", never as a default author.
    */
   async sendMessage(
     conversationId: string,
@@ -1072,7 +1079,7 @@ export class TelegramListener extends EventEmitter {
       replyToMessageId?: string;
       parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML';
     }
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     // Extract chat ID from conversation ID
     const chatId = conversationId.startsWith('telegram:')
       ? conversationId.replace('telegram:', '')
@@ -1102,8 +1109,9 @@ export class TelegramListener extends EventEmitter {
     });
 
     try {
-      await this.apiCall('sendMessage', params);
+      const sent = await this.apiCall<TelegramMessage>('sendMessage', params);
       logger.info(`Sent message to Telegram chat ${chatId}`);
+      return sent?.message_id !== undefined ? String(sent.message_id) : undefined;
     } catch (error) {
       logger.error(`Failed to send message to Telegram chat ${chatId}:`, error);
       throw error;

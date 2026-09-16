@@ -7,7 +7,7 @@
  * (resolveCopySourceRoot).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import {
   mkdtempSync,
   mkdirSync,
@@ -20,6 +20,14 @@ import {
 import { tmpdir } from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+vi.mock('../../config/env', async () => ({
+  env: { ...(await import('../../test/fake-env')).fakeEnv },
+  isDevelopment: () => false,
+}));
+vi.mock('../../utils/logger', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 
 vi.mock('../../services/user-resolver', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services/user-resolver')>();
@@ -72,8 +80,8 @@ vi.mock('../../services/studio-lease.service', async (importOriginal) => {
 import { handleCreateStudio, handleAdoptStudio } from './studio-handlers';
 import type { DataComposer } from '../../data/composer';
 
-function git(cmd: string, cwd: string): void {
-  execSync(`git ${cmd}`, { cwd, stdio: 'pipe' });
+function git(args: string[], cwd: string): void {
+  execFileSync('git', args, { cwd, stdio: 'pipe' });
 }
 
 const MAIN_MCP = JSON.stringify({
@@ -108,15 +116,16 @@ describe('handleCreateStudio bootstrap source', () => {
     // realpath because git prints resolved worktree paths (macOS tmpdir is a
     // symlink: /var/folders → /private/var/folders) and the handler derives
     // the new studio path from git's output.
-    base = realpathSync(mkdtempSync(path.join(tmpdir(), 'studio-bootstrap-')));
+    base = realpathSync(mkdtempSync(path.join(tmpdir(), 'studio bootstrap-')));
     mainRoot = path.join(base, 'repo');
     mkdirSync(mainRoot);
-    git('init -b main', mainRoot);
-    git('config user.email test@example.com', mainRoot);
-    git('config user.name Test', mainRoot);
+    git(['init', '-b', 'main'], mainRoot);
+    git(['config', 'user.email', 'test@example.com'], mainRoot);
+    git(['config', 'user.name', 'Test'], mainRoot);
     writeFileSync(path.join(mainRoot, '.gitignore'), '.mcp.json\n.env.local\n.codex/\n.gemini/\n');
-    git('add .gitignore', mainRoot);
-    git('commit -m init', mainRoot);
+    git(['add', '.gitignore'], mainRoot);
+    writeFileSync(path.join(base, 'commit-message.txt'), 'init\n');
+    git(['commit', '-F', path.join(base, 'commit-message.txt')], mainRoot);
 
     // Bootstrap files are gitignored — they exist only as local files in main
     writeFileSync(path.join(mainRoot, '.mcp.json'), MAIN_MCP);
@@ -124,7 +133,7 @@ describe('handleCreateStudio bootstrap source', () => {
 
     // A linked worktree with a customised .mcp.json and no .env.local
     linkedPath = path.join(base, 'repo--linked');
-    git(`worktree add -b linked ${linkedPath}`, mainRoot);
+    git(['worktree', 'add', '-b', 'linked', '--', linkedPath], mainRoot);
     writeFileSync(path.join(linkedPath, '.mcp.json'), LINKED_MCP);
   });
 
@@ -274,10 +283,11 @@ describe('create_studio / adopt_studio provenance', () => {
 
   beforeEach(() => {
     repoRoot = realpathSync(mkdtempSync(path.join(tmpdir(), 'studio-provenance-')));
-    git('init -b main', repoRoot);
-    git('config user.email test@example.com', repoRoot);
-    git('config user.name Test', repoRoot);
-    git('commit --allow-empty -m init', repoRoot);
+    git(['init', '-b', 'main'], repoRoot);
+    git(['config', 'user.email', 'test@example.com'], repoRoot);
+    git(['config', 'user.name', 'Test'], repoRoot);
+    writeFileSync(path.join(repoRoot, 'commit-message.txt'), 'init\n');
+    git(['commit', '--allow-empty', '-F', path.join(repoRoot, 'commit-message.txt')], repoRoot);
     acquireMock.mockClear().mockResolvedValue({ acquired: true, lease: {} });
     callerMock.mockClear().mockResolvedValue({ sbSlug: 'wren', sbId: 'sb-1' });
     // The resolver only ever returns the caller's own session; the row carries

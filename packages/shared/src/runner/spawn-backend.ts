@@ -131,7 +131,7 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
 
   // Use basename — the container has CLI tools on its PATH, not at host-resolved absolute paths
   const containerBinary = path.basename(options.binary);
-  execArgs.push(options.container.containerName, containerBinary, ...options.args);
+  execArgs.push('--', options.container.containerName, containerBinary, ...options.args);
 
   return {
     binary: docker,
@@ -166,6 +166,7 @@ export function spawnBackend(options: SpawnBackendOptions): {
   const target = resolveSpawnTarget(options);
 
   const child = spawn(target.binary, target.args, {
+    shell: false,
     stdio: [options.pipeStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     cwd: target.cwd,
     env: target.env,

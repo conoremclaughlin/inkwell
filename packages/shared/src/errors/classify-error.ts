@@ -10,6 +10,7 @@ export type ErrorCategory =
   | 'capacity'
   | 'quota'
   | 'timeout'
+  | 'network'
   | 'config'
   | 'auth'
   | 'crash'
@@ -65,6 +66,33 @@ const RULES: Array<{
       /\btimeout\b/i.test(errorText) ||
       (/\bidle\b/i.test(errorText) && /\bkill/i.test(errorText)) ||
       exitCode === 124,
+  },
+  {
+    // Transient network / connectivity failures — the request never completed.
+    // Seen when the host's network dips mid-spawn: undici connect timeouts
+    // ("fetch failed" + UND_ERR_CONNECT_TIMEOUT), codex stream disconnects
+    // ("stream disconnected before completion: error sending request"), and
+    // codex startup model-list refresh failures. Note: signatures containing
+    // the literal word "timeout" (e.g. "failed to refresh available models:
+    // timeout waiting for child process") match the timeout rule above —
+    // both categories are retryable, so either classification triggers retry.
+    category: 'network',
+    retryable: true,
+    test: ({ errorText }) =>
+      /stream disconnected/i.test(errorText) ||
+      /error sending request/i.test(errorText) ||
+      /fetch failed/i.test(errorText) ||
+      /UND_ERR_CONNECT/i.test(errorText) ||
+      /UND_ERR_SOCKET/i.test(errorText) ||
+      /failed to refresh available models/i.test(errorText) ||
+      /\bECONNRESET\b/.test(errorText) ||
+      /\bECONNREFUSED\b/.test(errorText) ||
+      /\bETIMEDOUT\b/.test(errorText) ||
+      /\bENETUNREACH\b/.test(errorText) ||
+      /\bEHOSTUNREACH\b/.test(errorText) ||
+      /\bEAI_AGAIN\b/.test(errorText) ||
+      /socket hang ?up/i.test(errorText) ||
+      /\bnetwork error\b/i.test(errorText),
   },
   {
     category: 'auth',

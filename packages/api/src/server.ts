@@ -52,9 +52,14 @@ import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
+import {
+  TriggerRetryScheduler,
+  TRIGGER_MAX_ATTEMPTS,
+  getTriggerAttempt,
+} from './channels/trigger-retry';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteSlug } from './services/routing/resolve-route';
-import { resolveAgentFromMention } from './services/routing/resolve-mention';
+import { resolveInboundAgent } from './services/routing/resolve-inbound-agent';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
@@ -202,62 +207,31 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       return;
     }
 
-    // Resolve agent: mention → channel_routes → AGENT_ID env fallback
-    let routedSlug = sbSlug;
-    let routedIdentityId: string | undefined;
+    // Resolve agent: mention → reply authorship → channel_routes → AGENT_ID env
+    // fallback. The cascade lives in its own module so each tier knows whether
+    // an earlier one MATCHED, rather than inferring it from the selected slug —
+    // a mention of, or a reply to, the default SB is a match, and treating it
+    // as "nothing matched" handed the message to the next tier.
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
-    // For group chats, try mention-based routing first
-    // Always call for group chats — text matching works even without platform mentions
-    // (e.g., WhatsApp has no native @mentions, Slack bot mention excluded from users array)
-    if (isGroupChat) {
-      const mentionMatch = await resolveAgentFromMention(
-        dataComposer!.getClient(),
-        userId,
-        content,
-        metadata?.mentions?.users ?? []
-      );
-      if (mentionMatch) {
-        routedSlug = mentionMatch.sbSlug;
-        routedIdentityId = mentionMatch.sbId;
-        logger.debug(`[Route] Resolved agent from @mention`, {
-          platform: channel,
-          sbSlug: mentionMatch.sbSlug,
-          sbId: mentionMatch.sbId,
-        });
-      }
-    }
+    const resolution = await resolveInboundAgent({
+      supabase: dataComposer!.getClient(),
+      userId,
+      defaultSlug: sbSlug,
+      platform: channel,
+      conversationId,
+      content,
+      isGroupChat,
+      mentionedUserIds: metadata?.mentions?.users ?? [],
+      platformAccountId: metadata?.platformAccountId,
+      replyToMessageId: metadata?.replyToMessageId,
+    });
 
-    // If mention didn't match, try channel_routes specificity cascade
-    let routeStudioHint: string | null = null;
-    let resolvedRouteId: string | null = null;
-    if (routedSlug === sbSlug) {
-      const route = await resolveRouteSlug(
-        dataComposer!.getClient(),
-        userId,
-        channel,
-        metadata?.platformAccountId,
-        conversationId
-      );
-      if (route) {
-        routedSlug = route.sbSlug;
-        routedIdentityId = route.sbId;
-        routeStudioHint = route.studioHint;
-        resolvedRouteId = route.routeId;
-        logger.debug(`[Route] Resolved agent from channel_routes`, {
-          platform: channel,
-          sbSlug: route.sbSlug,
-          sbId: route.sbId,
-          routeId: route.routeId,
-          studioHint: route.studioHint,
-        });
-      } else {
-        logger.warn(
-          `[Route] No channel_route found for ${channel}, falling back to AGENT_ID=${sbSlug}`,
-          { userId, platform: channel, conversationId }
-        );
-      }
-    }
+    const routedSlug = resolution.sbSlug;
+    const routedIdentityId = resolution.sbId;
+    const routeStudioHint = resolution.studioHint;
+    const resolvedRouteId = resolution.routeId;
+    const replyRouting = resolution.replyRouting;
 
     // Resolve contact for per-sender session isolation (only when agent has session_scope: 'per_sender')
     let contactId: string | undefined;
@@ -338,6 +312,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         triggerType: 'message',
         ...(routeStudioHint ? { studioHint: routeStudioHint } : {}),
         ...(contactId ? { contactId } : {}),
+        // Carried so a misroute is diagnosable after the fact. Without it, a
+        // reply that fell through to the channel owner is indistinguishable
+        // from one that was never a reply at all. The cascade withholds this
+        // for a message that was never a reply, so its presence means one was.
+        ...(replyRouting ? { replyRouting } : {}),
       },
     };
 
@@ -1552,7 +1531,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           detail: result.refusal.detail,
           message: result.error || 'routing refused at spawn admission',
         });
-        throw new Error(result.error || 'routing refused at spawn admission');
+        // A RoutingRefusedError, not a bare Error (Lumen, r2). The two throw
+        // sites above rethrow the real one and carry `code` with them; this
+        // one used to flatten a refusal into prose, and prose is exactly what
+        // the retry scheduler cannot read a refusal from — a message naming
+        // thread "pr:503" classifies as capacity and gets re-dispatched.
+        throw new RoutingRefusedError(result.refusal.threadKey, targetSlug, result.refusal.detail);
       }
 
       // Post-admission failure (Lumen, PR #565 r2): routing completed —
@@ -1568,6 +1552,26 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       logger.error(`[Trigger] SessionService failed for ${targetSlug}: ${result.error}`);
       throw new Error(result.error || 'SessionService processing failed');
     }
+
+    // Mark the payload: the session turn completed. If anything below throws
+    // and lands in trigger:error, the retry scheduler must NOT re-dispatch —
+    // the spawn already produced a successful turn (double-execution guard).
+    payload.metadata = { ...(payload.metadata ?? {}), triggerTurnCompleted: true };
+
+    // And kill any retry still waiting on this message (Lumen, r2). The marker
+    // above only protects THIS payload; a delivery that arrives by another
+    // route — a heartbeat scan, a manual re-send — is a different payload
+    // object, and the pending timer holds a copy made before it existed. The
+    // timer would fire into an already-answered message and run a second
+    // session turn. cancelFor keys off the source message, which both payloads
+    // agree on.
+    //
+    // triggerRetryScheduler is declared further down this function on purpose:
+    // hoisting it above the handler re-indented 666 lines and, on the way,
+    // swallowed this registration into the scheduler's own callback. The
+    // binding is initialised long before any trigger arrives, so the closure
+    // is the cheaper half of that trade.
+    triggerRetryScheduler.cancelFor(payload);
 
     // Terminal for spawn: admission actually succeeded — occupancy was
     // rechecked, provisioning and acquisition landed, a process ran. Only now
@@ -1617,7 +1621,26 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
 
-  // 7b. Listen for trigger failures — restore inbox message + notify sender
+  // 7b. Delayed re-queue for transiently failed triggers (network dips,
+  // connect timeouts, stream disconnects). Attempt 2 after ~2min, attempt 3
+  // after ~10min; then the final failure notification fires, annotated with the
+  // attempt count. State is in-memory — a process restart drops pending
+  // retries (v1 tradeoff), which is why nothing depends on the timer: the
+  // inbox row is restored to unread before the retry decision, and a threaded
+  // failure is announced on its first failure rather than held silently.
+  const triggerRetryScheduler = new TriggerRetryScheduler((retryPayload) => {
+    logger.info('[TriggerRetry] Re-dispatching trigger', {
+      to: retryPayload.toSlug,
+      from: retryPayload.fromSlug,
+      attempt: getTriggerAttempt(retryPayload),
+      threadKey: retryPayload.threadKey || null,
+      inboxMessageId: retryPayload.inboxMessageId || null,
+    });
+    agentGateway.dispatchTrigger(retryPayload);
+  });
+
+  // 7c. Listen for trigger failures — transient errors get a delayed retry;
+  // otherwise restore inbox message + notify sender
   agentGateway.on(
     'trigger:error',
     async ({
@@ -1631,15 +1654,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     }) => {
       const errorText = error instanceof Error ? error.message : String(error);
       const classification = classifyError({ errorText });
+      const attempt = getTriggerAttempt(payload);
 
       // Log full error text — truncateSummary only keeps the first line,
       // which loses stderr content that's critical for diagnosis.
-      logger.warn('[TriggerFailure] Processing failure notification', {
+      logger.warn('[TriggerFailure] Processing trigger failure', {
         triggerId,
         from: payload.fromSlug,
         to: payload.toSlug,
         category: classification.category,
         retryable: classification.retryable,
+        attempt,
         inboxMessageId: payload.inboxMessageId,
         threadKey: payload.threadKey,
         errorText: errorText.slice(0, 2000),
@@ -1648,7 +1673,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const client = dataComposer?.getClient();
       if (!client) return;
 
-      // 1. Restore inbox message to unread (only for agent_inbox rows — not thread messages)
+      // 1. Restore inbox message to unread FIRST — before the retry decision,
+      // and before the sender check, because a crash mid-backoff must leave
+      // the message visible to heartbeat scans. A successful re-dispatch marks
+      // it read again. (only for agent_inbox rows — not thread messages)
       if (payload.inboxMessageId) {
         const { error: restoreErr } = await client
           .from('agent_inbox')
@@ -1668,10 +1696,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         }
       }
 
-      // 2. Notify sender agent (if there is one) — skip if no sender to avoid loops
-      if (!payload.fromSlug) return;
-
-      // Look up the userId from the original source row (needed for sender inbox insert).
+      // 2. Look up the userId from the original source row. This runs before
+      // the sender check because a retry is scheduled for a senderless trigger
+      // too, and its activity entry needs the user.
       let recipientUserId: string | undefined;
       let resolvedThreadId: string | undefined;
       if (payload.inboxMessageId) {
@@ -1717,6 +1744,83 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         recipientUserId = payload.recipientUserId;
       }
 
+      // 3. Transient failure → schedule a delayed retry instead of notifying.
+      // Guard: never retry if the spawn already produced a successful session
+      // turn (triggerTurnCompleted is set post-success in the default handler).
+      const turnCompleted = payload.metadata?.triggerTurnCompleted === true;
+      let pendingRetry: { attempt: number; delayMs: number } | undefined;
+      if (!turnCompleted) {
+        const retry = triggerRetryScheduler.scheduleRetry(payload, classification, error);
+        if (retry.scheduled) {
+          logger.warn(
+            `[TriggerRetry] attempt ${retry.attempt} in ${Math.round(retry.delayMs / 1000)}s, category=${classification.category}`,
+            {
+              triggerId,
+              from: payload.fromSlug,
+              to: payload.toSlug,
+              threadKey: payload.threadKey || null,
+              inboxMessageId: payload.inboxMessageId || null,
+            }
+          );
+
+          if (recipientUserId) {
+            try {
+              await dataComposer!.repositories.activityStream.logActivity({
+                userId: recipientUserId,
+                sbSlug: payload.toSlug,
+                type: 'error',
+                subtype: 'trigger_retry',
+                content: `Trigger to ${payload.toSlug} failed (${classification.category}) — retry ${retry.attempt}/${TRIGGER_MAX_ATTEMPTS} in ${Math.round(retry.delayMs / 1000)}s: ${classification.summary}`,
+                correlationId: payload.threadMessageId || payload.inboxMessageId,
+                status: 'pending',
+                payload: {
+                  triggerRetry: true,
+                  triggerId,
+                  attempt: retry.attempt,
+                  maxAttempts: TRIGGER_MAX_ATTEMPTS,
+                  delayMs: retry.delayMs,
+                  errorCategory: classification.category,
+                  errorSummary: classification.summary,
+                  fromSlug: payload.fromSlug,
+                  toSlug: payload.toSlug,
+                  threadKey: payload.threadKey || null,
+                },
+              });
+            } catch (logErr) {
+              logger.warn('[TriggerRetry] Failed to log retry activity', {
+                error: logErr instanceof Error ? logErr.message : String(logErr),
+              });
+            }
+          }
+
+          // Whether the notification may be suppressed depends on whether
+          // anything durable survives this process (Lumen, r2).
+          //
+          // An agent_inbox trigger has been restored to unread above, so the
+          // row IS the fallback: a restart mid-backoff loses the timer and the
+          // message is still sitting there unread for the next heartbeat scan.
+          // Staying quiet costs nothing.
+          //
+          // A thread-borne trigger has no such row. Thread read state is a
+          // monotonic inbox_thread_read_status.last_read_at, and rewinding it
+          // would resurface every message after that point rather than this
+          // one, so there is nothing to restore. Suppressing the notice would
+          // mean a restart during the backoff drops the message with no timer,
+          // no row and nothing said — strictly worse than the behaviour this
+          // PR replaces, which at least always told the sender.
+          //
+          // So a threaded failure still speaks once: on the first failure
+          // (attempt 1) the notice says a retry is pending, and the retry's own
+          // failure stays quiet because the sender has already been told.
+          if (payload.inboxMessageId) return;
+          if (attempt > 1) return;
+          pendingRetry = { attempt: retry.attempt, delayMs: retry.delayMs };
+        }
+      }
+
+      // 4. Notify sender agent (if there is one) — skip if no sender to avoid loops
+      if (!payload.fromSlug) return;
+
       if (recipientUserId) {
         await logInkmail('inkmail_fail', payload, recipientUserId, {
           error: errorText.slice(0, 2000),
@@ -1730,7 +1834,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
       const categoryLabel =
         classification.category !== 'unknown' ? ` (${classification.category})` : '';
-      const notificationContent = `Trigger to ${payload.toSlug} failed${categoryLabel}: ${classification.summary}`;
+      const attemptsLabel = attempt > 1 ? ` after ${attempt} attempts` : '';
+      const retryLabel = pendingRetry
+        ? ` — retrying (${pendingRetry.attempt}/${TRIGGER_MAX_ATTEMPTS}) in ${Math.round(pendingRetry.delayMs / 1000)}s`
+        : '';
+      const notificationContent = `Trigger to ${payload.toSlug} failed${attemptsLabel}${categoryLabel}${retryLabel}: ${classification.summary}`;
 
       // Thread-borne trigger → notice joins the thread (participants and
       // session stamps already exist; stamped-only delivery lands it in
@@ -1750,6 +1858,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           errorSummary: classification.summary,
           errorDetail: errorText.slice(0, 4000),
           retryable: classification.retryable,
+          attempts: attempt,
+          retryPending: pendingRetry ? pendingRetry.attempt : null,
           originalInboxMessageId: payload.inboxMessageId || null,
         },
       });

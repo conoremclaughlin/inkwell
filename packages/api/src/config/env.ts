@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 import { existsSync, readFileSync } from 'fs';
 import { resolve, basename } from 'path';
 import { z } from 'zod';
+import { httpRateLimitEnvSchema } from './http-rate-limit';
 
 // Load environment variables with priority (highest wins):
 // 1. Shell environment (always wins)
@@ -115,6 +116,7 @@ const envSchema = z.object({
   INK_PORT_BASE: z.string().transform(Number).optional(),
   PCP_PORT_BASE: z.string().transform(Number).optional(), // backward compat
   PORT: z.string().transform(Number).optional(),
+  ...httpRateLimitEnvSchema.shape,
 
   // Database - Supabase (supports both old and new naming conventions)
   SUPABASE_URL: z.string().url(),
