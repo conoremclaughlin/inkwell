@@ -1,42 +1,40 @@
 /**
  * Does a route pattern actually DETERMINE the destination?
  *
- * This probe exists because of a wrong finding. On 2026-09-16 I reported the
- * route-pattern tier as dead for 14 days, from a zero in
- * `studio_lease_events.reason`. Lumen took the trace apart: since v18 S3 the
- * spawn path stamps `recipientSessionId` before admission, so admission
- * answers at `recipient-session` and the lease event records the ADMISSION
- * phase's tier, never the phase that chose the studio. The tier had not gone
- * quiet — its label had moved. Confirmed against the plan-phase population
- * (`sessions.metadata->'routing_decision'->>'tier'`): 90 route-pattern plans
- * inside the window I had measured as zero.
+ * Neither routing channel can answer that on its own, which is what this file
+ * is for. Since v18 S3 the spawn path stamps `recipientSessionId` before
+ * admission, so admission answers at `recipient-session` and
+ * `studio_lease_events.reason` records the ADMISSION phase's tier — never the
+ * phase that chose the studio. Read as a placement census it shows the
+ * route-pattern tier at zero while the tier is working normally; the plan-phase
+ * population (`sessions.metadata->'routing_decision'->>'tier'`) shows the same
+ * traffic under its real label. The other direction fails too: a plan-phase
+ * tier records an intent, not where the work ran.
  *
- * Two controls passed while I was wrong. Both asked "does this channel emit",
- * and the channel kept emitting under a different value in the same column. A
- * coverage control established on the old side of a version boundary does not
- * transfer across it.
- *
- * So the question "does the pattern place the work" cannot be answered from
- * either channel alone — it needs the two phases run in order, with the
- * pattern as the only thing that varies. That is this file.
+ * Answering it needs both phases run in order with the pattern as the only
+ * variable, and the destination read from where the work actually landed.
  *
  * `route-patterns.test.ts` does NOT answer it: that suite re-implements
  * `matchRoutePattern`/`routePatternSpecificity` inside the test file, so it
  * stays green if production's resolver is deleted. It tests the algorithm,
  * never the wiring.
  *
- * WHAT RUNS. The first draft of this file composed the two phases by hand —
- * it called `getOrCreateSession(planOnly)`, stamped `planned.id` itself, called
- * `getOrCreateSession` again, and called the private cwd resolver directly.
- * Lumen's review: that is service composition, not handler coverage. The
- * orchestration under test was supplied by the test, so deleting server.ts's
- * winner stamp, dropping `metadata.recipientSessionId` forwarding in
- * handleMessage, or handing the runner a different directory all left the test
- * path unchanged. This version runs the REAL trigger handler instead —
- * extracted from `server.ts` by AST, the technique Lumen established in
- * `routing/inbound-agent-handler.probe.test.ts` (PR #638), because `server.ts`
- * ends in an unconditional `startServer(...)` and importing it to reach one
- * arrow would boot a server on every suite run.
+ * WHAT RUNS. The REAL trigger handler — the arrow production registers via
+ * `agentGateway.setDefaultHandler`, extracted from `server.ts` by AST and run
+ * with injected dependencies. That is the technique Lumen established in
+ * `routing/inbound-agent-handler.probe.test.ts` (PR #638), and it is here
+ * because `server.ts` has no exports and ends in an unconditional
+ * `startServer(...)`: importing it to reach one arrow would boot a server on
+ * every suite run.
+ *
+ * Composing the two phases in the test instead — calling `getOrCreateSession`
+ * twice, stamping `planned.id`, calling the cwd resolver directly — is what
+ * this file did first, and it covers service composition rather than wiring.
+ * Under it, deleting server.ts's winner stamp, dropping
+ * `metadata.recipientSessionId` forwarding in `handleMessage`, and handing the
+ * runner a different directory are all invisible. Those three are mutations
+ * N1–N3 below, and they are the reason the handler is extracted rather than
+ * imitated.
  *
  * The production code executing is: the trigger handler, SessionService's
  * `getOrCreateSession` (both phases), `decideDelivery`, and `handleMessage`
@@ -47,10 +45,19 @@
  *
  * STILL NOT COVERED, deliberately: thread assignment and routing-hold stamping.
  * The payload carries no `threadId`, so `assignThreadParticipant` /
- * `stampRoutingHold` / `clearRoutingHold` are never reached. They decide which
- * session a thread is stamped to, not which studio the work lands in, and each
- * has its own suite. Naming it here so the gap is a choice on the record rather
- * than an unexamined edge of the probe.
+ * `stampRoutingHold` / `clearRoutingHold` are never reached, and each has its
+ * own suite.
+ *
+ * That bounds what a pass here means, and the boundary is not cosmetic
+ * (Lumen, round 3). Assignment does not merely stamp a thread: when a
+ * concurrent dispatch or an existing binding wins the CAS, `server.ts` sets
+ * `deliverySession` to that winner and forwards ITS `studioId` and `id`
+ * onward. So a thread-bearing delivery can land in a studio the route-pattern
+ * tier did not choose — the tier picks a session, assignment can replace it
+ * afterwards, and the studio follows the replacement. These cases therefore
+ * answer "does the pattern place the work" for threadless deliveries only.
+ * Extending it to thread-bearing ones means driving the CAS with a live rival
+ * binding, which is a different fixture and a different probe.
  *
  * Shape (Lumen's spec, thread pcp:spec:trigger-studio-routing, 2026-09-16):
  *   - the full handler path, both phases, provisioning/runner boundaries
@@ -62,9 +69,6 @@
  *     acquiring under a `route-pattern` reason, because it never does;
  *   - NEGATIVE CONTROL: remove B's pattern and require the outcome to change
  *     to C, so a pass cannot mean "some other rung would have chosen B too".
- *
- * Tested head: cb810cb0 (origin/main, 2026-09-16); mechanism unchanged since
- * 9893af9f, the head Lumen and I both read.
  */
 
 import { readFileSync } from 'node:fs';
