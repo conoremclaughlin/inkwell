@@ -19,6 +19,22 @@ describe('MemoryRepository', () => {
 
   beforeEach(() => {
     mockSupabase = createMockSupabaseClient();
+    // The embedding swap and clear are database functions, and their default
+    // answer has to be the successful one or every test that merely touches a
+    // memory's text would read as a failed publish. Scoped by name so the
+    // recall RPCs keep the generic mock's behaviour; tests that want a failure
+    // override it.
+    const rpc = mockSupabase.rpc as unknown as ReturnType<typeof vi.fn>;
+    const passthrough = rpc.getMockImplementation();
+    rpc.mockImplementation((fn: string, args: unknown) => {
+      if (fn === 'swap_memory_embedding' || fn === 'clear_memory_embedding') {
+        return Promise.resolve({ data: 'ok', error: null });
+      }
+      if (fn === 'invalidate_memory_extractions') {
+        return Promise.resolve({ data: null, error: null });
+      }
+      return passthrough ? passthrough(fn, args) : Promise.resolve({ data: null, error: null });
+    });
     repo = new MemoryRepository(mockSupabase as unknown as SupabaseClient);
   });
 
@@ -581,22 +597,17 @@ describe('MemoryRepository', () => {
 
       expect(refreshSpy).toHaveBeenCalledTimes(1);
       expect(refreshSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 'mem-123', content: 'Corrected content' }),
-        // A content edit invalidates the cached llm_extractions: they describe
-        // the text that was just replaced, and the llm/merged chunk views
-        // embed them verbatim.
-        expect.objectContaining({ dropCachedExtractions: true })
+        expect.objectContaining({ id: 'mem-123', content: 'Corrected content' })
       );
     });
 
-    it('keeps cached extractions when only the summary changed', async () => {
-      // The control for the flag above. A summary edit does not replace the
-      // content the extractions were derived from, so recomputing them would
-      // be an LLM call bought for nothing.
-      const refreshSpy = vi
-        .spyOn(repo as unknown as Record<string, unknown>, 'refreshMemoryEmbedding')
-        .mockResolvedValue(undefined);
-
+    it('invalidates cached extractions on a summary-only edit too', async () => {
+      // I first wrote this as a control asserting the opposite — that a summary
+      // edit could keep them, since the content they were derived from had not
+      // changed. That was wrong about what they were derived from (Lumen, r2):
+      // buildSourceBlock feeds the summary into the extraction prompt
+      // alongside the memory text, so an extraction of the old summary
+      // describes a memory that no longer says that either.
       mockSupabase._setReturnData({
         id: 'mem-123',
         user_id: 'user-456',
@@ -606,7 +617,7 @@ describe('MemoryRepository', () => {
         salience: 'medium',
         topics: [],
         embedding: null,
-        metadata: {},
+        metadata: { llm_extractions: { durable_fact: 'stale' } },
         version: 2,
         created_at: '2026-01-26T12:00:00Z',
         expires_at: null,
@@ -614,9 +625,9 @@ describe('MemoryRepository', () => {
 
       await repo.updateMemory('mem-123', 'user-456', { summary: 'New summary' });
 
-      expect(refreshSpy).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({ dropCachedExtractions: false })
+      expect(mockSupabase.rpc).toHaveBeenCalledWith(
+        'invalidate_memory_extractions',
+        expect.objectContaining({ p_memory_id: 'mem-123', p_user_id: 'user-456' })
       );
     });
 
@@ -703,17 +714,16 @@ describe('MemoryRepository', () => {
         content: 'Edited content',
       });
 
-      // Stale chunk rows deleted
-      expect(mockSupabase.from).toHaveBeenCalledWith('memory_embedding_chunks');
-      expect(mockSupabase._queryBuilder.delete).toHaveBeenCalled();
-
-      // Embedding columns nulled and embedding metadata stripped (other keys kept)
-      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
+      // One fenced call, not a chunk delete followed by a row update: the
+      // point of the function is that neither store moves without the other.
+      expect(mockSupabase.rpc).toHaveBeenCalledWith(
+        'clear_memory_embedding',
         expect.objectContaining({
-          embedding: null,
-          embedding_chunks_version: null,
-          embedding_chunk_count: null,
-          metadata: { keep: 'me' },
+          p_memory_id: 'mem-123',
+          p_user_id: 'user-456',
+          p_expected_version: 2,
+          // Named keys, so anything else on the row survives.
+          p_metadata_remove: ['embedding', 'embedding_chunks'],
         })
       );
 
@@ -748,8 +758,10 @@ describe('MemoryRepository', () => {
 
       await repo.updateMemory('mem-123', 'user-456', { content: 'Edited content' });
 
-      expect(mockSupabase.from).toHaveBeenCalledWith('memory_embedding_chunks');
-      expect(mockSupabase._queryBuilder.delete).toHaveBeenCalled();
+      expect(mockSupabase.rpc).toHaveBeenCalledWith(
+        'clear_memory_embedding',
+        expect.objectContaining({ p_memory_id: 'mem-123' })
+      );
     });
   });
 
@@ -1623,41 +1635,38 @@ describe('MemoryRepository', () => {
         salience: 'high',
       });
 
-      const chunkRows = mockSupabase._queryBuilder.upsert.mock.calls[0][0] as Array<
-        Record<string, unknown>
-      >;
+      const swapCall = (mockSupabase.rpc as unknown as { mock: { calls: unknown[][] } }).mock.calls
+        .filter((call) => call[0] === 'swap_memory_embedding')
+        .pop() as [string, Record<string, unknown>];
+      expect(swapCall).toBeTruthy();
+      const args = swapCall[1];
+      const chunkRows = args.p_chunks as Array<Record<string, unknown>>;
+
       expect(embedDocument).toHaveBeenCalledTimes(chunkRows.length);
       expect(chunkRows.length).toBeGreaterThan(1);
-      expect(mockSupabase.from).toHaveBeenCalledWith('memory_embedding_chunks');
-      expect(mockSupabase._queryBuilder.upsert).toHaveBeenCalledWith(
-        expect.arrayContaining([
-          expect.objectContaining({
-            memory_id: 'mem-hm-5',
-            chunk_type: 'content',
-            chunk_index: 0,
-          }),
-        ]),
-        expect.objectContaining({ onConflict: 'memory_id,chunk_index' })
+      expect(chunkRows[0]).toEqual(
+        expect.objectContaining({ memory_id: 'mem-hm-5', chunk_type: 'content', chunk_index: 0 })
       );
       expect(chunkRows.every((row) => row.chunk_type === 'content')).toBe(true);
-      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
+
+      expect(args.p_chunks_version).toBe(MEMORY_EMBEDDING_CHUNKS_VERSION);
+      expect(args.p_chunk_count).toBe(chunkRows.length);
+      expect(args.p_expected_version).toBe(1);
+
+      // Only the keys the embedding owns — the function merges them onto
+      // whatever the row holds at commit time.
+      expect(Object.keys(args.p_metadata_patch as object).sort()).toEqual([
+        'embedding',
+        'embedding_chunks',
+      ]);
+      expect(args.p_metadata_patch).toEqual(
         expect.objectContaining({
-          embedding_chunks_version: MEMORY_EMBEDDING_CHUNKS_VERSION,
-          embedding_chunk_count: chunkRows.length,
-          metadata: expect.objectContaining({
-            embedding_chunks: expect.objectContaining({
-              chunkCount: chunkRows.length,
-              version: MEMORY_EMBEDDING_CHUNKS_VERSION,
-              viewCounts: expect.objectContaining({
-                content: chunkRows.length,
-                summary: 0,
-              }),
-            }),
-            embedding: expect.objectContaining({
-              provider: 'ollama',
-              model: 'mxbai-embed-large',
-            }),
+          embedding_chunks: expect.objectContaining({
+            chunkCount: chunkRows.length,
+            version: MEMORY_EMBEDDING_CHUNKS_VERSION,
+            viewCounts: expect.objectContaining({ content: chunkRows.length, summary: 0 }),
           }),
+          embedding: expect.objectContaining({ provider: 'ollama', model: 'mxbai-embed-large' }),
         })
       );
       expect(result.embedding).toEqual(new Array(1024).fill(0.1));
