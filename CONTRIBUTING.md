@@ -408,7 +408,43 @@ Notes:
 
 ### Integration tests
 
-`yarn test:integration:db:local` spins up an **isolated, temporary local Supabase stack** with dedicated ports, applies migrations + seed, runs integration tests, then tears it down. This avoids accidental use of remote credentials.
+Local DB integration tests share a **retained, test-only Supabase stack** across
+worktrees. The first run starts it and applies migrations + seed; subsequent runs
+reuse the containers and schema. CI still starts, resets, and tears down a fresh
+stack on each job. Neither path uses an application database.
+
+```bash
+# Focus on the affected integration file rather than repeatedly running everything.
+yarn test:integration:db:local src/auth/pcp-tokens.integration.test.ts
+# Rebuild test data/schema after migration/seed changes, or for a clean rerun.
+yarn test:integration:db:local --reset
+# Release the retained containers and their test data when finished.
+yarn test:integration:db:local --stop
+# CI-equivalent lifecycle (stop a retained stack first).
+yarn test:integration:db:local --fresh
+```
+
+**Warm runs are not pristine runs.** Fixtures normally clean themselves up, but an
+interrupted run can leave data or schema changes behind. Use `--reset` to diagnose
+possible state-dependent failures, and rely on fresh CI for clean-schema coverage.
+A fingerprint covers migration/seed SQL, config, exclusions, and CLI version; a
+mismatch refuses reuse with an explicit reset/stop instruction rather than silently
+running against another branch's schema. It does not detect arbitrary SQL changes
+made directly to the running database.
+
+The harness takes project/port locks. A competing run or an occupied port prints
+its owner when available and tells the caller to **wait and retry**, without stopping
+that owner's stack. Run DB integration tests sparingly; prefer focused unit tests
+while iterating. Unmanaged/legacy kept stacks are never automatically adopted.
+
+State lives outside the repository at
+`~/.cache/inkwell/integration-db/<project>`. `INTEGRATION_SUPABASE_CACHE_DIR` can
+override the base. Existing `INTEGRATION_SUPABASE_*_PORT` overrides remain supported;
+project IDs must be `pcp-integration` or `pcp-integration-<suffix>`. `--reuse` explicitly
+selects retained mode (including in a CI-marked shell). The legacy
+`INTEGRATION_KEEP_SUPABASE=1` with `--fresh` retains a temporary inspection stack;
+release it with the printed `supabase stop --workdir ... --no-backup` command before
+using the same project again.
 
 ## Key Technologies
 

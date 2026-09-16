@@ -59,6 +59,9 @@ jobs:
       - name: Integration-DB harness endpoint isolation
         run: sh scripts/test-integration-db-local.test.sh
 
+      - name: Integration stack lifecycle (mock-only)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-stack.py
+
       # Every tracked file at HEAD, through the same guard the hooks run: no
       # credential-shaped file, no vendor token, no email address off the
       # fixture-domain list. The private-marker arm is the owner's machine's
