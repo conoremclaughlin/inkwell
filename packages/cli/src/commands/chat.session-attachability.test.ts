@@ -238,10 +238,42 @@ describe('sessionNeedsReopen', () => {
  * So the POST-STATE is the evidence, not the envelope.
  */
 describe('reopenSucceeded', () => {
-  const live = { id: 's1', status: 'active', lifecycle: 'idle' } as SessionSummary;
+  // endedAt: null is part of the fixture, not decoration. A current server
+  // always sends endedAt and status — null when cleared — and this fixture used
+  // to omit both, which is why it agreed with a predicate that could not tell a
+  // cleared field from an absent one.
+  const live = {
+    id: 's1',
+    status: 'active',
+    lifecycle: 'idle',
+    endedAt: null,
+  } as unknown as SessionSummary;
 
   it('accepts a row that now reads attachable', () => {
     expect(reopenSucceeded(live).ok).toBe(true);
+  });
+
+  it('rejects a response that never mentions the markers — the old-server case', () => {
+    // The failure that matters most, and the one an exception check misses: a
+    // server predating `reopen` strips the field, changes nothing, and answers
+    // success with a session object that simply has no endedAt and no status.
+    // Every terminal check then reads undefined and concludes the fence is
+    // clear, so the client attaches to a session the server still calls over.
+    const outcome = reopenSucceeded({
+      id: 's1',
+      sbSlug: 'wren',
+      lifecycle: 'idle',
+      currentPhase: 'reviewing',
+    } as SessionSummary);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toContain('did not report');
+    expect(outcome.reason).toContain('older server');
+  });
+
+  it('names every marker the response withheld, not just the first', () => {
+    const outcome = reopenSucceeded({ id: 's1', lifecycle: 'idle' } as SessionSummary);
+    expect(outcome.reason).toContain('endedAt');
+    expect(outcome.reason).toContain('status');
   });
 
   it('rejects a cheerful success that left ended_at set — the old-server case', () => {
@@ -252,7 +284,10 @@ describe('reopenSucceeded', () => {
   });
 
   it('rejects a row still phased complete, and names the marker', () => {
-    const outcome = reopenSucceeded({ ...live, currentPhase: 'complete' } as SessionSummary);
+    const outcome = reopenSucceeded({
+      ...live,
+      currentPhase: 'complete',
+    } as unknown as SessionSummary);
     expect(outcome.ok).toBe(false);
     expect(outcome.reason).toContain('complete');
   });
@@ -264,7 +299,10 @@ describe('reopenSucceeded', () => {
 });
 
 describe('reopenSelectedSession', () => {
-  const okSession = { id: 's1', status: 'active', lifecycle: 'idle' };
+  // Mirrors the real response: a current server reports both terminal markers,
+  // endedAt null once cleared. Omitting them here is the old-server shape, and
+  // it belongs in its own case rather than being the default fixture.
+  const okSession = { id: 's1', status: 'active', lifecycle: 'idle', endedAt: null };
 
   it('sends reopen with an idle lifecycle and confirms the post-state', async () => {
     const callTool = vi.fn().mockResolvedValue({ success: true, session: okSession });

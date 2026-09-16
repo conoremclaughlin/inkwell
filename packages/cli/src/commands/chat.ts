@@ -1690,6 +1690,23 @@ export interface ReopenOutcome {
  */
 export function reopenSucceeded(session: SessionSummary | null | undefined): ReopenOutcome {
   if (!session) return { ok: false, reason: 'the server returned no session' };
+
+  // Absence is not evidence (Lumen, r2). isAttachableSessionSummary answers
+  // "does this row carry a terminal marker", which is the right question for a
+  // LISTING, where every field is present. Here the question is "did the reopen
+  // actually happen", and a server too old to know the field answers by
+  // omitting it: an undefined endedAt reads as cleared and an absent status
+  // reads as non-terminal, so the predicate returns attachable for a row
+  // nothing touched. The response has to STATE the post-state before it can be
+  // believed — a current server always sends both, null when cleared.
+  const unreported = (['endedAt', 'status'] as const).filter((field) => !(field in session));
+  if (unreported.length > 0) {
+    return {
+      ok: false,
+      reason: `the server did not report ${unreported.join(' or ')} (an older server may not support reopen)`,
+    };
+  }
+
   if (!isAttachableSessionSummary(session)) {
     // Name the marker still set — "it did not work" sends the reader hunting,
     // and the usual cause is a server predating the reopen field.

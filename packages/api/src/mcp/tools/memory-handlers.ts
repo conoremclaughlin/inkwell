@@ -1971,12 +1971,21 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     // this whole PR exists to remove.
     updates.endedAt = null;
     if (updates.lifecycle === undefined) updates.lifecycle = 'running';
-    if (params.phase === undefined && isTerminalPhaseMarker(priorSession?.currentPhase)) {
+    // Keyed off what this write is ABOUT to set, not off what the caller
+    // passed (Lumen, r2). `phase: 'runtime:idle'` and `runtime:generating` are
+    // lifecycle in disguise — the mapping above sets `lifecycle` and
+    // deliberately writes no phase — but they read as "the caller declared a
+    // phase" and skipped the clear, so a reopen through the CLI's own idle
+    // path left currentPhase reading 'complete' and the row still classified
+    // as history. `updates.currentPhase === undefined` is the real question:
+    // nothing else is writing this field, so the terminal marker is ours to
+    // clear.
+    if (updates.currentPhase === undefined && isTerminalPhaseMarker(priorSession?.currentPhase)) {
       // Null rather than a substitute phase: the work phase is the agent's to
       // declare, and inventing one here would report progress nobody made.
       updates.currentPhase = null;
     }
-    if (params.status === undefined && isTerminalPhaseMarker(priorSession?.status)) {
+    if (updates.status === undefined && isTerminalPhaseMarker(priorSession?.status)) {
       updates.status = 'active';
     }
   }
