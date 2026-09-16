@@ -397,7 +397,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Original edit-test summary',
         topicKey: 'test:content-edit',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
       expect(memory.version).toBe(1);
@@ -432,7 +432,7 @@ describe('Hierarchical Memory Integration', () => {
         content: 'Rollback test original content',
         summary: 'Rollback original summary',
         salience: 'medium',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
@@ -460,7 +460,7 @@ describe('Hierarchical Memory Integration', () => {
         userId: testUserId,
         content: 'Metadata-only update test',
         salience: 'low',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
