@@ -1,4 +1,4 @@
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { mkdtemp, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -101,22 +101,64 @@ describe('buildTemplatedCommand', () => {
     it('does not add quotes inside double quotes, which would close them', () => {
       const { command } = buildTemplatedCommand('printf %s "{text}"', { text: 'x' });
 
-      // `""$INK_TPL_TEXT""` would leave the expansion unquoted — the bug Lumen
+      // `""${INK_TPL_TEXT}""` would leave the expansion unquoted — the bug Lumen
       // found in the first cut of this module.
-      expect(command).toBe('printf %s "$INK_TPL_TEXT"');
+      expect(command).toBe('printf %s "${INK_TPL_TEXT}"');
     });
 
     it('adds quotes when the slot is bare', () => {
       const { command } = buildTemplatedCommand('printf %s {text}', { text: 'x' });
 
-      expect(command).toBe('printf %s "$INK_TPL_TEXT"');
+      expect(command).toBe('printf %s "${INK_TPL_TEXT}"');
     });
 
     it('closes and reopens a single-quoted region rather than giving up on it', () => {
       const { command } = buildTemplatedCommand(`printf %s 'a{text}b'`, { text: 'x' });
 
-      expect(command).toBe(`printf %s 'a'"$INK_TPL_TEXT"'b'`);
+      expect(command).toBe(`printf %s 'a'"\${INK_TPL_TEXT}"'b'`);
     });
+  });
+
+  // A parameter name runs to the first character that cannot be part of one, so
+  // an undelimited `$INK_TPL_TEXT_suffix` names a different, unset variable and
+  // expands to nothing. `bare` and `single` happen to be saved by our own quote
+  // ending the name; only `double` was exposed. Lumen found it in r1. Delimited
+  // uniformly, and covered in all three contexts so the next affix cannot
+  // reintroduce it in the two that were only accidentally safe.
+  describe('text touching a slot is not swallowed into the variable name', () => {
+    const affixes: Array<[string, string, string]> = [
+      ['an underscore suffix', '{text}_suffix', 'hello_suffix'],
+      ['a letter suffix', '{text}suffix', 'hellosuffix'],
+      ['a digit suffix', '{text}2', 'hello2'],
+      ['a mixed suffix', '{text}_v2x', 'hello_v2x'],
+      ['a prefix', 'pre_{text}', 'pre_hello'],
+      ['both ends', 'pre_{text}_post', 'pre_hello_post'],
+    ];
+
+    for (const [name, slot, expected] of affixes) {
+      for (const [contextName, wrap] of [
+        ['bare', (inner: string) => inner],
+        ['double-quoted', (inner: string) => `"${inner}"`],
+        ['single-quoted', (inner: string) => `'${inner}'`],
+      ] as Array<[string, (inner: string) => string]>) {
+        it(`preserves ${name} on a ${contextName} slot`, async () => {
+          const { command, env } = buildTemplatedCommand(`printf '<%s>' ${wrap(slot)}`, {
+            text: 'hello',
+          });
+
+          // Guard against the assertion passing because some neighbouring
+          // variable happens to be set in this process's environment.
+          for (const key of Object.keys(env)) {
+            if (key.startsWith('INK_TPL_TEXT') && key !== 'INK_TPL_TEXT') delete env[key];
+          }
+
+          const result = await runShellCommand(command, 5_000, env);
+
+          expect(result.code).toBe(0);
+          expect(result.stdout).toBe(`<${expected}>`);
+        });
+      }
+    }
   });
 
   describe('the grammar it claims to parse', () => {
@@ -161,7 +203,7 @@ describe('buildTemplatedCommand', () => {
       // Asserted directly: the slot is bare, so it needs OUR quotes. A value
       // without whitespace would render both readings identical and prove
       // nothing — that is how this mutant survived the first matrix.
-      expect(command).toBe(`printf "'%s' <%s>" one "$INK_TPL_TEXT"`);
+      expect(command).toBe(`printf "'%s' <%s>" one "\${INK_TPL_TEXT}"`);
 
       const result = await runShellCommand(command, 5_000, env);
 
@@ -201,7 +243,7 @@ describe('buildTemplatedCommand', () => {
     });
 
     it('stays inert when the inner shell does the expansion, which is the form to write', async () => {
-      const { command, env } = buildTemplatedCommand(`sh -c 'printf %s "$INK_TPL_TEXT"'`, {
+      const { command, env } = buildTemplatedCommand(`sh -c 'printf %s "\${INK_TPL_TEXT}"'`, {
         text: '$(printf SUBSTITUTED)',
       });
 
@@ -229,7 +271,7 @@ describe('buildTemplatedCommand', () => {
     for (const template of templates) {
       const { command } = buildTemplatedCommand(template, { text: 'SENTINEL_VALUE' });
       expect(command, `template: ${template}`).not.toContain('SENTINEL_VALUE');
-      expect(command, `template: ${template}`).toContain('$INK_TPL_TEXT');
+      expect(command, `template: ${template}`).toContain('${INK_TPL_TEXT}');
     }
   });
 
@@ -252,7 +294,76 @@ describe('buildTemplatedCommand', () => {
   it('leaves a placeholder the caller supplied no value for alone', () => {
     const { command } = buildTemplatedCommand('cmd {input} {mime}', { input: '/tmp/a' });
 
-    expect(command).toBe('cmd "$INK_TPL_INPUT" {mime}');
+    expect(command).toBe('cmd "${INK_TPL_INPUT}" {mime}');
+  });
+});
+
+/**
+ * Doc/code agreement. The `*_CLI_COMMAND` lines in .env.example are what an
+ * operator pastes, so they are the templates this module most has to handle.
+ * Reading them from the file rather than copying them here means a new example
+ * with a shape the parser cannot see fails this suite instead of a deployment.
+ *
+ * What this block does NOT do, measured rather than assumed: it does not go red
+ * against the pre-fix implementation. Every shipped example puts its slot bare,
+ * which is exactly why the vulnerability was latent — the bug needed a quoted
+ * slot, and none of the examples has one. So this is a forward-looking guard,
+ * not a regression test. It does kill real mutants: reverting to interpolation
+ * fails 1 of these, and a SLOT_PATTERN that stops matching lowercase names
+ * fails 5. The regression evidence lives in the blocks above.
+ */
+describe('the command templates shipped in .env.example', () => {
+  function repoRoot(): string {
+    let dir = process.cwd();
+    while (!existsSync(path.join(dir, '.env.example'))) {
+      const parent = path.dirname(dir);
+      if (parent === dir) throw new Error('.env.example not found above ' + process.cwd());
+      dir = parent;
+    }
+    return dir;
+  }
+
+  const shipped = readFileSync(path.join(repoRoot(), '.env.example'), 'utf8')
+    .split('\n')
+    .map((line) => /^#?\s*[A-Z0-9_]*CLI_COMMAND=(.+)$/.exec(line.trim())?.[1])
+    .filter((template): template is string => Boolean(template));
+
+  it('finds the examples it is meant to be checking', () => {
+    expect(shipped.length).toBeGreaterThanOrEqual(4);
+  });
+
+  for (const template of shipped) {
+    it(`substitutes every slot in: ${template.slice(0, 48)}…`, () => {
+      const values = {
+        input: '/tmp/some dir/clip.ogg',
+        mime: 'audio/ogg',
+        text: 'spoken words',
+        output: '/tmp/some dir/out.ogg',
+        format: 'opus',
+      };
+      const { command } = buildTemplatedCommand(template, values);
+
+      expect(command).not.toMatch(/\{[a-z]+\}/);
+      for (const value of Object.values(values)) {
+        expect(command).not.toContain(value);
+      }
+    });
+  }
+
+  it('keeps the whole shipped STT template working, both slots and the substitution', async () => {
+    const template = shipped.find((t) => t.includes('basename'));
+    expect(template).toBeDefined();
+
+    // The command itself needs whisper, so exercise the substitution shape with
+    // printf in its place — two slots, one bare and one inside $( ).
+    const shape = template!.replace('whisper', 'printf "%s\\n"').replace('cat ', 'printf "%s" ');
+    const { command, env } = buildTemplatedCommand(shape, { input: '/tmp/some dir/clip.ogg' });
+
+    expect(command).toContain('"${INK_TPL_INPUT}"');
+    expect(command).not.toContain('/tmp/some dir/clip.ogg');
+
+    const result = await runShellCommand(command, 5_000, env);
+    expect(result.stdout).toContain('/tmp/some dir/clip.ogg');
   });
 });
 

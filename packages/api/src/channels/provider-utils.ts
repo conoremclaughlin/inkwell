@@ -66,11 +66,18 @@ interface Slot {
  * unquoted — the value would word-split and glob. `single` cannot expand at all,
  * so the quote is closed, a quoted expansion inserted, and the quote reopened,
  * which is the ordinary shell idiom for exactly this.
+ *
+ * The braces are not decoration. A name runs to the first character that cannot
+ * be part of one, so `"{text}_suffix"` would expand `$INK_TPL_TEXT_suffix` — a
+ * different, unset variable — and silently produce an empty string. In `bare`
+ * and `single` our own quote happens to end the name, so only `double` is
+ * exposed; they are delimited uniformly rather than only where it currently
+ * bites. Quoted filename affixes are the realistic case.
  */
 const EXPANSION: Record<SlotQuote, (name: string) => string> = {
-  bare: (name) => `"$${name}"`,
-  double: (name) => `$${name}`,
-  single: (name) => `'"$${name}"'`,
+  bare: (name) => `"\${${name}}"`,
+  double: (name) => `\${${name}}`,
+  single: (name) => `'"\${${name}}"'`,
 };
 
 /**
