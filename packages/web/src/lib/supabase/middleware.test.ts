@@ -1,6 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { NextRequest } from 'next/server';
-import nextConfig from '../../../next.config';
 
 const BASE_PORT = Number(process.env.INK_PORT_BASE || 3001);
 const WEB_PORT = BASE_PORT + 1;
@@ -174,15 +173,8 @@ describe('middleware updateSession', () => {
 });
 
 describe('cookie-to-bearer mutation protection', () => {
-  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     vi.clearAllMocks();
-    // Mirror Next's build-time mapping of the actual application config. If
-    // the flag regresses, the IP-literal origin cases below must fail.
-    vi.stubEnv(
-      '__NEXT_NO_MIDDLEWARE_URL_NORMALIZE',
-      nextConfig.skipMiddlewareUrlNormalize ? '1' : undefined
-    );
     mockGetSession.mockResolvedValue({
       data: { session: { access_token: 'synthetic-supabase-token' } },
     });
@@ -200,6 +192,7 @@ describe('cookie-to-bearer mutation protection', () => {
         method: 'POST',
         headers: {
           cookie: 'pcp-admin-token=synthetic-token',
+          host: new URL(origin).host,
           origin,
           'sec-fetch-site': 'same-origin',
         },
@@ -220,7 +213,11 @@ describe('cookie-to-bearer mutation protection', () => {
     const response = await updateSession(
       new NextRequest(`${target}/api/admin/tasks`, {
         method: 'POST',
-        headers: { cookie: 'pcp-admin-token=synthetic-token', origin },
+        headers: {
+          cookie: 'pcp-admin-token=synthetic-token',
+          host: new URL(target).host,
+          origin,
+        },
       })
     );
     expect(response.status).toBe(403);
@@ -233,6 +230,7 @@ describe('cookie-to-bearer mutation protection', () => {
         method: 'POST',
         headers: {
           cookie: 'pcp-admin-token=synthetic-token',
+          host: 'localhost:4002',
           origin: 'http://localhost:3002',
           'x-forwarded-host': 'localhost:3002',
           'X-Inkwell-CSRF': '1',
@@ -242,6 +240,28 @@ describe('cookie-to-bearer mutation protection', () => {
     expect(response.status).toBe(403);
     expect(mockGetSession).not.toHaveBeenCalled();
     expect(mockGetUser).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'http://localhost:3002',
+    'http://127.0.0.1:4002',
+    'http://[::1]:4002',
+    'http://192.0.2.10:5002',
+  ])('uses HTTP Host when Next supplies a bind-address URL instead of %s', async (origin) => {
+    // Next-server constructs the middleware URL using its configured bind
+    // hostname/port, which need not be the address the browser requested.
+    const response = await updateSession(
+      new NextRequest('http://0.0.0.0:4002/api/admin/tasks', {
+        method: 'POST',
+        headers: {
+          host: new URL(origin).host,
+          origin,
+          cookie: 'pcp-admin-token=synthetic-token',
+        },
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-middleware-request-x-inkwell-csrf')).toBe('1');
   });
 
   it.each(['pcp-admin-token=synthetic-token', 'sb-synthetic-auth=synthetic-session'])(

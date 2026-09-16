@@ -46,11 +46,12 @@ back to a refresh cookie on the API.
 
 - The web proxy validates exact Origin, or Referer when Origin is absent,
   before any credential conversion. Opaque origins and same-site siblings are
-  rejected. Target origin comes from the actual request URL, not an untrusted
-  forwarded-host header; custom ports and LAN hosts remain supported.
-  Next.js URL normalization is disabled so loopback IP literals retain their
-  actual browser origin instead of being rewritten to localhost. Local host
-  aliases and different ports are still distinct origins, not exemptions.
+  rejected. Target origin uses HTTP Host and the request URL's protocol, not
+  an untrusted forwarded-host header. Next can build its URL from a bind address
+  or normalize loopback IPs to localhost; HTTP Host preserves the browser's
+  requested authority. URL origin is the fallback when Host is absent. Malformed
+  Host authorities fail closed; custom ports and LAN hosts remain supported.
+  No global Next URL-normalization change or alias equivalence is needed.
 - After that check, the proxy supplies `X-Inkwell-CSRF: 1`. This is a
   **non-simple request header**, not a secret token. Incoming copies cannot
   bypass the proxy's origin check.
