@@ -1,6 +1,6 @@
 import { stat } from 'fs/promises';
 import { logger } from '../../utils/logger';
-import { runShellCommand, shellEscape } from '../provider-utils';
+import { buildTemplatedCommand, runShellCommand } from '../provider-utils';
 import {
   createTempAudioPath,
   removeTempAudioDir,
@@ -24,12 +24,13 @@ export class CliTextToSpeechProvider implements TextToSpeechProvider {
 
     const extension = extensionForFormat(this.format);
     const filePath = await createTempAudioPath(extension);
-    const command = this.commandTemplate
-      .replace(/\{text\}/g, shellEscape(prompt))
-      .replace(/\{output\}/g, shellEscape(filePath))
-      .replace(/\{format\}/g, shellEscape(this.format));
+    const { command, env } = buildTemplatedCommand(this.commandTemplate, {
+      text: prompt,
+      output: filePath,
+      format: this.format,
+    });
 
-    const result = await runShellCommand(command, this.timeoutMs);
+    const result = await runShellCommand(command, this.timeoutMs, env);
     if (result.timedOut || result.code !== 0) {
       await removeTempAudioDir(filePath);
       logger.warn('TTS CLI provider failed', {
