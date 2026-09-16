@@ -26,7 +26,7 @@
  * never the wiring.
  *
  * Shape (Lumen's spec, thread pcp:spec:trigger-studio-routing, 2026-09-16):
- *   - the full handler path, both phases, provisioning/runner boundaries
+ *   - both phases in production's order, provisioning/runner boundaries
  *     stubbed — no real worktree, no executor;
  *   - unbound participant: no recipient/alias/history/default-session reuse;
  *   - one unique matching free studio B, distinct reachable fallback C;
@@ -35,6 +35,22 @@
  *     acquiring under a `route-pattern` reason, because it never does;
  *   - NEGATIVE CONTROL: remove B's pattern and require the outcome to change
  *     to C, so a pass cannot mean "some other rung would have chosen B too".
+ *
+ * COVERAGE BOUNDARY — READ THIS BEFORE TRUSTING A GREEN RUN.
+ * This exercises SERVICE COMPOSITION, not the delivery handler. `deliver()`
+ * below makes both `getOrCreateSession` calls itself, writes the admission
+ * stamp itself, and reaches `resolveWorkingDirectory` past the public
+ * surface. It does NOT enter `packages/api/src/server.ts`, does not call
+ * `handleMessage`, and never observes a runner invocation. So it pins what
+ * this author believes that handler does. If the real handler reorders the
+ * phases, drops the stamp, or passes different arguments, every case here
+ * stays green (Lumen, review of PR #648).
+ *
+ * That gap is structural, not laziness: `packages/api/src/server.ts` has ZERO
+ * exports and ends in an unconditional module-scope `startServer(...)`, so
+ * importing it to reach the sequence boots a real server (the PR #635
+ * incident). Closing it needs that sequence extracted into a side-effect-free
+ * module — task 0b25d2b7, a production change with its own review.
  *
  * Tested head: cb810cb0 (origin/main, 2026-09-16); mechanism unchanged since
  * 9893af9f, the head Lumen and I both read.
@@ -213,6 +229,10 @@ async function makeWorld(bPatterns: string[], dPatterns: string[] = []) {
   /**
    * The two resolutions one delivery performs, in production's order.
    *
+   * Line cites are `packages/api/src/server.ts` (2103 lines), NOT
+   * `packages/api/src/mcp/server.ts` — both exist and only the first carries
+   * this sequence.
+   *
    * PHASE 1 — PLAN (server.ts:1259-1280): `planOnly`, carrying the ORIGINAL
    * payload's recipientSessionId, which for an unbound participant is absent.
    * No lease is taken.
@@ -232,6 +252,10 @@ async function makeWorld(bPatterns: string[], dPatterns: string[] = []) {
       repoRoot: REPO_ROOT,
       recipientSessionId: planned.id,
     });
+    // NOT a runner invocation. This reaches past the public surface to the
+    // resolver a runner WOULD consult; nothing is spawned and no executor
+    // runs. Read every `runnerDir` assertion below as "the cwd a runner would
+    // be handed", never as "the runner started there" (Lumen, PR #648).
     const runnerDir = await (
       service as unknown as {
         resolveWorkingDirectory: (u: string, s: string, id?: string) => Promise<string>;
