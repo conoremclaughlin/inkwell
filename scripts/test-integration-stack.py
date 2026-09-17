@@ -216,6 +216,31 @@ class LifecycleTests(unittest.TestCase):
                                     self.project, "fixture-db-id", 55422, "fixture-baseline-hash"))
         self.assertTrue(args[5], "cleanup children must hold locks")
 
+    def test_replacement_after_initial_ownership_check_is_not_adopted(self):
+        self.run_stack()
+        before = self.state()["dbId"]
+        reads = 0
+        def replace_after_read(_):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                self.current[self.db] = "replacement-after-ownership-read"
+            return dict(self.current)
+        with mock.patch.object(stack, "containers", replace_after_read), self.assertRaisesRegex(stack.Refusal, "changed"):
+            self.run_stack()
+        self.assertEqual(self.state()["dbId"], before)
+        self.assertEqual(self.count("bash"), 1)
+
+    def test_replacement_during_cleanup_does_not_rebind_suite_or_ownership(self):
+        self.run_stack()
+        before = self.state()["dbId"]
+        def replace(*args):
+            self.current[self.db] = "replacement-during-cleanup"
+        with mock.patch.object(stack, "clean_fixtures", replace), self.assertRaisesRegex(stack.Refusal, "changed"):
+            self.run_stack()
+        self.assertEqual(self.state()["dbId"], before)
+        self.assertEqual(self.count("bash"), 1)
+
     def test_ci_keeps_disposable_lifecycle(self):
         self.env["CI"] = "true"
         self.run_stack()

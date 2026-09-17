@@ -327,6 +327,8 @@ def manage(root, harness, args, env):
                 say("Reusing test stack " + project + " (no container recreation)")
             if not fresh:
                 snapshot = containers(project)
+                if existing and snapshot.get(db_name) != db_id:
+                    raise Refusal("Database container changed after ownership validation; refusing to adopt it.")
                 state = {"project": project, "dbId": snapshot.get(db_name), "containers": snapshot,
                          "config": config, "exclude": exclude, "version": version,
                          "fingerprint": signature if existing and not reset else None,
@@ -355,8 +357,10 @@ def manage(root, harness, args, env):
                 say("Cleaning allowlisted fixture tables (not resetting the database or containers)")
                 clean_fixtures(workdir, project, db_id, ports[1], baseline_state, lock_fds,
                                signature, marker["runId"])
+            if containers(project).get(db_name) != db_id:
+                raise Refusal("Database container changed during fixture preparation; suite not started.")
             if not fresh:
-                state.update(dbId=containers(project).get(db_name), fingerprint=signature,
+                state.update(dbId=db_id, fingerprint=signature,
                              baseline=baseline_state)
                 write_state(state_path, state)
             suite_env = dict(env, INTEGRATION_MANAGED_WORKDIR=str(workdir),
