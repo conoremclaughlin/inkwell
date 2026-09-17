@@ -60,7 +60,9 @@ jobs:
         run: sh scripts/test-integration-db-local.test.sh
 
       - name: Integration stack lifecycle (mock-only)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-stack.py
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-stack.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-data.py
 
       # Every tracked file at HEAD, through the same guard the hooks run: no
       # credential-shaped file, no vendor token, no email address off the
@@ -98,8 +100,22 @@ jobs:
 
       - run: yarn install --immutable
 
-      - name: Run DB integration suite with isolated local Supabase
-        run: yarn test:integration:db:local
+      # Explicit retained mode on this disposable runner exercises the cold and
+      # warm paths. Unflagged CI invocations still default to --fresh.
+      - name: Run full DB integration suite from a cold isolated stack
+        run: yarn test:integration:db:local --reuse
+
+      - name: Scoped fixture cleanup and refusal probes (disposable runner only)
+        env:
+          INK_DISPOSABLE_RUNNER_TESTS: '1'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-data-ci.py
+
+      - name: Run full DB integration suite again on the warm stack
+        run: yarn test:integration:db:local --reuse
+
+      - name: Release the runner-owned integration stack
+        if: always()
+        run: yarn test:integration:db:local --stop
 
   integration-runtime:
     name: Integration Runtime Tests

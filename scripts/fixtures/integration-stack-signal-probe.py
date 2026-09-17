@@ -9,6 +9,8 @@ import sys
 from unittest import mock
 
 module, root_arg = sys.argv[1:]
+sys.path.insert(0, str(Path(module).parent))
+import integration_data
 root = Path(root_arg)
 harness = root / "scripts/test-integration-db-local.sh"
 state = {"started": False}
@@ -51,7 +53,8 @@ def call(args, **kwargs):
 
 
 sys.argv = [module, str(harness), "--fresh"]
-with mock.patch.dict(os.environ, {"INTEGRATION_SUPABASE_WORKDIR_BASE": str(root)}, clear=True), \
+with mock.patch.object(integration_data, "capture_baseline", return_value="fixture"), \
+     mock.patch.dict(os.environ, {"INTEGRATION_SUPABASE_WORKDIR_BASE": str(root)}, clear=True), \
      mock.patch("pathlib.Path.home", return_value=root), \
      mock.patch("shutil.which", return_value="mock-command"), \
      mock.patch("socket.socket"), \

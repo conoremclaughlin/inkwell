@@ -6,6 +6,7 @@ Only this parent owns cleanup. Its advisory locks outlive the suite subprocess.
 """
 
 import contextlib
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -19,15 +20,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+import uuid
+
+from integration_data import (BASELINE_FILE, POLICY, Refusal, capture_baseline,
+                              clean_fixtures, finish_run)
 
 
 PREFIX = "[integration-db] "
 PORT_NAMES = ("API", "DB", "STUDIO", "INBUCKET", "INBUCKET_SMTP", "INBUCKET_POP3")
 DEFAULT_EXCLUDE = "studio,mailpit,logflare,vector,supavisor"
-
-
-class Refusal(Exception):
-    pass
 
 
 def say(message):
@@ -171,7 +172,7 @@ def configuration(root, project, ports):
 
 def fingerprint(root, config, exclude, version):
     digest = hashlib.sha256()
-    for value in (config, exclude, version):
+    for value in (config, exclude, version, POLICY):
         digest.update(value.encode() + b"\0")
     # Include file names as well as contents: rename/removal is schema drift.
     for path in sorted((root / "supabase").rglob("*.sql")):
@@ -211,7 +212,7 @@ def manage(root, harness, args, env):
     if "--help" in args or "-h" in args:
         say("Usage: yarn test:integration:db:local [--reuse|--fresh] [--reset|--stop] [vitest filters]")
         say("Local default: retained test stack. CI default: fresh stack. --reset reapplies migrations + seed.")
-        say("--stop releases an owned retained stack. Warm runs retain data; run focused integration tests sparingly.")
+        say("--stop releases an owned retained stack. Warm runs clean scoped fixture data; run tests sparingly.")
         return 0
     project, ports, exclude = settings(env)
     fresh = env.get("CI", "").lower() in ("1", "true")
@@ -284,6 +285,8 @@ def manage(root, harness, args, env):
             if state:
                 shutil.rmtree(cache / "supabase")
                 state_path.unlink()
+                for name in (BASELINE_FILE, "run.json"):
+                    (cache / name).unlink(missing_ok=True)
             return 0
         config = configuration(root, project, ports)
         version = capture(["supabase", "--version"])
@@ -298,6 +301,15 @@ def manage(root, harness, args, env):
         workdir = Path(tempfile.mkdtemp(prefix="pcp-supabase-it-", dir=env.get("INTEGRATION_SUPABASE_WORKDIR_BASE"))) if fresh else cache
         workdir.mkdir(parents=True, exist_ok=True, mode=0o700)
         say("Test workdir=" + str(workdir))
+        marker_path = workdir / "run.json"
+        if marker_path.exists():
+            say("Previous run did not complete successfully; preparing fixture data before retry. "
+                "The marker is diagnostic, not a lock; never delete lock files to force a run.")
+        marker = {"runId": str(uuid.uuid4()), "project": project, "pid": os.getpid(),
+                  "startedAt": datetime.now(timezone.utc).isoformat(), "phase": "preparing"}
+        write_state(marker_path, marker)
+        baseline_state = state.get("baseline") if state else None
+        db_id = existing.get(db_name)
         started = False
         ready = False
         suite_code = 0
@@ -316,7 +328,9 @@ def manage(root, harness, args, env):
             if not fresh:
                 snapshot = containers(project)
                 state = {"project": project, "dbId": snapshot.get(db_name), "containers": snapshot,
-                         "config": config, "exclude": exclude, "version": version, "fingerprint": None}
+                         "config": config, "exclude": exclude, "version": version,
+                         "fingerprint": signature if existing and not reset else None,
+                         "baseline": baseline_state}
                 write_state(state_path, state)
             if fresh or reset or not existing:
                 if existing:
@@ -332,14 +346,29 @@ def manage(root, harness, args, env):
                         after_reset = containers(project)
                         state.update(dbId=after_reset.get(db_name), containers=after_reset)
                         write_state(state_path, state)
+                db_id = containers(project).get(db_name)
+                baseline_state = capture_baseline(workdir, project, db_id, ports[1], lock_fds,
+                                                  signature, marker["runId"])
+            else:
+                marker["phase"] = "cleaning"
+                write_state(marker_path, marker)
+                say("Cleaning allowlisted fixture tables (not resetting the database or containers)")
+                clean_fixtures(workdir, project, db_id, ports[1], baseline_state, lock_fds,
+                               signature, marker["runId"])
             if not fresh:
-                state.update(dbId=containers(project).get(db_name), fingerprint=signature)
+                state.update(dbId=containers(project).get(db_name), fingerprint=signature,
+                             baseline=baseline_state)
                 write_state(state_path, state)
             suite_env = dict(env, INTEGRATION_MANAGED_WORKDIR=str(workdir),
                              INTEGRATION_MANAGED_API_PORT=str(ports[0]),
                              INTEGRATION_MANAGED_DB_PORT=str(ports[1]))
-            say("Run focused DB tests sparingly; warm runs retain data. Use --reset for a pristine test DB.")
+            marker["phase"] = "testing"
+            write_state(marker_path, marker)
+            say("Run focused DB tests sparingly; fixture cleanup does not repair schema drift. Use --reset if needed.")
             suite_code = subprocess.call(["bash", "-c", 'harness=$1; shift; source "$harness"', "integration-db-suite", str(harness), *suite_args], env=suite_env, pass_fds=lock_fds)
+            if suite_code == 0:
+                finish_run(project, db_id, ports[1], baseline_state, lock_fds, signature, marker["runId"])
+                marker_path.unlink()
             return suite_code
         except BaseException:
             # Include signal exits, but not a handled exception in our caller.

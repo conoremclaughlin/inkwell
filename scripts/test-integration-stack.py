@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 MODULE_PATH = Path(os.environ.get("INTEGRATION_STACK_UNDER_TEST", str(Path(__file__).parent / "lib/integration-stack.py"))).resolve()
+sys.path.insert(0, str(Path(__file__).parent / "lib"))
 spec = importlib.util.spec_from_file_location("stack", MODULE_PATH)
 stack = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stack)
@@ -45,8 +46,11 @@ class LifecycleTests(unittest.TestCase):
             ("capture", self.capture), ("containers", lambda _: dict(self.current)),
             ("port_preflight", lambda _: self.calls.append(["preflight"])),
             ("say", lambda _: None),
+            ("capture_baseline", lambda *args: self.calls.append(["capture-baseline"]) or "fixture-baseline-hash"),
+            ("clean_fixtures", lambda *args: self.calls.append(["clean-fixtures"])),
+            ("finish_run", lambda *args: None),
         ):
-            patch = mock.patch.object(stack, target, replacement)
+            patch = mock.patch.object(stack, target, replacement, create=True)
             patch.start()
             self.addCleanup(patch.stop)
         for target, replacement in (
@@ -116,6 +120,101 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.suite_env["INTEGRATION_MANAGED_API_PORT"], "55421")
         self.assertEqual(self.suite_env["INTEGRATION_MANAGED_DB_PORT"], "55422")
         self.assertTrue(self.state()["fingerprint"])
+        self.assertEqual(self.count("capture-baseline"), 1)
+        self.assertEqual(self.count("clean-fixtures"), 1)
+
+    def test_cold_and_reset_capture_baseline_before_tests_without_truncating(self):
+        self.run_stack()
+        self.run_stack("--reset")
+        self.assertEqual(self.count("capture-baseline"), 2)
+        self.assertEqual(self.count("clean-fixtures"), 0)
+        self.assertIn("baseline", self.state())
+        self.assertEqual(self.state()["baseline"], "fixture-baseline-hash")
+        for index, command in enumerate(self.calls):
+            if command[0] == "capture-baseline":
+                self.assertEqual(self.calls[index - 1][:3], ["supabase", "db", "reset"])
+                self.assertEqual(self.calls[index + 1][0], "bash")
+
+    def test_marker_exists_during_suite_and_is_removed_only_on_success(self):
+        original = self.suite
+        def inspect(args, **kwargs):
+            path = Path(kwargs["env"]["INTEGRATION_MANAGED_WORKDIR"]) / "run.json"
+            self.assertTrue(path.exists(), "run marker must exist before the suite")
+            marker = json.loads(path.read_text())
+            self.assertEqual(marker["phase"], "testing")
+            self.assertEqual(marker["project"], self.project)
+            self.assertEqual(marker["pid"], os.getpid())
+            self.assertTrue(marker["runId"])
+            return original(args, **kwargs)
+        with mock.patch.object(stack.subprocess, "call", inspect):
+            self.run_stack()
+        self.assertFalse((Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]) / "run.json").exists())
+
+    def test_failed_suite_marker_survives_and_retry_cleans_without_reset(self):
+        self.suite_code = 7
+        self.assertEqual(self.run_stack(), 7)
+        marker = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]) / "run.json"
+        self.assertTrue(marker.exists())
+        self.suite_code = 0
+        with mock.patch.object(stack, "say") as output:
+            self.assertEqual(self.run_stack(), 0)
+        self.assertTrue(any("Previous run did not complete" in call.args[0] for call in output.call_args_list))
+        self.assertEqual(self.count("clean-fixtures"), 1)
+        self.assertEqual(self.count("supabase", "db", "reset"), 1)
+        self.assertFalse(marker.exists())
+
+    def test_retained_interrupt_preserves_marker_without_being_a_lock(self):
+        self.run_stack()
+        with mock.patch.object(stack.subprocess, "call", side_effect=SystemExit(143)):
+            with self.assertRaises(SystemExit):
+                self.run_stack()
+        marker = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]) / "run.json"
+        self.assertTrue(marker.exists())
+        self.assertEqual(self.run_stack(), 0)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.count("supabase", "db", "reset"), 1)
+
+    def test_failed_cleanup_leaves_marker_and_does_not_start_suite(self):
+        self.run_stack()
+        def refuse(*args):
+            self.assertEqual(json.loads((args[0] / "run.json").read_text())["phase"], "cleaning")
+            raise stack.Refusal("fixture cleanup failed")
+        with mock.patch.object(stack, "clean_fixtures", refuse), self.assertRaises(stack.Refusal):
+            self.run_stack()
+        self.assertEqual(self.count("bash"), 1)
+        marker = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]) / "run.json"
+        self.assertTrue(marker.exists())
+        self.run_stack()
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.count("supabase", "db", "reset"), 1)
+
+    def test_failed_baseline_capture_leaves_unready_schema_and_no_suite(self):
+        with mock.patch.object(stack, "capture_baseline", side_effect=stack.Refusal("dump failed")):
+            with self.assertRaises(stack.Refusal):
+                self.run_stack()
+        self.assertIsNone(self.state()["fingerprint"])
+        self.assertEqual(self.count("bash"), 0)
+        self.assertTrue((self.root / "cache" / self.project / "run.json").exists())
+
+    def test_stop_removes_owned_baseline_and_diagnostic_marker(self):
+        self.suite_code = 7
+        self.run_stack()
+        cache = Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"])
+        (cache / "fixture-baseline.sql").write_text("synthetic baseline")
+        self.run_stack("--stop")
+        self.assertFalse((cache / "fixture-baseline.sql").exists())
+        self.assertFalse((cache / "run.json").exists())
+        self.assertEqual(self.run_stack(), 7, "stop must not leave unmanaged-cache debris")
+
+    def test_warm_cleanup_receives_owned_identity_and_baseline_hash(self):
+        self.run_stack()
+        with mock.patch.object(stack, "clean_fixtures") as clean:
+            self.run_stack()
+        clean.assert_called_once()
+        args = clean.call_args.args
+        self.assertEqual(args[:5], (Path(self.suite_env["INTEGRATION_MANAGED_WORKDIR"]),
+                                    self.project, "fixture-db-id", 55422, "fixture-baseline-hash"))
+        self.assertTrue(args[5], "cleanup children must hold locks")
 
     def test_ci_keeps_disposable_lifecycle(self):
         self.env["CI"] = "true"

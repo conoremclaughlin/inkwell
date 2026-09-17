@@ -424,9 +424,37 @@ yarn test:integration:db:local --stop
 yarn test:integration:db:local --fresh
 ```
 
-**Warm runs are not pristine runs.** Fixtures normally clean themselves up, but an
-interrupted run can leave data or schema changes behind. Use `--reset` to diagnose
-possible state-dependent failures, and rely on fresh CI for clean-schema coverage.
+**Warm runs clean fixture data before the suite, not on exit.** A reviewed list of
+70 application fixture tables is truncated in one `RESTRICT` transaction and
+restored from a data-only snapshot captured immediately after migrations and seed.
+There is no database/schema drop, implicit `CASCADE`, or container recreation.
+Migration-seeded templates and seed rows are restored too; auth, storage, extensions,
+migration metadata, `pcp_config`, and `permission_definitions` are outside that scope.
+The public-table catalog must exactly match the fixture/exclusion partition.
+Unclassified tables or changed excluded reference rows refuse rather than silently
+carrying data forward. Checksums for all 72 public tables must match the cold
+baseline before the transaction can commit. This does not isolate test files from
+one another within a run, restore excluded non-public data, or repair schema drift.
+Use `--reset` to diagnose schema-dependent failures.
+
+Cleanup requires the **exact** `supabase_db_<integration-project>` container name,
+recorded Docker ID, project label, running/unpaused state, and reserved DB port.
+SQL executes inside that immutable container ID over an explicit local socket,
+never via an inherited connection URL. `current_database() = 'postgres'` is also
+required, but is only a typo guard: application stacks can share that SQL name.
+The additional `_pcp_it.stack` row, installed only after a managed reset, must match
+the project, full container ID, fingerprint, and random token **in the same
+transaction** before cleanup. Missing or mismatching identity refuses; do not
+create this marker by hand to force adoption.
+
+The DB marker also records an in-progress run independently of schema readiness.
+It is cleared only by that run after success; failures/interrupts preserve it and
+the dirty database for investigation. `run.json` in the workdir is an additional
+diagnostic during startup/reset, not an ownership lock. The next owner cleans on
+acquire even when the previous run died without cleanup. Baseline SQL stays in the
+private cache, integrity-checked against its recorded hash. Never copy a baseline
+or state file from another stack.
+
 A fingerprint covers migration/seed SQL, config, exclusions, and CLI version; a
 mismatch refuses reuse with an explicit reset/stop instruction rather than silently
 running against another branch's schema. It does not detect arbitrary SQL changes
