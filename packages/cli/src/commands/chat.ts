@@ -2596,6 +2596,48 @@ function sanitizeArgsForApproval(tool: string, args: Record<string, unknown>): s
   }
 }
 
+/**
+ * Ask the user a yes/no question from inside a slash command.
+ *
+ * There are three input surfaces and only one of them is `rl`. Every other
+ * in-command question already dispatches over all three, via
+ * `promptForToolApproval`; the eviction confirm reached for `rl` directly
+ * behind a `!`, and `rl` is null on the Ink path — so a large `/evict` in the
+ * TUI threw on `null.question` and took `runChat` down with it before cleanup
+ * (Lumen, PR #653). Anything that asks a question belongs here.
+ *
+ * `priority` because a background turn's approval prompt may already hold the
+ * standing reader; the slot hands the line back afterwards.
+ *
+ * No input surface at all — JSONL, non-interactive — answers NO. A removal
+ * that cannot be confirmed is not confirmed; `--force` is how a caller with
+ * nobody to ask says yes.
+ */
+async function promptYesNo(
+  question: string,
+  rl: ReturnType<typeof createInterface> | null,
+  inkRepl?: InkRepl | null
+): Promise<boolean> {
+  let answer: string;
+  if (inkRepl) {
+    inkRepl.addMessage('system', `${question} [y/N]`, { label: '⚠️  confirm' });
+    try {
+      answer = (await inkRepl.waitForInput({ priority: true })).trim();
+    } catch (error) {
+      // Exit requested mid-question: cancel rather than propagate. The REPL
+      // loop's own waitForInput rejects with the same sticky signal on the
+      // next pass and exits cleanly there.
+      if (error instanceof InkExitSignal) return false;
+      throw error;
+    }
+  } else if (rl) {
+    answer = (await rl.question(chalk.yellow(`${question} [y/N]: `))).trim();
+  } else {
+    return false;
+  }
+  return ['y', 'yes'].includes(answer.toLowerCase());
+}
+
 async function promptForToolApproval(
   rl: ReturnType<typeof createInterface> | null,
   toolPolicy: ToolPolicyState,
@@ -5712,8 +5754,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         const from = msg.from || 'unknown';
         const heading = msg.subject ? `${from} — ${msg.subject}` : from;
         const rendered = `📥 ${heading}: ${msg.content}`.trim();
-        ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-        appendTranscript(runtime.transcriptPath, {
+        const inboxEid = appendTranscript(runtime.transcriptPath, {
           type: 'inbox',
           messageId: msg.id,
           rendered,
@@ -5722,6 +5763,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           messageType: msg.messageType || null,
           relatedSessionId: msg.relatedSessionId || null,
         });
+        ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail', inboxEid);
       }
       if (inkRepl) {
         // Show one-line summaries for each collapsed message
@@ -5765,8 +5807,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
       }
       const rendered = `📥 ${heading}${delegationLabel}: ${msg.content}`.trim();
-      ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-      appendTranscript(runtime.transcriptPath, {
+      const inboxEid = appendTranscript(runtime.transcriptPath, {
         type: 'inbox',
         messageId: msg.id,
         rendered,
@@ -5775,6 +5816,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         messageType: msg.messageType || null,
         relatedSessionId: msg.relatedSessionId || null,
       });
+      ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail', inboxEid);
       if (inkRepl) {
         // Emoji in label, clean content without emoji prefix
         const inboxContent = `${heading}${delegationLabel}: ${msg.content}`.trim();
@@ -6990,16 +7032,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // typed while another turn is in flight must appear immediately, not when
     // the queue reaches it. Ledger/transcript appends stay here, sequenced
     // with the turn.
+    // Transcript first, so the ledger entry carries the eid of the event it
+    // will hydrate from. An entry without one is addressable only by content
+    // hash, and content is not unique — two identical messages could not be
+    // told apart across reattach (Lumen, PR #653).
     if (source === 'user') {
-      ledger.addEntry('user', raw, 'repl');
-      appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+      const eid = appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+      ledger.addEntry('user', raw, 'repl', eid);
     } else if (source === 'system') {
       // Synthetic turn input: heartbeat triggers, server-delivered messages,
       // continuation prompts. Recorded as system (not "you") so transcripts
       // distinguish harness prompts from the human's words.
       const label = displayLabel || 'system';
-      ledger.addEntry('system', raw, label);
-      appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
+      const eid = appendTranscript(runtime.transcriptPath, {
+        type: 'system_turn',
+        content: raw,
+        label,
+      });
+      ledger.addEntry('system', raw, label, eid);
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${raw}`, 500), 'auto-run');
       appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
@@ -7778,8 +7828,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         usage: runResult.usage || null,
       });
     } else {
-      ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-      appendTranscript(runtime.transcriptPath, {
+      const assistantEid = appendTranscript(runtime.transcriptPath, {
         type: 'assistant',
         backend: runtime.backend,
         model: runtime.model || null,
@@ -7792,6 +7841,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         approxTokens: estimateTokens(assistantDisplayText),
         usage: runResult.usage || null,
       });
+      ledger.addEntry('assistant', assistantDisplayText, runtime.backend, assistantEid);
     }
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
@@ -9795,10 +9845,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               `About to evict ${matched.length} entries (~${matchedTokens.toLocaleString()} tok).`,
               ...(previewLines.length ? ['Recent entries in range:', ...previewLines] : []),
             ]);
-            const confirm = (await rl!.question(chalk.yellow('Proceed with eviction? [y/N]: ')))
-              .trim()
-              .toLowerCase();
-            if (!['y', 'yes'].includes(confirm)) {
+            if (!(await promptYesNo('Proceed with eviction?', rl, inkRepl))) {
               showInPanel(['Eviction cancelled.']);
               break;
             }

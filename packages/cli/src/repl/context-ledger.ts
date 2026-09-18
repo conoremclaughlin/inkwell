@@ -132,8 +132,8 @@ export class ContextLedger {
 
   /**
    * Find entry IDs matching persistent eviction refs. Matches by eid when
-   * the ref carries one (precise), otherwise by content hash (legacy /
-   * live entries — identical role+content duplicates match together).
+   * the ref carries one (precise), otherwise by content hash — bounded to as
+   * many entries as there were refs.
    */
   public findEntriesByRefs(refs: Array<{ eid?: number; hash?: string }>): number[] {
     // Three kinds of ref, three rules. A ref that carries a hash ENFORCES it:
@@ -141,23 +141,37 @@ export class ContextLedger {
     // later event both hydrate with it), so matching by eid alone whenever
     // one was present turned a hash-selected eviction back into an eid
     // eviction on replay — the neighbour went with the target (Lumen, PR
-    // #582). Eid-only refs keep their legacy behaviour; hash-only refs match
-    // by content wherever it sits.
+    // #582). Eid-only refs keep their legacy behaviour.
+    //
+    // Hash-only refs are COUNTED, not set-matched. Content is not a unique
+    // key: send the same message twice and both entries share a hash, so a
+    // set removed every copy on replay no matter how many the eviction
+    // actually took. Evicting one of two identical messages dropped the
+    // survivor too — it existed live, and came back missing (Lumen, PR #653).
+    // One ref is written per removed entry, so the ref count IS the number
+    // evicted; spending a budget per hash replays that multiplicity.
+    //
+    // Which copy gets spent is ledger order, oldest first, because that is
+    // what an eviction back to a bookmark removed. A ref that must name an
+    // exact occurrence carries an eid — that is what eids are for, and live
+    // entries from transcript-backed events now carry theirs.
     const eidOnly = new Set(
       refs.filter((r) => typeof r.eid === 'number' && typeof r.hash !== 'string').map((r) => r.eid!)
     );
-    const hashOnly = new Set(
-      refs
-        .filter((r) => typeof r.eid !== 'number' && typeof r.hash === 'string')
-        .map((r) => r.hash!)
-    );
+    const hashOnlyBudget = new Map<string, number>();
+    for (const ref of refs) {
+      if (typeof ref.eid === 'number' || typeof ref.hash !== 'string') continue;
+      hashOnlyBudget.set(ref.hash, (hashOnlyBudget.get(ref.hash) ?? 0) + 1);
+    }
     const both = refs.filter((r) => typeof r.eid === 'number' && typeof r.hash === 'string');
     const ids: number[] = [];
     for (const entry of this.entries) {
       const hash = entryRefHash(entry.role, entry.content);
+      const budget = hashOnlyBudget.get(hash) ?? 0;
       if (entry.eid !== undefined && eidOnly.has(entry.eid)) {
         ids.push(entry.id);
-      } else if (hashOnly.has(hash)) {
+      } else if (budget > 0) {
+        hashOnlyBudget.set(hash, budget - 1);
         ids.push(entry.id);
       } else if (both.some((r) => r.eid === entry.eid && r.hash === hash)) {
         ids.push(entry.id);

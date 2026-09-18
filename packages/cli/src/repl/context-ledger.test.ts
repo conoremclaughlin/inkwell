@@ -214,6 +214,68 @@ describe('ContextLedger', () => {
     });
   });
 
+  describe('findEntriesByRefs — hash-only refs are counted, not set-matched (Lumen, PR #653)', () => {
+    // Entries that never carried an eid — a pre-eid transcript, or history
+    // loaded from the server rather than the transcript — are addressable
+    // only by content hash, and content is not a unique key.
+    it('REGRESSION: one ref over two identical entries selects one, not both', () => {
+      const ledger = new ContextLedger();
+      const first = ledger.addEntry('user', 'repeated message');
+      const second = ledger.addEntry('user', 'repeated message');
+      const ids = ledger.findEntriesByRefs([{ hash: entryRefHash('user', 'repeated message') }]);
+      expect(ids).toEqual([first.id]);
+      expect(ids).not.toContain(second.id);
+    });
+
+    it('spends one ref per entry, so evicting both copies still takes both', () => {
+      const ledger = new ContextLedger();
+      const first = ledger.addEntry('user', 'repeated message');
+      const second = ledger.addEntry('user', 'repeated message');
+      const hash = entryRefHash('user', 'repeated message');
+      expect(ledger.findEntriesByRefs([{ hash }, { hash }])).toEqual([first.id, second.id]);
+    });
+
+    it('a budget larger than the ledger is not an error — it matches what is there', () => {
+      const ledger = new ContextLedger();
+      const only = ledger.addEntry('user', 'repeated message');
+      const hash = entryRefHash('user', 'repeated message');
+      expect(ledger.findEntriesByRefs([{ hash }, { hash }, { hash }])).toEqual([only.id]);
+    });
+
+    it('budgets are per hash — one hash running out does not consume another', () => {
+      const ledger = new ContextLedger();
+      const dupA = ledger.addEntry('user', 'alpha');
+      ledger.addEntry('user', 'alpha');
+      const beta = ledger.addEntry('user', 'beta');
+      const ids = ledger.findEntriesByRefs([
+        { hash: entryRefHash('user', 'alpha') },
+        { hash: entryRefHash('user', 'beta') },
+      ]);
+      expect(ids).toEqual([dupA.id, beta.id]);
+    });
+
+    it('role is part of the key, so identical text in another role is untouched', () => {
+      const ledger = new ContextLedger();
+      const asUser = ledger.addEntry('user', 'same words');
+      const asAssistant = ledger.addEntry('assistant', 'same words');
+      const ids = ledger.findEntriesByRefs([{ hash: entryRefHash('user', 'same words') }]);
+      expect(ids).toEqual([asUser.id]);
+      expect(ids).not.toContain(asAssistant.id);
+    });
+
+    it('an eid ref still names its exact occurrence among identical copies', () => {
+      // The precision the budget cannot give: which of two identical entries.
+      // Live entries from transcript-backed events carry their eid for this.
+      const ledger = new ContextLedger();
+      ledger.addEntry('user', 'repeated message', 'repl', 4);
+      const later = ledger.addEntry('user', 'repeated message', 'repl', 9);
+      const ids = ledger.findEntriesByRefs([
+        { eid: 9, hash: entryRefHash('user', 'repeated message') },
+      ]);
+      expect(ids).toEqual([later.id]);
+    });
+  });
+
   describe('compactEntriesToSummary (by id — Lumen, PR #578)', () => {
     it('REGRESSION: an entry appended while the summarizer ran survives, and the protected tail is untouched', () => {
       const ledger = new ContextLedger();

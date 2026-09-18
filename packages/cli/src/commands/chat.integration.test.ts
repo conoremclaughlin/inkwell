@@ -6,6 +6,13 @@ import { mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
+  /**
+   * A stand-in InkRepl. Left undefined, `renderInkChat` returns nothing and
+   * the REPL takes its legacy readline path, which is what every case here
+   * but the TUI ones wants. Set it to exercise the Ink surface — where `rl`
+   * is null, so anything reaching for it directly throws.
+   */
+  ink: undefined as Record<string, unknown> | undefined,
   pcpCalls: [] as Array<{ tool: string; args: Record<string, unknown> }>,
   identity: { studioId: 'studio-test' } as { studioId?: string },
   callToolImpl: vi.fn(),
@@ -68,8 +75,18 @@ vi.mock('../repl/skills.js', () => ({
     testState.loadSkillInstructionImpl(skill, maxChars),
 }));
 
+// `renderInkChat` is NOT async in production, and chat.ts does not await it —
+// an `async () => null` stub handed back a Promise, so `useInk` cases got an
+// object with none of the InkRepl methods on it. Returning testState.ink
+// directly is what lets a case exercise the Ink surface at all; undefined
+// (the default) keeps every other case on the legacy readline path.
+// The picker throws rather than stubbing a choice: cases pass `new: true` to
+// skip it, and a silent default would pick a branch on their behalf.
 vi.mock('../repl/ink/index.js', () => ({
-  renderInkChat: async () => null,
+  renderInkChat: () => testState.ink ?? null,
+  renderSessionPicker: () => {
+    throw new Error('renderSessionPicker reached — pass `new: true` to skip the session picker');
+  },
   InkExitSignal: class InkExitSignal extends Error {},
 }));
 
@@ -116,6 +133,7 @@ describe('runChat integration', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-02-27T00:00:00.000Z'));
     testState.inputs = [];
+    testState.ink = undefined;
     testState.pcpCalls = [];
     testState.identity = { studioId: 'studio-test' };
     testState.callToolImpl.mockReset();
@@ -2431,28 +2449,6 @@ describe('runChat integration', () => {
 
   it('control: without a bookmark eviction the entry is present after reattach', async () => {
     const { survived } = await bookmarkEvictionCase([]);
-    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
-    const files = readdirSync(replDir);
-    process.stderr.write(
-      'PROBE-FILES ' +
-        JSON.stringify(
-          files.map((f) => ({
-            f,
-            lines: readFileSync(join(replDir, f), 'utf-8').split('\n').filter(Boolean).length,
-            types: readFileSync(join(replDir, f), 'utf-8')
-              .split('\n')
-              .filter(Boolean)
-              .map((l) => {
-                try {
-                  return JSON.parse(l).type;
-                } catch {
-                  return '?';
-                }
-              }),
-          }))
-        ) +
-        '\n'
-    );
     expect(survived).toBe(true);
   });
 
@@ -2482,6 +2478,187 @@ describe('runChat integration', () => {
     const match = logText.match(/Would evict (\d+) entries \(~([\d,]+) tok\)/);
     expect(match, 'expected a dry-run summary line').toBeTruthy();
     expect(Number(match![2].replace(/,/g, ''))).toBeGreaterThanOrEqual(1750);
+  });
+
+  // ── Review findings, PR #653 (Lumen) ──
+
+  // The confirmation has three possible input surfaces and `rl` is only one of
+  // them. Asking through `rl` directly threw on the Ink path, where it is null,
+  // and took runChat down before cleanup — reachable by any /evict big enough
+  // to prompt, which is the case the confirmation exists for.
+  it('REGRESSION: a large eviction can be asked and cancelled in the Ink TUI', async () => {
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    const noop = () => undefined;
+    // Ink output does not go to console.log — it goes to these. Collect it, or
+    // the assertion reads an empty stream and passes for the wrong reason.
+    const inkOutput: string[] = [];
+    const record = (...parts: unknown[]) => {
+      inkOutput.push(
+        parts.map((part) => (Array.isArray(part) ? part.join('\n') : String(part))).join(' ')
+      );
+    };
+    testState.ink = {
+      waitForInput: async () => {
+        const next = testState.inputs.shift();
+        if (next === undefined) throw new Error('No scripted input left for Ink waitForInput');
+        return next;
+      },
+      addMessage: (_role: unknown, content: unknown) => record(content),
+      printSystem: record,
+      printEvent: record,
+      setCommandOutput: record,
+      setStatus: noop,
+      setWaiting: noop,
+      setInfoItems: noop,
+      setAbortHandler: noop,
+      setSurfacedMemories: noop,
+      showContextView: noop,
+      requestExit: noop,
+      cleanup: noop,
+      handle: { setCtrlOHandler: noop, setCtrlTHandler: noop },
+    };
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+    testState.inputs = ['x'.repeat(7000), '/evict role:user', 'n', '/quit'];
+    try {
+      await expect(
+        runChat({ agent: 'lumen', backend: 'claude', new: true, pollSeconds: '999' })
+      ).resolves.toBeUndefined();
+      const text = stripAnsi(inkOutput.join('\n'));
+      // Asked on the Ink surface, and the scripted "n" was read as the answer.
+      expect(text).toContain('Proceed with eviction?');
+      expect(text).toContain('Eviction cancelled');
+      // Cancelled means cancelled: the entry is still there.
+      expect(text).not.toContain('🗑 evicted');
+    } finally {
+      if (tty) Object.defineProperty(process.stdout, 'isTTY', tty);
+      else delete (process.stdout as unknown as { isTTY?: boolean }).isTTY;
+      testState.ink = undefined;
+    }
+  });
+
+  it('a large eviction confirmed with y in the Ink TUI goes through', async () => {
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    const noop = () => undefined;
+    const inkOutput: string[] = [];
+    const record = (...parts: unknown[]) => {
+      inkOutput.push(
+        parts.map((part) => (Array.isArray(part) ? part.join('\n') : String(part))).join(' ')
+      );
+    };
+    testState.ink = {
+      waitForInput: async () => {
+        const next = testState.inputs.shift();
+        if (next === undefined) throw new Error('No scripted input left for Ink waitForInput');
+        return next;
+      },
+      addMessage: (_role: unknown, content: unknown) => record(content),
+      printSystem: record,
+      printEvent: record,
+      setCommandOutput: record,
+      setStatus: noop,
+      setWaiting: noop,
+      setInfoItems: noop,
+      setAbortHandler: noop,
+      setSurfacedMemories: noop,
+      showContextView: noop,
+      requestExit: noop,
+      cleanup: noop,
+      handle: { setCtrlOHandler: noop, setCtrlTHandler: noop },
+    };
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+    testState.inputs = ['x'.repeat(7000), '/evict role:user', 'y', '/quit'];
+    try {
+      await runChat({ agent: 'lumen', backend: 'claude', new: true, pollSeconds: '999' });
+      const text = stripAnsi(inkOutput.join('\n'));
+      expect(text).toContain('Proceed with eviction?');
+      expect(text).toContain('🗑 evicted');
+      expect(text).not.toContain('Eviction cancelled');
+    } finally {
+      if (tty) Object.defineProperty(process.stdout, 'isTTY', tty);
+      else delete (process.stdout as unknown as { isTTY?: boolean }).isTTY;
+      testState.ink = undefined;
+    }
+  });
+
+  // Content is not a unique key. Two identical messages either side of a
+  // bookmark produce one eviction ref and two matching entries, so replay
+  // removed the survivor along with the target: it was there live and came
+  // back missing. The control below is what makes the count mean anything —
+  // without the eviction, hydration holds both copies.
+  const repeatedMessageCase = async (inputs: string[]) => {
+    testState.inputs = [
+      'repeated message',
+      '/bookmark boundary',
+      'repeated message',
+      ...inputs,
+      '/quit',
+    ];
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptPath = join(
+      replDir,
+      readdirSync(replDir).find((entry) => entry.endsWith('.jsonl'))!
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    return ledger
+      .listEntries()
+      .filter((entry) => entry.role === 'user')
+      .map((entry) => entry.content);
+  };
+
+  it('control: without an eviction both identical copies survive reattach', async () => {
+    expect(await repeatedMessageCase([])).toEqual(['repeated message', 'repeated message']);
+  });
+
+  it.each([['/evict bookmark:boundary --force'], ['/eject boundary --force']])(
+    'REGRESSION: %s keeps the identical message after the bookmark',
+    async (command) => {
+      expect(await repeatedMessageCase([command])).toEqual(['repeated message']);
+    }
+  );
+
+  // The precision above rests on live entries carrying the eid of the event
+  // they will hydrate from, which only helps while the two agree on content:
+  // a ref carries eid AND hash, and the hash is enforced, so a divergence
+  // makes the eviction match nothing on replay instead of too much. Pin the
+  // agreement rather than assume it — `clone_fanout` does NOT have it (live
+  // collapses whitespace, hydration truncates raw), which is why its entries
+  // are deliberately not wired.
+  it('live ledger entries agree with their hydrated twin on eid and content', async () => {
+    testState.inputs = ['a user message', '/quit'];
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptPath = join(
+      replDir,
+      readdirSync(replDir).find((entry) => entry.endsWith('.jsonl'))!
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const byEid = new Map(
+      ledger
+        .listEntries()
+        .filter((entry) => entry.eid !== undefined)
+        .map((entry) => [entry.eid!, entry])
+    );
+    const events = readFileSync(transcriptPath, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+    // The user turn and the assistant reply both hydrate, and both are wired.
+    const userEvent = events.find((event) => event.type === 'user')!;
+    const assistantEvent = events.find((event) => event.type === 'assistant')!;
+    expect(userEvent, 'expected a user event with an eid').toBeTruthy();
+    expect(assistantEvent, 'expected an assistant event with an eid').toBeTruthy();
+
+    for (const event of [userEvent, assistantEvent]) {
+      const hydrated = byEid.get(event.eid as number);
+      expect(hydrated, `no hydrated entry for eid ${event.eid} (${event.type})`).toBeTruthy();
+      expect(hydrated!.content).toBe(event.content);
+    }
   });
 
   it('sends delegated inbox message with signed token metadata', async () => {
