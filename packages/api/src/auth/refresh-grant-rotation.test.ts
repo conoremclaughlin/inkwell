@@ -101,6 +101,8 @@ function makeGrantStore(initial: Row) {
    * the row BEFORE the winner wrote and tried to write AFTER.
    */
   let zeroRowUpdates = 0;
+  /** Row lookups, by the column each one filtered on. */
+  const lookups: string[] = [];
 
   const matches = (candidate: Row, filters: Array<[string, unknown]>) =>
     filters.every(([col, val]) => candidate[col] === val);
@@ -143,6 +145,7 @@ function makeGrantStore(initial: Row) {
         return chain;
       });
       chain.single = vi.fn(async () => {
+        lookups.push(filters.map(([col]) => col).join('+'));
         if (row && matches(row, filters)) return { data: { ...row }, error: null };
         return { data: null, error: { code: 'PGRST116', message: 'no rows' } };
       });
@@ -154,6 +157,7 @@ function makeGrantStore(initial: Row) {
     client,
     current: () => row,
     zeroRowUpdates: () => zeroRowUpdates,
+    lookups: () => [...lookups],
     /** Block every update until the returned function is called. */
     holdUpdates(): () => void {
       let release!: () => void;
@@ -650,6 +654,22 @@ describe('exchangeRefreshToken — retry overlap', () => {
 
     expect(await exchange(store.client, 'pcp-rt-A', 0)).toBeNull();
     expect(store.current()!.refresh_token).toBe(first!.refreshToken);
+  });
+
+  it('does not even look for a predecessor when the overlap is disabled', async () => {
+    // Refusing and refusing-without-asking are different, and only the second
+    // justifies the early return that produces it. Without this the branch
+    // could be deleted with every other test still green, because the policy
+    // function refuses a zero window anyway — a guard nothing can distinguish
+    // from its absence is decoration.
+    const store = makeGrantStore(storeRow());
+    await exchange(store.client, 'pcp-rt-A', 0);
+
+    const before = store.lookups().length;
+    expect(await exchange(store.client, 'pcp-rt-A', 0)).toBeNull();
+
+    // Exactly one lookup, on the live secret. No second query for a predecessor.
+    expect(store.lookups().slice(before)).toEqual(['refresh_token']);
   });
 
   it('honours a retry right at the edge of the window and refuses one just past it', async () => {

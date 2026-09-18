@@ -321,27 +321,33 @@ export async function getValidAccessToken(
     // shared by every CLI process on this machine, and the grant rotates: if
     // another process refreshed while we were in flight, the secret we
     // presented is the one IT retired, and the file already holds the live
-    // successor. Re-read before concluding anything.
-    const current = loadAuth();
-    if (current && current.refresh_token !== auth.refresh_token) {
-      // Someone else won. Their result is the answer.
-      if (!isTokenExpired(current)) return current.access_token;
-      try {
-        const refreshed = await refreshAccessToken(serverUrl, current);
-        saveAuth(refreshed);
-        return refreshed.access_token;
-      } catch {
-        // Their secret failed too, but it is not ours to delete — we never
-        // held it, and a third process may be mid-rotation with it right now.
-        return null;
-      }
-    }
+    // successor.
+    //
+    // ONE decision, made by the compare-and-delete. If the file still holds
+    // what we presented, the failure is the grant's own — revoked, or past its
+    // deadline — and clearing it is right. If it does not, the rotation was
+    // someone else's success and the file is not ours to touch.
+    //
+    // Deciding it here rather than with a separate read is deliberate: two
+    // comparisons would mean the guarded delete could never behave differently
+    // from an unguarded one, which makes it decoration. This way, weakening it
+    // to an unconditional clearAuth() deletes the winner's credential and the
+    // regression for that says so.
+    if (clearAuthIfUnchanged(auth.refresh_token)) return null;
 
-    // The file still holds the secret we presented, so the failure is the
-    // grant's own: revoked, or past its deadline. Clear it — but conditionally,
-    // so a rotation landing in the meantime survives.
-    clearAuthIfUnchanged(auth.refresh_token);
-    return null;
+    // Someone else won. Their result is the answer.
+    const current = loadAuth();
+    if (!current) return null;
+    if (!isTokenExpired(current)) return current.access_token;
+    try {
+      const refreshed = await refreshAccessToken(serverUrl, current);
+      saveAuth(refreshed);
+      return refreshed.access_token;
+    } catch {
+      // Their secret failed too, but it is still not ours to delete — we never
+      // held it, and a third process may be mid-rotation with it right now.
+      return null;
+    }
   }
 }
 
