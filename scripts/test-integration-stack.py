@@ -123,6 +123,22 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.count("capture-baseline"), 1)
         self.assertEqual(self.count("clean-fixtures"), 1)
 
+    def test_cleanup_policy_change_refuses_cached_baseline_until_reset(self):
+        self.run_stack()
+        previous = self.state()["fingerprint"]
+        self.calls.clear()
+        with mock.patch.object(stack, "POLICY", stack.POLICY + ":synthetic-next-policy"):
+            with self.assertRaisesRegex(stack.Refusal, "--reset"):
+                self.run_stack()
+            self.assertEqual(self.count("clean-fixtures"), 0)
+            self.assertEqual(self.count("bash"), 0)
+            self.assertEqual(self.state()["fingerprint"], previous)
+            self.assertEqual(self.run_stack("--reset"), 0)
+            self.assertNotEqual(self.state()["fingerprint"], previous)
+            self.assertEqual(self.count("capture-baseline"), 1)
+            self.assertEqual(self.run_stack(), 0)
+            self.assertEqual(self.count("clean-fixtures"), 1)
+
     def test_cold_and_reset_capture_baseline_before_tests_without_truncating(self):
         self.run_stack()
         self.run_stack("--reset")

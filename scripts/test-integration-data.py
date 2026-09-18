@@ -232,6 +232,13 @@ class DataTests(unittest.TestCase):
         self.assertLess(update.index("Fixture stack identity mismatch"), update.index("UPDATE _pcp_it.stack"))
         self.assertIn("run_id = " + data.literal(self.run_id), self.mutations()[0])
 
+    def test_checksum_queries_do_not_depend_on_dump_search_path(self):
+        sql = data.checksum_guard(data.FIXTURE_TABLES + data.EXCLUDED_TABLES)
+        for table in data.FIXTURE_TABLES + data.EXCLUDED_TABLES:
+            with self.subTest(table=table):
+                self.assertIn("FROM public." + table + " AS t", sql)
+        self.assertIn("FROM _pcp_it.stack", sql)
+
     def test_excluded_and_full_checksums_bracket_the_mutation(self):
         self.clean()
         sql = self.mutations()[0]
