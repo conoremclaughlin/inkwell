@@ -1154,9 +1154,15 @@ describe('adminAuthMiddleware — Tier 2 refusals that must not end the session'
     mockVerifyPcpAccessToken.mockReturnValue(null);
   });
 
-  const requestWithStaleCookie = () =>
+  /** A bearer shaped like one WE issued — a real JWT with a PCP `type`. */
+  const pcpBearer = () => {
+    const part = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    return `${part({ alg: 'HS256' })}.${part({ type: 'pcp_admin', sub: 'user-1' })}.sig`;
+  };
+
+  const requestWithStaleCookie = (authorization = `Bearer ${pcpBearer()}`) =>
     createMockReq({
-      headers: { authorization: 'Bearer some-bearer' },
+      headers: { authorization },
       cookies: { 'pcp-admin-refresh': 'pcp-rt-one-generation-behind' },
     });
 
@@ -1205,6 +1211,52 @@ describe('adminAuthMiddleware — Tier 2 refusals that must not end the session'
 
     expect(res._status).toBe(401);
     expect(res._json).toEqual({ error: 'Invalid token' });
+  });
+
+  it('does not refuse a caller whose own bearer was never checked', async () => {
+    // A browser can arrive with a genuine SUPABASE token AND a stale refresh
+    // cookie — signed in again while an old cookie was still on the jar. Tier 3
+    // can authenticate that request. Answering it from the cookie's problem
+    // refuses a credential nobody had yet looked at.
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({ status: 'superseded' });
+    mockGetUser.mockResolvedValue({
+      data: { user: { id: 'sb-1', email: 'tester@example.invalid' } },
+      error: null,
+    });
+    mockSupabaseFrom.mockReturnValue({
+      select: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+      single: vi.fn().mockResolvedValue({ data: { id: 'user-1' }, error: null }),
+      update: vi.fn().mockReturnThis(),
+    });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie('Bearer not-a-pcp-jwt'), res, next);
+
+    expect(mockGetUser).toHaveBeenCalled();
+    expect(res._status).not.toBe(401);
+  });
+
+  it('does not refuse an unchecked bearer when the grant could not be checked either', async () => {
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({ status: 'unavailable' });
+    mockGetUser.mockResolvedValue({
+      data: { user: { id: 'sb-1', email: 'tester@example.invalid' } },
+      error: null,
+    });
+    mockSupabaseFrom.mockReturnValue({
+      select: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+      single: vi.fn().mockResolvedValue({ data: { id: 'user-1' }, error: null }),
+      update: vi.fn().mockReturnThis(),
+    });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie('Bearer not-a-pcp-jwt'), res, next);
+
+    expect(mockGetUser).toHaveBeenCalled();
+    expect(res._status).not.toBe(503);
   });
 
   it('lets a rotation through untouched', async () => {

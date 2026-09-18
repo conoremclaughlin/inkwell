@@ -1070,14 +1070,25 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         // back" is the only honest answer, and because a 401 of any shape
         // invites the client to conclude something about a credential nobody
         // checked.
-        if (outcome.status === 'superseded') {
+        //
+        // Both refusals are conditional on the bearer being one of OURS, and
+        // that condition is load-bearing rather than defensive. A request can
+        // arrive with a genuine SUPABASE access token AND a stale refresh
+        // cookie — a browser that just signed in again while an old cookie was
+        // still on the jar. Tier 3 can authenticate that request perfectly
+        // well, and answering it here would refuse a caller holding a
+        // credential nobody had yet looked at. The cookie's problem is not the
+        // bearer's problem.
+        const bearerIsOurs = isPcpIssuedJwt(token);
+
+        if (bearerIsOurs && outcome.status === 'superseded') {
           logger.warn('Admin refresh cookie is a superseded generation; not ending the session', {
             path: req.path,
           });
           res.status(401).json({ error: 'Stale credential' });
           return;
         }
-        if (outcome.status === 'unavailable') {
+        if (bearerIsOurs && outcome.status === 'unavailable') {
           logger.error('Admin refresh exchange could not be completed', { path: req.path });
           res.status(503).json({ error: 'Authentication temporarily unavailable' });
           return;
