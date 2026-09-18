@@ -93,25 +93,34 @@ def checked_container(project, recorded_id, db_port):
 def db_command(container_id, tool):
     # Pin the immutable ID, never resolve the name again at the mutation boundary.
     # Explicit socket/user/port/db defeat container-side libpq defaults as well.
-    return ["docker", "exec", "-i", "-e", "PGOPTIONS=", "-e", "PGSERVICE=",
-            container_id, tool, "--host=/var/run/postgresql", "--port=5432",
+    # An empty PGSERVICE is NOT unset: libpq tries to resolve service "".
+    return ["docker", "exec", "-i", container_id, "env", "-u", "PGOPTIONS",
+            "-u", "PGSERVICE", "-u", "PGSERVICEFILE", tool,
+            "--host=/var/run/postgresql", "--port=5432",
             "--username=postgres", "--dbname=" + DATABASE, "--no-password"]
 
 
-def execute(container_id, tool, args, lock_fds, sql=None):
+def execute(container_id, tool, args, lock_fds, sql=None, phase="SQL operation"):
     try:
-        return subprocess.run(db_command(container_id, tool) + args, input=sql,
+        diagnostics = ["-v", "VERBOSITY=sqlstate"] if tool == "psql" else []
+        return subprocess.run(db_command(container_id, tool) + diagnostics + args, input=sql,
                               capture_output=True, text=True, check=True, timeout=60,
                               pass_fds=lock_fds).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
         # Never echo SQL, dump contents, connection strings or subprocess stderr.
-        raise Refusal("Fixture data preparation failed; suite not started. State/marker preserved; "
+        detail = type(error).__name__
+        if isinstance(error, subprocess.CalledProcessError):
+            detail += " exit=" + str(error.returncode)
+            sqlstate = re.search(r"ERROR:\s+([0-9A-Z]{5})\s*(?:\n|$)", error.stderr or "")
+            if sqlstate:
+                detail += " SQLSTATE=" + sqlstate[1]
+        raise Refusal("Fixture " + phase + " failed (" + detail + "); operation stopped. State/marker preserved; "
                       "verify ownership, then use --reset if recovery is needed.") from None
 
 
 def verify_database(container_id, lock_fds):
     name = execute(container_id, "psql", ["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-f", "-"],
-                   lock_fds, "SELECT current_database();\n").strip()
+                   lock_fds, "SELECT current_database();\n", phase="database-name probe").strip()
     if name != DATABASE:
         raise Refusal("Refusing fixture cleanup: exact database name does not match postgres.")
 
@@ -122,7 +131,8 @@ def literal(value):
 
 def verify_catalog(container_id, lock_fds):
     output = execute(container_id, "psql", ["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-f", "-"],
-                     lock_fds, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;\n")
+                     lock_fds, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;\n",
+                     phase="catalog probe")
     actual = set(output.splitlines())
     expected = set(FIXTURE_TABLES + EXCLUDED_TABLES)
     if actual != expected:
@@ -160,9 +170,9 @@ def identity_guard(project, container_id, signature, token, run_id=None):
                             "RAISE EXCEPTION 'Fixture stack identity mismatch'; END IF; END $identity$;\n")
 
 
-def transaction(container_id, sql, lock_fds):
+def transaction(container_id, sql, lock_fds, phase="transaction"):
     return execute(container_id, "psql", ["-X", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-f", "-"],
-                   lock_fds, "SET TIME ZONE 'UTC';\nSET lock_timeout = '5s';\n" + sql)
+                   lock_fds, "SET TIME ZONE 'UTC';\nSET lock_timeout = '5s';\n" + sql, phase=phase)
 
 
 def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature, run_id):
@@ -171,7 +181,8 @@ def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature
     verify_database(container_id, lock_fds)
     verify_catalog(container_id, lock_fds)
     checksums = execute(container_id, "psql", ["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-f", "-"],
-                        lock_fds, "SET TIME ZONE 'UTC';\nSELECT " + checksum_expression(FIXTURE_TABLES + EXCLUDED_TABLES) + ";\n")
+                        lock_fds, "SET TIME ZONE 'UTC';\nSELECT " + checksum_expression(FIXTURE_TABLES + EXCLUDED_TABLES) + ";\n",
+                        phase="cold checksum capture")
     # psql emits SET even in tuples-only mode. The final line is the JSON row.
     try:
         checksums = json.loads(checksums.strip().splitlines()[-1])
@@ -180,10 +191,10 @@ def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature
     except (ValueError, IndexError, TypeError):
         raise Refusal("Could not record the cold fixture baseline checksums.") from None
     args = ["--data-only", "--column-inserts", "--disable-triggers", "--no-owner",
-            "--no-privileges", "--no-comments", "--strict-names", "--no-large-objects"]
+            "--no-privileges", "--no-comments", "--strict-names", "--no-blobs"]
     for table in FIXTURE_TABLES:
         args += ["--table=public." + table]
-    baseline = execute(container_id, "pg_dump", args, lock_fds)
+    baseline = execute(container_id, "pg_dump", args, lock_fds, phase="baseline dump")
     if not baseline.strip() or len(baseline.encode()) > 10 * 1024 * 1024:
         raise Refusal("Unexpected fixture baseline size; refusing to mark this stack ready.")
     path = workdir / BASELINE_FILE
@@ -204,7 +215,8 @@ CREATE TABLE IF NOT EXISTS _pcp_it.stack (
 );
 DELETE FROM _pcp_it.stack;
 INSERT INTO _pcp_it.stack VALUES (true, """ + ", ".join(map(literal, (
-        project, container_id, signature, token, json.dumps(checksums), run_id))) + ", now());\n", lock_fds)
+        project, container_id, signature, token, json.dumps(checksums), run_id))) + ", now());\n", lock_fds,
+                phase="marker initialization")
     return {"hash": hashlib.sha256(baseline.encode()).hexdigest(), "token": token}
 
 
@@ -222,7 +234,7 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     guard = identity_guard(project, container_id, signature, baseline_state["token"])
     # Commit the diagnostic marker BEFORE cleanup; failed cleanup/suite leaves it.
     transaction(container_id, guard + "UPDATE _pcp_it.stack SET run_id = " + literal(run_id) +
-                "::uuid, started_at = now();\n", lock_fds)
+                "::uuid, started_at = now();\n", lock_fds, phase="run marker acquisition")
     guard = identity_guard(project, container_id, signature, baseline_state["token"], run_id)
     # ONLY excludes descendants; RESTRICT prevents cleanup expanding via FKs.
     # A single transaction rolls back truncation and trigger changes on failure.
@@ -230,10 +242,10 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     # dependency logic; the dump was captured before any test ran, not from residue.
     truncate = "TRUNCATE " + ", ".join("ONLY public." + t for t in FIXTURE_TABLES) + " CONTINUE IDENTITY RESTRICT;\n"
     transaction(container_id, guard + checksum_guard(EXCLUDED_TABLES) + truncate + baseline + "\n" +
-                checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds)
+                checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup")
 
 
 def finish_run(project, recorded_id, db_port, baseline_state, lock_fds, signature, run_id):
     container_id = checked_container(project, recorded_id, db_port)
     transaction(container_id, identity_guard(project, container_id, signature, baseline_state["token"], run_id) +
-                "UPDATE _pcp_it.stack SET run_id = NULL, started_at = NULL;\n", lock_fds)
+                "UPDATE _pcp_it.stack SET run_id = NULL, started_at = NULL;\n", lock_fds, phase="run marker completion")

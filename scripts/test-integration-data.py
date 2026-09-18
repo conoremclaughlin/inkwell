@@ -157,7 +157,7 @@ class DataTests(unittest.TestCase):
         self.assertTrue(result["token"])
         command, _ = next(call for call in self.calls if "pg_dump" in call[0])
         self.assertIn("pg_dump", command)
-        for flag in ("--data-only", "--disable-triggers", "--strict-names", "--no-large-objects"):
+        for flag in ("--data-only", "--disable-triggers", "--strict-names", "--no-blobs"):
             self.assertIn(flag, command)
         self.assertEqual([s[8:] for s in command if s.startswith("--table=")],
                          ["public." + t for t in data.FIXTURE_TABLES])
@@ -200,7 +200,7 @@ class DataTests(unittest.TestCase):
         with mock.patch.object(data.subprocess, "run", fail_restore), self.assertRaises(data.Refusal) as error:
             self.clean()
         self.assertNotIn("synthetic-private-error", str(error.exception))
-        self.assertIn("suite not started", str(error.exception))
+        self.assertIn("scoped cleanup failed", str(error.exception))
 
     def test_inspection_parse_or_command_failure_refuses(self):
         for result in (subprocess.CompletedProcess([], 0, stdout="not json"),
@@ -255,6 +255,23 @@ class DataTests(unittest.TestCase):
         self.assertIn("Fixture stack identity mismatch", sql)
         self.assertIn("UPDATE _pcp_it.stack SET run_id = NULL", sql)
         self.assertFalse(self.mutations())
+
+    def test_libpq_service_is_unset_not_assigned_an_empty_name(self):
+        for tool in ("psql", "pg_dump"):
+            command = data.db_command(self.id, tool)
+            self.assertEqual(command[:5], ["docker", "exec", "-i", self.id, "env"])
+            for variable in ("PGSERVICE", "PGSERVICEFILE", "PGOPTIONS"):
+                self.assertNotIn(variable + "=", command)
+                self.assertEqual(command[command.index(variable) - 1], "-u")
+
+    def test_phase_exit_and_sqlstate_are_reported_without_error_values(self):
+        error = subprocess.CalledProcessError(3, [], stderr="ERROR: 42501\nsynthetic-private-detail\n")
+        with mock.patch.object(data.subprocess, "run", side_effect=error), self.assertRaises(data.Refusal) as refused:
+            data.verify_database(self.id, [7])
+        message = str(refused.exception)
+        self.assertIn("database-name probe failed", message)
+        self.assertIn("exit=3 SQLSTATE=42501", message)
+        self.assertNotIn("synthetic-private-detail", message)
 
 
 if __name__ == "__main__":
