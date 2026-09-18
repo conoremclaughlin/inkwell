@@ -265,7 +265,7 @@ class DataTests(unittest.TestCase):
                 self.assertEqual(command[command.index(variable) - 1], "-u")
 
     def test_phase_exit_and_sqlstate_are_reported_without_error_values(self):
-        error = subprocess.CalledProcessError(3, [], stderr="ERROR: 42501\nsynthetic-private-detail\n")
+        error = subprocess.CalledProcessError(3, [], stderr="psql:<stdin>:1: ERROR:  42501\nsynthetic-private-detail\n")
         with mock.patch.object(data.subprocess, "run", side_effect=error), self.assertRaises(data.Refusal) as refused:
             data.verify_database(self.id, [7])
         message = str(refused.exception)
@@ -314,6 +314,14 @@ class DataTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(data.literal("fixture'quote"), "'fixture''quote'")
 
+    def test_psql_diagnostics_are_not_passed_to_pg_dump(self):
+        data.capture_baseline(self.workdir, self.project, self.id, 55422, [7], self.signature, self.run_id)
+        dump, _ = next(call for call in self.calls if "pg_dump" in call[0])
+        self.assertNotIn("VERBOSITY=sqlstate", dump)
+        psql_commands = [args for args, _ in self.calls if "psql" in args]
+        self.assertTrue(psql_commands)
+        self.assertTrue(all("VERBOSITY=sqlstate" in args for args in psql_commands))
+
     def test_guard_sqlstates_distinguish_all_four_failure_conditions(self):
         guards = (
             (data.DATABASE_GUARD, "PC001", "wrong database name"),
@@ -326,7 +334,7 @@ class DataTests(unittest.TestCase):
         for sql, code, reason in guards:
             with self.subTest(code=code):
                 self.assertIn("USING ERRCODE = '" + code + "'", sql)
-                error = subprocess.CalledProcessError(3, [], stderr="ERROR: " + code + "\nsynthetic-private-detail\n")
+                error = subprocess.CalledProcessError(3, [], stderr="psql:<stdin>:1: ERROR:  " + code + "\nsynthetic-private-detail\n")
                 with mock.patch.object(data.subprocess, "run", side_effect=error), self.assertRaises(data.Refusal) as refused:
                     data.verify_database(self.id, [7])
                 self.assertIn("SQLSTATE=" + code, str(refused.exception))

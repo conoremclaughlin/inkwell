@@ -49,6 +49,7 @@ DATABASE_GUARD = """DO $guard$ BEGIN
 END $guard$;
 """
 # Diagnostics come from fixed SQLSTATEs, never from error text or fixture rows.
+# PC avoids P0 codes already used by built-in PL/pgSQL exceptions.
 REFUSAL_CODES = {
     "PC001": "wrong database name",
     "PC002": "stack identity mismatch",
