@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Pressable } from 'react-native';
 import { DarkTheme, NavigationContainer, useNavigation } from '@react-navigation/native';
+import { createLinking } from './src/linking';
 import {
   createNativeStackNavigator,
   type NativeStackNavigationProp,
@@ -168,11 +169,15 @@ export default function App() {
 
   if (!booted) return null; // Keychain read is fast; a splash frame, not a screen.
 
+  // Rebuilt when auth flips so a link followed right after sign-in resolves
+  // against the navigator that is actually mounted.
+  const linking = createLinking(!!auth.refreshToken);
+
   return (
     <SafeAreaProvider>
       <QueryClientProvider client={queryClient}>
         <StatusBar style="light" />
-        <NavigationContainer theme={navTheme}>
+        <NavigationContainer theme={navTheme} linking={linking}>
           {auth.refreshToken ? (
             <Stack.Navigator screenOptions={stackHeaderOptions}>
               <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
