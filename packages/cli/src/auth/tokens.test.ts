@@ -11,6 +11,7 @@ import {
   readdirSync,
   statSync,
   writeFileSync,
+  utimesSync,
   rmSync,
 } from 'fs';
 import { join } from 'path';
@@ -29,6 +30,7 @@ import {
   clearDelegatedAuth,
   clearAuth,
   clearAuthIfUnchanged,
+  saveAuthIfUnchanged,
   updateConfigEmail,
   type StoredAuth,
 } from './tokens.js';
@@ -388,12 +390,18 @@ describe('getValidAccessToken — a lost rotation race', () => {
     issued_at: Date.now(),
   });
 
-  /** A server that refuses everything — what the loser of a race actually sees. */
+  /**
+   * A server that refuses everything TERMINALLY — the shape RFC 6749 §5.2 gives
+   * a revoked or expired grant, and the only one that licenses deleting the
+   * credential. The status is part of that shape: a refusal carrying no status
+   * is a proxy or a socket, not the authorization server.
+   */
   const refuseEveryExchange = (onCall?: () => void) => {
     globalThis.fetch = (async () => {
       onCall?.();
       return {
         ok: false,
+        status: 400,
         json: async () => ({ error: 'invalid_grant' }),
       } as unknown as Response;
     }) as typeof globalThis.fetch;
@@ -628,5 +636,371 @@ describe('updateConfigEmail', () => {
     const config = JSON.parse(readFileSync(join(configDir, 'config.json'), 'utf-8'));
     expect(config.email).toBe('new@example.com');
     expect(config.agentMapping).toEqual({ 'claude-code': 'wren' });
+  });
+});
+
+// ============================================================================
+// What a failed exchange is allowed to mean
+//
+// One `catch` used to answer every way of not getting a token, and it answered
+// with the most destructive reading available: delete the credential. Almost
+// none of those failures say anything about the grant. A restarted server, a
+// proxy's HTML error page, a 30-second timeout on a train — each of them logged
+// the machine out of a session that was alive the whole time.
+// ============================================================================
+
+describe('getValidAccessToken — what a failed exchange is allowed to conclude', () => {
+  let origHome: string | undefined;
+  let origEnvToken: string | undefined;
+  let origFetch: typeof globalThis.fetch;
+  let tempHome: string;
+  let authPath: string;
+
+  const staleAuth = (refreshToken: string): StoredAuth => ({
+    access_token: `access-for-${refreshToken}`,
+    refresh_token: refreshToken,
+    expires_in: 3600,
+    scope: 'full',
+    issued_at: Date.now() - 2 * 3600 * 1000,
+  });
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origEnvToken = process.env.INK_ACCESS_TOKEN;
+    origFetch = globalThis.fetch;
+    delete process.env.INK_ACCESS_TOKEN;
+    tempHome = join(tmpdir(), `ink-failure-kind-${Date.now()}-${Math.random()}`);
+    mkdirSync(join(tempHome, '.ink'), { recursive: true });
+    process.env.HOME = tempHome;
+    authPath = join(tempHome, '.ink', 'auth.json');
+    saveAuth(staleAuth('refresh-A'));
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    if (origEnvToken === undefined) delete process.env.INK_ACCESS_TOKEN;
+    else process.env.INK_ACCESS_TOKEN = origEnvToken;
+    globalThis.fetch = origFetch;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /**
+   * Every one of these is a failure the CLI can meet on an ordinary day, and
+   * in none of them has the authorization server said the grant is invalid.
+   * The file must survive all of them.
+   */
+  const nonTerminalFailures: Array<{ name: string; fetch: typeof globalThis.fetch }> = [
+    {
+      name: 'a request that never completed (timeout, DNS, reset socket)',
+      fetch: (async () => {
+        throw Object.assign(new Error('The operation was aborted due to timeout'), {
+          name: 'TimeoutError',
+        });
+      }) as typeof globalThis.fetch,
+    },
+    {
+      name: 'the server being restarted (503)',
+      fetch: (async () =>
+        ({
+          ok: false,
+          status: 503,
+          json: async () => ({ error: 'temporarily_unavailable' }),
+        }) as unknown as Response) as typeof globalThis.fetch,
+    },
+    {
+      name: 'a proxy answering with HTML that will not parse',
+      fetch: (async () =>
+        ({
+          ok: false,
+          status: 502,
+          json: async () => {
+            throw new SyntaxError('Unexpected token < in JSON at position 0');
+          },
+        }) as unknown as Response) as typeof globalThis.fetch,
+    },
+    {
+      name: 'a 500 that happens to carry an OAuth-shaped body',
+      fetch: (async () =>
+        ({
+          ok: false,
+          status: 500,
+          json: async () => ({ error: 'server_error' }),
+        }) as unknown as Response) as typeof globalThis.fetch,
+    },
+    {
+      name: 'the grant being alive but this secret superseded (409)',
+      fetch: (async () =>
+        ({
+          ok: false,
+          status: 409,
+          json: async () => ({ error: 'superseded_grant' }),
+        }) as unknown as Response) as typeof globalThis.fetch,
+    },
+    {
+      name: 'a refusal whose code this CLI has never heard of',
+      fetch: (async () =>
+        ({
+          ok: false,
+          status: 400,
+          json: async () => ({ error: 'some_future_policy_refusal' }),
+        }) as unknown as Response) as typeof globalThis.fetch,
+    },
+  ];
+
+  for (const failure of nonTerminalFailures) {
+    it(`keeps the credential through ${failure.name}`, async () => {
+      globalThis.fetch = failure.fetch;
+
+      const token = await getValidAccessToken('http://localhost:3001');
+
+      expect(token).toBeNull();
+      expect(existsSync(authPath)).toBe(true);
+      expect(loadAuth()!.refresh_token).toBe('refresh-A');
+    });
+  }
+
+  it('deletes the credential when the server says the grant is invalid', async () => {
+    // The control. Without it, "never delete" would pass every test above and
+    // leave a genuinely revoked credential on disk, 401ing in silence forever.
+    globalThis.fetch = (async () =>
+      ({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: 'invalid_grant', error_description: 'Invalid refresh token' }),
+      }) as unknown as Response) as typeof globalThis.fetch;
+
+    const token = await getValidAccessToken('http://localhost:3001');
+
+    expect(token).toBeNull();
+    expect(existsSync(authPath)).toBe(false);
+  });
+
+  it('deletes the credential when the client is no longer authorized', async () => {
+    globalThis.fetch = (async () =>
+      ({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: 'invalid_client' }),
+      }) as unknown as Response) as typeof globalThis.fetch;
+
+    await getValidAccessToken('http://localhost:3001');
+
+    expect(existsSync(authPath)).toBe(false);
+  });
+});
+
+// ============================================================================
+// A successful exchange is not automatically a write
+//
+// An exchange takes as long as the network does, and the file can change
+// completely while one is in flight. Storing the result unconditionally on the
+// way back rolls the machine backwards onto a secret the server has already
+// replaced — or undoes a logout that happened while we were waiting.
+// ============================================================================
+
+describe('getValidAccessToken — storing a result that arrived late', () => {
+  let origHome: string | undefined;
+  let origEnvToken: string | undefined;
+  let origFetch: typeof globalThis.fetch;
+  let tempHome: string;
+  let authPath: string;
+
+  const authFor = (refreshToken: string, ageMs: number): StoredAuth => ({
+    access_token: `access-for-${refreshToken}`,
+    refresh_token: refreshToken,
+    expires_in: 3600,
+    scope: 'full',
+    issued_at: Date.now() - ageMs,
+  });
+
+  /** An exchange that succeeds, with something else happening while it runs. */
+  const succeedAfter = (whileInFlight: () => void, granted: string) => {
+    globalThis.fetch = (async () => {
+      whileInFlight();
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          access_token: `access-for-${granted}`,
+          refresh_token: granted,
+          token_type: 'Bearer',
+          expires_in: 3600,
+          scope: 'full',
+        }),
+      } as unknown as Response;
+    }) as typeof globalThis.fetch;
+  };
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origEnvToken = process.env.INK_ACCESS_TOKEN;
+    origFetch = globalThis.fetch;
+    delete process.env.INK_ACCESS_TOKEN;
+    tempHome = join(tmpdir(), `ink-late-write-${Date.now()}-${Math.random()}`);
+    mkdirSync(join(tempHome, '.ink'), { recursive: true });
+    process.env.HOME = tempHome;
+    authPath = join(tempHome, '.ink', 'auth.json');
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    if (origEnvToken === undefined) delete process.env.INK_ACCESS_TOKEN;
+    else process.env.INK_ACCESS_TOKEN = origEnvToken;
+    globalThis.fetch = origFetch;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it('does not roll the file back to its own result when a later generation has landed', async () => {
+    // We present A and the server grants B. While we wait, the process that
+    // owns the file has already gone A -> B -> C. Writing B now hands the next
+    // command a secret the server retired, and the machine is logged out by a
+    // response that SUCCEEDED.
+    saveAuth(authFor('refresh-A', 2 * 3600 * 1000));
+    succeedAfter(() => saveAuth(authFor('refresh-C', 0)), 'refresh-B');
+
+    const token = await getValidAccessToken('http://localhost:3001');
+
+    expect(loadAuth()!.refresh_token).toBe('refresh-C');
+    // Our own exchange did succeed, so this command is served rather than failed.
+    expect(token).toBe('access-for-refresh-B');
+  });
+
+  it('does not recreate the credential when a logout landed while it was in flight', async () => {
+    saveAuth(authFor('refresh-A', 2 * 3600 * 1000));
+    succeedAfter(() => clearAuth(), 'refresh-B');
+
+    const token = await getValidAccessToken('http://localhost:3001');
+
+    expect(existsSync(authPath)).toBe(false);
+    // And the command does not get to act on a session the user just ended.
+    expect(token).toBeNull();
+  });
+
+  it('stores the result when the file is still the one it rotated', async () => {
+    // The control: if the comparison refused everything, every refresh would
+    // succeed once and then never persist, and the next command would rotate
+    // from a dead secret.
+    saveAuth(authFor('refresh-A', 2 * 3600 * 1000));
+    succeedAfter(() => {}, 'refresh-B');
+
+    const token = await getValidAccessToken('http://localhost:3001');
+
+    expect(loadAuth()!.refresh_token).toBe('refresh-B');
+    expect(token).toBe('access-for-refresh-B');
+  });
+});
+
+// ============================================================================
+// The generation check is a decision, and decisions need exclusion
+//
+// Writing atomically is not deciding atomically. Every interesting operation on
+// ~/.ink/auth.json is read-compare-write, and temp-file+rename does nothing at
+// all for the gap between the read and the write — a rotation landing in that
+// gap is precisely the case being guarded against, and it lands unseen.
+// ============================================================================
+
+describe('credential file lock', () => {
+  let origHome: string | undefined;
+  let tempHome: string;
+  let authPath: string;
+  let lockPath: string;
+
+  const authFor = (refreshToken: string): StoredAuth => ({
+    access_token: `access-for-${refreshToken}`,
+    refresh_token: refreshToken,
+    expires_in: 3600,
+    scope: 'full',
+    issued_at: Date.now(),
+  });
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    tempHome = join(tmpdir(), `ink-lock-${Date.now()}-${Math.random()}`);
+    mkdirSync(join(tempHome, '.ink'), { recursive: true });
+    process.env.HOME = tempHome;
+    authPath = join(tempHome, '.ink', 'auth.json');
+    lockPath = `${authPath}.lock`;
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it('deletes nothing while another process holds the lock', () => {
+    saveAuth(authFor('refresh-A'));
+    mkdirSync(lockPath); // another process is mid-decision about this file
+
+    expect(clearAuthIfUnchanged('refresh-A', { lockWaitMs: 30 })).toBe(false);
+    expect(existsSync(authPath)).toBe(true);
+  });
+
+  it('writes nothing while another process holds the lock', () => {
+    saveAuth(authFor('refresh-A'));
+    mkdirSync(lockPath);
+
+    expect(saveAuthIfUnchanged('refresh-A', authFor('refresh-B'), { lockWaitMs: 30 })).toBe(
+      'contended'
+    );
+    expect(loadAuth()!.refresh_token).toBe('refresh-A');
+  });
+
+  it('does the work once the lock is free', () => {
+    // The control for both of the above: a lock that refused unconditionally
+    // would pass them and break every refresh on the machine.
+    saveAuth(authFor('refresh-A'));
+
+    expect(saveAuthIfUnchanged('refresh-A', authFor('refresh-B'), { lockWaitMs: 30 })).toBe(
+      'saved'
+    );
+    expect(loadAuth()!.refresh_token).toBe('refresh-B');
+    expect(clearAuthIfUnchanged('refresh-B', { lockWaitMs: 30 })).toBe(true);
+    expect(existsSync(authPath)).toBe(false);
+  });
+
+  it('reports a file that moved on rather than overwriting it', () => {
+    saveAuth(authFor('refresh-C'));
+
+    expect(saveAuthIfUnchanged('refresh-A', authFor('refresh-B'), { lockWaitMs: 30 })).toBe(
+      'superseded'
+    );
+    expect(loadAuth()!.refresh_token).toBe('refresh-C');
+  });
+
+  it('reports an absent file rather than creating one', () => {
+    expect(saveAuthIfUnchanged('refresh-A', authFor('refresh-B'), { lockWaitMs: 30 })).toBe(
+      'absent'
+    );
+    expect(existsSync(authPath)).toBe(false);
+  });
+
+  it('breaks a lock left behind by a process that died holding it', () => {
+    // Otherwise one crash makes the machine permanently unable to rotate.
+    saveAuth(authFor('refresh-A'));
+    mkdirSync(lockPath);
+    const longAgo = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, longAgo, longAgo);
+
+    expect(clearAuthIfUnchanged('refresh-A', { lockWaitMs: 30 })).toBe(true);
+    expect(existsSync(authPath)).toBe(false);
+  });
+
+  it('lets an explicit login through even against a held lock', () => {
+    // A person typing `ink login` decides what this machine's credential is.
+    // Silently doing nothing because a background command held a lock would be
+    // a worse failure than the one the lock prevents.
+    mkdirSync(lockPath);
+
+    saveAuth(authFor('refresh-NEW'), { lockWaitMs: 30 });
+
+    expect(loadAuth()!.refresh_token).toBe('refresh-NEW');
+  });
+
+  it('releases the lock after a decision, including a refused one', () => {
+    saveAuth(authFor('refresh-A'));
+
+    clearAuthIfUnchanged('refresh-WRONG', { lockWaitMs: 30 });
+
+    expect(existsSync(lockPath)).toBe(false);
   });
 });

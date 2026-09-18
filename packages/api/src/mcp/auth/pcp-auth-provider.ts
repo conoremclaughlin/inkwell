@@ -19,7 +19,7 @@ import {
   signPcpAccessToken,
   verifyPcpAccessToken,
   createRefreshToken,
-  exchangeRefreshToken as exchangeRefreshTokenShared,
+  exchangeRefreshTokenDetailed,
 } from '../../auth/pcp-tokens';
 
 /**
@@ -79,6 +79,15 @@ export interface OAuthTokenResponse {
 export interface OAuthErrorResponse {
   error: string;
   error_description?: string;
+  /**
+   * The status this refusal should be sent with, when 400 would misdescribe it.
+   *
+   * Stripped before the body goes out — see the /token handler. It exists
+   * because "your grant is invalid" and "ask me again in a moment" are both
+   * refusals and a client MUST be able to tell them apart: one means delete the
+   * credential on disk, the other means keep it.
+   */
+  http_status?: number;
 }
 
 export interface AuthCallbackResult {
@@ -383,7 +392,7 @@ export class PcpAuthProvider {
     refreshToken: string;
     clientId: string;
   }): Promise<OAuthTokenResponse | OAuthErrorResponse> {
-    const result = await exchangeRefreshTokenShared(
+    const outcome = await exchangeRefreshTokenDetailed(
       this.supabase,
       params.refreshToken,
       params.clientId,
@@ -391,9 +400,31 @@ export class PcpAuthProvider {
       ACCESS_TOKEN_LIFETIME_SECONDS
     );
 
-    if (!result) {
+    // `invalid_grant` is the one answer a client may act on destructively: RFC
+    // 6749 §5.2 defines it as the grant being invalid, expired or revoked, and
+    // the CLI deletes `~/.ink/auth.json` on it. So it is reserved for the
+    // outcome that actually means that, and the other two get codes that say
+    // what they are.
+    if (outcome.status === 'superseded') {
+      return {
+        error: 'superseded_grant',
+        error_description:
+          'This refresh token has been replaced and its retry window has closed. The grant is still valid — re-read the stored credential and use the current secret.',
+        http_status: 409,
+      };
+    }
+    if (outcome.status === 'unavailable') {
+      return {
+        error: 'temporarily_unavailable',
+        error_description: 'The grant could not be checked. Retry; do not discard the credential.',
+        http_status: 503,
+      };
+    }
+    if (!('result' in outcome)) {
       return { error: 'invalid_grant', error_description: 'Invalid refresh token' };
     }
+
+    const result = outcome.result;
 
     logger.info('MCP token refreshed', {
       userId: result.userId,

@@ -683,6 +683,65 @@ describe('PcpAuthProvider', () => {
       });
     });
 
+    it('should not call an unreachable database an invalid grant', async () => {
+      // `invalid_grant` is the one answer the CLI acts on destructively — it
+      // deletes ~/.ink/auth.json. A statement timeout is not that answer, and
+      // sending it as one logs every machine out over a busy database.
+      currentMcpTokensChain = mockChain(null, {
+        code: '57014',
+        message: 'canceling statement due to statement timeout',
+      });
+
+      const result = await provider.exchangeRefreshToken({
+        refreshToken: 'pcp-rt-abc',
+        clientId: 'test-client',
+      });
+
+      expect(result).toEqual({
+        error: 'temporarily_unavailable',
+        error_description: expect.stringContaining('Retry'),
+        http_status: 503,
+      });
+    });
+
+    it('should not call a superseded secret an invalid grant', async () => {
+      // The grant is alive; this value is spent. The client holding its
+      // successor must not be told to re-authenticate.
+      const futureDate = new Date(Date.now() + 86400000).toISOString();
+      currentMcpTokensChain = mockChain(null, { code: 'PGRST116' });
+      // The retry-overlap lookup finds the row by the column that records what
+      // it replaced, stamped long enough ago that the window has closed.
+      currentMcpTokensChain.single = vi
+        .fn()
+        .mockResolvedValueOnce({ data: null, error: { code: 'PGRST116' } })
+        .mockResolvedValue({
+          data: {
+            id: 'token-1',
+            user_id: 'user-123',
+            client_id: 'test-client',
+            refresh_token: 'pcp-rt-successor',
+            previous_refresh_token: 'pcp-rt-abc',
+            rotated_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+            supabase_refresh_token: null,
+            scopes: ['mcp:tools'],
+            expires_at: futureDate,
+            users: { email: 'test@example.com' },
+          },
+          error: null,
+        });
+
+      const result = await provider.exchangeRefreshToken({
+        refreshToken: 'pcp-rt-abc',
+        clientId: 'test-client',
+      });
+
+      expect(result).toEqual({
+        error: 'superseded_grant',
+        error_description: expect.stringContaining('still valid'),
+        http_status: 409,
+      });
+    });
+
     it('should return error for expired refresh token', async () => {
       const pastDate = new Date(Date.now() - 86400000).toISOString();
       currentMcpTokensChain = mockChain({

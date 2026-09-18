@@ -845,7 +845,12 @@ export class MCPServer {
         });
 
         if ('error' in result) {
-          res.status(400).json(result);
+          // The status is part of the refusal, not part of the body: a client
+          // that cannot distinguish "this grant is dead" from "I could not
+          // check" deletes its credential over a blip. `http_status` never goes
+          // out on the wire.
+          const { http_status: status, ...body } = result;
+          res.status(status ?? 400).json(body);
           return;
         }
 

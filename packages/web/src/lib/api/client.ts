@@ -19,7 +19,16 @@ const apiClient = axios.create({
 
 let invalidTokenRecoveryInFlight = false;
 
-function isInvalidTokenAuthFailure(error: AxiosError<{ error?: string }>): boolean {
+/**
+ * Whether a failure means this browser's session is over.
+ *
+ * Deliberately narrow, and exported so it can be tested: it is the trigger for
+ * a full logout and redirect, and the server relies on being able to refuse a
+ * request WITHOUT setting it off. `Invalid token` is the terminal answer; a
+ * superseded cookie or an unreachable database get their own, and a request
+ * that fails for either of those reasons must leave the session alone.
+ */
+export function isInvalidTokenAuthFailure(error: AxiosError<{ error?: string }>): boolean {
   const status = error.response?.status;
   const serverMessage = error.response?.data?.error?.trim().toLowerCase();
   const requestUrl = error.config?.url || '';
