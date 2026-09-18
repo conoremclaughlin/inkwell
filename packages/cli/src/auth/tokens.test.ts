@@ -32,6 +32,7 @@ import {
   clearAuthIfUnchanged,
   saveAuthIfUnchanged,
   updateConfigEmail,
+  CredentialLockUnavailableError,
   type StoredAuth,
 } from './tokens.js';
 
@@ -985,15 +986,55 @@ describe('credential file lock', () => {
     expect(existsSync(authPath)).toBe(false);
   });
 
-  it('lets an explicit login through even against a held lock', () => {
-    // A person typing `ink login` decides what this machine's credential is.
-    // Silently doing nothing because a background command held a lock would be
-    // a worse failure than the one the lock prevents.
+  it('refuses a login against a held lock instead of writing past it', () => {
+    // A login that wrote past the lock was the version of this that lost the
+    // login: the holder has already read the old value and writes it back the
+    // moment it finishes its own decision.
+    saveAuth(authFor('refresh-A'));
     mkdirSync(lockPath);
 
-    saveAuth(authFor('refresh-NEW'), { lockWaitMs: 30 });
+    expect(() => saveAuth(authFor('refresh-NEW'), { lockWaitMs: 30 })).toThrow(
+      CredentialLockUnavailableError
+    );
+    expect(loadAuth()!.refresh_token).toBe('refresh-A');
+  });
 
+  it('refuses a logout against a held lock instead of deleting past it', () => {
+    // Deleting past the lock is how a logout undoes itself: the holder, already
+    // past its own read, writes the credential straight back.
+    saveAuth(authFor('refresh-A'));
+    mkdirSync(lockPath);
+
+    expect(() => clearAuth({ lockWaitMs: 30 })).toThrow(CredentialLockUnavailableError);
+    expect(existsSync(authPath)).toBe(true);
+  });
+
+  it('logs out under a free lock, and releases it', () => {
+    // The control for the refusal above: a clearAuth that refused
+    // unconditionally would pass that test and break every `ink logout`.
+    saveAuth(authFor('refresh-A'));
+
+    clearAuth({ lockWaitMs: 30 });
+
+    expect(existsSync(authPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('lets login and logout past a lock left behind by a dead process', () => {
+    // Their budget outlasts the staleness threshold, so a crash cannot wedge
+    // either of them permanently — which is what makes refusing acceptable.
+    mkdirSync(lockPath);
+    const longAgo = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, longAgo, longAgo);
+
+    saveAuth(authFor('refresh-NEW'));
     expect(loadAuth()!.refresh_token).toBe('refresh-NEW');
+
+    mkdirSync(lockPath);
+    utimesSync(lockPath, longAgo, longAgo);
+
+    clearAuth();
+    expect(existsSync(authPath)).toBe(false);
   });
 
   it('releases the lock after a decision, including a refused one', () => {

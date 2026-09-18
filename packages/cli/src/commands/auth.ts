@@ -303,7 +303,16 @@ async function logoutCommand(): Promise<void> {
     return;
   }
 
-  clearAuth();
+  try {
+    clearAuth();
+  } catch (err) {
+    // The credential is still on disk. Reporting a logout that did not happen
+    // is the one outcome worse than failing to log out.
+    console.log(chalk.red(err instanceof Error ? err.message : 'Logout failed'));
+    process.exitCode = 1;
+    return;
+  }
+
   console.log(chalk.green('Logged out. Tokens cleared.'));
 }
 

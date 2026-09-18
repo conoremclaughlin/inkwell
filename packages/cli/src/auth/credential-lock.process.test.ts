@@ -21,7 +21,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { clearAuthIfUnchanged, loadAuth, saveAuth, type StoredAuth } from './tokens.js';
+import { clearAuth, clearAuthIfUnchanged, loadAuth, saveAuth, type StoredAuth } from './tokens.js';
 
 const tokensModule = join(dirname(fileURLToPath(import.meta.url)), 'tokens.ts');
 
@@ -41,6 +41,15 @@ function canRunTypeScriptChildren(): boolean {
   return probe.status === 0;
 }
 
+/**
+ * Resolve when a child has exited. Assertions about what the file ends up
+ * holding have to wait for this — a resurrection that has not happened yet
+ * reads exactly like one that never happens.
+ */
+function childExit(child: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve) => child.on('close', () => resolve()));
+}
+
 function waitForFile(path: string, timeoutMs: number): boolean {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -50,6 +59,51 @@ function waitForFile(path: string, timeoutMs: number): boolean {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
   }
   return false;
+}
+
+/**
+ * A child that behaves the way a rotation behaves: take the lock, hold it, and
+ * write at the END of the critical section. Writing last is what makes the gap
+ * dangerous — at the instant an unguarded caller would look, the file still
+ * holds the old secret.
+ */
+function spawnLockHolder(args: {
+  lockPath: string;
+  authPath: string;
+  marker: string;
+  writes: string;
+  holdMs: number;
+}) {
+  return spawn(
+    process.execPath,
+    [
+      '-e',
+      `
+      const { mkdirSync, rmdirSync, writeFileSync } = require('fs');
+      const [lockPath, authPath, marker, refreshToken, holdMs] = process.argv.slice(1);
+      mkdirSync(lockPath);
+      writeFileSync(marker, 'held');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(holdMs));
+      writeFileSync(
+        authPath,
+        JSON.stringify({
+          access_token: 'access-for-' + refreshToken,
+          refresh_token: refreshToken,
+          expires_in: 3600,
+          scope: 'full',
+          issued_at: Date.now(),
+        })
+      );
+      rmdirSync(lockPath);
+      `,
+      args.lockPath,
+      args.authPath,
+      args.marker,
+      args.writes,
+      String(args.holdMs),
+    ],
+    { stdio: 'ignore' }
+  );
 }
 
 describe('credential decisions across real processes', () => {
@@ -132,6 +186,108 @@ describe('credential decisions across real processes', () => {
     } finally {
       child.kill();
     }
+  }, 20_000);
+
+  it('never reports a login it did not manage to store', async () => {
+    // The contract, stated so it survives either implementation: if `saveAuth`
+    // returns, the credential it was given is the one on disk once every other
+    // process has finished. If it cannot promise that, it says so.
+    //
+    // Writing past the lock breaks exactly this and nothing announces it. The
+    // holder has already read the old value; the moment it finishes its own
+    // decision it writes that value's successor back over the login, and the
+    // person is holding a session they were told they had against a file that
+    // reverted to a rotation of the grant they replaced.
+    //
+    // The budget here is deliberately shorter than the hold, because the
+    // unguarded write is reachable only by losing the wait.
+    saveAuth(authFor('refresh-A'));
+
+    const marker = join(tempHome, 'holder-acquired');
+    const child = spawnLockHolder({
+      lockPath,
+      authPath,
+      marker,
+      writes: 'refresh-B',
+      holdMs: 500,
+    });
+    const finished = childExit(child);
+
+    expect(waitForFile(marker, 5_000)).toBe(true);
+    // The holder has the lock and has NOT written yet.
+    expect(loadAuth()!.refresh_token).toBe('refresh-A');
+
+    let reportedStored = true;
+    try {
+      saveAuth(authFor('refresh-LOGIN'), { lockWaitMs: 100 });
+    } catch {
+      reportedStored = false;
+    }
+
+    await finished;
+
+    if (reportedStored) {
+      expect(loadAuth()!.refresh_token).toBe('refresh-LOGIN');
+    } else {
+      // Refusing is allowed. Refusing and having written anyway is not.
+      expect(loadAuth()!.refresh_token).toBe('refresh-B');
+    }
+  }, 20_000);
+
+  it('stores a login that can get its turn, after the rotation in progress', () => {
+    // The control for the above: an implementation that simply always threw
+    // would satisfy the contract test and make `ink login` impossible.
+    saveAuth(authFor('refresh-A'));
+
+    const marker = join(tempHome, 'holder-acquired');
+    const child = spawnLockHolder({
+      lockPath,
+      authPath,
+      marker,
+      writes: 'refresh-B',
+      holdMs: 500,
+    });
+
+    try {
+      expect(waitForFile(marker, 5_000)).toBe(true);
+
+      saveAuth(authFor('refresh-LOGIN'), { lockWaitMs: 5_000 });
+
+      expect(loadAuth()!.refresh_token).toBe('refresh-LOGIN');
+    } finally {
+      child.kill();
+    }
+  }, 20_000);
+
+  it('does not let a rotation already in progress undo a logout', async () => {
+    // The same gap, run the other way, and this one needs no contention at all:
+    // an unguarded `ink logout` unlinks the file while the holder is
+    // mid-decision, the holder then writes, and the credential the user
+    // destroyed is back on disk and usable. They were told they were logged out.
+    //
+    // Which is why the assertion waits for the holder to finish. Checked the
+    // instant `clearAuth` returns, the file is absent under both
+    // implementations — the resurrection has not happened yet.
+    saveAuth(authFor('refresh-A'));
+
+    const marker = join(tempHome, 'holder-acquired');
+    const child = spawnLockHolder({
+      lockPath,
+      authPath,
+      marker,
+      writes: 'refresh-B',
+      holdMs: 500,
+    });
+    const finished = childExit(child);
+
+    expect(waitForFile(marker, 5_000)).toBe(true);
+    expect(loadAuth()!.refresh_token).toBe('refresh-A');
+
+    clearAuth({ lockWaitMs: 5_000 });
+
+    await finished;
+
+    expect(existsSync(authPath)).toBe(false);
   }, 20_000);
 
   it('never loses a generation when several processes rotate the same file', async () => {

@@ -120,6 +120,37 @@ const CREDENTIAL_LOCK_WAIT_MS = 2_000;
 const CREDENTIAL_LOCK_STALE_MS = 10_000;
 /** Gap between attempts. Short: every critical section here is microseconds. */
 const CREDENTIAL_LOCK_POLL_MS = 15;
+/**
+ * The budget for operations that have no safe way to decline.
+ *
+ * `ink login` and `ink logout` are a person stating what this machine's
+ * credential should be; neither has a "leave it alone" branch to fall back on
+ * the way a failed refresh does. They also cannot write unguarded, because an
+ * unguarded write is precisely the schedule the lock exists to prevent — see
+ * `saveAuth`.
+ *
+ * So they wait past the staleness threshold instead. A lock older than
+ * `CREDENTIAL_LOCK_STALE_MS` is broken rather than waited on, so a budget
+ * beyond it cannot be defeated by a holder that died, only by live processes
+ * taking and releasing the lock in an unbroken chain for twelve seconds — at
+ * which point refusing is the honest answer and the caller is told.
+ */
+const CREDENTIAL_LOCK_UNCONDITIONAL_WAIT_MS = CREDENTIAL_LOCK_STALE_MS + CREDENTIAL_LOCK_WAIT_MS;
+
+/**
+ * Raised when an operation that cannot decline could not take the credential
+ * lock. The credential on disk is UNCHANGED — that is the point of raising
+ * rather than proceeding.
+ */
+export class CredentialLockUnavailableError extends Error {
+  constructor(operation: string) {
+    super(
+      `Could not get exclusive access to ~/.ink/auth.json to ${operation}. ` +
+        'Another ink process is updating credentials; nothing was changed. Try again.'
+    );
+    this.name = 'CredentialLockUnavailableError';
+  }
+}
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -247,14 +278,34 @@ function writeAuthFile(auth: StoredAuth): void {
  * Store a credential unconditionally — for `ink login`, which is a person
  * deciding what this machine's credential should now be.
  *
- * Takes the lock so it cannot land in the middle of another process's
- * compare-and-write, but writes anyway if it cannot get it. A login that
- * silently did nothing because some background command held a lock would be a
- * worse failure than the one being prevented.
+ * Unconditional about WHAT it writes, never about WHEN. An earlier version took
+ * the lock and wrote anyway if it could not get it, reasoning that a login which
+ * silently did nothing would be the worse failure. That reasoning was wrong in a
+ * way worth recording, because the unguarded write does not merely skip a
+ * precaution — it silently loses the login it was trying to guarantee:
+ *
+ *   a refresh takes the lock, reads A, and is about to write B;
+ *   the login writes L without the lock;
+ *   the refresh completes its decision and writes B.
+ *
+ * The person is now holding a session they were told they had, against a
+ * credential file that reverted to a rotation of the old grant. The same gap
+ * runs the other way for `clearAuthIfUnchanged`: a login landing between its
+ * read and its unlink is deleted by a caller that compared against a file that
+ * is no longer the file it is deleting.
+ *
+ * So a login waits, on a budget that outlasts a stale lock, and reports rather
+ * than writing blind. "Nothing happened and you were told" beats "something
+ * happened and then quietly unhappened".
+ *
+ * @throws CredentialLockUnavailableError if the lock could not be taken. The
+ * file is unchanged.
  */
 export function saveAuth(auth: StoredAuth, options?: CredentialLockOptions): void {
-  const outcome = withCredentialLock(authFilePath(), () => writeAuthFile(auth), options);
-  if (!outcome.held) writeAuthFile(auth);
+  const outcome = withCredentialLock(authFilePath(), () => writeAuthFile(auth), {
+    lockWaitMs: options?.lockWaitMs ?? CREDENTIAL_LOCK_UNCONDITIONAL_WAIT_MS,
+  });
+  if (!outcome.held) throw new CredentialLockUnavailableError('store a new credential');
 }
 
 /** What a conditional store did, which is never simply "worked" or "failed". */
@@ -305,11 +356,41 @@ export function saveAuthIfUnchanged(
   return outcome.held ? outcome.value : 'contended';
 }
 
-export function clearAuth(): void {
+/**
+ * Remove the credential file. Callers must already hold the credential lock —
+ * this is the body of a decision, not a decision.
+ */
+function unlinkAuthFile(): void {
   const path = authFilePath();
   if (existsSync(path)) {
     unlinkSync(path);
   }
+}
+
+/**
+ * Destroy the stored credential unconditionally — for `ink logout`.
+ *
+ * Under the lock, for the schedule that makes an unguarded logout undo itself:
+ *
+ *   a refresh takes the lock, reads A, and is about to write B;
+ *   the logout unlinks the file;
+ *   the refresh writes B.
+ *
+ * The user is told they are logged out and the machine holds a live credential
+ * again. `saveAuthIfUnchanged` cannot catch this on its own — it answers
+ * `absent` for a file that was already gone when it looked, and the whole
+ * problem here is that the file goes away *after* it looks. The exclusion has to
+ * come from the deleter.
+ *
+ * @throws CredentialLockUnavailableError if the lock could not be taken. The
+ * credential is still there, and saying so is better than a logout that reports
+ * success and leaves a usable credential on disk.
+ */
+export function clearAuth(options?: CredentialLockOptions): void {
+  const outcome = withCredentialLock(authFilePath(), unlinkAuthFile, {
+    lockWaitMs: options?.lockWaitMs ?? CREDENTIAL_LOCK_UNCONDITIONAL_WAIT_MS,
+  });
+  if (!outcome.held) throw new CredentialLockUnavailableError('remove the stored credential');
 }
 
 /**
@@ -344,7 +425,9 @@ export function clearAuthIfUnchanged(
       const current = loadAuth();
       if (!current) return false;
       if (current.refresh_token !== refreshToken) return false;
-      clearAuth();
+      // The unlocked body: we are already inside the lock, and `clearAuth`
+      // would try to take it again.
+      unlinkAuthFile();
       return true;
     },
     options
