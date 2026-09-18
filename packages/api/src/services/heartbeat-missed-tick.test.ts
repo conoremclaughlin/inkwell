@@ -169,6 +169,56 @@ describe('heartbeat scheduler liveness (real node-cron)', () => {
     );
   }, 30000);
 
+  it('does not credit the replacement scheduler with a retired in-flight completion', async () => {
+    // Lumen's finding on #656, against the reset the same change introduced.
+    // Re-init stops the old cron, so it cannot fire again — but a tick already
+    // awaiting keeps running, and its `finally` lands AFTER the reset. The
+    // successor then reports a completion it never had, beside a `lastTickAt`
+    // still null: work finished before any was scheduled.
+    //
+    // The re-init test below cannot catch this. It resets while the old tick is
+    // still suspended and asserts immediately, so the late write happens after
+    // its last assertion. This one releases the old work and then looks.
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    initHeartbeatService({
+      interval: '* * * * * *',
+      enableLocalCron: true,
+      onHeartbeat: async () => {
+        entered();
+        await pending;
+      },
+    });
+
+    try {
+      await started;
+      // A successor whose own first tick is far in the future, so anything
+      // written to its state can only have come from the retired scheduler.
+      initHeartbeatService({
+        interval: '0 0 1 1 *',
+        enableLocalCron: true,
+        onHeartbeat: async () => {},
+      });
+      expect(getHeartbeatTickHealth().lastTickCompletedAt).toBeNull();
+    } finally {
+      release();
+    }
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await sleep(50);
+    const health = getHeartbeatTickHealth();
+    expect(health.lastTickCompletedAt, 'retired tick credited the successor').toBeNull();
+    expect(health.lastTickAt).toBeNull();
+    expect(health.sinceLastCompletedTickMs).toBeNull();
+  }, 30000);
+
   it('does not inherit the previous scheduler count across re-init', async () => {
     let ticks = 0;
     initHeartbeatService({

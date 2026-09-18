@@ -169,6 +169,23 @@ let lastMissedTickAt: Date | null = null;
 let missedTickCount = 0;
 
 /**
+ * Which scheduler these numbers belong to.
+ *
+ * `initHeartbeatService` stops the old cron, so a retired scheduler cannot fire
+ * again — but a tick already in flight keeps running, and its `finally` lands
+ * after the reset. Without a fence it writes `lastTickCompletedAt` into the
+ * successor's freshly cleared state, reporting a completion the new scheduler
+ * never had, next to a `lastTickAt` still null. Health then claims work
+ * finished before any was scheduled. Found by Lumen reviewing #656, against
+ * the reset this very change introduced; the original re-init test missed it
+ * because it reset synchronously, while the old tick was still suspended.
+ *
+ * Compared at the moment of each write, never captured at entry: retirement is
+ * exactly what happens during the await.
+ */
+let schedulerGeneration = 0;
+
+/**
  * What the scheduler has and has not done, for anything that needs to notice a
  * tick that did not happen.
  *
@@ -228,7 +245,10 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
   supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
 
   // A fresh scheduler has not missed anything yet, and must not inherit the
-  // previous one's gap: re-init is a new process's worth of history.
+  // previous one's gap: re-init is a new process's worth of history. The
+  // generation bump retires the old scheduler's writes along with its numbers —
+  // clearing the fields is not enough while its last tick is still in flight.
+  const generation = ++schedulerGeneration;
   lastTickAt = null;
   lastTickCompletedAt = null;
   lastMissedTickAt = null;
@@ -238,7 +258,7 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
     logger.info('Starting local heartbeat cron scheduler', { interval });
 
     cronTask = cron.schedule(interval, async () => {
-      lastTickAt = new Date();
+      if (generation === schedulerGeneration) lastTickAt = new Date();
       if (heartbeatRunning) {
         logger.debug('Heartbeat tick skipped — previous tick still running');
         return;
@@ -251,8 +271,11 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
       } catch (error) {
         logger.error('Heartbeat cron error:', error);
       } finally {
+        // Deliberately unfenced: the overlap guard is shared, and a retired
+        // tick finishing is exactly when the successor becomes free to run.
+        // Only the health numbers belong to a generation.
         heartbeatRunning = false;
-        lastTickCompletedAt = new Date();
+        if (generation === schedulerGeneration) lastTickCompletedAt = new Date();
       }
     });
 
@@ -282,6 +305,7 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
      * still in the future. `lastTickAt` is ours and is not off by one.
      */
     cronTask.on('execution:missed', () => {
+      if (generation !== schedulerGeneration) return;
       const detectedAt = new Date();
       missedTickCount += 1;
       lastMissedTickAt = detectedAt;
