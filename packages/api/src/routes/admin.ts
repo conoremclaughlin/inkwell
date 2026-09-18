@@ -7106,7 +7106,7 @@ router.get('/threads', async (req: Request, res: Response) => {
       supabase
         .from('inbox_threads')
         .select(
-          'id, thread_key, key_project, key_type, key_id, title, status, created_by_agent_id, updated_at, closed_at',
+          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_agent_id, updated_at, closed_at',
           { count: 'exact' }
         )
         .eq('user_id', userId)
@@ -7198,7 +7198,7 @@ router.get('/threads', async (req: Request, res: Response) => {
       const { data: extraRows, error: extraError } = await supabase
         .from('inbox_threads')
         .select(
-          'id, thread_key, key_project, key_type, key_id, title, status, created_by_agent_id, updated_at, closed_at'
+          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_agent_id, updated_at, closed_at'
         )
         .eq('user_id', userId)
         .in('thread_key', missing.slice(i, i + 50));
@@ -7258,12 +7258,15 @@ router.get('/threads', async (req: Request, res: Response) => {
     }
 
     const spines = mergeThreadSpines({
+      // One instant for every session in this response; see isSessionLive.
+      nowMs: Date.now(),
       threads: threadRows.map((t) => ({
         threadKey: t.thread_key,
         keyProject: t.key_project ?? null,
         keyType: t.key_type ?? null,
         keyId: t.key_id ?? null,
         title: t.title ?? null,
+        summary: t.summary ?? null,
         status: t.status,
         createdBySlug: t.created_by_agent_id,
         updatedAt: t.updated_at,
