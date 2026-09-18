@@ -1330,11 +1330,32 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
       const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
+      const clients = [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID];
+
+      // Revoke by EITHER expression of the grant's secret.
+      //
+      // Grants rotate, and a browser can easily be holding the value a
+      // rotation just replaced — a background tab refreshed, or this request
+      // was already in flight. Matching only `refresh_token` then deletes
+      // nothing: the cookies clear, the user sees a logout, and the grant is
+      // still alive on the server. Worse since the retry overlap, because for
+      // the length of that window the very secret they just "logged out" with
+      // is redeemable by anyone holding it.
+      //
+      // Two statements rather than one `.or(...)`: the token arrives from a
+      // request body, and PostgREST's `or` filter is a parsed expression, so
+      // interpolating caller-supplied text into it is an injection surface.
+      // `.eq()` sends the value as a parameter and cannot be parsed as syntax.
       await supabase
         .from('mcp_tokens')
         .delete()
         .eq('refresh_token', refreshToken)
-        .in('client_id', [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID]);
+        .in('client_id', clients);
+      await supabase
+        .from('mcp_tokens')
+        .delete()
+        .eq('previous_refresh_token', refreshToken)
+        .in('client_id', clients);
     }
 
     // Clear cookies regardless (same options used when setting them)

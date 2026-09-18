@@ -90,6 +90,17 @@ function makeGrantStore(initial: Row) {
   let row: Row | null = { ...initial };
   /** Held open to pin an interleaving: no update applies until this resolves. */
   let updateGate: Promise<void> = Promise.resolve();
+  /**
+   * How many conditional updates matched nothing.
+   *
+   * Without this a concurrency test cannot tell a real race from two sequential
+   * calls: both end with one live secret and the presented value recorded as
+   * its predecessor, because the second caller's lookup would simply miss and
+   * be answered by the same overlap. A zero-row update is the fingerprint of
+   * the CAS-loss path specifically — it can only happen to a caller that read
+   * the row BEFORE the winner wrote and tried to write AFTER.
+   */
+  let zeroRowUpdates = 0;
 
   const matches = (candidate: Row, filters: Array<[string, unknown]>) =>
     filters.every(([col, val]) => candidate[col] === val);
@@ -107,7 +118,10 @@ function makeGrantStore(initial: Row) {
         const applied = [...filters];
         return (async () => {
           await updateGate;
-          if (!row || !matches(row, applied)) return { data: [], error: null };
+          if (!row || !matches(row, applied)) {
+            zeroRowUpdates += 1;
+            return { data: [], error: null };
+          }
           row = { ...row, ...values } as Row;
           return { data: [{ id: row.id }], error: null };
         })();
@@ -139,6 +153,7 @@ function makeGrantStore(initial: Row) {
   return {
     client,
     current: () => row,
+    zeroRowUpdates: () => zeroRowUpdates,
     /** Block every update until the returned function is called. */
     holdUpdates(): () => void {
       let release!: () => void;
@@ -568,9 +583,12 @@ describe('exchangeRefreshToken — retry overlap', () => {
     expect(retry!.refreshToken).toBe(successor);
 
     // And it rotated NOTHING: the grant still holds the one live secret, so a
-    // client retrying ten times converges instead of walking a chain.
+    // client retrying ten times converges instead of walking a chain. No
+    // conditional update was even attempted — this arrived through the
+    // lookup-miss door, which is the sequential retry rather than the race.
     expect(store.current()!.refresh_token).toBe(successor);
     expect(store.current()!.previous_refresh_token).toBe('pcp-rt-A');
+    expect(store.zeroRowUpdates()).toBe(0);
   });
 
   it('serves BOTH of two concurrent consumers, and leaves one live secret', async () => {
@@ -588,6 +606,12 @@ describe('exchangeRefreshToken — retry overlap', () => {
     release();
 
     const [one, two] = await both;
+
+    // Prove the race happened. Exactly one conditional update matched nothing,
+    // which only a caller that read before the winner wrote and tried to write
+    // after can produce. Without this the assertions below would also pass if
+    // the two exchanges had simply run one after the other.
+    expect(store.zeroRowUpdates()).toBe(1);
 
     expect(one).not.toBeNull();
     expect(two).not.toBeNull();

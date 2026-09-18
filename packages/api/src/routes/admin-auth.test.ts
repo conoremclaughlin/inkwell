@@ -1196,6 +1196,59 @@ describe('POST /auth/logout', () => {
     expect(res._json).toEqual({ success: true });
   });
 
+  it('should revoke a secret the grant has already rotated away from', async () => {
+    // A browser can easily present the value a rotation just replaced — a
+    // background tab refreshed, or this request was already in flight. Matching
+    // only `refresh_token` deletes nothing: the cookies clear, the user sees a
+    // logout, and the grant lives on. Since the retry overlap it is worse than
+    // untidy, because for the length of that window the secret they just
+    // "logged out" with is still redeemable.
+    const deleteChain: Record<string, any> = {};
+    deleteChain.delete = vi.fn(() => deleteChain);
+    deleteChain.eq = vi.fn(() => deleteChain);
+    deleteChain.in = vi.fn(() => deleteChain);
+    mockSupabaseFrom.mockReturnValue(deleteChain);
+
+    const req = createMockReq({
+      body: {},
+      cookies: { 'pcp-admin-refresh': 'pcp-rt-stale' },
+    });
+    const res = createMockRes();
+
+    await logoutHandler(req, res);
+
+    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-rt-stale');
+    expect(deleteChain.eq).toHaveBeenCalledWith('previous_refresh_token', 'pcp-rt-stale');
+    // Both statements are scoped to the same two clients — the second must not
+    // be a wider delete than the first.
+    expect(deleteChain.in).toHaveBeenCalledTimes(2);
+    expect(deleteChain.in).toHaveBeenNthCalledWith(1, 'client_id', ['dashboard', 'mobile']);
+    expect(deleteChain.in).toHaveBeenNthCalledWith(2, 'client_id', ['dashboard', 'mobile']);
+  });
+
+  it('should send the token as a value, never as filter syntax', async () => {
+    // The token arrives from a request body. PostgREST's `or` filter is a
+    // parsed expression, so interpolating caller text into one is an injection
+    // surface; `.eq()` sends a parameter. A hostile value must reach the
+    // database intact and unparsed.
+    const hostile = 'x,client_id.neq.nothing';
+    const deleteChain: Record<string, any> = {};
+    deleteChain.delete = vi.fn(() => deleteChain);
+    deleteChain.eq = vi.fn(() => deleteChain);
+    deleteChain.in = vi.fn(() => deleteChain);
+    deleteChain.or = vi.fn(() => deleteChain);
+    mockSupabaseFrom.mockReturnValue(deleteChain);
+
+    const req = createMockReq({ body: { refreshToken: hostile }, cookies: {} });
+    const res = createMockRes();
+
+    await logoutHandler(req, res);
+
+    expect(deleteChain.or).not.toHaveBeenCalled();
+    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', hostile);
+    expect(deleteChain.eq).toHaveBeenCalledWith('previous_refresh_token', hostile);
+  });
+
   it('should succeed even with no refresh token (just clears cookies)', async () => {
     const req = createMockReq({ body: {}, cookies: {} });
     const res = createMockRes();
