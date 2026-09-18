@@ -329,13 +329,18 @@ describe('PCP Tokens Integration', () => {
         new Date(preRow!.expires_at).toISOString()
       );
 
-      // The presented secret is dead — a real end-to-end replay check.
+      // The presented secret is dead — a real end-to-end replay check. The
+      // overlap is switched off for it, because with the overlap on, a replay
+      // one millisecond later is exactly the retry the overlap exists to
+      // answer; this assertion is about ROTATION, and zero is the setting under
+      // which rotation alone decides.
       const replay = await exchangeRefreshToken(
         supabase,
         validRefreshToken,
         'integration-test',
         'mcp_access',
-        3600
+        3600,
+        { retryOverlapSeconds: 0 }
       );
       expect(replay).toBeNull();
     });
@@ -446,6 +451,203 @@ describe('PCP Tokens Integration', () => {
         3600
       );
       expect(sameResult).not.toBeNull();
+    });
+  });
+
+  // =========================================================================
+  // The retry overlap, against a real database.
+  //
+  // The unit suite models the conditional update; here Postgres enforces it.
+  // That matters for the case this was built for: two consumers issuing their
+  // exchanges at once, where the row, its UNIQUE index and the UPDATE's own
+  // WHERE clause decide the winner rather than a test double.
+  // =========================================================================
+
+  describe('retry overlap (real concurrency)', () => {
+    let grantToken: string;
+    let grantRowId: string;
+
+    beforeEach(async () => {
+      const supabase = dataComposer.getClient();
+      const { refreshToken } = await createRefreshToken(
+        supabase,
+        testUserId,
+        'integration-test',
+        ['mcp:tools'],
+        90
+      );
+      grantToken = refreshToken;
+
+      const { data: row } = await supabase
+        .from('mcp_tokens')
+        .select('id')
+        .eq('refresh_token', refreshToken)
+        .single();
+      expect(row).not.toBeNull();
+      grantRowId = row!.id;
+      createdTokenIds.push(grantRowId);
+    });
+
+    it('serves both of two genuinely concurrent exchanges, and leaves one live secret', async () => {
+      // Two processes sharing one grant, issued together — not sequenced, not
+      // scripted. Exactly one UPDATE can match `refresh_token`; the loser is
+      // answered from the row the winner just wrote.
+      const supabase = dataComposer.getClient();
+
+      const [first, second] = await Promise.all([
+        exchangeRefreshToken(supabase, grantToken, 'integration-test', 'mcp_access', 3600),
+        exchangeRefreshToken(supabase, grantToken, 'integration-test', 'mcp_access', 3600),
+      ]);
+
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull();
+      expect(first!.refreshToken).toBe(second!.refreshToken);
+      expect(first!.refreshToken).not.toBe(grantToken);
+
+      // Each caller got its own usable access token.
+      expect(verifyPcpAccessToken(first!.accessToken, 'mcp_access')).not.toBeNull();
+      expect(verifyPcpAccessToken(second!.accessToken, 'mcp_access')).not.toBeNull();
+
+      // And the database holds ONE live secret, with the presented value
+      // recorded as its predecessor exactly once.
+      const { data: after } = await supabase
+        .from('mcp_tokens')
+        .select('refresh_token, previous_refresh_token, rotated_at')
+        .eq('id', grantRowId)
+        .single();
+      expect(after!.refresh_token).toBe(first!.refreshToken);
+      expect(after!.previous_refresh_token).toBe(grantToken);
+      expect(after!.rotated_at).not.toBeNull();
+
+      const { data: rows } = await supabase
+        .from('mcp_tokens')
+        .select('id')
+        .eq('user_id', testUserId)
+        .eq('previous_refresh_token', grantToken);
+      expect(rows).toHaveLength(1);
+    });
+
+    it('answers a sequential retry of the same secret with the committed successor', async () => {
+      const supabase = dataComposer.getClient();
+
+      const first = await exchangeRefreshToken(
+        supabase,
+        grantToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+      const retry = await exchangeRefreshToken(
+        supabase,
+        grantToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+
+      expect(retry).not.toBeNull();
+      expect(retry!.refreshToken).toBe(first!.refreshToken);
+
+      // No second rotation: the row is untouched by the retry.
+      const { data: after } = await supabase
+        .from('mcp_tokens')
+        .select('refresh_token, previous_refresh_token')
+        .eq('id', grantRowId)
+        .single();
+      expect(after!.refresh_token).toBe(first!.refreshToken);
+      expect(after!.previous_refresh_token).toBe(grantToken);
+    });
+
+    it('refuses the previous secret once the window has closed', async () => {
+      const supabase = dataComposer.getClient();
+      await exchangeRefreshToken(supabase, grantToken, 'integration-test', 'mcp_access', 3600);
+
+      // Age the rotation in the database rather than sleeping through it.
+      await supabase
+        .from('mcp_tokens')
+        .update({ rotated_at: new Date(Date.now() - 10 * 60 * 1000).toISOString() })
+        .eq('id', grantRowId);
+
+      const late = await exchangeRefreshToken(
+        supabase,
+        grantToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+      expect(late).toBeNull();
+    });
+
+    it('does not move either deadline column when answering a retry', async () => {
+      const supabase = dataComposer.getClient();
+      const { data: before } = await supabase
+        .from('mcp_tokens')
+        .select('expires_at, created_at')
+        .eq('id', grantRowId)
+        .single();
+
+      await exchangeRefreshToken(supabase, grantToken, 'integration-test', 'mcp_access', 3600);
+      const retry = await exchangeRefreshToken(
+        supabase,
+        grantToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+
+      const { data: after } = await supabase
+        .from('mcp_tokens')
+        .select('expires_at, created_at')
+        .eq('id', grantRowId)
+        .single();
+
+      expect(after!.expires_at).toBe(before!.expires_at);
+      expect(after!.created_at).toBe(before!.created_at);
+      expect(retry!.refreshTokenExpiresAt.toISOString()).toBe(
+        new Date(before!.expires_at).toISOString()
+      );
+    });
+
+    it('keeps only one generation — the secret before last stays dead', async () => {
+      const supabase = dataComposer.getClient();
+      const first = await exchangeRefreshToken(
+        supabase,
+        grantToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+      await exchangeRefreshToken(
+        supabase,
+        first!.refreshToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+
+      // The original is now two generations back: no row names it.
+      const twoBack = await exchangeRefreshToken(
+        supabase,
+        grantToken,
+        'integration-test',
+        'mcp_access',
+        3600
+      );
+      expect(twoBack).toBeNull();
+    });
+
+    it('refuses a retry from a different client_id', async () => {
+      const supabase = dataComposer.getClient();
+      await exchangeRefreshToken(supabase, grantToken, 'integration-test', 'mcp_access', 3600);
+
+      const crossClient = await exchangeRefreshToken(
+        supabase,
+        grantToken,
+        'dashboard',
+        'pcp_admin',
+        3600
+      );
+      expect(crossClient).toBeNull();
     });
   });
 

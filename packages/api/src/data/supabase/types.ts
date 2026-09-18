@@ -1763,7 +1763,9 @@ export type Database = {
           expires_at: string;
           id: string;
           last_used_at: string | null;
+          previous_refresh_token: string | null;
           refresh_token: string;
+          rotated_at: string | null;
           sb_id: string | null;
           scopes: string[] | null;
           supabase_refresh_token: string | null;
@@ -1777,7 +1779,9 @@ export type Database = {
           expires_at: string;
           id?: string;
           last_used_at?: string | null;
+          previous_refresh_token?: string | null;
           refresh_token: string;
+          rotated_at?: string | null;
           sb_id?: string | null;
           scopes?: string[] | null;
           supabase_refresh_token?: string | null;
@@ -1791,7 +1795,9 @@ export type Database = {
           expires_at?: string;
           id?: string;
           last_used_at?: string | null;
+          previous_refresh_token?: string | null;
           refresh_token?: string;
+          rotated_at?: string | null;
           sb_id?: string | null;
           scopes?: string[] | null;
           supabase_refresh_token?: string | null;

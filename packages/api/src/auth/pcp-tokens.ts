@@ -11,13 +11,25 @@ import jwt from 'jsonwebtoken';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
-import { DAY_MS, REFRESH_ABSOLUTE_DAYS, effectiveGrantDeadline } from './refresh-policy';
+import {
+  DAY_MS,
+  REFRESH_ABSOLUTE_DAYS,
+  REFRESH_RETRY_OVERLAP_SECONDS,
+  effectiveGrantDeadline,
+  isWithinRetryOverlap,
+} from './refresh-policy';
 
 // Re-exported so callers and tests have one import site for the token module's
 // own surface. Modules that only need the policy (admin routes, the OAuth
 // provider) import './refresh-policy' directly — many suites mock this module
 // wholesale, and every export added here becomes a broken mock in one of them.
-export { DAY_MS, REFRESH_ABSOLUTE_DAYS, effectiveGrantDeadline } from './refresh-policy';
+export {
+  DAY_MS,
+  REFRESH_ABSOLUTE_DAYS,
+  REFRESH_RETRY_OVERLAP_SECONDS,
+  effectiveGrantDeadline,
+  isWithinRetryOverlap,
+} from './refresh-policy';
 import type { Database } from '../data/supabase/types';
 
 // ============================================================================
@@ -151,9 +163,195 @@ export function verifyPcpAccessToken(
 // the secret is not a reason to extend the grant — if it were, an active client
 // would hold one forever and the ceiling would never arrive. Re-authentication
 // lands on the original schedule regardless of how often the secret changes.
+//
+// Rotation alone, though, refuses two clients who have done nothing wrong: the
+// loser of a race between processes sharing one grant, and a client whose
+// successful response never arrived and which retried the only secret it had.
+// So the row keeps ONE generation of history — `previous_refresh_token` and
+// `rotated_at` — and for a bounded overlap after a rotation the replaced value
+// is answered with the successor that was already committed, rotating nothing.
+// Retries converge rather than cascade. The window is exposure: inside it the
+// previous secret is redeemable by whoever holds it. See
+// REFRESH_RETRY_OVERLAP_SECONDS.
 
 function newRefreshTokenValue(): string {
   return `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
+}
+
+/** The subset of a grant row this module reads. Columns come back untyped. */
+type GrantRow = Record<string, unknown> & {
+  id: string;
+  user_id: string;
+  client_id: string;
+  refresh_token: string;
+  expires_at: string;
+  scopes: string[] | null;
+};
+
+interface ExchangeResult {
+  accessToken: string;
+  /** The grant's LIVE secret. The value presented is now dead. */
+  refreshToken: string;
+  refreshTokenExpiresAt: Date;
+  userId: string;
+  email: string;
+  agentId?: string;
+  identityId?: string;
+}
+
+/**
+ * Mint an access token carrying the grant's bindings, and package the reply.
+ *
+ * Shared by the rotating path and the retry-overlap path on purpose: a replayed
+ * exchange must produce a token with exactly the same authority as the one the
+ * winner got, never a broader or narrower one.
+ */
+function grantExchangeResult(
+  record: GrantRow,
+  liveRefreshToken: string,
+  tokenType: PcpTokenPayload['type'],
+  accessTokenLifetimeSeconds: number
+): ExchangeResult {
+  const email = (record.users as unknown as { email: string | null })?.email || '';
+  const scope = record.scopes?.join(' ') || 'mcp:tools';
+  const agentId = record.agent_id as string | null;
+  const sbId = record.sb_id as string | null;
+
+  const accessToken = signPcpAccessToken(
+    {
+      type: tokenType,
+      sub: record.user_id,
+      email,
+      scope,
+      ...(agentId ? { agentId } : {}),
+      ...(sbId ? { identityId: sbId } : {}),
+    },
+    accessTokenLifetimeSeconds
+  );
+
+  const { expiresAt } = effectiveGrantDeadline({
+    createdAt: record.created_at as string | null,
+    currentExpiresAt: record.expires_at,
+  });
+
+  return {
+    accessToken,
+    refreshToken: liveRefreshToken,
+    refreshTokenExpiresAt: expiresAt,
+    userId: record.user_id,
+    email,
+    ...(agentId ? { agentId } : {}),
+    ...(sbId ? { identityId: sbId } : {}),
+  };
+}
+
+/**
+ * Whether a grant has outlived either expression of its deadline.
+ *
+ * Deletes the row when it has. Both deadlines are checked because a row whose
+ * stored `expires_at` was written too generously — or migrated in from an older
+ * scheme — is still finished, and its `expires_at` is not where that shows up.
+ */
+async function grantIsPastDeadline(
+  supabase: SupabaseClient<Database>,
+  record: GrantRow,
+  clientId: string,
+  now: Date
+): Promise<boolean> {
+  if (new Date(record.expires_at) < now) {
+    logger.warn('Refresh token expired', { userId: record.user_id, clientId });
+    await supabase.from('mcp_tokens').delete().eq('id', record.id);
+    return true;
+  }
+
+  const createdAt = record.created_at as string | null;
+  if (createdAt && new Date(createdAt).getTime() + REFRESH_ABSOLUTE_DAYS * DAY_MS < now.getTime()) {
+    logger.warn('Refresh token past its absolute lifetime', {
+      userId: record.user_id,
+      clientId,
+      createdAt,
+    });
+    await supabase.from('mcp_tokens').delete().eq('id', record.id);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Answer a secret that a rotation has already replaced.
+ *
+ * Reached two ways, and they are the same situation seen from either side of
+ * the winner's write:
+ *
+ *   - the lookup missed, because the rotation committed before we read;
+ *   - the lookup hit but our conditional update matched zero rows, because the
+ *     rotation committed between our read and our write.
+ *
+ * Either way the question is whether the value presented is the one this grant
+ * just replaced, and whether that happened recently enough. If so the answer is
+ * the successor already committed — no second rotation, so concurrent retries
+ * converge on one live secret instead of fighting over the grant.
+ *
+ * Past the window this refuses, and says so distinctly: with one generation on
+ * the row the server can now tell a replayed secret from an unknown one. It
+ * does NOT revoke the grant on that signal — breach detection (RFC 9700
+ * §4.14.2) needs a full token family and a policy decision neither of which
+ * exists yet — but the signal is in the log rather than indistinguishable from
+ * an ordinary stale token.
+ */
+async function replayRotatedGrant(
+  supabase: SupabaseClient<Database>,
+  presentedToken: string,
+  clientId: string,
+  tokenType: PcpTokenPayload['type'],
+  accessTokenLifetimeSeconds: number,
+  overlapSeconds: number
+): Promise<ExchangeResult | null> {
+  if (overlapSeconds <= 0) return null;
+
+  const { data, error } = await supabase
+    .from('mcp_tokens')
+    .select('*, users(email)')
+    .eq('previous_refresh_token', presentedToken)
+    .single();
+
+  if (error || !data) return null;
+  const record = data as unknown as GrantRow;
+
+  if (record.client_id !== clientId) {
+    logger.warn('Rotated refresh token client_id mismatch', {
+      expected: record.client_id,
+      received: clientId,
+    });
+    return null;
+  }
+
+  const now = new Date();
+
+  if (
+    !isWithinRetryOverlap({ rotatedAt: record.rotated_at as string | null, now, overlapSeconds })
+  ) {
+    logger.warn('Refresh token was already rotated and its retry window has closed', {
+      userId: record.user_id,
+      clientId,
+      rotatedAt: record.rotated_at,
+      overlapSeconds,
+    });
+    return null;
+  }
+
+  // A grant past its deadline is over however the secret was presented.
+  if (await grantIsPastDeadline(supabase, record, clientId, now)) return null;
+
+  logger.info('Honouring a just-rotated refresh token within its retry window', {
+    userId: record.user_id,
+    clientId,
+    rotatedAt: record.rotated_at,
+    overlapSeconds,
+  });
+
+  return grantExchangeResult(record, record.refresh_token, tokenType, accessTokenLifetimeSeconds);
 }
 
 /**
@@ -203,34 +401,49 @@ export async function createRefreshToken(
  * stored expiry and the absolute ceiling. Callers setting a cookie must use it
  * rather than computing a fresh window, or the cookie outlives the grant.
  *
- * @returns  Access token, the ROTATED refresh token and user info, or null
+ * A secret this grant rotated away from is still answered for
+ * `retryOverlapSeconds` afterwards, with the successor already committed rather
+ * than a second rotation. That is what keeps a retry, or the loser of a race
+ * between two processes sharing a grant, from being logged out of a live
+ * session. `refreshToken` in the reply is the grant's LIVE secret either way,
+ * so a caller never needs to know which path answered it.
+ *
+ * @returns  Access token, the grant's live refresh token and user info, or null
  */
 export async function exchangeRefreshToken(
   supabase: SupabaseClient<Database>,
   refreshToken: string,
   clientId: string,
   tokenType: PcpTokenPayload['type'],
-  accessTokenLifetimeSeconds: number
-): Promise<{
-  accessToken: string;
-  /** ROTATED — the presented token is now dead. Return this to the client. */
-  refreshToken: string;
-  refreshTokenExpiresAt: Date;
-  userId: string;
-  email: string;
-  agentId?: string;
-  identityId?: string;
-} | null> {
-  const { data: tokenRecord, error: lookupError } = await supabase
+  accessTokenLifetimeSeconds: number,
+  options?: { retryOverlapSeconds?: number }
+): Promise<ExchangeResult | null> {
+  const overlapSeconds = options?.retryOverlapSeconds ?? REFRESH_RETRY_OVERLAP_SECONDS;
+  const replay = () =>
+    replayRotatedGrant(
+      supabase,
+      refreshToken,
+      clientId,
+      tokenType,
+      accessTokenLifetimeSeconds,
+      overlapSeconds
+    );
+
+  const { data, error: lookupError } = await supabase
     .from('mcp_tokens')
     .select('*, users(email)')
     .eq('refresh_token', refreshToken)
     .single();
 
-  if (lookupError || !tokenRecord) {
-    logger.warn('Refresh token not found', { clientId });
-    return null;
+  if (lookupError || !data) {
+    // Not the live secret — but it may be the one this grant just replaced,
+    // which is the ordinary shape of a retry. Ask before refusing.
+    const replayed = await replay();
+    if (!replayed) logger.warn('Refresh token not found', { clientId });
+    return replayed;
   }
+
+  const tokenRecord = data as unknown as GrantRow;
 
   if (tokenRecord.client_id !== clientId) {
     logger.warn('Refresh token client_id mismatch', {
@@ -241,64 +454,28 @@ export async function exchangeRefreshToken(
   }
 
   const now = new Date();
-
-  if (new Date(tokenRecord.expires_at) < now) {
-    logger.warn('Refresh token expired', { userId: tokenRecord.user_id, clientId });
-    await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
-    return null;
-  }
-
-  // The absolute ceiling is checked on its own, because a row whose stored
-  // expires_at was written too generously — or migrated in from an older
-  // scheme — is still finished, and its expires_at is not where that shows up.
-  const createdAt = (tokenRecord as Record<string, unknown>).created_at as string | null;
-  if (createdAt && new Date(createdAt).getTime() + REFRESH_ABSOLUTE_DAYS * DAY_MS < now.getTime()) {
-    logger.warn('Refresh token past its absolute lifetime', {
-      userId: tokenRecord.user_id,
-      clientId,
-      createdAt,
-    });
-    await supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
-    return null;
-  }
-
-  const userEmail = (tokenRecord.users as unknown as { email: string | null })?.email || '';
-
-  const scope = tokenRecord.scopes?.join(' ') || 'mcp:tools';
-  const tokenAny = tokenRecord as Record<string, unknown>;
-  const agentId = tokenAny.agent_id as string | null;
-  const sbId = tokenAny.sb_id as string | null;
-
-  const accessToken = signPcpAccessToken(
-    {
-      type: tokenType,
-      sub: tokenRecord.user_id,
-      email: userEmail,
-      scope,
-      ...(agentId ? { agentId } : {}),
-      ...(sbId ? { identityId: sbId } : {}),
-    },
-    accessTokenLifetimeSeconds
-  );
+  if (await grantIsPastDeadline(supabase, tokenRecord, clientId, now)) return null;
 
   // Rotate and stamp — one write, conditional on the value presented. Matching
   // on refresh_token as well as id is what makes a concurrent second exchange
   // lose: it updates zero rows rather than handing out a second live token for
   // the same grant.
   //
+  // The value presented is kept as `previous_refresh_token`, stamped
+  // `rotated_at`, so the loser of that race can be answered with THIS rotation's
+  // result instead of being turned away.
+  //
   // `expires_at` and `created_at` are deliberately absent from this update. The
   // deadline belongs to the grant, not to the secret currently representing it,
   // so rotating cannot move it and neither can a retry.
   const rotated = newRefreshTokenValue();
-  const { expiresAt, atAbsoluteCeiling } = effectiveGrantDeadline({
-    createdAt,
-    currentExpiresAt: tokenRecord.expires_at,
-  });
 
   const { data: updated, error: rotateError } = await supabase
     .from('mcp_tokens')
     .update({
       refresh_token: rotated,
+      previous_refresh_token: refreshToken,
+      rotated_at: now.toISOString(),
       last_used_at: now.toISOString(),
     })
     .eq('id', tokenRecord.id)
@@ -310,15 +487,22 @@ export async function exchangeRefreshToken(
     return null;
   }
   if (!updated || updated.length === 0) {
-    // Someone else rotated this grant between our read and our write. Refusing
-    // is the safe direction: the winner holds the live token.
-    logger.warn('Refresh token was rotated concurrently; refusing this exchange', {
+    // Someone else rotated this grant between our read and our write. Their
+    // write recorded the value we presented, so if we are inside the overlap
+    // the answer is their successor — one live secret, both callers served.
+    logger.warn('Refresh token was rotated concurrently; checking the retry window', {
       userId: tokenRecord.user_id,
       clientId,
     });
-    return null;
+    return replay();
   }
 
+  const result = grantExchangeResult(tokenRecord, rotated, tokenType, accessTokenLifetimeSeconds);
+
+  const { atAbsoluteCeiling } = effectiveGrantDeadline({
+    createdAt: tokenRecord.created_at as string | null,
+    currentExpiresAt: tokenRecord.expires_at,
+  });
   if (atAbsoluteCeiling) {
     // The stored expiry reaches past created_at + REFRESH_ABSOLUTE_DAYS, so the
     // ceiling is the deadline actually in force and the client has less time
@@ -327,17 +511,9 @@ export async function exchangeRefreshToken(
       userId: tokenRecord.user_id,
       clientId,
       storedExpiresAt: tokenRecord.expires_at,
-      effectiveExpiresAt: expiresAt.toISOString(),
+      effectiveExpiresAt: result.refreshTokenExpiresAt.toISOString(),
     });
   }
 
-  return {
-    accessToken,
-    refreshToken: rotated,
-    refreshTokenExpiresAt: expiresAt,
-    userId: tokenRecord.user_id,
-    email: userEmail,
-    ...(agentId ? { agentId } : {}),
-    ...(sbId ? { identityId: sbId } : {}),
-  };
+  return result;
 }

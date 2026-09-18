@@ -24,6 +24,47 @@ export const REFRESH_ABSOLUTE_DAYS = 90;
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * How long the secret a rotation just replaced stays redeemable.
+ *
+ * **PROVISIONAL — not an approved policy value.** #632 R7 is open and the
+ * number is Conor's; 60 seconds is the candidate put to him, and everything
+ * that reads this constant takes it as a parameter so the choice is one edit.
+ *
+ * The tradeoff is not softened by the mechanism. Inside this window, anyone
+ * holding the previous secret — its legitimate owner retrying, or a thief who
+ * captured it — gets the committed successor. A longer window rescues more
+ * honest clients and lengthens exactly the same opening. Zero disables the
+ * overlap entirely and restores the refuse-everything behaviour.
+ */
+export const REFRESH_RETRY_OVERLAP_SECONDS = 60;
+
+/**
+ * Whether a grant rotated at `rotatedAt` is still inside its overlap window.
+ *
+ * A missing `rotatedAt` is NOT inside it. A row can carry a previous secret
+ * with no timestamp only if something wrote one without the other, and an
+ * unknown rotation time cannot be shown to be recent — so it is treated as old.
+ */
+export function isWithinRetryOverlap(params: {
+  rotatedAt: string | null | undefined;
+  now: Date;
+  overlapSeconds?: number;
+}): boolean {
+  const overlapSeconds = params.overlapSeconds ?? REFRESH_RETRY_OVERLAP_SECONDS;
+  if (overlapSeconds <= 0) return false;
+  if (!params.rotatedAt) return false;
+
+  const rotatedAtMs = new Date(params.rotatedAt).getTime();
+  if (Number.isNaN(rotatedAtMs)) return false;
+
+  const elapsedMs = params.now.getTime() - rotatedAtMs;
+  // A rotation stamped in the future is clock skew, not a fresh rotation.
+  // Treat it as inside the window rather than refusing a client for a server
+  // clock it has no part in; the window's far edge is what bounds exposure.
+  return elapsedMs <= overlapSeconds * 1000;
+}
+
+/**
  * The deadline actually in force for a grant: the earlier of its stored
  * `expires_at` and `created_at` + REFRESH_ABSOLUTE_DAYS.
  *
