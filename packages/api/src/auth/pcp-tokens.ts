@@ -517,8 +517,32 @@ export async function exchangeRefreshTokenDetailed(
     // Not the live secret — but it may be the one this grant just replaced,
     // which is the ordinary shape of a retry. Ask before refusing.
     const replayed = await replay();
-    if (!replayed) logger.warn('Refresh token not found', { clientId });
-    return replayed ?? { status: 'rejected' };
+    if (replayed) return replayed;
+
+    // And if it is not that either, this is where the design's limit bites, so
+    // it is worth being exact about what is and is not being claimed.
+    //
+    // The CAS-loss path below can answer `superseded`, because it holds a row
+    // id: it knows which grant it lost to and can ask whether that grant is
+    // still alive. Here there is no id. A secret that matches neither
+    // `refresh_token` nor `previous_refresh_token` on any row — a client two
+    // rotations behind, or one whose overlap has expired — is named by nothing,
+    // and is therefore indistinguishable from a secret that never existed.
+    //
+    // So `rejected` is the only honest answer, and it is NOT true that
+    // exceeding one generation is always reported as `superseded`. It is
+    // reported that way when the caller lost a race we can see, and reported as
+    // a rejection when it is simply too far behind to identify. Lumen caught me
+    // claiming the stronger version of this.
+    //
+    // Which means the consumer's fence is load-bearing rather than defensive,
+    // because it is all there is: the CLI compares the file before deleting
+    // anything, and the dashboard asks whether the credential it holds NOW
+    // authenticates before ending a session (`GET /api/admin/auth/session`). A
+    // consumer that treats this result as proof its own current credential is
+    // dead will eventually be wrong about a live session.
+    logger.warn('Refresh token matches no live or recently rotated grant', { clientId });
+    return { status: 'rejected' };
   }
 
   const tokenRecord = data as unknown as GrantRow;

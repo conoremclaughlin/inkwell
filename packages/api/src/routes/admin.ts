@@ -1831,6 +1831,32 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 router.use(adminAuthMiddleware);
 
 /**
+ * Whether the credentials on THIS request authenticate. Nothing else.
+ *
+ * It exists because of a question the browser cannot otherwise ask. A refusal
+ * arrives attached to one request, and the credential that request carried may
+ * no longer be the credential the browser holds: a sibling request rotated the
+ * grant while this one was in flight, or the person signed in again. The server
+ * cannot close that gap from its side — a secret two rotations back is named by
+ * no column on the row, so it is indistinguishable from one that never existed,
+ * and answering it `superseded` would mean guessing.
+ *
+ * The browser can ask, though, and this is the question: not "was that
+ * credential good" but "is the one I hold NOW good". A success here means the
+ * refusal was about something the browser has already replaced, and ending the
+ * session on it would revoke a session that a sibling request just renewed.
+ *
+ * It must stay BELOW `router.use(adminAuthMiddleware)`. Mounted above it, it
+ * would answer 200 to anyone, the browser would read every dead session as
+ * alive, and nothing would ever log out again — silently, since the endpoint
+ * would look identical. There is a test pinning the ordering.
+ */
+router.get('/auth/session', (req: Request, res: Response) => {
+  const authReq = req as AdminAuthRequest;
+  res.json({ userId: authReq.pcpUserId, email: authReq.user?.email ?? null });
+});
+
+/**
  * Where a phone could reach this server, in the order it should try them.
  *
  * Candidates: the configured public URL, the host the dashboard itself was
