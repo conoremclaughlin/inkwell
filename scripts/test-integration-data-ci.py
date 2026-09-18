@@ -17,6 +17,16 @@ sys.path.insert(0, str(Path(__file__).parent / "lib"))
 import integration_data as data
 
 
+def refused(fn, expected):
+    try:
+        fn()
+    except data.Refusal as error:
+        # A permission or syntax failure is NOT evidence the intended guard ran.
+        assert expected in str(error), "Refused for an unexpected reason: " + str(error)
+        return
+    raise AssertionError("Expected refusal; unsafe probe proceeded")
+
+
 def main():
     if not all(os.environ.get(k) == v for k, v in {
         "CI": "true", "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
@@ -45,13 +55,6 @@ def main():
             data.clean_fixtures(workdir, project, state["dbId"], ports[1], baseline or state["baseline"],
                                 fds, state["fingerprint"], run_id)
 
-        def refused(fn):
-            try:
-                fn()
-            except data.Refusal:
-                return
-            raise AssertionError("Expected refusal; unsafe probe proceeded")
-
         residue_id = "00000000-0000-4000-8000-000000000649"
         # This dedicated test schema is outside the public cleanup allowlist.
         data.transaction(container_id, guard + """
@@ -77,11 +80,11 @@ UPDATE _pcp_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
 
         # Same connection identity guard refuses a validly-shaped wrong token.
         wrong = dict(state["baseline"], token="00000000-0000-4000-8000-000000000000")
-        refused(lambda: clean(wrong))
+        refused(lambda: clean(wrong), "SQLSTATE=PC002")
         assert residue_count() == "1"
 
         data.transaction(container_id, guard + "ALTER TABLE _pcp_it.stack RENAME TO missing_marker_probe;", fds)
-        refused(clean)
+        refused(clean, "SQLSTATE=42P01")
         assert residue_count() == "1"
         # The assertion is missing by design; restoration targets this pinned CI
         # container only. No fallback to a host URL or a production database.
@@ -89,13 +92,13 @@ UPDATE _pcp_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
 
         # Classification must fail for an independent table with NO foreign keys.
         data.transaction(container_id, guard + "CREATE TABLE public.cleanup_unclassified_probe (value text);", fds)
-        refused(clean)
+        refused(clean, "Public table classification differs")
         assert residue_count() == "1"
         data.transaction(container_id, guard + "DROP TABLE public.cleanup_unclassified_probe;", fds)
 
         # A changed excluded table is refused, not silently carried into the suite.
         data.transaction(container_id, guard + "INSERT INTO public.pcp_config (key, value) VALUES ('cleanup-ci-probe', 'fixture');", fds)
-        refused(clean)
+        refused(clean, "SQLSTATE=PC003")
         assert residue_count() == "1"
         data.transaction(container_id, guard + "DELETE FROM public.pcp_config WHERE key = 'cleanup-ci-probe';", fds)
 
@@ -106,7 +109,7 @@ UPDATE _pcp_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
         try:
             path.write_text(broken)
             fault = dict(state["baseline"], hash=data.hashlib.sha256(broken.encode()).hexdigest())
-            refused(lambda: clean(fault))
+            refused(lambda: clean(fault), "SQLSTATE=22012")
             assert residue_count() == "1", "failed restore committed truncation"
         finally:
             path.write_text(original)

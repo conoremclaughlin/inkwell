@@ -98,20 +98,23 @@ def checked_container(project, recorded_id, db_port):
     return validate_identity(info, project, recorded_id, db_port)
 
 
-def db_command(container_id, tool):
+def db_command(container_id, tool, maintenance=False):
     # Pin the immutable ID, never resolve the name again at the mutation boundary.
     # Explicit socket/user/port/db defeat container-side libpq defaults as well.
     # An empty PGSERVICE is NOT unset: libpq tries to resolve service "".
+    # Supabase's postgres is not a superuser. Only the guarded restore needs
+    # supabase_admin: pg_dump's DISABLE TRIGGER ALL includes system FK triggers.
+    user = "supabase_admin" if maintenance else "postgres"
     return ["docker", "exec", "-i", container_id, "env", "-u", "PGOPTIONS",
             "-u", "PGSERVICE", "-u", "PGSERVICEFILE", tool,
             "--host=/var/run/postgresql", "--port=5432",
-            "--username=postgres", "--dbname=" + DATABASE, "--no-password"]
+            "--username=" + user, "--dbname=" + DATABASE, "--no-password"]
 
 
-def execute(container_id, tool, args, lock_fds, sql=None, phase="SQL operation"):
+def execute(container_id, tool, args, lock_fds, sql=None, phase="SQL operation", maintenance=False):
     try:
         diagnostics = ["-v", "VERBOSITY=sqlstate"] if tool == "psql" else []
-        return subprocess.run(db_command(container_id, tool) + diagnostics + args, input=sql,
+        return subprocess.run(db_command(container_id, tool, maintenance=maintenance) + diagnostics + args, input=sql,
                               capture_output=True, text=True, check=True, timeout=60,
                               pass_fds=lock_fds).stdout
     except (OSError, subprocess.SubprocessError) as error:
@@ -197,9 +200,9 @@ def canonical_uuid(value):
         raise Refusal("Invalid persisted fixture identity/run token; refusing SQL construction.") from None
 
 
-def transaction(container_id, sql, lock_fds, phase="transaction"):
+def transaction(container_id, sql, lock_fds, phase="transaction", maintenance=False):
     return execute(container_id, "psql", ["-X", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-f", "-"],
-                   lock_fds, "SET TIME ZONE 'UTC';\nSET lock_timeout = '5s';\n" + sql, phase=phase)
+                   lock_fds, "SET TIME ZONE 'UTC';\nSET lock_timeout = '5s';\n" + sql, phase=phase, maintenance=maintenance)
 
 
 def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature, run_id):
@@ -274,7 +277,7 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     # preamble and everything after it schema-qualified.
     truncate = "TRUNCATE " + ", ".join("ONLY public." + t for t in FIXTURE_TABLES) + " CONTINUE IDENTITY RESTRICT;\n"
     transaction(container_id, guard + checksum_guard(EXCLUDED_TABLES) + truncate + baseline + "\n" +
-                checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup")
+                checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup", maintenance=True)
 
 
 def finish_run(project, recorded_id, db_port, baseline_state, lock_fds, signature, run_id):
