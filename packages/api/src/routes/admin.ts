@@ -53,6 +53,7 @@ import {
   verifyPcpAccessToken,
   createRefreshToken,
   exchangeRefreshToken,
+  exchangeRefreshTokenDetailed,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
 import { applyGraphBlockedBy } from '../data/task-graph-read-model';
@@ -1044,13 +1045,45 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       const refreshCookie = req.cookies?.['pcp-admin-refresh'];
       if (refreshCookie) {
         refreshExchangeFailed = true;
-        const result = await exchangeRefreshToken(
+        const outcome = await exchangeRefreshTokenDetailed(
           supabase,
           refreshCookie,
           ADMIN_CLIENT_ID,
           'pcp_admin',
           ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
         );
+
+        // Two of the ways this can fail must NOT end the browser's session, and
+        // until now both did — the 401 below carries the one string the
+        // dashboard's interceptor turns into a logout and a redirect.
+        //
+        // `superseded`: the cookie is one generation behind. That happens on its
+        // own, without anything being wrong: two tabs refresh at once, the
+        // loser's request carries the value the winner just replaced, and by the
+        // time it arrives the browser already holds the live secret from the
+        // winner's Set-Cookie. Logging out on it means a late request revokes
+        // the session its own sibling just renewed. It gets a distinct 401 the
+        // client treats as an ordinary failure, and the next request — carrying
+        // the current cookie — succeeds.
+        //
+        // `unavailable`: nothing is known about the grant. 503, because "come
+        // back" is the only honest answer, and because a 401 of any shape
+        // invites the client to conclude something about a credential nobody
+        // checked.
+        if (outcome.status === 'superseded') {
+          logger.warn('Admin refresh cookie is a superseded generation; not ending the session', {
+            path: req.path,
+          });
+          res.status(401).json({ error: 'Stale credential' });
+          return;
+        }
+        if (outcome.status === 'unavailable') {
+          logger.error('Admin refresh exchange could not be completed', { path: req.path });
+          res.status(503).json({ error: 'Authentication temporarily unavailable' });
+          return;
+        }
+
+        const result = 'result' in outcome ? outcome.result : null;
         if (result) {
           refreshExchangeFailed = false;
           pcpUserId = result.userId;
@@ -1334,7 +1367,7 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
       });
       const clients = [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID];
 
-      // Revoke by EITHER expression of the grant's secret.
+      // Revoke by EITHER expression of the grant's secret, in ONE statement.
       //
       // Grants rotate, and a browser can easily be holding the value a
       // rotation just replaced — a background tab refreshed, or this request
@@ -1344,20 +1377,33 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
       // the length of that window the very secret they just "logged out" with
       // is redeemable by anyone holding it.
       //
-      // Two statements rather than one `.or(...)`: the token arrives from a
-      // request body, and PostgREST's `or` filter is a parsed expression, so
-      // interpolating caller-supplied text into it is an injection surface.
-      // `.eq()` sends the value as a parameter and cannot be parsed as syntax.
-      await supabase
-        .from('mcp_tokens')
-        .delete()
-        .eq('refresh_token', refreshToken)
-        .in('client_id', clients);
-      await supabase
-        .from('mcp_tokens')
-        .delete()
-        .eq('previous_refresh_token', refreshToken)
-        .in('client_id', clients);
+      // Done as two DELETEs, a rotation landing between them escapes both — the
+      // first misses because the value is already `previous_refresh_token`, and
+      // the second misses because a generation has since advanced past it. Both
+      // statements looked at a row that held the secret; neither deleted it.
+      // `revoke_refresh_grant` is one statement, so the two orderings are
+      // "revoked" and "the rotation committed first and the secret is genuinely
+      // no longer on the row" — no interleaving in between.
+      //
+      // A function rather than a PostgREST `.or(...)` filter: the token arrives
+      // from a request body, and `or` is a parsed expression, so interpolating
+      // caller-supplied text into one is an injection surface. A function
+      // argument is a parameter and cannot be read as syntax.
+      const { data: revokedCount, error: revokeError } = await supabase.rpc(
+        'revoke_refresh_grant',
+        { p_secret: refreshToken, p_client_ids: clients }
+      );
+
+      // Both of these are reported, never swallowed. A logout that revoked
+      // nothing has left a live grant behind, and the one place that can be
+      // noticed is here.
+      if (revokeError) {
+        logger.error('Admin logout could not revoke the refresh grant', { error: revokeError });
+      } else if (!revokedCount) {
+        logger.warn(
+          'Admin logout matched no refresh grant; the presented secret is older than the one generation a row keeps'
+        );
+      }
     }
 
     // Clear cookies regardless (same options used when setting them)
