@@ -2,6 +2,7 @@
   "expo": {
     "name": "Inkwell",
     "slug": "inkwell",
+    "scheme": "inkwell",
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
