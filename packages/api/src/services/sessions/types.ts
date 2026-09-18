@@ -107,7 +107,7 @@ export interface UsageCheckpoint {
 export interface Session {
   id: string;
   userId: string;
-  agentId: string;
+  sbSlug: string;
   sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
@@ -211,7 +211,7 @@ export type ContentBlock = { type: 'text'; text: string } | ImageContent;
 export interface SessionRequest {
   // Auth context (required)
   userId: string;
-  agentId: string;
+  sbSlug: string;
 
   // Message context
   channel: ChannelType;
@@ -354,7 +354,7 @@ export interface ToolCall {
 // ─── Context Injection Types ───
 
 export interface AgentIdentity {
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   description?: string;
@@ -460,7 +460,7 @@ export interface ISessionService {
    */
   getOrCreateSession(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: {
       type?: SessionType;
       taskDescription?: string;
@@ -490,7 +490,7 @@ export interface ISessionService {
   listSessions(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -529,7 +529,7 @@ export interface ISessionRepository {
 
   findByUserAndAgent(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: {
       status?: SessionStatus;
       type?: SessionType;
@@ -542,7 +542,7 @@ export interface ISessionRepository {
 
   findByThreadKey?(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     threadKey: string,
     studioId?: string,
     contactId?: string,
@@ -553,7 +553,7 @@ export interface ISessionRepository {
   findByUser(
     userId: string,
     options?: {
-      agentId?: string;
+      sbSlug?: string;
       status?: SessionStatus;
       type?: SessionType;
       limit?: number;
@@ -626,7 +626,7 @@ export interface IContextBuilder {
    * Build the full injected context for an agent message.
    * Queries DB for identity, memories, projects, etc.
    */
-  buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext>;
+  buildContext(userId: string, sbSlug: string, session: Session): Promise<InjectedContext>;
 
   /**
    * Build minimal context for a resumed session.
@@ -634,7 +634,7 @@ export interface IContextBuilder {
    */
   buildMinimalContext(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     session?: Session
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>>;
 
@@ -644,7 +644,7 @@ export interface IContextBuilder {
    */
   getAgentBackend(
     userId: string,
-    agentId: string
+    sbSlug: string
   ): Promise<{ backend: string | null; provider: string | null }>;
 }
 
@@ -666,8 +666,8 @@ export interface ClaudeRunnerConfig {
   pcpAccessToken?: string;
   /** PCP session ID for this run — written to runtime hint files so hooks link correctly */
   pcpSessionId?: string;
-  /** Agent ID for this run — written to runtime hint files */
-  agentId?: string;
+  /** SB slug for this run — written to runtime hint files */
+  sbSlug?: string;
   /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
   channel?: string;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */

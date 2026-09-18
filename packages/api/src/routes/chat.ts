@@ -14,6 +14,7 @@ import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import type { SessionService } from '../services/sessions/session-service';
 import type { SessionRequest } from '../services/sessions/types';
+import { isSafeStudioComponent } from '@inklabs/shared';
 
 /**
  * Create a chat router with access to the session service.
@@ -32,10 +33,10 @@ export function createChatRouter(getSessionService: () => SessionService | null)
   router.post('/message', async (req, res: Response) => {
     try {
       const { userId, userEmail } = req as ChatAuthRequest;
-      const { agentId, content } = req.body;
+      const { sbSlug, content } = req.body ?? {};
 
-      if (!agentId || !content) {
-        res.status(400).json({ error: 'agentId and content are required' });
+      if (!isSafeStudioComponent(sbSlug) || typeof content !== 'string' || !content) {
+        res.status(400).json({ error: 'A valid sbSlug and nonempty text content are required' });
         return;
       }
 
@@ -48,9 +49,9 @@ export function createChatRouter(getSessionService: () => SessionService | null)
       // Build SessionRequest
       const sessionRequest: SessionRequest = {
         userId,
-        agentId,
+        sbSlug,
         channel: 'web',
-        conversationId: `web:${userId}:${agentId}`,
+        conversationId: `web:${userId}:${sbSlug}`,
         sender: {
           id: userId,
           name: userEmail,
@@ -80,16 +81,16 @@ export function createChatRouter(getSessionService: () => SessionService | null)
   /**
    * GET /api/chat/history
    * Get chat history with an agent.
-   * Query params: agentId (required), limit (optional, default 50)
+   * Query params: sbSlug (required), limit (optional, default 50)
    */
   router.get('/history', async (req, res: Response) => {
     try {
       const { userId } = req as ChatAuthRequest;
-      const agentId = req.query.agentId as string;
+      const sbSlug = req.query.sbSlug as string;
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
 
-      if (!agentId) {
-        res.status(400).json({ error: 'agentId query parameter is required' });
+      if (!sbSlug) {
+        res.status(400).json({ error: 'sbSlug query parameter is required' });
         return;
       }
 
@@ -100,7 +101,7 @@ export function createChatRouter(getSessionService: () => SessionService | null)
         .from('activity_stream')
         .select('id, direction, content, agent_id, created_at')
         .eq('user_id', userId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .eq('platform', 'web')
         .eq('type', 'message')
         .order('created_at', { ascending: false })
@@ -117,7 +118,7 @@ export function createChatRouter(getSessionService: () => SessionService | null)
         id: m.id,
         direction: m.direction,
         content: m.content,
-        agentId: m.agent_id,
+        sbSlug: m.agent_id,
         createdAt: m.created_at,
       }));
 
@@ -152,7 +153,7 @@ export function createChatRouter(getSessionService: () => SessionService | null)
       }
 
       const agents = (data || []).map((a) => ({
-        agentId: a.agent_id,
+        sbSlug: a.agent_id,
         name: a.name,
         role: a.role,
         description: a.description,

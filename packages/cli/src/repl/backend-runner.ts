@@ -15,7 +15,7 @@ export const DEFAULT_TURN_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
 export interface BackendRunRequest {
   backend: string;
-  agentId: string;
+  sbSlug: string;
   model?: string;
   /** Reasoning effort for the spawn (claude: low | medium | high | xhigh | max). */
   effort?: string;
@@ -109,7 +109,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const parser = streaming ? adapter.createStreamParser!() : null;
 
   const prepared = adapter.prepare({
-    agentId: request.agentId,
+    sbSlug: request.sbSlug,
     model: request.model,
     effort: request.effort,
     prompt: request.prompt,

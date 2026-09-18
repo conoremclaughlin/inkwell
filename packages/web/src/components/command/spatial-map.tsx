@@ -15,8 +15,8 @@ const AGENT_COLORS: Record<string, string> = {
   echo: '#ff9ff3',
 };
 
-function getAgentColor(agentId: string): string {
-  return AGENT_COLORS[agentId] ?? '#888888';
+function getAgentColor(sbSlug: string): string {
+  return AGENT_COLORS[sbSlug] ?? '#888888';
 }
 
 function getPhaseLabel(phase: string | null): string {
@@ -253,7 +253,7 @@ function drawStudio(
   if (lease && z > 0.7) {
     const holder = destructive
       ? `⚠ ${lease.claimKind ?? 'quarantined'}`
-      : `${lease.agentId} · ${lease.threadKey}`;
+      : `${lease.sbSlug} · ${lease.threadKey}`;
     ctx.fillStyle = (destructive ? skin.colors.taskBlocked : baseColor) + 'dd';
     ctx.font = `${Math.max(7, 8 * z)}px ${skin.fonts.mono}`;
     ctx.fillText(holder, pos.x, pos.y + radius + 15 * z);
@@ -273,7 +273,7 @@ function drawAgent(
   timestamp: number,
   isSelected: boolean
 ) {
-  const color = getAgentColor(agent.agentId);
+  const color = getAgentColor(agent.sbSlug);
   const agentRadius = 26 * z;
   const isRunning = agent.lifecycle === 'running';
 
@@ -545,7 +545,7 @@ export function SpatialMap() {
         const sy = (agent.position.y + camera.y) * z + canvas.height / 2;
         const dist = Math.sqrt((mx - sx) ** 2 + (my - sy) ** 2);
         if (dist < 35 * z) {
-          selectAgent(selectedAgent === agent.agentId ? null : agent.agentId);
+          selectAgent(selectedAgent === agent.sbSlug ? null : agent.sbSlug);
           return;
         }
       }
@@ -625,7 +625,7 @@ export function SpatialMap() {
       // Draw agent territory zones (subtle colored regions)
       for (const agent of agents) {
         const pos = toScreen(agent.position.x, agent.position.y);
-        const color = getAgentColor(agent.agentId);
+        const color = getAgentColor(agent.sbSlug);
         const territoryRadius = 140 * z;
 
         const grad = ctx!.createRadialGradient(pos.x, pos.y, 0, pos.x, pos.y, territoryRadius);
@@ -646,11 +646,11 @@ export function SpatialMap() {
 
       // Draw connections from agents to studios
       for (const agent of agents) {
-        const agentStudios = studios.filter((s) => s.agentId === agent.agentId);
+        const agentStudios = studios.filter((s) => s.sbSlug === agent.sbSlug);
         for (const studio of agentStudios) {
           const from = toScreen(agent.position.x, agent.position.y);
           const to = toScreen(studio.position.x, studio.position.y);
-          const color = getAgentColor(agent.agentId);
+          const color = getAgentColor(agent.sbSlug);
           // Every studio this agent holds gets a live connection, not just the
           // one the avatar sits on. An agent running concurrent sessions in
           // separate worktrees is genuinely present in all of them, and
@@ -695,7 +695,7 @@ export function SpatialMap() {
       // Draw agents (on top of everything)
       for (const agent of agents) {
         const pos = toScreen(agent.position.x, agent.position.y);
-        const isSelected = selectedAgent === agent.agentId;
+        const isSelected = selectedAgent === agent.sbSlug;
         drawAgent(ctx!, skin, agent, pos, z, timestamp, isSelected);
       }
 

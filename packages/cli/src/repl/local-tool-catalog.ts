@@ -156,20 +156,27 @@ export const LOCAL_TOOL_CATALOG: readonly LocalToolEntry[] = [
     name: 'compact_context',
     group: 'client-local',
     summary:
-      'Compact your context window: everything but the most recent entries is replaced by a summary, and the provider session is re-seeded from it.',
-    args: 'summary (string, optional — your own brief of what matters; omit to have the runtime summarize), keepRecent (number, optional, default 12)',
-    note: 'Prefer writing the summary yourself: you know which decisions, identifiers and open threads matter. Compaction is lossy — remember anything that must outlive the session first.',
+      'Replace context entries with a summary. By default the oldest entries go and the most recent are kept; pass refs to replace a set you name instead, wherever it sits.',
+    args: 'summary (string, optional — your own brief of what matters; omit to have the runtime summarize), keepRecent (number, optional, default 12), refs (string[], optional — replace exactly these entries instead of the oldest)',
+    note: 'Prefer writing the summary yourself: you know which decisions, identifiers and open threads matter. Compaction is lossy — remember anything that must outlive the session first. Use refs to consolidate work that has FINISHED (a merged PR, a closed thread) while leaving live work untouched; the summary takes the place of the first entry it replaces, so surrounding context keeps its order.',
     parameters: {
       type: 'object',
       properties: {
         summary: {
           type: 'string',
           description:
-            'Your own continuation brief: decisions and why, work done and in progress, key facts, open questions, identifiers. Omit to have the runtime summarize.',
+            'Your own continuation brief: decisions and why, work done and in progress, key facts, open questions, identifiers. Omit to have the runtime summarize. When consolidating with refs, keep what a later reader would act on wrongly without — especially any claim that was RETRACTED.',
         },
         keepRecent: {
           type: 'number',
-          description: 'Recent entries kept verbatim after the summary (default 12, max 200).',
+          description:
+            'Recent entries kept verbatim after the summary (default 12, max 200). Applies to the oldest-first default only — not valid with refs.',
+        },
+        refs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'The ref values from list_context naming exactly the entries to replace. They need not be contiguous or old. The summary must be smaller than what it replaces or the call is refused. Not valid with keepRecent.',
         },
       },
     },

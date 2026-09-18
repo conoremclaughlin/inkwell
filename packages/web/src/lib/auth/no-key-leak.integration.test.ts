@@ -1,24 +1,46 @@
 import { describe, it, expect } from 'vitest';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const WEB_ROOT = path.resolve(__dirname, '../../..');
 
+// grep's status 1 means no matches; IO/tool failures must fail the check.
+function matchingFiles(pattern: string, directory: string, filters: string[] = []): string {
+  try {
+    return execFileSync('grep', ['-r', '-l', ...filters, '--', pattern, directory], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    if ((error as { status?: number }).status === 1) return '';
+    throw error;
+  }
+}
+
+const SOURCE_FILTERS = [
+  '--include=*.ts',
+  '--include=*.tsx',
+  '--exclude=*.test.ts',
+  '--exclude=*.test.tsx',
+];
+
 describe('publishable key leak prevention', () => {
   it('source code has no NEXT_PUBLIC_SUPABASE references', () => {
     // Check all source files (not build output, node_modules, or test files)
-    const result = execSync(
-      `grep -r "NEXT_PUBLIC_SUPABASE" src/ --include="*.ts" --include="*.tsx" --exclude="*.test.ts" --exclude="*.test.tsx" -l 2>/dev/null || true`,
-      { cwd: WEB_ROOT, encoding: 'utf-8' }
+    const result = matchingFiles(
+      'NEXT_PUBLIC_SUPABASE',
+      path.join(WEB_ROOT, 'src'),
+      SOURCE_FILTERS
     );
     expect(result.trim()).toBe('');
   });
 
   it('source code has no imports of @/lib/supabase/client', () => {
-    const result = execSync(
-      `grep -r "from.*supabase/client" src/ --include="*.ts" --include="*.tsx" --exclude="*.test.ts" --exclude="*.test.tsx" -l 2>/dev/null || true`,
-      { cwd: WEB_ROOT, encoding: 'utf-8' }
+    const result = matchingFiles(
+      'from.*supabase/client',
+      path.join(WEB_ROOT, 'src'),
+      SOURCE_FILTERS
     );
     expect(result.trim()).toBe('');
   });
@@ -52,31 +74,25 @@ describe('publishable key leak prevention', () => {
     expect(middlewareTs).toContain('process.env.SUPABASE_PUBLISHABLE_KEY');
   });
 
-  it('build output does not contain the publishable key', () => {
+  it('build output does not contain the publishable key', (context) => {
     // Check that the production build doesn't embed the key
-    // This uses the actual .env.local key pattern (not the literal key, just the prefix)
+    // Match a public credential prefix; never read a real environment file.
     const buildServerDir = path.join(WEB_ROOT, '.next/server');
     const buildStaticDir = path.join(WEB_ROOT, '.next/static');
 
     if (!fs.existsSync(buildServerDir)) {
       // Build hasn't been run — skip gracefully
-      console.log('Skipping build output check — .next/server not found (run `yarn build` first)');
+      context.skip();
       return;
     }
 
     // Check server output
-    const serverResult = execSync(
-      `grep -r "sb_publishable_" ${buildServerDir} -l 2>/dev/null || true`,
-      { encoding: 'utf-8' }
-    );
+    const serverResult = matchingFiles('sb_publishable_', buildServerDir);
     expect(serverResult.trim()).toBe('');
 
     // Check static output (client bundles)
     if (fs.existsSync(buildStaticDir)) {
-      const staticResult = execSync(
-        `grep -r "sb_publishable_" ${buildStaticDir} -l 2>/dev/null || true`,
-        { encoding: 'utf-8' }
-      );
+      const staticResult = matchingFiles('sb_publishable_', buildStaticDir);
       expect(staticResult.trim()).toBe('');
     }
   });

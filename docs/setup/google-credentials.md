@@ -82,7 +82,7 @@ sources. A source with nothing bound to the user is skipped silently; a source
 that had a credential and failed is named in the error:
 
 ```
-No usable google credential — cloud: Failed to refresh google token; desktop: Google refused the desktop credential /Users/you/.ink/google/you@example.com.json (400): {"error":"invalid_grant",…}
+No usable google credential — cloud: Failed to refresh google token; desktop: Google refused the desktop credential /Users/you/.ink/google/<account>.json (400): {"error":"invalid_grant",…}
 ```
 
 A user with no desktop file sees exactly the errors they always saw.

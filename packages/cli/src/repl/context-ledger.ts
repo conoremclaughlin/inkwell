@@ -77,6 +77,17 @@ export interface LedgerCompactResult {
   removedTokens: number;
   summaryTokens: number;
   totalAfter: number;
+  /**
+   * Where the summary landed among the surviving entries.
+   *
+   * Always 0 for an oldest-N compaction, which is why nothing needed it until
+   * ref-selected consolidation arrived: that removes a set from the MIDDLE, so
+   * the summary takes the first removed entry's place rather than the front.
+   * The transcript event has to carry this or reattach rebuilds the ledger in a
+   * different order than the live session holds — see the compaction event's
+   * `summaryIndex` in compaction.ts.
+   */
+  summaryIndex: number;
 }
 
 export interface PromptBuildOptions {
@@ -312,6 +323,9 @@ export class ContextLedger {
       removedTokens,
       summaryTokens: summaryEntry.approxTokens,
       totalAfter: this.totalTokens(),
+      // This path always prepends — the removed set is by construction the
+      // oldest run, so there are no survivors before it.
+      summaryIndex: 0,
     };
   }
 
@@ -367,6 +381,7 @@ export class ContextLedger {
       removedTokens,
       summaryTokens: summaryEntry.approxTokens,
       totalAfter: this.totalTokens(),
+      summaryIndex: insertAt,
     };
   }
 

@@ -41,7 +41,7 @@ export interface PcpTokenPayload {
   sub: string; // PCP user ID
   email: string;
   scope: string;
-  agentId?: string; // Bound agent identity label (absent for human users)
+  sbSlug?: string; // Bound agent identity label (absent for human users)
   identityId?: string; // Canonical agent_identities UUID (JWT claim — kept as identityId for token compat)
   sbId?: string; // New-style alias for identityId in runner tokens
   /**
@@ -88,7 +88,7 @@ export function signRunnerAccessToken(
   claims: {
     userId: string;
     email: string;
-    agentId?: string;
+    sbSlug?: string;
     sbId?: string;
     /** The session this runner was spawned for. */
     sessionId?: string;
@@ -103,7 +103,7 @@ export function signRunnerAccessToken(
       sub: claims.userId,
       email: claims.email,
       scope: 'mcp:tools',
-      ...(claims.agentId ? { agentId: claims.agentId } : {}),
+      ...(claims.sbSlug ? { sbSlug: claims.sbSlug } : {}),
       ...(claims.sbId ? { sbId: claims.sbId } : {}),
       ...(claims.sessionId ? { sessionId: claims.sessionId } : {}),
       ...(claims.contactId ? { contactId: claims.contactId } : {}),
@@ -131,10 +131,19 @@ export function verifyPcpAccessToken(
     const decoded = jwt.verify(token, env.JWT_SECRET);
     if (typeof decoded === 'string') return null;
 
-    const payload = decoded as PcpTokenPayload;
+    const payload = decoded as PcpTokenPayload & { agentId?: string };
     if (!payload.type || !payload.sub) return null;
 
     if (expectedType && payload.type !== expectedType) return null;
+
+    // Tokens minted before the agentId -> sbSlug rename carry `agentId`, and
+    // stay valid for their full lifetime (an hour for runner tokens, days for
+    // refreshed CLI ones). Normalize here, at the single boundary every
+    // consumer goes through, so a session that authenticated before the deploy
+    // does not silently lose its identity binding mid-flight.
+    if (!payload.sbSlug && payload.agentId) {
+      return { ...payload, sbSlug: payload.agentId };
+    }
 
     return payload;
   } catch {
@@ -195,7 +204,7 @@ interface ExchangeResult {
   refreshTokenExpiresAt: Date;
   userId: string;
   email: string;
-  agentId?: string;
+  sbSlug?: string;
   identityId?: string;
 }
 
@@ -214,7 +223,8 @@ function grantExchangeResult(
 ): ExchangeResult {
   const email = (record.users as unknown as { email: string | null })?.email || '';
   const scope = record.scopes?.join(' ') || 'mcp:tools';
-  const agentId = record.agent_id as string | null;
+  // The COLUMN is still `agent_id`; the claim and the field are `sbSlug`.
+  const sbSlug = record.agent_id as string | null;
   const sbId = record.sb_id as string | null;
 
   const accessToken = signPcpAccessToken(
@@ -223,7 +233,7 @@ function grantExchangeResult(
       sub: record.user_id,
       email,
       scope,
-      ...(agentId ? { agentId } : {}),
+      ...(sbSlug ? { sbSlug } : {}),
       ...(sbId ? { identityId: sbId } : {}),
     },
     accessTokenLifetimeSeconds
@@ -240,7 +250,7 @@ function grantExchangeResult(
     refreshTokenExpiresAt: expiresAt,
     userId: record.user_id,
     email,
-    ...(agentId ? { agentId } : {}),
+    ...(sbSlug ? { sbSlug } : {}),
     ...(sbId ? { identityId: sbId } : {}),
   };
 }
@@ -364,7 +374,7 @@ export async function createRefreshToken(
   clientId: string,
   scopes: string[],
   lifetimeDays: number,
-  agentId?: string,
+  sbSlug?: string,
   sbId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
   const refreshToken = newRefreshTokenValue();
@@ -377,7 +387,7 @@ export async function createRefreshToken(
     supabase_refresh_token: null,
     scopes,
     expires_at: expiresAt.toISOString(),
-    ...(agentId ? { agent_id: agentId } : {}),
+    ...(sbSlug ? { agent_id: sbSlug } : {}),
     ...(sbId ? { sb_id: sbId } : {}),
   });
 

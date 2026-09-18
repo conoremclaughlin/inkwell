@@ -135,7 +135,7 @@ User message → Listener → Buffer → ChannelGateway
 Wren calls send_to_inbox() + trigger: true
   → Message saved in agent_inbox
   → HTTP POST /api/agent/trigger
-  → AgentGateway → SessionService.handleMessage(agentId='myra')
+  → AgentGateway → SessionService.handleMessage(sbSlug='myra')
   → Myra processes, responds via ChannelGateway
 ```
 
@@ -173,7 +173,7 @@ Six agents share the same infrastructure with distinct identities, backends, and
 | **Benson** | Discord / Slack        | claude      | claude      | Conversational partner                 |
 | **Echo**   | (test only)            | —           | —           | Integration test agent                 |
 
-Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.ink/identity.json` → `~/.ink/config.json`. Identity documents (SOUL, HEARTBEAT, IDENTITY) live in the database (`agent_identities` table), with `~/.ink/` as a fallback cache. Memories are filtered by agentId (plus shared memories where `agentId` is null).
+Identity is resolved from: system prompt override → `$SB_SLUG` env var → `.ink/identity.json` → `~/.ink/config.json`. Identity documents (SOUL, HEARTBEAT, IDENTITY) live in the database (`agent_identities` table), with `~/.ink/` as a fallback cache. Memories are filtered by sbSlug (plus shared memories where `sbSlug` is null).
 
 ## MCP Tools
 

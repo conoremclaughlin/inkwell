@@ -18,20 +18,20 @@ import { agentColor, colors, spacing, type } from '../ui/theme';
  * expect to find someone you're just talking to.
  */
 const DM_STUDIO_SLUG = 'main';
-export function dmThreadKey(agentId: string): string {
-  return `chat:${agentId}`;
+export function dmThreadKey(sbSlug: string): string {
+  return `chat:${sbSlug}`;
 }
 
 function AgentRow({ agent }: { agent: Individual }) {
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
-  const hue = agentColor(agent.agentId);
+  const hue = agentColor(agent.sbSlug);
   return (
     <Pressable
       onPress={() =>
         navigation.navigate('Thread', {
-          threadKey: dmThreadKey(agent.agentId),
+          threadKey: dmThreadKey(agent.sbSlug),
           title: agent.name,
-          recipients: [agent.agentId],
+          recipients: [agent.sbSlug],
           studioSlug: DM_STUDIO_SLUG,
         })
       }
@@ -46,10 +46,10 @@ function AgentRow({ agent }: { agent: Individual }) {
       <View style={{ flex: 1 }}>
         <Text style={styles.name}>{agent.name}</Text>
         <Text style={styles.meta} numberOfLines={1}>
-          {[agent.role, agent.backend].filter(Boolean).join(' · ') || agent.agentId}
+          {[agent.role, agent.backend].filter(Boolean).join(' · ') || agent.sbSlug}
         </Text>
       </View>
-      <Text style={styles.key}>{dmThreadKey(agent.agentId)}</Text>
+      <Text style={styles.key}>{dmThreadKey(agent.sbSlug)}</Text>
     </Pressable>
   );
 }

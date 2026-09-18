@@ -220,7 +220,8 @@ import {
   handleListThreads,
   handleMarkThreadRead,
   handleReopenThread,
-  threadToolDefinitions,
+  handleUpdateThread,
+  threadTool,
 } from './thread-handlers';
 
 import {
@@ -1442,7 +1443,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_task_group',
     {
-      description: `Update a task group — change its status (active/paused/completed/cancelled), title, description, priority, tags, metadata, thread key, or owner. Use this to close a group when its work ships (status: completed) or is abandoned (status: cancelled), or to reassign ownership.
+      description: `Update a task group — change its status (active/paused/completed/cancelled), title, description, priority, tags, metadata, thread key, owner, or project. Use this to close a group when its work ships (status: completed) or is abandoned (status: cancelled), to reassign ownership, or to re-home the group under a different project via \`projectId\` (pass null to detach) — no need to recreate the group.
 
 Pass \`closedReason\` as a shorthand to record why a group was closed — it's stored under \`metadata.closed_reason\`.
 
@@ -1920,7 +1921,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe('Filter by topics (any match)'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
         includeExpired: z.boolean().optional().describe('Include expired memories'),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
@@ -1928,7 +1929,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .boolean()
           .optional()
           .describe(
-            'Include shared memories (agentId=null) when filtering by agentId (default: true)'
+            'Include shared memories (sbSlug=null) when filtering by sbSlug (default: true)'
           ),
       }),
     },
@@ -1988,7 +1989,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           )
           .optional()
           .describe('Memories the SB found irrelevant — should be evicted from context'),
-        agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
+        sbSlug: z.string().optional().describe('Agent identity (e.g., "wren")'),
         sessionId: z.string().guid().optional().describe('Current session ID for attribution'),
       }),
     },
@@ -2050,12 +2051,25 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_memory',
     {
-      description: `Update a memory's salience, topics, or metadata.
+      description: `Update a memory in place: edit its content/summary, or adjust salience, topics, and metadata.
+
+Content edits are versioned — the previous version is archived to memory history, so get_memory_history shows it and restore_memory can roll back. Embeddings are refreshed automatically so recall matches the new text.
+
+Use content editing to correct or revise a memory while preserving its history trail (especially "current state" memories that evolve). Use forget + remember only when the topic itself is being replaced. Omitted fields are left unchanged.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: z.object({
         ...userIdentifierFields,
         memoryId: z.string().guid().describe('ID of the memory to update'),
+        content: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('New memory content (prior version is preserved in memory history)'),
+        summary: z
+          .string()
+          .optional()
+          .describe('New one-liner summary. Pass an empty string to clear.'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])
           .optional()
@@ -2109,7 +2123,7 @@ When forceNew=true, start_session always creates a new session (skips active-ses
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
         inputSchema: z.object({
           ...userIdentifierFields,
-          agentId: z
+          sbSlug: z
             .string()
             .optional()
             .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
@@ -2180,7 +2194,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       {
         description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
 
-Session resolution: sessionId (explicit) > agentId+studioId (scoped) > most recent active (fallback).
+Session resolution: sessionId (explicit) > sbSlug+studioId (scoped) > most recent active (fallback).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
         inputSchema: z.object({
@@ -2190,7 +2204,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .guid()
             .optional()
             .describe('Session ID (uses active session if not provided)'),
-          agentId: z
+          sbSlug: z
             .string()
             .optional()
             .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -2239,7 +2253,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .guid()
           .optional()
           .describe('Session ID (returns active session if not provided)'),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -2500,7 +2514,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Set true when bootstrapping after context compaction. Includes the most recent memories regardless of salience to restore context continuity.'
           ),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe(
@@ -2569,7 +2583,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .guid()
           .optional()
           .describe('Session ID to compact (uses active session if not provided)'),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -3264,7 +3278,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_identity',
     {
-      description: `Get an AI being's identity by agent ID. Returns structured identity data including name, role, values, relationships, and capabilities.
+      description: `Get an AI being's identity by SB slug. Returns structured identity data including name, role, values, relationships, and capabilities.
 
 Use the optional 'file' parameter to fetch a single document (heartbeat, soul, identity) for minimal token usage. Omit to get everything. For the values and process documents, use get_team_constitution instead.
 
@@ -3582,13 +3596,13 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Create a scheduled reminder. Can be one-time or recurring.
 
-Use agentId to assign which agent handles the reminder (e.g., "myra" for monitoring tasks,
-"lumen" for dev tasks). Without agentId, the reminder routes to the server's default agent.
+Use sbSlug to assign which agent handles the reminder (e.g., "myra" for monitoring tasks,
+"lumen" for dev tasks). Without sbSlug, the reminder routes to the server's default agent.
 
 Examples:
 - "Remind me to call mom tomorrow at 9am" → runAt: "2024-01-28T09:00:00Z"
-- "Remind me daily at 9am to take vitamins" → cronExpression: "0 9 * * *", agentId: "myra"
-- "Run nightly test suite" → cronExpression: "0 2 * * *", agentId: "lumen"
+- "Remind me daily at 9am to take vitamins" → cronExpression: "0 9 * * *", sbSlug: "myra"
+- "Run nightly test suite" → cronExpression: "0 2 * * *", sbSlug: "lumen"
 
 Common cron patterns:
 - "0 9 * * *" - Daily at 9am
@@ -3624,7 +3638,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'list_reminders',
     {
       description: `List a user's scheduled reminders. By default shows only active reminders.
-Use agentId to filter reminders assigned to a specific agent.
+Use sbSlug to filter reminders assigned to a specific agent.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: listRemindersSchema,
@@ -3653,7 +3667,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_reminder',
     {
-      description: `Update an existing reminder. Can change title, description, schedule, pause/resume, or reassign to a different agent via agentId.
+      description: `Update an existing reminder. Can change title, description, schedule, pause/resume, or reassign to a different agent via sbSlug.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: updateReminderSchema,
@@ -4134,7 +4148,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Add a comment to a document without modifying the document body.
 
 Use this for collaborative review/discussion to avoid overwrite conflicts.
-Stores canonical author identity via agent_identities.id while preserving agentId slug for display.
+Stores canonical author identity via agent_identities.id while preserving sbSlug slug for display.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getArtifactToolSchema('add_artifact_comment'),
@@ -4226,7 +4240,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Send a message to another agent's inbox or reply to a thread. This is the unified tool for all cross-agent messaging.
 
 Recipient modes (provide exactly one):
-- recipientAgentId: Single recipient. Works with or without threadKey.
+- recipientSlug: Single recipient. Works with or without threadKey.
 - recipients[]: Multiple recipients. Requires threadKey. Creates a group thread automatically.
 
 Thread routing:
@@ -4398,7 +4412,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_agent_summaries',
     {
-      description: `Get summaries for all agents in one call. Returns per-agent unread counts (legacy inbox + thread-aware), generating count, sessions today, studio count, and latest session lifecycle/phase. Ideal for dashboards and mission control. Omit agentIds to auto-discover all agents.
+      description: `Get summaries for all agents in one call. Returns per-agent unread counts (legacy inbox + thread-aware), generating count, sessions today, studio count, and latest session lifecycle/phase. Ideal for dashboards and mission control. Omit sbSlugs to auto-discover all agents.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: inboxToolDefinitions.find((d) => d.name === 'get_agent_summaries')!.schema,
@@ -4433,12 +4447,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       // Description derived from the canonical definition so the MCP catalog
       // can't drift from the handler's documented behavior again
-      description: `${threadToolDefinitions[0].description}
+      description: `${threadTool('get_thread_messages').description}
 
 Use to read conversation history in a group thread before replying.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[0].schema,
+      inputSchema: threadTool('get_thread_messages').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4467,7 +4481,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Add an agent to a thread. Idempotent (no-op if already a participant). Creates an audited system event in the thread. Triggers the new participant by default so they can catch up.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[1].schema,
+      inputSchema: threadTool('add_thread_participant').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4496,7 +4510,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close a thread; reopen_thread puts the work back on.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[2].schema,
+      inputSchema: threadTool('close_thread').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4525,7 +4539,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List threads an agent participates in, with unread counts and last message preview. Useful for heartbeat triage and inbox overview.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[3].schema,
+      inputSchema: threadTool('list_threads').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4554,7 +4568,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Mark a thread as read without fetching messages. Useful when you see thread activity in get_inbox and want to acknowledge it without reading the full history.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[4].schema,
+      inputSchema: threadTool('mark_thread_read').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -4580,16 +4594,45 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'reopen_thread',
     {
-      description: `${threadToolDefinitions[5].description}
+      description: `${threadTool('reopen_thread').description}
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[5].schema,
+      inputSchema: threadTool('reopen_thread').schema,
     },
     async (args: Record<string, unknown>) => {
       try {
         return await handleReopenThread(args, dataComposer);
       } catch (error) {
         logger.error('Error in reopen_thread:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_thread',
+    {
+      description: `${threadTool('update_thread').description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadTool('update_thread').schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateThread(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_thread:', error);
         return {
           content: [
             {
@@ -4709,6 +4752,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 Returns events with start/end times, summary, location, attendees, and status.
 
 Dates can be full ISO 8601 (e.g., "2026-01-30T00:00:00-08:00") or bare YYYY-MM-DD (e.g., "2026-01-30"). Bare dates are resolved to midnight in the specified timezone — always pass timezone when using bare dates to get correct day boundaries.
+
+A bare endDate is INCLUSIVE: the whole of that day is covered, so startDate == endDate returns that day's events. A full ISO timestamp is used as-is, as an exclusive upper bound.
 
 User must have connected their Google account with Calendar permissions.
 

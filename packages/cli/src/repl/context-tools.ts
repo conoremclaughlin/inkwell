@@ -150,6 +150,132 @@ export function effectiveContextTokens(
 }
 
 /**
+ * Where the window actually sits, split by WHAT CAN REACH IT.
+ *
+ * One total is not enough, because the parts answer to different remedies — and
+ * they are not the parts an earlier draft of this comment named. It claimed the
+ * ledger half was the evictable half and that only compaction re-seeded the
+ * provider side. Both halves of that are wrong against this head (Lumen, PR #639):
+ *
+ *   ledgerTokens        transcript entries. The only bucket a tool selects
+ *                       entries from, and both `evict_context` and
+ *                       `compact_context` select from it.
+ *   fixedTokens         the identity envelope. `buildPromptEnvelope` re-renders
+ *                       `runtime.bootstrapContext` on every seed — it is marked
+ *                       "always included" there — so no context tool reclaims a
+ *                       byte of it. It is occupancy to budget around, not spend.
+ *   unaccountedTokens   the measurement minus what ink can account for. It is a
+ *                       RESIDUAL, not an inventory, and that is the whole reason
+ *                       it does not name a remedy. Some of it is native-session
+ *                       history, which any provider reseed drops — every
+ *                       eviction is one, since `recordEviction` clears
+ *                       `activeBackendSessionId` and the `providerSample`, and
+ *                       `assessContextPressure` has a `reseed` action for
+ *                       exactly this case. The rest is fixed provider overhead
+ *                       and this estimator's own drift (characters ÷ 4), which
+ *                       a reseed does NOT clear: the re-packed window is
+ *                       estimated by the same arithmetic that was wrong before.
+ *                       Naming a tool for this bucket would promise a reclaim
+ *                       nobody can compute (Lumen, PR #639).
+ *
+ * The ledger/provider gap is not a rounding error and it is not invisible — it
+ * is mis-sized. A tool result enters the ledger as a stub of at most
+ * LEDGER_COMPACT_CHARS (chat.ts) while the provider reads the whole payload.
+ * Measured 2026-09-15: one `list_tasks` reply put 125 tokens in the ledger and
+ * ~145,000 in the window. An agent that evicts that stub is told
+ * `tokensFreed: 125` — but the reseed the eviction just triggered also dropped
+ * the ~145,000. The reported figure is still wrong; it UNDERSTATES, which is
+ * the opposite of what this comment used to say, and the opposite direction of
+ * error from the one that makes an agent complacent.
+ *
+ * `splitKnown` is false when the provider has not reported yet. Then the split
+ * is genuinely unknown and the renderer must say so — reporting the estimate
+ * alone implies all of it is actionable, which is the failure this guards.
+ */
+export interface ContextOccupancy {
+  /** Transcript entries — what evict_context and compact_context actually edit. */
+  ledgerTokens: number;
+  /** The identity envelope, re-rendered on every seed. No context tool reclaims it. */
+  fixedTokens: number;
+  /**
+   * Measured minus accountable: a residual, not an inventory. Part native-session
+   * history (a reseed drops it), part provider overhead and estimator drift (a
+   * reseed does not). Deliberately names no remedy — see the note above.
+   */
+  unaccountedTokens: number;
+  /** The number to budget against — the larger of the estimate and the measurement. */
+  effectiveTokens: number;
+  limit: number;
+  /** effectiveTokens / limit, clamped at 0 but NOT at 1 — over-budget must read as over-budget. */
+  utilization: number;
+  /** False when no provider measurement exists; the split is then unknown, not zero. */
+  splitKnown: boolean;
+}
+
+/**
+ * `bootstrapTokens` is added to the estimate rather than subtracted from the
+ * limit. The provider's measurement covers the whole window including the
+ * identity envelope, so comparing it against a transcript-only estimate over a
+ * reduced limit compares two different quantities. Both sides are whole-window
+ * here, which is what makes max() meaningful.
+ *
+ * It lands in the numerator but in its OWN bucket: counting it is right,
+ * calling it reclaimable is not.
+ */
+export function computeContextOccupancy(
+  ledgerTokens: number,
+  bootstrapTokens: number,
+  limit: number,
+  measured: ProviderContextMeasurement | undefined
+): ContextOccupancy {
+  const ledger = Math.max(0, ledgerTokens);
+  const fixed = Math.max(0, bootstrapTokens);
+  const accountable = ledger + fixed;
+  const effectiveTokens = effectiveContextTokens(accountable, measured);
+  const safeLimit = limit > 0 ? limit : 1;
+  return {
+    ledgerTokens: ledger,
+    fixedTokens: fixed,
+    unaccountedTokens: Math.max(0, effectiveTokens - accountable),
+    effectiveTokens,
+    limit: safeLimit,
+    utilization: effectiveTokens / safeLimit,
+    splitKnown: measured !== undefined,
+  };
+}
+
+/**
+ * The per-turn stamp. Ephemeral by design: it is rendered into the prompt each
+ * turn and never added to the ledger, because an entry per turn would
+ * accumulate one stale occupancy reading per turn — context spent reporting
+ * context, growing with the thing it measures.
+ */
+export function formatContextStamp(occ: ContextOccupancy): string {
+  const pct = Math.round(occ.utilization * 100);
+  const n = (v: number) => v.toLocaleString();
+  const head = `[context] ${n(occ.effectiveTokens)} / ${n(occ.limit)} (${pct}%)`;
+  if (!occ.splitKnown) {
+    return (
+      `${head} — ledger estimate only; the provider has not reported this session, ` +
+      `so how much of this is reclaimable is unknown.`
+    );
+  }
+  // All three buckets, always, even at zero. A stamp whose shape changes per
+  // turn is one the reader has to re-parse per turn, and a zero is itself a
+  // reading ("nothing unaccounted for") rather than an absence.
+  //
+  // Only the first two name a tool. The third names its composition instead,
+  // because it is a residual: saying what it is made of is a claim we can
+  // support, and saying what reclaims it is not.
+  return (
+    `${head} — ledger ${n(occ.ledgerTokens)} (evict_context/compact_context), ` +
+    `identity envelope ${n(occ.fixedTokens)} (fixed, re-sent every seed), ` +
+    `unaccounted ${n(occ.unaccountedTokens)} (native history + estimate drift; ` +
+    `a reseed clears the history, not the drift).`
+  );
+}
+
+/**
  * Handle a client-local tool call. Returns the result in PCP tool format,
  * or null if the tool isn't recognized.
  */
@@ -196,6 +322,12 @@ export function handleClientLocalTool(
 export const COMPACT_CONTEXT_SUMMARY_MAX_CHARS = 20_000;
 /** Ceiling on the protected recent tail an agent may ask to keep verbatim. */
 export const COMPACT_CONTEXT_MAX_KEEP_RECENT = 200;
+/**
+ * Ceiling on a ref-selected consolidation. The refs arrive in the args of a
+ * tool call the model wrote, so the list is already bounded by what it can
+ * emit; this bounds the pathological case rather than the ordinary one.
+ */
+export const COMPACT_CONTEXT_MAX_REFS = 2_000;
 
 /**
  * A compaction must leave the window smaller than it found it. An agent may
@@ -212,6 +344,18 @@ export interface CompactContextArgs {
   summary?: string;
   /** Entries kept verbatim after the summary. Absent means the runtime default. */
   keepRecent?: number;
+  /**
+   * Content-hash refs (the `ref` values from list_context) naming EXACTLY the
+   * entries to replace. This is the second selector, not a second verb: the
+   * operation is the same remove-and-insert `compact_context` already performs,
+   * chosen by name instead of by age — the way `evict_context` already takes
+   * refs, source or role for one eviction.
+   *
+   * Refs, never entryIds: the process ordinal renumbers on reattach, so a set
+   * captured against it can resolve to different content later and still read
+   * as correct (Myra, 2026-09-03; #570).
+   */
+  refs?: string[];
 }
 
 /**
@@ -247,6 +391,33 @@ export function parseCompactContextArgs(
       return { error: `keepRecent must be at most ${COMPACT_CONTEXT_MAX_KEEP_RECENT}` };
     }
     out.keepRecent = Math.floor(n);
+  }
+  if (args.refs !== undefined) {
+    if (!Array.isArray(args.refs)) return { error: 'refs must be an array of strings' };
+    const refs = args.refs.filter((r): r is string => typeof r === 'string' && r.trim() !== '');
+    if (refs.length !== args.refs.length) {
+      return {
+        error: 'refs must contain only non-empty strings (the ref values from list_context)',
+      };
+    }
+    if (refs.length === 0) {
+      return { error: 'refs is empty — omit it to compact the oldest entries instead' };
+    }
+    if (refs.length > COMPACT_CONTEXT_MAX_REFS) {
+      return {
+        error: `refs holds ${refs.length} entries; the ceiling is ${COMPACT_CONTEXT_MAX_REFS}`,
+      };
+    }
+    // The two selectors answer the same question differently — which entries
+    // go. Honouring both would mean silently picking one, and the caller could
+    // not tell which from the result.
+    if (out.keepRecent !== undefined) {
+      return {
+        error:
+          'refs and keepRecent are alternative selectors — refs names the entries to replace, keepRecent protects a recent tail of an oldest-first compaction. Pass one.',
+      };
+    }
+    out.refs = refs;
   }
   return out;
 }

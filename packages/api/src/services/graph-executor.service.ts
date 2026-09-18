@@ -25,7 +25,7 @@ import type { DataComposer } from '../data/composer';
 import type { TaskGroup } from '../data/repositories/task-groups.repository';
 import type { Database, Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { resolveAgentSlug } from '../auth/resolve-identity';
+import { resolveSbSlug } from '../auth/resolve-identity';
 import { StudioLeaseService } from './studio-lease.service';
 import { renderGateChecklistBlock } from './graph-templates/types';
 import { logger } from '../utils/logger';
@@ -497,7 +497,7 @@ export class GraphExecutorService {
     await this.logActivity(userId, group, 'graph_group_complete', { ...counts, summary });
 
     const ownerSlug = group.sb_id
-      ? await resolveAgentSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
+      ? await resolveSbSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
       : null;
     if (ownerSlug) {
       await this.sendTrigger(userId, group, ownerSlug, summary, 'graph_group_complete');
@@ -547,7 +547,7 @@ export class GraphExecutorService {
     await this.logActivity(userId, group, 'graph_dependency_failure', { failures, summary });
 
     const ownerSlug = group.sb_id
-      ? await resolveAgentSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
+      ? await resolveSbSlug(this.dataComposer.getClient(), group.sb_id).catch(() => null)
       : null;
     if (ownerSlug) {
       await this.sendTrigger(userId, group, ownerSlug, summary, 'graph_dependency_failure');
@@ -575,7 +575,7 @@ export class GraphExecutorService {
     let slug: string | null = null;
     let recipientIdentityId: string | null = null;
     if (node.assigneeIdentityId) {
-      slug = await resolveAgentSlug(client, node.assigneeIdentityId).catch(() => null);
+      slug = await resolveSbSlug(client, node.assigneeIdentityId).catch(() => null);
       if (slug) recipientIdentityId = node.assigneeIdentityId;
     }
     if (!slug && node.assigneeUserId) {
@@ -589,7 +589,7 @@ export class GraphExecutorService {
       return { ok: false, recipientIdentityId: null };
     }
     if (!slug && group.sb_id) {
-      slug = await resolveAgentSlug(client, group.sb_id).catch(() => null);
+      slug = await resolveSbSlug(client, group.sb_id).catch(() => null);
       if (slug) recipientIdentityId = group.sb_id;
     }
     if (!slug) {
@@ -656,8 +656,8 @@ export class GraphExecutorService {
       await handleSendToInbox(
         {
           userId,
-          recipientAgentId: recipientSlug,
-          senderAgentId: recipientSlug,
+          recipientSlug: recipientSlug,
+          senderSlug: recipientSlug,
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
           content,
@@ -743,7 +743,7 @@ export class GraphExecutorService {
     try {
       await this.dataComposer.repositories.activityStream.logActivity({
         userId,
-        agentId: 'system',
+        sbSlug: 'system',
         type: 'state_change',
         subtype,
         content:

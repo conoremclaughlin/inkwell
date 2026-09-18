@@ -21,14 +21,14 @@ describe('summarizeMissionRows', () => {
     const sessions: Session[] = [
       {
         id: '1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         status: 'active',
         lifecycle: 'running',
         startedAt: '2026-02-20T08:00:00.000Z',
       },
       {
         id: '2',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         status: 'active',
         lifecycle: 'idle',
         startedAt: '2026-02-20T08:05:00.000Z',
@@ -38,7 +38,7 @@ describe('summarizeMissionRows', () => {
       },
       {
         id: '3',
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'active',
         lifecycle: 'running',
         startedAt: '2026-02-20T07:55:00.000Z',
@@ -120,19 +120,19 @@ describe('resolveAttachCommand', () => {
   const sessions: Session[] = [
     {
       id: 'abc12345-aaaa',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       status: 'active',
       startedAt: '2026-02-20T10:00:00.000Z',
     },
     {
       id: 'def67890-bbbb',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       status: 'active',
       startedAt: '2026-02-20T11:00:00.000Z',
     },
     {
       id: 'wren1111-cccc',
-      agentId: 'wren',
+      sbSlug: 'wren',
       status: 'active',
       startedAt: '2026-02-20T11:30:00.000Z',
     },
@@ -142,7 +142,7 @@ describe('resolveAttachCommand', () => {
     expect(resolveAttachCommand(sessions, 'abc1')).toEqual({
       command: 'ink chat -a lumen --session-id abc12345-aaaa',
       sessionId: 'abc12345-aaaa',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
     });
   });
 
@@ -150,7 +150,7 @@ describe('resolveAttachCommand', () => {
     expect(resolveAttachCommand(sessions, 'lumen')).toEqual({
       command: 'ink chat -a lumen --session-id def67890-bbbb',
       sessionId: 'def67890-bbbb',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
     });
   });
 
@@ -199,7 +199,7 @@ describe('summarizeMissionFeedRows', () => {
     const sessions: Session[] = [
       {
         id: 'session-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'active',
         startedAt: '2026-02-20T10:00:00.000Z',
         studioId: 'studio-abc12345',
@@ -212,7 +212,7 @@ describe('summarizeMissionFeedRows', () => {
         {
           id: 'evt-1',
           type: 'message_in',
-          agentId: 'wren',
+          sbSlug: 'wren',
           sessionId: 'session-1',
           createdAt: '2026-02-20T10:01:00.000Z',
           platform: 'agent',
@@ -239,7 +239,7 @@ describe('summarizeMissionFeedRows', () => {
     const sessions: Session[] = [
       {
         id: 'session-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'active',
         startedAt: '2026-02-20T10:00:00.000Z',
         studio: { worktreeFolder: 'workspace-wren' },
@@ -251,7 +251,7 @@ describe('summarizeMissionFeedRows', () => {
         {
           id: 'evt-1',
           type: 'message_out',
-          agentId: 'wren',
+          sbSlug: 'wren',
           sessionId: 'session-1',
           createdAt: '2026-02-20T10:01:00.000Z',
           platform: 'telegram',
@@ -270,7 +270,7 @@ describe('summarizeMissionFeedRows', () => {
         {
           id: 'evt-1',
           type: 'tool_call',
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           createdAt: '2026-02-20T10:01:00.000Z',
           payload: { studioId: 'abcd1234-full-uuid' },
         },
@@ -298,7 +298,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'agent_spawn',
-          agentId: 'myra',
+          sbSlug: 'myra',
           payload: { backend: 'claude-code', triggerSource: 'heartbeat', triggeredBy: 'system' },
         })
       );
@@ -310,7 +310,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'agent_spawn',
-          agentId: 'wren',
+          sbSlug: 'wren',
           payload: {
             backend: 'claude',
             triggerSource: 'agent',
@@ -323,7 +323,7 @@ describe('activityToFeedEvent', () => {
     });
 
     it('falls back to "spawned sub-process" when no payload', () => {
-      const event = activityToFeedEvent(activity({ type: 'agent_spawn', agentId: 'myra' }));
+      const event = activityToFeedEvent(activity({ type: 'agent_spawn', sbSlug: 'myra' }));
       expect(event.content).toBe('spawned sub-process');
     });
   });
@@ -333,7 +333,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'agent_complete',
-          agentId: 'myra',
+          sbSlug: 'myra',
           payload: {
             backend: 'claude-code',
             durationMs: 25000,
@@ -346,7 +346,7 @@ describe('activityToFeedEvent', () => {
     });
 
     it('falls back to "sub-process completed" when no payload', () => {
-      const event = activityToFeedEvent(activity({ type: 'agent_complete', agentId: 'myra' }));
+      const event = activityToFeedEvent(activity({ type: 'agent_complete', sbSlug: 'myra' }));
       expect(event.content).toBe('sub-process completed');
     });
   });
@@ -356,7 +356,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'error',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'Backend turn failed (claude): short preview',
           payload: {
             backend: 'claude',
@@ -373,7 +373,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'error',
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           content: 'Backend turn failed (codex): timeout after 300s',
         })
       );
@@ -381,7 +381,7 @@ describe('activityToFeedEvent', () => {
     });
 
     it('shows "unknown error" when no content or payload', () => {
-      const event = activityToFeedEvent(activity({ type: 'error', agentId: 'wren' }));
+      const event = activityToFeedEvent(activity({ type: 'error', sbSlug: 'wren' }));
       expect(event.content).toBe('error: unknown error');
     });
 
@@ -389,7 +389,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'error',
-          agentId: 'aster',
+          sbSlug: 'aster',
           payload: {
             backend: 'gemini',
             error: 'We are currently experiencing high demand',
@@ -406,7 +406,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'error',
-          agentId: 'wren',
+          sbSlug: 'wren',
           payload: {
             backend: 'claude',
             error: 'something went wrong',
@@ -420,7 +420,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'error',
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           payload: {
             error: 'authentication_error: invalid API key',
             errorCategory: 'auth',
@@ -438,7 +438,7 @@ describe('activityToFeedEvent', () => {
           'sess-1',
           {
             id: 'sess-1',
-            agentId: 'wren',
+            sbSlug: 'wren',
             status: 'active',
             startedAt: '2026-03-02T10:00:00.000Z',
             studio: { worktreeFolder: 'personal-context-protocol--wren' },
@@ -448,7 +448,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'agent_spawn',
-          agentId: 'wren',
+          sbSlug: 'wren',
           sessionId: 'sess-1',
           payload: { backend: 'claude' },
         }),
@@ -464,7 +464,7 @@ describe('activityToFeedEvent', () => {
           'sess-1',
           {
             id: 'sess-1',
-            agentId: 'myra',
+            sbSlug: 'myra',
             status: 'active',
             startedAt: '2026-03-02T10:00:00.000Z',
             workingDir: '/Users/conor/ws/pcp/personal-context-protocol',
@@ -474,7 +474,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'agent_spawn',
-          agentId: 'myra',
+          sbSlug: 'myra',
           sessionId: 'sess-1',
           payload: { backend: 'claude-code', triggerSource: 'heartbeat' },
         }),
@@ -488,7 +488,7 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(
         activity({
           type: 'agent_spawn',
-          agentId: 'wren',
+          sbSlug: 'wren',
           payload: { backend: 'claude' },
         })
       );
@@ -505,7 +505,7 @@ describe('studioLabelForSession', () => {
     expect(
       studioLabelForSession({
         id: '1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'active',
         startedAt: '',
         studio: { worktreeFolder: 'personal-context-protocol--wren' },
@@ -517,7 +517,7 @@ describe('studioLabelForSession', () => {
     expect(
       studioLabelForSession({
         id: '1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'active',
         startedAt: '',
         studioId: 'abcd1234-5678-9abc-def0',
@@ -529,7 +529,7 @@ describe('studioLabelForSession', () => {
     expect(
       studioLabelForSession({
         id: '1',
-        agentId: 'myra',
+        sbSlug: 'myra',
         status: 'active',
         startedAt: '',
         workingDir: '/Users/conor/ws/pcp/personal-context-protocol',
@@ -538,7 +538,7 @@ describe('studioLabelForSession', () => {
   });
 
   it('returns dash when no info available', () => {
-    expect(studioLabelForSession({ id: '1', agentId: 'x', status: 'active', startedAt: '' })).toBe(
+    expect(studioLabelForSession({ id: '1', sbSlug: 'x', status: 'active', startedAt: '' })).toBe(
       '-'
     );
   });
@@ -583,8 +583,8 @@ describe('extractInboxMessages', () => {
           subject: 'Review PR #129',
           messageType: 'task_request',
           priority: 'high',
-          senderAgentId: 'lumen',
-          recipientAgentId: 'wren',
+          senderSlug: 'lumen',
+          recipientSlug: 'wren',
           threadKey: 'pr:129',
           createdAt: '2026-03-02T20:06:21Z',
         },
@@ -597,8 +597,8 @@ describe('extractInboxMessages', () => {
       subject: 'Review PR #129',
       messageType: 'task_request',
       priority: 'high',
-      senderAgentId: 'lumen',
-      recipientAgentId: 'wren',
+      senderSlug: 'lumen',
+      recipientSlug: 'wren',
       threadKey: 'pr:129',
     });
   });
@@ -625,13 +625,13 @@ describe('extractInboxMessages', () => {
           unreadCount: 2,
           previewMessages: [
             {
-              senderAgentId: 'lumen',
+              senderSlug: 'lumen',
               content: 'Looking at it now.',
               messageType: 'message',
               createdAt: '2026-03-10T02:00:00Z',
             },
             {
-              senderAgentId: 'wren',
+              senderSlug: 'wren',
               content: 'Thanks for the review!',
               messageType: 'message',
               createdAt: '2026-03-10T03:00:00Z',
@@ -643,15 +643,15 @@ describe('extractInboxMessages', () => {
     const msgs = extractInboxMessages(result);
     expect(msgs).toHaveLength(2);
     expect(msgs[0]).toMatchObject({
-      senderAgentId: 'lumen',
-      recipientAgentId: 'wren',
+      senderSlug: 'lumen',
+      recipientSlug: 'wren',
       content: 'Looking at it now.',
       threadKey: 'pr:210',
       createdAt: '2026-03-10T02:00:00Z',
     });
     expect(msgs[1]).toMatchObject({
-      senderAgentId: 'wren',
-      recipientAgentId: 'lumen',
+      senderSlug: 'wren',
+      recipientSlug: 'lumen',
       content: 'Thanks for the review!',
       threadKey: 'pr:210',
     });
@@ -663,8 +663,8 @@ describe('extractInboxMessages', () => {
         {
           id: 'msg-1',
           subject: 'Direct message',
-          senderAgentId: 'myra',
-          recipientAgentId: 'wren',
+          senderSlug: 'myra',
+          recipientSlug: 'wren',
           createdAt: '2026-03-10T01:00:00Z',
         },
       ],
@@ -675,7 +675,7 @@ describe('extractInboxMessages', () => {
           unreadCount: 1,
           previewMessages: [
             {
-              senderAgentId: 'lumen',
+              senderSlug: 'lumen',
               content: 'Thread message',
               messageType: 'task_request',
               createdAt: '2026-03-10T02:00:00Z',
@@ -708,9 +708,9 @@ describe('extractInboxMessages', () => {
           participants: ['wren', 'aster'],
           unreadCount: 1,
           previewMessages: [
-            { senderAgentId: 'aster', content: 'No timestamp' },
+            { senderSlug: 'aster', content: 'No timestamp' },
             {
-              senderAgentId: 'aster',
+              senderSlug: 'aster',
               content: 'Has timestamp',
               createdAt: '2026-03-10T05:00:00Z',
             },
@@ -733,7 +733,7 @@ describe('extractInboxMessages', () => {
           unreadCount: 1,
           previewMessages: [
             {
-              senderAgentId: 'myra',
+              senderSlug: 'myra',
               content: 'Group message',
               messageType: 'message',
               createdAt: '2026-03-10T06:00:00Z',
@@ -744,9 +744,9 @@ describe('extractInboxMessages', () => {
     };
     const msgs = extractInboxMessages(result);
     expect(msgs).toHaveLength(1);
-    // recipientAgentId should be the first non-sender participant
-    expect(msgs[0].recipientAgentId).toBe('benson');
-    expect(msgs[0].senderAgentId).toBe('myra');
+    // recipientSlug should be the first non-sender participant
+    expect(msgs[0].recipientSlug).toBe('benson');
+    expect(msgs[0].senderSlug).toBe('myra');
   });
 });
 
@@ -758,8 +758,8 @@ describe('inboxMessageToFeedEvent', () => {
       id: 'msg-1',
       subject: 'Review PR #129',
       messageType: 'task_request',
-      senderAgentId: 'lumen',
-      recipientAgentId: 'wren',
+      senderSlug: 'lumen',
+      recipientSlug: 'wren',
       createdAt: '2026-03-02T20:06:21Z',
     };
     const event = inboxMessageToFeedEvent(msg);
@@ -775,8 +775,8 @@ describe('inboxMessageToFeedEvent', () => {
       id: 'msg-2',
       content: 'Hey, how is the review going?',
       messageType: 'message',
-      senderAgentId: 'aster',
-      recipientAgentId: 'wren',
+      senderSlug: 'aster',
+      recipientSlug: 'wren',
       createdAt: '2026-03-02T21:00:00Z',
     };
     const event = inboxMessageToFeedEvent(msg);
@@ -785,11 +785,11 @@ describe('inboxMessageToFeedEvent', () => {
     expect(event.content).not.toContain('[message]');
   });
 
-  it('shows "user" when no senderAgentId', () => {
+  it('shows "user" when no senderSlug', () => {
     const msg: InboxMessage = {
       id: 'msg-3',
       subject: 'Manual message',
-      recipientAgentId: 'wren',
+      recipientSlug: 'wren',
       createdAt: '2026-03-02T21:00:00Z',
     };
     const event = inboxMessageToFeedEvent(msg);
@@ -802,8 +802,8 @@ describe('inboxMessageToFeedEvent', () => {
       subject: 'Review PR #232',
       content: 'Hey, please review this fix for the stuck compacting lifecycle on Gemini sessions.',
       messageType: 'task_request',
-      senderAgentId: 'wren',
-      recipientAgentId: 'lumen',
+      senderSlug: 'wren',
+      recipientSlug: 'lumen',
       createdAt: '2026-03-18T16:36:00Z',
     };
     const event = inboxMessageToFeedEvent(msg);
@@ -819,8 +819,8 @@ describe('inboxMessageToFeedEvent', () => {
       id: 'msg-5',
       content: longContent,
       messageType: 'message',
-      senderAgentId: 'aster',
-      recipientAgentId: 'wren',
+      senderSlug: 'aster',
+      recipientSlug: 'wren',
       createdAt: '2026-03-18T17:00:00Z',
     };
     const event = inboxMessageToFeedEvent(msg);
@@ -835,8 +835,8 @@ describe('inboxMessageToFeedEvent', () => {
       id: 'msg-6',
       content: 'Quick question',
       messageType: 'message',
-      senderAgentId: 'aster',
-      recipientAgentId: 'wren',
+      senderSlug: 'aster',
+      recipientSlug: 'wren',
       createdAt: '2026-03-18T17:00:00Z',
     };
     const event = inboxMessageToFeedEvent(msg);
@@ -874,7 +874,7 @@ describe('activityToFeedEvent subtype fallback', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'agent_spawn',
-        agentId: 'myra',
+        sbSlug: 'myra',
         subtype: 'backend_cli:claude-code',
         // no payload
       })
@@ -886,7 +886,7 @@ describe('activityToFeedEvent subtype fallback', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'agent_complete',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         subtype: 'backend_cli:codex',
         // no payload
       })
@@ -898,7 +898,7 @@ describe('activityToFeedEvent subtype fallback', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'error',
-        agentId: 'wren',
+        sbSlug: 'wren',
         subtype: 'backend_cli:claude',
         content: 'Something broke',
         // no payload
@@ -911,7 +911,7 @@ describe('activityToFeedEvent subtype fallback', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'agent_spawn',
-        agentId: 'myra',
+        sbSlug: 'myra',
         subtype: 'backend_cli:codex',
         payload: { backend: 'claude-code', triggerSource: 'heartbeat' },
       })
@@ -933,7 +933,7 @@ describe('activityToFeedEvent tool_call/tool_result', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'tool_call',
-        agentId: 'myra',
+        sbSlug: 'myra',
         subtype: 'backend_cli:claude-code',
         content: 'Spawned backend CLI (claude)',
         payload: {
@@ -951,7 +951,7 @@ describe('activityToFeedEvent tool_call/tool_result', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'tool_result',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         subtype: 'backend_cli:codex',
         status: 'completed',
         content: 'Backend CLI finished (codex)',
@@ -969,7 +969,7 @@ describe('activityToFeedEvent tool_call/tool_result', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'tool_result',
-        agentId: 'wren',
+        sbSlug: 'wren',
         subtype: 'backend_cli:claude',
         status: 'failed',
         content: 'Backend CLI failed (claude)',
@@ -986,7 +986,7 @@ describe('activityToFeedEvent tool_call/tool_result', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'tool_call',
-        agentId: 'myra',
+        sbSlug: 'myra',
         subtype: 'backend_cli:claude-code',
         content: 'Spawned backend CLI (claude)',
       })
@@ -998,12 +998,12 @@ describe('activityToFeedEvent tool_call/tool_result', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'tool_call',
-        agentId: 'myra',
+        sbSlug: 'myra',
         subtype: 'remember',
-        content: 'remember(email, content, agentId, topicKey)',
+        content: 'remember(email, content, sbSlug, topicKey)',
       })
     );
-    expect(event.content).toBe('remember(email, content, agentId, topicKey)');
+    expect(event.content).toBe('remember(email, content, sbSlug, topicKey)');
     expect(event.type).toBe('activity');
   });
 });
@@ -1020,7 +1020,7 @@ describe('activityToFeedEvent state_change', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'state_change',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         content: 'Session b73acc8f updated (currentPhase, lifecycle)',
         payload: {
           sessionId: 'b73acc8f-1234-5678-9abc-def012345678',
@@ -1037,7 +1037,7 @@ describe('activityToFeedEvent state_change', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'state_change',
-        agentId: 'myra',
+        sbSlug: 'myra',
         content: 'Session a1b2c3d4 updated (lifecycle)',
         payload: {
           sessionId: 'a1b2c3d4-0000-0000-0000-000000000000',
@@ -1052,7 +1052,7 @@ describe('activityToFeedEvent state_change', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'state_change',
-        agentId: 'wren',
+        sbSlug: 'wren',
         content: 'Session abc12345 updated (status)',
       })
     );
@@ -1064,7 +1064,7 @@ describe('activityToFeedEvent state_change', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'state_change',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         payload: {
           sessionId: 'deadbeef-0000-0000-0000-000000000000',
           changedFields: ['currentPhase', 'context'],
@@ -1092,7 +1092,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_completed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: '✓ Shipped the auth module',
           payload: {
             taskId: 'task-1',
@@ -1114,7 +1114,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_completed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: '✓ Implement auth',
           payload: { taskId: 'task-1', taskTitle: 'Implement auth', outcome: 'completed' },
         })
@@ -1128,7 +1128,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_completed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: '✓ Done',
           payload: {
             groupId: '12345678-abcd-1234-5678-123456789abc',
@@ -1150,7 +1150,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_closed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'skipped: Optional cleanup — Not needed',
           payload: {
             taskId: 'task-2',
@@ -1173,7 +1173,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_closed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'blocked: DB migration',
           payload: {
             taskId: 'task-3',
@@ -1194,7 +1194,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_closed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'failed: Build pipeline',
           payload: {
             taskId: 'task-4',
@@ -1217,7 +1217,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_group_closed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'Group closed (completed): 3/3 tasks completed.',
           payload: {
             groupId: 'group-1',
@@ -1240,7 +1240,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_group_closed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'Group closed (abandoned): 1/5 tasks completed, 2 blocked.',
           payload: {
             groupId: 'group-2',
@@ -1262,7 +1262,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_group_comment',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'Progress looking good',
           payload: {
             groupId: 'group-1',
@@ -1285,7 +1285,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'task_completed',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: '✓ Done',
           payload: {
             groupId: 'abcdef12-1234-5678-9abc-def012345678',
@@ -1303,7 +1303,7 @@ describe('activityToFeedEvent task lifecycle', () => {
         activity({
           type: 'state_change',
           subtype: 'strategy_started',
-          agentId: 'wren',
+          sbSlug: 'wren',
           content: 'persistence strategy started',
           payload: { groupId: 'group-1', strategy: 'persistence' },
         })

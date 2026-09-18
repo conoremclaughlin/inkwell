@@ -1326,6 +1326,70 @@ export type Database = {
           },
         ];
       };
+      heartbeat_notifications: {
+        Row: {
+          attempts: number;
+          created_at: string;
+          delivered_at: string | null;
+          destination: string | null;
+          episode_closed_at: string | null;
+          episode_key: string;
+          failed_beats: number;
+          id: string;
+          kind: string;
+          last_attempt_at: string | null;
+          last_error: string | null;
+          next_attempt_at: string | null;
+          reminder_id: string;
+          status: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key: string;
+          failed_beats?: number;
+          id?: string;
+          kind: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id: string;
+          status?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key?: string;
+          failed_beats?: number;
+          id?: string;
+          kind?: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id?: string;
+          status?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'heartbeat_notifications_reminder_id_fkey';
+            columns: ['reminder_id'];
+            referencedRelation: 'scheduled_reminders';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       heartbeat_state: {
         Row: {
           last_checks: Json | null;
@@ -1471,8 +1535,13 @@ export type Database = {
           key_type: string | null;
           metadata: Json | null;
           status: string;
+          summary: string | null;
+          summary_updated_at: string | null;
+          summary_updated_by_sb_id: string | null;
           thread_key: string;
           title: string | null;
+          title_updated_at: string | null;
+          title_updated_by_sb_id: string | null;
           updated_at: string | null;
           user_id: string;
         };
@@ -1487,8 +1556,13 @@ export type Database = {
           key_type?: string | null;
           metadata?: Json | null;
           status?: string;
+          summary?: string | null;
+          summary_updated_at?: string | null;
+          summary_updated_by_sb_id?: string | null;
           thread_key: string;
           title?: string | null;
+          title_updated_at?: string | null;
+          title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
           user_id: string;
         };
@@ -1503,12 +1577,29 @@ export type Database = {
           key_type?: string | null;
           metadata?: Json | null;
           status?: string;
+          summary?: string | null;
+          summary_updated_at?: string | null;
+          summary_updated_by_sb_id?: string | null;
           thread_key?: string;
           title?: string | null;
+          title_updated_at?: string | null;
+          title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
           user_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'inbox_threads_summary_updated_by_sb_id_fkey';
+            columns: ['summary_updated_by_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'inbox_threads_title_updated_by_sb_id_fkey';
+            columns: ['title_updated_by_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'inbox_threads_user_id_fkey';
             columns: ['user_id'];
@@ -4471,6 +4562,29 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      swap_memory_embedding: {
+        Args: {
+          p_memory_id: string;
+          p_user_id: string;
+          p_expected_version: number;
+          p_chunks: Json;
+          p_embedding: string;
+          p_chunks_version: number;
+          p_chunk_count: number;
+          p_metadata_patch: Json;
+          p_metadata_remove?: string[];
+        };
+        Returns: string;
+      };
+      clear_memory_embedding: {
+        Args: {
+          p_memory_id: string;
+          p_user_id: string;
+          p_expected_version: number;
+          p_metadata_remove?: string[];
+        };
+        Returns: string;
+      };
       advance_agent_inbox_read_pointer: {
         Args: {
           p_agent_id: string;
@@ -4497,6 +4611,19 @@ export type Database = {
           p_actor_agent_id?: string | null;
         };
         Returns: boolean;
+      };
+      update_inbox_thread_metadata: {
+        Args: {
+          p_thread_id: string;
+          p_set_title: boolean;
+          p_title: string | null;
+          p_set_summary: boolean;
+          p_summary: string | null;
+          p_editor_sb_id: string | null;
+          p_editor_slug: string;
+          p_attributed_by: string;
+        };
+        Returns: string;
       };
       add_graph_nodes: {
         Args: {

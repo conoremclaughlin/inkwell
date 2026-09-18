@@ -30,13 +30,13 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'content-only',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-1'],
       })
     ).toMatchObject({
       recallMode: 'hybrid',
       limit: 5,
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       topics: ['benchmark:memory-recall:case-1'],
       hybridChunkStrategy: 'content-only',
       applyChunkTypeBoosts: false,
@@ -51,7 +51,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'derived-only',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-2'],
       })
     ).toMatchObject({
@@ -67,7 +67,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'entity-only',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-entity'],
       })
     ).toMatchObject({
@@ -81,7 +81,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'entity-only',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-entity'],
       })
     ).toMatchObject({
@@ -100,7 +100,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-entity',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-content-entity'],
       })
     ).toMatchObject({
@@ -114,7 +114,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'content-plus-entity',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-content-entity'],
       })
     ).toMatchObject({
@@ -133,7 +133,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-entity-parallel',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-content-entity-parallel'],
       })
     ).toMatchObject({
@@ -148,7 +148,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'content-plus-entity-parallel',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-content-entity-parallel'],
       })
     ).toMatchObject({
@@ -168,7 +168,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'exact-only',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-exact'],
       })
     ).toMatchObject({
@@ -182,7 +182,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-exact',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-content-exact'],
       })
     ).toMatchObject({
@@ -198,7 +198,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'content-plus-derived',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-content-derived'],
       })
     ).toMatchObject({
@@ -234,13 +234,13 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'multiview-no-chrono',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-3'],
       })
     ).toMatchObject({
       recallMode: 'semantic',
       limit: 5,
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       topics: ['benchmark:memory-recall:case-3'],
     });
     expect(
@@ -248,7 +248,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'semantic',
         variant: 'multiview-no-chrono',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-3'],
       })
     ).not.toHaveProperty('semanticChunkTypes');
@@ -260,7 +260,7 @@ describe('benchmark-memory-recall variants', () => {
         mode: 'hybrid',
         variant: 'multiview-no-boost',
         limit: 5,
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         topics: ['benchmark:memory-recall:case-4'],
       })
     ).toMatchObject({

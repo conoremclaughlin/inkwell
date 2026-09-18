@@ -23,7 +23,7 @@ export interface CommandAnalysis {
 }
 
 export interface BashGuardConfig {
-  agentId: string;
+  sbSlug: string;
   /** Block catastrophic commands before execution (default: true) */
   blockDangerousCommands?: boolean;
   /** Enforce kill targeting only agent-owned PIDs (default: true) */
@@ -214,7 +214,7 @@ export function analyzeCommand(command: string): CommandAnalysis {
 
 interface ProcessEntry {
   pid: number;
-  agentId: string;
+  sbSlug: string;
   command: string;
   registeredAt: number;
 }
@@ -229,21 +229,21 @@ export class ProcessRegistry {
     this.ttlMs = ttlMs;
   }
 
-  register(agentId: string, pid: number, command: string): void {
-    this.entries.set(pid, { pid, agentId, command, registeredAt: Date.now() });
+  register(sbSlug: string, pid: number, command: string): void {
+    this.entries.set(pid, { pid, sbSlug, command, registeredAt: Date.now() });
   }
 
-  isOwned(agentId: string, pid: number): boolean {
+  isOwned(sbSlug: string, pid: number): boolean {
     const entry = this.entries.get(pid);
-    return !!entry && entry.agentId === agentId;
+    return !!entry && entry.sbSlug === sbSlug;
   }
 
   getOwner(pid: number): string | undefined {
-    return this.entries.get(pid)?.agentId;
+    return this.entries.get(pid)?.sbSlug;
   }
 
-  getAgentPids(agentId: string): number[] {
-    return [...this.entries.values()].filter((e) => e.agentId === agentId).map((e) => e.pid);
+  getAgentPids(sbSlug: string): number[] {
+    return [...this.entries.values()].filter((e) => e.sbSlug === sbSlug).map((e) => e.pid);
   }
 
   has(pid: number): boolean {
@@ -309,7 +309,7 @@ export function guardBashCommand(command: string, config: BashGuardConfig): Guar
 
   if (config.blockDangerousCommands !== false && analysis.blocked) {
     logger.warn('Bash guard blocked command', {
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       command: command.substring(0, 200),
       reason: analysis.reason,
     });
@@ -323,12 +323,12 @@ export function guardBashCommand(command: string, config: BashGuardConfig): Guar
   ) {
     const registry = getProcessRegistry();
     const unauthorized = analysis.killPidTargets.filter(
-      (pid) => !registry.isOwned(config.agentId, pid)
+      (pid) => !registry.isOwned(config.sbSlug, pid)
     );
     if (unauthorized.length > 0) {
       const reason = `Blocked: cannot signal PIDs not owned by this agent: [${unauthorized.join(', ')}]`;
       logger.warn('Bash guard blocked kill', {
-        agentId: config.agentId,
+        sbSlug: config.sbSlug,
         unauthorizedPids: unauthorized,
       });
       return { allowed: false, reason };

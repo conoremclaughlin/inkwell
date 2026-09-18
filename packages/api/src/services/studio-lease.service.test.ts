@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { mkdtemp, rm, writeFile, readFile } from 'fs/promises';
+import { rmSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import {
@@ -26,6 +27,7 @@ import {
   writeCheckoutPin,
   rescueSucceeded,
   isLeaseStale,
+  leaseAttribution,
   leaseThreadKeys,
   LEASE_STALE_MS,
   QUARANTINE_THREAD_KEY,
@@ -331,7 +333,7 @@ function freshLease(overrides: Partial<StudioLease> = {}): StudioLease {
   return {
     sessionId: 'session-a',
     threadKey: 'pr:100',
-    agentId: 'wren',
+    sbSlug: 'wren',
     acquiredAt: now,
     heartbeatAt: now,
     ...overrides,
@@ -391,7 +393,7 @@ describe('StudioLeaseService.acquire', () => {
     studioId: 'studio-1',
     sessionId: 'session-b',
     threadKey: 'pr:200',
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: 'user-1',
     reason: 'route-pattern',
   };
@@ -775,7 +777,7 @@ describe('StudioLeaseService.acquire', () => {
       sessionId: '44444444-4444-4444-4444-444444444444',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:5',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: new Date().toISOString(),
       heartbeatAt: new Date().toISOString(),
       quarantined: true,
@@ -818,7 +820,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-live',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -881,7 +883,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-old',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -975,7 +977,7 @@ describe('StudioLeaseService.acquire', () => {
       studioId: 'studio-1',
       sessionId: 'session-b',
       threadKey: 'pr:200',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'user-1',
     });
     expect(result.acquired).toBe(false);
@@ -1127,7 +1129,7 @@ describe('StudioLeaseService.acquire', () => {
       sessionId: 'session-dead',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:999',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       acquiredAt: staleQuarantineHeartbeat,
       heartbeatAt: staleQuarantineHeartbeat,
       quarantined: true,
@@ -1144,7 +1146,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-live',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1176,7 +1178,7 @@ describe('StudioLeaseService.acquire', () => {
     registerActiveRun({
       sessionId: 'session-running',
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1270,7 +1272,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1372,7 +1374,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1427,7 +1429,7 @@ describe('StudioLeaseService release paths', () => {
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1482,7 +1484,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
     registerActiveRun({
       sessionId: 'sess-3',
       userId: 'u',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -1535,7 +1537,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
         studioId: 's-bad',
         sessionId: 'sess-new',
         threadKey: 'pr:7',
-        agentId: 'wren',
+        sbSlug: 'wren',
         userId: 'u',
       });
       expect(acq.acquired).toBe(false);
@@ -1556,7 +1558,7 @@ describe('sweep worktree-absent reconciliation (round 6)', () => {
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:33',
       holderSessionId: 'sess-orig',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: staleIso,
       heartbeatAt: staleIso,
       quarantined: true,
@@ -1765,7 +1767,7 @@ describe('sweep pendingRelease backstop', () => {
     registerActiveRun({
       sessionId: 'sess-p',
       userId: 'u',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -2047,7 +2049,7 @@ describe('claimForTeardown ownership (round 3)', () => {
       sessionId: '11111111-1111-1111-1111-111111111111',
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: 'pr:5',
-      agentId: 'wren',
+      sbSlug: 'wren',
       acquiredAt: staleIso,
       heartbeatAt: staleIso,
       quarantined: true,
@@ -2061,6 +2063,413 @@ describe('claimForTeardown ownership (round 3)', () => {
     // The old quarantine's identity no longer verifies.
     expect(await service.verifyClaim('s-1', 'u', staleQuarantine)).toBe(false);
     expect(await service.verifyClaim('s-1', 'u', claim!)).toBe(true);
+  });
+});
+
+/**
+ * The teardown claim fences the window in which a worktree is removed, and it
+ * was the one lease transition absent from `studio_lease_events`: the vacant
+ * path wrote `studios.lease` directly, the other two went through `casLease`,
+ * and `casLease` is a pure CAS primitive that logs nothing. A timeline ran
+ * from the previous holder's `released` straight to an already-`cleaned`
+ * studio.
+ *
+ * Every assertion here fails against the pre-fix service — not because the
+ * event carries the wrong shape, but because there is no event at all.
+ */
+describe('claimForTeardown lease events (destructive window is on the record)', () => {
+  function claimTables(lease: StudioLease | null): Record<string, Row[]> {
+    return {
+      studios: [{ id: 's-1', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+  }
+
+  const staleAt = () => new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+
+  it('records the claim on the vacant path', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(claim).not.toBeNull();
+
+    expect(tables.studio_lease_events).toHaveLength(1);
+    const event = tables.studio_lease_events[0];
+    expect(event.event).toBe('acquired');
+    expect(event.reason).toBe('teardown-claimed');
+    const detail = event.detail as Record<string, unknown>;
+    expect(detail.claimKind).toBe('teardown');
+    expect(detail.path).toBe('vacant');
+    expect(detail.claimReason).toBe('close_studio');
+  });
+
+  it('names the PREVIOUS HOLDER in session_id and keeps the synthetic token in detail', async () => {
+    // The diagnosability failure this fixes: a claim token is a bare
+    // randomUUID that resolves to no session anywhere. Recording it as the
+    // row's session_id would reproduce, in the event table, exactly the
+    // "held by session <uuid>" misreading the table exists to settle.
+    const holder: StudioLease = {
+      sessionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      threadKey: 'pr:642',
+      sbSlug: 'wren',
+      acquiredAt: staleAt(),
+      heartbeatAt: staleAt(),
+    };
+    const tables = claimTables(holder);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', {
+      reason: 'close_studio',
+      expectedThreadKey: 'pr:642',
+    });
+    expect(claim).not.toBeNull();
+
+    const event = tables.studio_lease_events.find((e) => e.reason === 'teardown-claimed');
+    expect(event).toBeDefined();
+    expect(event!.session_id).toBe(holder.sessionId);
+    expect(event!.session_id).not.toBe(claim!.sessionId);
+    expect(event!.thread_key).toBe('pr:642');
+    expect((event!.detail as Record<string, unknown>).claimToken).toBe(claim!.sessionId);
+    expect((event!.detail as Record<string, unknown>).path).toBe('thread-release');
+  });
+
+  it('records a refusal, so "refused" is distinguishable from "never attempted"', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const first = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(first).not.toBeNull();
+
+    // A second worker reaches for the same studio while the first holds it.
+    const second = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(second).toBeNull();
+
+    const refusal = tables.studio_lease_events.find((e) => e.event === 'conflict');
+    expect(refusal).toBeDefined();
+    expect(refusal!.reason).toBe('teardown-refused-active-claim');
+    expect((refusal!.detail as Record<string, unknown>).blockingToken).toBe(first!.sessionId);
+  });
+
+  it('records a refusal when the lease still multiplexes other live threads', async () => {
+    const holder: StudioLease = {
+      sessionId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      threadKey: 'pr:1',
+      threadKeys: ['pr:1', 'pr:2'],
+      sbSlug: 'wren',
+      acquiredAt: staleAt(),
+      heartbeatAt: staleAt(),
+    };
+    const tables = claimTables(holder);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', {
+      reason: 'close_studio',
+      expectedThreadKey: 'pr:1',
+    });
+    expect(claim).toBeNull();
+
+    const refusal = tables.studio_lease_events.find((e) => e.event === 'conflict');
+    expect(refusal).toBeDefined();
+    expect(refusal!.reason).toBe('teardown-refused-multiplexed');
+    expect((refusal!.detail as Record<string, unknown>).remainingThreadKeys).toEqual(['pr:2']);
+  });
+
+  it('terminates the window: finalizeTeardown closes what the claim opened', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(await service.finalizeTeardown('s-1', 'u', claim!)).toBe(true);
+
+    // An open with no close is what made an in-flight fence read as a stuck one.
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual([
+      'teardown-claimed',
+      'teardown-finalized',
+    ]);
+  });
+
+  it('lets a caller that logs its own close opt out, so one transition is not double-recorded', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(await service.finalizeTeardown('s-1', 'u', claim!, { closeReason: null })).toBe(true);
+
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual(['teardown-claimed']);
+  });
+
+  it('terminates the window on the abort path too: clearTeardownClaim', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(await service.clearTeardownClaim('s-1', 'u', claim!)).toBe(true);
+
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual([
+      'teardown-claimed',
+      'teardown-claim-cleared',
+    ]);
+    const cleared = tables.studio_lease_events[1];
+    expect(cleared.event).toBe('released');
+    expect((cleared.detail as Record<string, unknown>).claimToken).toBe(claim!.sessionId);
+  });
+
+  it('does not log a terminator for a finalize that did not happen', async () => {
+    // Control for the two tests above: the close event tracks the real
+    // transition, not the call. A stolen claim finalizes nothing and must
+    // leave the window open on the record.
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    tables.studios[0].lease = {
+      ...claim!,
+      sessionId: '33333333-3333-3333-3333-333333333333',
+    } as unknown as Row;
+
+    expect(await service.finalizeTeardown('s-1', 'u', claim!)).toBe(false);
+    expect(await service.clearTeardownClaim('s-1', 'u', claim!)).toBe(false);
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual(['teardown-claimed']);
+  });
+});
+
+/**
+ * A CLAIM OF A CLAIM must not inherit the earlier claim's token as a holder
+ * (PR #650 round 1, Lumen).
+ *
+ * `claimRecord` carried attribution forward with `holder.holderSessionId ??
+ * holder.sessionId`, which is right for an ordinary lease and wrong for a
+ * quarantined one: there `sessionId` is a synthetic token and `threadKey` is
+ * the `__quarantine__` sentinel. A claim taken over VACANCY has no holder to
+ * carry, so the fallback reached past the empty field and adopted the token —
+ * which then landed in `studio_lease_events.session_id`, the column whose
+ * purpose is to settle "held by session <uuid>" readings, not create them.
+ *
+ * The same hand-written idiom sat at two more sites (`retireMissingWorktree`,
+ * `claimAndRescue`'s worktree-absent retirement), both reachable with a stale
+ * quarantine via `resolveOccupied`. All three now go through
+ * `leaseAttribution`, and the vacant-origin cases below fail against
+ * 0cc00ca5 at each of them.
+ *
+ * The control that keeps this honest is `a KNOWN holder still survives`: the
+ * fix must distinguish "this claim never knew a holder" from "null it all
+ * out", and only a claim carrying a real holder can show that.
+ */
+describe('claim attribution never adopts a claim token (PR #650 round 1)', () => {
+  function claimTables(lease: StudioLease | null): Record<string, Row[]> {
+    return {
+      studios: [{ id: 's-1', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+  }
+
+  const staleAt = () => new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+
+  /** A claim taken over vacancy: unforgeable token, no holder behind it. */
+  const vacantOriginClaim = (over: Partial<StudioLease> = {}): StudioLease => ({
+    sessionId: '11111111-1111-1111-1111-111111111111',
+    threadKey: QUARANTINE_THREAD_KEY,
+    sbSlug: 'system',
+    acquiredAt: staleAt(),
+    heartbeatAt: staleAt(),
+    quarantined: true,
+    claimKind: 'teardown',
+    ...over,
+  });
+
+  describe('leaseAttribution', () => {
+    it('reads an ordinary lease as its own holder', () => {
+      expect(leaseAttribution(freshLease({ sessionId: 's-9', threadKey: 'pr:9' }))).toEqual({
+        sessionId: 's-9',
+        threadKey: 'pr:9',
+      });
+    });
+
+    it('prefers carried-through attribution when the lease has it', () => {
+      const lease = freshLease({ sessionId: 's-9', threadKey: 'pr:9' });
+      expect(
+        leaseAttribution({ ...lease, holderSessionId: 's-real', heldThreadKey: 'pr:real' })
+      ).toEqual({ sessionId: 's-real', threadKey: 'pr:real' });
+    });
+
+    it('reads a claim over a REAL holder as that holder', () => {
+      const claim = vacantOriginClaim({ holderSessionId: 's-real', heldThreadKey: 'pr:real' });
+      expect(leaseAttribution(claim)).toEqual({ sessionId: 's-real', threadKey: 'pr:real' });
+    });
+
+    it('reads a claim over VACANCY as unknown — never the token or the sentinel', () => {
+      const claim = vacantOriginClaim();
+      expect(leaseAttribution(claim)).toEqual({ sessionId: undefined, threadKey: undefined });
+      // The precise regression: the old idiom returned these two values.
+      expect(leaseAttribution(claim).sessionId).not.toBe(claim.sessionId);
+      expect(leaseAttribution(claim).threadKey).not.toBe(QUARANTINE_THREAD_KEY);
+    });
+
+    it('reads a vacant studio as unknown', () => {
+      expect(leaseAttribution(null)).toEqual({});
+    });
+  });
+
+  it('REFUSAL against a fresh vacant-origin claim attributes to no session', async () => {
+    // Lumen's first reproduction: two teardown attempts over a vacant studio.
+    // The second is refused, and the refusal used to name the FIRST attempt's
+    // token as the session that held the studio.
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const first = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(first).not.toBeNull();
+    expect(await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' })).toBeNull();
+
+    const refusal = tables.studio_lease_events.find(
+      (e) => e.reason === 'teardown-refused-active-claim'
+    );
+    expect(refusal).toBeDefined();
+    expect(refusal!.session_id).toBeNull();
+    expect(refusal!.session_id).not.toBe(first!.sessionId);
+    expect(refusal!.thread_key).toBeNull();
+    // The blocking token is still recorded — as a token, in detail, where it
+    // reads as the synthetic value it is.
+    expect((refusal!.detail as Record<string, unknown>).blockingToken).toBe(first!.sessionId);
+  });
+
+  it('a STALE retry attributes to no session on BOTH the claim and its terminator', async () => {
+    // Lumen's second reproduction. The retry wins the CAS, so the earlier
+    // token propagated into the new claim record and from there onto every
+    // event the window produced — the open AND the close.
+    const stale = vacantOriginClaim();
+    const tables = claimTables(stale);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const retry = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(retry).not.toBeNull();
+    expect(retry!.holderSessionId).toBeUndefined();
+    expect(retry!.heldThreadKey).toBeUndefined();
+    expect(await service.finalizeTeardown('s-1', 'u', retry!)).toBe(true);
+
+    expect(tables.studio_lease_events.map((e) => e.reason)).toEqual([
+      'teardown-claimed',
+      'teardown-finalized',
+    ]);
+    for (const event of tables.studio_lease_events) {
+      expect(event.session_id).toBeNull();
+      expect(event.session_id).not.toBe(stale.sessionId);
+      expect(event.thread_key).toBeNull();
+    }
+    // The new claim's own token is still on the record, under detail.
+    expect((tables.studio_lease_events[0].detail as Record<string, unknown>).claimToken).toBe(
+      retry!.sessionId
+    );
+  });
+
+  it('CONTROL: a KNOWN holder still survives a claim of a claim', async () => {
+    // Without this, "restrict the fallback to non-quarantined leases" could
+    // be satisfied by dropping carried attribution altogether — which would
+    // lose the real holder of every recovered quarantine.
+    const stale = vacantOriginClaim({
+      holderSessionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      heldThreadKey: 'pr:642',
+    });
+    const tables = claimTables(stale);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const retry = await service.claimForTeardown('s-1', 'u', { reason: 'close_studio' });
+    expect(retry!.holderSessionId).toBe('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    expect(retry!.heldThreadKey).toBe('pr:642');
+
+    const claimed = tables.studio_lease_events.find((e) => e.reason === 'teardown-claimed');
+    expect(claimed!.session_id).toBe('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    expect(claimed!.thread_key).toBe('pr:642');
+  });
+
+  it('falls back to the CLOSING thread rather than promoting the sentinel', async () => {
+    // `__quarantine__` is not a thread. It matches no `inbox_threads` row and
+    // no thread-key grammar, so promoting it names a thread that cannot
+    // exist; the caller's expectedThreadKey is a real one.
+    const tables = claimTables(vacantOriginClaim());
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const retry = await service.claimForTeardown('s-1', 'u', {
+      reason: 'close_studio',
+      expectedThreadKey: 'pcp:pr:650',
+    });
+    expect(retry!.heldThreadKey).toBe('pcp:pr:650');
+    expect(retry!.heldThreadKey).not.toBe(QUARANTINE_THREAD_KEY);
+
+    const claimed = tables.studio_lease_events.find((e) => e.reason === 'teardown-claimed');
+    expect(claimed!.thread_key).toBe('pcp:pr:650');
+  });
+
+  it('retireMissingWorktree attributes a stale vacant-origin claim to no session', async () => {
+    // Second site, same idiom. `refuseUngrantable` routes here when the
+    // configured worktree is gone; a FRESH claim returns early, a STALE one
+    // reaches the event.
+    resetActiveRuns();
+    const tables = baseTables();
+    tables.studios[0].worktree_path = path.join(tmpdir(), 'lease-attr-absent-xyz');
+    tables.studios[0].lease = vacantOriginClaim({ claimKind: 'recovery' }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire({
+      studioId: 'studio-1',
+      sessionId: 'session-b',
+      threadKey: 'pr:200',
+      sbSlug: 'wren',
+      userId: 'user-1',
+      reason: 'route-pattern',
+    });
+    expect(result.acquired).toBe(false);
+
+    const retired = tables.studio_lease_events.find((e) => e.reason === 'worktree-absent-retired');
+    expect(retired).toBeDefined();
+    // Discriminates this site from claimAndRescue's retirement, which carries
+    // a previousHolder detail — so the assertion cannot pass on the wrong path.
+    expect(retired!.detail).toEqual({});
+    expect(retired!.session_id).toBeNull();
+    expect(retired!.thread_key).toBeNull();
+  });
+
+  it('claimAndRescue retirement attributes a stale vacant-origin claim to no session', async () => {
+    // Third site. Reachable only through the TOCTOU window: the worktree is
+    // present at `refuseUngrantable`'s check and gone by the time the claim
+    // has been taken, which `onGrantWindow` reproduces exactly (it fires
+    // inside studio_path_conflict, after the claim CAS and before the
+    // worktree check).
+    resetActiveRuns();
+    const worktree = await mkdtemp(path.join(tmpdir(), 'lease-attr-toctou-'));
+    const tables = baseTables();
+    tables.studios[0].worktree_path = worktree;
+    tables.studios[0].lease = vacantOriginClaim({ claimKind: 'recovery' }) as unknown as Row;
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        onGrantWindow: () => rmSync(worktree, { recursive: true, force: true }),
+      })
+    );
+
+    const result = await service.acquire({
+      studioId: 'studio-1',
+      sessionId: 'session-b',
+      threadKey: 'pr:200',
+      sbSlug: 'wren',
+      userId: 'user-1',
+      reason: 'route-pattern',
+    });
+    expect(result.acquired).toBe(false);
+
+    const retired = tables.studio_lease_events.find((e) => e.reason === 'worktree-absent-retired');
+    expect(retired).toBeDefined();
+    // The previousHolder detail proves this is claimAndRescue's retirement
+    // and NOT retireMissingWorktree's — the two write the same reason.
+    expect((retired!.detail as Record<string, unknown>).previousHolder).toBeDefined();
+    expect(retired!.session_id).toBeNull();
+    expect(retired!.thread_key).toBeNull();
   });
 });
 
@@ -2686,7 +3095,7 @@ describe('S1 r1: release/repoint gap regressions (PR #550, Lumen r1)', () => {
       studioId: 's-eph',
       sessionId: 'sess-new',
       threadKey: 'pr:11',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'u',
     });
 
@@ -2737,7 +3146,7 @@ describe('S2: thread multiplexing on the lease (spec v18)', () => {
     studioId: 'studio-1',
     sessionId,
     threadKey,
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: 'user-1',
     reason: 'route-pattern',
   });
@@ -2894,7 +3303,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     registerActiveRun({
       sessionId: 'session-b',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -3075,7 +3484,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
       studioId: 'studio-1',
       sessionId: 'session-b',
       threadKey: 'pr:B',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'user-1',
       reason: 'route-pattern',
     });
@@ -3216,7 +3625,7 @@ describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
     studioId: 'studio-1',
     sessionId: 'session-b',
     threadKey: 'pr:100',
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: 'user-1',
     reason: 'route-pattern',
     ...overrides,

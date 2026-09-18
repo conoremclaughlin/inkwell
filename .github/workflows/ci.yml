@@ -1,5 +1,9 @@
 name: CI
 
+# Test jobs only clone the repository; they never write repository metadata.
+permissions:
+  contents: read
+
 on:
   pull_request:
     branches: [main]
@@ -47,6 +51,26 @@ jobs:
       - name: Pre-push commit replay
         run: sh scripts/check-push.test.sh
 
+      # The integration-DB harness's endpoint isolation. Mock-only: synthetic
+      # `supabase status` payloads, no Docker and no database. CI has no
+      # ambient Supabase env, so the contamination this covers cannot arise
+      # here — which is why it has to be reproduced from synthetic payloads
+      # rather than by running the harness.
+      - name: Integration-DB harness endpoint isolation
+        run: sh scripts/test-integration-db-local.test.sh
+
+      - name: Integration stack lifecycle (mock-only)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-stack.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-data.py
+
+      # Every tracked file at HEAD, through the same guard the hooks run: no
+      # credential-shaped file, no vendor token, no email address off the
+      # fixture-domain list. The private-marker arm is the owner's machine's
+      # concern, so CI opts out of it explicitly with an empty list.
+      - name: Tree-wide personal-data and credential check
+        run: INK_PRIVATE_MARKERS=/dev/null sh scripts/check-staged-files.sh --tree HEAD
+
   integration-db-local:
     name: Integration DB Tests (Local Supabase)
     runs-on: ubuntu-latest
@@ -76,8 +100,22 @@ jobs:
 
       - run: yarn install --immutable
 
-      - name: Run DB integration suite with isolated local Supabase
-        run: yarn test:integration:db:local
+      # Explicit retained mode on this disposable runner exercises the cold and
+      # warm paths. Unflagged CI invocations still default to --fresh.
+      - name: Run full DB integration suite from a cold isolated stack
+        run: yarn test:integration:db:local --reuse
+
+      - name: Scoped fixture cleanup and refusal probes (disposable runner only)
+        env:
+          INK_DISPOSABLE_RUNNER_TESTS: '1'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-data-ci.py
+
+      - name: Run full DB integration suite again on the warm stack
+        run: yarn test:integration:db:local --reuse
+
+      - name: Release the runner-owned integration stack
+        if: always()
+        run: yarn test:integration:db:local --stop
 
   integration-runtime:
     name: Integration Runtime Tests

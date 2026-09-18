@@ -35,8 +35,8 @@ describe('ephemeralWorktreePath', () => {
     process.env.INK_STUDIOS_ROOT = '/tmp/studios';
     expect(
       ephemeralWorktreePath({
-        agentId: 'wren',
-        repoRoot: '/Users/conor/ws/pcp/inkwell',
+        sbSlug: 'wren',
+        repoRoot: '/home/synthetic/ws/inkwell',
         leaf: 'wren-omega--pr-537',
       })
     ).toBe('/tmp/studios/wren/inkwell/wren-omega--pr-537');
@@ -45,7 +45,7 @@ describe('ephemeralWorktreePath', () => {
   it('preserves the DB slug byte-for-byte as the leaf, double hyphens included', () => {
     process.env.INK_STUDIOS_ROOT = '/tmp/studios';
     const p = ephemeralWorktreePath({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       repoRoot: '/ws/inkwell',
       leaf: 'lumen-review--pr-476-h1a2b3c',
     });
@@ -56,7 +56,7 @@ describe('ephemeralWorktreePath', () => {
     process.env.INK_STUDIOS_ROOT = '/tmp/studios';
     // Absent agent/leaf → plain fallbacks; the repo basename ':::' is a
     // NON-EMPTY input that sanitizes away, so it gets the digested fallback.
-    const p = ephemeralWorktreePath({ agentId: null, repoRoot: '/x/:::', leaf: '' });
+    const p = ephemeralWorktreePath({ sbSlug: null, repoRoot: '/x/:::', leaf: '' });
     const parts = p.split('/');
     expect(parts.slice(0, 4).join('/')).toBe('/tmp/studios/agent');
     expect(parts[4]).toMatch(/^project-h[a-z0-9]+$/);
@@ -145,4 +145,24 @@ describe('studioPathSegment', () => {
       expect(b).not.toBe('project');
     });
   });
+});
+
+it('keeps hostile components beneath the normalized configured root', () => {
+  process.env.INK_STUDIOS_ROOT = '/tmp/synthetic-studios/../studio-root';
+  for (const component of [
+    '../../outside',
+    '../studio-root-sibling',
+    '/outside',
+    'nested\\path',
+    '..',
+    'name\n',
+  ]) {
+    const candidate = ephemeralWorktreePath({
+      sbSlug: component,
+      repoRoot: '/synthetic/repository',
+      leaf: component,
+    });
+    expect(candidate.startsWith('/tmp/studio-root/')).toBe(true);
+    expect(path.relative('/tmp/studio-root', candidate).split(path.sep)).toHaveLength(3);
+  }
 });

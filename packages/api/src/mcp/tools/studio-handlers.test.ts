@@ -7,7 +7,7 @@
  * (resolveCopySourceRoot).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import {
   mkdtempSync,
   mkdirSync,
@@ -20,6 +20,14 @@ import {
 import { tmpdir } from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+vi.mock('../../config/env', async () => ({
+  env: { ...(await import('../../test/fake-env')).fakeEnv },
+  isDevelopment: () => false,
+}));
+vi.mock('../../utils/logger', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 
 vi.mock('../../services/user-resolver', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services/user-resolver')>();
@@ -42,7 +50,7 @@ const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMoc
   () => ({
     acquireMock: vi.fn(async () => ({ acquired: true, lease: {} })),
     implicitMock: vi.fn(async () => ({ session: null, reason: 'no-session' })),
-    callerMock: vi.fn(async () => ({ agentId: 'wren', sbId: undefined })),
+    callerMock: vi.fn(async () => ({ sbSlug: 'wren', sbId: undefined })),
     findOrCreateThreadMock: vi.fn(async () => ({ id: 'thread-1', isNew: true })),
     assignMock: vi.fn(async () => ({
       sessionId: 'sess-1',
@@ -72,8 +80,8 @@ vi.mock('../../services/studio-lease.service', async (importOriginal) => {
 import { handleCreateStudio, handleAdoptStudio } from './studio-handlers';
 import type { DataComposer } from '../../data/composer';
 
-function git(cmd: string, cwd: string): void {
-  execSync(`git ${cmd}`, { cwd, stdio: 'pipe' });
+function git(args: string[], cwd: string): void {
+  execFileSync('git', args, { cwd, stdio: 'pipe' });
 }
 
 const MAIN_MCP = JSON.stringify({
@@ -108,15 +116,16 @@ describe('handleCreateStudio bootstrap source', () => {
     // realpath because git prints resolved worktree paths (macOS tmpdir is a
     // symlink: /var/folders → /private/var/folders) and the handler derives
     // the new studio path from git's output.
-    base = realpathSync(mkdtempSync(path.join(tmpdir(), 'studio-bootstrap-')));
+    base = realpathSync(mkdtempSync(path.join(tmpdir(), 'studio bootstrap-')));
     mainRoot = path.join(base, 'repo');
     mkdirSync(mainRoot);
-    git('init -b main', mainRoot);
-    git('config user.email test@example.com', mainRoot);
-    git('config user.name Test', mainRoot);
+    git(['init', '-b', 'main'], mainRoot);
+    git(['config', 'user.email', 'test@example.com'], mainRoot);
+    git(['config', 'user.name', 'Test'], mainRoot);
     writeFileSync(path.join(mainRoot, '.gitignore'), '.mcp.json\n.env.local\n.codex/\n.gemini/\n');
-    git('add .gitignore', mainRoot);
-    git('commit -m init', mainRoot);
+    git(['add', '.gitignore'], mainRoot);
+    writeFileSync(path.join(base, 'commit-message.txt'), 'init\n');
+    git(['commit', '-F', path.join(base, 'commit-message.txt')], mainRoot);
 
     // Bootstrap files are gitignored — they exist only as local files in main
     writeFileSync(path.join(mainRoot, '.mcp.json'), MAIN_MCP);
@@ -124,7 +133,7 @@ describe('handleCreateStudio bootstrap source', () => {
 
     // A linked worktree with a customised .mcp.json and no .env.local
     linkedPath = path.join(base, 'repo--linked');
-    git(`worktree add -b linked ${linkedPath}`, mainRoot);
+    git(['worktree', 'add', '-b', 'linked', '--', linkedPath], mainRoot);
     writeFileSync(path.join(linkedPath, '.mcp.json'), LINKED_MCP);
   });
 
@@ -135,7 +144,7 @@ describe('handleCreateStudio bootstrap source', () => {
   it('seeds a studio created from a linked worktree with main config, not the linked copy', async () => {
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot: linkedPath, // caller is inside the linked worktree
         slug: 'fresh',
         baseBranch: 'main',
@@ -162,7 +171,7 @@ describe('handleCreateStudio bootstrap source', () => {
   it('seeds a studio created from the main root with its own config', async () => {
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot: mainRoot,
         slug: 'direct',
         baseBranch: 'main',
@@ -245,7 +254,7 @@ describe('create_studio / adopt_studio provenance', () => {
       purpose: 'an old studio',
       routePatterns: ['pr:*'],
       status: 'active',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: '00000000-0000-0000-0000-000000000001',
     };
     const findById = vi.fn(async () => existing);
@@ -256,7 +265,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const getSession = vi.fn(async (id: string) => ({
       id,
       userId: '00000000-0000-0000-0000-000000000001',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-1',
       contactId: undefined,
     }));
@@ -274,16 +283,17 @@ describe('create_studio / adopt_studio provenance', () => {
 
   beforeEach(() => {
     repoRoot = realpathSync(mkdtempSync(path.join(tmpdir(), 'studio-provenance-')));
-    git('init -b main', repoRoot);
-    git('config user.email test@example.com', repoRoot);
-    git('config user.name Test', repoRoot);
-    git('commit --allow-empty -m init', repoRoot);
+    git(['init', '-b', 'main'], repoRoot);
+    git(['config', 'user.email', 'test@example.com'], repoRoot);
+    git(['config', 'user.name', 'Test'], repoRoot);
+    writeFileSync(path.join(repoRoot, 'commit-message.txt'), 'init\n');
+    git(['commit', '--allow-empty', '-F', path.join(repoRoot, 'commit-message.txt')], repoRoot);
     acquireMock.mockClear().mockResolvedValue({ acquired: true, lease: {} });
-    callerMock.mockClear().mockResolvedValue({ agentId: 'wren', sbId: 'sb-1' });
+    callerMock.mockClear().mockResolvedValue({ sbSlug: 'wren', sbId: 'sb-1' });
     // The resolver only ever returns the caller's own session; the row carries
     // its identity, which the handler now verifies before using it.
     implicitMock.mockClear().mockResolvedValue({
-      session: { id: 'sess-1', agentId: 'wren', sbId: 'sb-1' },
+      session: { id: 'sess-1', sbSlug: 'wren', sbId: 'sb-1' },
       via: 'context',
     });
     findOrCreateThreadMock.mockClear().mockResolvedValue({ id: 'thread-1', isNew: true });
@@ -303,7 +313,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc, create, update, logActivity } = composer();
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'review-600',
         baseBranch: 'main',
@@ -332,7 +342,7 @@ describe('create_studio / adopt_studio provenance', () => {
         studioId: 'studio-1',
         sessionId: 'sess-1',
         threadKey: 'pr:600',
-        agentId: 'wren',
+        sbSlug: 'wren',
         reason: 'create_studio',
       })
     );
@@ -344,7 +354,7 @@ describe('create_studio / adopt_studio provenance', () => {
       subtype: 'studio_created',
       sessionId: 'sess-1',
       sbId: 'sb-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
     });
     expect(entry.content).toContain('for pr:600');
     expect(entry.content).toContain('review PR 600');
@@ -362,7 +372,7 @@ describe('create_studio / adopt_studio provenance', () => {
       expect.anything(),
       expect.objectContaining({
         threadKey: 'pr:600',
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         participants: ['wren'],
       })
     );
@@ -370,7 +380,7 @@ describe('create_studio / adopt_studio provenance', () => {
       expect.anything(),
       expect.objectContaining({
         threadId: 'thread-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         candidateSessionId: 'sess-1',
         explicitAnchor: true,
         source: 'create_studio',
@@ -399,7 +409,7 @@ describe('create_studio / adopt_studio provenance', () => {
     update.mockRejectedValue(new Error('route update failed'));
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'noroute',
         baseBranch: 'main',
@@ -429,7 +439,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc } = composer();
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'nohome',
         baseBranch: 'main',
@@ -451,7 +461,7 @@ describe('create_studio / adopt_studio provenance', () => {
 
   it("an explicit sessionId that is not the caller's is refused before any side effect (Lumen, PR #605 P1)", async () => {
     callerMock.mockResolvedValue({
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-1',
       agentBound: true,
       contactId: null,
@@ -460,13 +470,13 @@ describe('create_studio / adopt_studio provenance', () => {
     getSession.mockResolvedValue({
       id: SESSION,
       userId: '00000000-0000-0000-0000-000000000001',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       sbId: 'other-sb',
       contactId: undefined,
     });
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'foreign',
         baseBranch: 'main',
@@ -488,7 +498,7 @@ describe('create_studio / adopt_studio provenance', () => {
 
   it('adopt_studio refuses a foreign sessionId before linking, leasing, or logging', async () => {
     callerMock.mockResolvedValue({
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-1',
       agentBound: true,
       contactId: null,
@@ -497,12 +507,12 @@ describe('create_studio / adopt_studio provenance', () => {
     getSession.mockResolvedValue({
       id: SESSION,
       userId: '00000000-0000-0000-0000-000000000001',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       sbId: 'other-sb',
       contactId: undefined,
     });
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:12' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:12' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -513,12 +523,12 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(logActivity).not.toHaveBeenCalled();
   });
 
-  it('an agentId that is not the authenticated identity is refused before any side effect (Lumen, PR #605 r2)', async () => {
+  it('an sbSlug that is not the authenticated identity is refused before any side effect (Lumen, PR #605 r2)', async () => {
     // Lumen's credential, typed as wren, naming Lumen's OWN valid session:
     // session authorization passes, and without the acting-identity check
     // wren's thread home would be stamped with Lumen's session under wren's name.
     callerMock.mockResolvedValue({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       sbId: 'sb-lumen',
       agentBound: true,
       contactId: null,
@@ -526,7 +536,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc, create, logActivity, getSession } = composer();
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'claimed',
         baseBranch: 'main',
@@ -546,16 +556,16 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(logActivity).not.toHaveBeenCalled();
   });
 
-  it('adopt_studio refuses an agentId that is not the authenticated identity', async () => {
+  it('adopt_studio refuses an sbSlug that is not the authenticated identity', async () => {
     callerMock.mockResolvedValue({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       sbId: 'sb-lumen',
       agentBound: true,
       contactId: null,
     });
     const { dc, linkSession, logActivity, getSession } = composer();
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:13' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:13' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -571,18 +581,18 @@ describe('create_studio / adopt_studio provenance', () => {
   it("a user token acting as wren may not name another agent's session as the creator (explicit mismatch)", async () => {
     // Same-user authorization passes for a user token; the session is still
     // lumen's, and the thread home would be written under wren's key.
-    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    callerMock.mockResolvedValue({ sbSlug: 'wren', agentBound: false });
     const { dc, create, logActivity, getSession } = composer();
     getSession.mockResolvedValue({
       id: SESSION,
       userId: '00000000-0000-0000-0000-000000000001',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       sbId: 'sb-lumen',
       contactId: undefined,
     });
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'mismatch',
         baseBranch: 'main',
@@ -603,17 +613,17 @@ describe('create_studio / adopt_studio provenance', () => {
   });
 
   it('adopt_studio: the same explicit mismatch is refused before linking', async () => {
-    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    callerMock.mockResolvedValue({ sbSlug: 'wren', agentBound: false });
     const { dc, linkSession, logActivity, getSession } = composer();
     getSession.mockResolvedValue({
       id: SESSION,
       userId: '00000000-0000-0000-0000-000000000001',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       sbId: 'sb-lumen',
       contactId: undefined,
     });
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:14' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:14' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -626,15 +636,15 @@ describe('create_studio / adopt_studio provenance', () => {
   });
 
   it("an implicit session that is not the acting identity's is not used: no creator session, lease, or home, and the response says why", async () => {
-    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    callerMock.mockResolvedValue({ sbSlug: 'wren', agentBound: false });
     implicitMock.mockResolvedValue({
-      session: { id: 'sess-lumen', agentId: 'lumen', sbId: 'sb-lumen' },
+      session: { id: 'sess-lumen', sbSlug: 'lumen', sbId: 'sb-lumen' },
       via: 'context',
     });
     const { dc, create, logActivity } = composer();
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'ambient',
         baseBranch: 'main',
@@ -650,31 +660,31 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(payload.provenance.sessionReason).toContain('belongs to agent lumen, not wren');
     expect(payload.warnings.join('\n')).toContain('identity-mismatch');
     expect(create).toHaveBeenCalledTimes(1);
-    expect(create.mock.calls[0][0]).toMatchObject({ agentId: 'wren' });
+    expect(create.mock.calls[0][0]).toMatchObject({ sbSlug: 'wren' });
     expect(create.mock.calls[0][0].sessionId).toBeUndefined();
     expect(acquireMock).not.toHaveBeenCalled();
     expect(assignMock).not.toHaveBeenCalled();
     expect(logActivity).toHaveBeenCalledTimes(1);
-    expect(logActivity.mock.calls[0][0]).toMatchObject({ agentId: 'wren' });
+    expect(logActivity.mock.calls[0][0]).toMatchObject({ sbSlug: 'wren' });
     expect(logActivity.mock.calls[0][0].sessionId).toBeUndefined();
   });
 
   it('the canonical id decides when both sides carry one: same slug, other identity, no creator session', async () => {
     // "wren" in another workspace is a different identity wearing the same name.
     callerMock.mockResolvedValue({
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-1',
       agentBound: true,
       contactId: null,
     });
     implicitMock.mockResolvedValue({
-      session: { id: 'sess-twin', agentId: 'wren', sbId: 'sb-twin' },
+      session: { id: 'sess-twin', sbSlug: 'wren', sbId: 'sb-twin' },
       via: 'lookup',
     });
     const { dc, create } = composer();
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'twin',
         baseBranch: 'main',
@@ -694,9 +704,9 @@ describe('create_studio / adopt_studio provenance', () => {
 
   it("adopt_studio refuses another agent's studio before linking, leasing, or logging", async () => {
     const { dc, findById, linkSession, logActivity, existing } = composer();
-    findById.mockResolvedValue({ ...existing, agentId: 'lumen' });
+    findById.mockResolvedValue({ ...existing, sbSlug: 'lumen' });
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:16' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:16' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -709,7 +719,7 @@ describe('create_studio / adopt_studio provenance', () => {
 
   it("create carries the credential's canonical id onto the studio row and into the lease (Lumen, PR #605 r3)", async () => {
     callerMock.mockResolvedValue({
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-1',
       agentBound: true,
       contactId: null,
@@ -717,7 +727,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc, create } = composer();
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'canon',
         baseBranch: 'main',
@@ -728,23 +738,23 @@ describe('create_studio / adopt_studio provenance', () => {
       dc
     );
     expect(JSON.parse(result.content[0].text).success).toBe(true);
-    expect(create.mock.calls[0][0]).toMatchObject({ agentId: 'wren', sbId: 'sb-1' });
+    expect(create.mock.calls[0][0]).toMatchObject({ sbSlug: 'wren', sbId: 'sb-1' });
     expect(acquireMock).toHaveBeenCalledWith(
-      expect.objectContaining({ agentId: 'wren', sbId: 'sb-1', sessionId: SESSION })
+      expect.objectContaining({ sbSlug: 'wren', sbId: 'sb-1', sessionId: SESSION })
     );
   });
 
   it('adopt_studio refuses ground owned by another identity wearing the same slug', async () => {
     callerMock.mockResolvedValue({
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-1',
       agentBound: true,
       contactId: null,
     });
     const { dc, findById, linkSession, logActivity, existing } = composer();
-    findById.mockResolvedValue({ ...existing, agentId: 'wren', sbId: 'sb-twin' });
+    findById.mockResolvedValue({ ...existing, sbSlug: 'wren', sbId: 'sb-twin' });
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:19' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:19' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -757,7 +767,7 @@ describe('create_studio / adopt_studio provenance', () => {
 
   it('a canonical owner is matched only by a canonical caller: a credential without one cannot adopt, even when the row names no slug', async () => {
     callerMock.mockResolvedValue({
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: undefined,
       agentBound: true,
       contactId: null,
@@ -766,13 +776,13 @@ describe('create_studio / adopt_studio provenance', () => {
     getSession.mockResolvedValue({
       id: SESSION,
       userId: '00000000-0000-0000-0000-000000000001',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: undefined,
       contactId: undefined,
     });
-    findById.mockResolvedValue({ ...existing, agentId: null, sbId: 'sb-1' });
+    findById.mockResolvedValue({ ...existing, sbSlug: null, sbId: 'sb-1' });
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:19' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:19' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -784,11 +794,11 @@ describe('create_studio / adopt_studio provenance', () => {
   });
 
   it("a user token is held to the slug: it may adopt the user's own studio whichever canonical id the row carries", async () => {
-    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    callerMock.mockResolvedValue({ sbSlug: 'wren', agentBound: false });
     const { dc, findById, linkSession, existing } = composer();
-    findById.mockResolvedValue({ ...existing, agentId: 'wren', sbId: 'sb-twin' });
+    findById.mockResolvedValue({ ...existing, sbSlug: 'wren', sbId: 'sb-twin' });
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:20' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:20' },
       dc
     );
     expect(JSON.parse(result.content[0].text).success).toBe(true);
@@ -801,7 +811,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc, findById, linkSession, logActivity, existing } = composer();
     findById.mockResolvedValue({ ...existing, userId: '00000000-0000-0000-0000-000000000002' });
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:16' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:16' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -814,7 +824,7 @@ describe('create_studio / adopt_studio provenance', () => {
   it('without a threadKey: a durable home studio, leased to the session itself, still logged', async () => {
     const { dc, create, update, logActivity } = composer();
     const result = await handleCreateStudio(
-      { agentId: 'wren', repoRoot, slug: 'home', baseBranch: 'main', skipGitOperations: true },
+      { sbSlug: 'wren', repoRoot, slug: 'home', baseBranch: 'main', skipGitOperations: true },
       dc
     );
     const payload = JSON.parse(result.content[0].text);
@@ -836,7 +846,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc, create } = composer();
     await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'kept',
         baseBranch: 'main',
@@ -858,7 +868,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc, logActivity } = composer();
     const result = await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'nobody',
         baseBranch: 'main',
@@ -885,7 +895,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const { dc, create } = composer();
     await handleCreateStudio(
       {
-        agentId: 'wren',
+        sbSlug: 'wren',
         repoRoot,
         slug: 'explicit',
         baseBranch: 'main',
@@ -908,7 +918,7 @@ describe('create_studio / adopt_studio provenance', () => {
     });
     const { dc, update, logActivity, linkSession } = composer();
     const result = await handleAdoptStudio(
-      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:601' },
+      { sbSlug: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:601' },
       dc
     );
     const payload = JSON.parse(result.content[0].text);

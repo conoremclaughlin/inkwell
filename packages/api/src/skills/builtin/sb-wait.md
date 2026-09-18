@@ -47,7 +47,7 @@ Run via `run_in_background` so you wake up when the response arrives:
 
 ```
 # 1. Send your message
-send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:239", ...)
+send_to_inbox(recipientSlug: "lumen", threadKey: "pr:239", ...)
 
 # 2. Hold in background
 run_in_background: sb wait --thread pr:239 --timeout 300
@@ -60,13 +60,13 @@ run_in_background: sb wait --thread pr:239 --timeout 300
 
 ## Options
 
-| Flag                   | Description                 | Default          |
-| ---------------------- | --------------------------- | ---------------- |
-| `--thread <threadKey>` | Watch a specific thread     | (watches inbox)  |
-| `--timeout <seconds>`  | Max wait time               | 300              |
-| `--interval <seconds>` | Poll frequency              | 15               |
-| `--agent <agentId>`    | Agent ID                    | from `$AGENT_ID` |
-| `--pending`            | Check pending trigger queue | off              |
+| Flag                   | Description                 | Default         |
+| ---------------------- | --------------------------- | --------------- |
+| `--thread <threadKey>` | Watch a specific thread     | (watches inbox) |
+| `--timeout <seconds>`  | Max wait time               | 300             |
+| `--interval <seconds>` | Poll frequency              | 15              |
+| `--agent <sbSlug>`     | SB slug                     | from `$SB_SLUG` |
+| `--pending`            | Check pending trigger queue | off             |
 
 ## Exit Codes
 
@@ -88,7 +88,7 @@ run_in_background: sb wait --thread pr:239 --timeout 300
 
 ```
 # Send review request → hold → wake on review → fix → re-request → hold → ...
-send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:240", ...)
+send_to_inbox(recipientSlug: "lumen", threadKey: "pr:240", ...)
 run_in_background: sb wait --thread pr:240 --timeout 300
 # ... wake up, process review ...
 # Fix issues, push, re-request

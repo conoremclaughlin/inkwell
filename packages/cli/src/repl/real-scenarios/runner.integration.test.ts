@@ -61,7 +61,7 @@ async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]
         name: 'recall',
         arguments: {
           query,
-          agentId: 'wren',
+          sbSlug: 'wren',
           includeShared: true,
           limit,
           recallMode: 'hybrid',

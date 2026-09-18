@@ -16,7 +16,7 @@ import { isAbsolute, join } from 'path';
 import { randomUUID } from 'crypto';
 import {
   readIdentityJson,
-  resolveAgentId,
+  resolveSlug,
   saveRuntimePreferences,
   type RuntimePreferences,
 } from '../backends/identity.js';
@@ -128,6 +128,9 @@ import {
   handleClientLocalTool,
   globalSignalSink,
   parseCompactContextArgs,
+  computeContextOccupancy,
+  formatContextStamp,
+  type ContextOccupancy,
   type ProviderContextMeasurement,
   type SignalSink,
   getLastSignal,
@@ -343,7 +346,7 @@ interface ChatRuntime {
 
 interface SessionSummary {
   id: string;
-  agentId?: string;
+  sbSlug?: string;
   studioId?: string;
   studioName?: string;
   status?: string;
@@ -364,13 +367,13 @@ interface ActivitySummary {
   type?: string;
   subtype?: string;
   content?: string;
-  agentId?: string;
+  sbSlug?: string;
   sessionId?: string;
   createdAt?: string;
   /** Originating platform for message activities (telegram, discord, …) */
   platform?: string;
   /** Sender from the inkmail lifecycle payload — tells own sends from inbound mechanics. */
-  fromAgentId?: string;
+  fromSlug?: string;
 }
 
 type BackendToolGateSnapshot = {
@@ -751,7 +754,7 @@ export function readProviderSampleEvent(
 export function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
   transcriptPath: string,
-  agentId?: string
+  sbSlug?: string
 ): {
   loaded: number;
   messageCount: number;
@@ -903,9 +906,7 @@ export function hydrateLedgerFromTranscript(
       // post-compaction ledger exactly.
       ledger.evictEntries(hydratedEntryIds);
       hydratedEntryIds.length = 0;
-      const summaryEntry = ledger.addEntry('system', event.summary, 'compaction-history');
-      hydratedEntryIds.push(summaryEntry.id);
-      loaded = 1;
+      loaded = 0;
       messageCount = 0;
       // Reset the visible replay too — pre-compaction turns are out of
       // context and must not appear below the cutoff divider. The kept
@@ -913,7 +914,34 @@ export function hydrateLedgerFromTranscript(
       preview.length = 0;
       compactionCollapsed = true;
       const keptEntries = Array.isArray(event.keptEntries) ? event.keptEntries : [];
-      for (const kept of keptEntries) {
+      // The summary goes where the live ledger put it, not always at the front.
+      // An oldest-N compaction removes a prefix, so its summary IS the first
+      // entry and every event written before `summaryIndex` existed means that
+      // — hence the 0 default, which replays legacy events unchanged. A
+      // ref-selected consolidation removes a named set that can start
+      // mid-ledger, and there the summary takes the first removed entry's
+      // place; replaying it at the front would hand the reattached session the
+      // same entries in a different order than it held live.
+      const summaryIndex =
+        typeof event.summaryIndex === 'number' && Number.isFinite(event.summaryIndex)
+          ? Math.max(0, Math.min(Math.floor(event.summaryIndex), keptEntries.length))
+          : 0;
+      const addSummary = (): void => {
+        const summaryEntry = ledger.addEntry(
+          'system',
+          event.summary as string,
+          'compaction-history'
+        );
+        hydratedEntryIds.push(summaryEntry.id);
+        loaded += 1;
+      };
+      // Positioned against the SERIALIZED array, not against how many entries
+      // were successfully added: `summaryIndex` indexes the kept list as it was
+      // written, and a malformed record skipped below would otherwise slide the
+      // summary one place left of where it sat.
+      for (let ki = 0; ki < keptEntries.length; ki++) {
+        if (ki === summaryIndex) addSummary();
+        const kept = keptEntries[ki];
         if (!kept || typeof kept !== 'object') continue;
         const keptRecord = kept as Record<string, unknown>;
         if (typeof keptRecord.content !== 'string') continue;
@@ -958,6 +986,11 @@ export function hydrateLedgerFromTranscript(
           );
         }
       }
+      // Consolidating the newest entries leaves no survivor after them, so the
+      // summary is last. The clamp above caps the index at keptEntries.length,
+      // which is exactly this case — and it also covers an empty kept list,
+      // where the summary is the whole ledger.
+      if (summaryIndex >= keptEntries.length) addSummary();
       continue;
     }
     if (type === 'user' && typeof event.content === 'string') {
@@ -1097,7 +1130,7 @@ export function hydrateLedgerFromTranscript(
       const argsPreview = argsJson.length > 100 ? `${argsJson.slice(0, 100)}…` : argsJson;
       pushPreview(
         'event',
-        `🛠 ${agentId ? `${agentId} · ` : ''}${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
+        `🛠 ${sbSlug ? `${sbSlug} · ` : ''}${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
         typeof event.ts === 'string' ? event.ts : undefined,
         undefined,
         eid
@@ -1134,7 +1167,7 @@ export function hydrateLedgerFromTranscript(
       continue;
     }
     if (type === 'activity' && typeof event.content === 'string') {
-      const actor = typeof event.agentId === 'string' ? event.agentId : 'system';
+      const actor = typeof event.sbSlug === 'string' ? event.sbSlug : 'system';
       const activityType = typeof event.activityType === 'string' ? event.activityType : 'activity';
       // Platform messages are real conversation: replay them as the same
       // directional message blocks the live activity poll renders, so a
@@ -1146,11 +1179,11 @@ export function hydrateLedgerFromTranscript(
         {
           type: activityType,
           subtype: typeof event.activitySubtype === 'string' ? event.activitySubtype : undefined,
-          agentId: typeof event.agentId === 'string' ? event.agentId : undefined,
+          sbSlug: typeof event.sbSlug === 'string' ? event.sbSlug : undefined,
           platform: typeof event.platform === 'string' ? event.platform : undefined,
-          fromAgentId: typeof event.fromAgentId === 'string' ? event.fromAgentId : undefined,
+          fromSlug: typeof event.fromSlug === 'string' ? event.fromSlug : undefined,
         },
-        agentId ?? actor
+        sbSlug ?? actor
       );
       const activityTs =
         typeof event.createdAt === 'string'
@@ -1508,11 +1541,7 @@ function extractInboxMessages(result: Record<string, unknown> | null | undefined
       return {
         id,
         content: String(msg.content || ''),
-        from: msg.senderAgentId
-          ? String(msg.senderAgentId)
-          : msg.from
-            ? String(msg.from)
-            : undefined,
+        from: msg.senderSlug ? String(msg.senderSlug) : msg.from ? String(msg.from) : undefined,
         subject: msg.subject ? String(msg.subject) : undefined,
         createdAt:
           typeof msg.createdAt === 'string'
@@ -1575,7 +1604,7 @@ function extractSessionSummaries(
       if (typeof id !== 'string') return undefined;
       return {
         id,
-        agentId: typeof row.agentId === 'string' ? row.agentId : undefined,
+        sbSlug: typeof row.sbSlug === 'string' ? row.sbSlug : undefined,
         studioId:
           typeof row.studioId === 'string'
             ? row.studioId
@@ -1661,6 +1690,115 @@ export function isAttachableSessionSummary(session: SessionSummary): boolean {
 }
 
 /**
+ * Does picking this row require an explicit server-side reopen?
+ *
+ * Exactly the rows the picker shows as history — the ones
+ * {@link isAttachableSessionSummary} rejects. Defined as the negation rather
+ * than as its own list of terminal markers, because two lists of "what counts
+ * as finished" would drift, and the drift would be silent: a row shown as
+ * history but not reopened resumes into a session the server still considers
+ * over, which is the exact defect this repairs.
+ */
+export function sessionNeedsReopen(session: SessionSummary): boolean {
+  return !isAttachableSessionSummary(session);
+}
+
+export interface ReopenOutcome {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * Decide whether a reopen actually took, from the row the server sent back.
+ *
+ * Pure so the decision can be tested without a server, and separate from the
+ * call so the thing being judged is the POST-STATE rather than the response
+ * envelope. `success: true` proves only that the request was accepted — a
+ * server that has never heard of `reopen` strips the unknown field, updates
+ * nothing, and answers exactly that way. The only evidence that counts is a
+ * row which now reads attachable.
+ */
+export function reopenSucceeded(session: SessionSummary | null | undefined): ReopenOutcome {
+  if (!session) return { ok: false, reason: 'the server returned no session' };
+
+  // Absence is not evidence (Lumen, r2). isAttachableSessionSummary answers
+  // "does this row carry a terminal marker", which is the right question for a
+  // LISTING, where every field is present. Here the question is "did the reopen
+  // actually happen", and a server too old to know the field answers by
+  // omitting it: an undefined endedAt reads as cleared and an absent status
+  // reads as non-terminal, so the predicate returns attachable for a row
+  // nothing touched. The response has to STATE the post-state before it can be
+  // believed — a current server always sends both, null when cleared.
+  const unreported = (['endedAt', 'status'] as const).filter((field) => !(field in session));
+  if (unreported.length > 0) {
+    return {
+      ok: false,
+      reason: `the server did not report ${unreported.join(' or ')} (an older server may not support reopen)`,
+    };
+  }
+
+  if (!isAttachableSessionSummary(session)) {
+    // Name the marker still set — "it did not work" sends the reader hunting,
+    // and the usual cause is a server predating the reopen field.
+    const stuck = session.endedAt
+      ? 'ended_at is still set'
+      : session.lifecycle === 'completed'
+        ? "lifecycle is still 'completed'"
+        : `phase/status still reads ${session.currentPhase || session.status}`;
+    return { ok: false, reason: `${stuck} (an older server may not support reopen)` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Ask the server to reopen a finished session, and verify it did.
+ */
+export async function reopenSelectedSession(
+  pcp: { callTool: (tool: string, args: Record<string, unknown>) => Promise<unknown> },
+  sbSlug: string,
+  sessionId: string
+): Promise<ReopenOutcome> {
+  let raw: unknown;
+  try {
+    raw = await pcp.callTool('update_session_state', {
+      sbSlug,
+      sessionId,
+      reopen: true,
+      // Idle, not running: they are back at the prompt, and the on-prompt hook
+      // marks running when they actually type.
+      lifecycle: 'idle',
+    });
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+
+  const payload = raw as { success?: boolean; error?: string; session?: SessionSummary } | null;
+  if (payload?.success === false) {
+    return { ok: false, reason: payload.error || 'the server rejected the reopen' };
+  }
+  return reopenSucceeded(payload?.session);
+}
+
+/**
+ * Union of the attachable list and full history for the interactive picker.
+ *
+ * Sessions are chat history — always resumable unless deleted — so the
+ * picker shows finished ones too. The two lists stay separate fetches so a
+ * flood of completed rows can never push a live session past the history
+ * call's row limit (the limit-before-filter defect from PR #532 r2):
+ * attachable rows are guaranteed a seat first, history fills in around them.
+ * Auto-attach paths keep using the attachable list alone — a non-interactive
+ * launch should never silently resume a finished session.
+ */
+export function mergeSessionsWithHistory(
+  attachable: SessionSummary[],
+  history: SessionSummary[]
+): SessionSummary[] {
+  const seen = new Set(attachable.map((session) => session.id));
+  return [...attachable, ...history.filter((session) => !seen.has(session.id))];
+}
+
+/**
  * List the sessions this agent could attach to.
  *
  * Asks for `status: 'attachable'` so the server excludes finished sessions
@@ -1720,9 +1858,9 @@ function extractActivitySummaries(
         type: typeof row.type === 'string' ? row.type : undefined,
         subtype: typeof row.subtype === 'string' ? row.subtype : undefined,
         content: typeof row.content === 'string' ? row.content : undefined,
-        agentId:
-          typeof row.agentId === 'string'
-            ? row.agentId
+        sbSlug:
+          typeof row.sbSlug === 'string'
+            ? row.sbSlug
             : typeof row.agent_id === 'string'
               ? row.agent_id
               : undefined,
@@ -1739,11 +1877,9 @@ function extractActivitySummaries(
               ? row.created_at
               : undefined,
         platform: typeof row.platform === 'string' ? row.platform : undefined,
-        fromAgentId: (() => {
+        fromSlug: (() => {
           const payload = row.payload as Record<string, unknown> | undefined;
-          return payload && typeof payload.fromAgentId === 'string'
-            ? payload.fromAgentId
-            : undefined;
+          return payload && typeof payload.fromSlug === 'string' ? payload.fromSlug : undefined;
         })(),
       };
     })
@@ -2088,13 +2224,13 @@ function sessionHistoryLabel(meta: SessionTranscriptMetadata | null): string {
 }
 
 function sessionLatestMessagePreview(
-  session: Pick<SessionSummary, 'agentId'>,
+  session: Pick<SessionSummary, 'sbSlug'>,
   meta: SessionTranscriptMetadata | null
 ): string | null {
   if (!meta?.lastMessagePreview) return null;
   const speaker =
     meta.lastMessageRole === 'assistant'
-      ? session.agentId || 'assistant'
+      ? session.sbSlug || 'assistant'
       : meta.lastMessageRole === 'inbox'
         ? 'inbox'
         : 'you';
@@ -2119,7 +2255,7 @@ function formatSessionsLines(
   for (const session of sessions) {
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const id = session.id.slice(0, 7).padEnd(7);
-    const agent = (session.agentId || '-').slice(0, 6).padEnd(6);
+    const agent = (session.sbSlug || '-').slice(0, 6).padEnd(6);
     const status = (session.currentPhase || session.status || '-').slice(0, 22).padEnd(22);
     const studio = sessionStudioLabel(session, 'short').slice(0, 16).padEnd(16);
     const thread = (session.threadKey || '-').slice(0, 12).padEnd(12);
@@ -2273,7 +2409,7 @@ function inboxMessageMatchesSessionScope(runtime: ChatRuntime, message: InboxMes
 function filterSessionsByPolicy(
   sessions: SessionSummary[],
   runtime: ChatRuntime,
-  agentId: string,
+  sbSlug: string,
   toolPolicy: ToolPolicyState,
   action: 'list' | 'attach'
 ): SessionSummary[] {
@@ -2285,13 +2421,13 @@ function filterSessionsByPolicy(
           sessionId: runtime.sessionId,
           threadKey: runtime.threadKey,
           studioId: runtime.studioId,
-          agentId,
+          sbSlug,
         },
         target: {
           sessionId: session.id,
           threadKey: session.threadKey,
           studioId: session.studioId,
-          agentId: session.agentId,
+          sbSlug: session.sbSlug,
         },
       }).allowed
   );
@@ -2314,7 +2450,7 @@ function buildAutoRunPromptFromInbox(runtime: ChatRuntime, message: InboxMessage
 
 function matchesAttachQuery(session: SessionSummary, query?: string): boolean {
   if (!query) return true;
-  const haystack = `${session.id} ${session.agentId || ''} ${session.threadKey || ''} ${
+  const haystack = `${session.id} ${session.sbSlug || ''} ${session.threadKey || ''} ${
     session.currentPhase || session.status || ''
   } ${session.backend || ''} ${session.model || ''} ${session.backendSessionId || session.claudeSessionId || ''} ${
     session.studioId || ''
@@ -2627,7 +2763,7 @@ export function failIfBootstrapRequired(
   process.exit(78); // EX_CONFIG — the environment is wrong, not the request
 }
 
-function formatBootstrapContext(result: Record<string, unknown>, agentId: string): string {
+function formatBootstrapContext(result: Record<string, unknown>, sbSlug: string): string {
   const sections: string[] = [];
 
   // Identity files — the core of who the agent is
@@ -3184,11 +3320,103 @@ export function spawnDialogueText(
   return guarded.imitationDiscarded ? spawnSaid.slice(0, guarded.frameIndex ?? 0) : spawnSaid;
 }
 
+/**
+ * The occupancy a turn reasons with — for the hooks that gate on it and for
+ * the stamp the agent reads.
+ *
+ * This was `ledger.totalTokens() / (maxContextTokens - bootstrapReserve)` at
+ * both fire sites: the ledger estimate, which is the number task 480b76f7
+ * exists to stop us acting on. Measured on myra session 64e1eb49 the estimate
+ * read 131,071 against a provider measurement of 383,046 — so a monitor armed
+ * at 80% would not have fired until the real window was long past full, and
+ * the passive-recall ceiling that suppresses injection above 80% was reading
+ * the same wrong number. Both behaviours were calibrated against a figure
+ * roughly 2.9x below the truth.
+ *
+ * Exported so the wiring is testable without standing up a turn: a test that
+ * only checks the hook's reaction to a supplied utilization cannot see which
+ * number the caller computed.
+ */
+export function turnContextOccupancy(
+  ledger: ContextLedger,
+  runtime: ChatRuntime,
+  measured: ProviderContextMeasurement | undefined
+): ContextOccupancy {
+  return computeContextOccupancy(
+    ledger.totalTokens(),
+    runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
+    runtime.maxContextTokens,
+    measured
+  );
+}
+
+/**
+ * The turn body sent to a RESUMED native session: the delta only, because the
+ * session already holds the history.
+ *
+ * Extracted so the stamp's presence on this path is testable. The envelope path
+ * is the easy one to get right and the easy one to test; this is the path a
+ * long-running bridge session actually takes, turn after turn, and the seat
+ * where nobody is watching (task 480b76f7, acceptance 1).
+ */
+export function buildDeltaPrompt(
+  contextStamp: string | undefined,
+  recallDelta: string,
+  userMessage: string
+): string {
+  return [contextStamp, recallDelta, userMessage].filter(Boolean).join('\n\n');
+}
+
+/**
+ * The body of a TOOL-LOOP CONTINUATION, for each of the three ways one reaches
+ * the provider.
+ *
+ * All three carried no stamp at all until Lumen's #639 review: `resume` sent
+ * the bare tool result, and `seed`/`stateless` called buildPromptEnvelope
+ * without its stamp argument. That left the stamp on the outer opening only —
+ * which is the one request per turn where it is LEAST informative. The provider
+ * measurement for a turn is sampled from each spawn's usage AFTER that spawn
+ * returns, so a fresh run's opening stamp has no measurement to report
+ * (`splitKnown: false`); by the first continuation there is one. A headless run
+ * that does all its work inside one turn's tool loop could therefore finish
+ * without ever seeing a provider-backed reading of its own window.
+ *
+ * So the caller regenerates the stamp per continuation rather than threading
+ * the opening's down: a stamp recomputed after the last spawn is the point of
+ * the thing, and a stale one is what the envelope path already taught us to
+ * avoid.
+ *
+ * Extracted and pure for the same reason buildDeltaPrompt is — the wiring is
+ * the part that was wrong, and a test of the selection logic has to be able to
+ * reach it without standing up a backend.
+ */
+export function buildContinuationPrompt(
+  mode: 'resume' | 'seed' | 'stateless',
+  contextStamp: string | undefined,
+  body: string,
+  renderEnvelope: (promptBody: string, stamp: string | undefined) => string,
+  renderReseedBody: () => string
+): string {
+  if (mode === 'resume') {
+    // The live session already holds the transcript; the stamp is the only
+    // thing it cannot have, since it describes the window as of right now.
+    return buildDeltaPrompt(contextStamp, '', body);
+  }
+  return renderEnvelope(mode === 'seed' ? renderReseedBody() : body, contextStamp);
+}
+
 export function buildPromptEnvelope(
-  agentId: string,
+  sbSlug: string,
   runtime: ChatRuntime,
   ledger: ContextLedger,
-  userMessage: string
+  userMessage: string,
+  /**
+   * Rendered immediately before the latest user message so it is the freshest
+   * thing in the envelope. Deliberately NOT part of envelopeShapeKey — it
+   * changes every turn, and treating it as envelope shape would invalidate and
+   * reseed the native session on each one.
+   */
+  contextStamp?: string
 ): string {
   // Reserve bootstrap context budget (not counted against transcript budget)
   const bootstrapTokens = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
@@ -3213,7 +3441,7 @@ export function buildPromptEnvelope(
     // this is. `ink awaken` runs under the placeholder agent id `nascent`;
     // asserting "You are nascent." here would contradict the system prompt
     // that is, at that moment, telling them they do not have a name yet.
-    runtime.systemPromptOverride ? '' : `You are ${agentId}.`,
+    runtime.systemPromptOverride ? '' : `You are ${sbSlug}.`,
     'You are running inside ink chat (first-class Ink REPL).',
     'Answer in plain text. Be concise but complete.',
     `Current backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}.`,
@@ -3236,6 +3464,7 @@ export function buildPromptEnvelope(
       ? `\nSkill instructions:${renderActiveSkills(runtime.activeSkills)}`
       : '',
     '',
+    contextStamp ?? '',
     'Latest user message:',
     userMessage,
   ]
@@ -3272,7 +3501,7 @@ export function envelopeShapeKey(runtime: ChatRuntime): string {
     runtime.threadKey ?? '',
     runtime.activeSkills.map((s) => s.name).join(','),
     runtime.bootstrapContext ?? '',
-    // Gates the "You are <agentId>." line. Fixed for the session's lifetime
+    // Gates the "You are <sbSlug>." line. Fixed for the session's lifetime
     // (set from --system-prompt-file at startup, never mutated), so it cannot
     // actually drift — included to keep this in sync with every static field
     // buildPromptEnvelope renders, as the contract above requires.
@@ -3313,11 +3542,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     divertConsoleLogToStderr();
   }
 
-  const resolvedAgentId = resolveAgentId(options.agent);
-  if (!resolvedAgentId) {
+  const resolvedSlug = resolveSlug(options.agent);
+  if (!resolvedSlug) {
     throw new Error('Could not resolve agent identity. Run `ink init` or pass `--agent <id>`.');
   }
-  const agentId: string = resolvedAgentId;
+  const sbSlug: string = resolvedSlug;
   const identity = readIdentityJson(process.cwd());
   // x-ink-context on every ink-routed tool call: the server validates the
   // named session against the authenticated user and enriches request
@@ -3335,7 +3564,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       encodeContextToken({
         sessionId: currentPcpSessionId() || '',
         studioId: currentPcpStudioId() || 'main',
-        agentId,
+        sbSlug,
         cliAttached: !options.nonInteractive && !options.message,
         runtime: 'ink',
       }),
@@ -3506,7 +3735,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     policyPathFromEnv ? { policyPath: policyPathFromEnv } : undefined
   );
   toolPolicy.setContext({
-    agentId,
+    sbSlug,
     studioId: runtime.studioId,
   });
   if (runtime.studioId) {
@@ -3538,23 +3767,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // so the JSON stays machine-parseable, and before the TUI so a TTY-less
   // invocation exits instead of blocking on stdin forever.
   if (options.sessionCandidates || options.sessionCandidatesJson) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        sbSlug,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { sbSlug, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
     const attachable = extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary);
-    const sessions = filterSessionsByPolicy(attachable, runtime, agentId, toolPolicy, 'attach');
+    const sessions = filterSessionsByPolicy(
+      mergeSessionsWithHistory(attachable, extractSessionSummaries(historyResult)),
+      runtime,
+      sbSlug,
+      toolPolicy,
+      'attach'
+    );
     const candidates = sessions.map((session) => ({
       type: 'pcp' as const,
       id: session.id,
-      agentId: session.agentId || null,
+      sbSlug: session.sbSlug || null,
       backend: session.backend || 'ink',
       phase: session.currentPhase || session.status || null,
       lifecycle: session.lifecycle || null,
       threadKey: session.threadKey || null,
       studioName: session.studioName || null,
       startedAt: session.startedAt || null,
+      attachable: isAttachableSessionSummary(session),
     }));
     if (options.sessionCandidatesJson) {
       restoreConsoleLog();
@@ -3562,7 +3803,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         JSON.stringify(
           {
             backend: 'ink',
-            agentId,
+            sbSlug,
             pcpAvailable: sessionsResult !== null,
             counts: { pcp: candidates.length },
             candidates: [{ type: 'new' as const }, ...candidates],
@@ -3572,12 +3813,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         )
       );
     } else {
-      console.log(chalk.bold(`\nInk session candidates for ${agentId}:`));
+      console.log(chalk.bold(`\nInk session candidates for ${sbSlug}:`));
       console.log(chalk.dim('  new — start a new session'));
       for (const candidate of candidates) {
         const bits = [
           candidate.id.slice(0, 8),
-          candidate.agentId || '-',
+          candidate.sbSlug || '-',
           candidate.phase || '-',
           candidate.threadKey || '-',
           candidate.studioName || '-',
@@ -3585,7 +3826,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         console.log(`  ${bits.join('  ·  ')}`);
       }
       if (candidates.length === 0) {
-        console.log(chalk.dim('  (no attachable ink sessions)'));
+        console.log(chalk.dim('  (no ink sessions)'));
       }
     }
     return;
@@ -3678,7 +3919,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // and removes from promptTools at all scopes so the tool stops prompting.
           const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
           const scopeId =
-            grantScope === 'studio' ? target.getContext()?.studioId : target.getContext()?.agentId;
+            grantScope === 'studio' ? target.getContext()?.studioId : target.getContext()?.sbSlug;
           if (scopeId) {
             target.persistentGrant(tool, { scope: grantScope, id: scopeId });
             printLine(
@@ -3900,7 +4141,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       inkRepl.addMessage(
         'assistant',
         line.text,
-        line.continuation ? { continuation: true } : { label: agentId }
+        line.continuation ? { continuation: true } : { label: sbSlug }
       );
     }
   };
@@ -3993,7 +4234,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (evt.kind === 'tool-use') {
       // Surface the call in the live feed as the agent's own — one dim line,
       // same shape as the replay's 🛠 rows.
-      printEvent(chalk.dim(`🛠 ${agentId} · ${evt.name} …`));
+      printEvent(chalk.dim(`🛠 ${sbSlug} · ${evt.name} …`));
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_tool',
         name: evt.name,
@@ -4097,7 +4338,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       try {
         const result = await pcp.callTool('recall', {
           query,
-          agentId,
+          sbSlug,
           includeShared: true,
           limit,
           recallMode: 'hybrid',
@@ -4192,7 +4433,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const bootstrapResult = identitySuppliedByCaller
     ? ({} as Record<string, unknown>)
     : ((await pcp
-        .callTool('bootstrap', { agentId })
+        .callTool('bootstrap', { sbSlug })
         .catch((error) => ({ error: String(error) }))) as Record<string, unknown>);
 
   if (identitySuppliedByCaller) {
@@ -4216,7 +4457,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // Format and inject the full bootstrap context into the prompt envelope.
     // This is what gives the backend its identity, values, and memories.
-    const ctx = formatBootstrapContext(bootstrapResult, agentId);
+    const ctx = formatBootstrapContext(bootstrapResult, sbSlug);
     if (!ctx) {
       // Bootstrap answered, but with nothing to render. Same outcome as a
       // failed call for our purposes: this session has no identity context.
@@ -4247,7 +4488,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     ledger.addEntry(
       'system',
-      `Bootstrapped as ${agentId}${timezone ? ` (${String(timezone)})` : ''}${
+      `Bootstrapped as ${sbSlug}${timezone ? ` (${String(timezone)})` : ''}${
         suggestion ? `. ${String(suggestion)}` : ''
       }`,
       'bootstrap'
@@ -4261,7 +4502,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const attachLatestQuery =
       typeof options.attachLatest === 'string' ? options.attachLatest.trim() : undefined;
     const query = attachLatestQuery || attachQuery;
-    const listed = await listAttachableSessions(pcp, { agentId, limit: 50 });
+    const listed = await listAttachableSessions(pcp, { sbSlug, limit: 50 });
     const sessionsResult: Record<string, unknown> = listed ?? {
       error: 'could not fetch attachable sessions',
     };
@@ -4279,7 +4520,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const sessions = filterSessionsByPolicy(
         extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
         runtime,
-        agentId,
+        sbSlug,
         toolPolicy,
         'attach'
       );
@@ -4301,7 +4542,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         runtime.threadKey = selected.threadKey;
       }
       toolPolicy.setContext({
-        agentId,
+        sbSlug,
         studioId: runtime.studioId,
       });
       const currentScope = toolPolicy.getMutationScope();
@@ -4319,15 +4560,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !options.attachLatest &&
     !runtime.threadKey
   ) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        sbSlug,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { sbSlug, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
+    const attachableSessions = extractSessionSummaries(sessionsResult).filter(
+      isAttachableSessionSummary
+    );
     const sessions = filterSessionsByPolicy(
-      extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
+      mergeSessionsWithHistory(attachableSessions, extractSessionSummaries(historyResult)),
       runtime,
-      agentId,
+      sbSlug,
       toolPolicy,
       'attach'
     );
@@ -4379,13 +4628,54 @@ export async function runChat(options: ChatOptions): Promise<void> {
         if (selected) {
           attachedSessionSummary = selected;
           runtime.sessionId = selected.id;
+          // A human just chose a FINISHED session out of their history, so it
+          // is not finished any more. Sent here, at the selection, because the
+          // selection is what caused it — the previous behaviour leaned on the
+          // next incidental `update_session_state`, and that call sends
+          // `status: 'active'`, which is and always was a server-side no-op.
+          // The row stayed terminal with `ended_at` set while the chat
+          // generated, invisible to attachable listing, active lookup and
+          // findByThreadKey — so a trigger could open a SECOND session on the
+          // thread the human was already typing into (Lumen, PR #541).
+          //
+          // Only the interactive picker reaches this. Auto-attach filters to
+          // attachable rows before choosing, so it can never revive anything,
+          // and the terminal fence automatic routing relies on stays intact.
+          if (sessionNeedsReopen(selected)) {
+            // FAIL CLOSED. The previous version swallowed everything with
+            // `.catch(() => undefined)` and carried on, which is the failure
+            // this PR exists to remove wearing a different coat: a reopen that
+            // errors, or that lands on a server too old to know the flag and
+            // returns a cheerful success without doing anything, would leave
+            // the human typing into a session the server still considers over
+            // — the exact silent resume-into-a-terminal-row we started from.
+            //
+            // So the RESULT is checked, not the absence of an exception, and
+            // the post-state is checked rather than the acknowledgement: an old
+            // server ignoring an unknown field still answers `success: true`.
+            // Only a row that actually comes back attachable counts.
+            const reopened = await reopenSelectedSession(pcp, sbSlug, selected.id);
+            if (!reopened.ok) {
+              console.log(
+                chalk.yellow(
+                  `Could not reopen session ${selected.id.slice(0, 8)} — ${reopened.reason}`
+                )
+              );
+              console.log(
+                chalk.dim(
+                  '  Not attaching: the server still lists it as finished, so a trigger could open a second session on this thread.'
+                )
+              );
+              return;
+            }
+          }
           if (selected.studioId) {
             runtime.studioId = selected.studioId;
           }
           if (!runtime.threadKey && selected.threadKey) {
             runtime.threadKey = selected.threadKey;
           }
-          toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+          toolPolicy.setContext({ sbSlug, studioId: runtime.studioId });
           const currentScope = toolPolicy.getMutationScope();
           if (currentScope.scope !== 'global') {
             toolPolicy.setMutationScope(currentScope.scope);
@@ -4395,8 +4685,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       // picked === null means "New session" — fall through to create one
     } else {
-      // Non-interactive or no sessions — auto-attach to latest (existing behavior)
-      const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
+      // Non-interactive or no sessions — auto-attach to latest. Filters back
+      // to attachable: history rows are for the human picker; a headless
+      // launch must not silently resume a finished session.
+      const selected = pickLatestSession(sessions.filter(isAttachableSessionSummary), undefined, {
+        studioId: runtime.studioId,
+      });
       if (selected) {
         attachedSessionSummary = selected;
         runtime.sessionId = selected.id;
@@ -4407,7 +4701,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runtime.threadKey = selected.threadKey;
         }
         autoAttachedLatest = true;
-        toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+        toolPolicy.setContext({ sbSlug, studioId: runtime.studioId });
         const currentScope = toolPolicy.getMutationScope();
         if (currentScope.scope !== 'global') {
           toolPolicy.setMutationScope(currentScope.scope);
@@ -4420,7 +4714,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const attachedToExistingSession = Boolean(runtime.sessionId);
   if (!runtime.sessionId) {
     const startArgs: Record<string, unknown> = {
-      agentId,
+      sbSlug,
       backend: 'ink',
       metadata: { provider: runtime.backend },
     };
@@ -4438,7 +4732,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   if (attachedToExistingSession && runtime.sessionId && !attachedSessionSummary) {
     const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, status: 'active', limit: 80 })
+      .callTool('list_sessions', { sbSlug, status: 'active', limit: 80 })
       .catch(() => null)) as Record<string, unknown> | null;
     attachedSessionSummary = extractSessionSummaries(sessionsResult).find(
       (session) => session.id === runtime.sessionId
@@ -4536,7 +4830,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
-    const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, agentId);
+    const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, sbSlug);
     if (hydrated.providerSample) {
       // Replayed under the scope it was taken in; measurement() decides
       // whether that is still the live window.
@@ -4634,7 +4928,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   appendTranscript(runtime.transcriptPath, {
     type: attachedToExistingSession ? 'session_attach' : 'session_start',
-    agentId,
+    sbSlug,
     backend: runtime.backend,
     model: runtime.model || null,
     threadKey: runtime.threadKey || null,
@@ -4648,7 +4942,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
       .callTool('update_session_state', {
-        agentId,
+        sbSlug,
         sessionId: runtime.sessionId,
         phase: 'investigating',
         status: 'active',
@@ -4879,7 +5173,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     attachedSessionSummary?.studioName ||
     (identity?.studioId ? formatStudioForDisplay(identity.studioId, 'short') : undefined);
   const bannerParts = [
-    chip('inkling', agentId, chalk.cyan),
+    chip('inkling', sbSlug, chalk.cyan),
     chip('backend', 'ink', chalk.yellow),
     chip('provider', runtime.backend, chalk.yellow),
     studioSlug ? chip('studio', studioSlug, chalk.cyan) : null,
@@ -4918,7 +5212,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     sessionsCache = filterSessionsByPolicy(
       extractSessionSummaries(result),
       runtime,
-      agentId,
+      sbSlug,
       toolPolicy,
       'list'
     );
@@ -5048,6 +5342,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     actor: 'system' | 'sb';
     summaryText?: string;
     keepRecent?: number;
+    /** A named set to replace, instead of the oldest run. See CompactionRequest. */
+    entryIds?: readonly number[];
     /** The turn's cancellation — aborts a running summarizer spawn. */
     signal?: AbortSignal;
   }): Promise<CompactionOutcome> => {
@@ -5062,7 +5358,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // spawn (it used to run on to its idle timeout).
           const summarizer = startBackendTurn({
             backend: runtime.backend,
-            agentId,
+            sbSlug,
             model: runtime.model,
             effort: runtime.effort,
             prompt: buildCompactionPrompt(chunk),
@@ -5104,16 +5400,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
         log: (line) => printEvent(chalk.yellow(`  ⛁ ${line}`)),
       });
       if (outcome.ok) {
-        // Cutoff divider: everything above this line in the scrollback is
-        // now out of the context window (replaced by the summary).
-        printEvent(
-          renderContextCutoff(
-            // Live pre-mutation total, as the result reports it — the
-            // wrapper's own pre-await snapshot showed "10K → 11K (freed 1K)"
-            // when entries arrived during summarization (Lumen, PR #578 round 4).
-            `compacted ${outcome.removed} entries · ${formatTokenCount(outcome.before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`
-          )
-        );
+        // Live pre-mutation total, as the result reports it — the wrapper's own
+        // pre-await snapshot showed "10K → 11K (freed 1K)" when entries arrived
+        // during summarization (Lumen, PR #578 round 4).
+        const sizes = `${formatTokenCount(outcome.before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`;
+        if (opts.entryIds !== undefined) {
+          // NOT a cutoff divider. That line means "everything above is out of
+          // the window", which is true of an oldest-N compaction and false of a
+          // consolidation: the replaced set can start mid-ledger, and entries
+          // above it are still in context. Drawing the divider here would
+          // report a larger loss than happened.
+          printEvent(
+            chalk.yellow(`  ⛁ consolidated ${outcome.removed} selected entries · ${sizes}`)
+          );
+        } else {
+          // Cutoff divider: everything above this line in the scrollback is
+          // now out of the context window (replaced by the summary).
+          printEvent(renderContextCutoff(`compacted ${outcome.removed} entries · ${sizes}`));
+        }
         // ink just rolled the ledger — roll the provider session too so the
         // next spawn seeds a fresh native session with the summary (we compact
         // before the provider ever would). Mid-turn, the next continuation
@@ -5210,11 +5514,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
     });
     const parsed = parseCompactContextArgs(args);
     if ('error' in parsed) return asResult({ success: false, error: parsed.error }, true);
+    // Refs resolve against the LIVE ledger, here, at call time. A ref is a
+    // content hash, so one captured before an earlier eviction names the same
+    // content or nothing at all — never a neighbour that inherited its
+    // position (#570, #582). Resolution happens before the summarizer runs;
+    // runCompaction then fixes the set by id, so appends during the await
+    // survive rather than shifting the selection.
+    const entryIds =
+      parsed.refs !== undefined
+        ? ledger.findEntriesByRefs(parsed.refs.map((hash) => ({ hash })))
+        : undefined;
+    if (entryIds !== undefined && entryIds.length === 0) {
+      return asResult(
+        {
+          success: false,
+          error:
+            'none of those refs match an entry in the context right now — they may already have been evicted or consolidated. Call list_context for current refs.',
+        },
+        true
+      );
+    }
     const outcome = await compactContextNow({
-      reason: parsed.summary ? 'agent: own summary' : 'agent: runtime summary',
+      reason: parsed.refs
+        ? 'agent: consolidate selected entries'
+        : parsed.summary
+          ? 'agent: own summary'
+          : 'agent: runtime summary',
       actor: 'sb',
       summaryText: parsed.summary,
       keepRecent: parsed.keepRecent,
+      entryIds,
       signal: ctx?.signal,
     });
     if (!outcome.ok) return asResult({ success: false, error: outcome.error }, true);
@@ -5224,8 +5553,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
       tokensFreed: outcome.freedTokens,
       summaryTokens: outcome.summaryTokens,
       totalAfter: outcome.totalAfter,
-      keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
-      note: 'Your context now starts from the summary; the provider session is re-seeded from it on the next spawn. Continue from here.',
+      ...(parsed.refs !== undefined
+        ? {
+            requestedRefs: parsed.refs.length,
+            matchedEntries: entryIds?.length ?? 0,
+            summaryIndex: outcome.summaryIndex,
+            // The ledger figure, and only the ledger figure. A tool result
+            // enters the ledger as a stub while the provider read the whole
+            // payload, so tokensFreed understates what the reseed actually
+            // drops — reporting it as window reclaimed would be a number
+            // nobody measured (task 44f2783e, acceptance 2).
+            note: 'Those entries are replaced by your summary, in their place — the rest of the context is untouched. tokensFreed counts LEDGER tokens; what the window actually reclaims is decided by the re-seed on the next spawn and is not measured here.',
+          }
+        : {
+            keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+            note: 'Your context now starts from the summary; the provider session is re-seeded from it on the next spawn. Continue from here.',
+          }),
     });
   };
 
@@ -5242,7 +5585,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     force: boolean
   ): Promise<{ freshCount: number; autoRunMessages: InboxMessage[] }> => {
     const inboxResult = (await pcp
-      .callTool('get_inbox', { agentId, status: 'unread', limit: 10 })
+      .callTool('get_inbox', { sbSlug, status: 'unread', limit: 10 })
       .catch(() => null)) as Record<string, unknown> | null;
     const messages = extractInboxMessages(inboxResult);
     const fresh = messages
@@ -5256,13 +5599,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              agentId,
+              sbSlug,
             },
             target: {
               sessionId: msg.relatedSessionId,
               threadKey: msg.threadKey,
               studioId: msg.recipientStudioId,
-              agentId,
+              sbSlug,
             },
           }).allowed
       )
@@ -5394,7 +5737,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           delegationLabel = ' [delegation:unverified:no-secret]';
         } else {
           const verified = verifyDelegationToken(msg.delegationToken, secret, {
-            expectedDelegateeAgentId: agentId,
+            expectedDelegateeSlug: sbSlug,
             expectedThreadKey: runtime.threadKey ?? undefined,
           });
           if (verified.valid && verified.payload) {
@@ -5439,7 +5782,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         runtime.autoRunInbox &&
         readyForAutoRun &&
         enqueueAutoRunFromInbox &&
-        (msg.from || '').toLowerCase() !== agentId.toLowerCase() &&
+        (msg.from || '').toLowerCase() !== sbSlug.toLowerCase() &&
         msg.messageType !== 'notification' &&
         msg.content.trim().length > 0;
 
@@ -5486,7 +5829,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const collectActivity = async (force: boolean): Promise<number> => {
     const activityResult = (await pcp
       .callTool('get_activity', {
-        agentId,
+        sbSlug,
         limit: 40,
         since: activitySince,
       })
@@ -5507,13 +5850,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              agentId,
+              sbSlug,
             },
             target: {
               sessionId: activity.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              agentId: activity.agentId,
+              sbSlug: activity.sbSlug,
             },
           }).allowed
       )
@@ -5541,7 +5884,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         inkmail_fail: 'mail failed',
       };
       const type = ACTIVITY_LABELS[rawType] || rawType;
-      const actor = activity.agentId || 'system';
+      const actor = activity.sbSlug || 'system';
       const preview = (activity.content || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
       const rendered = `⚡ ${actor} ${type}${preview ? ` — ${preview}` : ''}`;
 
@@ -5549,13 +5892,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // proper message blocks; the agent's own mechanics (tools, state,
       // backend turn lifecycle) are dim event lines; everything else stays
       // a ⚡ activity block.
-      const plan = classifyActivity(activity, agentId);
+      const plan = classifyActivity(activity, sbSlug);
       const activityEid = appendTranscript(runtime.transcriptPath, {
         type: 'activity',
         activityId: activity.id,
         activityType: activity.type || null,
         activitySubtype: activity.subtype || null,
-        agentId: activity.agentId || null,
+        sbSlug: activity.sbSlug || null,
         sessionId: activity.sessionId || null,
         createdAt: activity.createdAt || null,
         content: activity.content || null,
@@ -5563,7 +5906,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // directional message label (📤 myra → telegram) and to tell own
         // inkmail sends from inbound delivery mechanics.
         platform: activity.platform || null,
-        fromAgentId: activity.fromAgentId || null,
+        fromSlug: activity.fromSlug || null,
       });
       // Platform messages carry replay metadata so their message-block
       // rendering survives compaction (the kept tail serializes ledger
@@ -5747,7 +6090,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       sessionArgs: Record<string, string> = {}
     ): BackendRunRequest => ({
       backend: cloneBackend,
-      agentId,
+      sbSlug,
       model: cloneModel,
       effort: runtime.effort,
       prompt,
@@ -5965,7 +6308,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!record || !runtime.sessionId) return;
     void pcp
       .callTool('log_activity', {
-        agentId,
+        sbSlug,
         type: status === 'completed' ? 'agent_complete' : 'error',
         subtype: 'shadow_clone',
         content: `🌀 ${record.id} (${record.label}) — ${status}`,
@@ -6455,7 +6798,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (result.status === 'blocked' || result.status === 'denied') {
             const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
             printEvent(
-              chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
+              chalk.yellow(`🛠 ${sbSlug} · ${result.tool} (${result.status}) — ${result.reason}`)
             );
             appendTranscript(runtime.transcriptPath, {
               type: 'local_tool_call',
@@ -6501,7 +6844,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                   : '';
                 printEvent(
                   chalk.dim(
-                    `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
+                    `📋 ${sbSlug} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
                       sources ? ` · ${sources}` : ''
                     }`
                   )
@@ -6534,7 +6877,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               const resultPreview = compactForLedger(resultJson, 160);
               printEvent(
                 chalk.dim(
-                  `🛠 ${agentId} · ${result.tool} (${result.status})${
+                  `🛠 ${sbSlug} · ${result.tool} (${result.status})${
                     resultPreview ? ` — ${resultPreview}` : ''
                   }`
                 )
@@ -6574,7 +6917,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const msg = `Local tool error (${result.tool}): ${result.error}`;
             printEvent(
               chalk.red(
-                `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
+                `🛠 ${sbSlug} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
               )
             );
             appendTranscript(runtime.transcriptPath, {
@@ -6649,7 +6992,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (runtime.sessionId && !options.nonInteractive) {
       await pcp
         .callTool('update_session_state', {
-          agentId,
+          sbSlug,
           sessionId: runtime.sessionId,
           phase: 'implementing',
           status: 'active',
@@ -6663,20 +7006,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await maybeCompactContext('pre-turn budget check');
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
-    // Budget utilization must account for bootstrap tokens — the ledger only
-    // holds transcript, but bootstrap is reserved from the total budget.
-    const bootstrapReserve = runtime.bootstrapContext
-      ? estimateTokens(runtime.bootstrapContext)
-      : 0;
-    const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
+    // Occupancy comes from turnContextOccupancy, which prefers the provider's
+    // own measurement over ink's estimate. The estimate cannot see the identity
+    // envelope or what a resumed native session accumulated, and every hook
+    // gating on this number — the budget monitor, the passive-recall ceiling —
+    // was calibrated against it.
+    const turnOccupancy = turnContextOccupancy(ledger, runtime, providerContextMeasurement());
+    const contextStamp = formatContextStamp(turnOccupancy);
 
     const promptHookResult = await hookRegistry.fire('prompt_build', {
       ledger,
       runtime: {
         sessionId: runtime.sessionId,
-        agentId,
+        sbSlug,
         backend: runtime.backend,
-        budgetUtilization: ledger.totalTokens() / effectiveBudget,
+        budgetUtilization: turnOccupancy.utilization,
         turnCount: hookTurnCount,
       },
       // Pass user input so passive recall can surface memories BEFORE the backend responds
@@ -6738,10 +7082,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
 
       if (budgetEntries.length > 0) {
-        const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
+        // Same occupancy the hook gated on and the stamp reported. This line
+        // used to recompute it from the ledger estimate, so the human at the
+        // terminal could read a different percentage than the agent was given.
+        const util = Math.round(turnOccupancy.utilization * 100);
+        // Same three buckets the stamp names, same words. The human reading this
+        // line and the agent reading the stamp must not be given different
+        // accounts of the same turn — and "evictable" here once covered the
+        // identity envelope, which nothing evicts (Lumen, PR #639).
+        const split = turnOccupancy.splitKnown
+          ? `${turnOccupancy.ledgerTokens.toLocaleString()} ledger + ` +
+            `${turnOccupancy.fixedTokens.toLocaleString()} envelope + ` +
+            `${turnOccupancy.unaccountedTokens.toLocaleString()} unaccounted`
+          : 'ledger estimate only — provider has not reported';
         printEvent(
           chalk.yellow(
-            `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
+            `  ⚠ Context at ${util}% — ${turnOccupancy.effectiveTokens.toLocaleString()} / ${turnOccupancy.limit.toLocaleString()} tok (${split})`
           )
         );
       }
@@ -6804,9 +7160,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .filter((e) => e.source === 'passive-recall')
         .map((e) => e.content)
         .join('\n\n');
-      prompt = recallDelta ? `${recallDelta}\n\n${raw}` : raw;
+      // The stamp rides the DELTA, not just the envelope. A resumed native
+      // session never re-reads the envelope, so anything that lives only there
+      // is sent once at seed time and is stale for every turn after — and the
+      // long-running resumed session is exactly the seat whose window fills.
+      prompt = buildDeltaPrompt(contextStamp, recallDelta, raw);
     } else {
-      prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
+      prompt = buildPromptEnvelope(sbSlug, runtime, ledger, raw, contextStamp);
     }
 
     const turnStartedAt = Date.now();
@@ -6971,7 +7331,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false }
     ): BackendRunRequest => ({
       backend: runtime.backend,
-      agentId,
+      sbSlug,
       model: runtime.model,
       effort: runtime.effort,
       prompt,
@@ -7027,7 +7387,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         beginSpawn();
         const turn = startBackendTurn({
           backend: runtime.backend,
-          agentId,
+          sbSlug,
           model: runtime.model,
           effort: runtime.effort,
           prompt: body,
@@ -7094,13 +7454,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '  ⛁ provider session not found on resume — re-seeding a fresh native session'
             )
           );
+          // Regenerated HERE, after the new id is assigned, and never the
+          // opening's contextStamp reused. The stamped resume died before a
+          // model read it; THIS seed is the first request of the turn anything
+          // answers. The reassignment above is what makes the reading honest:
+          // providerScope() keys on activeBackendSessionId, so the failed
+          // session's measurement no longer matches and the stamp falls back to
+          // the estimate instead of describing a window that no longer exists.
+          const reseedStamp = formatContextStamp(
+            turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+          );
           beginSpawn();
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
-            agentId,
+            sbSlug,
             model: runtime.model,
             effort: runtime.effort,
-            prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
+            prompt: buildPromptEnvelope(sbSlug, runtime, ledger, raw, reseedStamp),
             verbose: runtime.verbose,
             passthroughArgs,
             systemPromptOverride: runtime.systemPromptOverride,
@@ -7163,7 +7533,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const runnerLabel = 'ink';
           pcp
             .callTool('log_activity', {
-              agentId,
+              sbSlug,
               type: runResult.success ? 'agent_complete' : 'error',
               subtype: `backend_cli:${runnerLabel}`,
               content: runResult.success
@@ -7207,10 +7577,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         activeBackendSessionId,
         randomUUID
       );
-      let continuationPrompt: string;
-      if (decision.mode === 'resume') {
-        continuationPrompt = body;
-      } else if (decision.mode === 'seed') {
+      if (decision.mode === 'seed') {
         activeBackendSessionId = decision.id;
         // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
         // model init may have changed the budget (applyDetectedModel), and
@@ -7227,15 +7594,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         printEvent(
           chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
         );
-        continuationPrompt = buildPromptEnvelope(
-          agentId,
-          runtime,
-          ledger,
-          buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
-        );
-      } else {
-        continuationPrompt = buildPromptEnvelope(agentId, runtime, ledger, body);
       }
+      // Regenerated per continuation, never the opening's stamp reused: the
+      // preceding spawn's usage has since been sampled, so THIS is the first
+      // reading of the turn backed by a provider measurement. A run whose whole
+      // job happens inside the tool loop would otherwise never see one.
+      const continuationStamp = formatContextStamp(
+        turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+      );
+      const continuationPrompt = buildContinuationPrompt(
+        decision.mode,
+        continuationStamp,
+        body,
+        (promptBody, stamp) => buildPromptEnvelope(sbSlug, runtime, ledger, promptBody, stamp),
+        () => buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
+      );
 
       // Recorded for a later reseed in this same turn; the seed above already
       // rendered this body itself.
@@ -7472,9 +7845,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ledger,
         runtime: {
           sessionId: runtime.sessionId,
-          agentId,
+          sbSlug,
           backend: runtime.backend,
-          budgetUtilization: ledger.totalTokens() / turnEndEffectiveBudget,
+          budgetUtilization: turnContextOccupancy(ledger, runtime, providerContextMeasurement())
+            .utilization,
           turnCount: hookTurnCount,
         },
         lastTurn: {
@@ -7550,10 +7924,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // completed assistant MESSAGE, modulo local-tool stripping), don't
         // print the body twice — close the turn with a compact meta line.
         if (streamRenderer.shouldSkipFinal(assistantDisplayText)) {
-          inkRepl.printEvent(`✔ ${agentId} · ${trailingParts}`);
+          inkRepl.printEvent(`✔ ${sbSlug} · ${trailingParts}`);
         } else {
           inkRepl.addMessage('assistant', assistantDisplayText, {
-            label: agentId,
+            label: sbSlug,
             trailingMeta: trailingParts,
           });
         }
@@ -7562,7 +7936,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       printLine('');
       printLine(
         renderMessageLine('assistant', assistantDisplayText, {
-          label: agentId,
+          label: sbSlug,
           timezone: runtime.userTimezone,
           trailingMeta: `${turnDurationSeconds}s`,
         })
@@ -7612,7 +7986,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const turnSignal = createTurnSignal({
     getSessionId: () => runtime.sessionId,
     getStudioId: () => currentPcpStudioId(),
-    agentId,
+    sbSlug,
     getServerUrl: async () => (await import('../lib/pcp-mcp.js')).getPcpServerUrl(),
     getToken: async (serverUrl) =>
       (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),
@@ -7750,7 +8124,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const toolName = String(payload.toolName ?? payload.name ?? 'tool');
             // The agent's own tool call — a dim event line in the message
             // flow, not a labeled activity block.
-            const line = `🛠 ${agentId} · ${toolName}`;
+            const line = `🛠 ${sbSlug} · ${toolName}`;
             if (inkRepl)
               inkRepl.addMessage('event', line, {
                 time: formatHumanTime(at, runtime.userTimezone),
@@ -7876,7 +8250,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (runtime.sessionId) {
       await pcp
         .callTool('update_session_state', {
-          agentId,
+          sbSlug,
           sessionId: runtime.sessionId,
           phase,
         })
@@ -7937,7 +8311,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     if (isBackendFailure) {
       console.log(chalk.red(`\nSession aborted: backend returned consecutive failures.`));
-      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${sbSlug}\n`));
       process.exitCode = 1;
     } else if (finalSignal?.status === 'blocked') {
       console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
@@ -7947,7 +8321,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(chalk.dim(`\nSession paused (${turnsCompleted} turn(s) completed).`));
     }
     if (!isBackendFailure) {
-      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${sbSlug}\n`));
     }
 
     // Clean up handles that would keep the process alive. Without this,
@@ -7984,7 +8358,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let lastCtrlCAt = 0;
   let lastSigintAt = 0;
   let exitAfterTurnNoticeShown = false;
-  let activePromptLabel = `${agentId}> `;
+  let activePromptLabel = `${sbSlug}> `;
 
   // Helper: build context view lines from current state
   const buildContextViewLines = (): string[] => {
@@ -8021,7 +8395,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (useInk) {
     // ── Ink path ──
     inkRepl = renderInkChat({
-      agentId,
+      sbSlug,
       timezone: runtime.userTimezone,
       infoItems: initialInfoItems,
       fullscreen: !!options.fullscreen,
@@ -8087,7 +8461,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           entry.role === 'user'
             ? entry.label || 'you'
             : entry.role === 'assistant'
-              ? entry.label || agentId
+              ? entry.label || sbSlug
               : entry.role === 'system'
                 ? entry.label || 'system'
                 : '📬 inbox';
@@ -8164,7 +8538,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Legacy readline
       statusLane.setPromptActive(true);
       try {
-        const promptLabel = pendingTurns > 0 ? `${agentId}+${pendingTurns}> ` : `${agentId}> `;
+        const promptLabel = pendingTurns > 0 ? `${sbSlug}+${pendingTurns}> ` : `${sbSlug}> `;
         activePromptLabel = promptLabel;
         const renderedPrompt = statusLane.buildPromptLabel(promptLabel);
         raw = (await rl.question(chalk.green(renderedPrompt))).trim();
@@ -8299,7 +8673,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (slash.args[0] === 'full' && inkRepl) {
             // Show all inbox messages fully expanded (re-fetch and display)
             const fullResult = (await pcp
-              .callTool('get_inbox', { agentId, status: 'unread', limit: 20 })
+              .callTool('get_inbox', { sbSlug, status: 'unread', limit: 20 })
               .catch(() => null)) as Record<string, unknown> | null;
             const allInbox = extractInboxMessages(fullResult).sort(
               (a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt)
@@ -8323,12 +8697,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'refresh': {
           showInPanel(['Refreshing identity context from Inkwell...']);
           const refreshResult = (await pcp
-            .callTool('bootstrap', { agentId })
+            .callTool('bootstrap', { sbSlug })
             .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
           if (refreshResult.error) {
             showInPanel([`Refresh failed: ${String(refreshResult.error)}`]);
           } else {
-            const ctx = formatBootstrapContext(refreshResult, agentId);
+            const ctx = formatBootstrapContext(refreshResult, sbSlug);
             if (ctx) {
               runtime.bootstrapContext = ctx;
               const ctxTokens = estimateTokens(ctx);
@@ -8656,8 +9030,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           const grantResult = await pcp
             .callTool('send_to_inbox', {
-              recipientAgentId: targetAgent,
-              senderAgentId: agentId,
+              recipientSlug: targetAgent,
+              senderSlug: sbSlug,
               messageType: 'permission_grant',
               content: `Permission ${action}: ${toolSpec}`,
               trigger: true,
@@ -8796,9 +9170,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               try {
                 pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
               } catch {
-                showInPanel([
-                  'Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}',
-                ]);
+                showInPanel(['Invalid JSON args. Example: /mcp call get_inbox {"sbSlug":"lumen"}']);
                 break;
               }
             }
@@ -8916,7 +9288,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             try {
               pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
             } catch {
-              showInPanel(['Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}']);
+              showInPanel(['Invalid JSON args. Example: /pcp get_inbox {"sbSlug":"lumen"}']);
               break;
             }
           }
@@ -9109,8 +9481,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           const token = mintDelegationToken(
             {
-              issuerAgentId: agentId,
-              delegateeAgentId: toAgent,
+              issuerSlug: sbSlug,
+              delegateeSlug: toAgent,
               scopes,
               ttlSeconds: Number.isFinite(ttlMinutes) ? Math.max(1, ttlMinutes) * 60 : 15 * 60,
               sessionId: runtime.sessionId,
@@ -9188,8 +9560,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
           const token = mintDelegationToken(
             {
-              issuerAgentId: agentId,
-              delegateeAgentId: toAgent,
+              issuerSlug: sbSlug,
+              delegateeSlug: toAgent,
               scopes,
               ttlSeconds: 15 * 60,
               sessionId: runtime.sessionId,
@@ -9222,10 +9594,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
 
           const inboxArgs: Record<string, unknown> = {
-            recipientAgentId: toAgent,
-            senderAgentId: agentId,
+            recipientSlug: toAgent,
+            senderSlug: sbSlug,
             messageType: 'task_request',
-            subject: `Delegated task from ${agentId}`,
+            subject: `Delegated task from ${sbSlug}`,
             content: message,
             trigger: true,
             ...(runtime.threadKey ? { threadKey: runtime.threadKey } : {}),
@@ -9336,7 +9708,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (summary) {
             await pcp
               .callTool('remember', {
-                agentId,
+                sbSlug,
                 ...(runtime.sessionId ? { sessionId: runtime.sessionId } : {}),
                 content: `Context ejection at ${result.bookmark.id} (${result.bookmark.label}).\n${summary}`,
                 topics: 'repl,context-ejection',
@@ -9517,7 +9889,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const summary = summarizeForSessionEnd(ledger);
   if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
-      .callTool('end_session', { agentId, sessionId: runtime.sessionId, summary })
+      .callTool('end_session', { sbSlug, sessionId: runtime.sessionId, summary })
       .catch(() => undefined);
   }
   appendTranscript(runtime.transcriptPath, {
@@ -9527,7 +9899,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   });
 
   if (runtime.sessionId) {
-    console.log(chalk.dim(`Reattach: ink chat -a ${agentId} --attach ${runtime.sessionId}`));
+    console.log(chalk.dim(`Reattach: ink chat -a ${sbSlug} --attach ${runtime.sessionId}`));
   }
   console.log(chalk.dim('\nChat ended.\n'));
 }

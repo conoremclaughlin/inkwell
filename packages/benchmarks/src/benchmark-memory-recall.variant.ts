@@ -277,13 +277,13 @@ export function buildBenchmarkRecallOptions(params: {
   mode: RecallMode;
   variant: BenchmarkRecallVariant;
   limit: number;
-  agentId: string;
+  sbSlug: string;
   topics: string[];
 }): MemorySearchOptions {
   const base: MemorySearchOptions = {
     recallMode: params.mode,
     limit: params.limit,
-    agentId: params.agentId,
+    sbSlug: params.sbSlug,
     includeShared: true,
     topics: params.topics,
   };

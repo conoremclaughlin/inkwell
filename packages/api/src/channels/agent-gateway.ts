@@ -17,9 +17,9 @@ import { logger } from '../utils/logger';
 
 export interface AgentTriggerPayload {
   /** Agent sending the trigger (e.g., "wren", "claude-code") */
-  fromAgentId: string;
+  fromSlug: string;
   /** Target agent to wake up (e.g., "myra") */
-  toAgentId: string;
+  toSlug: string;
   /** Optional inbox message ID that prompted this trigger (agent_inbox rows only) */
   inboxMessageId?: string;
   /** Optional thread message ID that prompted this trigger (inbox_thread_messages rows) */
@@ -108,10 +108,10 @@ export type TriggerCallback = (payload: AgentTriggerPayload) => Promise<void>;
  * Agent Gateway - handles agent-to-agent triggers
  *
  * Similar to TelegramListener/WhatsAppListener but for inter-agent communication.
- * Registered handlers process triggers by agent ID.
+ * Registered handlers process triggers by SB slug.
  *
  * Supports:
- * - Specific handlers: registerHandler(agentId, callback) for per-agent handling
+ * - Specific handlers: registerHandler(sbSlug, callback) for per-agent handling
  * - Default handler: setDefaultHandler(callback) for dynamic/stateless routing
  */
 export class AgentGateway extends EventEmitter {
@@ -128,17 +128,17 @@ export class AgentGateway extends EventEmitter {
    * Register a handler for a specific agent
    * When a trigger comes in for this agent, the handler is called
    */
-  registerHandler(agentId: string, callback: TriggerCallback): void {
-    this.handlers.set(agentId, callback);
-    logger.info(`[AgentGateway] Handler registered for agent: ${agentId}`);
+  registerHandler(sbSlug: string, callback: TriggerCallback): void {
+    this.handlers.set(sbSlug, callback);
+    logger.info(`[AgentGateway] Handler registered for agent: ${sbSlug}`);
   }
 
   /**
    * Unregister a handler
    */
-  unregisterHandler(agentId: string): void {
-    this.handlers.delete(agentId);
-    logger.info(`[AgentGateway] Handler unregistered for agent: ${agentId}`);
+  unregisterHandler(sbSlug: string): void {
+    this.handlers.delete(sbSlug);
+    logger.info(`[AgentGateway] Handler unregistered for agent: ${sbSlug}`);
   }
 
   /**
@@ -165,8 +165,8 @@ export class AgentGateway extends EventEmitter {
     handler: TriggerCallback | null;
     isDefaultHandler: boolean;
   } {
-    const handler = this.handlers.get(payload.toAgentId) || this.defaultHandler;
-    const isDefaultHandler = !this.handlers.has(payload.toAgentId);
+    const handler = this.handlers.get(payload.toSlug) || this.defaultHandler;
+    const isDefaultHandler = !this.handlers.has(payload.toSlug);
     return { handler, isDefaultHandler };
   }
 
@@ -180,7 +180,7 @@ export class AgentGateway extends EventEmitter {
     isDefaultHandler: boolean
   ): Promise<void> {
     if (isDefaultHandler) {
-      logger.info(`[AgentGateway] Using default handler for agent: ${payload.toAgentId}`);
+      logger.info(`[AgentGateway] Using default handler for agent: ${payload.toSlug}`);
     }
 
     await handler(payload);
@@ -195,8 +195,8 @@ export class AgentGateway extends EventEmitter {
   dispatchTrigger(payload: AgentTriggerPayload): AgentTriggerResponse {
     const triggerId = `trigger_${++this.triggerCounter}_${Date.now()}`;
     logger.info(`[AgentGateway] Dispatching trigger ${triggerId} (async)`, {
-      from: payload.fromAgentId,
-      to: payload.toAgentId,
+      from: payload.fromSlug,
+      to: payload.toSlug,
       type: payload.triggerType,
       priority: payload.priority,
       threadKey: payload.threadKey || null,
@@ -208,14 +208,14 @@ export class AgentGateway extends EventEmitter {
 
     const { handler, isDefaultHandler } = this.resolveHandler(payload);
     if (!handler) {
-      logger.warn(`[AgentGateway] No handler for agent: ${payload.toAgentId}`);
+      logger.warn(`[AgentGateway] No handler for agent: ${payload.toSlug}`);
       this.emit('trigger:unhandled', { triggerId, payload });
 
       return {
         success: false,
         triggerId,
         processed: false,
-        error: `No handler registered for agent: ${payload.toAgentId}`,
+        error: `No handler registered for agent: ${payload.toSlug}`,
       };
     }
 
@@ -246,21 +246,21 @@ export class AgentGateway extends EventEmitter {
   async processTrigger(payload: AgentTriggerPayload): Promise<AgentTriggerResponse> {
     const triggerId = `trigger_${++this.triggerCounter}_${Date.now()}`;
     logger.info(`[AgentGateway] Processing trigger ${triggerId}`, {
-      from: payload.fromAgentId,
-      to: payload.toAgentId,
+      from: payload.fromSlug,
+      to: payload.toSlug,
       type: payload.triggerType,
       priority: payload.priority,
     });
 
     const { handler, isDefaultHandler } = this.resolveHandler(payload);
     if (!handler) {
-      logger.warn(`[AgentGateway] No handler for agent: ${payload.toAgentId}`);
+      logger.warn(`[AgentGateway] No handler for agent: ${payload.toSlug}`);
       this.emit('trigger:unhandled', { triggerId, payload });
       return {
         success: false,
         triggerId,
         processed: false,
-        error: `No handler registered for agent: ${payload.toAgentId}`,
+        error: `No handler registered for agent: ${payload.toSlug}`,
       };
     }
 
@@ -290,8 +290,8 @@ export class AgentGateway extends EventEmitter {
   /**
    * Check if an agent has a registered handler
    */
-  hasHandler(agentId: string): boolean {
-    return this.handlers.has(agentId);
+  hasHandler(sbSlug: string): boolean {
+    return this.handlers.has(sbSlug);
   }
 }
 

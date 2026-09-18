@@ -87,7 +87,7 @@ function buildFixtureDir(serverUrl: string): string {
   );
   writeFileSync(
     join(root, '.ink', 'identity.json'),
-    JSON.stringify({ agentId: 'wren', studioId: 'main', context: 'main' })
+    JSON.stringify({ sbSlug: 'wren', studioId: 'main', context: 'main' })
   );
   return root;
 }

@@ -33,7 +33,7 @@ describe('integration_health last_healthy_at retention', () => {
 
   async function report(status: string, extra: Record<string, unknown> = {}) {
     return handleUpdateIntegrationHealth(
-      { userId, service: SERVICE, status, agentId: 'integration-test', ...extra },
+      { userId, service: SERVICE, status, sbSlug: 'integration-test', ...extra },
       dataComposer
     );
   }

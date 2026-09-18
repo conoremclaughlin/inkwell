@@ -193,7 +193,7 @@ describe('handleUpdateArtifact', () => {
           userId: '00000000-0000-0000-0000-000000000001',
           uri: 'ink://test/doc',
           content: 'Completely new content',
-          agentId: 'wren',
+          sbSlug: 'wren',
         },
         dataComposer
       );
@@ -216,7 +216,7 @@ describe('handleUpdateArtifact', () => {
           uri: 'ink://test/doc',
           content: 'Updated content',
           baseVersion: 1,
-          agentId: 'wren',
+          sbSlug: 'wren',
         },
         dataComposer
       );
@@ -260,7 +260,7 @@ describe('handleUpdateArtifact', () => {
           uri: 'ink://test/doc',
           content: incomingContent,
           baseVersion: 1,
-          agentId: 'wren',
+          sbSlug: 'wren',
         },
         dataComposer
       );
@@ -302,7 +302,7 @@ describe('handleUpdateArtifact', () => {
           uri: 'ink://test/doc',
           content: incomingContent,
           baseVersion: 1,
-          agentId: 'wren',
+          sbSlug: 'wren',
         },
         dataComposer
       );
@@ -343,7 +343,7 @@ describe('handleUpdateArtifact', () => {
           uri: 'ink://test/doc',
           content: incomingContent,
           baseVersion: 1,
-          agentId: 'wren',
+          sbSlug: 'wren',
         },
         dataComposer
       );
@@ -377,7 +377,7 @@ describe('handleUpdateArtifact', () => {
             uri: 'ink://test/doc',
             content: 'New content',
             baseVersion: 1,
-            agentId: 'wren',
+            sbSlug: 'wren',
           },
           dataComposer
         )
@@ -397,7 +397,7 @@ describe('handleUpdateArtifact', () => {
           userId: '00000000-0000-0000-0000-000000000001',
           uri: 'ink://test/doc',
           content: 'My update',
-          agentId: 'wren',
+          sbSlug: 'wren',
         },
         dataComposer
       );
@@ -433,7 +433,7 @@ describe('handleUpdateArtifact', () => {
           userId: '00000000-0000-0000-0000-000000000001',
           uri: 'ink://test/doc',
           content: 'Updated by another workspace agent',
-          agentId: 'myra',
+          sbSlug: 'myra',
         },
         dataComposer
       );
@@ -466,7 +466,7 @@ describe('handleUpdateArtifact', () => {
             userId: '00000000-0000-0000-0000-000000000001',
             uri: 'ink://test/doc',
             content: 'Unauthorized edit',
-            agentId: 'myra',
+            sbSlug: 'myra',
           },
           dataComposer
         )
@@ -498,7 +498,7 @@ describe('handleUpdateArtifact', () => {
             uri: 'ink://test/doc',
             editMode: 'editors',
             editors: [],
-            agentId: 'wren',
+            sbSlug: 'wren',
           },
           dataComposer
         )
@@ -528,7 +528,7 @@ describe('handleUpdateArtifact', () => {
           userId: '00000000-0000-0000-0000-000000000001',
           uri: 'ink://test/doc',
           editMode: 'workspace',
-          agentId: 'identity-wren',
+          sbSlug: 'identity-wren',
         },
         dataComposer
       );
@@ -561,7 +561,7 @@ describe('handleUpdateArtifact', () => {
           uri: 'ink://test/doc',
           tags: ['new-tag'],
           baseVersion: 1,
-          agentId: 'wren',
+          sbSlug: 'wren',
         },
         dataComposer
       );
@@ -586,10 +586,10 @@ describe('handleUpdateArtifact', () => {
       ).rejects.toThrow('Artifact write requires workspace scope');
     });
 
-    it('derives write workspace from the request-context agent with no args.agentId (session-enriched identity, PR #468)', async () => {
+    it('derives write workspace from the request-context agent with no args.sbSlug (session-enriched identity, PR #468)', async () => {
       // The ink runtime's tool calls arrive under a USER bearer with the agent
       // identity supplied via session-validated x-ink-context enrichment —
-      // request context carries agentId, args do not. Workspace derivation
+      // request context carries sbSlug, args do not. Workspace derivation
       // must succeed from the pinned agent alone; before the enrichment this
       // exact shape failed with 'requires workspace scope' (Myra's
       // create_artifact bug).
@@ -634,7 +634,7 @@ describe('handleUpdateArtifact', () => {
       });
 
       const result = await runWithRequestContext(
-        { userId: '00000000-0000-0000-0000-000000000001', agentId: 'myra' },
+        { userId: '00000000-0000-0000-0000-000000000001', sbSlug: 'myra' },
         async () =>
           handleCreateArtifact(
             {
@@ -752,10 +752,10 @@ describe('artifact comment + identity UUID flows', () => {
     expect(parsed.artifact.commentCount).toBe(1);
     expect(parsed.artifact.comments[0]).toMatchObject({
       id: 'comment-1',
-      createdByAgentId: 'lumen',
+      createdBySlug: 'lumen',
       createdByIdentity: {
         id: 'identity-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         name: 'Lumen',
       },
     });
@@ -852,7 +852,7 @@ describe('artifact comment + identity UUID flows', () => {
         title: 'Test Spec',
         content: '# Hello',
         artifactType: 'spec',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
       },
       createMockDataComposer(supabase)
     );
@@ -901,7 +901,7 @@ describe('artifact comment + identity UUID flows', () => {
           title: 'No editors',
           content: '# Hello',
           artifactType: 'spec',
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           editMode: 'editors',
           editors: [],
         },
@@ -950,7 +950,7 @@ describe('artifact comment + identity UUID flows', () => {
         title: 'Slug only',
         content: '# Hi',
         artifactType: 'spec',
-        agentId: 'unknown-agent-slug',
+        sbSlug: 'unknown-agent-slug',
       },
       createMockDataComposer(supabase)
     );
@@ -1160,7 +1160,7 @@ describe('artifact comment + identity UUID flows', () => {
             title: 'Header first',
             content: '# Header first',
             artifactType: 'spec',
-            agentId: 'lumen',
+            sbSlug: 'lumen',
           },
           createMockDataComposer(supabase)
         );
@@ -1236,7 +1236,7 @@ describe('artifact comment + identity UUID flows', () => {
             title: 'Derived over default',
             content: '# Derived over default',
             artifactType: 'spec',
-            agentId: 'lumen',
+            sbSlug: 'lumen',
           },
           createMockDataComposer(supabase)
         );
@@ -1306,7 +1306,7 @@ describe('artifact comment + identity UUID flows', () => {
         title: 'Derived workspace spec',
         content: '# Derived Workspace',
         artifactType: 'spec',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
       },
       createMockDataComposer(supabase)
     );
@@ -1400,7 +1400,7 @@ describe('artifact comment + identity UUID flows', () => {
         userId: '00000000-0000-0000-0000-000000000001',
         artifactId: '11111111-1111-1111-1111-111111111111',
         content: 'Great point.',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
       },
       createMockDataComposer(supabase)
     );
@@ -1408,7 +1408,7 @@ describe('artifact comment + identity UUID flows', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
     expect(parsed.comment.createdBySbId).toBe('identity-1');
-    expect(parsed.comment.createdByIdentity.agentId).toBe('lumen');
+    expect(parsed.comment.createdByIdentity.sbSlug).toBe('lumen');
 
     const commentsBuilder = supabase.calls.find((c) => c.table === 'artifact_comments')?.builder;
     expect((commentsBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
@@ -1548,7 +1548,7 @@ describe('artifact comment + identity UUID flows', () => {
     expect(parsed.count).toBe(2);
     expect(parsed.comments[0].createdByIdentity).toMatchObject({
       id: 'identity-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       name: 'Lumen',
     });
     expect(parsed.comments[1].createdByIdentity).toBeNull();
@@ -1600,7 +1600,7 @@ describe('Library: rename + URI aliases (spec:library)', () => {
     });
 
     const result = await handleUpdateArtifact(
-      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, sbSlug: 'wren' },
       createMockDataComposer(supabase)
     );
 
@@ -1672,7 +1672,7 @@ describe('Library: rename + URI aliases (spec:library)', () => {
     });
 
     const result = await handleUpdateArtifact(
-      { userId: USER_ID, uri: NEW_URI, newUri: OLD_URI, agentId: 'wren' },
+      { userId: USER_ID, uri: NEW_URI, newUri: OLD_URI, sbSlug: 'wren' },
       createMockDataComposer(supabase)
     );
 
@@ -1704,7 +1704,7 @@ describe('Library: rename + URI aliases (spec:library)', () => {
 
     await expect(
       handleUpdateArtifact(
-        { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+        { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, sbSlug: 'wren' },
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow(/already exists at/);
@@ -1727,7 +1727,7 @@ describe('Library: rename + URI aliases (spec:library)', () => {
 
     await expect(
       handleUpdateArtifact(
-        { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+        { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, sbSlug: 'wren' },
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow(/alias of another artifact/);
@@ -1738,7 +1738,7 @@ describe('Library: rename + URI aliases (spec:library)', () => {
 
     await expect(
       handleUpdateArtifact(
-        { userId: USER_ID, uri: OLD_URI, newUri: 'ink://BadNS/x', agentId: 'wren' },
+        { userId: USER_ID, uri: OLD_URI, newUri: 'ink://BadNS/x', sbSlug: 'wren' },
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow(/Artifact URIs must look like/);
@@ -1750,7 +1750,7 @@ describe('Library: rename + URI aliases (spec:library)', () => {
 
     await expect(
       handleCreateArtifact(
-        { userId: USER_ID, uri: 'not-a-uri', title: 'X', content: 'Y', agentId: 'wren' },
+        { userId: USER_ID, uri: 'not-a-uri', title: 'X', content: 'Y', sbSlug: 'wren' },
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow(/Artifact URIs must look like/);
@@ -1809,7 +1809,7 @@ describe('Library: rename + URI aliases (spec:library)', () => {
 
     await expect(
       handleCreateArtifact(
-        { userId: USER_ID, uri: OLD_URI, title: 'Squatter', content: 'X', agentId: 'wren' },
+        { userId: USER_ID, uri: OLD_URI, title: 'Squatter', content: 'X', sbSlug: 'wren' },
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow(/alias of an existing artifact/);
@@ -1860,7 +1860,7 @@ describe('Library round 2: reservation ordering + alias error contracts', () => 
     });
 
     const result = await handleUpdateArtifact(
-      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, sbSlug: 'wren' },
       createMockDataComposer(supabase)
     );
 
@@ -1912,7 +1912,7 @@ describe('Library round 2: reservation ordering + alias error contracts', () => 
     });
 
     const result = await handleUpdateArtifact(
-      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, sbSlug: 'wren' },
       createMockDataComposer(supabase)
     );
 
@@ -1945,7 +1945,7 @@ describe('Library round 2: reservation ordering + alias error contracts', () => 
 
     await expect(
       handleUpdateArtifact(
-        { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+        { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, sbSlug: 'wren' },
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow(/failed to reserve the old URI/);

@@ -55,14 +55,14 @@ export function SessionScreen({ route, navigation }: Props) {
         turns: logsToTurns(logs.data.logs),
         session: {
           ...s,
-          agentId: s.agentId ?? 'unknown',
-          agentName: s.agentId ?? 'Unknown',
+          sbSlug: s.sbSlug ?? 'unknown',
+          agentName: s.sbSlug ?? 'Unknown',
           lifecycle: s.status,
           activeThreadKey: null as string | null,
           backendSessionId: null,
         },
         source: 'logs' as const,
-        agentName: s.agentId ?? 'Unknown',
+        agentName: s.sbSlug ?? 'Unknown',
       };
     }
     return {
@@ -111,7 +111,7 @@ export function SessionScreen({ route, navigation }: Props) {
                     { backgroundColor: live ? colors.positive : colors.textMuted },
                   ]}
                 />
-                <Text style={[styles.agent, { color: agentColor(session.agentId) }]}>
+                <Text style={[styles.agent, { color: agentColor(session.sbSlug) }]}>
                   {agentName}
                 </Text>
                 <Text style={styles.meta}>{session.lifecycle ?? 'unknown'}</Text>

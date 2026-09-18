@@ -3,6 +3,7 @@
 ## Overview
 
 Refactor from stateful `SessionHost` singleton to stateless `SessionService` that resolves all context from the database per-request. This enables:
+
 - Multi-user support (thousands of users)
 - Horizontal scaling (stateless servers)
 - Clean separation of concerns
@@ -15,7 +16,7 @@ Refactor from stateful `SessionHost` singleton to stateless `SessionService` tha
 │            SessionHost                   │
 │  (Stateful singleton per process)        │
 ├─────────────────────────────────────────┤
-│  - this.agentId (hardcoded)             │
+│  - this.sbSlug (hardcoded)             │
 │  - this.backendManager (long-lived)     │
 │  - this.contextCache (in-memory)        │
 │  - this.currentSessionId                │
@@ -24,6 +25,7 @@ Refactor from stateful `SessionHost` singleton to stateless `SessionService` tha
 ```
 
 **Problems:**
+
 - Single agent per process
 - In-memory state doesn't scale
 - Can't serve multiple users
@@ -41,7 +43,7 @@ Refactor from stateful `SessionHost` singleton to stateless `SessionService` tha
 │                                                                  │
 │  Where SessionRequest contains:                                  │
 │    - userId: string (from auth)                                  │
-│    - agentId: string (which SB to invoke)                       │
+│    - sbSlug: string (which SB to invoke)                       │
 │    - channel: string (telegram, agent, api, etc.)               │
 │    - conversationId: string                                      │
 │    - content: string                                             │
@@ -55,14 +57,14 @@ Refactor from stateful `SessionHost` singleton to stateless `SessionService` tha
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  1. Resolve Session Context                                      │
-│     ├─ Query sessions table for (userId, agentId)               │
+│     ├─ Query sessions table for (userId, sbSlug)               │
 │     ├─ Query agent_identities for agent config                  │
 │     ├─ Query users for timezone, contacts                       │
 │     └─ Determine: resume existing or create new                 │
 │                                                                  │
 │  2. Build Agent Context                                          │
 │     ├─ Load identity (from agent_identities.soul, .heartbeat)   │
-│     ├─ Load recent memories (filtered by agentId)               │
+│     ├─ Load recent memories (filtered by sbSlug)               │
 │     ├─ Load active projects/focus                               │
 │     └─ Build temporal context (time in user's timezone)         │
 │                                                                  │
@@ -96,7 +98,7 @@ Refactor from stateful `SessionHost` singleton to stateless `SessionService` tha
 interface SessionRequest {
   // Auth context (required)
   userId: string;
-  agentId: string;
+  sbSlug: string;
 
   // Message context
   channel: ChannelType;
@@ -115,8 +117,8 @@ interface SessionRequest {
 
 interface SessionResult {
   success: boolean;
-  sessionId: string;           // PCP session ID
-  claudeSessionId: string;     // Claude Code session ID
+  sessionId: string; // PCP session ID
+  claudeSessionId: string; // Claude Code session ID
 
   // Response routing (if send_response was called)
   responses?: Array<{
@@ -143,7 +145,7 @@ type SessionType = 'primary' | 'task';
 interface Session {
   id: string;
   userId: string;
-  agentId: string;
+  sbSlug: string;
   claudeSessionId: string | null;
 
   type: SessionType;
@@ -179,7 +181,7 @@ interface ISessionService {
    */
   getOrCreateSession(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     options?: { type?: SessionType; taskDescription?: string }
   ): Promise<Session>;
 
@@ -199,11 +201,14 @@ interface ISessionService {
   /**
    * List active sessions for a user.
    */
-  listSessions(userId: string, options?: {
-    agentId?: string;
-    status?: Session['status'];
-    type?: SessionType;
-  }): Promise<Session[]>;
+  listSessions(
+    userId: string,
+    options?: {
+      sbSlug?: string;
+      status?: Session['status'];
+      type?: SessionType;
+    }
+  ): Promise<Session[]>;
 }
 ```
 
@@ -229,29 +234,34 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_agent_active
 ### Deprecate agent_sessions table
 
 The `agent_sessions` table appears to be legacy. After migration:
+
 - Migrate any needed data to `sessions`
 - Drop the table
 
 ## Migration Path
 
 ### Phase 1: SessionService alongside SessionHost
+
 1. Create `src/services/sessions/` directory
 2. Implement `SessionService` with same interface
 3. Add feature flag to switch between them
 4. Run both in parallel, compare behavior
 
 ### Phase 2: Migrate Callers
+
 1. Update heartbeat to use SessionService
 2. Update ChannelGateway message handler
 3. Update agent trigger handlers
 4. Update any HTTP API endpoints
 
 ### Phase 3: Remove SessionHost
+
 1. Remove SessionHost class
 2. Remove in-memory caching
 3. Clean up unused code
 
 ### Phase 4: Optimize
+
 1. Add connection pooling for Claude Code processes
 2. Add caching layer (Redis) for hot session data
 3. Add metrics and monitoring
@@ -302,6 +312,7 @@ src/services/sessions/
 ## Migration Status: COMPLETE (2026-02-04)
 
 The PCP server (`src/server.ts`) now uses SessionService for:
+
 - Stateless message handling (queries DB per-request)
 - Horizontal scaling ready (no in-memory state)
 - Response routing through ChannelGateway

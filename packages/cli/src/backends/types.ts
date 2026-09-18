@@ -16,7 +16,7 @@ export interface TurnMedia {
 }
 
 export interface BackendConfig {
-  agentId: string;
+  sbSlug: string;
   model?: string; // undefined = use backend's default model
   /** Reasoning effort (claude: low | medium | high | xhigh | max). undefined = provider default. */
   effort?: string;

@@ -15,7 +15,7 @@ interface HistoryResponse {
 }
 
 interface SendMessageInput {
-  agentId: string;
+  sbSlug: string;
   content: string;
 }
 
@@ -29,7 +29,7 @@ interface SendMessageResponse {
 interface KindleInfo {
   kindle: {
     id: string;
-    childAgentId: string;
+    childSlug: string;
     onboardingStatus: string;
     chosenName: string | null;
     valueSeed: {
@@ -45,7 +45,7 @@ function KindleOnboardingContent() {
   const queryClient = useQueryClient();
 
   const kindleId = searchParams.get('kindleId');
-  const agentId = searchParams.get('agentId');
+  const sbSlug = searchParams.get('sbSlug');
 
   const [optimisticMessages, setOptimisticMessages] = useState<ChatMessageData[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -61,9 +61,9 @@ function KindleOnboardingContent() {
 
   // Load chat history
   const { data: historyData } = useApiQuery<HistoryResponse>(
-    ['chat-history', agentId],
-    `/api/chat/history?agentId=${agentId}`,
-    { enabled: !!agentId }
+    ['chat-history', sbSlug],
+    `/api/chat/history?sbSlug=${sbSlug}`,
+    { enabled: !!sbSlug }
   );
 
   const historyMessages = historyData?.messages ?? [];
@@ -81,40 +81,40 @@ function KindleOnboardingContent() {
 
   const handleSend = useCallback(
     async (content: string) => {
-      if (!agentId || isProcessing) return;
+      if (!sbSlug || isProcessing) return;
 
       const optimisticId = `optimistic-${Date.now()}`;
       const userMessage: ChatMessageData = {
         id: optimisticId,
         direction: 'in',
         content,
-        agentId,
+        sbSlug,
         createdAt: new Date().toISOString(),
       };
       setOptimisticMessages((prev) => [...prev, userMessage]);
       setIsProcessing(true);
 
       try {
-        const result = await sendMutation.mutateAsync({ agentId, content });
+        const result = await sendMutation.mutateAsync({ sbSlug, content });
 
         if (result.response) {
           const responseMessage: ChatMessageData = {
             id: `response-${Date.now()}`,
             direction: 'out',
             content: result.response,
-            agentId,
+            sbSlug,
             createdAt: new Date().toISOString(),
           };
           setOptimisticMessages((prev) => [...prev, responseMessage]);
         }
 
-        queryClient.invalidateQueries({ queryKey: ['chat-history', agentId] });
+        queryClient.invalidateQueries({ queryKey: ['chat-history', sbSlug] });
       } catch {
         const errorMessage: ChatMessageData = {
           id: `error-${Date.now()}`,
           direction: 'out',
           content: 'Something went wrong. Please try again.',
-          agentId,
+          sbSlug,
           createdAt: new Date().toISOString(),
         };
         setOptimisticMessages((prev) => [...prev, errorMessage]);
@@ -122,12 +122,12 @@ function KindleOnboardingContent() {
         setIsProcessing(false);
       }
     },
-    [agentId, isProcessing, sendMutation, queryClient]
+    [sbSlug, isProcessing, sendMutation, queryClient]
   );
 
   // Complete onboarding mutation
   const completeMutation = useApiPost<
-    { kindle: { childAgentId: string }; agentId: string },
+    { kindle: { childSlug: string }; sbSlug: string },
     { chosenName: string }
   >(`/api/kindle/${kindleId}/complete`);
 
@@ -142,7 +142,7 @@ function KindleOnboardingContent() {
     }
   };
 
-  if (!kindleId || !agentId) {
+  if (!kindleId || !sbSlug) {
     return (
       <div className="flex h-full items-center justify-center text-gray-400">
         <p>Missing kindle or agent information. Please use a valid kindle invite link.</p>

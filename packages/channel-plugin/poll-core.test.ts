@@ -12,7 +12,7 @@ function mkMsg(id: string, sender = 'lumen') {
   msgClock += 1;
   return {
     id,
-    senderAgentId: sender,
+    senderSlug: sender,
     content: `content ${id}`,
     messageType: 'message',
     createdAt: new Date(1700000000000 + msgClock * 1000).toISOString(),
@@ -73,7 +73,7 @@ function createHarness(
       notifications.push({ content, meta });
     }),
     log: vi.fn(),
-    agentId: 'wren',
+    sbSlug: 'wren',
     email: 'test@test.com',
     studioId: 'studio-1',
   };
@@ -316,7 +316,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
         notifications.push({ content, meta });
       }),
       log: vi.fn(),
-      agentId: 'wren',
+      sbSlug: 'wren',
       email: 'test@test.com',
       studioId: 'studio-1',
     };
@@ -341,7 +341,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     expect(notifications).toHaveLength(3);
     // Delivered oldest-first; the ack is the newest processed id.
     expect(ackArgs).toHaveLength(1);
-    expect(ackArgs[0]).toMatchObject({ agentId: 'wren', throughMessageId: 'm3' });
+    expect(ackArgs[0]).toMatchObject({ sbSlug: 'wren', throughMessageId: 'm3' });
   });
 
   it('an emit failure stops the ack range — the newer remainder redelivers', async () => {
@@ -366,13 +366,13 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     const { deps, ackArgs, notifications } = legacyHarness();
     const seen = new Set<string>();
     const page = [
-      { ...mkMsg('own'), senderAgentId: 'wren', createdAt: '2026-08-16T12:00:00Z' },
+      { ...mkMsg('own'), senderSlug: 'wren', createdAt: '2026-08-16T12:00:00Z' },
       { ...mkMsg('m1'), createdAt: '2026-08-16T10:00:00Z' },
     ];
 
     // Skip own messages (the caller-side filter).
     const res = await drainLegacyInbox(deps, seen, page, (m) =>
-      m.senderAgentId === 'wren' ? 'skip' : 'deliver'
+      m.senderSlug === 'wren' ? 'skip' : 'deliver'
     );
 
     expect(res.injected).toBe(1);

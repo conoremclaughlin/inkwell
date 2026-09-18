@@ -204,6 +204,9 @@ export class CodexRunner implements IRunner {
       args.push('-m', config.model);
     }
 
+    // Everything following this delimiter is data, never a CLI option or
+    // subcommand selected by remote message text. Resume still gets its ID.
+    args.push('--');
     if (isResume && resumeSessionId) {
       args.push(resumeSessionId);
       args.push(message);
@@ -231,7 +234,7 @@ export class CodexRunner implements IRunner {
       writeRuntimeSessionHint(
         config.workingDirectory,
         config.pcpSessionId,
-        config.agentId || 'unknown',
+        config.sbSlug || 'unknown',
         'codex',
         runtimeLinkId,
         config.studioId
@@ -244,7 +247,7 @@ export class CodexRunner implements IRunner {
       const spawnEnv: Record<string, string> = {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(codexBin),
-        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
         // Tells the session-start hook the constitution is already in the
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
@@ -253,7 +256,7 @@ export class CodexRunner implements IRunner {
           runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
           accessToken: config.pcpAccessToken,
-          agentId: config.agentId,
+          sbSlug: config.sbSlug,
           runtime: 'codex',
           repoRoot: config.repoRoot,
         }),
@@ -268,6 +271,7 @@ export class CodexRunner implements IRunner {
       });
 
       const proc = spawn(target.binary, target.args, {
+        shell: false,
         cwd: target.cwd,
         env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
         stdio: ['ignore', 'pipe', 'pipe'],

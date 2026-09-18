@@ -17,7 +17,7 @@ function makeDeps(overrides: Partial<TurnSignalDeps> = {}) {
   );
   const deps: TurnSignalDeps = {
     getSessionId: () => 'sess-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     getServerUrl: () => 'http://localhost:3001/',
     getToken: async () => 'tok-abc',
     workingDir: '/work/tree',
@@ -47,7 +47,7 @@ describe('createTurnSignal', () => {
       sessionId: 'sess-1',
       lifecycle: 'running',
       event: 'prompt',
-      agentId: 'wren',
+      sbSlug: 'wren',
       workingDir: '/work/tree',
     });
   });
@@ -66,7 +66,7 @@ describe('createTurnSignal', () => {
     await expect(createTurnSignal(deps).detach()).resolves.toBe(true);
 
     const body = bodyOf(fetchImpl);
-    expect(body).toEqual({ sessionId: 'sess-1', cliAttached: false, agentId: 'wren' });
+    expect(body).toEqual({ sessionId: 'sess-1', cliAttached: false, sbSlug: 'wren' });
   });
 
   it('reports UNACKNOWLEDGED with no PCP session — a failed start_session must not slip the gate', async () => {

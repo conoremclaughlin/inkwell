@@ -9,9 +9,10 @@ import { z } from 'zod';
 import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
+import { resolveSbId, resolveSbSlug } from '../../auth/resolve-identity';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { boundThreadTitle } from './thread-bounds.js';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../../data/supabase/types';
@@ -21,11 +22,7 @@ import {
   describeUnregisteredProjectPrefix,
   mayHaveProjectPrefix,
 } from '../../services/thread-key/unregistered-prefix';
-import {
-  getRequestContext,
-  getSessionContext,
-  getPinnedAgentId,
-} from '../../utils/request-context';
+import { getRequestContext, getSessionContext, getPinnedSlug } from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import {
   senderRoutingContext,
@@ -49,17 +46,17 @@ const threadTable = (supabase: ReturnType<DataComposer['getClient']>, table: str
 // ============== Schemas ==============
 
 const sendToInboxSchema = userIdentifierBaseSchema.extend({
-  recipientAgentId: z
+  recipientSlug: z
     .string()
     .optional()
-    .describe('Agent ID to send message to. Required unless recipients[] is provided.'),
+    .describe('SB slug to send message to. Required unless recipients[] is provided.'),
   recipients: z
     .array(z.string().min(1).max(64))
     .min(1)
     .max(16)
     .optional()
-    .describe('Multiple recipient agent IDs for group thread creation. Requires threadKey.'),
-  senderAgentId: z.string().optional().describe('Agent ID of sender (optional if from human)'),
+    .describe('Multiple recipient SB slugs for group thread creation. Requires threadKey.'),
+  senderSlug: z.string().optional().describe('SB slug of sender (optional if from human)'),
   subject: z.string().optional().describe('Message subject'),
   content: z.string().describe('Message content'),
   messageType: z
@@ -140,7 +137,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .max(16)
     .optional()
     .describe(
-      'Trigger specific thread participants by agent ID. Takes highest precedence. Non-participants are silently ignored.'
+      'Trigger specific thread participants by SB slug. Takes highest precedence. Non-participants are silently ignored.'
     ),
 });
 
@@ -186,11 +183,11 @@ export function isThreadOwnedByStudio(
 
 const getInboxSchema = userIdentifierBaseSchema
   .extend({
-    agentId: z
+    sbSlug: z
       .string()
       .optional()
       .describe(
-        'Agent ID to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
+        'SB slug to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
       ),
     status: z
       .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
@@ -217,7 +214,7 @@ const getInboxSchema = userIdentifierBaseSchema
       .describe(
         'Filter to a conversation thread. Aliases through to get_thread_messages ' +
           '(thread messages are stored separately from the legacy inbox; participant ' +
-          'membership and read-state are respected). Requires agentId. status "all" ' +
+          'membership and read-state are respected). Requires sbSlug. status "all" ' +
           'maps to the full thread history; priority/messageType/since do not apply.'
       ),
     channelPoll: z
@@ -250,12 +247,12 @@ const getInboxSchema = userIdentifierBaseSchema
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
   messageId: z.string().guid().describe('Message ID to update'),
-  agentId: z.string().describe('Agent ID making the update (must be recipient)'),
+  sbSlug: z.string().describe('SB slug making the update (must be recipient)'),
   status: z.enum(['read', 'acknowledged', 'completed']).describe('New status'),
 });
 
 const markInboxReadSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID whose inbox to mark as read'),
+  sbSlug: z.string().describe('SB slug whose inbox to mark as read'),
   before: isoDateTime()
     .optional()
     .describe(
@@ -272,15 +269,15 @@ const markInboxReadSchema = userIdentifierBaseSchema.extend({
 });
 
 const getAgentStatusSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID to check status for'),
+  sbSlug: z.string().describe('SB slug to check status for'),
 });
 
 const getAgentSummariesSchema = userIdentifierBaseSchema.extend({
-  agentIds: z
+  sbSlugs: z
     .array(z.string())
     .optional()
     .describe(
-      'Specific agent IDs to summarize. Omit to auto-discover all agents from agent_identities.'
+      'Specific SB slugs to summarize. Omit to auto-discover all agents from agent_identities.'
     ),
 });
 
@@ -339,7 +336,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const {
-    recipientAgentId,
+    recipientSlug,
     recipients,
     subject,
     content,
@@ -366,11 +363,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const recipientStudioSlugOrHint: string | undefined =
     recipientStudioSlug || recipientStudioHint || undefined;
 
-  // Validate: exactly one of recipientAgentId or recipients
-  const hasSingle = !!recipientAgentId;
+  // Validate: exactly one of recipientSlug or recipients
+  const hasSingle = !!recipientSlug;
   const hasMany = !!recipients?.length;
   if (hasSingle === hasMany) {
-    throw new Error('Provide exactly one of recipientAgentId or recipients');
+    throw new Error('Provide exactly one of recipientSlug or recipients');
   }
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
@@ -384,23 +381,22 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     );
   }
 
-  // Resolve sender identity: pinned/explicit → request context sbId → context agentId → unknown
-  let senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
-  if (!senderAgentId) {
+  // Resolve sender identity: pinned/explicit → request context sbId → context sbSlug → unknown
+  let senderSlug = getEffectiveSlug(parsed.senderSlug);
+  if (!senderSlug) {
     const reqCtx = getRequestContext() || getSessionContext();
     if (reqCtx?.sbId) {
-      senderAgentId =
-        (await resolveAgentSlug(dataComposer.getClient(), reqCtx.sbId)) || reqCtx.agentId;
-    } else if (reqCtx?.agentId) {
-      senderAgentId = reqCtx.agentId;
+      senderSlug = (await resolveSbSlug(dataComposer.getClient(), reqCtx.sbId)) || reqCtx.sbSlug;
+    } else if (reqCtx?.sbSlug) {
+      senderSlug = reqCtx.sbSlug;
     }
   }
-  const triggerSenderId = senderAgentId || 'unknown';
+  const triggerSenderId = senderSlug || 'unknown';
 
   // SECURITY: permission_grant messages can only originate from the system layer
   // (platform listeners verifying human identity), never from agents.
   // See ink://specs/2fa-permission-grants for the full design.
-  if (messageType === 'permission_grant' && senderAgentId) {
+  if (messageType === 'permission_grant' && senderSlug) {
     throw new Error(
       'permission_grant messages cannot be sent by agents — must originate from platform verification'
     );
@@ -426,18 +422,18 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // lookup as a deterministic fallback.
   // We intentionally do NOT fall back to "most recent active session" — that's
   // non-deterministic and can route replies to the wrong worktree/studio.
-  if (!senderSessionId && senderAgentId && threadKey) {
+  if (!senderSessionId && senderSlug && threadKey) {
     try {
       const threadSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
         resolved.user.id,
-        senderAgentId,
+        senderSlug,
         threadKey,
         senderStudioId
       );
       if (threadSession) {
         senderSessionId = threadSession.id;
         logger.debug('Resolved sender session from threadKey match (no header)', {
-          senderAgentId,
+          senderSlug,
           threadKey,
           senderSessionId,
         });
@@ -445,7 +441,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     } catch (err) {
       logger.warn('Failed to resolve sender session from threadKey', {
         error: err instanceof Error ? err.message : String(err),
-        senderAgentId,
+        senderSlug,
         threadKey,
       });
     }
@@ -470,12 +466,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const senderIsBridge = await isBridgeIdentity(
     supabase,
     resolved.user.id,
-    senderAgentId,
+    senderSlug,
     senderSbIdFromContext()
   );
 
   const nonAgentSender = triggerSenderId === 'system' || triggerSenderId === 'unknown';
-  const missingSenderSession = !senderSessionId && !!senderAgentId && !nonAgentSender;
+  const missingSenderSession = !senderSessionId && !!senderSlug && !nonAgentSender;
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Unified handler for both new thread creation and replies to existing threads.
@@ -485,7 +481,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   let prefixWarning: string | undefined;
 
   if (threadKey) {
-    const allRecipients = recipients || [recipientAgentId!];
+    const allRecipients = recipients || [recipientSlug!];
 
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, resolved.user.id, threadKey);
@@ -508,14 +504,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     let thread = await findOrCreateThread(supabase, {
       userId: resolved.user.id,
       threadKey,
-      creatorAgentId: triggerSenderId,
+      creatorSlug: triggerSenderId,
       title: subject || null,
-      participants: senderAgentId ? [...new Set([senderAgentId, ...allRecipients])] : allRecipients,
+      participants: senderSlug ? [...new Set([senderSlug, ...allRecipients])] : allRecipients,
     });
 
     // Include sender as participant if they have an identity
-    const allParticipants = senderAgentId
-      ? [...new Set([senderAgentId, ...allRecipients])]
+    const allParticipants = senderSlug
+      ? [...new Set([senderSlug, ...allRecipients])]
       : allRecipients;
 
     // Cross-studio self-message: sender targets themselves in a different studio.
@@ -523,17 +519,17 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // session_id would scope it to one studio and hide it from the other. Leave null
     // so both sessions see the thread.
     const isCrossStudioSelf = !!(
-      senderAgentId &&
-      senderAgentId === recipientAgentId &&
+      senderSlug &&
+      senderSlug === recipientSlug &&
       (recipientStudioId || recipientStudioSlugOrHint)
     );
 
     // Ensure all participants are registered (recipients + sender for existing threads).
     // Stamp session_id so channel plugins can filter threads to their session.
-    for (const participantAgentId of allParticipants) {
-      const isSender = participantAgentId === senderAgentId;
+    for (const participantSlug of allParticipants) {
+      const isSender = participantSlug === senderSlug;
       const participantSessionId =
-        isCrossStudioSelf && participantAgentId === senderAgentId
+        isCrossStudioSelf && participantSlug === senderSlug
           ? null
           : isSender
             ? senderSessionId
@@ -542,13 +538,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
         .select('agent_id, session_id')
         .eq('thread_id', thread.id)
-        .eq('agent_id', participantAgentId)
+        .eq('agent_id', participantSlug)
         .maybeSingle();
 
       if (!existing) {
         await threadTable(supabase, 'inbox_thread_participants').insert({
           thread_id: thread.id,
-          agent_id: participantAgentId,
+          agent_id: participantSlug,
           ...(participantSessionId ? { session_id: participantSessionId } : {}),
         });
       } else if (participantSessionId) {
@@ -562,7 +558,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           await threadTable(supabase, 'inbox_thread_participants')
             .update({ session_id: participantSessionId })
             .eq('thread_id', thread.id)
-            .eq('agent_id', participantAgentId);
+            .eq('agent_id', participantSlug);
         }
       }
     }
@@ -579,7 +575,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // so the channelPoll filter can recognize the target studio as an owner.
     // Resolve recipientStudioSlug/Hint to a studioId if needed.
     let resolvedRecipientStudioId: string | undefined = recipientStudioId || undefined;
-    const resolveAgentForStudio = recipientAgentId || senderAgentId;
+    const resolveAgentForStudio = recipientSlug || senderSlug;
     if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && resolveAgentForStudio) {
       try {
         // Resolve in the recipient's scope so cross-agent sends (sender=wren,
@@ -598,19 +594,33 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     }
 
     const selfStudioRecipient = !!(
-      senderAgentId &&
+      senderSlug &&
       resolvedRecipientStudioId &&
-      allRecipients.includes(senderAgentId)
+      allRecipients.includes(senderSlug)
     );
     const threadMessageMetadata = {
       ...rawMeta,
       pcp: {
         ...existingPcpMeta,
         sender: {
-          agentId: triggerSenderId,
+          sbSlug: triggerSenderId,
           sessionId: senderSessionId,
           studioId: senderStudioId,
         },
+        // The sender's own subject, kept whole on the row it was sent with.
+        //
+        // `inbox_thread_messages` has no subject column, so before this the
+        // thread path's only copy of a subject was `inbox_threads.title` — and
+        // only for the first message, since a reply's subject was dropped
+        // outright. Bounding the title at 200 characters therefore truncated
+        // the one durable copy a 240-character subject had (Lumen, #641
+        // round 2, measured on the real send handler). The bound is about a
+        // thread's label; it was never meant to edit what someone sent.
+        //
+        // Stored for every message, not just the overflowing first one: a rule
+        // that keeps long subjects and discards short ones is the harder thing
+        // to reason about, and the reply case was already losing them.
+        ...(subject ? { subject } : {}),
         ...(selfStudioRecipient ? { recipient: { studioId: resolvedRecipientStudioId } } : {}),
       },
     };
@@ -644,7 +654,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // atomic RPC, never wall-clock (spec: ink://specs/inkmail-read-state §1-2).
     //
     // Self-addressing exemption: when the sender targets ANOTHER of their own
-    // sessions/studios (senderAgentId is a recipient + explicit studio/session
+    // sessions/studios (senderSlug is a recipient + explicit studio/session
     // target), do NOT advance. There is only one (thread_id, agent_id)
     // pointer; advancing at insert would make the target instance see the
     // message as already read before delivery. The target's delivery advances
@@ -656,14 +666,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // alias self-sends were advanced before fetch while session-id self-sends
     // were filtered out of triggering).
     const explicitSelfTarget = !!(
-      senderAgentId &&
-      allRecipients.includes(senderAgentId) &&
+      senderSlug &&
+      allRecipients.includes(senderSlug) &&
       (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionAlias)
     );
-    if (senderAgentId && threadMessage?.id && !explicitSelfTarget) {
+    if (senderSlug && threadMessage?.id && !explicitSelfTarget) {
       await advanceThreadReadPointer(supabase, {
         threadId: thread.id,
-        agentId: senderAgentId,
+        sbSlug: senderSlug,
         throughMessageId: threadMessage.id,
         source: 'send_to_inbox:sender',
       });
@@ -679,13 +689,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     const selfStudioTarget = explicitSelfTarget;
 
     if (trigger !== false && !missingSenderSession) {
-      if (existingThread && senderAgentId) {
+      if (existingThread && senderSlug) {
         // Reply: fetch current participants from DB for accurate trigger resolution
         const currentParticipants = await getParticipants(supabase, thread.id);
         agentsToTrigger = resolveTriggeredAgents({
-          senderAgentId,
+          senderSlug,
           participants: currentParticipants,
-          creatorAgentId: existingThread.created_by_agent_id,
+          creatorSlug: existingThread.created_by_agent_id,
           triggerAgents,
           triggerAll,
           messageType,
@@ -697,7 +707,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         // self-message or actionable self-target like strategy kickoff)
         const actionableSelf = new Set(['task_request', 'session_resume']);
         const allowSelf = selfStudioTarget || (!!messageType && actionableSelf.has(messageType));
-        agentsToTrigger = allRecipients.filter((a) => allowSelf || a !== senderAgentId);
+        agentsToTrigger = allRecipients.filter((a) => allowSelf || a !== senderSlug);
       }
     }
 
@@ -724,21 +734,21 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // routing stamp did not persist must NOT return unqualified success —
     // for trigger:false recipients no wake follows, so an unstamped thread
     // is invisible to stamped-only polling with no retry coming.
-    const routingFailures: Array<{ agentId: string; error: string }> = [];
+    const routingFailures: Array<{ sbSlug: string; error: string }> = [];
     // Union with agentsToTrigger: actionable self-sends (session_resume /
     // task_request strategy kickoffs) wake self without an explicit
     // studio/session target and must keep dispatching.
     const routingSet = [
       ...new Set([
-        ...allRecipients.filter((a) => a !== senderAgentId || explicitSelfTarget),
+        ...allRecipients.filter((a) => a !== senderSlug || explicitSelfTarget),
         ...agentsToTrigger,
       ]),
     ];
     if (routingSet.length > 0) {
       const gateway = getAgentGateway();
 
-      for (const toAgentId of routingSet) {
-        const wake = agentsToTrigger.includes(toAgentId);
+      for (const toSlug of routingSet) {
+        const wake = agentsToTrigger.includes(toSlug);
         // Auto-resolve recipientSessionId: find the recipient's most recent
         // message on this thread to extract their sender session. This ensures
         // replies route back to the session that originated the conversation,
@@ -749,13 +759,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         // will use recipientStudioId to route to the correct studio session.
         let resolvedRecipientSessionId: string | undefined =
           effectiveRecipientSessionId || undefined;
-        const isSelfStudioMessage = selfStudioTarget && toAgentId === senderAgentId;
+        const isSelfStudioMessage = selfStudioTarget && toSlug === senderSlug;
         if (!resolvedRecipientSessionId && !isSelfStudioMessage) {
           try {
             const { data: recipientMsg } = await threadTable(supabase, 'inbox_thread_messages')
               .select('metadata')
               .eq('thread_id', thread.id)
-              .eq('sender_agent_id', toAgentId)
+              .eq('sender_agent_id', toSlug)
               .order('created_at', { ascending: false })
               .limit(1)
               .maybeSingle();
@@ -767,14 +777,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
               resolvedRecipientSessionId = recipientSender.sessionId;
               logger.debug('[ThreadTrigger] Auto-resolved recipientSessionId from thread history', {
                 threadKey,
-                toAgentId,
+                toSlug,
                 recipientSessionId: resolvedRecipientSessionId,
               });
             }
           } catch (err) {
             logger.warn('[ThreadTrigger] Failed to resolve recipientSessionId from thread', {
               threadKey,
-              toAgentId,
+              toSlug,
               error: err instanceof Error ? err.message : String(err),
             });
           }
@@ -789,7 +799,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
               const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
                 .select('session_id')
                 .eq('thread_id', thread.id)
-                .eq('agent_id', toAgentId)
+                .eq('agent_id', toSlug)
                 .maybeSingle();
               if (participant?.session_id && typeof participant.session_id === 'string') {
                 resolvedRecipientSessionId = participant.session_id;
@@ -797,7 +807,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
                   '[ThreadTrigger] Auto-resolved recipientSessionId from the participant stamp',
                   {
                     threadKey,
-                    toAgentId,
+                    toSlug,
                     recipientSessionId: resolvedRecipientSessionId,
                   }
                 );
@@ -805,7 +815,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             } catch (err) {
               logger.warn('[ThreadTrigger] Failed to read the participant stamp', {
                 threadKey,
-                toAgentId,
+                toSlug,
                 error: err instanceof Error ? err.message : String(err),
               });
             }
@@ -818,12 +828,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         // and cross-agent delegation (e.g., strategy service → owner agent
         // in group.metadata.studioId). Incidental trigger participants —
         // like a thread creator auto-woken on reply — do NOT inherit the
-        // routing, since the caller only explicitly targeted recipientAgentId.
+        // routing, since the caller only explicitly targeted recipientSlug.
         //
         // Before this fix, studio was only forwarded when `isSelfStudioMessage`
         // was true, so system/human → owner delegation lost the assigned
         // studio and fell back to route patterns / default studio.
-        const isAddressedRecipient = !recipients && toAgentId === recipientAgentId;
+        const isAddressedRecipient = !recipients && toSlug === recipientSlug;
         // Anchor provenance (spec §3b.1): only CALLER-passed targeting counts
         // as the deliberate-retarget signal. History-inferred
         // recipientSessionId is a continuity hint, never an overwrite.
@@ -832,8 +842,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           (recipientSessionId || sessionAlias || recipientStudioId || recipientStudioSlugOrHint)
         );
         const payload: AgentTriggerPayload = {
-          fromAgentId: triggerSenderId,
-          toAgentId,
+          fromSlug: triggerSenderId,
+          toSlug,
           threadId: thread.id,
           threadMessageId: threadMessage.id,
           triggerType: triggerType || 'message',
@@ -871,21 +881,21 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           const assignResult = await gateway.processTrigger({ ...payload, routeOnly: true });
           if (!assignResult.success) {
             routingFailures.push({
-              agentId: toAgentId,
+              sbSlug: toSlug,
               error: assignResult.error || 'assignment failed',
             });
             logger.warn('[ThreadTrigger] Synchronous assignment failed', {
               threadKey,
-              toAgentId,
+              toSlug,
               error: assignResult.error || 'assignment failed',
             });
           }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          routingFailures.push({ agentId: toAgentId, error: message });
+          routingFailures.push({ sbSlug: toSlug, error: message });
           logger.warn('[ThreadTrigger] Synchronous assignment failed', {
             threadKey,
-            toAgentId,
+            toSlug,
             error: message,
           });
         }
@@ -897,7 +907,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         if (wake) {
           const result = gateway.dispatchTrigger(payload);
           if (result.accepted) {
-            triggeredAgents.push(toAgentId);
+            triggeredAgents.push(toSlug);
           }
         }
       }
@@ -913,7 +923,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
               routingFailures.length === 0
                 ? `Thread message sent to ${threadKey}`
                 : `Thread message stored in ${threadKey}, but session routing FAILED for: ${routingFailures
-                    .map((f) => f.agentId)
+                    .map((f) => f.sbSlug)
                     .join(
                       ', '
                     )}. Untriggered recipients will NOT see it via inbox polling until routing succeeds — resend or re-trigger to retry assignment.`,
@@ -947,13 +957,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const hasRoutingAnchor = Boolean(
     effectiveRecipientSessionId || recipientStudioId || recipientStudioSlugOrHint
   );
-  const requiresRoutingAnchor = Boolean(senderAgentId) && messageType !== 'message';
+  const requiresRoutingAnchor = Boolean(senderSlug) && messageType !== 'message';
   const missingRoutingAnchor = requiresRoutingAnchor && !hasRoutingAnchor;
   if (missingRoutingAnchor) {
     logger.warn('send_to_inbox missing routing anchor for actionable handoff', {
       messageType,
-      recipientAgentId,
-      senderAgentId,
+      recipientSlug,
+      senderSlug,
     });
   }
 
@@ -969,7 +979,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     pcp: {
       ...existingPcp,
       sender: {
-        agentId: triggerSenderId,
+        sbSlug: triggerSenderId,
         sessionId: senderSessionId,
         studioId: senderStudioId,
       },
@@ -985,19 +995,17 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   };
 
   // Resolve canonical identity UUIDs for sender and recipient
-  const recipientSbId = await resolveIdentityId(supabase, resolved.user.id, recipientAgentId!);
-  const senderSbId = senderAgentId
-    ? await resolveIdentityId(supabase, resolved.user.id, senderAgentId)
-    : null;
+  const recipientSbId = await resolveSbId(supabase, resolved.user.id, recipientSlug!);
+  const senderSbId = senderSlug ? await resolveSbId(supabase, resolved.user.id, senderSlug) : null;
 
   const { data: message, error } = await supabase
     .from('agent_inbox')
     .insert({
       recipient_user_id: resolved.user.id,
-      recipient_agent_id: recipientAgentId!,
+      recipient_agent_id: recipientSlug!,
       recipient_sb_id: recipientSbId,
-      sender_user_id: senderAgentId ? null : resolved.user.id,
-      sender_agent_id: senderAgentId || null,
+      sender_user_id: senderSlug ? null : resolved.user.id,
+      sender_agent_id: senderSlug || null,
       sender_sb_id: senderSbId,
       subject,
       content,
@@ -1013,14 +1021,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     .single();
 
   if (error) {
-    logger.error('Failed to send inbox message', { error, recipientAgentId });
+    logger.error('Failed to send inbox message', { error, recipientSlug });
     throw new Error(`Failed to send message: ${error.message}`);
   }
 
   logger.info('Inbox message sent', {
     messageId: message.id,
-    to: recipientAgentId,
-    from: senderAgentId || 'user',
+    to: recipientSlug,
+    from: senderSlug || 'user',
     type: messageType,
     priority,
     trigger,
@@ -1040,8 +1048,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (trigger && !missingSenderSession) {
     const gateway = getAgentGateway();
     const payload: AgentTriggerPayload = {
-      fromAgentId: triggerSenderId,
-      toAgentId: recipientAgentId!,
+      fromSlug: triggerSenderId,
+      toSlug: recipientSlug!,
       inboxMessageId: message.id,
       triggerType: triggerType || 'message',
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
@@ -1059,7 +1067,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
     logger.info('Inbox message trigger dispatched (async)', {
       messageId: message.id,
-      recipientAgentId,
+      recipientSlug,
     });
 
     const result = gateway.dispatchTrigger(payload);
@@ -1087,9 +1095,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          message: `Message sent to ${recipientAgentId}${triggerResult.triggered ? ' and triggered' : ''}`,
+          message: `Message sent to ${recipientSlug}${triggerResult.triggered ? ' and triggered' : ''}`,
           messageId: message.id,
-          recipientAgentId,
+          recipientSlug,
           messageType,
           priority,
           threadKey: null,
@@ -1119,13 +1127,25 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
 /**
  * Find or create a thread. Returns the thread row with an `isNew` flag.
+ *
+ * `opts.title` is the first message's subject, which is unbounded, and is
+ * bounded here to fit `inbox_threads.title`. Truncating rather than refusing is
+ * deliberate: losing a message because its thread's label was one character too
+ * long would be a new failure introduced by a constraint meant to prevent a
+ * cosmetic one.
+ *
+ * The subject survives in full at `metadata.pcp.subject` on the message row —
+ * which is a thing the caller must do, not something this function arranges. It
+ * was not true when this comment first claimed it: nothing on the thread path
+ * stored a subject anywhere but here, so a 240-character one was truncated into
+ * the title and kept nowhere (Lumen, #641 round 2).
  */
 export async function findOrCreateThread(
   supabase: ReturnType<DataComposer['getClient']>,
   opts: {
     userId: string;
     threadKey: string;
-    creatorAgentId: string;
+    creatorSlug: string;
     title: string | null;
     participants: string[];
   }
@@ -1150,8 +1170,8 @@ export async function findOrCreateThread(
     .insert({
       thread_key: opts.threadKey,
       user_id: opts.userId,
-      created_by_agent_id: opts.creatorAgentId,
-      title: opts.title,
+      created_by_agent_id: opts.creatorSlug,
+      title: boundThreadTitle(opts.title),
     })
     .select()
     .single();
@@ -1170,9 +1190,9 @@ export async function findOrCreateThread(
   }
 
   // Add all participants
-  const participantRows = opts.participants.map((agentId) => ({
+  const participantRows = opts.participants.map((sbSlug) => ({
     thread_id: thread.id,
-    agent_id: agentId,
+    agent_id: sbSlug,
   }));
   await threadTable(supabase, 'inbox_thread_participants').insert(participantRows);
 
@@ -1189,10 +1209,10 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // the inbox with one want the thread timeline, not a silently-empty legacy
   // query. Participant membership and read-state checks are the delegate's.
   if (parsed.threadKey) {
-    if (!parsed.agentId) {
+    if (!parsed.sbSlug) {
       throw new Error(
-        'get_inbox with threadKey requires agentId — thread access is participant-scoped. ' +
-          'Pass your agentId, or use get_thread_messages directly.'
+        'get_inbox with threadKey requires sbSlug — thread access is participant-scoped. ' +
+          'Pass your sbSlug, or use get_thread_messages directly.'
       );
     }
     // Discovery filters that don't map onto thread reads must reject
@@ -1222,7 +1242,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         ...(parsed.phone ? { phone: parsed.phone } : {}),
         ...(parsed.platform ? { platform: parsed.platform } : {}),
         ...(parsed.platformId ? { platformId: parsed.platformId } : {}),
-        agentId: parsed.agentId,
+        sbSlug: parsed.sbSlug,
         threadKey: parsed.threadKey,
         limit: parsed.limit ?? 20,
         // markRead carries through: an observer that must not drain the legacy
@@ -1248,17 +1268,15 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     markRead = true,
   } = parsed;
   // Enforce identity: pinned agents can only read their own inbox.
-  // When agentId is omitted, return inbox across ALL agents (unified timeline)
+  // When sbSlug is omitted, return inbox across ALL agents (unified timeline)
   // — EXCEPT for channelPoll, where the gate below derives it from the
   // session so an agent-less poll can never read the all-agent surface.
-  let agentId = parsed.agentId
-    ? (getEffectiveAgentId(parsed.agentId) ?? parsed.agentId)
-    : undefined;
+  let sbSlug = parsed.sbSlug ? (getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug) : undefined;
 
   // Fail-closed (spec inkmail-read-state §3) — FIRST, before ANY read or
   // pointer advance: a channelPoll caller must present BOTH scopes — a
   // resolvable session AND an agent that matches that session — or it gets
-  // nothing and touches nothing. agentId is derived from the session row
+  // nothing and touches nothing. sbSlug is derived from the session row
   // when omitted and validated against it when provided (Lumen, PR #460
   // round 2: an agent-less channelPoll previously passed the gate and read
   // the all-agent legacy inbox). Unlike thread-assignment's liveness check,
@@ -1281,26 +1299,26 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         .eq('id', callerSessionId)
         .eq('user_id', resolved.user.id)
         .maybeSingle();
-      const sessionAgentId: string | null = sessionRow?.agent_id ?? null;
+      const sessionSlug: string | null = sessionRow?.agent_id ?? null;
       // Pinned identity must agree with the session's agent — otherwise a
-      // pinned caller can present another agent's session id, omit agentId,
+      // pinned caller can present another agent's session id, omit sbSlug,
       // and switch the derived read scope to that agent (Lumen, round 3).
-      const pinnedAgentId = getPinnedAgentId();
+      const pinnedSlug = getPinnedSlug();
       if (sessionErr) {
         failClosedReason = `session lookup failed: ${sessionErr.message}`;
-      } else if (!sessionRow || !sessionAgentId) {
+      } else if (!sessionRow || !sessionSlug) {
         failClosedReason = 'session not found for this user or has no agent';
-      } else if (pinnedAgentId && pinnedAgentId !== sessionAgentId) {
-        failClosedReason = `session agent '${sessionAgentId}' does not match pinned identity '${pinnedAgentId}'`;
-      } else if (agentId && agentId !== sessionAgentId) {
-        failClosedReason = `agentId '${agentId}' does not match session agent '${sessionAgentId}'`;
+      } else if (pinnedSlug && pinnedSlug !== sessionSlug) {
+        failClosedReason = `session agent '${sessionSlug}' does not match pinned identity '${pinnedSlug}'`;
+      } else if (sbSlug && sbSlug !== sessionSlug) {
+        failClosedReason = `sbSlug '${sbSlug}' does not match session agent '${sessionSlug}'`;
       } else {
-        agentId = sessionAgentId;
+        sbSlug = sessionSlug;
       }
     }
     if (failClosedReason) {
       logger.warn('channel_poll_unscoped', {
-        agentId: agentId || null,
+        sbSlug: sbSlug || null,
         sessionId: callerSessionId,
         userId: resolved.user.id,
         hint: `channelPoll scope invalid (${failClosedReason}) — returning empty (fail-closed)`,
@@ -1311,7 +1329,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             type: 'text' as const,
             text: JSON.stringify({
               success: true,
-              agentId: agentId || null,
+              sbSlug: sbSlug || null,
               unreadCount: 0,
               threadUnreadCount: 0,
               totalUnreadCount: 0,
@@ -1342,21 +1360,21 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // it afterwards is what made the count structurally zero: the same call moved
   // the pointer past everything it was about to count.
   let unreadFloor: string | null = null;
-  if (agentId) {
+  if (sbSlug) {
     const { data: readStatus, error: pointerErr } = await threadTable(
       supabase,
       'agent_inbox_read_status'
     )
       .select('last_read_at')
       .eq('user_id', resolved.user.id)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
     if (pointerErr) {
       // Fail LOUD but open: a missing floor over-reports (every message looks
       // unseen), which is the safe direction — the opposite silently empties
       // the mailbox, which is the bug being fixed.
       logger.error('[ReadState] Failed to read inbox pointer; treating inbox as fully unread', {
-        agentId,
+        sbSlug,
         userId: resolved.user.id,
         error: pointerErr.message,
       });
@@ -1405,7 +1423,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // to the remainder (Lumen #504 r1 P1). The response is re-ordered
   // newest-first for display either way.
   const consumingUnread =
-    status === 'unread' && markRead && !!agentId && !priority && !messageType && !since;
+    status === 'unread' && markRead && !!sbSlug && !priority && !messageType && !since;
   const oldestFirst = status === 'unread';
 
   let query = supabase
@@ -1416,8 +1434,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     .order('id', { ascending: oldestFirst })
     .limit(limit);
 
-  if (agentId) {
-    query = query.eq('recipient_agent_id', agentId);
+  if (sbSlug) {
+    query = query.eq('recipient_agent_id', sbSlug);
   }
   if (status === 'unread') {
     if (unreadFloor) {
@@ -1467,7 +1485,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       .eq('created_at', boundary)
       .not('id', 'in', `(${pageIds.join(',')})`)
       .order('id', { ascending: true });
-    if (agentId) tieQuery = tieQuery.eq('recipient_agent_id', agentId);
+    if (sbSlug) tieQuery = tieQuery.eq('recipient_agent_id', sbSlug);
     tieQuery = tieQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
     const { data: siblings, error: tieError } = await tieQuery;
     if (tieError) {
@@ -1488,8 +1506,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     .from('agent_inbox')
     .select('*', { count: 'exact', head: true })
     .eq('recipient_user_id', resolved.user.id);
-  if (agentId) {
-    countQuery = countQuery.eq('recipient_agent_id', agentId);
+  if (sbSlug) {
+    countQuery = countQuery.eq('recipient_agent_id', sbSlug);
   }
   if (unreadFloor) {
     countQuery = countQuery.gt('created_at', unreadFloor);
@@ -1523,7 +1541,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     const newest = messages[0] as { id: string; created_at: string };
     const advance = await advanceAgentInboxReadPointer(supabase, {
       userId: resolved.user.id,
-      agentId: agentId!,
+      sbSlug: sbSlug!,
       throughMessageId: newest.id,
       source: 'get_inbox:markRead',
     });
@@ -1534,7 +1552,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
 
   // Get threads with unread counts and preview messages.
-  // Works with or without agentId — when omitted, finds threads for ALL agents
+  // Works with or without sbSlug — when omitted, finds threads for ALL agents
   // (used by `sb mission` unified timeline).
   interface ThreadSummary {
     threadKey: string;
@@ -1543,7 +1561,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     unreadCount: number;
     lastMessageAt: string | null;
     previewMessages: Array<{
-      senderAgentId: string;
+      senderSlug: string;
       content: string;
       messageType: string;
       createdAt: string;
@@ -1569,7 +1587,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     if (res.error) {
       logger.error('channel_poll_query_failed', {
         query: queryLabel,
-        agentId: agentId || null,
+        sbSlug: sbSlug || null,
         sessionId: callerSessionId,
         error: res.error.message,
       });
@@ -1598,7 +1616,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       // cause missed messages when lastPollTime advances past the
       // thread's updated_at between polls.
       let threads: ThreadPageRow[] | null = null;
-      if (channelPoll && agentId) {
+      if (channelPoll && sbSlug) {
         // Delivery polls page by EXACT candidacy in SQL (Lumen, PR #473
         // round 3): candidacy compares the read pointer against the latest
         // MESSAGE timestamp — thread.updated_at is bumped AFTER the message
@@ -1610,14 +1628,14 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           'get_unread_thread_candidates',
           {
             p_user_id: resolved.user.id,
-            p_agent_id: agentId,
+            p_agent_id: sbSlug,
             p_session_id: callerSessionId ?? undefined,
             p_limit: THREAD_PAGE_LIMIT,
           }
         );
         if (candErr) {
           logger.error('channel_poll_candidates_failed', {
-            agentId,
+            sbSlug,
             sessionId: callerSessionId,
             error: candErr.message,
           });
@@ -1656,13 +1674,13 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // list_threads(status='open') is the explicit work-list filter.
         let recencyQuery = threadTable(supabase, 'inbox_threads')
           .select(
-            agentId
+            sbSlug
               ? 'id, thread_key, title, user_id, created_by_agent_id, updated_at, inbox_thread_participants!inner(agent_id)'
               : 'id, thread_key, title, user_id, created_by_agent_id, updated_at'
           )
           .eq('user_id', resolved.user.id);
-        if (agentId) {
-          recencyQuery = recencyQuery.eq('inbox_thread_participants.agent_id', agentId);
+        if (sbSlug) {
+          recencyQuery = recencyQuery.eq('inbox_thread_participants.agent_id', sbSlug);
         }
         const data = checkedRead<ThreadPageRow[]>(
           await recencyQuery.order('updated_at', { ascending: false }).limit(THREAD_PAGE_LIMIT),
@@ -1692,14 +1710,14 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
         // Batch 2: all read statuses for all threads (was N queries)
         const readStatusByThread = new Map<string, string | null>();
-        if (agentId) {
+        if (sbSlug) {
           const allReadStatuses = checkedRead<
             Array<{ thread_id: string; last_read_at: string | null }>
           >(
             await threadTable(supabase, 'inbox_thread_read_status')
               .select('thread_id, last_read_at')
               .in('thread_id', tIds)
-              .eq('agent_id', agentId),
+              .eq('agent_id', sbSlug),
             'thread_read_status'
           );
           for (const rs of allReadStatuses || []) {
@@ -1753,8 +1771,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
           let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
           let joinedAt: string | null = null;
-          if (agentId) {
-            const callerPart = parts.find((p) => p.agent_id === agentId);
+          if (sbSlug) {
+            const callerPart = parts.find((p) => p.agent_id === sbSlug);
             joinedAt = callerPart?.joined_at || null;
           }
 
@@ -1775,7 +1793,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             .slice(0, 3)
             .reverse()
             .map((m) => ({
-              senderAgentId: m.sender_agent_id,
+              senderSlug: m.sender_agent_id,
               content: m.content,
               messageType: m.message_type,
               createdAt: m.created_at,
@@ -1797,7 +1815,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // Channel poll studio filtering (defense-in-depth): when channelPoll=true
         // and no session_id filter was applied, fall back to message-metadata-based
         // studio ownership check. Uses the already-batched messages (no extra queries).
-        if (channelPoll && agentId && !callerSessionId) {
+        if (channelPoll && sbSlug && !callerSessionId) {
           const reqCtx = getRequestContext();
           const sessCtx = getSessionContext();
           const callerStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
@@ -1812,7 +1830,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               const tid = keyToId.get(thread.threadKey);
               if (!tid) return true; // safety fallback
               const ourMsgs = (msgsByThread.get(tid) || [])
-                .filter((m) => m.sender_agent_id === agentId)
+                .filter((m) => m.sender_agent_id === sbSlug)
                 .slice(0, 5);
               const owned = isThreadOwnedByStudio(ourMsgs, callerStudioId);
               if (!owned) {
@@ -1846,7 +1864,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          ...(agentId ? { agentId } : { allAgents: true }),
+          ...(sbSlug ? { sbSlug } : { allAgents: true }),
           unreadCount: inboxUnreadCount,
           threadUnreadCount,
           totalUnreadCount,
@@ -1864,8 +1882,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             messageType: m.message_type,
             priority: m.priority,
             status: m.status,
-            senderAgentId: m.sender_agent_id,
-            recipientAgentId: m.recipient_agent_id,
+            senderSlug: m.sender_agent_id,
+            recipientSlug: m.recipient_agent_id,
             threadKey: m.thread_key || null,
             recipientSessionId: m.recipient_session_id,
             relatedArtifactUri: m.related_artifact_uri,
@@ -1899,7 +1917,7 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
   const parsed = updateInboxMessageSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { messageId, agentId, status } = parsed;
+  const { messageId, sbSlug, status } = parsed;
 
   // Try legacy agent_inbox first
   const { data: existing } = await supabase
@@ -1907,7 +1925,7 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
     .select('*')
     .eq('id', messageId)
     .eq('recipient_user_id', resolved.user.id)
-    .eq('recipient_agent_id', agentId)
+    .eq('recipient_agent_id', sbSlug)
     .maybeSingle();
 
   if (existing) {
@@ -1931,7 +1949,7 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
       throw new Error(`Failed to update message: ${updateError.message}`);
     }
 
-    logger.info('Inbox message updated', { messageId, agentId, newStatus: status });
+    logger.info('Inbox message updated', { messageId, sbSlug, newStatus: status });
 
     return {
       content: [
@@ -1972,7 +1990,7 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
     const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
       .select('agent_id')
       .eq('thread_id', threadMsg.thread_id)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
 
     if (!participant) {
@@ -1987,7 +2005,7 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
     if (status === 'read' || status === 'acknowledged' || status === 'completed') {
       const advanced = await advanceThreadReadPointer(supabase, {
         threadId: threadMsg.thread_id,
-        agentId,
+        sbSlug,
         throughMessageId: messageId,
         source: 'update_inbox_message:thread-fallback',
       });
@@ -2001,7 +2019,7 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
     logger.info('Thread message status updated (via read pointer)', {
       messageId,
       threadId: threadMsg.thread_id,
-      agentId,
+      sbSlug,
       newStatus: status,
     });
 
@@ -2030,7 +2048,7 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
   const parsed = markInboxReadSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
 
   // Resolve the requested cutoff to a REAL message before touching the pointer.
   // The old code wrote `before || now()` straight into the row, which is the
@@ -2046,7 +2064,7 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
     .from('agent_inbox')
     .select('id, created_at')
     .eq('recipient_user_id', resolved.user.id)
-    .eq('recipient_agent_id', agentId)
+    .eq('recipient_agent_id', sbSlug)
     .order('created_at', { ascending: false })
     .limit(1);
   if (parsed.throughMessageId) {
@@ -2069,7 +2087,7 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
           type: 'text' as const,
           text: JSON.stringify({
             success: true,
-            agentId,
+            sbSlug,
             lastReadAt: null,
             advanced: false,
             message: parsed.throughMessageId
@@ -2085,7 +2103,7 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
 
   const result = await advanceAgentInboxReadPointer(supabase, {
     userId: resolved.user.id,
-    agentId,
+    sbSlug,
     throughMessageId: anchor.id,
     source: 'mark_inbox_read',
   });
@@ -2094,7 +2112,7 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
     throw new Error('Failed to mark inbox read: read pointer advance failed (see server logs)');
   }
 
-  logger.info('Inbox marked as read', { agentId, lastReadAt: result.lastReadAt });
+  logger.info('Inbox marked as read', { sbSlug, lastReadAt: result.lastReadAt });
 
   // Report the MONOTONIC RESULT, never the requested anchor (Lumen #504 r1):
   // when the stored pointer is already ahead, the DB correctly keeps it — and
@@ -2106,7 +2124,7 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          agentId,
+          sbSlug,
           lastReadAt: result.lastReadAt,
           advanced: result.changed,
           message: result.changed
@@ -2124,14 +2142,14 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
   const parsed = getAgentStatusSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { agentId } = parsed;
+  const { sbSlug } = parsed;
 
   // Get latest session for this agent
   const { data: latestSession } = await supabase
     .from('sessions')
     .select('*')
     .eq('user_id', resolved.user.id)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .order('started_at', { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -2140,7 +2158,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
   const { data: readStatus } = await threadTable(supabase, 'agent_inbox_read_status')
     .select('last_read_at')
     .eq('user_id', resolved.user.id)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .maybeSingle();
 
   // Expired messages are excluded here to match get_inbox's predicate. These
@@ -2152,7 +2170,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
     .from('agent_inbox')
     .select('*', { count: 'exact', head: true })
     .eq('recipient_user_id', resolved.user.id)
-    .eq('recipient_agent_id', agentId);
+    .eq('recipient_agent_id', sbSlug);
   if (readStatus?.last_read_at) {
     unreadQuery = unreadQuery.gt('created_at', readStatus.last_read_at);
   }
@@ -2163,7 +2181,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
     .from('agent_inbox')
     .select('*', { count: 'exact', head: true })
     .eq('recipient_user_id', resolved.user.id)
-    .eq('recipient_agent_id', agentId)
+    .eq('recipient_agent_id', sbSlug)
     .eq('priority', 'urgent');
   if (readStatus?.last_read_at) {
     urgentQuery = urgentQuery.gt('created_at', readStatus.last_read_at);
@@ -2175,7 +2193,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
     .from('studios')
     .select('id, branch, worktree_path, purpose, status, work_type, session_id, created_at')
     .eq('user_id', resolved.user.id)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .in('status', ['active', 'idle'])
     .order('created_at', { ascending: false });
 
@@ -2197,7 +2215,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          agentId,
+          sbSlug,
           status: agentStatus,
           inbox: {
             unreadCount: unreadCount || 0,
@@ -2236,16 +2254,16 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
   const userId = resolved.user.id;
 
   // Discover agents
-  let agentIds = parsed.agentIds;
-  if (!agentIds?.length) {
+  let sbSlugs = parsed.sbSlugs;
+  if (!sbSlugs?.length) {
     const { data: identities } = await supabase
       .from('agent_identities')
       .select('agent_id')
       .eq('user_id', userId);
-    agentIds = (identities || []).map((i: { agent_id: string }) => i.agent_id);
+    sbSlugs = (identities || []).map((i: { agent_id: string }) => i.agent_id);
   }
 
-  if (!agentIds.length) {
+  if (!sbSlugs.length) {
     return {
       content: [{ type: 'text' as const, text: JSON.stringify({ success: true, agents: [] }) }],
     };
@@ -2268,7 +2286,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       .from('sessions')
       .select('id, agent_id, lifecycle, current_phase, started_at, ended_at, studio_id, updated_at')
       .eq('user_id', userId)
-      .in('agent_id', agentIds)
+      .in('agent_id', sbSlugs)
       .or(`ended_at.is.null,started_at.gte.${todayCutoff}`)
       .order('started_at', { ascending: false })
       .then((r: { data: unknown }) => r.data || []),
@@ -2279,7 +2297,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
     // candidacy; Lumen, PR #613).
     threadTable(supabase, 'inbox_thread_participants')
       .select('thread_id, agent_id, joined_at')
-      .in('agent_id', agentIds)
+      .in('agent_id', sbSlugs)
       .then((r: { data: unknown }) => r.data || [])
       .catch(() => []), // Thread tables may not exist yet
 
@@ -2288,7 +2306,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       .from('studios')
       .select('id, agent_id')
       .eq('user_id', userId)
-      .in('agent_id', agentIds)
+      .in('agent_id', sbSlugs)
       .in('status', ['active', 'idle'])
       .then((r: { data: unknown }) => r.data || []),
   ]);
@@ -2306,8 +2324,8 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
   // agents on the Mission path (Lumen #504 r2 P1). Min over REQUESTED agents
   // only, and only when none of them is pointer-less.
   let minPointer: string | null = null;
-  if (agentIds.every((a) => readPointerMap.has(a))) {
-    for (const a of agentIds) {
+  if (sbSlugs.every((a) => readPointerMap.has(a))) {
+    for (const a of sbSlugs) {
       const ts = readPointerMap.get(a)!;
       if (!minPointer || ts < minPointer) minPointer = ts;
     }
@@ -2328,7 +2346,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
         .from('agent_inbox')
         .select('recipient_agent_id, created_at')
         .eq('recipient_user_id', userId)
-        .in('recipient_agent_id', agentIds)
+        .in('recipient_agent_id', sbSlugs)
         // Expiry parity with get_inbox/get_agent_status (Lumen #504 r2 P2):
         // Mission's total must not disagree with the surfaces it links to.
         .or(`expires_at.is.null,expires_at.gt.${now.toISOString()}`);
@@ -2364,7 +2382,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       const { data } = await threadTable(supabase, 'inbox_thread_read_status')
         .select('thread_id, agent_id, last_read_at')
         .in('thread_id', participantThreadIds)
-        .in('agent_id', agentIds);
+        .in('agent_id', sbSlugs);
       return (data || []) as Array<{
         thread_id: string;
         agent_id: string;
@@ -2400,7 +2418,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
   }
 
   // Thread unreads: build per-agent read pointer lookup, then count messages
-  const threadReadMap = new Map<string, string>(); // "threadId:agentId" → last_read_at
+  const threadReadMap = new Map<string, string>(); // "threadId:sbSlug" → last_read_at
   for (const rs of threadReadStatuses) {
     threadReadMap.set(`${rs.thread_id}:${rs.agent_id}`, rs.last_read_at);
   }
@@ -2409,7 +2427,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
   // remember when each participant joined: a message older than the join is
   // history the participant was never handed, not unread mail.
   const agentThreads = new Map<string, Set<string>>();
-  const joinedAtMap = new Map<string, string>(); // "threadId:agentId" → joined_at
+  const joinedAtMap = new Map<string, string>(); // "threadId:sbSlug" → joined_at
   const participantThreadIdSet = new Set(participantThreadIds);
   for (const p of allParticipation as Array<{
     thread_id: string;
@@ -2475,8 +2493,8 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
   }
 
   // Assemble summaries
-  const agents = agentIds.map((agentId) => {
-    const sessions = sessionsByAgent.get(agentId) || [];
+  const agents = sbSlugs.map((sbSlug) => {
+    const sessions = sessionsByAgent.get(sbSlug) || [];
     const latest = sessions[0] || null; // already sorted by started_at DESC
 
     const byLifecycle: Record<string, number> = {};
@@ -2492,19 +2510,19 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       return !Number.isNaN(updatedMs) && now.getTime() - updatedMs < staleThresholdMs;
     }).length;
 
-    const inboxUnread = inboxUnreadMap.get(agentId) || 0;
-    const threadUnread = threadUnreadMap.get(agentId) || 0;
+    const inboxUnread = inboxUnreadMap.get(sbSlug) || 0;
+    const threadUnread = threadUnreadMap.get(sbSlug) || 0;
 
     return {
-      agentId,
+      sbSlug,
       inboxUnread,
       threadUnread,
       totalUnread: inboxUnread + threadUnread,
       activeSessions: sessions.length,
       sessionsByLifecycle: byLifecycle,
       generating,
-      sessionsToday: todayCountMap.get(agentId) || 0,
-      studioCount: studioCountMap.get(agentId) || 0,
+      sessionsToday: todayCountMap.get(sbSlug) || 0,
+      studioCount: studioCountMap.get(sbSlug) || 0,
       latestSession: latest
         ? {
             id: latest.id,
@@ -2534,14 +2552,14 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      'Send a message to agent(s) or reply to a thread. Unified tool for all cross-agent messaging.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\nReply to thread: send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row.\n\nFor existing threads, reply semantics are automatic: closed threads still accept replies (closed is a work-state signal, not a lock — the reply is stored and wakes its recipients without reopening the thread), and smart trigger defaults apply (1:1 → other participant; group with explicit recipient → that recipient; group non-creator → creator; group creator → all others). Override with triggerAll or triggerAgents.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      'Send a message to agent(s) or reply to a thread. Unified tool for all cross-agent messaging.\n\nSingle recipient: send_to_inbox(recipientSlug: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\nReply to thread: send_to_inbox(recipientSlug: "lumen", threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row.\n\nFor existing threads, reply semantics are automatic: closed threads still accept replies (closed is a work-state signal, not a lock — the reply is stored and wakes its recipients without reopening the thread), and smart trigger defaults apply (1:1 → other participant; group with explicit recipient → that recipient; group non-creator → creator; group creator → all others). Override with triggerAll or triggerAgents.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },
   {
     name: 'get_inbox',
     description:
-      'Get messages from an agent\'s inbox. Returns UNSEEN messages by default — those newer than your read pointer, not rows whose status column says "unread". `unreadCount` is measured before this call advances anything, so it reports the backlog you were handed rather than what\'s left after reading it; `truncated: true` means `limit` cut that backlog short. Reading advances your pointer only over messages this call actually returned — pass markRead:false to observe without draining (watchers and pollers with their own cursor must). Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending. Pass threadKey to read a conversation thread instead — this aliases through to get_thread_messages (thread messages are stored separately from the legacy inbox) and requires agentId.',
+      'Get messages from an agent\'s inbox. Returns UNSEEN messages by default — those newer than your read pointer, not rows whose status column says "unread". `unreadCount` is measured before this call advances anything, so it reports the backlog you were handed rather than what\'s left after reading it; `truncated: true` means `limit` cut that backlog short. Reading advances your pointer only over messages this call actually returned — pass markRead:false to observe without draining (watchers and pollers with their own cursor must). Omit sbSlug to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending. Pass threadKey to read a conversation thread instead — this aliases through to get_thread_messages (thread messages are stored separately from the legacy inbox) and requires sbSlug.',
     schema: getInboxSchema,
     handler: handleGetInbox,
   },
@@ -2568,7 +2586,7 @@ export const inboxToolDefinitions = [
   {
     name: 'get_agent_summaries',
     description:
-      'Get summaries for all agents in one call. Returns per-agent unread counts (legacy inbox + thread-aware with proper per-agent read status), active session count, and latest session lifecycle/phase. Ideal for dashboards and mission control. Omit agentIds to auto-discover all agents.',
+      'Get summaries for all agents in one call. Returns per-agent unread counts (legacy inbox + thread-aware with proper per-agent read status), active session count, and latest session lifecycle/phase. Ideal for dashboards and mission control. Omit sbSlugs to auto-discover all agents.',
     schema: getAgentSummariesSchema,
     handler: handleGetAgentSummaries,
   },

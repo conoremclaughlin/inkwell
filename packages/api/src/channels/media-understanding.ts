@@ -4,8 +4,8 @@ import {
   normalizeBaseUrl,
   parseIntEnv,
   parseProviderList,
+  buildTemplatedCommand,
   runShellCommand,
-  shellEscape,
   truncate,
 } from './provider-utils';
 
@@ -145,11 +145,12 @@ class CliMediaAnalysisProvider implements MediaAnalysisProvider {
     const commandTemplate = input.type === 'image' ? this.imageCommand : this.videoCommand;
     if (!commandTemplate) return undefined;
 
-    const command = commandTemplate
-      .replace(/\{input\}/g, shellEscape(input.filePath))
-      .replace(/\{mime\}/g, shellEscape(normalizeMime(input.contentType, input.type)));
+    const { command, env } = buildTemplatedCommand(commandTemplate, {
+      input: input.filePath,
+      mime: normalizeMime(input.contentType, input.type),
+    });
 
-    const result = await runShellCommand(command, this.timeoutMs);
+    const result = await runShellCommand(command, this.timeoutMs, env);
     if (result.timedOut || result.code !== 0) {
       logger.warn('Media analysis CLI provider failed', {
         mediaType: input.type,

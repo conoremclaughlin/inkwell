@@ -55,14 +55,14 @@ export function ActivityLog() {
         </div>
         <div className="space-y-0.5">
           {agents.map((agent) => {
-            const color = AGENT_COLORS[agent.agentId] ?? '#888';
+            const color = AGENT_COLORS[agent.sbSlug] ?? '#888';
             const running = agent.lifecycle === 'running';
             // No session at all = offline. Idle is a real state (session
             // parked between turns); offline means nothing to report.
             const offline = !agent.lifecycle;
             return (
               <div
-                key={agent.agentId}
+                key={agent.sbSlug}
                 className="flex items-center gap-1.5 text-xs"
                 style={{ fontFamily: skin.fonts.mono, fontSize: '10px' }}
               >
@@ -107,7 +107,7 @@ export function ActivityLog() {
           </div>
         ) : (
           activity.map((event) => {
-            const color = event.agentId ? (AGENT_COLORS[event.agentId] ?? '#888') : '#888';
+            const color = event.sbSlug ? (AGENT_COLORS[event.sbSlug] ?? '#888') : '#888';
             const icon = TYPE_ICONS[event.type] ?? '·';
             const failed = event.type === 'error' || event.type === 'inkmail_fail';
             return (
@@ -123,9 +123,9 @@ export function ActivityLog() {
                   >
                     {icon}
                   </span>
-                  {event.agentId && (
+                  {event.sbSlug && (
                     <span className="font-bold shrink-0" style={{ color }}>
-                      {event.agentId}
+                      {event.sbSlug}
                     </span>
                   )}
                   <span className="shrink-0" style={{ color: skin.colors.textMuted }}>

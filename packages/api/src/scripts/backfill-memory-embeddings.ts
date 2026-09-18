@@ -11,6 +11,7 @@ import {
 import { EmbeddingRouter } from '../services/embeddings/router';
 import { getVettedEmbeddingModel } from '../services/embeddings/vetted-models';
 import { env } from '../config/env';
+import { describeBackfillScope } from './backfill-memory-scope';
 
 type MemoryRow = Database['public']['Tables']['memories']['Row'];
 
@@ -47,7 +48,7 @@ async function main() {
     );
   }
 
-  const agentId = process.env.BACKFILL_MEMORY_AGENT_ID;
+  const sbSlug = process.env.BACKFILL_MEMORY_AGENT_ID;
   const topic = process.env.BACKFILL_MEMORY_TOPIC;
   const memoryId = process.env.BACKFILL_MEMORY_ID;
   const batchSize = parsePositiveInt(process.env.BACKFILL_MEMORY_BATCH_SIZE, DEFAULT_BATCH_SIZE);
@@ -87,7 +88,9 @@ async function main() {
   const failures: Array<{ memoryId: string; message: string }> = [];
 
   console.log(
-    `[memory-embedding-backfill] user=${userId} agent=${agentId || '*'} memory=${memoryId || '*'} topic=${topic || '*'} ` +
+    // Scope selectors may be private. Report only whether filters are active,
+    // never environment-derived identifiers or topics.
+    `[memory-embedding-backfill] ${describeBackfillScope({ sbSlug, memoryId, topic })} ` +
       `offset=${startOffset} limit=${limit ?? 'all'} batchSize=${batchSize} force=${force} dryRun=${dryRun} ` +
       `continueOnError=${continueOnError} rowAttempts=${maxRowAttempts} ` +
       `mode=${env.MEMORY_EXTRACTION_MODE} chunkVersion=${MEMORY_EMBEDDING_CHUNKS_VERSION}`
@@ -106,8 +109,8 @@ async function main() {
       .order('created_at', { ascending: true })
       .range(cursor, cursor + remaining - 1);
 
-    if (agentId) {
-      query = query.eq('agent_id', agentId);
+    if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
     }
 
     if (topic?.trim()) {

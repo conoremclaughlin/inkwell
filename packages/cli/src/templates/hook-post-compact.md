@@ -1,6 +1,6 @@
 ## Post-Compaction Context (Inkwell)
 
-Agent: {{AGENT_ID}}
+Agent: {{SB_SLUG}}
 
 {{IDENTITY_BLOCK}}
 

@@ -54,6 +54,14 @@ chmod +x "$work/stubs/npx" "$work/stubs/yarn"
 PATH="$work/stubs:$PATH"
 export PATH
 
+# The staged-file guard the replay calls refuses to run without a private-marker
+# list (see scripts/check-staged-files.sh, MARKERS). This suite is about the
+# replay, so it supplies an empty list: the opt-out, made explicit.
+markers_fixture="$work/private-markers"
+printf '# empty on purpose: this suite exercises the replay, not the markers\n' > "$markers_fixture"
+INK_PRIVATE_MARKERS="$markers_fixture"
+export INK_PRIVATE_MARKERS
+
 pass=0
 fail=0
 ok() {
@@ -194,6 +202,37 @@ out=$(git -C "$r" push -u origin topic 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "a new branch pushes" || bad "a new branch pushes" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 c=$(echo "$out" | grep -c -- '^--- ')
 [ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $st" && ok "a new branch replays only the commits no remote has" || bad "a new branch replays only the commits no remote has" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
+
+# An EXISTING ref whose remote head is behind: merging an up-to-date main in
+# must not replay main's history. Those commits are already at the destination,
+# so they are not leaving the machine, and re-scanning them blocks the merge
+# without protecting anything. The range for an existing ref used to be
+# `remote_sha..local_sha` alone, which made every stale branch unpushable as
+# soon as a commit on main tripped a guard — and the commits that carry the
+# guards' own fixtures do exactly that.
+r=$(new_pair stalemerge "$hooks_dir")
+commit_file "$r" a.txt 'one' 'feat: base'
+git -C "$r" push -q -u origin main >/dev/null 2>&1
+git -C "$r" checkout -q -b topic
+commit_file "$r" t.txt 'topic' 'feat: on topic'
+git -C "$r" push -q -u origin topic >/dev/null 2>&1
+# main moves on, carrying a commit the guard refuses, pushed past the hooks
+# exactly as a pre-guard commit would have been.
+git -C "$r" checkout -q main
+commit_file "$r" legacy.txt 'x' 'chore: pre-guard commit on main
+
+SUPABASE_SECRET_KEY=STALEMERGE0000' --no-verify
+git -C "$r" -c core.hooksPath="$work/none" push -q origin main >/dev/null 2>&1
+# the stale branch catches up
+git -C "$r" checkout -q topic
+printf 'merge: bring main into topic\n' > "$r/.git/MSG"
+git -C "$r" merge -q --no-ff --no-verify -F "$r/.git/MSG" main >/dev/null 2>&1
+mt=$(git -C "$r" rev-parse --short HEAD)
+out=$(git -C "$r" push origin topic 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a stale branch that merges main still pushes" || bad "a stale branch that merges main still pushes" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -- '^--- ')
+[ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $mt" && ok "merging main replays only the merge commit, not main's history" || bad "merging main replays only the merge commit, not main's history" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'STALEMERGE0000' && bad "the merged-in history's values are never printed" "value bytes in output" || ok "the merged-in history's values are never printed"
 
 # A credential file introduced only in a merge resolution (Lumen r1 #2),
 # pushed for real.

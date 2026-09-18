@@ -11,11 +11,11 @@ import { extractLocalToolCalls, stripLocalToolBlocks } from './chat.js';
 describe('extractLocalToolCalls — format resilience', () => {
   it('parses canonical ink-tool fences (unchanged)', () => {
     const calls = extractLocalToolCalls(
-      'Let me check.\n```ink-tool\n{"tool":"get_inbox","args":{"agentId":"myra"}}\n```\ndone'
+      'Let me check.\n```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"myra"}}\n```\ndone'
     );
     expect(calls).toHaveLength(1);
     expect(calls[0]!.tool).toBe('get_inbox');
-    expect(calls[0]!.args).toEqual({ agentId: 'myra' });
+    expect(calls[0]!.args).toEqual({ sbSlug: 'myra' });
     expect(calls[0]!.variantFormat).toBeUndefined();
   });
 

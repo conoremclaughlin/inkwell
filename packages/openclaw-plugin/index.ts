@@ -8,7 +8,7 @@
  * Config:
  *   serverUrl     - PCP server URL (default: http://localhost:3001)
  *   accessToken   - PCP access token (or reads from ~/.ink/auth.json)
- *   agentId       - Agent identity (or reads from ~/.ink/config.json)
+ *   sbSlug       - Agent identity (or reads from ~/.ink/config.json)
  *   autoBootstrap - Inject identity context before each turn (default: true)
  *   autoSessionEnd - End PCP session on agent_end (default: true)
  */
@@ -25,6 +25,8 @@ import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 interface PcpConfig {
   serverUrl: string;
   accessToken?: string;
+  sbSlug?: string;
+  /** Pre-rename name for sbSlug, still present in users' OpenClaw configs. */
   agentId?: string;
   autoBootstrap: boolean;
   autoSessionEnd: boolean;
@@ -33,6 +35,8 @@ interface PcpConfig {
 interface PcpUserConfig {
   userId?: string;
   email?: string;
+  sbMapping?: Record<string, string>;
+  /** Pre-rename name for sbMapping. ~/.ink/config.json is the user's file; nothing rewrites it. */
   agentMapping?: Record<string, string>;
 }
 
@@ -71,16 +75,18 @@ function readJsonFile<T>(path: string): T | null {
   }
 }
 
-function resolveAgentId(pluginAgentId?: string): string | null {
-  if (pluginAgentId) return pluginAgentId;
+/** Exported so the identity-compat regression exercises THIS resolver, not a copy. */
+export function resolveSlug(pluginSlug?: string): string | null {
+  if (pluginSlug) return pluginSlug;
 
-  // Check ~/.ink/config.json agentMapping
+  // Check ~/.ink/config.json sbMapping (agentMapping is its pre-rename name)
   const config = readJsonFile<PcpUserConfig>(join(homedir(), '.ink', 'config.json'));
-  if (config?.agentMapping?.openclaw) return config.agentMapping.openclaw;
+  const mapping = config?.sbMapping || config?.agentMapping;
+  if (mapping?.openclaw) return mapping.openclaw;
 
   // Fall back to first mapping
-  if (config?.agentMapping) {
-    const ids = Object.values(config.agentMapping);
+  if (mapping) {
+    const ids = Object.values(mapping);
     if (ids.length > 0) return ids[0];
   }
 
@@ -172,10 +178,10 @@ class PcpClient {
 // Context Formatting
 // ============================================================================
 
-function formatBootstrapContext(bootstrap: BootstrapResponse, agentId: string): string {
+function formatBootstrapContext(bootstrap: BootstrapResponse, sbSlug: string): string {
   const sections: string[] = [];
 
-  sections.push(`<pcp-context agentId="${agentId}">`);
+  sections.push(`<pcp-context sbSlug="${sbSlug}">`);
 
   // Constitution: identity (self), values, soul
   if (bootstrap.identityFiles?.self) {
@@ -222,7 +228,10 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
   const autoBootstrap = pluginConfig.autoBootstrap ?? true;
   const autoSessionEnd = pluginConfig.autoSessionEnd ?? true;
 
-  const agentId = resolveAgentId(pluginConfig.agentId);
+  // Accept the pre-rename key: the manifest still declares it because nothing
+  // rewrites a user's OpenClaw config, and reading only sbSlug would silently
+  // drop a working configured identity (Lumen, PR #635). We only ever WRITE sbSlug.
+  const sbSlug = resolveSlug(pluginConfig.sbSlug ?? pluginConfig.agentId);
   const accessToken = resolveAccessToken(pluginConfig.accessToken);
 
   if (!accessToken) {
@@ -233,10 +242,10 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
     return;
   }
 
-  if (!agentId) {
+  if (!sbSlug) {
     api.logger.warn(
-      'pcp: no agent ID resolved. Set plugins.entries.pcp.config.agentId ' +
-        'or add an openclaw entry to ~/.ink/config.json agentMapping. PCP hooks disabled.'
+      'pcp: no SB slug resolved. Set plugins.entries.pcp.config.sbSlug ' +
+        'or add an openclaw entry to ~/.ink/config.json sbMapping. PCP hooks disabled.'
     );
     return;
   }
@@ -244,7 +253,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
   const userId = resolveUserId();
   const client = new PcpClient(serverUrl, accessToken);
 
-  api.logger.info?.(`pcp: initialized (agent=${agentId}, server=${serverUrl})`);
+  api.logger.info?.(`pcp: initialized (agent=${sbSlug}, server=${serverUrl})`);
 
   // --------------------------------------------------------------------------
   // Hook: auto-bootstrap — inject PCP identity context before each agent turn
@@ -255,7 +264,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
       try {
         const result = (await client.callTool('bootstrap', {
           ...(userId ? { userId } : {}),
-          agentId,
+          sbSlug,
         })) as BootstrapResponse | null;
 
         if (!result) {
@@ -263,7 +272,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
           return;
         }
 
-        const context = formatBootstrapContext(result, agentId);
+        const context = formatBootstrapContext(result, sbSlug);
         api.logger.info?.(`pcp: injected ${context.length} chars of identity context`);
 
         return { prependContext: context };
@@ -282,7 +291,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
       try {
         await client.callTool('end_session', {
           ...(userId ? { userId } : {}),
-          agentId,
+          sbSlug,
           summary: event.success
             ? `Agent turn completed (${event.durationMs ? Math.round(event.durationMs / 1000) + 's' : 'unknown duration'})`
             : `Agent turn failed: ${event.error ?? 'unknown error'}`,
@@ -310,7 +319,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
     async execute() {
       try {
         const result = (await client.callTool('get_identity', {
-          agentId,
+          sbSlug,
           file: 'identity',
         })) as { content?: string } | null;
 
@@ -322,7 +331,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
                 {
                   connected: true,
                   server: serverUrl,
-                  agentId,
+                  sbSlug,
                   identityLoaded: !!result?.content,
                 },
                 null,
@@ -340,7 +349,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
                 {
                   connected: false,
                   server: serverUrl,
-                  agentId,
+                  sbSlug,
                   error: String(err),
                 },
                 null,

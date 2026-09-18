@@ -11,7 +11,7 @@ import type { DataComposer } from '../../data/composer';
 import type { ChannelType, AgentResponse, ResponseFormat, OutboundMedia } from '../../agent/types';
 import { logger } from '../../utils/logger';
 import { hasDeliveryEvidence } from '../../services/channel-forward.js';
-import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
+import { getPinnedSlug, getRequestContext } from '../../utils/request-context';
 import { resolveAttributedSession } from './caller-identity';
 
 // Response result returned by the callback (optional — void is still accepted)
@@ -102,14 +102,14 @@ interface TtsConfig {
 async function resolveAgentDefaultVoice(dataComposer: DataComposer): Promise<string | undefined> {
   try {
     const reqCtx = getRequestContext();
-    const agentId = reqCtx?.agentId || getPinnedAgentId();
-    if (!agentId) return undefined;
+    const sbSlug = reqCtx?.sbSlug || getPinnedSlug();
+    if (!sbSlug) return undefined;
 
     const { data } = await dataComposer
       .getClient()
       .from('agent_identities')
       .select('tts_config')
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .not('tts_config', 'is', null)
       .limit(1)
       .single();
@@ -424,8 +424,8 @@ interface PendingMessage {
   content: string;
   timestamp: Date;
   read: boolean;
-  /** Target agent ID — scopes delivery to the right CLI session */
-  agentId?: string;
+  /** Target SB slug — scopes delivery to the right CLI session */
+  sbSlug?: string;
   /** Target session ID — for precise routing */
   sessionId?: string;
 }
@@ -465,12 +465,12 @@ export async function handleGetPendingMessages(
 
     // Scope by calling agent + session — prevents cross-agent and
     // cross-session message leaks. Uses request context for identity.
-    const callerAgentId = getPinnedAgentId();
+    const callerSlug = getPinnedSlug();
     const reqCtx = getRequestContext();
     const callerSessionId = reqCtx?.sessionId;
 
-    if (callerAgentId) {
-      filtered = filtered.filter((m) => !m.agentId || m.agentId === callerAgentId);
+    if (callerSlug) {
+      filtered = filtered.filter((m) => !m.sbSlug || m.sbSlug === callerSlug);
     }
     if (callerSessionId) {
       filtered = filtered.filter((m) => !m.sessionId || m.sessionId === callerSessionId);

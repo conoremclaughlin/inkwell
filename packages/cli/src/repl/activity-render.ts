@@ -17,7 +17,7 @@
 export interface ActivityLike {
   type?: string;
   subtype?: string;
-  agentId?: string;
+  sbSlug?: string;
   platform?: string;
   /**
    * Inkmail lifecycle fields (from the activity row's payload): who sent it.
@@ -25,7 +25,7 @@ export interface ActivityLike {
    * delivery mechanics of inbound mail (dispatch/deliver rows that duplicate
    * the trigger turn the session already renders).
    */
-  fromAgentId?: string;
+  fromSlug?: string;
 }
 
 export type ActivityRenderMode = 'message-in' | 'message-out' | 'bookkeeping' | 'block';
@@ -55,11 +55,11 @@ const BOOKKEEPING_PREFIXES = [
  */
 const INTERNAL_MESSAGE_PLATFORMS = new Set(['heartbeat', 'internal']);
 
-export function classifyActivity(activity: ActivityLike, selfAgentId: string): ActivityRenderPlan {
+export function classifyActivity(activity: ActivityLike, selfSlug: string): ActivityRenderPlan {
   const rawType = activity.subtype
     ? `${activity.type}:${activity.subtype}`
     : activity.type || 'activity';
-  const actor = activity.agentId || 'system';
+  const actor = activity.sbSlug || 'system';
   const platform = activity.platform || 'channel';
 
   if (rawType.startsWith('message_in')) {
@@ -87,13 +87,13 @@ export function classifyActivity(activity: ActivityLike, selfAgentId: string): A
   if (rawType.startsWith('inkmail_fail')) {
     return { mode: 'block' };
   }
-  if (rawType.startsWith('inkmail_dispatch') && activity.fromAgentId === selfAgentId) {
+  if (rawType.startsWith('inkmail_dispatch') && activity.fromSlug === selfSlug) {
     return { mode: 'block' };
   }
   if (rawType.startsWith('inkmail_dispatch') || rawType.startsWith('inkmail_deliver')) {
     return { mode: 'bookkeeping' };
   }
-  if (activity.agentId === selfAgentId && BOOKKEEPING_PREFIXES.some((p) => rawType.startsWith(p))) {
+  if (activity.sbSlug === selfSlug && BOOKKEEPING_PREFIXES.some((p) => rawType.startsWith(p))) {
     return { mode: 'bookkeeping' };
   }
   return { mode: 'block' };
