@@ -9,6 +9,7 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
+import { renderOAuthCallbackPage, type OAuthCallbackResult } from './oauth-callback-page';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
@@ -44,6 +45,7 @@ import path from 'path';
 import QRCode from 'qrcode';
 import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
+import { isPlausibleEmailAddress, stripTrailingSlashes } from '../utils/input-text';
 import {
   signPcpAccessToken,
   verifyPcpAccessToken,
@@ -1496,7 +1498,7 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'email and password are required' });
       return;
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    if (!isPlausibleEmailAddress(email)) {
       res.status(400).json({ error: 'A valid email address is required' });
       return;
     }
@@ -1556,12 +1558,11 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
 
 // ─── Pairing codes ───
 
-function generatePairingCode(): string {
-  // 32 symbols divide 256 evenly, so a byte mod 32 is unbiased.
-  const bytes = crypto.randomBytes(MOBILE_PAIR_CODE_LENGTH);
+export function generatePairingCode(): string {
+  // randomInt uses rejection sampling, remaining unbiased if the alphabet changes.
   let code = '';
   for (let i = 0; i < MOBILE_PAIR_CODE_LENGTH; i += 1) {
-    code += MOBILE_PAIR_CODE_ALPHABET[bytes[i] % MOBILE_PAIR_CODE_ALPHABET.length];
+    code += MOBILE_PAIR_CODE_ALPHABET[crypto.randomInt(MOBILE_PAIR_CODE_ALPHABET.length)];
   }
   return code;
 }
@@ -1744,7 +1745,7 @@ function candidateServerUrls(req: Request): { urls: string[]; insecureTransport:
 
   const urls: string[] = [];
   for (const candidate of candidates) {
-    const normalized = candidate.replace(/\/+$/, '');
+    const normalized = stripTrailingSlashes(candidate);
     if (!isHttps(normalized) && !dev) continue;
     if (!urls.includes(normalized)) urls.push(normalized);
   }
@@ -4651,67 +4652,38 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
   const { provider } = req.params;
   const { code, state, error: oauthError } = req.query;
 
-  // HTML response helper
-  const sendHtmlResponse = (success: boolean, message: string) => {
-    const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <title>${success ? 'Connected' : 'Error'}</title>
-  <style>
-    body { font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }
-    .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; max-width: 400px; }
-    .success { color: #16a34a; }
-    .error { color: #dc2626; }
-    p { color: #666; margin: 1rem 0; }
-    button { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; cursor: pointer; font-size: 1rem; }
-    button:hover { background: #2563eb; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1 class="${success ? 'success' : 'error'}">${success ? 'Account Connected!' : 'Connection Failed'}</h1>
-    <p>${message}</p>
-    <button onclick="window.close()">Close Window</button>
-    <script>
-      // Notify parent window and close
-      if (window.opener) {
-        window.opener.postMessage({ type: 'oauth-callback', success: ${success}, provider: '${provider}' }, '*');
-      }
-    </script>
-  </div>
-</body>
-</html>`;
-    res.send(html);
+  const sendHtmlResponse = (result: OAuthCallbackResult) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.type('html').send(renderOAuthCallbackPage(result));
   };
 
   try {
-    if (oauthError) {
-      sendHtmlResponse(false, `OAuth error: ${oauthError}`);
+    // Query parameters can be arrays/objects. Consume only a scalar state
+    // belonging to this provider, including on error redirects.
+    if (typeof state !== 'string') {
+      sendHtmlResponse('invalid');
       return;
     }
-
-    if (!code || !state) {
-      sendHtmlResponse(false, 'Missing code or state parameter');
+    const stateData = oauthStateStore.get(state);
+    if (!stateData || stateData.provider !== provider) {
+      sendHtmlResponse('invalid');
       return;
     }
-
-    // Validate state
-    const stateData = oauthStateStore.get(state as string);
-    if (!stateData) {
-      sendHtmlResponse(false, 'Invalid or expired state token');
-      return;
-    }
-
-    // Check expiry
+    oauthStateStore.delete(state);
     if (Date.now() > stateData.expiresAt) {
-      oauthStateStore.delete(state as string);
-      sendHtmlResponse(false, 'OAuth session expired. Please try again.');
+      sendHtmlResponse('expired');
       return;
     }
-
-    // Clean up state
-    oauthStateStore.delete(state as string);
+    if (oauthError) {
+      sendHtmlResponse('denied');
+      return;
+    }
+    if (typeof code !== 'string' || !code) {
+      sendHtmlResponse('invalid');
+      return;
+    }
 
     // Exchange code for tokens (redirect URI must match what was sent in auth request)
     const oauthService = getOAuthService();
@@ -4725,7 +4697,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
       redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
     }
 
-    const tokens = await oauthService.exchangeCode(provider, code as string, redirectUri);
+    const tokens = await oauthService.exchangeCode(provider, code, redirectUri);
 
     // Get user info
     const userInfo = await oauthService.getUserInfo(provider, tokens.accessToken);
@@ -4739,10 +4711,10 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
       stateData.workspaceId
     );
 
-    sendHtmlResponse(true, `Successfully connected ${userInfo.email || provider} account.`);
+    sendHtmlResponse('connected');
   } catch (error) {
-    logger.error('OAuth callback error:', error);
-    sendHtmlResponse(false, error instanceof Error ? error.message : 'Failed to connect account');
+    logger.error('OAuth callback failed');
+    sendHtmlResponse('failed');
   }
 });
 

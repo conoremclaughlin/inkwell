@@ -128,9 +128,14 @@ export class DesktopGoogleCredentialStore {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'ENOENT' || code === 'ENOTDIR')
         return { records: [], error: null, unreadable: 0 };
-      const error = err instanceof Error ? err.message : String(err);
-      logger.warn('Could not read desktop Google credentials directory', { dir, error });
-      return { records: [], error: `Could not read ${dir}: ${error}`, unreadable: 0 };
+      // Filesystem errors contain local paths; parser errors can quote credential
+      // bytes. Neither belongs in the shared server log or a status response.
+      logger.warn('Could not read desktop Google credentials directory');
+      return {
+        records: [],
+        error: 'Could not read desktop Google credentials directory',
+        unreadable: 0,
+      };
     }
 
     const records: DesktopCredentialRecord[] = [];
@@ -155,10 +160,7 @@ export class DesktopGoogleCredentialStore {
         }
         const parsed = parseDesktopGoogleCredential(JSON.parse(raw));
         if (!parsed.ok) {
-          logger.warn('Ignoring malformed desktop Google credential', {
-            path,
-            reason: parsed.reason,
-          });
+          logger.warn('Ignoring malformed desktop Google credential');
           unreadable += 1;
           continue;
         }
@@ -171,11 +173,8 @@ export class DesktopGoogleCredentialStore {
           generation: createHash('sha256').update(raw).digest('hex'),
           credential: parsed.value,
         });
-      } catch (err) {
-        logger.warn('Ignoring unreadable desktop Google credential', {
-          path,
-          error: err instanceof Error ? err.message : String(err),
-        });
+      } catch {
+        logger.warn('Ignoring unreadable desktop Google credential');
         unreadable += 1;
       }
     }
@@ -291,7 +290,6 @@ export class DesktopGoogleCredentialStore {
         this.tokens.delete(record.path);
       }
       logger.warn('Desktop Google credential refresh failed', {
-        path: record.path,
         status: response.status,
       });
       throw new Error(reason);
@@ -308,7 +306,7 @@ export class DesktopGoogleCredentialStore {
       generation: record.generation,
     });
     this.refusals.delete(record.path);
-    logger.info('Refreshed desktop Google credential', { path: record.path, email: record.email });
+    logger.info('Refreshed desktop Google credential');
     return data.access_token;
   }
 }

@@ -1,4 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
+
+const spawnMock = vi.hoisted(() => vi.fn());
+vi.mock('child_process', () => ({ spawn: spawnMock }));
 import { buildCleanEnv, spawnBackend, resolveSpawnTarget, LineBuffer } from './spawn-backend.js';
 
 describe('buildCleanEnv', () => {
@@ -27,83 +32,109 @@ describe('buildCleanEnv', () => {
   });
 });
 
-describe('spawnBackend', () => {
-  it('captures stdout and stderr from a simple command', async () => {
-    const { result } = spawnBackend({
-      binary: 'echo',
-      args: ['hello world'],
+describe('spawnBackend (mocked process boundary)', () => {
+  let child: EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    stdin: PassThrough;
+    kill: ReturnType<typeof vi.fn>;
+  };
+  beforeEach(() => {
+    child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      stdin: new PassThrough(),
+      kill: vi.fn(),
     });
-    const res = await result;
-    expect(res.stdout).toBe('hello world');
-    expect(res.exitCode).toBe(0);
-    expect(res.timedOut).toBe(false);
-    expect(res.durationMs).toBeGreaterThan(0);
+    spawnMock.mockReset().mockReturnValue(child);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
   });
 
-  it('captures stderr output', async () => {
-    const { result } = spawnBackend({
-      binary: 'sh',
-      args: ['-c', 'echo error >&2'],
-    });
-    const res = await result;
-    expect(res.stderr).toBe('error');
-    expect(res.exitCode).toBe(0);
-  });
-
-  it('reports non-zero exit code', async () => {
-    const { result } = spawnBackend({
-      binary: 'sh',
-      args: ['-c', 'exit 42'],
-    });
-    const res = await result;
-    expect(res.exitCode).toBe(42);
-    expect(res.timedOut).toBe(false);
-  });
-
-  it('times out with hard ceiling', async () => {
-    const { result } = spawnBackend({
-      binary: 'sleep',
-      args: ['10'],
-      timeoutMs: 100,
-    });
-    const res = await result;
-    expect(res.timedOut).toBe(true);
-    expect(res.timeoutType).toBe('hard');
-    expect(res.exitCode).toBe(124);
-  });
-
-  it('calls onStdout callback for each chunk', async () => {
+  it('captures output and keeps prompt bytes in argv without a shell', async () => {
+    const prompt = 'synthetic prompt with "quotes" and $(echo literal)';
     const chunks: string[] = [];
     const { result } = spawnBackend({
-      binary: 'sh',
-      args: ['-c', 'echo line1; echo line2'],
-      onStdout: (chunk) => chunks.push(chunk),
+      binary: 'codex',
+      args: ['exec', '--', prompt],
+      onStdout: (text) => chunks.push(text),
     });
+    child.stdout.emit('data', 'hello\n');
+    child.stderr.emit('data', 'diagnostic\n');
+    child.emit('close', 0);
+    expect(await result).toMatchObject({
+      stdout: 'hello',
+      stderr: 'diagnostic',
+      exitCode: 0,
+      timedOut: false,
+    });
+    expect(chunks).toEqual(['hello\n']);
+    expect(spawnMock).toHaveBeenCalledWith(
+      'codex',
+      ['exec', '--', prompt],
+      expect.objectContaining({ shell: false })
+    );
+  });
+
+  it('reports nonzero exits and spawn errors', async () => {
+    const first = spawnBackend({ binary: 'codex', args: [] });
+    child.emit('close', 42);
+    expect(await first.result).toMatchObject({ exitCode: 42, timedOut: false });
+    const second = spawnBackend({ binary: 'codex', args: [] });
+    child.emit('error', new Error('synthetic spawn failure'));
+    expect(await second.result).toMatchObject({
+      exitCode: 1,
+      stderr: expect.stringContaining('synthetic spawn failure'),
+    });
+  });
+
+  it.each(['hard', 'idle'] as const)(
+    'reports a %s timeout without starting or killing a real process',
+    async (kind) => {
+      vi.useFakeTimers();
+      const { result } = spawnBackend({
+        binary: 'codex',
+        args: [],
+        timeoutMs: kind === 'hard' ? 100 : 1000,
+        idleTimeoutMs: kind === 'idle' ? 100 : undefined,
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await result).toMatchObject({ timedOut: true, timeoutType: kind, exitCode: 124 });
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      vi.clearAllTimers();
+    }
+  );
+
+  it('cleans process environment and merges explicit variables', async () => {
+    vi.stubEnv('CLAUDECODE', '1');
+    const { result } = spawnBackend({ binary: 'codex', args: [], env: { SYNTHETIC_TEST: 'yes' } });
+    const options = spawnMock.mock.calls[0][2];
+    expect(options.env.CLAUDECODE).toBeUndefined();
+    expect(options.env.SYNTHETIC_TEST).toBe('yes');
+    child.emit('close', 0);
     await result;
-    const combined = chunks.join('');
-    expect(combined).toContain('line1');
-    expect(combined).toContain('line2');
   });
 
-  it('strips CLAUDECODE from spawned process env', async () => {
-    process.env.CLAUDECODE = '1';
+  it('pipes explicit stdin and enables docker interactive input', async () => {
     const { result } = spawnBackend({
-      binary: 'sh',
-      args: ['-c', 'echo $CLAUDECODE'],
+      binary: 'claude',
+      args: ['--print'],
+      stdinData: 'synthetic prompt',
+      container: { containerName: 'synthetic-container' },
     });
-    const res = await result;
-    expect(res.stdout).toBe('');
-    delete process.env.CLAUDECODE;
-  });
-
-  it('merges extra env vars into spawned process', async () => {
-    const { result } = spawnBackend({
-      binary: 'sh',
-      args: ['-c', 'echo $MY_TEST_VAR'],
-      env: { MY_TEST_VAR: 'wren-test' },
-    });
-    const res = await result;
-    expect(res.stdout).toBe('wren-test');
+    expect(child.stdin.read().toString()).toBe('synthetic prompt');
+    expect(spawnMock.mock.calls[0][1]).toEqual([
+      'exec',
+      '-i',
+      '--',
+      'synthetic-container',
+      'claude',
+      '--print',
+    ]);
+    child.emit('close', 0);
+    await result;
   });
 });
 
@@ -196,7 +227,7 @@ describe('resolveSpawnTarget', () => {
 
   it('converts host binary path to basename for container execution', () => {
     const target = resolveSpawnTarget({
-      binary: '/Users/conor/.local/bin/claude',
+      binary: '/home/synthetic/.local/bin/claude',
       args: ['--print'],
       container: { containerName: 'test-container' },
     });
@@ -209,7 +240,7 @@ describe('resolveSpawnTarget', () => {
     const target = resolveSpawnTarget({
       binary: 'claude',
       args: [],
-      cwd: '/Users/conor/ws/pcp/personal-context-protocol--wren',
+      cwd: '/home/synthetic/ws/pcp/personal-context-protocol--wren',
       container: { containerName: 'test-container' },
     });
     const workdirIdx = target.args.indexOf('--workdir');
@@ -221,7 +252,7 @@ describe('resolveSpawnTarget', () => {
     const target = resolveSpawnTarget({
       binary: 'claude',
       args: [],
-      cwd: '/Users/conor/ws/project',
+      cwd: '/home/synthetic/ws/project',
       container: { containerName: 'test-container', workDir: '/workspace' },
     });
     const workdirIdx = target.args.indexOf('--workdir');

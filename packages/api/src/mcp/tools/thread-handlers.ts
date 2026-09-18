@@ -19,6 +19,7 @@ import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import { advanceThreadReadPointer } from './read-state.js';
+import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -152,14 +153,9 @@ const reopenThreadSchema = userIdentifierBaseSchema.extend({
   sbSlug: sbSlugSchema.describe('SB slug reopening the thread (must be a participant)'),
 });
 
-/**
- * Brevity bounds, mirrored from the CHECK constraints on inbox_threads. Kept in
- * both places deliberately: the schema gives a caller a usable error, the
- * constraint is what actually holds — including for writers that never pass
- * through this tool.
- */
-export const THREAD_TITLE_MAX = 200;
-export const THREAD_SUMMARY_MAX = 280;
+// Bounds live in thread-bounds.ts so findOrCreateThread can reach them without
+// importing this module. Re-exported because callers already import them here.
+export { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX };
 
 const updateThreadSchema = userIdentifierBaseSchema
   .extend({
@@ -489,6 +485,10 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   //   1. last_read_at (explicit read pointer from prior reads)
   //   2. joined_at (participant join time — no replay of pre-join history)
   let readStateFloor: string | null = null;
+  // WHICH floor it is. `COALESCE(last_read_at, joined_at)` collapses two very
+  // different facts — "you were given these" and "these predate you" — and the
+  // hint must not claim the first when it only knows the second.
+  let readFloorSource: 'pointer' | 'join' | null = null;
   if (!afterMessageId && !beforeMessageId && !parsed.fullHistory) {
     const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
       .select('last_read_at')
@@ -496,6 +496,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       .eq('agent_id', sbSlug)
       .maybeSingle();
     readStateFloor = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
+    if (readStateFloor) readFloorSource = 'pointer';
 
     if (!readStateFloor) {
       const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
@@ -504,6 +505,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
         .eq('agent_id', sbSlug)
         .maybeSingle();
       readStateFloor = (participant as { joined_at?: string } | null)?.joined_at || null;
+      if (readStateFloor) readFloorSource = 'join';
     }
   }
 
@@ -531,6 +533,15 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
 
   let messages: Record<string, unknown>[] | null = null;
   let skippedOlderCount = 0;
+  // How many messages the read-state floor withheld. Only computed when the
+  // answer would otherwise be a bare empty list — see below.
+  let hiddenByReadState = 0;
+  // Set when the oldest-first page filled exactly and more messages matched.
+  let truncatedNewer = 0;
+  // Why a diagnostic count is missing. An unknown count is reported as unknown
+  // — never as zero, which would read as a definite "nothing there" and rebuild
+  // the ambiguity this handler exists to remove.
+  let diagnosticsUnavailable: string | null = null;
 
   if (!newestFirst) {
     const { data, error } = await buildQuery('*')
@@ -540,6 +551,21 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       throw new Error(`Failed to get thread messages: ${error.message}`);
     }
     messages = data;
+
+    if ((messages?.length ?? 0) === effectiveLimit) {
+      // The page filled exactly, so newer messages may exist past it. This
+      // branch is oldest-first, so a truncated page silently hands back the
+      // WRONG END of the thread — the caller asked what is going on and got
+      // the beginning of the conversation.
+      const { count, error: truncErr } = await buildQuery('id', true);
+      if (truncErr) {
+        // An unknown count must not read as a complete page. Say the number is
+        // missing rather than implying there is nothing past the end.
+        diagnosticsUnavailable = truncErr.message;
+      } else {
+        truncatedNewer = Math.max(0, (count ?? 0) - effectiveLimit);
+      }
+    }
   } else {
     // Count everything past the floor so truncation is visible, not silent.
     const { count: totalMatching, error: countErr } = await buildQuery('id', true);
@@ -581,6 +607,57 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     skippedOlderCount = Math.max(0, (totalMatching ?? delivered.length) - delivered.length);
     // Response stays oldest-first regardless of how the window was cut.
     messages = delivered.reverse();
+  }
+
+  // An empty result has two completely different meanings — "this thread has
+  // nothing in it" and "you have already been given all of this" — and the
+  // response said exactly the same thing for both.
+  //
+  // On 2026-09-11 a trigger woke a session with "Fetch the thread using
+  // get_thread_messages(threadKey: ...)". Between the spawn and that call, the
+  // session's OWN channel plugin pushed the same message inline and acked it
+  // (poll-core.ts) — a correct ack, after a real render. So the instructed
+  // fetch returned [], correctly by its own rules, and read as an empty thread.
+  // The recipient went to Postgres to find a message that had been delivered to
+  // it a second earlier.
+  //
+  // Two delivery paths share one pointer and there is no ordering between them.
+  // Whichever loses must at least be able to say what happened, so count what
+  // the floor withheld. Costs a query only in the ambiguous case.
+  //
+  // Runs AFTER window selection and keys off `!channelPoll`, not off query
+  // direction: `newestFirst` is also true for any ordinary caller passing
+  // `latestN`, and asking for recent context is a normal agent call that
+  // deserves the same answer. A delivery poll is the one caller that does not —
+  // it manages its own cursor and an empty cold start is expected there.
+  if (!channelPoll && readStateFloor && (messages?.length ?? 0) === 0) {
+    let consumed = threadTable(supabase, 'inbox_thread_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('thread_id', thread.id);
+    if (!includeSystemEvents) consumed = consumed.neq('message_type', 'system');
+    if (beforeTs) consumed = consumed.lt('created_at', beforeTs);
+
+    // Lift ONLY the read floor. The caller's own filters stay on, or a message
+    // excluded purely by an explicit `newerThan` gets reported as already
+    // consumed — and the suggested `fullHistory` retry would still return
+    // nothing, because the filter was never the read state.
+    const explicitFloor = resolveEffectiveFloor({ readStateFloor: null, afterTs, newerThan });
+    if (explicitFloor) consumed = consumed.gt('created_at', explicitFloor);
+
+    // Bounded above by the floor we captured at the top of this request, so a
+    // message inserted mid-request cannot be counted as something you already
+    // read. Only what sits at or below the pointer was withheld by it.
+    consumed = consumed.lte('created_at', readStateFloor);
+
+    const { count, error: countErr } = await consumed;
+    if (countErr) {
+      // The whole point of this PR is that an empty list must say why. Falling
+      // back to zero here would restore the exact ambiguity it removes, so the
+      // unknown is reported as unknown.
+      diagnosticsUnavailable = countErr.message;
+    } else {
+      hiddenByReadState = count ?? 0;
+    }
   }
 
   // Get participants
@@ -676,6 +753,48 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           // messages were cut by the cold-start guard or latestN window.
           ...(skippedOlderCount > 0 ? { skippedOlderCount } : {}),
           ...(guardActive ? { coldStartGuard: true } : {}),
+          // Empty because already-read, NOT because the thread is empty.
+          ...(hiddenByReadState > 0
+            ? {
+                hiddenByReadState,
+                // The wording follows the floor's provenance. Claiming previous
+                // delivery when only `joined_at` supplied the floor would tell
+                // a brand-new participant it had already been sent a history it
+                // has never seen.
+                hint:
+                  readFloorSource === 'join'
+                    ? `Nothing in this thread postdates the moment you joined it, but ` +
+                      `${hiddenByReadState} earlier ${hiddenByReadState === 1 ? 'message' : 'messages'} ` +
+                      `exist. They are pre-join history, not messages you were sent. Pass ` +
+                      `fullHistory: true with latestN to read them.`
+                    : `No messages are newer than your read pointer, but this thread has ` +
+                      `${hiddenByReadState}. They may already have been delivered to you by ` +
+                      `another path (an inline channel push acks on render). Pass ` +
+                      `fullHistory: true with latestN to see them.`,
+              }
+            : {}),
+          // A count we could not take. Reported rather than silently zeroed:
+          // "I don't know" and "there is nothing" must not look the same.
+          ...(diagnosticsUnavailable
+            ? {
+                diagnosticsUnavailable: true,
+                warning:
+                  `Could not determine whether messages were withheld by read state or ` +
+                  `truncation (${diagnosticsUnavailable}). An empty or full page here is ` +
+                  `NOT evidence the thread is empty or complete — retry with ` +
+                  `fullHistory: true and an explicit latestN.`,
+              }
+            : {}),
+          // The page filled and this branch is oldest-first, so what came back
+          // is the START of the thread, not the latest of it.
+          ...(truncatedNewer > 0
+            ? {
+                truncatedNewerCount: truncatedNewer,
+                hint:
+                  `Returned the OLDEST ${effectiveLimit} messages; ${truncatedNewer} newer ` +
+                  `ones were cut. Pass latestN to get the most recent instead.`,
+              }
+            : {}),
           // Checked write surfaced to the caller (spec §5): messages were
           // returned, but the read-pointer advance did NOT persist — read
           // state is stale and messages may re-deliver.
@@ -686,15 +805,25 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
                   'read-pointer advance failed — read state is stale; messages may re-deliver',
               }
             : {}),
-          messages: (messages || []).map((m: Record<string, unknown>) => ({
-            id: m.id,
-            senderSlug: m.sender_agent_id,
-            content: m.content,
-            messageType: m.message_type,
-            priority: m.priority,
-            metadata: m.metadata,
-            createdAt: m.created_at,
-          })),
+          messages: (messages || []).map((m: Record<string, unknown>) => {
+            // The sender's subject, whole. send_to_inbox stores it under
+            // metadata.pcp so a bounded thread title is never the only copy
+            // (#641 round 2); lifted to the top level here because that is
+            // where every other reader of a message expects to find it, and
+            // digging it out of a metadata blob is not something a caller
+            // should have to know to do. Omitted when there was no subject.
+            const subject = threadMessageSubject(m.metadata);
+            return {
+              id: m.id,
+              senderSlug: m.sender_agent_id,
+              content: m.content,
+              messageType: m.message_type,
+              priority: m.priority,
+              ...(subject ? { subject } : {}),
+              metadata: m.metadata,
+              createdAt: m.created_at,
+            };
+          }),
         }),
       },
     ],
@@ -1048,6 +1177,61 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
   });
 }
 
+/** What one update_thread call writes: the fields it touches, and who by. */
+export interface ThreadMetadataEdit {
+  setTitle: boolean;
+  title: string | null;
+  setSummary: boolean;
+  summary: string | null;
+  editorSbId: string | null;
+  editorSlug: string;
+  attributedBy: 'identity' | 'slug-only';
+}
+
+/**
+ * Write a title/summary edit AND its timeline event — in ONE transaction, the
+ * `update_inbox_thread_metadata` SQL function (migration 20260916020035).
+ *
+ * The same two-round-trip shape Lumen caught on reopen in #615, and caught
+ * again here in #641: as an UPDATE followed by an INSERT these are two
+ * transactions, so a rejected audit INSERT left the edit standing with nothing
+ * in the timeline recording who made it. The first cut also discarded the
+ * INSERT's error, which turned that into `success: true` — and in the
+ * `slug-only` attribution case the timeline message is the only durable record
+ * of the editor, so the response claimed a trail it had just failed to write.
+ *
+ * Throwing after the fact would have detected the failure without restoring the
+ * trail. One function restores it: either both land or neither does.
+ *
+ * Returns the timestamp the row was written with, so the response reports the
+ * stored instant rather than an app-side guess at it.
+ */
+export async function updateThreadMetadataRow(
+  supabase: SupabaseClient,
+  threadId: string,
+  edit: ThreadMetadataEdit
+): Promise<string> {
+  const { data, error } = await supabase.rpc('update_inbox_thread_metadata', {
+    p_thread_id: threadId,
+    p_set_title: edit.setTitle,
+    p_title: edit.title,
+    p_set_summary: edit.setSummary,
+    p_summary: edit.summary,
+    p_editor_sb_id: edit.editorSbId,
+    p_editor_slug: edit.editorSlug,
+    p_attributed_by: edit.attributedBy,
+  });
+  if (error) {
+    throw new Error(`Failed to update thread: ${error.message}`);
+  }
+  if (typeof data !== 'string' || !data) {
+    // The function returns exactly a timestamptz; anything else means the call
+    // did not reach it (a missing migration, a mocked client).
+    throw new Error(`Failed to update thread: unexpected reply ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
 /**
  * Set or update a thread's title and summary.
  *
@@ -1107,49 +1291,24 @@ export async function handleUpdateThread(args: unknown, dataComposer: DataCompos
     senderSbId() ?? (await resolveSbId(supabase, resolved.user.id, sbSlug)) ?? null;
   const attributedBy = editorSbId ? 'identity' : 'slug-only';
 
-  const now = new Date().toISOString();
-  const update: Record<string, unknown> = { updated_at: now };
-  const changed: string[] = [];
-
   // `undefined` means "not provided" and `null` means "explicitly cleared" —
   // never collapse them, or a caller editing only the summary silently wipes
-  // the title.
-  if (title !== undefined) {
-    update.title = title;
-    update.title_updated_by_sb_id = editorSbId;
-    update.title_updated_at = now;
-    changed.push('title');
-  }
-  if (summary !== undefined) {
-    update.summary = summary;
-    update.summary_updated_by_sb_id = editorSbId;
-    update.summary_updated_at = now;
-    changed.push('summary');
-  }
+  // the title. The two are carried to SQL as a set-flag and a value for the
+  // same reason.
+  const changed: string[] = [];
+  if (title !== undefined) changed.push('title');
+  if (summary !== undefined) changed.push('summary');
 
-  const { error } = await threadTable(supabase, 'inbox_threads').update(update).eq('id', thread.id);
-
-  if (error) {
-    throw new Error(`Failed to update thread: ${error.message}`);
-  }
-
-  // A system message in the timeline, matching close/reopen. This is the
-  // version trail: an edit that silently replaced its predecessor would leave a
-  // record no one can tell has changed.
-  await threadTable(supabase, 'inbox_thread_messages').insert({
-    thread_id: thread.id,
-    sender_agent_id: 'system',
-    content: `Thread ${changed.join(' and ')} updated by ${sbSlug}`,
-    message_type: 'system',
-    metadata: {
-      type: 'thread_metadata_updated',
-      updatedBy: sbSlug,
-      updatedBySbId: editorSbId,
-      attributedBy,
-      updatedFields: changed,
-      ...(title !== undefined ? { title } : {}),
-      ...(summary !== undefined ? { summary } : {}),
-    } as Json,
+  // The edit and its timeline event, in one transaction. See
+  // updateThreadMetadataRow: a failed audit must not leave an edit standing.
+  const now = await updateThreadMetadataRow(supabase, thread.id, {
+    setTitle: title !== undefined,
+    title: title ?? null,
+    setSummary: summary !== undefined,
+    summary: summary ?? null,
+    editorSbId,
+    editorSlug: sbSlug,
+    attributedBy,
   });
 
   logger.info('[Thread] Title/summary updated', {

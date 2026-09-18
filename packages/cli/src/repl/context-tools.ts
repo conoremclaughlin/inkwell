@@ -150,6 +150,132 @@ export function effectiveContextTokens(
 }
 
 /**
+ * Where the window actually sits, split by WHAT CAN REACH IT.
+ *
+ * One total is not enough, because the parts answer to different remedies — and
+ * they are not the parts an earlier draft of this comment named. It claimed the
+ * ledger half was the evictable half and that only compaction re-seeded the
+ * provider side. Both halves of that are wrong against this head (Lumen, PR #639):
+ *
+ *   ledgerTokens        transcript entries. The only bucket a tool selects
+ *                       entries from, and both `evict_context` and
+ *                       `compact_context` select from it.
+ *   fixedTokens         the identity envelope. `buildPromptEnvelope` re-renders
+ *                       `runtime.bootstrapContext` on every seed — it is marked
+ *                       "always included" there — so no context tool reclaims a
+ *                       byte of it. It is occupancy to budget around, not spend.
+ *   unaccountedTokens   the measurement minus what ink can account for. It is a
+ *                       RESIDUAL, not an inventory, and that is the whole reason
+ *                       it does not name a remedy. Some of it is native-session
+ *                       history, which any provider reseed drops — every
+ *                       eviction is one, since `recordEviction` clears
+ *                       `activeBackendSessionId` and the `providerSample`, and
+ *                       `assessContextPressure` has a `reseed` action for
+ *                       exactly this case. The rest is fixed provider overhead
+ *                       and this estimator's own drift (characters ÷ 4), which
+ *                       a reseed does NOT clear: the re-packed window is
+ *                       estimated by the same arithmetic that was wrong before.
+ *                       Naming a tool for this bucket would promise a reclaim
+ *                       nobody can compute (Lumen, PR #639).
+ *
+ * The ledger/provider gap is not a rounding error and it is not invisible — it
+ * is mis-sized. A tool result enters the ledger as a stub of at most
+ * LEDGER_COMPACT_CHARS (chat.ts) while the provider reads the whole payload.
+ * Measured 2026-09-15: one `list_tasks` reply put 125 tokens in the ledger and
+ * ~145,000 in the window. An agent that evicts that stub is told
+ * `tokensFreed: 125` — but the reseed the eviction just triggered also dropped
+ * the ~145,000. The reported figure is still wrong; it UNDERSTATES, which is
+ * the opposite of what this comment used to say, and the opposite direction of
+ * error from the one that makes an agent complacent.
+ *
+ * `splitKnown` is false when the provider has not reported yet. Then the split
+ * is genuinely unknown and the renderer must say so — reporting the estimate
+ * alone implies all of it is actionable, which is the failure this guards.
+ */
+export interface ContextOccupancy {
+  /** Transcript entries — what evict_context and compact_context actually edit. */
+  ledgerTokens: number;
+  /** The identity envelope, re-rendered on every seed. No context tool reclaims it. */
+  fixedTokens: number;
+  /**
+   * Measured minus accountable: a residual, not an inventory. Part native-session
+   * history (a reseed drops it), part provider overhead and estimator drift (a
+   * reseed does not). Deliberately names no remedy — see the note above.
+   */
+  unaccountedTokens: number;
+  /** The number to budget against — the larger of the estimate and the measurement. */
+  effectiveTokens: number;
+  limit: number;
+  /** effectiveTokens / limit, clamped at 0 but NOT at 1 — over-budget must read as over-budget. */
+  utilization: number;
+  /** False when no provider measurement exists; the split is then unknown, not zero. */
+  splitKnown: boolean;
+}
+
+/**
+ * `bootstrapTokens` is added to the estimate rather than subtracted from the
+ * limit. The provider's measurement covers the whole window including the
+ * identity envelope, so comparing it against a transcript-only estimate over a
+ * reduced limit compares two different quantities. Both sides are whole-window
+ * here, which is what makes max() meaningful.
+ *
+ * It lands in the numerator but in its OWN bucket: counting it is right,
+ * calling it reclaimable is not.
+ */
+export function computeContextOccupancy(
+  ledgerTokens: number,
+  bootstrapTokens: number,
+  limit: number,
+  measured: ProviderContextMeasurement | undefined
+): ContextOccupancy {
+  const ledger = Math.max(0, ledgerTokens);
+  const fixed = Math.max(0, bootstrapTokens);
+  const accountable = ledger + fixed;
+  const effectiveTokens = effectiveContextTokens(accountable, measured);
+  const safeLimit = limit > 0 ? limit : 1;
+  return {
+    ledgerTokens: ledger,
+    fixedTokens: fixed,
+    unaccountedTokens: Math.max(0, effectiveTokens - accountable),
+    effectiveTokens,
+    limit: safeLimit,
+    utilization: effectiveTokens / safeLimit,
+    splitKnown: measured !== undefined,
+  };
+}
+
+/**
+ * The per-turn stamp. Ephemeral by design: it is rendered into the prompt each
+ * turn and never added to the ledger, because an entry per turn would
+ * accumulate one stale occupancy reading per turn — context spent reporting
+ * context, growing with the thing it measures.
+ */
+export function formatContextStamp(occ: ContextOccupancy): string {
+  const pct = Math.round(occ.utilization * 100);
+  const n = (v: number) => v.toLocaleString();
+  const head = `[context] ${n(occ.effectiveTokens)} / ${n(occ.limit)} (${pct}%)`;
+  if (!occ.splitKnown) {
+    return (
+      `${head} — ledger estimate only; the provider has not reported this session, ` +
+      `so how much of this is reclaimable is unknown.`
+    );
+  }
+  // All three buckets, always, even at zero. A stamp whose shape changes per
+  // turn is one the reader has to re-parse per turn, and a zero is itself a
+  // reading ("nothing unaccounted for") rather than an absence.
+  //
+  // Only the first two name a tool. The third names its composition instead,
+  // because it is a residual: saying what it is made of is a claim we can
+  // support, and saying what reclaims it is not.
+  return (
+    `${head} — ledger ${n(occ.ledgerTokens)} (evict_context/compact_context), ` +
+    `identity envelope ${n(occ.fixedTokens)} (fixed, re-sent every seed), ` +
+    `unaccounted ${n(occ.unaccountedTokens)} (native history + estimate drift; ` +
+    `a reseed clears the history, not the drift).`
+  );
+}
+
+/**
  * Handle a client-local tool call. Returns the result in PCP tool format,
  * or null if the tool isn't recognized.
  */

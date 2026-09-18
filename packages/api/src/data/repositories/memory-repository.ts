@@ -3,7 +3,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Database } from '../supabase/types';
+import type { Database, TablesInsert } from '../supabase/types';
 import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import {
@@ -362,6 +362,57 @@ export function computeKnowledgeMemoryScore(
   return salienceWeight * recencyDecay * threadBoost * focusBoost;
 }
 
+/** Why a re-embed stopped, which decides whether stale artifacts get cleared. */
+type EmbedOutcome =
+  /** New vector, chunk rows and metadata are all published. */
+  | 'embedded'
+  /** Nothing usable was written; whatever is on the row is now stale. */
+  | 'failed'
+  /** A newer revision won the race; its artifacts are correct and must stand. */
+  | 'superseded';
+
+interface EmbedOptions {
+  /** The `version` this embed was computed from; publication is fenced on it. */
+  fenceVersion: number;
+}
+
+/**
+ * The two embedding functions, narrowly typed.
+ *
+ * Mirrors MatchMemoriesRpcClient: the generated Supabase types do not carry
+ * project RPCs, so each call site declares the shape it depends on rather than
+ * casting the whole client to `any`.
+ */
+interface MemoryEmbeddingRpcClient {
+  rpc(
+    fn: 'swap_memory_embedding' | 'clear_memory_embedding',
+    args: Record<string, unknown>
+  ): Promise<{ data: unknown; error: { message: string } | null }>;
+}
+
+/** 'ok' | 'superseded' | 'missing' from the fenced swap, as an EmbedOutcome. */
+function interpretSwapResult(data: unknown, memory: Memory, fenceVersion: number): EmbedOutcome {
+  if (data === 'ok') return 'embedded';
+
+  if (data === 'superseded') {
+    logger.info('Abandoning embedding for a superseded memory revision', {
+      memoryId: memory.id,
+      embeddedVersion: fenceVersion,
+    });
+    return 'superseded';
+  }
+
+  // 'missing', or anything unrecognised. Both mean the swap did not happen and
+  // neither means the artifacts on the row are correct, so this is a failure —
+  // treating an unknown answer as success is how a silent no-op looks fine.
+  logger.warn('Memory embedding swap did not apply', {
+    memoryId: memory.id,
+    embeddedVersion: fenceVersion,
+    result: typeof data === 'string' ? data : String(data),
+  });
+  return 'failed';
+}
+
 export class MemoryRepository {
   private embeddingRouter: EmbeddingRouter;
 
@@ -415,7 +466,7 @@ export class MemoryRepository {
     // Embedding persistence is intentionally eventually consistent: we insert the
     // memory row first so writes never fail on provider/network issues, then best-
     // effort persist the vector in a follow-up update.
-    await this.tryEmbedMemory(memory, input);
+    await this.tryEmbedMemory(memory, input, { fenceVersion: memory.version });
 
     return memory;
   }
@@ -998,11 +1049,28 @@ export class MemoryRepository {
     });
   }
 
-  private async tryEmbedMemory(memory: Memory, input: MemoryCreateInput): Promise<void> {
-    if (!this.embeddingRouter.isEnabled()) return;
+  /**
+   * Embed a memory and publish the result as one atomic swap.
+   *
+   * 'embedded' means the chunk rows, the primary vector and the embedding
+   * metadata all landed together. 'failed' means none of them did and whatever
+   * is on the row is now stale. 'superseded' means a newer revision owns the
+   * artifacts — which is neither, and must not be cleaned up.
+   */
+  private async tryEmbedMemory(
+    memory: Memory,
+    input: MemoryCreateInput,
+    options: EmbedOptions
+  ): Promise<EmbedOutcome> {
+    if (!this.embeddingRouter.isEnabled()) return 'failed';
 
     const config = this.embeddingRouter.getRuntimeConfig();
     const vettedModel = getVettedEmbeddingModel(config.provider, config.model);
+    // Whatever the ROW says, which after a text edit is nothing: the
+    // memory_update_strip_stale_extractions trigger removes extractions that
+    // were carried across the edit unchanged, inside the same UPDATE. Reading
+    // the row rather than a caller's flag is the point — a flag is a promise
+    // the caller has to keep on every path, and the row is simply true.
     const llmExtractions =
       memory.metadata && typeof memory.metadata === 'object' && 'llm_extractions' in memory.metadata
         ? (memory.metadata.llm_extractions as Record<string, unknown>)
@@ -1018,16 +1086,16 @@ export class MemoryRepository {
       llmExtractions,
       extractionMode: env.MEMORY_EXTRACTION_MODE,
     });
-    if (chunks.length === 0) return;
+    if (chunks.length === 0) return 'failed';
 
     const embeddedChunks = [];
     for (const chunk of chunks) {
       const embedding = await this.embeddingRouter.embedDocument(chunk.text);
-      if (!embedding) return;
+      if (!embedding) return 'failed';
       embeddedChunks.push({ chunk, embedding });
     }
 
-    if (embeddedChunks.length === 0) return;
+    if (embeddedChunks.length === 0) return 'failed';
 
     const primaryChunk = embeddedChunks[0];
     const primaryEmbedding = primaryChunk.embedding;
@@ -1041,134 +1109,116 @@ export class MemoryRepository {
       embeddedChunks: embeddedChunks.map(({ chunk, embedding }) => ({ ...chunk, embedding })),
     });
 
-    let chunkErrorDetails: Record<string, unknown> | null = null;
-    for (let attempt = 1; attempt <= EMBEDDING_PERSIST_RETRY_ATTEMPTS; attempt += 1) {
-      const { error: chunkError } = await this.supabase
-        .from('memory_embedding_chunks')
-        .upsert(chunkRows, {
-          onConflict: 'memory_id,chunk_index',
-        });
-
-      if (!chunkError) {
-        if (attempt > 1) {
-          logger.info('Memory embedding chunk persistence recovered after retry', {
-            ...chunkContext,
-            stage: 'chunk_upsert',
-            attempt,
-            attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
-          });
-        }
-        chunkErrorDetails = null;
-        break;
-      }
-
-      chunkErrorDetails = normalizeErrorDetails(chunkError);
-      logger.warn('Failed to persist memory embedding chunks', {
-        ...chunkContext,
-        stage: 'chunk_upsert',
-        attempt,
-        retrying: attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS,
-        error: chunkErrorDetails,
-      });
-
-      if (attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS) {
-        await sleep(200 * attempt);
-      }
-    }
-
-    if (chunkErrorDetails) {
-      logger.error('Giving up on memory embedding chunk persistence', {
-        ...chunkContext,
-        stage: 'chunk_upsert',
-        attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
-        error: chunkErrorDetails,
-      });
-      return;
-    }
-
-    const memoryUpdate: Database['public']['Tables']['memories']['Update'] = {
-      embedding: formatVectorLiteral(primaryEmbedding.vector),
-      embedding_chunks_version: MEMORY_EMBEDDING_CHUNKS_VERSION,
-      embedding_chunk_count: embeddedChunks.length,
-      metadata: {
-        ...buildChunkMetadataUpdate({
-          provider: primaryEmbedding.provider,
-          model: primaryEmbedding.model,
-          chunkCount: embeddedChunks.length,
-          viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
-          extractionMode: env.MEMORY_EXTRACTION_MODE,
-          existingMetadata: memory.metadata || {},
-        }),
-        embedding: {
-          provider: primaryEmbedding.provider,
-          model: primaryEmbedding.model,
-          dimensions: primaryEmbedding.dimensions,
-          updatedAt: new Date().toISOString(),
-        },
-      } as Database['public']['Tables']['memories']['Update']['metadata'],
-    };
-
-    let memoryErrorDetails: Record<string, unknown> | null = null;
-    for (let attempt = 1; attempt <= EMBEDDING_PERSIST_RETRY_ATTEMPTS; attempt += 1) {
-      const { error } = await this.supabase
-        .from('memories')
-        .update(memoryUpdate)
-        .eq('id', memory.id)
-        .eq('user_id', memory.userId);
-
-      if (!error) {
-        if (attempt > 1) {
-          logger.info('Memory embedding metadata persistence recovered after retry', {
-            ...chunkContext,
-            stage: 'memory_update',
-            attempt,
-            attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
-          });
-        }
-        memoryErrorDetails = null;
-        break;
-      }
-
-      memoryErrorDetails = normalizeErrorDetails(error);
-      logger.warn('Failed to persist memory embedding metadata', {
-        ...chunkContext,
-        stage: 'memory_update',
-        attempt,
-        retrying: attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS,
-        error: memoryErrorDetails,
-      });
-
-      if (attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS) {
-        await sleep(200 * attempt);
-      }
-    }
-
-    if (memoryErrorDetails) {
-      logger.error('Giving up on memory embedding metadata persistence', {
-        ...chunkContext,
-        stage: 'memory_update',
-        attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
-        error: memoryErrorDetails,
-      });
-      return;
-    }
-
-    memory.embedding = primaryEmbedding.vector;
-    memory.metadata = {
-      ...buildChunkMetadataUpdate({
-        provider: primaryEmbedding.provider,
-        model: primaryEmbedding.model,
-        chunkCount: embeddedChunks.length,
-        viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
-        extractionMode: env.MEMORY_EXTRACTION_MODE,
-        existingMetadata: memory.metadata || {},
-      }),
+    // Only the keys this write owns. Passing the whole object would carry a
+    // snapshot taken before the embedding ran, and a metadata-only update does
+    // not move `version` — so an unrelated write landing during the embed
+    // passes the fence and gets erased anyway (Lumen, r2). The function merges
+    // this patch onto whatever the row holds at commit time.
+    const fullMetadata = buildChunkMetadataUpdate({
+      provider: primaryEmbedding.provider,
+      model: primaryEmbedding.model,
+      chunkCount: embeddedChunks.length,
+      viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
+      extractionMode: env.MEMORY_EXTRACTION_MODE,
+      existingMetadata: {},
+    });
+    const metadataPatch: Record<string, unknown> = {
+      embedding_chunks: fullMetadata.embedding_chunks,
       embedding: {
         provider: primaryEmbedding.provider,
         model: primaryEmbedding.model,
         dimensions: primaryEmbedding.dimensions,
+        updatedAt: new Date().toISOString(),
       },
     };
+
+    const outcome = await this.publishEmbedding({
+      memory,
+      chunkRows,
+      chunkContext,
+      fenceVersion: options.fenceVersion,
+      primaryVector: formatVectorLiteral(primaryEmbedding.vector),
+      chunkCount: embeddedChunks.length,
+      metadataPatch,
+    });
+
+    if (outcome !== 'embedded') return outcome;
+
+    memory.embedding = primaryEmbedding.vector;
+    memory.metadata = { ...(memory.metadata || {}), ...metadataPatch };
+
+    return 'embedded';
+  }
+
+  /**
+   * Hand the whole artifact swap to the database as one decision.
+   *
+   * Chunk rows and the memory row used to be written by separate statements,
+   * with the revision check done in application code in between. That is two
+   * decisions pretending to be one: a concurrent edit landing in the gap wins
+   * the row and loses its chunks, and no amount of re-checking in TypeScript
+   * closes it. swap_memory_embedding takes the row lock, compares `version`
+   * and swaps both stores inside a single transaction, so the answer cannot
+   * change between asking and acting (Lumen, r2).
+   */
+  private async publishEmbedding(params: {
+    memory: Memory;
+    chunkRows: TablesInsert<'memory_embedding_chunks'>[];
+    chunkContext: Record<string, unknown>;
+    fenceVersion: number;
+    primaryVector: string;
+    chunkCount: number;
+    metadataPatch: Record<string, unknown>;
+  }): Promise<EmbedOutcome> {
+    const { memory, chunkRows, chunkContext, fenceVersion } = params;
+    const rpcClient = this.supabase as unknown as MemoryEmbeddingRpcClient;
+
+    let errorDetails: Record<string, unknown> | null = null;
+    for (let attempt = 1; attempt <= EMBEDDING_PERSIST_RETRY_ATTEMPTS; attempt += 1) {
+      const { data, error } = await rpcClient.rpc('swap_memory_embedding', {
+        p_memory_id: memory.id,
+        p_user_id: memory.userId,
+        p_expected_version: fenceVersion,
+        p_chunks: chunkRows,
+        p_embedding: params.primaryVector,
+        p_chunks_version: MEMORY_EMBEDDING_CHUNKS_VERSION,
+        p_chunk_count: params.chunkCount,
+        p_metadata_patch: params.metadataPatch,
+      });
+
+      if (!error) {
+        if (attempt > 1) {
+          logger.info('Memory embedding persistence recovered after retry', {
+            ...chunkContext,
+            stage: 'embedding_swap',
+            attempt,
+            attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+          });
+        }
+        return interpretSwapResult(data, memory, fenceVersion);
+      }
+
+      errorDetails = normalizeErrorDetails(error);
+      logger.warn('Failed to publish memory embedding', {
+        ...chunkContext,
+        stage: 'embedding_swap',
+        attempt,
+        retrying: attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+        error: errorDetails,
+      });
+
+      if (attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS) {
+        await sleep(200 * attempt);
+      }
+    }
+
+    logger.error('Giving up on memory embedding persistence', {
+      ...chunkContext,
+      stage: 'embedding_swap',
+      attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+      error: errorDetails,
+    });
+    return 'failed';
   }
 
   /**
@@ -1446,14 +1496,30 @@ export class MemoryRepository {
   }
 
   /**
-   * Update memory salience or topics
+   * Update memory content, summary, salience, topics, or metadata.
+   *
+   * Content/summary edits are versioned: the `archive_memory_on_update` DB trigger
+   * snapshots the prior row into `memory_history` and bumps `version`, so the old
+   * version remains visible via getMemoryHistory and restorable via restoreMemory.
+   *
+   * Fields left `undefined` are not touched. Passing an empty-string summary clears it.
+   * Content/summary changes refresh semantic embeddings; if re-embedding fails, stale
+   * embeddings are cleared so recall never matches the old text.
    */
   async updateMemory(
     id: string,
     userId: string,
-    updates: { salience?: Salience; topics?: string[]; metadata?: Record<string, unknown> }
+    updates: {
+      content?: string;
+      summary?: string;
+      salience?: Salience;
+      topics?: string[];
+      metadata?: Record<string, unknown>;
+    }
   ): Promise<Memory | null> {
     const updateData: Record<string, unknown> = {};
+    if (updates.content !== undefined) updateData.content = updates.content;
+    if (updates.summary !== undefined) updateData.summary = updates.summary || null;
     if (updates.salience) updateData.salience = updates.salience;
     if (updates.topics) updateData.topics = updates.topics;
     if (updates.metadata) updateData.metadata = updates.metadata;
@@ -1472,7 +1538,159 @@ export class MemoryRepository {
       throw new Error(`Failed to update memory: ${error.message}`);
     }
 
-    return data ? this.rowToMemory(data) : null;
+    if (!data) return null;
+
+    const memory = this.rowToMemory(data);
+
+    // Embeddings index the memory text — refresh them whenever it changes so
+    // recall matches the edited content instead of the stale version.
+    if (updates.content !== undefined || updates.summary !== undefined) {
+      // Cached llm_extractions are dropped by the memory_update_strip_stale_extractions
+      // trigger, inside the UPDATE above, so there is nothing to do here and no
+      // window in which the row carries extractions of text it no longer has
+      // (Lumen, r3). `memory` is the post-trigger row, so the re-embed below
+      // cannot see them either.
+      await this.invalidateCachedSummaries(memory.userId);
+      await this.refreshMemoryEmbedding(memory);
+    }
+
+    return memory;
+  }
+
+  /**
+   * Re-embed a memory after its text changed (content edit or restore).
+   *
+   * Best-effort like the remember() path: if re-embedding cannot complete
+   * (provider disabled/unavailable, persistence failure), stale vectors are
+   * cleared so semantic recall falls back to text search rather than matching
+   * the pre-edit content.
+   */
+  private async refreshMemoryEmbedding(memory: Memory): Promise<void> {
+    const outcome = await this.tryEmbedMemory(
+      memory,
+      {
+        userId: memory.userId,
+        content: memory.content,
+        summary: memory.summary,
+        topicKey: memory.topicKey,
+        topics: memory.topics,
+        source: memory.source,
+        salience: memory.salience,
+      },
+      {
+        // The revision we just wrote. Anything newer owns the artifacts.
+        fenceVersion: memory.version,
+      }
+    );
+
+    // Superseded is not failed, and the difference matters: clearing here
+    // would delete the chunk rows and vector the WINNING revision just wrote,
+    // leaving a current memory with no embedding at all.
+    if (outcome === 'failed') {
+      await this.clearMemoryEmbedding(memory, memory.version);
+    }
+  }
+
+  /**
+   * Drop the bootstrap summary cache for a user whose memory text changed.
+   *
+   * getCachedSummary decides freshness by asking whether any memory was
+   * CREATED after the cache was computed. An edit does not move created_at, so
+   * a corrected memory kept being summarised with its pre-edit text for as
+   * long as nothing new was written — which for an established user can be a
+   * long time (Lumen, r2). Both cache keys go: an edit to a shared memory
+   * changes what every agent's summary should say.
+   */
+  private async invalidateCachedSummaries(userId: string): Promise<void> {
+    const { error } = await this.supabase
+      .from('memory_summary_cache')
+      .delete()
+      .eq('user_id', userId);
+
+    if (!error) return;
+
+    // Not a warning to carry on from (Lumen, r3). The cache's own freshness
+    // check asks whether a memory was CREATED since it was computed, and an
+    // edit creates nothing — so a delete that quietly failed leaves bootstrap
+    // quoting the pre-edit text indefinitely, for as long as the user writes
+    // no new memories. Reporting the edit as successful is what makes that
+    // undetectable.
+    logger.error('Failed to invalidate cached memory summaries after an edit', {
+      userId,
+      error: normalizeErrorDetails(error),
+    });
+    throw new Error(
+      `Memory text changed but the cached summaries for user ${userId} could not be ` +
+        `invalidated; bootstrap may keep quoting the previous text. Cause: ${error.message}`
+    );
+  }
+
+  /**
+   * Remove a memory's stale embedding artifacts (vector, chunk rows, embedding
+   * metadata). Called when the memory text changed but re-embedding failed.
+   */
+  private async clearMemoryEmbedding(memory: Memory, fenceVersion: number): Promise<void> {
+    logger.warn('Clearing stale memory embedding after failed re-embed', {
+      memoryId: memory.id,
+      userId: memory.userId,
+    });
+
+    const rpcClient = this.supabase as unknown as MemoryEmbeddingRpcClient;
+    const { data, error } = await rpcClient.rpc('clear_memory_embedding', {
+      p_memory_id: memory.id,
+      p_user_id: memory.userId,
+      p_expected_version: fenceVersion,
+      // Named keys, not a rewritten object, for the same reason the publish
+      // uses a patch: anything else on the row belongs to someone else.
+      p_metadata_remove: ['embedding', 'embedding_chunks'],
+    });
+
+    if (error) {
+      // Loud, and no partial write to explain away. The function does the chunk
+      // delete and the row update in one transaction, so a failure leaves both
+      // as they were rather than leaving a memory that looks un-embedded while
+      // its chunk rows are still there and still matching — the most
+      // misleading of the three possible states, because every surface that
+      // reports on embeddings reads the metadata and would report nothing
+      // wrong.
+      logger.error('Failed to clear stale memory embedding', {
+        memoryId: memory.id,
+        error: normalizeErrorDetails(error),
+      });
+      throw new Error(
+        `Memory ${memory.id} was updated but its stale embedding could not be removed; ` +
+          `recall may still match the previous text. Cause: ${error.message}`
+      );
+    }
+
+    if (data === 'superseded') {
+      // The row moved on while this edit's provider was failing. Its artifacts
+      // belong to the newer revision and are correct; deleting them would
+      // leave a current memory unsearchable by every semantic path (Lumen,
+      // r2). This is why the cleanup needs the same fence as the publish, and
+      // why a provider failure cannot be allowed to skip straight to it.
+      logger.info('Skipping embedding cleanup for a superseded memory revision', {
+        memoryId: memory.id,
+        embeddedVersion: fenceVersion,
+      });
+      return;
+    }
+
+    if (data !== 'ok') {
+      logger.warn('Memory embedding cleanup did not apply', {
+        memoryId: memory.id,
+        result: typeof data === 'string' ? data : String(data),
+      });
+      return;
+    }
+
+    memory.embedding = undefined;
+    if (memory.metadata && typeof memory.metadata === 'object') {
+      const metadata = { ...memory.metadata };
+      delete metadata.embedding;
+      delete metadata.embedding_chunks;
+      memory.metadata = metadata;
+    }
   }
 
   // ==================== SESSIONS ====================
@@ -2192,7 +2410,15 @@ export class MemoryRepository {
         throw new Error(`Failed to restore memory: ${error.message}`);
       }
 
-      return this.rowToMemory(data);
+      const restored = this.rowToMemory(data);
+      // Restore rewrites the memory text, so everything derived from that text
+      // is stale — including the bootstrap summary cache, which was quoting the
+      // edited version right up until this rollback (Lumen, r2). Its freshness
+      // check only asks whether a memory was CREATED since, and a restore
+      // creates nothing.
+      await this.invalidateCachedSummaries(userId);
+      await this.refreshMemoryEmbedding(restored);
+      return restored;
     } else {
       // Memory was deleted, recreate it
       const { data, error } = await this.supabase
@@ -2219,7 +2445,14 @@ export class MemoryRepository {
         throw new Error(`Failed to recreate memory: ${error.message}`);
       }
 
-      return this.rowToMemory(data);
+      const recreated = this.rowToMemory(data);
+      // A new row here, so the cache's created_at check would eventually catch
+      // up — but not until the next read, and not for a cache computed in the
+      // same second. Drop it explicitly.
+      await this.invalidateCachedSummaries(userId);
+      // Freshly recreated row has no vector yet — embed it like remember() would.
+      await this.refreshMemoryEmbedding(recreated);
+      return recreated;
     }
   }
 

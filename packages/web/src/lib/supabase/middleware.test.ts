@@ -171,3 +171,155 @@ describe('middleware updateSession', () => {
     });
   });
 });
+
+describe('cookie-to-bearer mutation protection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: 'synthetic-supabase-token' } },
+    });
+  });
+
+  it.each([
+    'http://localhost:3002',
+    'http://localhost:4002',
+    'http://localhost:5002',
+    'http://127.0.0.1:4002',
+    'http://[::1]:4002',
+  ])('supports same-origin dashboard mutations at %s without a CORS exception', async (origin) => {
+    const response = await updateSession(
+      new NextRequest(`${origin}/api/admin/tasks`, {
+        method: 'POST',
+        headers: {
+          cookie: 'pcp-admin-token=synthetic-token',
+          host: new URL(origin).host,
+          origin,
+          'sec-fetch-site': 'same-origin',
+        },
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-middleware-request-x-inkwell-csrf')).toBe('1');
+    expect(response.headers.get('x-middleware-request-authorization')).toBe(
+      'Bearer synthetic-token'
+    );
+  });
+
+  it.each([
+    ['http://127.0.0.1:4002', 'http://localhost:4002'],
+    ['http://localhost:4002', 'http://127.0.0.1:4002'],
+    ['http://[::1]:4002', 'http://localhost:4002'],
+  ])('keeps browser origins distinct: request %s, Origin %s', async (target, origin) => {
+    const response = await updateSession(
+      new NextRequest(`${target}/api/admin/tasks`, {
+        method: 'POST',
+        headers: {
+          cookie: 'pcp-admin-token=synthetic-token',
+          host: new URL(target).host,
+          origin,
+        },
+      })
+    );
+    expect(response.status).toBe(403);
+    expect(mockGetSession).not.toHaveBeenCalled();
+  });
+
+  it('does not treat other localhost ports as the dashboard origin', async () => {
+    const response = await updateSession(
+      new NextRequest('http://localhost:4002/api/admin/tasks', {
+        method: 'POST',
+        headers: {
+          cookie: 'pcp-admin-token=synthetic-token',
+          host: 'localhost:4002',
+          origin: 'http://localhost:3002',
+          'x-forwarded-host': 'localhost:3002',
+          'X-Inkwell-CSRF': '1',
+        },
+      })
+    );
+    expect(response.status).toBe(403);
+    expect(mockGetSession).not.toHaveBeenCalled();
+    expect(mockGetUser).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'http://localhost:3002',
+    'http://127.0.0.1:4002',
+    'http://[::1]:4002',
+    'http://192.0.2.10:5002',
+  ])('uses HTTP Host when Next supplies a bind-address URL instead of %s', async (origin) => {
+    // Next-server constructs the middleware URL using its configured bind
+    // hostname/port, which need not be the address the browser requested.
+    const response = await updateSession(
+      new NextRequest('http://0.0.0.0:4002/api/admin/tasks', {
+        method: 'POST',
+        headers: {
+          host: new URL(origin).host,
+          origin,
+          cookie: 'pcp-admin-token=synthetic-token',
+        },
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-middleware-request-x-inkwell-csrf')).toBe('1');
+  });
+
+  it.each(['pcp-admin-token=synthetic-token', 'sb-synthetic-auth=synthetic-session'])(
+    'rejects cross-origin before reading either credential source',
+    async (cookie) => {
+      const response = await updateSession(
+        new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+          method: 'POST',
+          headers: {
+            cookie,
+            origin: 'https://attacker.example',
+            'X-Inkwell-CSRF': '1',
+            authorization: 'Bearer synthetic',
+          },
+        })
+      );
+      expect(response.status).toBe(403);
+      expect(mockGetSession).not.toHaveBeenCalled();
+      expect(mockGetUser).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['pcp-admin-token=synthetic-token', 'sb-synthetic-auth=synthetic-session'])(
+    'adds the non-simple header only after same-origin validation',
+    async (cookie) => {
+      const response = await updateSession(
+        new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+          method: 'POST',
+          headers: { cookie, origin: WEB_ORIGIN },
+        })
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get('x-middleware-request-x-inkwell-csrf')).toBe('1');
+      expect(response.headers.get('x-middleware-request-authorization')).toMatch(
+        /^Bearer synthetic/
+      );
+    }
+  );
+
+  it('rejects ambient cookies without provenance but preserves cookie-free native calls', async () => {
+    const rejected = await updateSession(
+      new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+        method: 'POST',
+        headers: { cookie: 'pcp-admin-token=synthetic-token' },
+      })
+    );
+    expect(rejected.status).toBe(403);
+    mockGetSession.mockResolvedValue({ data: { session: null } });
+    const native = await updateSession(
+      new NextRequest(`${WEB_ORIGIN}/api/admin/tasks`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer synthetic-native', 'X-Inkwell-CSRF': 'forged' },
+      })
+    );
+    expect(native.status).toBe(200);
+    expect(native.headers.get('x-middleware-request-authorization')).toBe(
+      'Bearer synthetic-native'
+    );
+    expect(native.headers.get('x-middleware-request-x-inkwell-csrf')).toBeNull();
+  });
+});

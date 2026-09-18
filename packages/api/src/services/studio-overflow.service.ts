@@ -57,7 +57,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { access, lstat, rm } from 'fs/promises';
-import { bootstrapStudio } from '@inklabs/shared';
+import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
 import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
@@ -624,6 +624,7 @@ export class StudioOverflowService {
     sbId?: string | null;
   }): Promise<Studio | null> {
     const { userId, sbSlug, repoRoot, sbId } = opts;
+    if (!isSafeStudioComponent(sbSlug)) throw new Error('Invalid SB path component');
     const slug = `${path.basename(repoRoot)}--${sbSlug}`;
 
     const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
@@ -725,9 +726,7 @@ export class StudioOverflowService {
     // Ephemeral callers pass the canonical-root path; the durable D1 parent
     // omits it and keeps the legacy sibling-of-repo location. `git worktree
     // add` creates missing parent directories itself (verified empirically).
-    const worktreePath =
-      opts?.worktreePath ??
-      path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+    const worktreePath = opts?.worktreePath ?? studioSiblingPath(mainRoot, slug);
     const baseBranch = parentStudio.baseBranch || 'main';
 
     if (opts?.branch) {
@@ -1074,8 +1073,10 @@ export class StudioOverflowService {
     // ONE user+exact-claim-guarded CAS records cleaned + clears the claim
     // together (round 7) — a claim replaced mid-teardown fails here and the
     // sweep reconciles instead of us reporting a phantom success.
+    // Opts out of the default terminator: the `released` event below already
+    // closes this teardown window under the caller's own reason.
     const finalized = await this.leases
-      .finalizeTeardown(studio.id, studio.userId, claim)
+      .finalizeTeardown(studio.id, studio.userId, claim, { closeReason: null })
       .catch(() => false);
     if (!finalized) {
       logger.error(

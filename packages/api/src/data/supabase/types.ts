@@ -4565,6 +4565,29 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      swap_memory_embedding: {
+        Args: {
+          p_memory_id: string;
+          p_user_id: string;
+          p_expected_version: number;
+          p_chunks: Json;
+          p_embedding: string;
+          p_chunks_version: number;
+          p_chunk_count: number;
+          p_metadata_patch: Json;
+          p_metadata_remove?: string[];
+        };
+        Returns: string;
+      };
+      clear_memory_embedding: {
+        Args: {
+          p_memory_id: string;
+          p_user_id: string;
+          p_expected_version: number;
+          p_metadata_remove?: string[];
+        };
+        Returns: string;
+      };
       advance_agent_inbox_read_pointer: {
         Args: {
           p_agent_id: string;
@@ -4591,6 +4614,19 @@ export type Database = {
           p_actor_agent_id?: string | null;
         };
         Returns: boolean;
+      };
+      update_inbox_thread_metadata: {
+        Args: {
+          p_thread_id: string;
+          p_set_title: boolean;
+          p_title: string | null;
+          p_set_summary: boolean;
+          p_summary: string | null;
+          p_editor_sb_id: string | null;
+          p_editor_slug: string;
+          p_attributed_by: string;
+        };
+        Returns: string;
       };
       add_graph_nodes: {
         Args: {
