@@ -1807,14 +1807,23 @@ export class MemoryRepository {
     if (updates.context !== undefined) {
       dbUpdates.context = updates.context;
     }
-    if (updates.contextUpdatedAt !== undefined) {
-      dbUpdates.context_updated_at = updates.contextUpdatedAt.toISOString();
+    // Stamp whenever the text moves, whether or not the caller remembered to.
+    //
+    // These were independent optional params, which made the invariant
+    // "displayed text always has an age" a convention every future call site
+    // had to know about rather than a property of the column. One caller
+    // passing `context` alone would write text that renders ageless — the
+    // precise failure the column exists to prevent. This is the only code path
+    // that writes `sessions.context` (audited across TS, SQL, RPCs and the
+    // CLI), so enforcing it here makes it structural.
+    if (updates.context !== undefined || updates.contextUpdatedAt !== undefined) {
+      dbUpdates.context_updated_at = (updates.contextUpdatedAt ?? new Date()).toISOString();
     }
     if (updates.headline !== undefined) {
       dbUpdates.headline = updates.headline;
     }
-    if (updates.headlineUpdatedAt !== undefined) {
-      dbUpdates.headline_updated_at = updates.headlineUpdatedAt.toISOString();
+    if (updates.headline !== undefined || updates.headlineUpdatedAt !== undefined) {
+      dbUpdates.headline_updated_at = (updates.headlineUpdatedAt ?? new Date()).toISOString();
     }
     if (updates.workingDir !== undefined) {
       dbUpdates.working_dir = updates.workingDir;
