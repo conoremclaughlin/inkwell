@@ -14,7 +14,14 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
-import { handleUpdateSessionState, handleListSessions, handleGetSession } from './memory-handlers';
+import {
+  handleUpdateSessionState,
+  handleListSessions,
+  handleGetSession,
+  handleBootstrap,
+} from './memory-handlers';
+import { runWithRequestContext } from '../../utils/request-context';
+import { resolveCallerIdentity, isSessionAuthorized } from './caller-identity';
 
 function parse<T>(raw: { content: Array<{ text: string }> }): T {
   return JSON.parse(raw.content[0].text) as T;
@@ -181,5 +188,156 @@ describe('Session current work (integration)', () => {
     const row = await findInList(sessionId);
     expect(row?.currentWork).toBeNull();
     expect(row?.currentWorkSource).toBeNull();
+  });
+
+  /**
+   * Cross-contact scope, through the real handlers.
+   *
+   * One SB identity serves many contacts, and every session read here selects
+   * on user + slug, which is not an identity. So the row beside yours can be
+   * the same SB talking to a different person. `isSessionAuthorized` already
+   * knew that — it is why get_session withholds logs — but the current-work
+   * fields were spread in beside that check rather than behind it, and a
+   * truncated scratch board is still a scratch board.
+   *
+   * These assert on the SERIALIZED response, not on a field name. A gate that
+   * merely renamed the key would pass a `currentWork` assertion.
+   */
+  describe('another contact of the same SB', () => {
+    const PRIVATE_NOTE = 'Sentinel zebra: drafting the reply about Tuesday';
+    // Two invented people, fixed synthetic UUIDs. `sessions.contact_id` carries
+    // a foreign key, so these need rows; nothing here comes from a live contact.
+    const CONTACT_A = '11111111-2222-3333-4444-555555550001';
+    const CONTACT_B = '11111111-2222-3333-4444-555555550002';
+
+    beforeAll(async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const raw = dataComposer.getClient() as any;
+      const { error } = await raw.from('contacts').upsert(
+        [
+          { id: CONTACT_A, user_id: userId, name: 'Fixture Contact A', email: 'a@example.com' },
+          { id: CONTACT_B, user_id: userId, name: 'Fixture Contact B', email: 'b@example.com' },
+        ],
+        { onConflict: 'id' }
+      );
+      if (error) throw new Error(`contact fixture: ${error.message}`);
+    });
+
+    /**
+     * Run as an agent-bound caller scoped to `contactId`.
+     *
+     * Uses the signed-claim branch of `resolveCallerIdentity` — `tokenSlug` and
+     * `tokenContactId`, the fields it documents as the only authentication
+     * facts — rather than the stdio pin, so this exercises the same code path a
+     * real agent's bearer token takes.
+     */
+    async function asContact<T>(contactId: string, run: () => Promise<T>): Promise<T> {
+      return (await runWithRequestContext(
+        { userId, agentTokenBound: true, tokenSlug: 'echo', tokenContactId: contactId },
+        run
+      )) as T;
+    }
+
+    it('the caller really is agent-bound and contact-scoped', async () => {
+      // Control for every test below. If this binding silently failed, the
+      // caller would fall through to the same-user repair path, every session
+      // would be authorized, and the four suppression tests would pass by
+      // testing nothing at all.
+      const foreignId = await createSession({ contact_id: CONTACT_B });
+      const target = await dataComposer.repositories.memory.getSession(foreignId);
+
+      await asContact(CONTACT_A, async () => {
+        const caller = resolveCallerIdentity('echo');
+        expect(caller.agentBound).toBe(true);
+        expect(caller.contactId).toBe(CONTACT_A);
+        expect(isSessionAuthorized(target!, userId, caller)).toBe(false);
+      });
+
+      // ...and authorized for its own contact, so the gate turns on scope
+      // rather than refusing everything.
+      await asContact(CONTACT_B, async () => {
+        expect(isSessionAuthorized(target!, userId, resolveCallerIdentity('echo'))).toBe(true);
+      });
+    });
+
+    it('list_sessions withholds the other contact’s context and its fallback', async () => {
+      const foreignId = await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
+
+      const raw = await asContact(CONTACT_A, () =>
+        handleListSessions({ userId, sbSlug: 'echo', limit: 100 }, dataComposer)
+      );
+
+      expect(raw.content[0].text).not.toContain('Sentinel zebra');
+      const row = parse<{ sessions: SessionView[] }>(raw).sessions.find((s) => s.id === foreignId);
+      expect(row?.currentWork).toBeNull();
+    });
+
+    it('get_session withholds the OWNER’s context from a contact-scoped agent', async () => {
+      // The sharpest version of this path, and the one `getActiveSession`
+      // actually produces: it scopes to `contact_id IS NULL`, so the row a
+      // contact-bound caller gets back here is the account owner's own session.
+      // An SB talking to an outside contact asking "what is echo up to" was
+      // being handed the owner's private scratch board.
+      const ownerSessionId = await createSession({ contact_id: null, context: PRIVATE_NOTE });
+
+      const raw = await asContact(CONTACT_A, () =>
+        handleGetSession({ userId, sbSlug: 'echo' }, dataComposer)
+      );
+
+      // Assert WHICH session came back first. Without this, a null session or
+      // some unrelated row would make the sentinel absent for reasons that have
+      // nothing to do with the gate, and the test would pass against the bug.
+      const { session } = parse<{ session: SessionView }>(raw);
+      expect(session).not.toBeNull();
+      expect(session.id).toBe(ownerSessionId);
+      expect(raw.content[0].text).not.toContain('Sentinel zebra');
+    });
+
+    it('bootstrap withholds it from the active-sessions list', async () => {
+      await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
+
+      const raw = await asContact(CONTACT_A, () =>
+        handleBootstrap({ userId, sbSlug: 'echo', includeMemories: false }, dataComposer)
+      );
+
+      expect(raw.content[0].text).not.toContain('Sentinel zebra');
+    });
+
+    it('still publishes the other contact’s headline', async () => {
+      // The control that keeps the three above honest. Suppressing everything
+      // cross-contact would pass them all while deleting peer status entirely,
+      // which is the feature. A headline is written to be read by someone else.
+      const foreignId = await createSession({
+        contact_id: CONTACT_B,
+        context: PRIVATE_NOTE,
+        headline: 'Reviewing PR #652',
+        headline_updated_at: new Date().toISOString(),
+      });
+
+      const raw = await asContact(CONTACT_A, () =>
+        handleListSessions({ userId, sbSlug: 'echo', limit: 100 }, dataComposer)
+      );
+
+      expect(raw.content[0].text).not.toContain('Sentinel zebra');
+      const row = parse<{ sessions: SessionView[] }>(raw).sessions.find((s) => s.id === foreignId);
+      expect(row?.currentWork).toBe('Reviewing PR #652');
+      expect(row?.currentWorkSource).toBe('headline');
+      expect(row?.currentWorkAgeLabel).toBe('just now');
+    });
+
+    it('shows the same row in full to its own contact', async () => {
+      // The second half of the control: the gate turns on the audience and
+      // nothing else. Same row, same instant, the contact it belongs to.
+      const ownId = await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
+
+      const raw = await asContact(CONTACT_B, () =>
+        handleListSessions({ userId, sbSlug: 'echo', limit: 100 }, dataComposer)
+      );
+
+      expect(raw.content[0].text).toContain('Sentinel zebra');
+      const row = parse<{ sessions: SessionView[] }>(raw).sessions.find((s) => s.id === ownId);
+      expect(row?.currentWork).toBe(PRIVATE_NOTE);
+      expect(row?.currentWorkSource).toBe('context');
+    });
   });
 });

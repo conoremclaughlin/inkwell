@@ -5759,7 +5759,12 @@ router.get('/sessions', async (req: Request, res: Response) => {
           // kept for callers that still read it, but it carries no timestamp of
           // its own — rendering it alone is how a four-day-old note gets read
           // as a live claim.
-          ...describeCurrentWorkFromRow(s),
+          //
+          // 'owner': this route is the account holder's own dashboard, and every
+          // row it returns is already scoped to their user_id. The audience gate
+          // separates SBs from each other, not a user from their own sessions —
+          // `context` is returned in full two lines above for the same reason.
+          ...describeCurrentWorkFromRow(s, 'owner'),
           backend: s.backend,
           model: s.model,
           messageCount: s.message_count,

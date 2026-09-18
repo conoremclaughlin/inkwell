@@ -25,6 +25,27 @@
 /** Display cap for a context block used as a headline fallback. */
 export const CURRENT_WORK_FALLBACK_MAX = 160;
 
+/**
+ * Who is reading, and therefore whether the scratch board may be quoted.
+ *
+ * `headline` and `context` are not the same kind of text and cannot share a
+ * visibility rule. A headline is written to be read by someone else — one line,
+ * capped at 120 chars, described to its author as "what gets displayed wherever
+ * sessions are listed". Publishing it to a peer is the feature. `context` is a
+ * private working note that predates any intent to display it, and one SB
+ * identity serves many contacts, so the next session wearing the same slug may
+ * belong to a different person entirely.
+ *
+ * - `owner` — the caller is authorized for this session (`isSessionAuthorized`):
+ *   headline, else the truncated context.
+ * - `peer`  — anyone else: headline only. No context, at any length.
+ *
+ * Required rather than defaulted, because the safe value is the one a new call
+ * site would omit. Truncating to 160 chars is not an authorization boundary —
+ * 160 characters of someone else's note is still someone else's note.
+ */
+export type CurrentWorkAudience = 'owner' | 'peer';
+
 export interface CurrentWorkSource {
   headline?: string;
   headlineUpdatedAt?: Date;
@@ -68,15 +89,21 @@ export function formatAge(
 }
 
 /**
- * Render a session's current work.
+ * Render a session's current work for `audience`.
  *
- * Prefers the headline, falls back to a truncated context, and reports which it
- * used. Reporting the source matters: a truncated scratch-board note and a line
- * someone wrote to be read are different kinds of claim, and collapsing them
- * would let the fallback pass as a deliberate status.
+ * Prefers the headline, falls back to a truncated context for an owner, and
+ * reports which it used. Reporting the source matters: a truncated scratch-board
+ * note and a line someone wrote to be read are different kinds of claim, and
+ * collapsing them would let the fallback pass as a deliberate status. The same
+ * difference is why the fallback is owner-only — see `CurrentWorkAudience`.
+ *
+ * A peer looking at a session with no headline gets `null`, which is the honest
+ * answer: that session has not published a status, and its private note is not
+ * a substitute for one.
  */
 export function describeCurrentWork(
   session: CurrentWorkSource,
+  audience: CurrentWorkAudience,
   now: number = Date.now()
 ): CurrentWorkView {
   const headline = session.headline?.trim();
@@ -90,7 +117,7 @@ export function describeCurrentWork(
     };
   }
 
-  const context = session.context?.trim();
+  const context = audience === 'owner' ? session.context?.trim() : undefined;
   if (context) {
     const truncated = context.length > CURRENT_WORK_FALLBACK_MAX;
     return {
@@ -133,6 +160,7 @@ export interface CurrentWorkRow {
  */
 export function describeCurrentWorkFromRow(
   row: CurrentWorkRow,
+  audience: CurrentWorkAudience,
   now: number = Date.now()
 ): CurrentWorkView {
   return describeCurrentWork(
@@ -142,6 +170,7 @@ export function describeCurrentWorkFromRow(
       context: row.context ?? undefined,
       contextUpdatedAt: row.context_updated_at ? new Date(row.context_updated_at) : undefined,
     },
+    audience,
     now
   );
 }
