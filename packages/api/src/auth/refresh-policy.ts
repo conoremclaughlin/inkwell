@@ -39,18 +39,44 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
 export const REFRESH_RETRY_OVERLAP_SECONDS = 60;
 
 /**
+ * How far in the future a rotation stamp may sit and still be believed.
+ *
+ * `rotated_at` is written by whichever API instance served the rotation and
+ * read by whichever one serves the retry, so the two clocks can differ by a
+ * little even when both are healthy. This is the allowance for that, and only
+ * that.
+ */
+export const REFRESH_CLOCK_SKEW_TOLERANCE_SECONDS = 5;
+
+/**
  * Whether a grant rotated at `rotatedAt` is still inside its overlap window.
  *
- * A missing `rotatedAt` is NOT inside it. A row can carry a previous secret
- * with no timestamp only if something wrote one without the other, and an
- * unknown rotation time cannot be shown to be recent — so it is treated as old.
+ * Bounded in BOTH directions. The obvious bound is the far edge — a rotation
+ * older than `overlapSeconds` is out. The other one matters more: a stamp in
+ * the future makes elapsed time negative, and a check that only looks forward
+ * lets any future stamp through. A row stamped 30 days from now would keep its
+ * replaced secret redeemable for 30 days out of a window described as 60
+ * seconds, which is not a window at all.
+ *
+ * So a stamp more than `REFRESH_CLOCK_SKEW_TOLERANCE_SECONDS` ahead of `now` is
+ * refused rather than trusted. The database is the authority that keeps this
+ * rare: a trigger clamps `rotated_at` to the transaction's own `now()`, so no
+ * API-server clock can write a future rotation at all, and what remains here is
+ * genuine instance-to-instance skew plus rows that predate the trigger.
+ *
+ * A missing `rotatedAt` is NOT inside the window. A row can carry a previous
+ * secret with no timestamp only if something wrote one without the other, and
+ * an unknown rotation time cannot be shown to be recent — so it is treated as
+ * old.
  */
 export function isWithinRetryOverlap(params: {
   rotatedAt: string | null | undefined;
   now: Date;
   overlapSeconds?: number;
+  skewToleranceSeconds?: number;
 }): boolean {
   const overlapSeconds = params.overlapSeconds ?? REFRESH_RETRY_OVERLAP_SECONDS;
+  const skewToleranceSeconds = params.skewToleranceSeconds ?? REFRESH_CLOCK_SKEW_TOLERANCE_SECONDS;
   if (overlapSeconds <= 0) return false;
   if (!params.rotatedAt) return false;
 
@@ -58,9 +84,8 @@ export function isWithinRetryOverlap(params: {
   if (Number.isNaN(rotatedAtMs)) return false;
 
   const elapsedMs = params.now.getTime() - rotatedAtMs;
-  // A rotation stamped in the future is clock skew, not a fresh rotation.
-  // Treat it as inside the window rather than refusing a client for a server
-  // clock it has no part in; the window's far edge is what bounds exposure.
+  if (elapsedMs < -skewToleranceSeconds * 1000) return false;
+
   return elapsedMs <= overlapSeconds * 1000;
 }
 

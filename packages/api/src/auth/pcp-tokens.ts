@@ -209,6 +209,47 @@ interface ExchangeResult {
 }
 
 /**
+ * What an exchange concluded — as opposed to merely whether it produced a token.
+ *
+ * `null` used to stand for every way of not succeeding at once, and its callers
+ * had to guess. They guessed the most destructive reading available: the CLI
+ * deleted the credential on disk, and the dashboard returned the one string its
+ * client turns into a logout. A database that was briefly unreachable therefore
+ * ended a healthy session, and so did a request that arrived one rotation late
+ * through no fault of the client holding it.
+ *
+ * Three outcomes, and the difference between them is the whole point:
+ *
+ *   `rejected`    — terminal. The grant does not exist, belongs to another
+ *                   client, or has passed its deadline (in which case the row is
+ *                   gone). Re-authentication is genuinely required.
+ *   `superseded`  — the secret was this grant's previous one and the overlap has
+ *                   closed. The GRANT IS ALIVE; only this value is spent. A
+ *                   client holding a newer one is fine, and telling it to log
+ *                   out would destroy a working session.
+ *   `unavailable` — nothing was concluded. A database error, a timeout. The
+ *                   grant's state is unknown, so the only safe reading is "try
+ *                   again", never "you are logged out".
+ */
+export type RefreshExchangeOutcome =
+  | { status: 'rotated'; result: ExchangeResult }
+  | { status: 'replayed'; result: ExchangeResult }
+  | { status: 'superseded' }
+  | { status: 'unavailable' }
+  | { status: 'rejected' };
+
+/**
+ * PostgREST's "no rows" from `.single()`, as distinct from a real failure.
+ *
+ * Everything else — a connection reset, a statement timeout, a permissions
+ * error — means the question was never answered, and must not be read as "that
+ * token does not exist".
+ */
+function isNoRowsError(error: { code?: string } | null): boolean {
+  return error?.code === 'PGRST116';
+}
+
+/**
  * Mint an access token carrying the grant's bindings, and package the reply.
  *
  * Shared by the rotating path and the retry-overlap path on purpose: a replayed
@@ -308,7 +349,12 @@ async function grantIsPastDeadline(
  * does NOT revoke the grant on that signal — breach detection (RFC 9700
  * §4.14.2) needs a full token family and a policy decision neither of which
  * exists yet — but the signal is in the log rather than indistinguishable from
- * an ordinary stale token.
+ * an ordinary stale token, and the caller is told `superseded` rather than
+ * `rejected` so nothing downstream mistakes a live grant for a dead one.
+ *
+ * @returns the outcome, or `null` for "this path reached no conclusion" — the
+ *   overlap is switched off, or no row carries the presented value at all. What
+ *   that means depends on how the caller got here, so the caller decides.
  */
 async function replayRotatedGrant(
   supabase: SupabaseClient<Database>,
@@ -317,7 +363,7 @@ async function replayRotatedGrant(
   tokenType: PcpTokenPayload['type'],
   accessTokenLifetimeSeconds: number,
   overlapSeconds: number
-): Promise<ExchangeResult | null> {
+): Promise<RefreshExchangeOutcome | null> {
   if (overlapSeconds <= 0) return null;
 
   const { data, error } = await supabase
@@ -326,6 +372,10 @@ async function replayRotatedGrant(
     .eq('previous_refresh_token', presentedToken)
     .single();
 
+  if (error && !isNoRowsError(error)) {
+    logger.error('Failed to look up a rotated refresh token', { error, clientId });
+    return { status: 'unavailable' };
+  }
   if (error || !data) return null;
   const record = data as unknown as GrantRow;
 
@@ -334,7 +384,7 @@ async function replayRotatedGrant(
       expected: record.client_id,
       received: clientId,
     });
-    return null;
+    return { status: 'rejected' };
   }
 
   const now = new Date();
@@ -348,11 +398,12 @@ async function replayRotatedGrant(
       rotatedAt: record.rotated_at,
       overlapSeconds,
     });
-    return null;
+    // Spent, but the grant behind it is alive and someone holds its live secret.
+    return { status: 'superseded' };
   }
 
   // A grant past its deadline is over however the secret was presented.
-  if (await grantIsPastDeadline(supabase, record, clientId, now)) return null;
+  if (await grantIsPastDeadline(supabase, record, clientId, now)) return { status: 'rejected' };
 
   logger.info('Honouring a just-rotated refresh token within its retry window', {
     userId: record.user_id,
@@ -361,7 +412,15 @@ async function replayRotatedGrant(
     overlapSeconds,
   });
 
-  return grantExchangeResult(record, record.refresh_token, tokenType, accessTokenLifetimeSeconds);
+  return {
+    status: 'replayed',
+    result: grantExchangeResult(
+      record,
+      record.refresh_token,
+      tokenType,
+      accessTokenLifetimeSeconds
+    ),
+  };
 }
 
 /**
@@ -418,16 +477,18 @@ export async function createRefreshToken(
  * session. `refreshToken` in the reply is the grant's LIVE secret either way,
  * so a caller never needs to know which path answered it.
  *
- * @returns  Access token, the grant's live refresh token and user info, or null
+ * Returns a classified outcome, not a bare result. A caller that cannot tell a
+ * dead grant from an unreachable database will eventually destroy a live session
+ * on behalf of one — see `RefreshExchangeOutcome`.
  */
-export async function exchangeRefreshToken(
+export async function exchangeRefreshTokenDetailed(
   supabase: SupabaseClient<Database>,
   refreshToken: string,
   clientId: string,
   tokenType: PcpTokenPayload['type'],
   accessTokenLifetimeSeconds: number,
   options?: { retryOverlapSeconds?: number }
-): Promise<ExchangeResult | null> {
+): Promise<RefreshExchangeOutcome> {
   const overlapSeconds = options?.retryOverlapSeconds ?? REFRESH_RETRY_OVERLAP_SECONDS;
   const replay = () =>
     replayRotatedGrant(
@@ -445,12 +506,19 @@ export async function exchangeRefreshToken(
     .eq('refresh_token', refreshToken)
     .single();
 
+  if (lookupError && !isNoRowsError(lookupError)) {
+    // The question was never answered. Saying "not found" here is what turns a
+    // database hiccup into a logout.
+    logger.error('Failed to look up a refresh token', { error: lookupError, clientId });
+    return { status: 'unavailable' };
+  }
+
   if (lookupError || !data) {
     // Not the live secret — but it may be the one this grant just replaced,
     // which is the ordinary shape of a retry. Ask before refusing.
     const replayed = await replay();
     if (!replayed) logger.warn('Refresh token not found', { clientId });
-    return replayed;
+    return replayed ?? { status: 'rejected' };
   }
 
   const tokenRecord = data as unknown as GrantRow;
@@ -460,11 +528,13 @@ export async function exchangeRefreshToken(
       expected: tokenRecord.client_id,
       received: clientId,
     });
-    return null;
+    return { status: 'rejected' };
   }
 
   const now = new Date();
-  if (await grantIsPastDeadline(supabase, tokenRecord, clientId, now)) return null;
+  if (await grantIsPastDeadline(supabase, tokenRecord, clientId, now)) {
+    return { status: 'rejected' };
+  }
 
   // Rotate and stamp — one write, conditional on the value presented. Matching
   // on refresh_token as well as id is what makes a concurrent second exchange
@@ -494,17 +564,27 @@ export async function exchangeRefreshToken(
 
   if (rotateError) {
     logger.error('Failed to rotate refresh token', { error: rotateError, clientId });
-    return null;
+    return { status: 'unavailable' };
   }
   if (!updated || updated.length === 0) {
-    // Someone else rotated this grant between our read and our write. Their
-    // write recorded the value we presented, so if we are inside the overlap
-    // the answer is their successor — one live secret, both callers served.
+    // Someone else changed this grant between our read and our write. Usually a
+    // rotation: their write recorded the value we presented, so inside the
+    // overlap the answer is their successor — one live secret, both callers
+    // served.
     logger.warn('Refresh token was rotated concurrently; checking the retry window', {
       userId: tokenRecord.user_id,
       clientId,
     });
-    return replay();
+    const replayed = await replay();
+    if (replayed) return replayed;
+
+    // No replay to give. The row itself distinguishes the two ways to get here,
+    // and they are opposite answers: a grant that is still there was rotated
+    // out from under us and lives on without our secret; a grant that is gone
+    // was revoked mid-flight and its client really is finished.
+    return (await grantStillExists(supabase, tokenRecord.id))
+      ? { status: 'superseded' }
+      : { status: 'rejected' };
   }
 
   const result = grantExchangeResult(tokenRecord, rotated, tokenType, accessTokenLifetimeSeconds);
@@ -525,5 +605,46 @@ export async function exchangeRefreshToken(
     });
   }
 
-  return result;
+  return { status: 'rotated', result };
+}
+
+/**
+ * Whether the grant row is still there, asked only after a conditional update
+ * matched nothing.
+ *
+ * An error here is not an answer, and the safe reading of "unknown" on this
+ * path is that the grant survives: it keeps a client that may well be fine from
+ * being told to re-authenticate on the strength of a failed follow-up query.
+ */
+async function grantStillExists(supabase: SupabaseClient<Database>, id: string): Promise<boolean> {
+  const { data, error } = await supabase.from('mcp_tokens').select('id').eq('id', id).single();
+  if (error && !isNoRowsError(error)) return true;
+  return Boolean(data);
+}
+
+/**
+ * The exchange as a plain result-or-null, for callers with nothing useful to do
+ * with the distinction.
+ *
+ * Every caller that speaks to a client SHOULD use `exchangeRefreshTokenDetailed`
+ * instead: collapsing the outcomes here is precisely what made a database error
+ * indistinguishable from a revoked grant.
+ */
+export async function exchangeRefreshToken(
+  supabase: SupabaseClient<Database>,
+  refreshToken: string,
+  clientId: string,
+  tokenType: PcpTokenPayload['type'],
+  accessTokenLifetimeSeconds: number,
+  options?: { retryOverlapSeconds?: number }
+): Promise<ExchangeResult | null> {
+  const outcome = await exchangeRefreshTokenDetailed(
+    supabase,
+    refreshToken,
+    clientId,
+    tokenType,
+    accessTokenLifetimeSeconds,
+    options
+  );
+  return 'result' in outcome ? outcome.result : null;
 }

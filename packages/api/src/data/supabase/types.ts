@@ -4562,6 +4562,13 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      revoke_refresh_grant: {
+        Args: {
+          p_secret: string;
+          p_client_ids: string[];
+        };
+        Returns: number;
+      };
       swap_memory_embedding: {
         Args: {
           p_memory_id: string;

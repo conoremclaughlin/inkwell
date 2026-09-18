@@ -186,6 +186,7 @@ vi.mock('../utils/logger', () => ({
 
 import {
   exchangeRefreshToken,
+  exchangeRefreshTokenDetailed,
   effectiveGrantDeadline,
   isWithinRetryOverlap,
   REFRESH_ABSOLUTE_DAYS,
@@ -729,11 +730,12 @@ describe('exchangeRefreshToken — retry overlap', () => {
 
     expect(replay.scope).toBe(winner.scope);
     expect(replay.scope).toBe('mcp:tools admin');
-    expect(replay.agentId).toBe('wren');
+    // The claim and the field are `sbSlug`; only the COLUMN is still agent_id.
+    expect(replay.sbSlug).toBe('wren');
     expect(replay.identityId).toBe('sb-uuid-1');
     expect(replay.sub).toBe(winner.sub);
     expect(replay.type).toBe(winner.type);
-    expect(retry!.agentId).toBe(first!.agentId);
+    expect(retry!.sbSlug).toBe(first!.sbSlug);
     expect(retry!.identityId).toBe(first!.identityId);
   });
 
@@ -818,10 +820,200 @@ describe('isWithinRetryOverlap', () => {
     expect(isWithinRetryOverlap({ rotatedAt: at(61), now, overlapSeconds: 60 })).toBe(false);
   });
 
-  it('treats a stamp in the future as clock skew, not as a fresh rotation forever', () => {
-    // Inside, because refusing a client for the server's own clock helps nobody
-    // — and the far edge still bounds it.
-    const future = new Date(now.getTime() + 5_000).toISOString();
+  it('allows the small forward skew of one instance against another', () => {
+    // Refusing a client because two healthy servers disagree by a second helps
+    // nobody, and the far edge still bounds it.
+    const future = new Date(now.getTime() + 2_000).toISOString();
     expect(isWithinRetryOverlap({ rotatedAt: future, now, overlapSeconds: 60 })).toBe(true);
+  });
+
+  it('refuses a stamp far enough ahead to be a wrong clock rather than skew', () => {
+    // The window is bounded in both directions or it is not a window. A check
+    // that only looks at the far edge computes a NEGATIVE elapsed time for a
+    // future stamp and waves it through, so a row stamped a month ahead keeps
+    // its replaced secret redeemable for a month under a sixty-second policy.
+    const at = (msAhead: number) => new Date(now.getTime() + msAhead).toISOString();
+
+    expect(isWithinRetryOverlap({ rotatedAt: at(30 * DAY), now, overlapSeconds: 60 })).toBe(false);
+    expect(isWithinRetryOverlap({ rotatedAt: at(60 * 60 * 1000), now, overlapSeconds: 60 })).toBe(
+      false
+    );
+    // The boundary itself, both sides of it.
+    expect(
+      isWithinRetryOverlap({
+        rotatedAt: at(5_000),
+        now,
+        overlapSeconds: 60,
+        skewToleranceSeconds: 5,
+      })
+    ).toBe(true);
+    expect(
+      isWithinRetryOverlap({
+        rotatedAt: at(5_001),
+        now,
+        overlapSeconds: 60,
+        skewToleranceSeconds: 5,
+      })
+    ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What an exchange concluded, as opposed to whether it produced a token
+//
+// A single `null` used to stand for every way of not succeeding, and its
+// callers had to guess what it meant. They guessed the most destructive reading
+// available — the CLI deleted its credential, the dashboard logged the browser
+// out — so a database that was briefly unreachable ended healthy sessions, and
+// so did a request that arrived one rotation late.
+// ---------------------------------------------------------------------------
+
+describe('exchangeRefreshTokenDetailed — classifying the refusal', () => {
+  const exchange = (supabase: unknown, token = 'pcp-rt-presented') =>
+    exchangeRefreshTokenDetailed(supabase as never, token, CLIENT, 'pcp_admin', HOUR_SECONDS, {
+      retryOverlapSeconds: 60,
+    });
+
+  it('reports a rotation', async () => {
+    const outcome = await exchange(makeSupabase());
+    expect(outcome.status).toBe('rotated');
+  });
+
+  it('reports a replay inside the window', async () => {
+    lookupResult = { data: null, error: { code: 'PGRST116', message: 'no rows' } };
+    previousLookupResult = {
+      data: grantRow({
+        refresh_token: 'pcp-rt-successor',
+        previous_refresh_token: 'pcp-rt-presented',
+        rotated_at: new Date().toISOString(),
+      }),
+      error: null,
+    };
+
+    const outcome = await exchange(makeSupabase());
+
+    expect(outcome.status).toBe('replayed');
+    expect('result' in outcome && outcome.result.refreshToken).toBe('pcp-rt-successor');
+  });
+
+  it('calls an unreachable database unavailable, not a missing token', async () => {
+    // The distinction this whole type exists for. PostgREST says PGRST116 when
+    // a row is genuinely absent; ANY other error means the question was never
+    // answered, and answering "that token does not exist" on its behalf is what
+    // turns a five-second database blip into a fleet-wide logout.
+    lookupResult = {
+      data: null,
+      error: { code: '57014', message: 'canceling statement due to statement timeout' },
+    };
+
+    expect((await exchange(makeSupabase())).status).toBe('unavailable');
+  });
+
+  it('calls a failed previous-token lookup unavailable too', async () => {
+    lookupResult = { data: null, error: { code: 'PGRST116', message: 'no rows' } };
+    previousLookupResult = {
+      data: null,
+      error: { code: '08006', message: 'connection failure' },
+    };
+
+    expect((await exchange(makeSupabase())).status).toBe('unavailable');
+  });
+
+  it('calls a failed rotation write unavailable', async () => {
+    updateResult = { data: null, error: { code: '40001', message: 'serialization failure' } };
+
+    expect((await exchange(makeSupabase())).status).toBe('unavailable');
+  });
+
+  it('calls a secret whose window has closed superseded, not rejected', async () => {
+    // The grant is ALIVE — we found it, by the very column that records what it
+    // replaced. Only this value is spent. Telling the holder to re-authenticate
+    // destroys a working session on the strength of one late request.
+    lookupResult = { data: null, error: { code: 'PGRST116', message: 'no rows' } };
+    previousLookupResult = {
+      data: grantRow({
+        refresh_token: 'pcp-rt-successor',
+        previous_refresh_token: 'pcp-rt-presented',
+        rotated_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+      }),
+      error: null,
+    };
+
+    expect((await exchange(makeSupabase())).status).toBe('superseded');
+  });
+
+  it('rejects a token nothing on the row has ever seen', async () => {
+    // The control for the two above: if everything were superseded or
+    // unavailable, a genuinely invalid token would never be refused and a dead
+    // credential would sit on a client forever.
+    lookupResult = { data: null, error: { code: 'PGRST116', message: 'no rows' } };
+
+    expect((await exchange(makeSupabase())).status).toBe('rejected');
+  });
+
+  it('rejects a grant belonging to another client', async () => {
+    lookupResult = { data: grantRow({ client_id: 'someone-else' }), error: null };
+
+    expect((await exchange(makeSupabase())).status).toBe('rejected');
+  });
+
+  it('rejects a grant past its deadline', async () => {
+    lookupResult = {
+      data: grantRow({ expires_at: new Date(Date.now() - DAY).toISOString() }),
+      error: null,
+    };
+
+    expect((await exchange(makeSupabase())).status).toBe('rejected');
+  });
+});
+
+describe('exchangeRefreshTokenDetailed — losing the conditional write', () => {
+  // A zero-row update has two causes that look identical from here and mean
+  // opposite things: someone rotated the grant out from under us, or someone
+  // revoked it while we were mid-flight. The row itself is what tells them
+  // apart, and getting it wrong in either direction is a real failure — one
+  // logs out a live session, the other keeps a revoked one working.
+
+  const exchange = (supabase: unknown) =>
+    exchangeRefreshTokenDetailed(
+      supabase as never,
+      'pcp-rt-presented',
+      CLIENT,
+      'pcp_admin',
+      HOUR_SECONDS,
+      {
+        retryOverlapSeconds: 0,
+      }
+    );
+
+  it('calls it superseded when the grant is still there', async () => {
+    updateResult = { data: [], error: null };
+    const supabase = makeSupabase();
+
+    expect((await exchange(supabase)).status).toBe('superseded');
+  });
+
+  it('calls it rejected when the grant was revoked underneath it', async () => {
+    updateResult = { data: [], error: null };
+    // The follow-up existence check finds nothing: the row is gone.
+    let lookupCount = 0;
+    const base = makeSupabase();
+    const supabase = {
+      from: (table: string) => {
+        const chain = base.from(table);
+        const originalSingle = chain.single;
+        chain.single = vi.fn(() => {
+          lookupCount += 1;
+          // First call is the grant lookup; the second is the existence check.
+          if (lookupCount > 1) {
+            return Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'no rows' } });
+          }
+          return originalSingle();
+        });
+        return chain;
+      },
+    };
+
+    expect((await exchange(supabase)).status).toBe('rejected');
   });
 });
