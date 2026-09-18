@@ -18,6 +18,8 @@
  * created and the DB trigger pins it.
  */
 
+import { isTerminalPhaseMarker } from '../sessions/phase-markers';
+
 export interface SpineThreadRow {
   threadKey: string;
   keyProject: string | null;
@@ -171,9 +173,12 @@ export interface SessionLivenessFields {
  * Whether a session is working right now. Three independent ways to be not-live:
  *
  * 1. The lifecycle is not a working one.
- * 2. The session declared itself `complete` via its phase but the lifecycle
- *    was never moved off `running` — a real and common shape, and the phase
- *    is the more recent statement of the two.
+ * 2. The session declared itself finished via its phase but the lifecycle was
+ *    never moved off `running` — a real and common shape, and the phase is the
+ *    more recent statement of the two. "Finished" is isTerminalPhaseMarker's
+ *    call, not a comparison invented here: the fleet already recognises
+ *    `complete`, `completed` and either with a `:<reason>` suffix, and a
+ *    session the CLI's picker treats as history must not be advertised live.
  * 3. Its last write is older than the window (see above).
  *
  * `nowMs` is injected rather than read here so the rule is testable and so a
@@ -181,7 +186,7 @@ export interface SessionLivenessFields {
  */
 export function isSessionLive(session: SessionLivenessFields, nowMs: number): boolean {
   if (!session.lifecycle || !LIVE_LIFECYCLES.has(session.lifecycle)) return false;
-  if (session.currentPhase === 'complete') return false;
+  if (isTerminalPhaseMarker(session.currentPhase)) return false;
   const updatedMs = Date.parse(session.updatedAt);
   // An unparseable timestamp is no evidence of life. A future one is clock
   // skew, not a lie, so it stays live.

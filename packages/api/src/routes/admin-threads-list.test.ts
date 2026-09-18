@@ -122,16 +122,44 @@ function projector(columns: string): (row: Record<string, unknown>) => Record<st
 
 function table(rows: Array<Record<string, unknown>>) {
   let project: (row: Record<string, unknown>) => Record<string, unknown> = (row) => row;
+  let working = [...rows];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chain: any = {
     then: (resolve: (v: unknown) => unknown) =>
-      Promise.resolve({ data: rows.map(project), count: rows.length, error: null }).then(resolve),
+      // `count` is the PostgREST total BEFORE the limit, which is what the
+      // route's truncation meta reports — taking it from the sliced page
+      // would quietly make every response look complete.
+      Promise.resolve({ data: working.map(project), count: rows.length, error: null }).then(
+        resolve
+      ),
   };
   chain.select = vi.fn((columns?: string) => {
     if (typeof columns === 'string') project = projector(columns);
     return chain;
   });
-  for (const method of ['eq', 'or', 'not', 'neq', 'order', 'limit', 'in', 'range']) {
+  // order/limit/in are real, because the behaviour under test depends on them:
+  // the route hydrates thread rows for carrier keys that fall OUTSIDE the
+  // newest-N window, and a fake that ignores limit can never produce a row
+  // outside it — so the hydration query goes unexercised and its SELECT list
+  // can lose a column with every test still green. (It did: removing `summary`
+  // from the hydration SELECT survived until this was implemented.)
+  chain.order = vi.fn((column: string, opts?: { ascending?: boolean }) => {
+    const dir = opts?.ascending === false ? -1 : 1;
+    working = [...working].sort((a, b) =>
+      String(a[column] ?? '') < String(b[column] ?? '') ? -dir : dir
+    );
+    return chain;
+  });
+  chain.limit = vi.fn((n: number) => {
+    working = working.slice(0, n);
+    return chain;
+  });
+  chain.in = vi.fn((column: string, values: unknown[]) => {
+    const wanted = new Set(values);
+    working = working.filter((row) => wanted.has(row[column]));
+    return chain;
+  });
+  for (const method of ['eq', 'or', 'not', 'neq', 'range']) {
     chain[method] = vi.fn(() => chain);
   }
   return chain;
@@ -154,6 +182,9 @@ beforeEach(() => {
 });
 
 function respondWith(tables: Record<string, Array<Record<string, unknown>>>) {
+  // A fresh chain per from(): the route queries inbox_threads twice (window,
+  // then hydration) and a shared chain would carry the first slice into the
+  // second.
   mockSupabaseFrom.mockImplementation((name: string) => table(tables[name] ?? []));
 }
 
@@ -236,5 +267,48 @@ describe('GET /threads', () => {
       sessions: [sessionRow({ current_phase: 'complete', updated_at: ago(0) })],
     });
     expect(spine.sessions[0].live).toBe(false);
+  });
+
+  /**
+   * The hydration path. The thread window is capped at the newest 500 rows,
+   * but a session can reference an older real thread — without a second fetch
+   * that key merges as `thread: null` and gets a provisional re-parse,
+   * fabricating "no thread yet" for a thread whose identity is already pinned.
+   *
+   * The fixture puts the target thread OUTSIDE the window by making it the
+   * oldest of 501, which is the only way to reach the second query. Its SELECT
+   * list is a separate copy of the first one, so it can lose a column on its
+   * own — verified by mutation: removing `summary` from the hydration SELECT
+   * alone turns this test red and leaves the rest of the file green.
+   */
+  it('hydrates a thread outside the newest window, with its summary intact', async () => {
+    const OLD_KEY = 'pcp:pr:1';
+    const filler = Array.from({ length: 500 }, (_, i) =>
+      threadRow({
+        id: `filler-${i}`,
+        thread_key: `pcp:pr:9${String(i).padStart(3, '0')}`,
+        summary: null,
+        // Newer than the target, so the target is the one pushed out.
+        updated_at: new Date(Date.now() - i * MINUTE).toISOString(),
+      })
+    );
+    const target = threadRow({
+      id: 'old-thread',
+      thread_key: OLD_KEY,
+      title: 'An older thread someone is still working',
+      summary: 'Carried by a session, outside the newest-500 window.',
+      updated_at: new Date(Date.now() - 400 * 24 * 60 * MINUTE).toISOString(),
+    });
+
+    const spines = await listSpines({
+      inbox_threads: [...filler, target],
+      sessions: [sessionRow({ thread_key: OLD_KEY, updated_at: ago(2) })],
+    });
+
+    const spine = spines.find((s) => s.key === OLD_KEY);
+    expect(spine, 'the carrier key must produce a spine').toBeDefined();
+    expect(spine!.thread, 'hydration must find the real thread, not thread: null').not.toBeNull();
+    expect(spine!.thread?.summary).toBe('Carried by a session, outside the newest-500 window.');
+    expect(spine!.sessions[0].live).toBe(true);
   });
 });

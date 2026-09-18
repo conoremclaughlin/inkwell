@@ -375,6 +375,32 @@ describe('isSessionLive', () => {
     expect(live({ currentPhase: 'complete', updatedAt: agedMinutes(0) })).toBe(false);
   });
 
+  /**
+   * Completion has more than one spelling, and this rule does not get to
+   * invent a narrower one. isTerminalPhaseMarker is the fleet's predicate
+   * (session reopen honours it, and the CLI's picker mirrors it); a session
+   * the picker treats as history must not be advertised as live here.
+   *
+   * `completed` is in the live database today. `complete:<reason>` is the
+   * documented form for phases carrying a reason, which is how every
+   * `waiting:` and `blocked:` phase is already written.
+   */
+  it.each(['completed', 'complete:merged', 'completed:superseded', 'COMPLETE', '  complete  '])(
+    'treats %o as finished, not live',
+    (phase) => {
+      expect(live({ currentPhase: phase, updatedAt: agedMinutes(0) })).toBe(false);
+    }
+  );
+
+  // The colon is what separates a marker from a word that starts the same
+  // way; these are ordinary working phases and must stay live.
+  it.each(['completeness', 'completion-review', 'completing the port'])(
+    'does not mistake %o for a completion marker',
+    (phase) => {
+      expect(live({ currentPhase: phase, updatedAt: agedMinutes(0) })).toBe(true);
+    }
+  );
+
   it('holds the real 2026-03 row stale rather than calling it live', () => {
     expect(
       isSessionLive(
@@ -412,8 +438,15 @@ describe('mergeThreadSpines liveness', () => {
 
   /**
    * A session carried by two keys (anchor + a different active focus) is one
-   * session. Classifying inside the key loop would be a second Date.now()
-   * read per key; this pins that both copies carry the same verdict.
+   * session, and both copies must carry the same verdict.
+   *
+   * Note what this does NOT prove. With `nowMs` pinned, moving the
+   * isSessionLive call inside the key loop is behaviourally equivalent, so
+   * this test cannot fail on that relocation and no test should be contrived
+   * to make it. What it pins is the property — same session, same answer —
+   * which is what would break if the classifier ever went back to reading the
+   * clock itself. That is why `nowMs` is a parameter rather than a Date.now()
+   * inside the function.
    */
   it('gives one session the same verdict on every key it carries', () => {
     const spines = mergeThreadSpines({
