@@ -32,10 +32,13 @@ const mockSignInWithPassword = vi.fn();
 const mockSignUp = vi.fn();
 const mockSupabaseFrom = vi.fn();
 
+const mockSupabaseRpc = vi.fn();
+
 vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({
     auth: { signInWithPassword: mockSignInWithPassword, signUp: mockSignUp, getUser: vi.fn() },
     from: mockSupabaseFrom,
+    rpc: mockSupabaseRpc,
   })),
 }));
 
@@ -339,13 +342,8 @@ describe('POST /auth/mobile-refresh', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /auth/logout', () => {
-  it('deletes refresh tokens for BOTH dashboard and mobile client ids', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const chain: Record<string, any> = {};
-    chain.delete = vi.fn(() => chain);
-    chain.eq = vi.fn(() => chain);
-    chain.in = vi.fn(() => Promise.resolve({ data: null, error: null }));
-    mockSupabaseFrom.mockImplementation(() => chain);
+  it('revokes refresh tokens for BOTH dashboard and mobile client ids', async () => {
+    mockSupabaseRpc.mockResolvedValue({ data: 1, error: null });
 
     const logout = getRouteHandler('post', '/auth/logout');
     const res = createRes();
@@ -353,9 +351,12 @@ describe('POST /auth/logout', () => {
     (res as any).clearCookie = vi.fn();
     await logout(createReq({ refreshToken: 'pcp-rt-mobile' }), res);
 
-    // The route must not filter to the dashboard client alone — a mobile
-    // logout would then silently leave its 90-day token alive.
-    expect(chain.in).toHaveBeenCalledWith('client_id', ['dashboard', 'mobile']);
+    // The route must not scope revocation to the dashboard client alone — a
+    // mobile logout would then silently leave its 90-day token alive.
+    expect(mockSupabaseRpc).toHaveBeenCalledWith('revoke_refresh_grant', {
+      p_secret: 'pcp-rt-mobile',
+      p_client_ids: ['dashboard', 'mobile'],
+    });
   });
 });
 
