@@ -54,7 +54,7 @@ export interface LedgerBookmark {
   approxTokensAtCreation: number;
 }
 
-export interface LedgerEjectResult {
+export interface LedgerBookmarkEvictResult {
   bookmark: LedgerBookmark;
   removedEntries: LedgerEntry[];
   removedTokens: number;
@@ -191,24 +191,18 @@ export class ContextLedger {
     return bookmark;
   }
 
-  public ejectToBookmark(ref: string): LedgerEjectResult | null {
-    const preview = this.previewEjectToBookmark(ref);
-    if (!preview) {
-      return null;
-    }
-
-    const cutoff = Math.min(preview.bookmark.entryIndex, this.entries.length - 1);
-    this.entries = cutoff < 0 ? this.entries : this.entries.slice(cutoff + 1);
-
-    // Remove bookmarks at/inside the ejected region.
-    this.bookmarks = this.bookmarks
-      .filter((b) => b.entryIndex > cutoff)
-      .map((b) => ({ ...b, entryIndex: b.entryIndex - (cutoff + 1) }));
-
-    return preview;
-  }
-
-  public previewEjectToBookmark(ref: string): LedgerEjectResult | null {
+  /**
+   * Resolve a bookmark ref to the entries at or before it — the positional
+   * SELECTOR in the evict family, alongside by-id, by-source and by-role.
+   *
+   * Selection only: everything removes through `evictEntries`. There was a
+   * mutating twin here (`ejectToBookmark`, which sliced the prefix itself)
+   * until 2026-09-17. Two removal implementations on one ledger is how the
+   * two diverged in the first place — the slicing one never recorded a
+   * `context_evict`, so its removals came back on reattach. One remover, and
+   * that cannot happen again by construction.
+   */
+  public previewEvictToBookmark(ref: string): LedgerBookmarkEvictResult | null {
     const bookmark =
       ref === 'last'
         ? this.bookmarks[this.bookmarks.length - 1]
@@ -386,9 +380,9 @@ export class ContextLedger {
   }
 
   /**
-   * Evict specific entries by ID. Unlike eject (positional) or trim (oldest-first),
-   * this removes arbitrary entries — enabling the SB to surgically drop irrelevant
-   * context while preserving everything else.
+   * Evict specific entries by ID. Unlike evictToBookmark (positional) or trim
+   * (oldest-first), this removes arbitrary entries — enabling the SB to
+   * surgically drop irrelevant context while preserving everything else.
    */
   public evictEntries(entryIds: number[]): LedgerEvictResult {
     const idSet = new Set(entryIds);

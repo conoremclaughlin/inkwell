@@ -12,6 +12,14 @@ const testState = vi.hoisted(() => ({
   runBackendImpl: vi.fn(),
   discoverSkillsImpl: vi.fn(),
   loadSkillInstructionImpl: vi.fn(),
+  /**
+   * Whether the (absent) server acknowledges turn ownership. The harness runs
+   * with `studioId: 'studio-test'`, which is studio-backed, so the REAL
+   * turnGateDecision — still imported unmocked below — refuses every turn when
+   * this is false. Only the HTTP post is stubbed; the predicate chain the turn
+   * queue evaluates is production's.
+   */
+  turnOpenImpl: vi.fn(),
 }));
 
 vi.mock('../backends/identity.js', async (importOriginal) => {
@@ -39,6 +47,20 @@ vi.mock('../repl/backend-runner.js', () => ({
     abort: () => {},
   }),
 }));
+
+// Partial mock: `turnGateDecision` stays real so the gate is still exercised —
+// only the marker POST, which has no server here, is replaced.
+vi.mock('../repl/turn-signal.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../repl/turn-signal.js')>();
+  return {
+    ...original,
+    createTurnSignal: () => ({
+      open: async () => testState.turnOpenImpl() as boolean,
+      close: async () => true,
+      detach: async () => true,
+    }),
+  };
+});
 
 vi.mock('../repl/skills.js', () => ({
   discoverSkills: (cwd: string) => testState.discoverSkillsImpl(cwd),
@@ -76,7 +98,8 @@ vi.mock('readline/promises', () => ({
   }),
 }));
 
-import { runChat } from './chat.js';
+import { hydrateLedgerFromTranscript, runChat } from './chat.js';
+import { ContextLedger } from '../repl/context-ledger.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
@@ -99,6 +122,8 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockReset();
     testState.discoverSkillsImpl.mockReset();
     testState.loadSkillInstructionImpl.mockReset();
+    testState.turnOpenImpl.mockReset();
+    testState.turnOpenImpl.mockReturnValue(true);
 
     testState.callToolImpl.mockImplementation(async (tool: string) => {
       switch (tool) {
@@ -147,6 +172,22 @@ describe('runChat integration', () => {
     else process.env.INK_DELEGATION_SECRET = originalDelegationSecret;
     process.chdir(originalCwd);
     rmSync(testCwd, { recursive: true, force: true });
+  });
+
+  // The gate this asserts is why every turn-running test in this file was
+  // silently failing: studio-backed work with no acknowledged marker refuses
+  // the turn, and with no CI job running this suite nothing said so. Keeping
+  // an explicit case means a future gate change shows up as THIS test going
+  // red, not as thirty unrelated ones.
+  it('refuses a studio-backed turn when the server does not acknowledge ownership', async () => {
+    testState.turnOpenImpl.mockReturnValue(false);
+    testState.inputs = ['hello from test', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'codex', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('Turn not started');
+    expect(testState.runBackendImpl).not.toHaveBeenCalled();
   });
 
   it('runs a real user message turn and writes transcript entries', async () => {
@@ -2318,7 +2359,7 @@ describe('runChat integration', () => {
     expect(logText).toContain('Readline closed. Exiting chat gracefully.');
   });
 
-  it('requires confirmation before large context ejection and allows cancel', async () => {
+  it('requires confirmation before a large context eviction and allows cancel', async () => {
     const huge = 'x'.repeat(7000);
     testState.inputs = [huge, '/bookmark heavy', 'follow-up', '/eject heavy', 'n', '/quit'];
 
@@ -2329,13 +2370,118 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('About to eject');
-    expect(logText).toContain('Ejection cancelled.');
+    expect(logText).toContain('About to evict');
+    expect(logText).toContain('Eviction cancelled.');
 
     const replDir = join(testCwd, '.ink', 'runtime', 'repl');
     const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
     const transcript = readFileSync(join(replDir, transcriptFiles[0]!), 'utf-8');
+    // A cancelled removal records nothing, under either event name.
     expect(transcript).not.toContain('"type":"context_eject"');
+    expect(transcript).not.toContain('"type":"context_evict"');
+  });
+
+  // Confirmation used to be reachable only through the bookmark spelling, so
+  // `/evict role:assistant` could drop the same tokens with no prompt. The
+  // guard is on size now, and this is the selector that proves it moved.
+  it('confirms a large eviction selected by role, not just by bookmark', async () => {
+    const huge = 'x'.repeat(7000);
+    testState.inputs = [huge, '/evict role:user', 'n', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('About to evict');
+    expect(logText).toContain('Eviction cancelled.');
+  });
+
+  it('warns that /eject is deprecated and names its replacement', async () => {
+    testState.inputs = ['hello', '/bookmark b', '/eject b --force', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('/eject is deprecated');
+    expect(logText).toContain('/evict bookmark:');
+  });
+
+  // A bookmark removal is an eviction. It has to be recorded in the shape a
+  // reattach replays, or the panel reports tokens freed that come straight
+  // back on the next attach. The control below is what makes the absence
+  // assertion mean anything: without the removal, hydration DOES hold the
+  // entry, so `false` here is the eviction working rather than a ledger that
+  // never had it.
+  const bookmarkEvictionCase = async (inputs: string[]) => {
+    const huge = 'x'.repeat(7000);
+    testState.inputs = [huge, '/bookmark heavy', 'follow-up', ...inputs, '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
+    const transcriptPath = join(replDir, transcriptFiles[0]!);
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    return {
+      huge,
+      survived: ledger.listEntries().some((entry) => entry.content.includes(huge)),
+      transcript: readFileSync(transcriptPath, 'utf-8'),
+    };
+  };
+
+  it('control: without a bookmark eviction the entry is present after reattach', async () => {
+    const { survived } = await bookmarkEvictionCase([]);
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const files = readdirSync(replDir);
+    process.stderr.write(
+      'PROBE-FILES ' +
+        JSON.stringify(
+          files.map((f) => ({
+            f,
+            lines: readFileSync(join(replDir, f), 'utf-8').split('\n').filter(Boolean).length,
+            types: readFileSync(join(replDir, f), 'utf-8')
+              .split('\n')
+              .filter(Boolean)
+              .map((l) => {
+                try {
+                  return JSON.parse(l).type;
+                } catch {
+                  return '?';
+                }
+              }),
+          }))
+        ) +
+        '\n'
+    );
+    expect(survived).toBe(true);
+  });
+
+  it('a bookmark eviction stays gone on reattach', async () => {
+    const { survived } = await bookmarkEvictionCase(['/evict bookmark:heavy --force']);
+    expect(survived).toBe(false);
+  });
+
+  it('the deprecated /eject alias evicts the same way', async () => {
+    const { survived, transcript } = await bookmarkEvictionCase(['/eject heavy --force']);
+    expect(survived).toBe(false);
+    expect(transcript).toContain('"type":"context_evict"');
+  });
+
+  // The bookmark in every case above is set one input after a message that is
+  // still queued. Without the settle, `/bookmark` recorded index 0 on an
+  // empty ledger and the eviction that followed removed a single ~11-token
+  // entry while reporting success — which is exactly how the pre-existing
+  // confirmation test came to pass for years against the wrong entries.
+  it('a bookmark set right after a message covers that message', async () => {
+    const huge = 'x'.repeat(7000);
+    testState.inputs = [huge, '/bookmark heavy', '/evict bookmark:heavy --dry-run', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    const match = logText.match(/Would evict (\d+) entries \(~([\d,]+) tok\)/);
+    expect(match, 'expected a dry-run summary line').toBeTruthy();
+    expect(Number(match![2].replace(/,/g, ''))).toBeGreaterThanOrEqual(1750);
   });
 
   it('sends delegated inbox message with signed token metadata', async () => {

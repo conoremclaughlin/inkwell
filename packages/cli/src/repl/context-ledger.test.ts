@@ -20,28 +20,49 @@ describe('ContextLedger', () => {
     expect(ledger.totalTokens()).toBeGreaterThan(0);
   });
 
-  it('creates bookmarks and ejects context up to bookmark', () => {
+  it('creates bookmarks and evicts context up to bookmark', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('user', 'one');
     const bookmark = ledger.createBookmark('first');
     ledger.addEntry('assistant', 'two');
     ledger.addEntry('user', 'three');
 
-    const result = ledger.ejectToBookmark(bookmark.id);
-    expect(result).not.toBeNull();
-    expect(result?.removedEntries).toHaveLength(1);
+    const selected = ledger.previewEvictToBookmark(bookmark.id);
+    expect(selected).not.toBeNull();
+    expect(selected?.removedEntries).toHaveLength(1);
+    ledger.evictEntries(selected!.removedEntries.map((entry) => entry.id));
     expect(ledger.listEntries().map((entry) => entry.content)).toEqual(['two', 'three']);
   });
 
-  it('previews ejection without mutating entries', () => {
+  it('selecting to a bookmark does not mutate entries', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('user', 'a');
     const bookmark = ledger.createBookmark('first');
     ledger.addEntry('assistant', 'b');
 
-    const preview = ledger.previewEjectToBookmark(bookmark.id);
+    const preview = ledger.previewEvictToBookmark(bookmark.id);
     expect(preview?.removedEntries.map((entry) => entry.content)).toEqual(['a']);
     expect(ledger.listEntries().map((entry) => entry.content)).toEqual(['a', 'b']);
+  });
+
+  // The two removal paths used to differ here: the bookmark one sliced the
+  // prefix and rewrote indices itself, evictEntries remapped them. Routing
+  // bookmark removal through evictEntries has to leave bookmarks where the
+  // old slice put them.
+  it('bookmark eviction drops bookmarks inside the range and keeps later ones', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'one');
+    const inside = ledger.createBookmark('inside');
+    ledger.addEntry('assistant', 'two');
+    const after = ledger.createBookmark('after');
+    ledger.addEntry('user', 'three');
+
+    const selected = ledger.previewEvictToBookmark(inside.id);
+    ledger.evictEntries(selected!.removedEntries.map((entry) => entry.id));
+
+    expect(ledger.listBookmarks().map((b) => b.label)).toEqual(['after']);
+    const survivor = ledger.listBookmarks()[0];
+    expect(ledger.listEntries()[survivor.entryIndex].content).toBe('two');
   });
 
   it('builds transcript respecting maxTokens', () => {
