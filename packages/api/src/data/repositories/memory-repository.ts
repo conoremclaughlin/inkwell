@@ -1556,6 +1556,9 @@ export class MemoryRepository {
       status?: string;
       backendSessionId?: string;
       context?: string;
+      contextUpdatedAt?: Date;
+      headline?: string | null;
+      headlineUpdatedAt?: Date;
       workingDir?: string;
       cliAttached?: boolean;
       cliPollAt?: string;
@@ -1585,6 +1588,15 @@ export class MemoryRepository {
     }
     if (updates.context !== undefined) {
       dbUpdates.context = updates.context;
+    }
+    if (updates.contextUpdatedAt !== undefined) {
+      dbUpdates.context_updated_at = updates.contextUpdatedAt.toISOString();
+    }
+    if (updates.headline !== undefined) {
+      dbUpdates.headline = updates.headline;
+    }
+    if (updates.headlineUpdatedAt !== undefined) {
+      dbUpdates.headline_updated_at = updates.headlineUpdatedAt.toISOString();
     }
     if (updates.workingDir !== undefined) {
       dbUpdates.working_dir = updates.workingDir;
@@ -2272,6 +2284,9 @@ export class MemoryRepository {
       claudeSessionId: row.claude_session_id || undefined,
       workingDir: row.working_dir || undefined,
       context: row.context || undefined,
+      contextUpdatedAt: row.context_updated_at ? new Date(row.context_updated_at) : undefined,
+      headline: row.headline || undefined,
+      headlineUpdatedAt: row.headline_updated_at ? new Date(row.headline_updated_at) : undefined,
       startedAt: new Date(row.started_at),
       endedAt: row.ended_at ? new Date(row.ended_at) : undefined,
       summary: row.summary || undefined,

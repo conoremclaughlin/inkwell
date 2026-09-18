@@ -30,6 +30,7 @@ import {
 import { getCloudSkillsService } from '../../skills/cloud-service';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { StudioLeaseService } from '../../services/studio-lease.service';
+import { describeCurrentWork } from '../../services/sessions/current-work';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -312,6 +313,11 @@ export function mapSessionForBootstrap(
     activeThreadKey: s.activeThreadKey || null,
     lifecycle: s.lifecycle || null,
     currentPhase: s.currentPhase || null,
+    // Shown for EVERY active session, not only the caller's own. Seeing what a
+    // sibling is working on is the whole point: this is the list an SB reads at
+    // startup to know who is doing what. The full context block stays scoped to
+    // the caller, since it is long and is their own scratch board.
+    ...describeCurrentWork(s),
     ...(callerSessionId && s.id === callerSessionId && s.context ? { context: s.context } : {}),
     startedAt: s.startedAt.toISOString(),
   };
@@ -612,6 +618,13 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
       '[Deprecated] Use lifecycle. Kept for backward compat — ignored when lifecycle is set.'
     ),
   context: z.string().optional().describe('Brief context of current work state'),
+  headline: z
+    .string()
+    .max(120)
+    .optional()
+    .describe(
+      'ONE LINE, max 120 chars: what you are working on right now. This is what gets displayed wherever sessions are listed, so it is the only part of your state anyone reads casually. Keep it current — it is shown with its age, and a stale headline is visibly stale. Distinct from `context`, which stays the longer scratch board.'
+    ),
   workingDir: z.string().optional().describe('Working directory'),
   cliAttached: z
     .boolean()
@@ -1534,6 +1547,8 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               currentPhase: session.currentPhase || null,
               threadKey: session.threadKey || null,
               activeThreadKey: session.activeThreadKey || null,
+              ...describeCurrentWork(session),
+              context: session.context || null,
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
               summary: session.summary,
@@ -1615,6 +1630,12 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
               backendSessionId: s.backendSessionId || null,
               /** @deprecated Use backendSessionId */
               claudeSessionId: s.backendSessionId || s.claudeSessionId || null,
+              // What this session is working on, on the surface a reader
+              // actually sees. `currentWork` is always populated when there is
+              // anything to say — headline if one was written, otherwise the
+              // context truncated — so a caller never has to know which field
+              // to look in, and `ageLabel` means it is never read as now.
+              ...describeCurrentWork(s),
               context: s.context || null,
               workingDir: s.workingDir || null,
               startedAt: s.startedAt.toISOString(),
@@ -1751,6 +1772,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     !params.backendSessionId &&
     !params.status &&
     !params.context &&
+    params.headline === undefined &&
     !params.workingDir &&
     params.cliAttached === undefined &&
     params.alias === undefined &&
@@ -1764,7 +1786,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
             {
               success: false,
               error:
-                'At least one field must be provided (phase, lifecycle, backendSessionId, status, context, workingDir).',
+                'At least one field must be provided (phase, lifecycle, backendSessionId, status, context, headline, workingDir).',
             },
             null,
             2
@@ -1839,6 +1861,9 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     status?: string;
     backendSessionId?: string;
     context?: string;
+    contextUpdatedAt?: Date;
+    headline?: string | null;
+    headlineUpdatedAt?: Date;
     workingDir?: string;
     cliAttached?: boolean;
     alias?: string | null;
@@ -1888,6 +1913,15 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   }
   if (params.context !== undefined) {
     updates.context = params.context;
+    // Stamped here rather than derived from sessions.updated_at, which moves on
+    // every write (lifecycle, phase, cliAttached) and so cannot say when the
+    // narrative was last true. Without a distinct stamp a four-day-old context
+    // block looks as fresh as the row it sits on.
+    updates.contextUpdatedAt = new Date();
+  }
+  if (params.headline !== undefined) {
+    updates.headline = params.headline || null;
+    updates.headlineUpdatedAt = new Date();
   }
   if (params.workingDir !== undefined) {
     updates.workingDir = params.workingDir;

@@ -3017,6 +3017,9 @@ export type Database = {
           cli_turn_fenced_attempts: Json;
           cli_turn_attempt_claims: Json;
           cli_turn_missing_stop_at: string | null;
+          context_updated_at: string | null;
+          headline: string | null;
+          headline_updated_at: string | null;
           turn_epoch: string | null;
           compacting_since: string | null;
           contact_id: string | null;
@@ -3055,6 +3058,9 @@ export type Database = {
           cli_turn_fenced_attempts?: Json;
           cli_turn_attempt_claims?: Json;
           cli_turn_missing_stop_at?: string | null;
+          context_updated_at?: string | null;
+          headline?: string | null;
+          headline_updated_at?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
@@ -3093,6 +3099,9 @@ export type Database = {
           cli_turn_fenced_attempts?: Json;
           cli_turn_attempt_claims?: Json;
           cli_turn_missing_stop_at?: string | null;
+          context_updated_at?: string | null;
+          headline?: string | null;
+          headline_updated_at?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;

@@ -1028,6 +1028,10 @@ describe('handleUpdateSessionState', () => {
           backendSessionId: 'claude-abc123',
           status: 'active',
           context: 'Building feature X',
+          // Writing context stamps its own age. sessions.updated_at moves on
+          // every write to the row, so it cannot date the narrative — without a
+          // separate stamp a four-day-old context block reads as current.
+          contextUpdatedAt: expect.any(Date),
           workingDir: '/Users/test/project',
         }
       );
