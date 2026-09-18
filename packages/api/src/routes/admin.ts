@@ -14,6 +14,7 @@ import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
 import { REFRESH_ABSOLUTE_DAYS } from '../auth/refresh-policy';
+import { isPcpIssuedJwt } from '../auth/pcp-bearer-shape';
 import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
@@ -1036,9 +1037,11 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     }
 
     // --- Tier 2: Refresh token exchange (1 DB call, ~once/hour) ---
+    let refreshExchangeFailed = false;
     if (!pcpUserId) {
       const refreshCookie = req.cookies?.['pcp-admin-refresh'];
       if (refreshCookie) {
+        refreshExchangeFailed = true;
         const result = await exchangeRefreshToken(
           supabase,
           refreshCookie,
@@ -1047,6 +1050,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
           ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
         );
         if (result) {
+          refreshExchangeFailed = false;
           pcpUserId = result.userId;
           userEmail = result.email;
           res.cookie('pcp-admin-token', result.accessToken, {
@@ -1077,6 +1081,27 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     // --- Tier 3: Supabase verification (network call, first login only) ---
     if (!pcpUserId) {
+      // Tier 3 verifies a SUPABASE access token, which is what a browser
+      // carries on its first request after signing in. A PCP-issued JWT is not
+      // one, and handing it to Supabase can only ever come back "Invalid
+      // token" — the exact string the dashboard's interceptor turns into a
+      // logout. So a session whose refresh exchange had just failed was logged
+      // out by a verifier that was never applicable to its credential.
+      //
+      // The refusal is the same; what changes is that it is reached honestly,
+      // without putting our bearer in front of an unrelated verifier and
+      // without making the outcome depend on Supabase being reachable.
+      if (refreshExchangeFailed && isPcpIssuedJwt(token)) {
+        logger.warn(
+          'Admin refresh exchange failed for a PCP-issued bearer; not consulting Supabase',
+          {
+            path: req.path,
+          }
+        );
+        res.status(401).json({ error: 'Invalid token' });
+        return;
+      }
+
       const {
         data: { user },
         error,

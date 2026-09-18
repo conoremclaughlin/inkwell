@@ -513,6 +513,118 @@ describe('adminAuthMiddleware', () => {
       expect(mockExchangeRefreshToken).not.toHaveBeenCalled();
       expect(mockGetUser).toHaveBeenCalled(); // Fell through to Tier 3
     });
+
+    // -----------------------------------------------------------------------
+    // A failed refresh must not send OUR bearer to Supabase.
+    //
+    // Tier 3 verifies a Supabase access token — what a browser carries on its
+    // first request after signing in. A PCP-issued JWT is not one, so handing
+    // it over can only come back "Invalid token", which is the exact string the
+    // dashboard interceptor turns into a logout. A session whose refresh had
+    // just lost a race was therefore logged out by a verifier that never
+    // applied to its credential.
+    // -----------------------------------------------------------------------
+
+    /** A PCP-shaped bearer: real base64url, our `type` claim, expired. */
+    const pcpBearer = (type = 'pcp_admin') => {
+      const part = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+      return [
+        part({ alg: 'HS256', typ: 'JWT' }),
+        part({ type, sub: 'user-1', email: 'a@example.invalid', exp: 1 }),
+        'sig',
+      ].join('.');
+    };
+
+    it('should refuse without consulting Supabase when the refresh fails for a PCP bearer', async () => {
+      mockExchangeRefreshToken.mockResolvedValue(null);
+      mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
+
+      const req = createMockReq({
+        headers: { authorization: `Bearer ${pcpBearer()}` },
+        cookies: { 'pcp-admin-refresh': 'pcp-rt-dead' },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockExchangeRefreshToken).toHaveBeenCalled();
+      expect(mockGetUser).not.toHaveBeenCalled();
+      expect(res._status).toBe(401);
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('should still reach Supabase for a bearer that is NOT one of ours', async () => {
+      // The control. The guard keys on the bearer's shape, so a genuine
+      // Supabase token whose stale refresh cookie failed must still be able to
+      // sign in — otherwise first-login would break for anyone holding both.
+      mockExchangeRefreshToken.mockResolvedValue(null);
+      mockGetUser.mockResolvedValue({
+        data: { user: { email: 'tier3@example.com' } },
+        error: null,
+      });
+      mockSupabaseUserLookup({ id: 'user-tier3', telegram_id: null, whatsapp_id: null });
+      mockDefaultWorkspace();
+      mockSignPcpAccessToken.mockReturnValue('signed-admin-jwt');
+      mockCreateRefreshToken.mockResolvedValue({ refreshToken: 'pcp-rt-new' });
+
+      const req = createMockReq({
+        headers: { authorization: 'Bearer supabase-opaque-token' },
+        cookies: { 'pcp-admin-refresh': 'pcp-rt-dead' },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockGetUser).toHaveBeenCalled();
+      expect(next).toHaveBeenCalled();
+    });
+
+    it('should still reach Supabase for a PCP bearer when no refresh was attempted', async () => {
+      // The second control: the guard fires on a FAILED exchange, not on the
+      // bearer's shape alone. With no cookie there was no exchange to fail.
+      mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
+
+      const req = createMockReq({
+        headers: { authorization: `Bearer ${pcpBearer('mcp_access')}` },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockExchangeRefreshToken).not.toHaveBeenCalled();
+      expect(mockGetUser).toHaveBeenCalled();
+    });
+
+    it('should not refuse when the refresh exchange succeeds, however stale the bearer', async () => {
+      // The race this exists for: the retry overlap makes the loser's exchange
+      // succeed, and the request must then proceed normally rather than being
+      // caught by the guard on its way past.
+      mockExchangeRefreshToken.mockResolvedValue({
+        accessToken: 'new-access',
+        refreshToken: 'pcp-rt-successor',
+        refreshTokenExpiresAt: new Date(Date.now() + 86_400_000),
+        userId: 'user-raced',
+        email: 'raced@test.com',
+      });
+      mockDefaultWorkspace();
+
+      const req = createMockReq({
+        headers: { authorization: `Bearer ${pcpBearer()}` },
+        cookies: { 'pcp-admin-refresh': 'pcp-rt-previous' },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockGetUser).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalled();
+      expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-successor');
+      expect((req as any).pcpUserId).toBe('user-raced');
+    });
   });
 
   // =========================================================================
