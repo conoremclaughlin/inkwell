@@ -4,7 +4,15 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import crypto from 'crypto';
-import { mkdirSync, existsSync, readFileSync, statSync, writeFileSync, rmSync } from 'fs';
+import {
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+  rmSync,
+} from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -20,6 +28,7 @@ import {
   saveDelegatedAuth,
   clearDelegatedAuth,
   clearAuth,
+  clearAuthIfUnchanged,
   updateConfigEmail,
   type StoredAuth,
 } from './tokens.js';
@@ -343,6 +352,212 @@ describe('getValidAccessToken', () => {
     process.env.INK_ACCESS_TOKEN = envJwt;
     const token = await getValidAccessToken('http://localhost:3001');
     expect(token).toBe(envJwt);
+  });
+});
+
+// ============================================================================
+// Concurrent rotation of the shared credential file
+//
+// ~/.ink/auth.json is shared by every CLI process on the machine, and the grant
+// rotates on refresh. Two processes reading the same secret is ordinary, not
+// exotic: a REPL and an `ink wait` running beside it is enough. Before these,
+// the loser of that race deleted the winner's freshly-written credential and
+// forced a re-login on a session whose grant was alive.
+// ============================================================================
+
+describe('getValidAccessToken — a lost rotation race', () => {
+  let origHome: string | undefined;
+  let origEnvToken: string | undefined;
+  let origFetch: typeof globalThis.fetch;
+  let tempHome: string;
+  let authPath: string;
+
+  const staleAuth = (refreshToken: string): StoredAuth => ({
+    access_token: `access-for-${refreshToken}`,
+    refresh_token: refreshToken,
+    expires_in: 3600,
+    scope: 'full',
+    issued_at: Date.now() - 2 * 3600 * 1000, // long past the refresh buffer
+  });
+
+  const freshAuth = (refreshToken: string): StoredAuth => ({
+    access_token: `access-for-${refreshToken}`,
+    refresh_token: refreshToken,
+    expires_in: 3600,
+    scope: 'full',
+    issued_at: Date.now(),
+  });
+
+  /** A server that refuses everything — what the loser of a race actually sees. */
+  const refuseEveryExchange = (onCall?: () => void) => {
+    globalThis.fetch = (async () => {
+      onCall?.();
+      return {
+        ok: false,
+        json: async () => ({ error: 'invalid_grant' }),
+      } as unknown as Response;
+    }) as typeof globalThis.fetch;
+  };
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origEnvToken = process.env.INK_ACCESS_TOKEN;
+    origFetch = globalThis.fetch;
+    delete process.env.INK_ACCESS_TOKEN;
+    tempHome = join(tmpdir(), `ink-rotation-race-${Date.now()}-${Math.random()}`);
+    mkdirSync(join(tempHome, '.ink'), { recursive: true });
+    process.env.HOME = tempHome;
+    authPath = join(tempHome, '.ink', 'auth.json');
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    if (origEnvToken === undefined) delete process.env.INK_ACCESS_TOKEN;
+    else process.env.INK_ACCESS_TOKEN = origEnvToken;
+    globalThis.fetch = origFetch;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it('does not delete the credential another process just rotated in', async () => {
+    saveAuth(staleAuth('refresh-A'));
+
+    // The winner's rotation lands while our exchange is in flight: by the time
+    // the server refuses OUR secret, the file already holds the successor.
+    refuseEveryExchange(() => saveAuth(freshAuth('refresh-B')));
+
+    const token = await getValidAccessToken('http://localhost:3001');
+
+    expect(existsSync(authPath)).toBe(true);
+    expect(loadAuth()!.refresh_token).toBe('refresh-B');
+    // And the caller is served from the winner's result rather than sent to
+    // re-login while a working credential sits on disk.
+    expect(token).toBe('access-for-refresh-B');
+  });
+
+  it('still clears the credential when the grant itself is dead', async () => {
+    // The control. If a refusal stopped clearing, a revoked or expired grant
+    // would sit in the file forever and every command would 401 in silence.
+    saveAuth(staleAuth('refresh-A'));
+    refuseEveryExchange();
+
+    const token = await getValidAccessToken('http://localhost:3001');
+
+    expect(token).toBeNull();
+    expect(existsSync(authPath)).toBe(false);
+  });
+
+  it('leaves the file alone when the successor it re-read fails too', async () => {
+    // We lost the race AND the winner's secret does not work either. It is
+    // still not ours to delete: a third process may be mid-rotation with it.
+    saveAuth(staleAuth('refresh-A'));
+    refuseEveryExchange(() => {
+      if (loadAuth()!.refresh_token === 'refresh-A') saveAuth(staleAuth('refresh-B'));
+    });
+
+    const token = await getValidAccessToken('http://localhost:3001');
+
+    expect(token).toBeNull();
+    expect(existsSync(authPath)).toBe(true);
+    expect(loadAuth()!.refresh_token).toBe('refresh-B');
+  });
+});
+
+describe('clearAuthIfUnchanged', () => {
+  let origHome: string | undefined;
+  let tempHome: string;
+  let authPath: string;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    tempHome = join(tmpdir(), `ink-clear-if-${Date.now()}-${Math.random()}`);
+    mkdirSync(join(tempHome, '.ink'), { recursive: true });
+    process.env.HOME = tempHome;
+    authPath = join(tempHome, '.ink', 'auth.json');
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  const auth = (refreshToken: string): StoredAuth => ({
+    access_token: 'access',
+    refresh_token: refreshToken,
+    expires_in: 3600,
+    scope: 'full',
+    issued_at: Date.now(),
+  });
+
+  it('removes the file when it still holds the caller has', () => {
+    saveAuth(auth('refresh-A'));
+    expect(clearAuthIfUnchanged('refresh-A')).toBe(true);
+    expect(existsSync(authPath)).toBe(false);
+  });
+
+  it('keeps a file that has since been rotated by someone else', () => {
+    saveAuth(auth('refresh-B'));
+    expect(clearAuthIfUnchanged('refresh-A')).toBe(false);
+    expect(existsSync(authPath)).toBe(true);
+    expect(loadAuth()!.refresh_token).toBe('refresh-B');
+  });
+
+  it('reports false rather than throwing when there is no file', () => {
+    expect(clearAuthIfUnchanged('refresh-A')).toBe(false);
+  });
+});
+
+describe('saveAuth — atomicity', () => {
+  let origHome: string | undefined;
+  let tempHome: string;
+  let authPath: string;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    tempHome = join(tmpdir(), `ink-atomic-save-${Date.now()}-${Math.random()}`);
+    mkdirSync(join(tempHome, '.ink'), { recursive: true });
+    process.env.HOME = tempHome;
+    authPath = join(tempHome, '.ink', 'auth.json');
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  const auth = (token: string): StoredAuth => ({
+    access_token: token,
+    refresh_token: 'refresh',
+    expires_in: 3600,
+    scope: 'full',
+    issued_at: Date.now(),
+  });
+
+  it('replaces the file rather than rewriting it in place', () => {
+    // The inode is the observable difference, and it is the guarantee itself: a
+    // truncate-and-write keeps the entry and exposes a half-written file to any
+    // concurrent reader, which loadAuth answers as "not logged in". A rename
+    // swaps the directory entry, so a reader sees the whole old file or the
+    // whole new one.
+    saveAuth(auth('first'));
+    const firstInode = statSync(authPath).ino;
+
+    saveAuth(auth('second'));
+    const secondInode = statSync(authPath).ino;
+
+    expect(secondInode).not.toBe(firstInode);
+    expect(loadAuth()!.access_token).toBe('second');
+  });
+
+  it('leaves no temp files behind', () => {
+    saveAuth(auth('first'));
+    saveAuth(auth('second'));
+    const leftovers = readdirSync(join(tempHome, '.ink')).filter((f) => f.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('keeps the credential file owner-only', () => {
+    saveAuth(auth('first'));
+    expect(statSync(authPath).mode & 0o777).toBe(0o600);
   });
 });
 

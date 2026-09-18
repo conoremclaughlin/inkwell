@@ -6,7 +6,15 @@
  */
 
 import crypto from 'crypto';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, chmodSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+  renameSync,
+  mkdirSync,
+  chmodSync,
+} from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -100,12 +108,36 @@ export function loadAuth(): StoredAuth | null {
   }
 }
 
+/**
+ * Write a credential file so a concurrent reader sees all of it or none of it.
+ *
+ * `writeFileSync` on an existing path truncates and then writes, so a second
+ * process reading in between gets a partial file. `loadAuth` answers a parse
+ * failure with null, which its callers read as "not logged in" — a race that
+ * logs the CLI out of a perfectly good session. Writing a sibling temp file and
+ * renaming makes the swap atomic: `rename(2)` within a directory either has
+ * happened or has not.
+ */
+function writeCredentialFileAtomically(path: string, contents: string): void {
+  const temp = `${path}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  writeFileSync(temp, contents, { mode: 0o600 });
+  try {
+    renameSync(temp, path);
+  } catch (err) {
+    try {
+      unlinkSync(temp);
+    } catch {
+      // Best-effort cleanup; the rename failure is what matters.
+    }
+    throw err;
+  }
+  chmodSync(path, 0o600);
+}
+
 export function saveAuth(auth: StoredAuth): void {
-  const path = authFilePath();
   const dir = join(homedir(), '.ink');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path, JSON.stringify(auth, null, 2) + '\n');
-  chmodSync(path, 0o600);
+  writeCredentialFileAtomically(authFilePath(), JSON.stringify(auth, null, 2) + '\n');
 }
 
 export function clearAuth(): void {
@@ -113,6 +145,32 @@ export function clearAuth(): void {
   if (existsSync(path)) {
     unlinkSync(path);
   }
+}
+
+/**
+ * Delete the stored credential only if it is still the one the caller was
+ * holding.
+ *
+ * `~/.ink/auth.json` is shared by every CLI process on the machine, and a
+ * refresh rotates it. A caller whose own refresh failed cannot conclude the
+ * file is dead: another process may have rotated the grant a moment earlier, in
+ * which case the file now holds a working secret that is none of this caller's
+ * business to delete. Comparing before unlinking keeps a lost race from logging
+ * the winner out.
+ *
+ * The compare and the unlink are not one operation, so a rotation landing
+ * between them is still lost. That window is microseconds against the seconds a
+ * token exchange takes, and the server's retry overlap means the loser
+ * usually succeeds and never reaches this function at all.
+ *
+ * @returns whether the file was removed
+ */
+export function clearAuthIfUnchanged(refreshToken: string): boolean {
+  const current = loadAuth();
+  if (!current) return false;
+  if (current.refresh_token !== refreshToken) return false;
+  clearAuth();
+  return true;
 }
 
 export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
@@ -134,9 +192,10 @@ export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): v
     // Best-effort only; some environments may not support chmod.
   }
 
-  const path = delegatedAuthFilePath(agentId);
-  writeFileSync(path, JSON.stringify(auth, null, 2) + '\n');
-  chmodSync(path, 0o600);
+  writeCredentialFileAtomically(
+    delegatedAuthFilePath(agentId),
+    JSON.stringify(auth, null, 2) + '\n'
+  );
 }
 
 export function clearDelegatedAuth(agentId: string): void {
@@ -258,8 +317,30 @@ export async function getValidAccessToken(
     saveAuth(refreshed);
     return refreshed.access_token;
   } catch {
-    // Refresh failed (token revoked or expired) — force re-login
-    clearAuth();
+    // A failed exchange is not proof the grant is dead. `~/.ink/auth.json` is
+    // shared by every CLI process on this machine, and the grant rotates: if
+    // another process refreshed while we were in flight, the secret we
+    // presented is the one IT retired, and the file already holds the live
+    // successor. Re-read before concluding anything.
+    const current = loadAuth();
+    if (current && current.refresh_token !== auth.refresh_token) {
+      // Someone else won. Their result is the answer.
+      if (!isTokenExpired(current)) return current.access_token;
+      try {
+        const refreshed = await refreshAccessToken(serverUrl, current);
+        saveAuth(refreshed);
+        return refreshed.access_token;
+      } catch {
+        // Their secret failed too, but it is not ours to delete — we never
+        // held it, and a third process may be mid-rotation with it right now.
+        return null;
+      }
+    }
+
+    // The file still holds the secret we presented, so the failure is the
+    // grant's own: revoked, or past its deadline. Clear it — but conditionally,
+    // so a rotation landing in the meantime survives.
+    clearAuthIfUnchanged(auth.refresh_token);
     return null;
   }
 }
