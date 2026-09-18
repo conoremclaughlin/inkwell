@@ -19,6 +19,15 @@ export interface CompactionRequest {
   summaryText?: string;
   /** Entries kept verbatim after the summary. Absent means `deps.keepRecentDefault`. */
   keepRecent?: number;
+  /**
+   * Replace EXACTLY these entries, wherever they sit, instead of the oldest
+   * run. Resolved from `refs` by the host against the live ledger, so a stale
+   * ref names the same content or nothing — never a neighbour that inherited
+   * its position. When present, `keepRecent` does not apply: the caller has
+   * already said which entries go, and a recent-tail guard would silently
+   * countermand it.
+   */
+  entryIds?: readonly number[];
   /** The turn's cancellation — reaches the summarizer. */
   signal?: AbortSignal;
 }
@@ -55,6 +64,8 @@ export type CompactionOutcome =
       totalAfter: number;
       /** What the operation itself freed: removed minus summary. Never confused with `before − totalAfter`. */
       freedTokens: number;
+      /** Where the summary sits among the survivors — 0 for an oldest-N compaction. */
+      summaryIndex: number;
     }
   | { ok: false; error: string; hardTrimmed?: number };
 
@@ -79,12 +90,29 @@ export async function runCompaction(
   const { ledger } = deps;
   const keepRecent = req.keepRecent ?? deps.keepRecentDefault;
   const entries = ledger.listEntries();
-  const cutoff = Math.max(0, entries.length - keepRecent);
-  if (cutoff === 0) {
-    return {
-      ok: false,
-      error: `nothing to compact — only the protected recent tail remains (${entries.length} entries, keepRecent ${keepRecent})`,
-    };
+
+  // Two selectors onto one operation. A named set is taken as given; otherwise
+  // the oldest run outside the protected tail is chosen here.
+  let oldest: ReturnType<ContextLedger['listEntries']>;
+  if (req.entryIds !== undefined) {
+    const wanted = new Set(req.entryIds);
+    oldest = entries.filter((e) => wanted.has(e.id));
+    if (oldest.length === 0) {
+      return {
+        ok: false,
+        error:
+          'none of those refs match an entry in the context right now — they may already have been evicted or consolidated. Call list_context for current refs.',
+      };
+    }
+  } else {
+    const cutoff = Math.max(0, entries.length - keepRecent);
+    if (cutoff === 0) {
+      return {
+        ok: false,
+        error: `nothing to compact — only the protected recent tail remains (${entries.length} entries, keepRecent ${keepRecent})`,
+      };
+    }
+    oldest = entries.slice(0, cutoff);
   }
 
   // The set to summarize is fixed HERE, by id. The ledger keeps moving while a
@@ -92,7 +120,6 @@ export async function runCompaction(
   // count after the await removed whatever was oldest by then — a protected
   // tail entry the summarizer never saw (Lumen, PR #578). The removed set is
   // exactly the summarized set; anything appended meanwhile survives.
-  const oldest = entries.slice(0, cutoff);
   const oldestIds = oldest.map((e) => e.id);
   const oldestIdSet = new Set(oldestIds);
   const removedTokensPlanned = oldest.reduce((sum, e) => sum + e.approxTokens, 0);
@@ -147,9 +174,14 @@ export async function runCompaction(
     }
   }
 
-  const summary = `[Conversation summary — compacted ${oldest.length} earlier entries${
-    req.actor === 'sb' ? ', written by the agent' : ''
-  }]\n${summaryText}`;
+  // "earlier" is only true of the oldest-N selector. A ref-selected set is
+  // named, not aged, and the summary sits where those entries sat — calling
+  // them earlier would misdescribe the ledger the agent is about to read.
+  const summary = `[Conversation summary — ${
+    req.entryIds !== undefined
+      ? `consolidated ${oldest.length} selected entries`
+      : `compacted ${oldest.length} earlier entries`
+  }${req.actor === 'sb' ? ', written by the agent' : ''}]\n${summaryText}`;
   const summaryTokens = estimateTokens(summary);
   // A compaction must shrink the window. A "summary" larger than what it
   // replaces is a rewrite that grows the context and rolls the provider
@@ -176,6 +208,17 @@ export async function runCompaction(
   // Live, pre-mutation: late appends are in here, as they are in totalAfter.
   const before = keptTokens + removedTokensNow;
   const totalAfter = keptTokens + summaryTokens;
+  // Where the summary will land among the survivors — the same arithmetic
+  // compactEntriesToSummary does, run here because the event is written BEFORE
+  // the mutation. Always 0 for an oldest-N compaction; non-zero whenever the
+  // named set starts mid-ledger. Hydration rebuilds [kept…] with the summary
+  // spliced in at this index, so without it a reattached session holds the
+  // same entries in a different order than the live one did.
+  const firstRemovedIndex = live.findIndex((e) => oldestIdSet.has(e.id));
+  const summaryIndex =
+    firstRemovedIndex === -1
+      ? 0
+      : live.slice(0, firstRemovedIndex).filter((e) => !oldestIdSet.has(e.id)).length;
   try {
     deps.persist({
       type: 'compaction',
@@ -189,6 +232,7 @@ export async function runCompaction(
         ...(e.eid !== undefined ? { eid: e.eid } : {}),
         ...(e.replay !== undefined ? { replay: e.replay } : {}),
       })),
+      summaryIndex,
       removedCount: removedNow.length,
       removedTokens: removedTokensNow,
       summaryTokens,
@@ -214,5 +258,6 @@ export async function runCompaction(
     // append during the summarizer turns negative while the context shrank
     // (Lumen, PR #578 round 2).
     freedTokens: result.removedTokens - result.summaryTokens,
+    summaryIndex: result.summaryIndex,
   };
 }

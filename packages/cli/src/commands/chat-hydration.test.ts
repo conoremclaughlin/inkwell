@@ -206,6 +206,89 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
     expect(result.messageCount).toBe(2); // tail messages count; summary doesn't
   });
 
+  it('places the summary at summaryIndex, not at the front (ref-selected consolidation)', () => {
+    // A consolidation replaces a NAMED set, which can start mid-ledger: the
+    // live ledger puts the summary where the first replaced entry sat. The
+    // event records that position; hydration must honour it, or a reattached
+    // session holds the same entries in a different order than it held live —
+    // the summary claiming to cover work that in fact comes after it.
+    writeTranscript([
+      {
+        type: 'compaction',
+        summary: '[Conversation summary — consolidated 2 selected entries]\nB and C are done.',
+        keptEntries: [
+          { role: 'user', content: 'A survives before', source: 'repl-history' },
+          { role: 'assistant', content: 'D survives after', source: 'claude' },
+        ],
+        summaryIndex: 1,
+        removedCount: 2,
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const entries = ledger.listEntries();
+    expect(entries).toHaveLength(3);
+    expect(entries[0].content).toBe('A survives before');
+    expect(entries[1].content).toContain('B and C are done');
+    expect(entries[1].source).toBe('compaction-history');
+    expect(entries[2].content).toBe('D survives after');
+  });
+
+  it('places the summary last when the consolidated set was the newest entries', () => {
+    writeTranscript([
+      {
+        type: 'compaction',
+        summary: 'tail consolidated',
+        keptEntries: [{ role: 'user', content: 'older survivor', source: 'repl-history' }],
+        summaryIndex: 1,
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const entries = ledger.listEntries();
+    expect(entries.map((e) => e.content)).toEqual(['older survivor', 'tail consolidated']);
+  });
+
+  it('defaults to the front when the event carries no summaryIndex (legacy events)', () => {
+    // Every compaction event written before consolidation existed is an
+    // oldest-N compaction, whose summary IS entry 0. The default must keep
+    // replaying those unchanged.
+    writeTranscript([
+      {
+        type: 'compaction',
+        summary: 'legacy summary',
+        keptEntries: [{ role: 'user', content: 'kept tail', source: 'repl-history' }],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['legacy summary', 'kept tail']);
+  });
+
+  it('clamps an out-of-range summaryIndex instead of dropping the summary', () => {
+    writeTranscript([
+      {
+        type: 'compaction',
+        summary: 'clamped summary',
+        keptEntries: [{ role: 'user', content: 'only survivor', source: 'repl-history' }],
+        summaryIndex: 99,
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const contents = ledger.listEntries().map((e) => e.content);
+    expect(contents).toContain('clamped summary');
+    expect(contents).toEqual(['only survivor', 'clamped summary']);
+  });
+
   it('replays events after the compaction marker on top of summary + tail', () => {
     writeTranscript([
       { type: 'user', content: 'pre-compaction' },
