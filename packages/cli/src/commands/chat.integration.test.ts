@@ -116,7 +116,7 @@ vi.mock('readline/promises', () => ({
 }));
 
 import { hydrateLedgerFromTranscript, runChat } from './chat.js';
-import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
+import { ContextLedger, entryRefHash, type LedgerRole } from '../repl/context-ledger.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
@@ -2734,7 +2734,7 @@ describe('runChat integration', () => {
     const liveWired = addEntrySpy.mock.calls
       .map((call) => ({ role: call[0], content: call[1], eid: call[3] }))
       .filter(
-        (append): append is { role: string; content: string; eid: number } =>
+        (append): append is { role: LedgerRole; content: string; eid: number } =>
           typeof append.eid === 'number'
       );
     addEntrySpy.mockRestore();
