@@ -141,15 +141,21 @@ describe('describeCurrentWork', () => {
 describe('describeCurrentWork — audience', () => {
   // A slug is not an identity. bootstrap, list_sessions and get_session all
   // select sessions by user + slug, so the row next to yours can belong to a
-  // different contact of the same SB — a different person. The headline is
-  // written to be published; the context block never was.
-  const peerSession = {
-    context: 'Drafting the reply about the clinic appointment on Tuesday',
+  // different contact of the same SB, or to another workspace's SB of the same
+  // name — a different person either way.
+  //
+  // Both fields are sentinels. The headline is the one the first version of
+  // this gate published, on the reasoning that a headline is written to be
+  // read; a headline written for contact A is still not addressed to contact B.
+  const otherPersonsSession = {
+    headline: 'Drafting the quote for the Ramsey job',
+    headlineUpdatedAt: ago(10 * MINUTE),
+    context: 'Working through the Ramsey estimate, waiting on the supplier',
     contextUpdatedAt: ago(2 * HOUR),
   };
 
-  it('never shows another contact the context fallback', () => {
-    const view = describeCurrentWork(peerSession, 'peer', NOW);
+  it('describes nothing at all to an unauthorized reader', () => {
+    const view = describeCurrentWork(otherPersonsSession, 'none', NOW);
 
     expect(view.currentWork).toBeNull();
     expect(view.currentWorkSource).toBeNull();
@@ -157,13 +163,27 @@ describe('describeCurrentWork — audience', () => {
     expect(view.currentWorkAgeLabel).toBeNull();
   });
 
-  it('does not leak the context in ANY field of the peer view', () => {
+  it('withholds the headline, not merely the context fallback', () => {
+    // The finding that collapsed the middle tier. Publishing the headline to
+    // everything that failed `isSessionAuthorized` published it across three
+    // different boundaries at once — contact, canonical identity, workspace —
+    // because "not authorized" is one bucket holding all three.
+    const headlineOnly = {
+      headline: otherPersonsSession.headline,
+      headlineUpdatedAt: otherPersonsSession.headlineUpdatedAt,
+    };
+
+    expect(describeCurrentWork(headlineOnly, 'none', NOW).currentWork).toBeNull();
+  });
+
+  it('leaks neither field in ANY key of the withheld view', () => {
     // Asserting on `currentWork` alone would pass an implementation that moved
     // the same text into a different key. Check the whole serialized view.
-    const serialized = JSON.stringify(describeCurrentWork(peerSession, 'peer', NOW));
+    const serialized = JSON.stringify(describeCurrentWork(otherPersonsSession, 'none', NOW));
 
-    expect(serialized).not.toContain('clinic');
-    expect(serialized).not.toContain('Tuesday');
+    expect(serialized).not.toContain('Ramsey');
+    expect(serialized).not.toContain('supplier');
+    expect(serialized).not.toContain('quote');
   });
 
   it('truncating is not authorizing — a short context is withheld too', () => {
@@ -171,50 +191,53 @@ describe('describeCurrentWork — audience', () => {
     // public, so the gate cannot be implemented as "truncate harder".
     const view = describeCurrentWork(
       { context: 'Short private note', contextUpdatedAt: ago(MINUTE) },
-      'peer',
+      'none',
       NOW
     );
 
     expect(view.currentWork).toBeNull();
   });
 
-  it('still publishes a peer headline, with its age', () => {
-    // Control for the three above: without this, a gate that suppressed
-    // EVERYTHING for a peer would pass them all and silently delete the
-    // feature. Peer visibility of a written headline is the point.
-    const view = describeCurrentWork(
-      {
-        headline: 'Reviewing PR #652',
-        headlineUpdatedAt: ago(10 * MINUTE),
-        ...peerSession,
-      },
-      'peer',
-      NOW
-    );
+  it('shows the owner exactly what the unauthorized reader is denied', () => {
+    // Control for all four above: without it, a renderer that returned nothing
+    // to anybody would pass them and silently delete the feature. The gate has
+    // to turn on the audience and nothing else — same input, same instant,
+    // different reader.
+    const asOwner = describeCurrentWork(otherPersonsSession, 'owner', NOW);
 
-    expect(view.currentWork).toBe('Reviewing PR #652');
-    expect(view.currentWorkSource).toBe('headline');
-    expect(view.currentWorkAgeLabel).toBe('10m ago');
+    expect(asOwner.currentWork).toBe(otherPersonsSession.headline);
+    expect(asOwner.currentWorkSource).toBe('headline');
+    expect(asOwner.currentWorkAgeLabel).toBe('10m ago');
+
+    // …and the fallback arm too, so the control covers both branches the gate
+    // now sits in front of rather than just the one it reaches first.
+    const { headline: _h, headlineUpdatedAt: _hAt, ...contextOnly } = otherPersonsSession;
+    expect(describeCurrentWork(contextOnly, 'owner', NOW).currentWork).toBe(
+      otherPersonsSession.context
+    );
   });
 
-  it('shows the owner exactly what the peer is denied', () => {
-    // The other half of the control: the gate must turn on the audience and
-    // nothing else. Same input, same instant, different reader.
-    const asOwner = describeCurrentWork(peerSession, 'owner', NOW);
+  it('cannot be edited into a later response', () => {
+    // The withheld view is a shared frozen constant, so a caller that spreads
+    // it and then assigns would otherwise poison every later call.
+    const view = describeCurrentWork(otherPersonsSession, 'none', NOW);
 
-    expect(asOwner.currentWork).toBe(peerSession.context);
-    expect(asOwner.currentWorkSource).toBe('context');
-    expect(asOwner.currentWorkAgeLabel).toBe('2h ago');
+    expect(() => {
+      (view as { currentWork: string | null }).currentWork = 'leaked';
+    }).toThrow();
+    expect(describeCurrentWork(otherPersonsSession, 'none', NOW).currentWork).toBeNull();
   });
 
   it('carries the audience through the snake_case adapter', () => {
     const row = {
+      headline: 'Private headline',
+      headline_updated_at: ago(MINUTE).toISOString(),
       context: 'Private scratch note',
       context_updated_at: ago(3 * HOUR).toISOString(),
     };
 
-    expect(describeCurrentWorkFromRow(row, 'peer', NOW).currentWork).toBeNull();
-    expect(describeCurrentWorkFromRow(row, 'owner', NOW).currentWork).toBe('Private scratch note');
+    expect(describeCurrentWorkFromRow(row, 'none', NOW).currentWork).toBeNull();
+    expect(describeCurrentWorkFromRow(row, 'owner', NOW).currentWork).toBe('Private headline');
   });
 });
 

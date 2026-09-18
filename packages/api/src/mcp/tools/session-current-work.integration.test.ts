@@ -205,6 +205,8 @@ describe('Session current work (integration)', () => {
    */
   describe('another contact of the same SB', () => {
     const PRIVATE_NOTE = 'Sentinel zebra: drafting the reply about Tuesday';
+    /** Distinct from the context sentinel, so a test can tell which field leaked. */
+    const HEADLINE_SENTINEL = 'Sentinel quokka: reviewing the estimate';
     // Two invented people, fixed synthetic UUIDs. `sessions.contact_id` carries
     // a foreign key, so these need rows; nothing here comes from a live contact.
     const CONTACT_A = '11111111-2222-3333-4444-555555550001';
@@ -231,9 +233,25 @@ describe('Session current work (integration)', () => {
      * facts — rather than the stdio pin, so this exercises the same code path a
      * real agent's bearer token takes.
      */
-    async function asContact<T>(contactId: string, run: () => Promise<T>): Promise<T> {
+    async function asContact<T>(
+      contactId: string,
+      run: () => Promise<T>,
+      /**
+       * The `x-ink-context` session assertion, which is UNSIGNED — a caller
+       * saying which session it believes it is running in. Passed separately
+       * from the signed claims above so a test can spoof one without touching
+       * the other, which is the whole shape of the bug it exercises.
+       */
+      claimedSessionId?: string
+    ): Promise<T> {
       return (await runWithRequestContext(
-        { userId, agentTokenBound: true, tokenSlug: 'echo', tokenContactId: contactId },
+        {
+          userId,
+          agentTokenBound: true,
+          tokenSlug: 'echo',
+          tokenContactId: contactId,
+          ...(claimedSessionId ? { sessionId: claimedSessionId } : {}),
+        },
         run
       )) as T;
     }
@@ -303,14 +321,16 @@ describe('Session current work (integration)', () => {
       expect(raw.content[0].text).not.toContain('Sentinel zebra');
     });
 
-    it('still publishes the other contact’s headline', async () => {
-      // The control that keeps the three above honest. Suppressing everything
-      // cross-contact would pass them all while deleting peer status entirely,
-      // which is the feature. A headline is written to be read by someone else.
+    it('withholds the other contact’s headline too, not just the context', async () => {
+      // This assertion was inverted until Lumen's second pass on #652. The
+      // earlier gate published the headline cross-contact on the reasoning that
+      // a headline is written to be read by someone else — true, and not a
+      // property of THIS reader. A line written while working for contact B is
+      // not addressed to contact A by virtue of being short.
       const foreignId = await createSession({
         contact_id: CONTACT_B,
         context: PRIVATE_NOTE,
-        headline: 'Reviewing PR #652',
+        headline: HEADLINE_SENTINEL,
         headline_updated_at: new Date().toISOString(),
       });
 
@@ -318,11 +338,58 @@ describe('Session current work (integration)', () => {
         handleListSessions({ userId, sbSlug: 'echo', limit: 100 }, dataComposer)
       );
 
+      expect(raw.content[0].text).not.toContain('Sentinel quokka');
       expect(raw.content[0].text).not.toContain('Sentinel zebra');
+      // Pin which row the absence is about. A response missing the row entirely
+      // would satisfy the two assertions above while proving nothing.
       const row = parse<{ sessions: SessionView[] }>(raw).sessions.find((s) => s.id === foreignId);
-      expect(row?.currentWork).toBe('Reviewing PR #652');
-      expect(row?.currentWorkSource).toBe('headline');
-      expect(row?.currentWorkAgeLabel).toBe('just now');
+      expect(row).toBeDefined();
+      expect(row?.currentWork).toBeNull();
+      expect(row?.currentWorkSource).toBeNull();
+      expect(row?.currentWorkAgeLabel).toBeNull();
+    });
+
+    it('an unsigned session-id claim does not unlock the context it names', async () => {
+      // bootstrap labels one row as "the caller's own" from the x-ink-context
+      // header, and returned that row's raw context — in `activeSessions` and
+      // again in the top-level `callerSession` block — on the strength of the id
+      // match alone. The header is a caller assertion, so naming another
+      // contact's session id was enough to be handed its scratch board.
+      const foreignId = await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
+
+      const raw = await asContact(
+        CONTACT_A,
+        () => handleBootstrap({ userId, sbSlug: 'echo', includeMemories: false }, dataComposer),
+        foreignId
+      );
+
+      expect(raw.content[0].text).not.toContain('Sentinel zebra');
+
+      // Pin the target: the claim has to have been honoured as far as selecting
+      // the row, or the sentinel would be absent because nothing looked it up.
+      const { callerSession } = parse<{
+        callerSession: { id: string; context: string | null } | null;
+      }>(raw);
+      expect(callerSession?.id).toBe(foreignId);
+      expect(callerSession?.context).toBeNull();
+    });
+
+    it('returns the context on that same claim when the session IS the caller’s', async () => {
+      // The control for the two above: the gate turns on authorization, not on
+      // the presence of a session-id header. Same path, same field, own contact.
+      const ownId = await createSession({ contact_id: CONTACT_B, context: PRIVATE_NOTE });
+
+      const raw = await asContact(
+        CONTACT_B,
+        () => handleBootstrap({ userId, sbSlug: 'echo', includeMemories: false }, dataComposer),
+        ownId
+      );
+
+      const { callerSession } = parse<{
+        callerSession: { id: string; context: string | null } | null;
+      }>(raw);
+      expect(callerSession?.id).toBe(ownId);
+      expect(callerSession?.context).toBe(PRIVATE_NOTE);
     });
 
     it('shows the same row in full to its own contact', async () => {

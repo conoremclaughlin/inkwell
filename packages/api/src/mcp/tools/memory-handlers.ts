@@ -22,6 +22,7 @@ import {
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import {
+  currentWorkAudience,
   isSessionAuthorized,
   loadAuthorizedAmbientSession,
   resolveCallerIdentity,
@@ -293,15 +294,17 @@ export function isCallerSessionEligible(
 /**
  * Map a Session to the bootstrap response shape.
  *
- * Two different scopes, and conflating them was a real bug. The full `context`
- * block is the caller's own session only. The current-work line is shown for
- * every active session — that is the point, it is the list an SB reads at
- * startup — but only as a published headline unless `audience` says the caller
- * is authorized for this particular row.
- *
  * `audience` is the caller's decision because this function cannot make it:
  * bootstrap's session query filters on user and slug, and a slug is not an
  * identity. Same name, different contact, different person.
+ *
+ * Note what `callerSessionId` is and is not. It comes from `x-ink-context`, an
+ * unsigned header — a caller asserting which session it is running in. That is
+ * fine for deciding which row to label as the caller's own, and it was NOT fine
+ * as the sole gate on returning that row's raw `context`: a caller that names a
+ * session id it does not own was handed the note in full, having passed no
+ * ownership check at all. So the id match selects the row and `audience`
+ * decides whether its narrative may be read, and both have to hold.
  */
 export function mapSessionForBootstrap(
   s: {
@@ -330,7 +333,9 @@ export function mapSessionForBootstrap(
     lifecycle: s.lifecycle || null,
     currentPhase: s.currentPhase || null,
     ...describeCurrentWork(s, audience),
-    ...(callerSessionId && s.id === callerSessionId && s.context ? { context: s.context } : {}),
+    ...(audience === 'owner' && callerSessionId && s.id === callerSessionId && s.context
+      ? { context: s.context }
+      : {}),
     startedAt: s.startedAt.toISOString(),
   };
 }
@@ -1585,12 +1590,15 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   }
 
   // An explicit sbSlug above is a free filter, so `session` may belong to
-  // another contact of the same SB. One boolean gates everything narrative:
-  // logs, the scratch board, and the current-work fallback derived from it.
+  // another contact of the same SB — and `getActiveSession` filters
+  // `contact_id IS NULL`, so what a contact-bound caller gets back on the slug
+  // path is the account OWNER's session. One boolean gates everything
+  // narrative: logs, the scratch board, and the current-work line.
   const authorized = isSessionAuthorized(session, user.id, caller);
 
-  // Logs are the session's transcript. A peer may see that another SB is
-  // "reviewing"; it may not read what that SB recorded while doing so.
+  // Logs are the session's transcript. An unauthorized reader may see that a
+  // session exists and that its phase is "reviewing" — structural facts it
+  // needs for routing — but not what was recorded while doing so.
   let logs;
   if (params.includeLogs && authorized) {
     logs = await dataComposer.repositories.memory.getSessionLogs(session.id);
@@ -1612,10 +1620,10 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               currentPhase: session.currentPhase || null,
               threadKey: session.threadKey || null,
               activeThreadKey: session.activeThreadKey || null,
-              ...describeCurrentWork(session, authorized ? 'owner' : 'peer'),
-              // Withheld from a peer for the same reason as logs, and omitted
-              // rather than nulled so an unauthorized read is byte-identical to
-              // main's, which never returned this field at all.
+              ...describeCurrentWork(session, currentWorkAudience(session, user.id, caller)),
+              // Withheld for the same reason as logs, and omitted rather than
+              // nulled so an unauthorized read is byte-identical to main's,
+              // which never returned this field at all.
               ...(authorized ? { context: session.context || null } : {}),
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
@@ -1709,8 +1717,8 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
                 // populated when there is anything to say — headline if one was
                 // written, otherwise the context truncated — so a caller never has
                 // to know which field to look in, and `ageLabel` means it is never
-                // read as now. For another contact's rows it is the headline only.
-                ...describeCurrentWork(s, authorized ? 'owner' : 'peer'),
+                // read as now. Another contact's rows describe nothing at all.
+                ...describeCurrentWork(s, currentWorkAudience(s, user.id, caller)),
                 // Pre-dates this branch and was never authorized. Gated here
                 // because the check is now one line away and shipping a fixed
                 // fallback beside an unfixed copy of the same text would be
@@ -2636,11 +2644,11 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   // The session query filters on user and slug, so this list can hold rows the
   // caller is not authorized for — a different contact of the same SB is a
-  // different person. Classify per row: published headlines carry across that
-  // line, private scratch-board text does not.
+  // different person, and so is another workspace's SB of the same name.
+  // Classify per row; nothing narrative crosses that line.
   const bootstrapCaller = await resolveCaller(dataComposer, user.id, sbSlug);
   const sessionAudience = (s: Session): CurrentWorkAudience =>
-    isSessionAuthorized(s, user.id, bootstrapCaller) ? 'owner' : 'peer';
+    currentWorkAudience(s, user.id, bootstrapCaller);
 
   const inferredThreadKey =
     params.threadKey || mergedSessions.find((session) => !!session.threadKey)?.threadKey;
@@ -2881,6 +2889,13 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
             // Caller's own session IDs — surfaced at top level so they survive compaction.
             // Without this, the agent loses its own session identity after context eviction.
+            //
+            // `context` here is the same scratch board `activeSessions` gates,
+            // reached by a second path, and it was ungated on this one. The ids
+            // stay: they are what this field exists for, they are what the
+            // caller already named in its own request header, and a caller that
+            // cannot recover its session id after compaction is the failure
+            // this block was added to prevent. The note is what needs an owner.
             callerSession: callerSessionId
               ? (() => {
                   const cs = mergedSessions.find((s) => s.id === callerSessionId);
@@ -2890,7 +2905,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                         backendSessionId: cs.backendSessionId || null,
                         studioId: cs.studioId || null,
                         sbSlug: cs.sbSlug || null,
-                        context: cs.context || null,
+                        context: sessionAudience(cs) === 'owner' ? cs.context || null : null,
                       }
                     : null;
                 })()

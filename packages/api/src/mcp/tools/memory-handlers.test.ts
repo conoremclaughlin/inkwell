@@ -3275,30 +3275,41 @@ describe('mapSessionForBootstrap', () => {
   };
 
   it('includes context for the caller session', () => {
-    const result = mapSessionForBootstrap(baseSession, 'session-abc');
+    const result = mapSessionForBootstrap(baseSession, 'session-abc', 'owner');
     expect(result.context).toBe('server running on :4001, vitest watching');
     expect(result.currentPhase).toBe('implementing');
   });
 
   it('omits context for non-caller sessions', () => {
-    const result = mapSessionForBootstrap(baseSession, 'session-other');
+    const result = mapSessionForBootstrap(baseSession, 'session-other', 'owner');
     expect(result).not.toHaveProperty('context');
     expect(result.currentPhase).toBe('implementing');
   });
 
   it('omits context when callerSessionId is undefined', () => {
-    const result = mapSessionForBootstrap(baseSession, undefined);
+    const result = mapSessionForBootstrap(baseSession, undefined, 'owner');
     expect(result).not.toHaveProperty('context');
   });
 
   it('omits context key entirely when caller session has no context set', () => {
     const noContextSession = { ...baseSession, context: undefined };
-    const result = mapSessionForBootstrap(noContextSession, 'session-abc');
+    const result = mapSessionForBootstrap(noContextSession, 'session-abc', 'owner');
     expect(result).not.toHaveProperty('context');
   });
 
+  it('omits context when the id matches but the caller is not authorized', () => {
+    // `callerSessionId` comes from the unsigned x-ink-context header, so the
+    // id match alone is a caller assertion. Both have to hold.
+    const result = mapSessionForBootstrap(baseSession, 'session-abc', 'none');
+    expect(result).not.toHaveProperty('context');
+    expect(result.currentWork).toBeNull();
+  });
+
   it('always includes phase and lifecycle for all sessions', () => {
-    const result = mapSessionForBootstrap(baseSession, 'session-other');
+    // Structural routing fields are not narrative and are not gated — an agent
+    // that cannot see its own lifecycle cannot resume. Asserted at the
+    // unauthorized audience so a gate that swallowed the whole row would fail.
+    const result = mapSessionForBootstrap(baseSession, 'session-other', 'none');
     expect(result.lifecycle).toBe('idle');
     expect(result.currentPhase).toBe('implementing');
     expect(result.sbSlug).toBe('wren');
