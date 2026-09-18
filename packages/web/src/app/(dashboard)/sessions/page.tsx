@@ -41,6 +41,16 @@ interface Session {
   currentPhase: string | null;
   summary: string | null;
   context: string | null;
+  currentWork: string | null;
+  currentWorkSource: 'headline' | 'context' | null;
+  currentWorkAt: string | null;
+  /**
+   * null means the age is UNKNOWN, not recent. Rows predating the timestamp
+   * columns have no age, and rendering that as "just now" is the exact failure
+   * this field exists to prevent — so it renders as nothing at all.
+   */
+  currentWorkAgeLabel: string | null;
+  currentWorkTruncated: boolean;
   backend: string | null;
   model: string | null;
   messageCount: number | null;
@@ -213,12 +223,19 @@ function SessionCard({ session }: { session: Session }) {
           {/* Phase - prominent for blocked sessions */}
           {phaseLabel && <p className={clsx('text-sm mt-1', state.phaseClass)}>{phaseLabel}</p>}
 
-          {/* Context / Summary */}
-          {session.context && (
+          {/* What this session is working on, and when it last said so. The age
+              is not decoration: without it a stale note reads as a live claim. */}
+          {session.currentWork && (
             <p className="text-sm text-muted-foreground mt-1 line-clamp-2">
-              {typeof session.context === 'string'
-                ? session.context
-                : JSON.stringify(session.context)}
+              {session.currentWork}
+              {session.currentWorkAgeLabel && (
+                <span
+                  className="ml-1.5 whitespace-nowrap text-xs text-muted-foreground/70"
+                  title={session.currentWorkAt || undefined}
+                >
+                  · {session.currentWorkAgeLabel}
+                </span>
+              )}
             </p>
           )}
 

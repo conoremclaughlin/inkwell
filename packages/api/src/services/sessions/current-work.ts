@@ -112,3 +112,36 @@ export function describeCurrentWork(
     currentWorkTruncated: false,
   };
 }
+
+/** The raw `sessions` columns this rendering reads. */
+export interface CurrentWorkRow {
+  headline?: string | null;
+  headline_updated_at?: string | null;
+  context?: string | null;
+  context_updated_at?: string | null;
+}
+
+/**
+ * Render current work straight from a database row.
+ *
+ * The admin routes map snake_case rows by hand rather than going through the
+ * repository's camelCase `Session`, so without this they would need their own
+ * copy of the headline/context fallback. Two copies of that rule is precisely
+ * the divergence this module exists to prevent: the fallback decides whether a
+ * displayed line is a deliberate status or a truncated scratch note, and a
+ * second implementation would eventually disagree about which.
+ */
+export function describeCurrentWorkFromRow(
+  row: CurrentWorkRow,
+  now: number = Date.now()
+): CurrentWorkView {
+  return describeCurrentWork(
+    {
+      headline: row.headline ?? undefined,
+      headlineUpdatedAt: row.headline_updated_at ? new Date(row.headline_updated_at) : undefined,
+      context: row.context ?? undefined,
+      contextUpdatedAt: row.context_updated_at ? new Date(row.context_updated_at) : undefined,
+    },
+    now
+  );
+}

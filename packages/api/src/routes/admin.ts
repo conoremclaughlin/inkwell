@@ -64,6 +64,7 @@ import {
 } from '../services/thread-key/thread-spines';
 import { groupNodeEvents, type GateEventInput } from '../services/thread-key/graph-evidence';
 import { openVerifiedMedia } from '../utils/media-path';
+import { describeCurrentWorkFromRow } from '../services/sessions/current-work';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -5754,6 +5755,11 @@ router.get('/sessions', async (req: Request, res: Response) => {
           activeThreadKey: s.active_thread_key || null,
           summary: s.summary,
           context: s.context,
+          // What this session is working on, with its age. `context` above is
+          // kept for callers that still read it, but it carries no timestamp of
+          // its own — rendering it alone is how a four-day-old note gets read
+          // as a live claim.
+          ...describeCurrentWorkFromRow(s),
           backend: s.backend,
           model: s.model,
           messageCount: s.message_count,
