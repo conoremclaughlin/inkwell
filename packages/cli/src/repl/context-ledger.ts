@@ -155,6 +155,17 @@ export class ContextLedger {
     // what an eviction back to a bookmark removed. A ref that must name an
     // exact occurrence carries an eid — that is what eids are for, and live
     // entries from transcript-backed events now carry theirs.
+    //
+    // The two kinds resolve in two passes, named first, because one batch
+    // holds both: recordEviction writes eid+hash for a removed entry that has
+    // an eid and hash-only for one that does not, and a ledger carries both
+    // identities at once wherever a compaction's kept tail preserves eids
+    // beside entries loaded without any. Spending budgets in ledger order
+    // alongside the named matches let the named entry consume the anonymous
+    // ref intended for its twin, and the twin — a genuinely removed entry —
+    // came back on reattach (Lumen, PR #653 round 2). Reserving first is not
+    // an ordering preference: a named ref has exactly one entry it can mean,
+    // an anonymous one has a choice, so the constrained match goes first.
     const eidOnly = new Set(
       refs.filter((r) => typeof r.eid === 'number' && typeof r.hash !== 'string').map((r) => r.eid!)
     );
@@ -164,20 +175,24 @@ export class ContextLedger {
       hashOnlyBudget.set(ref.hash, (hashOnlyBudget.get(ref.hash) ?? 0) + 1);
     }
     const both = refs.filter((r) => typeof r.eid === 'number' && typeof r.hash === 'string');
-    const ids: number[] = [];
+    const matched = new Set<number>();
     for (const entry of this.entries) {
+      if (entry.eid === undefined) continue;
       const hash = entryRefHash(entry.role, entry.content);
-      const budget = hashOnlyBudget.get(hash) ?? 0;
-      if (entry.eid !== undefined && eidOnly.has(entry.eid)) {
-        ids.push(entry.id);
-      } else if (budget > 0) {
-        hashOnlyBudget.set(hash, budget - 1);
-        ids.push(entry.id);
-      } else if (both.some((r) => r.eid === entry.eid && r.hash === hash)) {
-        ids.push(entry.id);
+      if (eidOnly.has(entry.eid) || both.some((r) => r.eid === entry.eid && r.hash === hash)) {
+        matched.add(entry.id);
       }
     }
-    return ids;
+    for (const entry of this.entries) {
+      if (matched.has(entry.id)) continue;
+      const hash = entryRefHash(entry.role, entry.content);
+      const budget = hashOnlyBudget.get(hash) ?? 0;
+      if (budget > 0) {
+        hashOnlyBudget.set(hash, budget - 1);
+        matched.add(entry.id);
+      }
+    }
+    return this.entries.filter((entry) => matched.has(entry.id)).map((entry) => entry.id);
   }
 
   public listEntries(): LedgerEntry[] {

@@ -274,6 +274,58 @@ describe('ContextLedger', () => {
       ]);
       expect(ids).toEqual([later.id]);
     });
+
+    // A batch can mix the two identities — recordEviction writes eid+hash for
+    // an entry that has one and hash-only for an entry that does not, and a
+    // ledger holds both at once wherever a compaction's kept tail carries eids
+    // beside entries loaded without any (Lumen, PR #653 round 2).
+    it('REGRESSION: a named entry does not spend the anonymous ref meant for its twin', () => {
+      const ledger = new ContextLedger();
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const anonymous = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const hash = entryRefHash('inbox', 'identical body');
+      expect(ledger.findEntriesByRefs([{ eid: 7, hash }, { hash }])).toEqual([
+        named.id,
+        anonymous.id,
+      ]);
+    });
+
+    it('REGRESSION: the same mixed batch in the other ref order takes both too', () => {
+      const ledger = new ContextLedger();
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const anonymous = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const hash = entryRefHash('inbox', 'identical body');
+      expect(ledger.findEntriesByRefs([{ hash }, { eid: 7, hash }])).toEqual([
+        named.id,
+        anonymous.id,
+      ]);
+    });
+
+    it('reserving the named entry does not widen the anonymous budget past its count', () => {
+      // One anonymous ref stays one entry: the eid-carrying twin is claimed by
+      // its own ref, and the third copy survives.
+      const ledger = new ContextLedger();
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const firstAnonymous = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const survivor = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const hash = entryRefHash('inbox', 'identical body');
+      const ids = ledger.findEntriesByRefs([{ eid: 7, hash }, { hash }]);
+      expect(ids).toEqual([named.id, firstAnonymous.id]);
+      expect(ids).not.toContain(survivor.id);
+    });
+
+    it('an anonymous ref may still claim an eid-carrying entry no ref names', () => {
+      // The budget is not restricted to eid-less entries — it spends on
+      // whatever the named refs left behind, oldest first.
+      const ledger = new ContextLedger();
+      const unnamed = ledger.addEntry('inbox', 'identical body', 'inkmail', 4);
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const hash = entryRefHash('inbox', 'identical body');
+      expect(ledger.findEntriesByRefs([{ eid: 7, hash }, { hash }])).toEqual([
+        unnamed.id,
+        named.id,
+      ]);
+    });
   });
 
   describe('compactEntriesToSummary (by id — Lumen, PR #578)', () => {

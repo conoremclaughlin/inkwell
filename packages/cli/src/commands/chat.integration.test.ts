@@ -116,7 +116,7 @@ vi.mock('readline/promises', () => ({
 }));
 
 import { hydrateLedgerFromTranscript, runChat } from './chat.js';
-import { ContextLedger } from '../repl/context-ledger.js';
+import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
@@ -2617,6 +2617,99 @@ describe('runChat integration', () => {
       expect(await repeatedMessageCase([command])).toEqual(['repeated message']);
     }
   );
+
+  // One eviction batch can carry both ref identities: recordEviction writes
+  // eid+hash for a removed entry that has an eid and hash-only for one that
+  // does not. A compaction's kept tail preserves eids only where they exist,
+  // so a ledger holding an eid-carrying entry beside an identical legacy one
+  // is what a transcript spanning the eid wiring replays (Lumen, PR #653
+  // round 2). Resolving the anonymous ref in ledger order alongside the named
+  // match let the named entry spend the anonymous budget, and the second
+  // removed entry came back.
+  const mixedIdentityTranscript = (events: Array<Record<string, unknown>>): ContextLedger => {
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    const transcriptPath = join(replDir, `sess-mixed-refs-1700000000000.jsonl`);
+    writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify({
+          ts: '2026-02-25T07:00:00.000Z',
+          type: 'compaction',
+          eid: 11,
+          summary: 'earlier turns summarized',
+          summaryIndex: 0,
+          keptEntries: [
+            // Kept from a session that wired eids …
+            { role: 'inbox', content: 'identical body', source: 'inkmail', eid: 7 },
+            // … beside one loaded before they existed.
+            { role: 'inbox', content: 'identical body', source: 'inkmail' },
+          ],
+        }),
+        ...events.map((event) => JSON.stringify(event)),
+      ].join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    return ledger;
+  };
+
+  const bodies = (ledger: ContextLedger): string[] =>
+    ledger
+      .listEntries()
+      .filter((entry) => entry.role === 'inbox')
+      .map((entry) => entry.content);
+
+  it('control: with no eviction both mixed-identity copies hydrate', () => {
+    expect(bodies(mixedIdentityTranscript([]))).toEqual(['identical body', 'identical body']);
+  });
+
+  it('REGRESSION: an eviction of both copies replays as both, not one', () => {
+    const hash = entryRefHash('inbox', 'identical body');
+    const ledger = mixedIdentityTranscript([
+      {
+        ts: '2026-02-25T07:00:02.000Z',
+        type: 'context_evict',
+        eid: 12,
+        refs: [
+          { eid: 7, hash, role: 'inbox' },
+          { hash, role: 'inbox' },
+        ],
+      },
+    ]);
+    expect(bodies(ledger)).toEqual([]);
+  });
+
+  it('REGRESSION: the same batch in the other ref order replays as both', () => {
+    const hash = entryRefHash('inbox', 'identical body');
+    const ledger = mixedIdentityTranscript([
+      {
+        ts: '2026-02-25T07:00:02.000Z',
+        type: 'context_evict',
+        eid: 12,
+        refs: [
+          { hash, role: 'inbox' },
+          { eid: 7, hash, role: 'inbox' },
+        ],
+      },
+    ]);
+    expect(bodies(ledger)).toEqual([]);
+  });
+
+  it('one ref of a mixed batch still removes exactly one copy', () => {
+    // The bound the count exists for, with a named ref in play: removing only
+    // the eid-carrying entry leaves its twin.
+    const hash = entryRefHash('inbox', 'identical body');
+    const ledger = mixedIdentityTranscript([
+      {
+        ts: '2026-02-25T07:00:02.000Z',
+        type: 'context_evict',
+        eid: 12,
+        refs: [{ eid: 7, hash, role: 'inbox' }],
+      },
+    ]);
+    expect(bodies(ledger)).toEqual(['identical body']);
+  });
 
   // The precision above rests on live entries carrying the eid of the event
   // they will hydrate from, which only helps while the two agree on content:
