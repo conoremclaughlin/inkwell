@@ -138,6 +138,91 @@ let heartbeatRunning = false;
 let heartbeatCallback: (() => Promise<void>) | null = null;
 
 /**
+ * Liveness of the scheduler itself, as opposed to the delivery it schedules.
+ *
+ * Every alerting path in this module hangs off a delivery ATTEMPT: a beat runs,
+ * the callback fails, a failure row lands, the streak crosses one, somebody is
+ * told. A tick that never happens attempts nothing, so it writes no row, moves
+ * no streak, and escalates to nobody. It is an absence, and absences were
+ * invisible here until 2026-09-18.
+ *
+ * What that cost, measured over the 64 hours of log retained at the time:
+ * 39 of 771 expected five-minute ticks never ran (5.1%), in nine separate
+ * outages, the longest 50 minutes. Every one of them fell inside a window where
+ * the host was asleep — `pmset -g log` accounts for all 39 with zero residual,
+ * and the machine was asleep for 5.2% of the span against 5.1% of slots missed.
+ * The process was never restarted and `/health` was correct throughout: this is
+ * not a crash, and looking for a bug inside the process finds nothing, because
+ * the process was suspended along with everything else on the machine. On a
+ * laptop, heartbeat coverage is laptop uptime, and nothing reported the
+ * difference.
+ *
+ * Reminders themselves survive it — the due query has no lower bound, so an
+ * overdue beat is picked up by whatever tick runs next. They arrive late, not
+ * never. The exception is a recurring beat, which carries a single
+ * `next_run_at`: several occurrences slept through collapse into one late
+ * delivery.
+ */
+let lastTickAt: Date | null = null;
+let lastTickCompletedAt: Date | null = null;
+let lastMissedTickAt: Date | null = null;
+let missedTickCount = 0;
+
+/**
+ * Which scheduler these numbers belong to.
+ *
+ * `initHeartbeatService` stops the old cron, so a retired scheduler cannot fire
+ * again — but a tick already in flight keeps running, and its `finally` lands
+ * after the reset. Without a fence it writes `lastTickCompletedAt` into the
+ * successor's freshly cleared state, reporting a completion the new scheduler
+ * never had, next to a `lastTickAt` still null. Health then claims work
+ * finished before any was scheduled. Found by Lumen reviewing #656, against
+ * the reset this very change introduced; the original re-init test missed it
+ * because it reset synchronously, while the old tick was still suspended.
+ *
+ * Compared at the moment of each write, never captured at entry: retirement is
+ * exactly what happens during the await.
+ */
+let schedulerGeneration = 0;
+
+/**
+ * What the scheduler has and has not done, for anything that needs to notice a
+ * tick that did not happen.
+ *
+ * Exposed on `/health` because that is the only place it can do its job. The
+ * failure mode is the process being unable to run its own code, so a check that
+ * has to run inside the process cannot report it — a stale `lastTickAt` read
+ * from outside can.
+ *
+ * TWO TIMESTAMPS, BECAUSE THERE ARE TWO WAYS TO GO QUIET. `lastTickAt` is the
+ * scheduler firing; `lastTickCompletedAt` is the work finishing. A suspended
+ * host freezes both. A tick wedged on a hung await freezes only the second,
+ * while the overlap guard turns every subsequent fire into a `debug`-level skip
+ * — which is the same invisible absence wearing different clothes, and reading
+ * `lastTickAt` alone would call it healthy. A widening distance between them is
+ * the signal.
+ */
+export function getHeartbeatTickHealth(): {
+  lastTickAt: string | null;
+  lastTickCompletedAt: string | null;
+  lastMissedTickAt: string | null;
+  missedTickCount: number;
+  sinceLastTickMs: number | null;
+  sinceLastCompletedTickMs: number | null;
+} {
+  return {
+    lastTickAt: lastTickAt?.toISOString() ?? null,
+    lastTickCompletedAt: lastTickCompletedAt?.toISOString() ?? null,
+    lastMissedTickAt: lastMissedTickAt?.toISOString() ?? null,
+    missedTickCount,
+    sinceLastTickMs: lastTickAt ? Date.now() - lastTickAt.getTime() : null,
+    sinceLastCompletedTickMs: lastTickCompletedAt
+      ? Date.now() - lastTickCompletedAt.getTime()
+      : null,
+  };
+}
+
+/**
  * Initialize the heartbeat service
  */
 export function initHeartbeatService(config: HeartbeatConfig = {}): void {
@@ -159,10 +244,21 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
   // Initialize typed Supabase client
   supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
 
+  // A fresh scheduler has not missed anything yet, and must not inherit the
+  // previous one's gap: re-init is a new process's worth of history. The
+  // generation bump retires the old scheduler's writes along with its numbers —
+  // clearing the fields is not enough while its last tick is still in flight.
+  const generation = ++schedulerGeneration;
+  lastTickAt = null;
+  lastTickCompletedAt = null;
+  lastMissedTickAt = null;
+  missedTickCount = 0;
+
   if (enableLocalCron) {
     logger.info('Starting local heartbeat cron scheduler', { interval });
 
     cronTask = cron.schedule(interval, async () => {
+      if (generation === schedulerGeneration) lastTickAt = new Date();
       if (heartbeatRunning) {
         logger.debug('Heartbeat tick skipped — previous tick still running');
         return;
@@ -175,8 +271,53 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
       } catch (error) {
         logger.error('Heartbeat cron error:', error);
       } finally {
+        // Deliberately unfenced: the overlap guard is shared, and a retired
+        // tick finishing is exactly when the successor becomes free to run.
+        // Only the health numbers belong to a generation.
         heartbeatRunning = false;
+        if (generation === schedulerGeneration) lastTickCompletedAt = new Date();
       }
+    });
+
+    /**
+     * node-cron already knows when a tick was missed. It compares the slot it
+     * expected against the clock every time its own timer fires late, and for
+     * each slot it skipped it warns and advances. We were discarding that:
+     * node-cron's logger is its own, `console.warn` only, so the one component
+     * in the system that noticed was writing to a terminal and reaching no
+     * durable surface. Grepping `~/.ink/logs/combined.log` for `missed
+     * execution` returned 0 against 732 for `Heartbeat tick`.
+     *
+     * THE EVENT, NOT THE OPTION, AND THE DIFFERENCE IS SILENT. The runner takes
+     * an `onMissedExecution` hook, but it is not reachable from here:
+     * `schedule()` accepts `TaskOptions`, which does not declare it, and
+     * `InlineScheduledTask` copies four keys (`timezone`, `noOverlap`,
+     * `maxExecutions`, `maxRandomDelay`) into its `RunnerOptions` by name. A
+     * hook passed to `schedule()` is dropped without complaint — the wire would
+     * be dead and a test against a mocked `cron.schedule` would still pass,
+     * because asserting we passed an argument is not asserting anybody calls
+     * it. The task wires that hook to `execution:missed` on its own emitter,
+     * and that event is public, typed, and actually fires.
+     *
+     * The event's date is deliberately not read. The runner advances its
+     * pointer BEFORE invoking the hook, so the date handed over is the next
+     * match after the missed one, and the last call of a burst reports a slot
+     * still in the future. `lastTickAt` is ours and is not off by one.
+     */
+    cronTask.on('execution:missed', () => {
+      if (generation !== schedulerGeneration) return;
+      const detectedAt = new Date();
+      missedTickCount += 1;
+      lastMissedTickAt = detectedAt;
+      logger.warn('Heartbeat tick missed — the scheduler did not run on schedule', {
+        detectedAt: detectedAt.toISOString(),
+        lastTickAt: lastTickAt?.toISOString() ?? null,
+        sinceLastTickMs: lastTickAt ? detectedAt.getTime() - lastTickAt.getTime() : null,
+        missedTickCount,
+        // The overwhelmingly likely cause on a laptop, and the one worth ruling
+        // in or out first: check `pmset -g log` for a Sleep spanning the gap.
+        likelyCause: 'host suspended, blocking IO, or CPU starvation',
+      });
     });
 
     cronTask.start();
