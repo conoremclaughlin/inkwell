@@ -906,9 +906,7 @@ export function hydrateLedgerFromTranscript(
       // post-compaction ledger exactly.
       ledger.evictEntries(hydratedEntryIds);
       hydratedEntryIds.length = 0;
-      const summaryEntry = ledger.addEntry('system', event.summary, 'compaction-history');
-      hydratedEntryIds.push(summaryEntry.id);
-      loaded = 1;
+      loaded = 0;
       messageCount = 0;
       // Reset the visible replay too — pre-compaction turns are out of
       // context and must not appear below the cutoff divider. The kept
@@ -916,7 +914,34 @@ export function hydrateLedgerFromTranscript(
       preview.length = 0;
       compactionCollapsed = true;
       const keptEntries = Array.isArray(event.keptEntries) ? event.keptEntries : [];
-      for (const kept of keptEntries) {
+      // The summary goes where the live ledger put it, not always at the front.
+      // An oldest-N compaction removes a prefix, so its summary IS the first
+      // entry and every event written before `summaryIndex` existed means that
+      // — hence the 0 default, which replays legacy events unchanged. A
+      // ref-selected consolidation removes a named set that can start
+      // mid-ledger, and there the summary takes the first removed entry's
+      // place; replaying it at the front would hand the reattached session the
+      // same entries in a different order than it held live.
+      const summaryIndex =
+        typeof event.summaryIndex === 'number' && Number.isFinite(event.summaryIndex)
+          ? Math.max(0, Math.min(Math.floor(event.summaryIndex), keptEntries.length))
+          : 0;
+      const addSummary = (): void => {
+        const summaryEntry = ledger.addEntry(
+          'system',
+          event.summary as string,
+          'compaction-history'
+        );
+        hydratedEntryIds.push(summaryEntry.id);
+        loaded += 1;
+      };
+      // Positioned against the SERIALIZED array, not against how many entries
+      // were successfully added: `summaryIndex` indexes the kept list as it was
+      // written, and a malformed record skipped below would otherwise slide the
+      // summary one place left of where it sat.
+      for (let ki = 0; ki < keptEntries.length; ki++) {
+        if (ki === summaryIndex) addSummary();
+        const kept = keptEntries[ki];
         if (!kept || typeof kept !== 'object') continue;
         const keptRecord = kept as Record<string, unknown>;
         if (typeof keptRecord.content !== 'string') continue;
@@ -961,6 +986,11 @@ export function hydrateLedgerFromTranscript(
           );
         }
       }
+      // Consolidating the newest entries leaves no survivor after them, so the
+      // summary is last. The clamp above caps the index at keptEntries.length,
+      // which is exactly this case — and it also covers an empty kept list,
+      // where the summary is the whole ledger.
+      if (summaryIndex >= keptEntries.length) addSummary();
       continue;
     }
     if (type === 'user' && typeof event.content === 'string') {
@@ -5312,6 +5342,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     actor: 'system' | 'sb';
     summaryText?: string;
     keepRecent?: number;
+    /** A named set to replace, instead of the oldest run. See CompactionRequest. */
+    entryIds?: readonly number[];
     /** The turn's cancellation — aborts a running summarizer spawn. */
     signal?: AbortSignal;
   }): Promise<CompactionOutcome> => {
@@ -5368,16 +5400,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
         log: (line) => printEvent(chalk.yellow(`  ⛁ ${line}`)),
       });
       if (outcome.ok) {
-        // Cutoff divider: everything above this line in the scrollback is
-        // now out of the context window (replaced by the summary).
-        printEvent(
-          renderContextCutoff(
-            // Live pre-mutation total, as the result reports it — the
-            // wrapper's own pre-await snapshot showed "10K → 11K (freed 1K)"
-            // when entries arrived during summarization (Lumen, PR #578 round 4).
-            `compacted ${outcome.removed} entries · ${formatTokenCount(outcome.before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`
-          )
-        );
+        // Live pre-mutation total, as the result reports it — the wrapper's own
+        // pre-await snapshot showed "10K → 11K (freed 1K)" when entries arrived
+        // during summarization (Lumen, PR #578 round 4).
+        const sizes = `${formatTokenCount(outcome.before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`;
+        if (opts.entryIds !== undefined) {
+          // NOT a cutoff divider. That line means "everything above is out of
+          // the window", which is true of an oldest-N compaction and false of a
+          // consolidation: the replaced set can start mid-ledger, and entries
+          // above it are still in context. Drawing the divider here would
+          // report a larger loss than happened.
+          printEvent(
+            chalk.yellow(`  ⛁ consolidated ${outcome.removed} selected entries · ${sizes}`)
+          );
+        } else {
+          // Cutoff divider: everything above this line in the scrollback is
+          // now out of the context window (replaced by the summary).
+          printEvent(renderContextCutoff(`compacted ${outcome.removed} entries · ${sizes}`));
+        }
         // ink just rolled the ledger — roll the provider session too so the
         // next spawn seeds a fresh native session with the summary (we compact
         // before the provider ever would). Mid-turn, the next continuation
@@ -5474,11 +5514,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
     });
     const parsed = parseCompactContextArgs(args);
     if ('error' in parsed) return asResult({ success: false, error: parsed.error }, true);
+    // Refs resolve against the LIVE ledger, here, at call time. A ref is a
+    // content hash, so one captured before an earlier eviction names the same
+    // content or nothing at all — never a neighbour that inherited its
+    // position (#570, #582). Resolution happens before the summarizer runs;
+    // runCompaction then fixes the set by id, so appends during the await
+    // survive rather than shifting the selection.
+    const entryIds =
+      parsed.refs !== undefined
+        ? ledger.findEntriesByRefs(parsed.refs.map((hash) => ({ hash })))
+        : undefined;
+    if (entryIds !== undefined && entryIds.length === 0) {
+      return asResult(
+        {
+          success: false,
+          error:
+            'none of those refs match an entry in the context right now — they may already have been evicted or consolidated. Call list_context for current refs.',
+        },
+        true
+      );
+    }
     const outcome = await compactContextNow({
-      reason: parsed.summary ? 'agent: own summary' : 'agent: runtime summary',
+      reason: parsed.refs
+        ? 'agent: consolidate selected entries'
+        : parsed.summary
+          ? 'agent: own summary'
+          : 'agent: runtime summary',
       actor: 'sb',
       summaryText: parsed.summary,
       keepRecent: parsed.keepRecent,
+      entryIds,
       signal: ctx?.signal,
     });
     if (!outcome.ok) return asResult({ success: false, error: outcome.error }, true);
@@ -5488,8 +5553,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
       tokensFreed: outcome.freedTokens,
       summaryTokens: outcome.summaryTokens,
       totalAfter: outcome.totalAfter,
-      keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
-      note: 'Your context now starts from the summary; the provider session is re-seeded from it on the next spawn. Continue from here.',
+      ...(parsed.refs !== undefined
+        ? {
+            requestedRefs: parsed.refs.length,
+            matchedEntries: entryIds?.length ?? 0,
+            summaryIndex: outcome.summaryIndex,
+            // The ledger figure, and only the ledger figure. A tool result
+            // enters the ledger as a stub while the provider read the whole
+            // payload, so tokensFreed understates what the reseed actually
+            // drops — reporting it as window reclaimed would be a number
+            // nobody measured (task 44f2783e, acceptance 2).
+            note: 'Those entries are replaced by your summary, in their place — the rest of the context is untouched. tokensFreed counts LEDGER tokens; what the window actually reclaims is decided by the re-seed on the next spawn and is not measured here.',
+          }
+        : {
+            keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+            note: 'Your context now starts from the summary; the provider session is re-seeded from it on the next spawn. Continue from here.',
+          }),
     });
   };
 
