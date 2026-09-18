@@ -580,8 +580,8 @@ describe('adminAuthMiddleware', () => {
         'user-tier3',
         'dashboard',
         ['admin'],
-        // The grant opens with one IDLE window, not the absolute ceiling.
-        7
+        // The grant is issued for its full fixed lifetime; rotation never moves it.
+        90
       );
     });
 
@@ -861,7 +861,7 @@ describe('adminAuthMiddleware', () => {
       expect(res._cookies['pcp-admin-token'].options.maxAge).toBe(3600 * 1000); // 1 hour in ms
     });
 
-    it('should set the refresh cookie to the sliding idle window, not the absolute ceiling', async () => {
+    it('should set the refresh cookie to the full fixed grant lifetime on first issue', async () => {
       mockVerifyPcpAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
@@ -882,9 +882,11 @@ describe('adminAuthMiddleware', () => {
 
       await middleware(req, res, next);
 
-      // 7 days: expires_at is the IDLE deadline now. The 90-day ceiling is
-      // enforced server-side from created_at, not by the cookie's lifetime.
-      expect(res._cookies['pcp-admin-refresh'].options.maxAge).toBe(7 * 24 * 60 * 60 * 1000);
+      // This is the FIRST issue of a grant, so the cookie carries its whole
+      // lifetime. The rotation path is different and must not compute a window
+      // this way — it echoes the grant's own deadline back (see the rotation
+      // cookie test below), or the cookie would outlive the grant.
+      expect(res._cookies['pcp-admin-refresh'].options.maxAge).toBe(90 * 24 * 60 * 60 * 1000);
     });
   });
 
@@ -973,6 +975,31 @@ describe('adminAuthMiddleware', () => {
       // browser a token the next exchange refuses — a silent hourly logout.
       expect(res._cookies['pcp-admin-token']).toBeDefined();
       expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-rotated');
+    });
+
+    it('should expire the rotated refresh cookie at the GRANT deadline, not a fresh window', async () => {
+      // The deadline the grant actually holds — deliberately not 90 days out,
+      // and deliberately not a round number, so a cookie computed as
+      // `now + ADMIN_REFRESH_TOKEN_LIFETIME_DAYS` cannot coincide with it.
+      const grantDeadline = new Date(Date.now() + 11 * 24 * 60 * 60 * 1000 + 12345);
+      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockExchangeRefreshToken.mockResolvedValue({
+        accessToken: 'refreshed-jwt',
+        refreshToken: 'pcp-rt-rotated',
+        refreshTokenExpiresAt: grantDeadline,
+        userId: 'user-t2',
+        email: 't2@example.com',
+      });
+
+      const req = createMockReq({ cookies: { 'pcp-admin-refresh': 'existing-refresh' } });
+      const res = createMockRes();
+      await middleware(req, res, vi.fn());
+
+      const opts = res._cookies['pcp-admin-refresh'].options;
+      // Echoed, not recomputed. Rotating hourly against a recomputed window
+      // would renew the cookie forever while the server-side grant expired.
+      expect(opts.expires).toBe(grantDeadline);
+      expect(opts.maxAge).toBeUndefined();
     });
   });
 });

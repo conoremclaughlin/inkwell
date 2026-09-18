@@ -13,7 +13,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
-import { REFRESH_IDLE_DAYS } from '../auth/refresh-policy';
+import { REFRESH_ABSOLUTE_DAYS } from '../auth/refresh-policy';
 import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
@@ -114,9 +114,9 @@ type ChannelRouteRow = {
 };
 
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
-// A grant's INITIAL idle window. It slides forward on every use, and the
-// absolute ceiling is enforced centrally from created_at (see refresh-policy).
-const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = REFRESH_IDLE_DAYS;
+// Fixed from issue, and enforced centrally against created_at as well (see
+// refresh-policy). Rotation changes the secret, never this deadline.
+const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = REFRESH_ABSOLUTE_DAYS;
 const ADMIN_CLIENT_ID = 'dashboard';
 /** Refresh-token client_id for the native app (packages/mobile). */
 const MOBILE_CLIENT_ID = 'mobile';
@@ -1056,9 +1056,14 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
             path: '/api/admin',
             maxAge: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS * 1000,
           });
-          // The grant rotated and slid forward, so the refresh cookie has to be
-          // rewritten too. Leaving the old one in place would log the browser
+          // The grant rotated, so the refresh cookie has to be rewritten with
+          // the new secret. Leaving the old one in place would log the browser
           // out at its next hourly refresh.
+          //
+          // `expires` is the grant's own unchanged deadline, NOT a fresh window
+          // measured from now — re-deriving it here would hand the browser a
+          // cookie that outlives the grant, and an hourly refresh would renew
+          // that cookie forever while the server-side ceiling stayed put.
           res.cookie('pcp-admin-refresh', result.refreshToken, {
             httpOnly: true,
             secure: env.NODE_ENV === 'production',

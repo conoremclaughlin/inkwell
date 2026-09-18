@@ -411,8 +411,9 @@ describe('PcpAuthProvider', () => {
 
         expect(result.refresh_token).toMatch(/^pcp-rt-/);
         expect(result.token_type).toBe('Bearer');
-        // One hour now: a 30-day access token left the refresh grant unexercised.
-        expect(result.expires_in).toBe(60 * 60);
+        // 30 days. Shortening this is real work with a real cost and is
+        // tracked separately — see the access-lifetime item on PR #632.
+        expect(result.expires_in).toBe(30 * 24 * 60 * 60);
         expect(result.scope).toBe('mcp:tools');
       }
     });
@@ -606,8 +607,9 @@ describe('PcpAuthProvider', () => {
         expect(result.refresh_token).not.toBe('pcp-rt-abc');
         expect(result.refresh_token).toMatch(/^pcp-rt-[0-9a-f]{64}$/);
         expect(result.token_type).toBe('Bearer');
-        // One hour now: a 30-day access token left the refresh grant unexercised.
-        expect(result.expires_in).toBe(60 * 60);
+        // 30 days. Shortening this is real work with a real cost and is
+        // tracked separately — see the access-lifetime item on PR #632.
+        expect(result.expires_in).toBe(30 * 24 * 60 * 60);
       }
     });
 

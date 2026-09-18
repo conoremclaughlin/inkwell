@@ -73,16 +73,12 @@ vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import {
-  exchangeRefreshToken,
-  slidingExpiry,
-  assertRefreshWindowIsReachable,
-  REFRESH_IDLE_DAYS,
-  REFRESH_ABSOLUTE_DAYS,
-} from './pcp-tokens';
+import { exchangeRefreshToken, effectiveGrantDeadline, REFRESH_ABSOLUTE_DAYS } from './pcp-tokens';
 
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR_SECONDS = 60 * 60;
+/** The access-token lifetime option C restores. Formerly refused outright. */
+const THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60;
 const CLIENT = 'dashboard';
 
 function grantRow(overrides: Record<string, unknown> = {}) {
@@ -112,71 +108,60 @@ beforeEach(() => {
 
 // ---------------------------------------------------------------------------
 
-describe('slidingExpiry', () => {
+describe('effectiveGrantDeadline', () => {
   const now = new Date('2026-06-01T00:00:00.000Z');
 
-  it('slides one idle window forward when far from the ceiling', () => {
-    const { expiresAt, atAbsoluteCeiling } = slidingExpiry({
-      now,
+  it('keeps the stored expiry when it sits inside the ceiling', () => {
+    const currentExpiresAt = new Date(now.getTime() + 10 * DAY).toISOString();
+    const { expiresAt, atAbsoluteCeiling } = effectiveGrantDeadline({
       createdAt: new Date(now.getTime() - 2 * DAY).toISOString(),
-      currentExpiresAt: new Date(now.getTime() + DAY).toISOString(),
+      currentExpiresAt,
     });
-    expect(expiresAt.getTime()).toBe(now.getTime() + REFRESH_IDLE_DAYS * DAY);
+    expect(expiresAt.toISOString()).toBe(currentExpiresAt);
     expect(atAbsoluteCeiling).toBe(false);
   });
 
-  it('clamps to created_at + the absolute window near the ceiling', () => {
-    // Issued 88 days ago: 7 more days would overshoot the 90-day ceiling.
+  it('cuts back to created_at + the absolute window when the stored expiry overshoots', () => {
+    // Issued 88 days ago with a stored expiry 10 days out: that reaches day 98,
+    // past the 90-day ceiling, so the ceiling is the deadline in force.
     const createdAt = new Date(now.getTime() - 88 * DAY);
-    const { expiresAt, atAbsoluteCeiling } = slidingExpiry({
-      now,
+    const { expiresAt, atAbsoluteCeiling } = effectiveGrantDeadline({
       createdAt: createdAt.toISOString(),
-      currentExpiresAt: new Date(now.getTime() + DAY).toISOString(),
+      currentExpiresAt: new Date(now.getTime() + 10 * DAY).toISOString(),
     });
     expect(expiresAt.getTime()).toBe(createdAt.getTime() + REFRESH_ABSOLUTE_DAYS * DAY);
-    expect(expiresAt.getTime()).toBeLessThan(now.getTime() + REFRESH_IDLE_DAYS * DAY);
     expect(atAbsoluteCeiling).toBe(true);
   });
 
-  it('never extends a legacy row that has no created_at', () => {
+  it('never extends a grant whose stored expiry is SHORTER than the ceiling', () => {
+    // The ceiling is a cap, not a floor. A deliberately-short grant keeps its
+    // own deadline; reading the ceiling as an entitlement would hand it 90 days.
+    const currentExpiresAt = new Date(now.getTime() + DAY).toISOString();
+    const { expiresAt, atAbsoluteCeiling } = effectiveGrantDeadline({
+      createdAt: now.toISOString(),
+      currentExpiresAt,
+    });
+    expect(expiresAt.toISOString()).toBe(currentExpiresAt);
+    expect(expiresAt.getTime()).toBeLessThan(now.getTime() + REFRESH_ABSOLUTE_DAYS * DAY);
+    expect(atAbsoluteCeiling).toBe(false);
+  });
+
+  it('leaves a legacy row without created_at on its stored expiry', () => {
     const currentExpiresAt = new Date(now.getTime() + 2 * DAY).toISOString();
-    const { expiresAt, atAbsoluteCeiling } = slidingExpiry({
-      now,
+    const { expiresAt, atAbsoluteCeiling } = effectiveGrantDeadline({
       createdAt: null,
       currentExpiresAt,
     });
     expect(expiresAt.toISOString()).toBe(currentExpiresAt);
-    expect(atAbsoluteCeiling).toBe(true);
+    expect(atAbsoluteCeiling).toBe(false);
   });
 
-  it('still shortens a legacy row whose stored expiry is far out', () => {
-    // A 90-day grant with no anchor: sliding must pull it in to one week.
-    const { expiresAt } = slidingExpiry({
-      now,
-      createdAt: null,
-      currentExpiresAt: new Date(now.getTime() + 80 * DAY).toISOString(),
-    });
-    expect(expiresAt.getTime()).toBe(now.getTime() + REFRESH_IDLE_DAYS * DAY);
-  });
-});
-
-describe('assertRefreshWindowIsReachable', () => {
-  it('refuses a 30-day access token against a 7-day idle window', () => {
-    // The pairing this PR removes: a client holding a 30-day access token never
-    // comes back inside the idle window, so every grant would die unused.
-    expect(() => assertRefreshWindowIsReachable(30 * 24 * 60 * 60, 'test')).toThrow(
-      /not comfortably inside/
-    );
-  });
-
-  it('refuses a lifetime that merely equals half the window', () => {
-    expect(() =>
-      assertRefreshWindowIsReachable((REFRESH_IDLE_DAYS / 2) * 24 * 60 * 60, 'test')
-    ).toThrow();
-  });
-
-  it('accepts an hour', () => {
-    expect(() => assertRefreshWindowIsReachable(HOUR_SECONDS, 'test')).not.toThrow();
+  it('does not extend a legacy row whose stored expiry is far out', () => {
+    // No anchor means no computable ceiling. The row keeps what it has — the
+    // one direction that cannot grant more time than the record already claims.
+    const currentExpiresAt = new Date(now.getTime() + 80 * DAY).toISOString();
+    const { expiresAt } = effectiveGrantDeadline({ createdAt: null, currentExpiresAt });
+    expect(expiresAt.toISOString()).toBe(currentExpiresAt);
   });
 });
 
@@ -216,8 +201,10 @@ describe('exchangeRefreshToken — rotation', () => {
     expect(write.filters).toContainEqual(['refresh_token', 'pcp-rt-presented']);
   });
 
-  it('slides the stored expiry one idle window forward', async () => {
-    const before = Date.now();
+  it('never writes expires_at or created_at — the deadline is not the secret', async () => {
+    const row = grantRow();
+    lookupResult = { data: row, error: null };
+
     const result = await exchangeRefreshToken(
       makeSupabase() as never,
       'pcp-rt-presented',
@@ -226,17 +213,54 @@ describe('exchangeRefreshToken — rotation', () => {
       HOUR_SECONDS
     );
 
-    const written = new Date(recorded.updates[0].values.expires_at as string).getTime();
-    expect(written).toBeGreaterThanOrEqual(before + REFRESH_IDLE_DAYS * DAY - 5000);
-    expect(written).toBeLessThanOrEqual(Date.now() + REFRESH_IDLE_DAYS * DAY + 5000);
-    expect(result!.refreshTokenExpiresAt.toISOString()).toBe(recorded.updates[0].values.expires_at);
+    const [write] = recorded.updates;
+    expect(Object.keys(write.values).sort()).toEqual(['last_used_at', 'refresh_token']);
+    expect(write.values).not.toHaveProperty('expires_at');
+    expect(write.values).not.toHaveProperty('created_at');
+    // And the caller is handed the grant's own deadline, not a fresh window.
+    expect(result!.refreshTokenExpiresAt.toISOString()).toBe(row.expires_at);
   });
 
-  it('does not slide past the absolute ceiling', async () => {
+  it('holds the deadline fixed across repeated rotations, including a retry', async () => {
+    // The mock follows production: each rotation's recorded write is applied to
+    // the row the next lookup returns. If the implementation ever started
+    // stamping expires_at, the drift would compound here instead of hiding.
+    let row = grantRow();
+    const originalExpiry = row.expires_at;
+    const originalCreatedAt = row.created_at;
+    let presented = 'pcp-rt-presented';
+
+    const deadlines: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      lookupResult = { data: row, error: null };
+      recorded.updates = [];
+
+      const result = await exchangeRefreshToken(
+        makeSupabase() as never,
+        presented,
+        CLIENT,
+        'pcp_admin',
+        HOUR_SECONDS
+      );
+      expect(result).not.toBeNull();
+      deadlines.push(result!.refreshTokenExpiresAt.toISOString());
+
+      row = { ...row, ...recorded.updates[0].values } as typeof row;
+      presented = result!.refreshToken;
+    }
+
+    expect(deadlines).toEqual([originalExpiry, originalExpiry, originalExpiry]);
+    expect(row.expires_at).toBe(originalExpiry);
+    expect(row.created_at).toBe(originalCreatedAt);
+  });
+
+  it('reports the ceiling, not the stored expiry, when the stored expiry overshoots it', async () => {
+    // Issued 89 days ago but carrying a 5-day stored expiry: that reaches day
+    // 94. The client must be told day 90, or its cookie outlives the grant.
     const createdAt = new Date(Date.now() - 89 * DAY);
     lookupResult = { data: grantRow({ created_at: createdAt.toISOString() }), error: null };
 
-    await exchangeRefreshToken(
+    const result = await exchangeRefreshToken(
       makeSupabase() as never,
       'pcp-rt-presented',
       CLIENT,
@@ -244,9 +268,11 @@ describe('exchangeRefreshToken — rotation', () => {
       HOUR_SECONDS
     );
 
-    const written = new Date(recorded.updates[0].values.expires_at as string).getTime();
-    expect(written).toBe(createdAt.getTime() + REFRESH_ABSOLUTE_DAYS * DAY);
-    expect(written).toBeLessThan(Date.now() + REFRESH_IDLE_DAYS * DAY);
+    expect(result!.refreshTokenExpiresAt.getTime()).toBe(
+      createdAt.getTime() + REFRESH_ABSOLUTE_DAYS * DAY
+    );
+    // Still no write to the column — the cap is computed, not persisted.
+    expect(recorded.updates[0].values).not.toHaveProperty('expires_at');
   });
 
   it('refuses and deletes a grant past its absolute lifetime, however fresh its expires_at looks', async () => {
@@ -314,15 +340,63 @@ describe('exchangeRefreshToken — rotation', () => {
     expect(recorded.updates).toHaveLength(0);
   });
 
-  it('refuses an access-token lifetime that would make the idle window unreachable', async () => {
-    await expect(
-      exchangeRefreshToken(
-        makeSupabase() as never,
-        'pcp-rt-presented',
-        CLIENT,
-        'pcp_admin',
-        30 * 24 * 60 * 60
-      )
-    ).rejects.toThrow(/not comfortably inside/);
+  it('refuses and deletes a grant whose stored expiry has passed', async () => {
+    lookupResult = {
+      data: grantRow({ expires_at: new Date(Date.now() - DAY).toISOString() }),
+      error: null,
+    };
+
+    const result = await exchangeRefreshToken(
+      makeSupabase() as never,
+      'pcp-rt-presented',
+      CLIENT,
+      'pcp_admin',
+      HOUR_SECONDS
+    );
+
+    expect(result).toBeNull();
+    expect(recorded.updates).toHaveLength(0);
+    expect(recorded.deletes.length).toBeGreaterThan(0);
+  });
+
+  it('exchanges and rotates under a 30-day access lifetime', async () => {
+    // Replaces the assertion that 30 days must THROW. Under option C the long
+    // access lifetime is restored, so the evidence that changing the guard's
+    // contract was safe has to be a working exchange — not a deleted test.
+    const row = grantRow();
+    lookupResult = { data: row, error: null };
+
+    const result = await exchangeRefreshToken(
+      makeSupabase() as never,
+      'pcp-rt-presented',
+      CLIENT,
+      'pcp_admin',
+      THIRTY_DAYS_SECONDS
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.accessToken).toBeTruthy();
+    expect(result!.refreshToken).toMatch(/^pcp-rt-[0-9a-f]{64}$/);
+    expect(result!.refreshToken).not.toBe('pcp-rt-presented');
+
+    // The long access lifetime must not leak into the grant's deadline.
+    expect(result!.refreshTokenExpiresAt.toISOString()).toBe(row.expires_at);
+    expect(recorded.updates).toHaveLength(1);
+    expect(recorded.updates[0].values).not.toHaveProperty('expires_at');
+  });
+
+  it('signs the access token for the lifetime it was given', async () => {
+    const result = await exchangeRefreshToken(
+      makeSupabase() as never,
+      'pcp-rt-presented',
+      CLIENT,
+      'pcp_admin',
+      THIRTY_DAYS_SECONDS
+    );
+
+    const claims = JSON.parse(
+      Buffer.from(result!.accessToken.split('.')[1], 'base64url').toString('utf8')
+    ) as { iat: number; exp: number };
+    expect(claims.exp - claims.iat).toBe(THIRTY_DAYS_SECONDS);
   });
 });

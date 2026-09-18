@@ -19,7 +19,6 @@ import {
   verifyPcpAccessToken,
   createRefreshToken,
   exchangeRefreshToken,
-  REFRESH_IDLE_DAYS,
 } from './pcp-tokens';
 import { env } from '../config/env';
 import { ensureEchoIntegrationFixture } from '../test/integration-fixtures';
@@ -277,10 +276,20 @@ describe('PCP Tokens Integration', () => {
       expect(decoded!.scope).toBe('admin');
     });
 
-    it('should rotate the secret, slide the expiry and stamp last_used_at', async () => {
+    it('should rotate the secret and stamp last_used_at, leaving the deadline alone', async () => {
       const supabase = dataComposer.getClient();
 
       const before = new Date();
+
+      // The deadline as the database actually holds it, read before the
+      // exchange so the comparison below is against a real stored value rather
+      // than against what the policy is assumed to compute.
+      const { data: preRow } = await supabase
+        .from('mcp_tokens')
+        .select('expires_at, created_at')
+        .eq('id', validTokenRowId!)
+        .single();
+      expect(preRow).not.toBeNull();
 
       const result = await exchangeRefreshToken(
         supabase,
@@ -297,7 +306,7 @@ describe('PCP Tokens Integration', () => {
       // exists, which is the rotation working.
       const { data: dbToken } = await supabase
         .from('mcp_tokens')
-        .select('refresh_token, last_used_at, expires_at')
+        .select('refresh_token, last_used_at, expires_at, created_at')
         .eq('id', validTokenRowId!)
         .single();
 
@@ -308,12 +317,17 @@ describe('PCP Tokens Integration', () => {
         before.getTime() - 1000
       );
 
-      // The grant was created with a 90-day lifetime; sliding pulls it in to
-      // one idle window.
-      const slidDays =
-        (new Date(dbToken!.expires_at).getTime() - Date.now()) / (24 * 60 * 60 * 1000);
-      expect(slidDays).toBeGreaterThan(REFRESH_IDLE_DAYS - 1);
-      expect(slidDays).toBeLessThan(REFRESH_IDLE_DAYS + 1);
+      // Rotation moved the secret and nothing else. Both deadline columns are
+      // byte-identical to what the row held before the exchange — the check
+      // that would catch a re-stamped expires_at against a real database,
+      // including any trigger that might rewrite it behind the query.
+      expect(dbToken!.expires_at).toBe(preRow!.expires_at);
+      expect(dbToken!.created_at).toBe(preRow!.created_at);
+
+      // And the caller was handed that same stored deadline, not a fresh one.
+      expect(result!.refreshTokenExpiresAt.toISOString()).toBe(
+        new Date(preRow!.expires_at).toISOString()
+      );
 
       // The presented secret is dead — a real end-to-end replay check.
       const replay = await exchangeRefreshToken(

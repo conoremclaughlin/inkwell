@@ -11,24 +11,13 @@ import jwt from 'jsonwebtoken';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
-import {
-  DAY_MS,
-  REFRESH_ABSOLUTE_DAYS,
-  assertRefreshWindowIsReachable,
-  slidingExpiry,
-} from './refresh-policy';
+import { DAY_MS, REFRESH_ABSOLUTE_DAYS, effectiveGrantDeadline } from './refresh-policy';
 
 // Re-exported so callers and tests have one import site for the token module's
 // own surface. Modules that only need the policy (admin routes, the OAuth
 // provider) import './refresh-policy' directly — many suites mock this module
 // wholesale, and every export added here becomes a broken mock in one of them.
-export {
-  DAY_MS,
-  REFRESH_ABSOLUTE_DAYS,
-  REFRESH_IDLE_DAYS,
-  assertRefreshWindowIsReachable,
-  slidingExpiry,
-} from './refresh-policy';
+export { DAY_MS, REFRESH_ABSOLUTE_DAYS, effectiveGrantDeadline } from './refresh-policy';
 import type { Database } from '../data/supabase/types';
 
 // ============================================================================
@@ -145,25 +134,23 @@ export function verifyPcpAccessToken(
 // Refresh Tokens (DB-backed)
 // ============================================================================
 //
-// A grant has TWO deadlines, and both are enforced on every exchange:
+// A grant has a FIXED deadline, and both expressions of it are enforced on
+// every exchange, earlier winning:
 //
-//   IDLE      — `expires_at`, pushed forward to now + REFRESH_IDLE_DAYS each
-//               time the grant is used. A client that stops calling loses the
-//               grant a week later instead of keeping it for three months.
-//   ABSOLUTE  — `created_at` + REFRESH_ABSOLUTE_DAYS, which sliding can never
-//               push past. Re-authentication is required eventually no matter
-//               how active the client is.
+//   STORED    — `expires_at`, written once at issue and never moved.
+//   ABSOLUTE  — `created_at` + REFRESH_ABSOLUTE_DAYS, recomputed each time so a
+//               row whose stored expiry outruns the policy is still cut off.
 //
-// The grant also ROTATES: each exchange issues a new secret and invalidates the
-// one presented, so a captured refresh token is useful only until its owner
-// next refreshes. The update is conditional on the presented value, so exactly
-// one caller can win a race; the loser is refused rather than handed a second
-// live token.
+// The grant ROTATES: each exchange issues a new secret and invalidates the one
+// presented, so a captured refresh token is useful only until its owner next
+// refreshes. The update is conditional on the presented value, so exactly one
+// caller can win a race; the loser is refused rather than handed a second live
+// token.
 //
-// INVARIANT, asserted below: the idle window must be comfortably longer than
-// the access-token lifetime. A client only refreshes when its access token
-// runs out, so an idle window shorter than that lifetime would expire every
-// grant before it was ever used — silently logging everyone out on a schedule.
+// Rotation deliberately does NOT touch `expires_at` or `created_at`. Rotating
+// the secret is not a reason to extend the grant — if it were, an active client
+// would hold one forever and the ceiling would never arrive. Re-authentication
+// lands on the original schedule regardless of how often the secret changes.
 
 function newRefreshTokenValue(): string {
   return `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
@@ -209,8 +196,12 @@ export async function createRefreshToken(
  *
  * The presented token is invalidated and a new one returned: callers MUST hand
  * `refreshToken` back to the client (OAuth response body, cookie) or the client
- * is locked out at its next refresh. Both deadlines are enforced, and the grant
- * slides one idle window forward on success.
+ * is locked out at its next refresh. Both deadlines are enforced, and the
+ * grant's own deadline is left exactly where it was.
+ *
+ * `refreshTokenExpiresAt` is that unchanged deadline — the earlier of the
+ * stored expiry and the absolute ceiling. Callers setting a cookie must use it
+ * rather than computing a fresh window, or the cookie outlives the grant.
  *
  * @returns  Access token, the ROTATED refresh token and user info, or null
  */
@@ -230,8 +221,6 @@ export async function exchangeRefreshToken(
   agentId?: string;
   identityId?: string;
 } | null> {
-  assertRefreshWindowIsReachable(accessTokenLifetimeSeconds, `exchangeRefreshToken(${clientId})`);
-
   const { data: tokenRecord, error: lookupError } = await supabase
     .from('mcp_tokens')
     .select('*, users(email)')
@@ -259,9 +248,9 @@ export async function exchangeRefreshToken(
     return null;
   }
 
-  // The absolute ceiling is checked on its own. A grant that has been slid
-  // forward every week for three months is still finished, and its stored
-  // expires_at is not where that shows up.
+  // The absolute ceiling is checked on its own, because a row whose stored
+  // expires_at was written too generously — or migrated in from an older
+  // scheme — is still finished, and its expires_at is not where that shows up.
   const createdAt = (tokenRecord as Record<string, unknown>).created_at as string | null;
   if (createdAt && new Date(createdAt).getTime() + REFRESH_ABSOLUTE_DAYS * DAY_MS < now.getTime()) {
     logger.warn('Refresh token past its absolute lifetime', {
@@ -292,13 +281,16 @@ export async function exchangeRefreshToken(
     accessTokenLifetimeSeconds
   );
 
-  // Rotate, slide, and stamp — one write, conditional on the value presented.
-  // Matching on refresh_token as well as id is what makes a concurrent second
-  // exchange lose: it updates zero rows rather than handing out a second live
-  // token for the same grant.
+  // Rotate and stamp — one write, conditional on the value presented. Matching
+  // on refresh_token as well as id is what makes a concurrent second exchange
+  // lose: it updates zero rows rather than handing out a second live token for
+  // the same grant.
+  //
+  // `expires_at` and `created_at` are deliberately absent from this update. The
+  // deadline belongs to the grant, not to the secret currently representing it,
+  // so rotating cannot move it and neither can a retry.
   const rotated = newRefreshTokenValue();
-  const { expiresAt, atAbsoluteCeiling } = slidingExpiry({
-    now,
+  const { expiresAt, atAbsoluteCeiling } = effectiveGrantDeadline({
     createdAt,
     currentExpiresAt: tokenRecord.expires_at,
   });
@@ -307,7 +299,6 @@ export async function exchangeRefreshToken(
     .from('mcp_tokens')
     .update({
       refresh_token: rotated,
-      expires_at: expiresAt.toISOString(),
       last_used_at: now.toISOString(),
     })
     .eq('id', tokenRecord.id)
@@ -329,10 +320,14 @@ export async function exchangeRefreshToken(
   }
 
   if (atAbsoluteCeiling) {
-    logger.info('Refresh grant is at its absolute ceiling; re-authentication due', {
+    // The stored expiry reaches past created_at + REFRESH_ABSOLUTE_DAYS, so the
+    // ceiling is the deadline actually in force and the client has less time
+    // than its row claims.
+    logger.info('Refresh grant is capped by its absolute ceiling; re-authentication due', {
       userId: tokenRecord.user_id,
       clientId,
-      expiresAt: expiresAt.toISOString(),
+      storedExpiresAt: tokenRecord.expires_at,
+      effectiveExpiresAt: expiresAt.toISOString(),
     });
   }
 

@@ -13,7 +13,7 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
-import { REFRESH_IDLE_DAYS } from '../../auth/refresh-policy';
+import { REFRESH_ABSOLUTE_DAYS } from '../../auth/refresh-policy';
 import type { Database } from '../../data/supabase/types';
 import {
   signPcpAccessToken,
@@ -78,13 +78,13 @@ export interface AuthCallbackResult {
 // Constants
 // ============================================================================
 
-// One hour, matching the dashboard. This was 30 days, which made the refresh
-// grant almost decorative: a client never came back to refresh, so the grant's
-// idle window never mattered and a stolen access token stayed useful for a
-// month. Short access tokens are what give rotation something to rotate.
-const ACCESS_TOKEN_LIFETIME_SECONDS = 60 * 60;
-// Initial idle window; slides on use, capped at 90 days from issue.
-const REFRESH_TOKEN_LIFETIME_DAYS = REFRESH_IDLE_DAYS;
+// A 30-day access token means a stolen one stays useful for a month, which
+// rotation does not address — shortening it is real work with a real cost
+// (long-running sessions would need renewable transport) and is tracked
+// separately rather than smuggled in with the rotation fix.
+const ACCESS_TOKEN_LIFETIME_SECONDS = 30 * 24 * 60 * 60; // 30 days
+// Fixed from issue. Rotation changes the secret, never this deadline.
+const REFRESH_TOKEN_LIFETIME_DAYS = REFRESH_ABSOLUTE_DAYS;
 const AUTH_CODE_LIFETIME_MS = 10 * 60 * 1000; // 10 minutes
 const PENDING_AUTH_LIFETIME_SECONDS = 600; // 10 minutes
 

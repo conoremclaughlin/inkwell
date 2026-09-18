@@ -6,65 +6,54 @@
  * '../auth/pcp-tokens' wholesale — so exporting them from there would make
  * every new constant a broken mock in seven unrelated test files.
  *
- * A grant has TWO deadlines, both enforced on every exchange:
+ * A grant has a FIXED deadline, set when it is issued and never moved. Two
+ * values express it and the EARLIER always wins:
  *
- *   IDLE      — the stored `expires_at`, pushed to now + REFRESH_IDLE_DAYS each
- *               time the grant is used. Stop calling and it dies in a week.
- *   ABSOLUTE  — `created_at` + REFRESH_ABSOLUTE_DAYS, which sliding can never
- *               push past, so re-authentication comes eventually regardless.
+ *   STORED    — the `expires_at` column, written once at issue.
+ *   ABSOLUTE  — `created_at` + REFRESH_ABSOLUTE_DAYS, recomputed on every
+ *               exchange so a row whose stored expiry was set too generously
+ *               (or migrated in from an older scheme) still dies on time.
+ *
+ * Rotation does not extend either one. Re-authentication comes on the grant's
+ * original schedule no matter how actively it is used.
  */
 
-/** Sliding window: a grant unused for this long is dead. */
-export const REFRESH_IDLE_DAYS = 7;
-
-/** Hard ceiling measured from issue; sliding cannot exceed it. */
+/** Hard ceiling measured from issue. Nothing may push a grant past it. */
 export const REFRESH_ABSOLUTE_DAYS = 90;
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Refuse a lifetime pairing that would make the idle window unreachable.
- * Called by each caller with its own access-token lifetime, so the two cannot
- * drift apart in different files without something saying so.
- */
-export function assertRefreshWindowIsReachable(
-  accessTokenLifetimeSeconds: number,
-  context: string
-): void {
-  const accessDays = accessTokenLifetimeSeconds / (24 * 60 * 60);
-  if (accessDays * 2 >= REFRESH_IDLE_DAYS) {
-    throw new Error(
-      `${context}: access-token lifetime (${accessDays.toFixed(2)}d) is not comfortably ` +
-        `inside the ${REFRESH_IDLE_DAYS}d refresh idle window. A client refreshes only when ` +
-        `its access token expires, so this pairing would expire grants before they are used. ` +
-        `Shorten the access-token lifetime or lengthen REFRESH_IDLE_DAYS.`
-    );
-  }
-}
-
-/**
- * The new `expires_at` for a grant being used at `now`: one idle window ahead,
- * clamped to the absolute deadline.
+ * The deadline actually in force for a grant: the earlier of its stored
+ * `expires_at` and `created_at` + REFRESH_ABSOLUTE_DAYS.
  *
- * `createdAt` anchors the absolute deadline. A legacy row without one cannot
- * have its ceiling computed, so its ORIGINAL expiry becomes the ceiling — such
- * a grant can shorten but never extend, which is the conservative direction.
+ * Earlier-wins in both directions, which is what keeps this from becoming an
+ * extension mechanism. A grant issued with a SHORTER stored expiry — a legacy
+ * row, or one deliberately issued short — keeps that shorter deadline; the
+ * ceiling is a cap, never a floor. A grant whose stored expiry reaches beyond
+ * the ceiling is cut back to the ceiling.
+ *
+ * `createdAt` anchors the ceiling. A legacy row without one cannot have a
+ * ceiling computed at all, so its stored expiry stands alone — such a grant can
+ * only ever be shorter than the policy, which is the conservative direction.
  */
-export function slidingExpiry(params: {
-  now: Date;
+export function effectiveGrantDeadline(params: {
   createdAt: string | null | undefined;
   currentExpiresAt: string;
-  idleDays?: number;
   absoluteDays?: number;
 }): { expiresAt: Date; atAbsoluteCeiling: boolean } {
-  const idleDays = params.idleDays ?? REFRESH_IDLE_DAYS;
   const absoluteDays = params.absoluteDays ?? REFRESH_ABSOLUTE_DAYS;
+  const stored = new Date(params.currentExpiresAt);
 
-  const ceiling = params.createdAt
-    ? new Date(new Date(params.createdAt).getTime() + absoluteDays * DAY_MS)
-    : new Date(params.currentExpiresAt);
+  if (!params.createdAt) {
+    return { expiresAt: stored, atAbsoluteCeiling: false };
+  }
 
-  const slid = new Date(params.now.getTime() + idleDays * DAY_MS);
-  const atCeiling = slid.getTime() > ceiling.getTime();
-  return { expiresAt: atCeiling ? ceiling : slid, atAbsoluteCeiling: atCeiling };
+  const ceiling = new Date(new Date(params.createdAt).getTime() + absoluteDays * DAY_MS);
+  const ceilingWins = ceiling.getTime() < stored.getTime();
+
+  return {
+    expiresAt: ceilingWins ? ceiling : stored,
+    atAbsoluteCeiling: ceilingWins,
+  };
 }
