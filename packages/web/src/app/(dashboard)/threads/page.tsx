@@ -41,6 +41,8 @@ interface SpineSession {
   status: string | null;
   phase: string | null;
   relation: 'anchor' | 'active' | 'both';
+  /** Server-computed presence — see isSessionLive in thread-spines.ts. */
+  live: boolean;
   updatedAt: string;
   studioId: string | null;
 }
@@ -258,8 +260,15 @@ function formatRelativeTime(date: string): string {
   return `${diffDays}d ago`;
 }
 
+/**
+ * Presence is the server's call (isSessionLive in thread-spines.ts), not a
+ * lifecycle comparison repeated per client. This used to read
+ * `running || generating` — `generating` is not in the SessionLifecycle
+ * union, so that half never matched, and the half that did matched sessions
+ * abandoned months earlier.
+ */
 function hasLiveSession(spine: ThreadSpine): boolean {
-  return spine.sessions.some((s) => s.lifecycle === 'running' || s.lifecycle === 'generating');
+  return spine.sessions.some((s) => s.live);
 }
 
 type StatusFilter = 'all' | 'active' | 'unannounced' | 'closed';
@@ -685,9 +694,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                 <span
                   className={clsx(
                     'h-2 w-2 shrink-0 rounded-full',
-                    s.lifecycle === 'running' || s.lifecycle === 'generating'
-                      ? 'animate-pulse bg-green-500'
-                      : 'bg-muted-foreground/40'
+                    s.live ? 'animate-pulse bg-green-500' : 'bg-muted-foreground/40'
                   )}
                 />
                 <span className="font-medium">{s.sbSlug ?? 'unknown'}</span>

@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
   aggregateStudioHistory,
+  isSessionLive,
   mergeThreadSpines,
   missingThreadKeys,
+  SESSION_LIVE_WINDOW_MS,
   type SpineGroupRow,
   type SpineSessionRow,
   type SpineStudioRow,
@@ -18,6 +20,7 @@ const thread = (over: Partial<SpineThreadRow> = {}): SpineThreadRow => ({
   keyType: 'pr',
   keyId: '531',
   title: 'Command center viz',
+  summary: null,
   status: 'open',
   createdBySlug: 'wren',
   updatedAt: at(10),
@@ -321,5 +324,126 @@ describe('missingThreadKeys', () => {
       pinned: true,
     });
     expect(parserCalls).toBe(0);
+  });
+});
+
+/**
+ * Liveness. The reason this rule exists at all: on 2026-09-17 production had
+ * 73 sessions whose lifecycle said `running`, 3 of which had been written to
+ * in the previous fifteen minutes, and the oldest of which had claimed to be
+ * running since March. `lifecycle` is a stored state nothing ever reaps, so
+ * reading it as presence marks ~50 threads live for one agent.
+ */
+describe('isSessionLive', () => {
+  const NOW = Date.UTC(2026, 8, 17, 12, 0, 0);
+  const agedMinutes = (m: number) => new Date(NOW - m * 60_000).toISOString();
+
+  const live = (over: Partial<Parameters<typeof isSessionLive>[0]> = {}) =>
+    isSessionLive(
+      { lifecycle: 'running', currentPhase: 'implementing', updatedAt: agedMinutes(1), ...over },
+      NOW
+    );
+
+  it('is live when a working lifecycle wrote recently', () => {
+    expect(live()).toBe(true);
+    expect(live({ lifecycle: 'compacting' })).toBe(true);
+  });
+
+  it.each(['idle', 'completed', 'failed', 'interrupted', null])(
+    'is not live in lifecycle %o, however recent the write',
+    (lifecycle) => {
+      expect(live({ lifecycle, updatedAt: agedMinutes(0) })).toBe(false);
+    }
+  );
+
+  // The dashboard tested for this value; it is not in the SessionLifecycle
+  // union, so that branch matched nothing. Pinned so the dead value cannot
+  // quietly come back as a third definition.
+  it('does not treat `generating` as a lifecycle — it is not one', () => {
+    expect(live({ lifecycle: 'generating', updatedAt: agedMinutes(0) })).toBe(false);
+  });
+
+  it('is not live once the last write falls outside the window', () => {
+    const edgeMinutes = SESSION_LIVE_WINDOW_MS / 60_000;
+    expect(live({ updatedAt: agedMinutes(edgeMinutes - 1) })).toBe(true);
+    expect(live({ updatedAt: agedMinutes(edgeMinutes + 1) })).toBe(false);
+  });
+
+  // Observed shape: a session that finished its work and said so, whose
+  // lifecycle was never moved off `running`. The phase is the later statement.
+  it('believes a `complete` phase over a stale `running` lifecycle', () => {
+    expect(live({ currentPhase: 'complete', updatedAt: agedMinutes(0) })).toBe(false);
+  });
+
+  it('holds the real 2026-03 row stale rather than calling it live', () => {
+    expect(
+      isSessionLive(
+        { lifecycle: 'running', currentPhase: 'reviewing', updatedAt: '2026-03-03T19:04:25Z' },
+        NOW
+      )
+    ).toBe(false);
+  });
+
+  it('treats an unparseable timestamp as no evidence, and clock skew as live', () => {
+    expect(live({ updatedAt: 'not a date' })).toBe(false);
+    expect(live({ updatedAt: agedMinutes(-5) })).toBe(true);
+  });
+});
+
+describe('mergeThreadSpines liveness', () => {
+  const NOW = Date.UTC(2026, 8, 17, 12, 0, 0);
+  const agedMinutes = (m: number) => new Date(NOW - m * 60_000).toISOString();
+
+  it('marks each session live or not, rather than leaving clients to guess', () => {
+    const spines = mergeThreadSpines({
+      threads: [],
+      sessions: [
+        session({ id: 'fresh', threadKey: 'pr:1', updatedAt: agedMinutes(1) }),
+        session({ id: 'abandoned', threadKey: 'pr:2', updatedAt: agedMinutes(60 * 24) }),
+      ],
+      studios: [],
+      groups: [],
+      parse: () => null,
+      nowMs: NOW,
+    });
+    const liveByKey = Object.fromEntries(spines.map((s) => [s.key, s.sessions[0].live]));
+    expect(liveByKey).toEqual({ 'pr:1': true, 'pr:2': false });
+  });
+
+  /**
+   * A session carried by two keys (anchor + a different active focus) is one
+   * session. Classifying inside the key loop would be a second Date.now()
+   * read per key; this pins that both copies carry the same verdict.
+   */
+  it('gives one session the same verdict on every key it carries', () => {
+    const spines = mergeThreadSpines({
+      threads: [],
+      sessions: [
+        session({
+          id: 's1',
+          threadKey: 'pr:10',
+          activeThreadKey: 'pr:11',
+          updatedAt: agedMinutes(2),
+        }),
+      ],
+      studios: [],
+      groups: [],
+      parse: () => null,
+      nowMs: NOW,
+    });
+    expect(spines.map((s) => s.sessions[0].live)).toEqual([true, true]);
+    expect(spines.map((s) => s.sessions[0].relation).sort()).toEqual(['active', 'anchor']);
+  });
+
+  it('carries the thread summary through to the spine', () => {
+    const [spine] = mergeThreadSpines({
+      threads: [thread({ summary: 'Wren is porting the discovery shim.' })],
+      sessions: [],
+      studios: [],
+      groups: [],
+      parse: () => null,
+      nowMs: NOW,
+    });
+    expect(spine.thread?.summary).toBe('Wren is porting the discovery shim.');
   });
 });
