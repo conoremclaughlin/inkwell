@@ -2719,8 +2719,25 @@ describe('runChat integration', () => {
   // collapses whitespace, hydration truncates raw), which is why its entries
   // are deliberately not wired.
   it('live ledger entries agree with their hydrated twin on eid and content', async () => {
+    // Capture what the LIVE path appends, at the append itself. Reading the
+    // transcript and comparing it to a ledger hydrated from that same file
+    // only proves hydration is self-consistent: both sides come from one
+    // source, so a live append that diverges from the event it wrote is
+    // invisible to it. Measured — with `ledger.addEntry('user', raw + '…')`
+    // mutated to diverge and the transcript write left alone, the earlier
+    // transcript-vs-hydrated form of this test stayed green (Lumen, #653 r2).
+    const addEntrySpy = vi.spyOn(ContextLedger.prototype, 'addEntry');
+
     testState.inputs = ['a user message', '/quit'];
     await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const liveWired = addEntrySpy.mock.calls
+      .map((call) => ({ role: call[0], content: call[1], eid: call[3] }))
+      .filter(
+        (append): append is { role: string; content: string; eid: number } =>
+          typeof append.eid === 'number'
+      );
+    addEntrySpy.mockRestore();
 
     const replDir = join(testCwd, '.ink', 'runtime', 'repl');
     const transcriptPath = join(
@@ -2736,21 +2753,25 @@ describe('runChat integration', () => {
         .filter((entry) => entry.eid !== undefined)
         .map((entry) => [entry.eid!, entry])
     );
-    const events = readFileSync(transcriptPath, 'utf-8')
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
 
-    // The user turn and the assistant reply both hydrate, and both are wired.
-    const userEvent = events.find((event) => event.type === 'user')!;
-    const assistantEvent = events.find((event) => event.type === 'assistant')!;
-    expect(userEvent, 'expected a user event with an eid').toBeTruthy();
-    expect(assistantEvent, 'expected an assistant event with an eid').toBeTruthy();
+    // Coverage control: an empty capture makes the loop below vacuous and
+    // green. This run drives one user turn and its assistant reply, and both
+    // of those append sites are eid-wired.
+    expect(liveWired.map((append) => append.role).sort()).toEqual(['assistant', 'user']);
 
-    for (const event of [userEvent, assistantEvent]) {
-      const hydrated = byEid.get(event.eid as number);
-      expect(hydrated, `no hydrated entry for eid ${event.eid} (${event.type})`).toBeTruthy();
-      expect(hydrated!.content).toBe(event.content);
+    for (const append of liveWired) {
+      const hydrated = byEid.get(append.eid);
+      expect(
+        hydrated,
+        `no hydrated entry for the live ${append.role} append at eid ${append.eid}`
+      ).toBeTruthy();
+      expect(hydrated!.role, `live/hydrated role drift at eid ${append.eid}`).toBe(append.role);
+      expect(
+        hydrated!.content,
+        `live/hydrated content drift for ${append.role} at eid ${append.eid} — ` +
+          `an eid ref carries the hash too, so a divergence here makes this ` +
+          `type's evictions match nothing on replay`
+      ).toBe(append.content);
     }
   });
 
