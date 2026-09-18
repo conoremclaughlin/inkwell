@@ -44,10 +44,17 @@ EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
 POLICY = "fixture-baseline-v2:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES)
 DATABASE_GUARD = """DO $guard$ BEGIN
   IF current_database() <> 'postgres' THEN
-    RAISE EXCEPTION 'Refusing fixture cleanup: wrong database name';
+    RAISE EXCEPTION 'Refusing fixture cleanup: wrong database name' USING ERRCODE = 'PC001';
   END IF;
 END $guard$;
 """
+# Diagnostics come from fixed SQLSTATEs, never from error text or fixture rows.
+REFUSAL_CODES = {
+    "PC001": "wrong database name",
+    "PC002": "stack identity mismatch",
+    "PC003": "excluded reference table drift",
+    "PC004": "restored baseline checksum mismatch",
+}
 
 
 def validate_identity(info, project, recorded_id, db_port):
@@ -114,6 +121,8 @@ def execute(container_id, tool, args, lock_fds, sql=None, phase="SQL operation")
             sqlstate = re.search(r"ERROR:\s+([0-9A-Z]{5})\s*(?:\n|$)", error.stderr or "")
             if sqlstate:
                 detail += " SQLSTATE=" + sqlstate[1]
+                if sqlstate[1] in REFUSAL_CODES:
+                    detail += " " + REFUSAL_CODES[sqlstate[1]]
         raise Refusal("Fixture " + phase + " failed (" + detail + "); operation stopped. State/marker preserved; "
                       "verify ownership, then use --reset if recovery is needed.") from None
 
@@ -153,21 +162,38 @@ def checksum_expression(tables):
 
 
 def checksum_guard(tables):
+    # Distinguish refusal before mutation from a failed restore verification.
+    code = "PC003" if tuple(tables) == EXCLUDED_TABLES else "PC004"
     # The full set exceeds jsonb_build_object's argument limit too.
     expected = " || ".join("jsonb_build_object(" + literal(t) +
                            ", (SELECT checksums -> " + literal(t) + " FROM _pcp_it.stack))" for t in tables)
     return ("DO $checks$ BEGIN IF (" + checksum_expression(tables) + ") IS DISTINCT FROM (" + expected +
-            ") THEN RAISE EXCEPTION 'Fixture baseline checksum mismatch'; END IF; END $checks$;\n")
+            ") THEN RAISE EXCEPTION 'Fixture baseline checksum mismatch' USING ERRCODE = " +
+            literal(code) + "; END IF; END $checks$;\n")
 
 
 def identity_guard(project, container_id, signature, token, run_id=None):
+    # These two fields can come from persisted state. Reject invalid UUIDs before
+    # constructing SQL, rather than relying only on SQL literal escaping.
+    token = canonical_uuid(token)
+    if run_id is not None:
+        run_id = canonical_uuid(run_id)
     predicates = ["project = " + literal(project), "db_id = " + literal(container_id),
                   "fingerprint = " + literal(signature), "token = " + literal(token) + "::uuid"]
     if run_id is not None:
         predicates.append("run_id = " + literal(run_id) + "::uuid")
     return DATABASE_GUARD + ("DO $identity$ BEGIN PERFORM 1 FROM _pcp_it.stack WHERE singleton AND " +
                             " AND ".join(predicates) + " FOR UPDATE; IF NOT FOUND THEN "
-                            "RAISE EXCEPTION 'Fixture stack identity mismatch'; END IF; END $identity$;\n")
+                            "RAISE EXCEPTION 'Fixture stack identity mismatch' USING ERRCODE = 'PC002'; END IF; END $identity$;\n")
+
+
+def canonical_uuid(value):
+    try:
+        if not isinstance(value, str):
+            raise ValueError()
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        raise Refusal("Invalid persisted fixture identity/run token; refusing SQL construction.") from None
 
 
 def transaction(container_id, sql, lock_fds, phase="transaction"):
@@ -177,6 +203,7 @@ def transaction(container_id, sql, lock_fds, phase="transaction"):
 
 def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature, run_id):
     """Called ONLY after successful managed reset, before tests can write rows."""
+    run_id = canonical_uuid(run_id)
     container_id = checked_container(project, recorded_id, db_port)
     verify_database(container_id, lock_fds)
     verify_catalog(container_id, lock_fds)
@@ -225,6 +252,8 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     if (path.is_symlink() or not path.is_file() or not isinstance(baseline_state, dict)
             or not baseline_state.get("hash") or not baseline_state.get("token")):
         raise Refusal("Fixture baseline is missing or unmanaged; run --reset once.")
+    canonical_uuid(baseline_state["token"])
+    run_id = canonical_uuid(run_id)
     baseline = path.read_text()
     if hashlib.sha256(baseline.encode()).hexdigest() != baseline_state["hash"]:
         raise Refusal("Fixture baseline changed outside the harness; refusing cleanup. Use --reset.")
@@ -240,6 +269,8 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     # A single transaction rolls back truncation and trigger changes on failure.
     # pg_dump handles restore ordering/trigger suppression instead of hand-rolled
     # dependency logic; the dump was captured before any test ran, not from residue.
+    # pg_dump resets lock_timeout and search_path: keep TRUNCATE before its
+    # preamble and everything after it schema-qualified.
     truncate = "TRUNCATE " + ", ".join("ONLY public." + t for t in FIXTURE_TABLES) + " CONTINUE IDENTITY RESTRICT;\n"
     transaction(container_id, guard + checksum_guard(EXCLUDED_TABLES) + truncate + baseline + "\n" +
                 checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup")

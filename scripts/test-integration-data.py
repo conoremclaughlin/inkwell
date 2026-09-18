@@ -273,6 +273,69 @@ class DataTests(unittest.TestCase):
         self.assertIn("exit=3 SQLSTATE=42501", message)
         self.assertNotIn("synthetic-private-detail", message)
 
+    def test_self_consistent_application_identity_is_refused_by_namespace(self):
+        for project in ("application", "pcp-integrationX"):
+            info = dict(self.info, project=project, name="/supabase_db_" + project,
+                        ports=[{"HostPort": "54322"}])
+            with self.subTest(project=project), self.assertRaisesRegex(data.Refusal, "integration project name"):
+                data.validate_identity(info, project, self.id, 54322)
+        self.assertEqual(data.validate_identity(self.info, self.project, self.id, 55422), self.id)
+        self.assertEqual(self.calls, [])
+
+    def test_checked_container_rejects_invalid_id_before_invoking_docker(self):
+        for recorded in ("--all", "", None, "fixture-name", "a" * 11):
+            with self.subTest(recorded=recorded), self.assertRaises(data.Refusal):
+                data.checked_container(self.project, recorded, 55422)
+        self.assertEqual(self.calls, [])
+
+    def test_cold_capture_refuses_unclassified_catalog_before_dump_or_marker(self):
+        self.catalog += ("independent_fixture",)
+        with self.assertRaisesRegex(data.Refusal, "classification differs"):
+            data.capture_baseline(self.workdir, self.project, self.id, 55422, [7], self.signature, self.run_id)
+        self.assertFalse(any("pg_dump" in args for args, _ in self.calls))
+        self.assertFalse(any("CREATE SCHEMA" in (opts.get("input") or "") for _, opts in self.calls))
+
+    def test_empty_and_oversized_dumps_cannot_initialize_marker(self):
+        for baseline in ("", " \n", "x" * (10 * 1024 * 1024 + 1)):
+            self.baseline = baseline
+            with self.subTest(size=len(baseline)), self.assertRaisesRegex(data.Refusal, "baseline size"):
+                data.capture_baseline(self.workdir, self.project, self.id, 55422, [7], self.signature, self.run_id)
+        self.assertFalse(any("CREATE SCHEMA" in (opts.get("input") or "") for _, opts in self.calls))
+
+    def test_invalid_persisted_tokens_never_reach_sql(self):
+        for value in ("' OR true --", "fixture-invalid-uuid", 42, [], {}):
+            with self.subTest(value=value), self.assertRaises(data.Refusal):
+                data.identity_guard(self.project, self.id, self.signature, value, self.run_id)
+            with self.subTest(run=value), self.assertRaises(data.Refusal):
+                data.identity_guard(self.project, self.id, self.signature, self.state["token"], value)
+        self.state["token"] = "' OR true --"
+        with self.assertRaises(data.Refusal):
+            self.clean()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(data.literal("fixture'quote"), "'fixture''quote'")
+
+    def test_guard_sqlstates_distinguish_all_four_failure_conditions(self):
+        guards = (
+            (data.DATABASE_GUARD, "PC001", "wrong database name"),
+            (data.identity_guard(self.project, self.id, self.signature, self.state["token"]),
+             "PC002", "stack identity mismatch"),
+            (data.checksum_guard(data.EXCLUDED_TABLES), "PC003", "excluded reference table drift"),
+            (data.checksum_guard(data.FIXTURE_TABLES + data.EXCLUDED_TABLES),
+             "PC004", "restored baseline checksum mismatch"),
+        )
+        for sql, code, reason in guards:
+            with self.subTest(code=code):
+                self.assertIn("USING ERRCODE = '" + code + "'", sql)
+                error = subprocess.CalledProcessError(3, [], stderr="ERROR: " + code + "\nsynthetic-private-detail\n")
+                with mock.patch.object(data.subprocess, "run", side_effect=error), self.assertRaises(data.Refusal) as refused:
+                    data.verify_database(self.id, [7])
+                self.assertIn("SQLSTATE=" + code, str(refused.exception))
+                self.assertIn(reason, str(refused.exception))
+                self.assertNotIn("synthetic-private-detail", str(refused.exception))
+        self.calls.clear()
+        data.finish_run(self.project, self.id, 55422, self.state, [7], self.signature, self.run_id)
+        self.assertIn("VERBOSITY=sqlstate", self.calls[-1][0])
+
 
 if __name__ == "__main__":
     unittest.main()
