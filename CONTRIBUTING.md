@@ -445,7 +445,12 @@ required, but is only a typo guard: application stacks can share that SQL name.
 The additional `_pcp_it.stack` row, installed only after a managed reset, must match
 the project, full container ID, fingerprint, and random token **in the same
 transaction** before cleanup. Missing or mismatching identity refuses; do not
-create this marker by hand to force adoption.
+create this marker by hand to force adoption. The restore remains on the `postgres`
+role: transaction-local replication mode suppresses normal triggers/FKs only around
+the trusted baseline load, then returns to origin mode before checksum verification.
+It does not authenticate as `supabase_admin` or persist trigger-state changes. The
+pinned local Supabase image grants this parameter to `postgres`; failure to set it
+refuses cleanup rather than attempting privilege escalation.
 
 The DB marker also records an in-progress run independently of schema readiness.
 It is cleared only by that run after success; failures/interrupts preserve it and

@@ -157,10 +157,11 @@ class DataTests(unittest.TestCase):
         self.assertTrue(result["token"])
         command, _ = next(call for call in self.calls if "pg_dump" in call[0])
         self.assertIn("pg_dump", command)
-        for flag in ("--data-only", "--disable-triggers", "--strict-names", "--no-blobs"):
+        for flag in ("--data-only", "--strict-names", "--no-blobs"):
             self.assertIn(flag, command)
         self.assertEqual([s[8:] for s in command if s.startswith("--table=")],
                          ["public." + t for t in data.FIXTURE_TABLES])
+        self.assertNotIn("--disable-triggers", command)
         self.assertNotIn("--clean", command)
         self.assertNotIn("--create", command)
         self.assertEqual((self.workdir / data.BASELINE_FILE).stat().st_mode & 0o777, 0o600)
@@ -314,28 +315,24 @@ class DataTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(data.literal("fixture'quote"), "'fixture''quote'")
 
-    def test_scoped_restore_uses_maintenance_role_after_identity_check(self):
-        original = self.run_command
-        def enforce_privilege(args, **kwargs):
-            if "TRUNCATE " in (kwargs.get("input") or "") and "--username=supabase_admin" not in args:
-                raise subprocess.CalledProcessError(3, args, stderr="psql:<stdin>:1: ERROR:  42501\n")
-            return original(args, **kwargs)
-        with mock.patch.object(data.subprocess, "run", enforce_privilege):
-            try:
-                self.clean()
-            except data.Refusal as error:
-                self.fail("Scoped restore must succeed with required privileges: " + str(error))
+    def test_scoped_restore_suppresses_triggers_only_around_trusted_dump(self):
+        self.clean()
         self.assertEqual(len(self.mutations()), 1)
         for args, opts in self.calls:
             if "psql" not in args:
                 continue
-            sql = opts.get("input") or ""
-            if "TRUNCATE " in sql:
-                self.assertIn("--username=supabase_admin", args)
-                self.assertLess(sql.index("Fixture stack identity mismatch"), sql.index("TRUNCATE "))
-                self.assertIn(self.id, args)
-            else:
-                self.assertIn("--username=postgres", args)
+            self.assertIn("--username=postgres", args)
+            self.assertNotIn("--username=supabase_admin", args)
+        sql = self.mutations()[0]
+        suppress = "SET LOCAL session_replication_role = replica;"
+        resume = "SET LOCAL session_replication_role = origin;"
+        self.assertLess(sql.index("Fixture stack identity mismatch"), sql.index("TRUNCATE "))
+        self.assertLess(sql.index("TRUNCATE "), sql.index(suppress))
+        self.assertLess(sql.index(suppress), sql.index(self.baseline))
+        self.assertLess(sql.index(self.baseline), sql.index(resume))
+        self.assertLess(sql.index(resume), sql.rindex("Fixture baseline checksum mismatch"))
+        self.assertNotIn("ALTER TABLE", sql)
+        self.assertIn("--single-transaction", self.calls[-1][0])
 
     def test_ci_refusal_control_cannot_pass_on_unrelated_sql_failure(self):
         ci_path = Path(__file__).parent / "test-integration-data-ci.py"

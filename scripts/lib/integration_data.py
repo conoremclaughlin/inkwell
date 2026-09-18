@@ -41,7 +41,7 @@ trusted_users user_identity user_identity_history user_permissions users
 workspace_members workspaces
 """.split())
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
-POLICY = "fixture-baseline-v2:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES)
+POLICY = "fixture-baseline-v3:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES)
 DATABASE_GUARD = """DO $guard$ BEGIN
   IF current_database() <> 'postgres' THEN
     RAISE EXCEPTION 'Refusing fixture cleanup: wrong database name' USING ERRCODE = 'PC001';
@@ -98,23 +98,20 @@ def checked_container(project, recorded_id, db_port):
     return validate_identity(info, project, recorded_id, db_port)
 
 
-def db_command(container_id, tool, maintenance=False):
+def db_command(container_id, tool):
     # Pin the immutable ID, never resolve the name again at the mutation boundary.
     # Explicit socket/user/port/db defeat container-side libpq defaults as well.
     # An empty PGSERVICE is NOT unset: libpq tries to resolve service "".
-    # Supabase's postgres is not a superuser. Only the guarded restore needs
-    # supabase_admin: pg_dump's DISABLE TRIGGER ALL includes system FK triggers.
-    user = "supabase_admin" if maintenance else "postgres"
     return ["docker", "exec", "-i", container_id, "env", "-u", "PGOPTIONS",
             "-u", "PGSERVICE", "-u", "PGSERVICEFILE", tool,
             "--host=/var/run/postgresql", "--port=5432",
-            "--username=" + user, "--dbname=" + DATABASE, "--no-password"]
+            "--username=postgres", "--dbname=" + DATABASE, "--no-password"]
 
 
-def execute(container_id, tool, args, lock_fds, sql=None, phase="SQL operation", maintenance=False):
+def execute(container_id, tool, args, lock_fds, sql=None, phase="SQL operation"):
     try:
         diagnostics = ["-v", "VERBOSITY=sqlstate"] if tool == "psql" else []
-        return subprocess.run(db_command(container_id, tool, maintenance=maintenance) + diagnostics + args, input=sql,
+        return subprocess.run(db_command(container_id, tool) + diagnostics + args, input=sql,
                               capture_output=True, text=True, check=True, timeout=60,
                               pass_fds=lock_fds).stdout
     except (OSError, subprocess.SubprocessError) as error:
@@ -200,9 +197,9 @@ def canonical_uuid(value):
         raise Refusal("Invalid persisted fixture identity/run token; refusing SQL construction.") from None
 
 
-def transaction(container_id, sql, lock_fds, phase="transaction", maintenance=False):
+def transaction(container_id, sql, lock_fds, phase="transaction"):
     return execute(container_id, "psql", ["-X", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-f", "-"],
-                   lock_fds, "SET TIME ZONE 'UTC';\nSET lock_timeout = '5s';\n" + sql, phase=phase, maintenance=maintenance)
+                   lock_fds, "SET TIME ZONE 'UTC';\nSET lock_timeout = '5s';\n" + sql, phase=phase)
 
 
 def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature, run_id):
@@ -221,7 +218,7 @@ def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature
             raise ValueError()
     except (ValueError, IndexError, TypeError):
         raise Refusal("Could not record the cold fixture baseline checksums.") from None
-    args = ["--data-only", "--column-inserts", "--disable-triggers", "--no-owner",
+    args = ["--data-only", "--column-inserts", "--no-owner",
             "--no-privileges", "--no-comments", "--strict-names", "--no-blobs"]
     for table in FIXTURE_TABLES:
         args += ["--table=public." + table]
@@ -271,13 +268,16 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     guard = identity_guard(project, container_id, signature, baseline_state["token"], run_id)
     # ONLY excludes descendants; RESTRICT prevents cleanup expanding via FKs.
     # A single transaction rolls back truncation and trigger changes on failure.
-    # pg_dump handles restore ordering/trigger suppression instead of hand-rolled
-    # dependency logic; the dump was captured before any test ran, not from residue.
+    # Supabase grants postgres session_replication_role without superuser access.
+    # Suppress normal triggers/FKs only while restoring the trusted cold dump;
+    # SET LOCAL reverts on rollback. No admin login or persistent ALTER TRIGGER.
+    # Row checksums after restoring origin mode still gate the transaction.
     # pg_dump resets lock_timeout and search_path: keep TRUNCATE before its
     # preamble and everything after it schema-qualified.
     truncate = "TRUNCATE " + ", ".join("ONLY public." + t for t in FIXTURE_TABLES) + " CONTINUE IDENTITY RESTRICT;\n"
-    transaction(container_id, guard + checksum_guard(EXCLUDED_TABLES) + truncate + baseline + "\n" +
-                checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup", maintenance=True)
+    restore = "SET LOCAL session_replication_role = replica;\n" + baseline + "\nSET LOCAL session_replication_role = origin;\n"
+    transaction(container_id, guard + checksum_guard(EXCLUDED_TABLES) + truncate + restore +
+                checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup")
 
 
 def finish_run(project, recorded_id, db_port, baseline_state, lock_fds, signature, run_id):
