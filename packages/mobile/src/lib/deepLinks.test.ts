@@ -1,5 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { getActionFromState } from '@react-navigation/core';
 import { buildDeepLinkPath, parseDeepLink, type DeepLinkTarget } from './deepLinks';
+
+vi.mock('expo-linking', () => ({
+  createURL: (path: string) => `exp://127.0.0.1:8092/--${path}`,
+  addEventListener: () => ({ remove: () => {} }),
+  parse: (url: string) => ({ path: url, queryParams: {} }),
+}));
 
 describe('parseDeepLink', () => {
   it('opens a thread from a plain key', () => {
@@ -125,5 +132,112 @@ describe('buildDeepLinkPath', () => {
     expect(buildDeepLinkPath({ screen: 'Thread', threadKey: 'branch:wren/feat/auth' })).toBe(
       'thread?key=branch%3Awren%2Ffeat%2Fauth'
     );
+  });
+});
+
+/**
+ * A prototype key is not a tab.
+ *
+ * An object lookup answers for inherited keys, so `TABS['constructor']`
+ * returned `Object.prototype.constructor` — a function — and `TABS['__proto__']`
+ * returned an object. Both are truthy, so both produced a Tabs target whose
+ * `tab` was not a screen name at all, and that value went on to the navigator.
+ * Only these two appear because `head` is lowercased first, which is exactly
+ * the kind of accident that makes the class easy to miss.
+ */
+describe('prototype keys are not routes', () => {
+  it.each(['/constructor', '/__proto__', '/prototype', '/valueOf', '/toString'])(
+    'returns null for %o',
+    (path) => {
+      expect(parseDeepLink(path)).toBeNull();
+    }
+  );
+
+  it('still routes the real tabs', () => {
+    expect(parseDeepLink('/fleet')).toEqual({ screen: 'Tabs', tab: 'Fleet' });
+  });
+});
+
+/**
+ * The state→action seam, against React Navigation's real converter.
+ *
+ * A link opened while the app is RUNNING must add to what is there, not
+ * replace it. React Navigation decides that in getActionFromState: a
+ * multi-route state with no `initialRouteName` to anchor it converts to
+ * **RESET**, which destroys and rebuilds the navigator. Measured in the
+ * simulator before the fix — following a link while on the Fleet tab returned
+ * new stack and Tabs keys with the tab index back at 0 — so a half-composed
+ * Thread would lose its draft to a notification.
+ *
+ * Asserting the action type is the whole point: the state shape is identical
+ * either way, so nothing about the state alone can tell you which happens.
+ */
+describe('warm links navigate rather than reset', () => {
+  /**
+   * Driven through the SHIPPED linking options end to end: a real path goes to
+   * production's getStateFromPath, and the state it returns goes to React
+   * Navigation's real converter with production's own config. Nothing here is
+   * a local copy of either, so breaking production breaks these — which is the
+   * only version of this test worth having.
+   */
+  async function actionForPath(path: string) {
+    const { createLinking } = await import('../linking');
+    const linking = createLinking(true);
+    const state = linking.getStateFromPath!(path, linking.config as never);
+    expect(state, `no state for ${path}`).toBeTruthy();
+    return getActionFromState(state as never, linking.config as never);
+  }
+
+  it.each([
+    '/thread/pr:101',
+    '/thread/branch:wren/feat/auth',
+    '/session/abc',
+    '/new-thread',
+    '/settings',
+    '/fleet',
+  ])('%o converts to NAVIGATE, never RESET', async (path) => {
+    expect((await actionForPath(path))?.type).toBe('NAVIGATE');
+  });
+
+  it('navigates to the target itself, leaving the stack below untouched', async () => {
+    expect(await actionForPath('/thread/pr:101')).toMatchObject({
+      type: 'NAVIGATE',
+      payload: { name: 'Thread', params: { threadKey: 'pr:101' } },
+    });
+  });
+
+  it('carries the chosen tab through', async () => {
+    expect(await actionForPath('/fleet')).toMatchObject({
+      type: 'NAVIGATE',
+      payload: { params: { screen: 'Fleet' } },
+    });
+  });
+
+  /**
+   * The control. The same production state, converted WITHOUT the anchor, is
+   * RESET — so the assertions above are load-bearing rather than describing
+   * something React Navigation would have done anyway. It also documents
+   * precisely what `initialRouteName` buys, since the state is identical in
+   * both cases and only the action differs.
+   */
+  it('is RESET without initialRouteName, which is the bug being prevented', async () => {
+    const { createLinking } = await import('../linking');
+    const linking = createLinking(true);
+    const state = linking.getStateFromPath!('/thread/pr:101', linking.config as never);
+    expect(getActionFromState(state as never)?.type).toBe('RESET');
+  });
+
+  it('stays inert when signed out, so a link cannot reach a navigator that is not mounted', async () => {
+    const { createLinking } = await import('../linking');
+    const linking = createLinking(false);
+    expect(linking.getStateFromPath!('/thread/pr:101', linking.config as never)).toBeUndefined();
+  });
+});
+
+/** The shipped config must be the one the tests above proved. */
+describe('the linking config actually used', () => {
+  it('anchors on Tabs', async () => {
+    const { createLinking } = await import('../linking');
+    expect(createLinking(true).config).toMatchObject({ initialRouteName: 'Tabs' });
   });
 });

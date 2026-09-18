@@ -33,11 +33,19 @@ export type DeepLinkTarget =
   | { screen: 'NewThread' }
   | { screen: 'Settings' };
 
-const TABS: Record<string, 'Threads' | 'Chat' | 'Fleet'> = {
-  threads: 'Threads',
-  chat: 'Chat',
-  fleet: 'Fleet',
-};
+/**
+ * A Map, not an object literal. An object lookup answers for inherited keys as
+ * well as own ones, so `/constructor` returned `Object.prototype.constructor`
+ * — a *function* — as the tab name, and `/__proto__` returned an object. Both
+ * are truthy, so both produced a Tabs target carrying a non-string tab, which
+ * then went to the navigator. A Map has no prototype chain to fall through,
+ * which fixes it by construction rather than by a guard someone can forget.
+ */
+const TABS = new Map<string, 'Threads' | 'Chat' | 'Fleet'>([
+  ['threads', 'Threads'],
+  ['chat', 'Chat'],
+  ['fleet', 'Fleet'],
+]);
 
 /** Decode, tolerating a malformed escape rather than throwing on a bad link. */
 function decode(value: string): string {
@@ -86,7 +94,7 @@ export function parseDeepLink(path: string): DeepLinkTarget | null {
   if (head === 'new-thread') return { screen: 'NewThread' };
   if (head === 'settings') return { screen: 'Settings' };
 
-  const tab = TABS[head];
+  const tab = TABS.get(head);
   if (tab) return { screen: 'Tabs', tab };
 
   return null;
