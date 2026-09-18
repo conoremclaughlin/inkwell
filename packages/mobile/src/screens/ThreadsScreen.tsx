@@ -131,12 +131,16 @@ export function ThreadsScreen() {
         }
         contentInsetAdjustmentBehavior="automatic"
         // Rows are variable height (title and summary are optional and wrap),
-        // so getItemLayout would be a guess. These bound how much work one
-        // update can do instead.
+        // so getItemLayout would be a guess. These bound how many rows are
+        // mounted, which is what an update has to walk.
+        //
+        // Deliberately NOT removeClippedSubviews: it is off by default on iOS
+        // and can blank cells, and it addresses scroll cost — the measured
+        // problem here was update cost on the 20s poll, which memoising the
+        // row fixes. No reason to take a rendering risk for an unrelated win.
         initialNumToRender={12}
         maxToRenderPerBatch={8}
         windowSize={11}
-        removeClippedSubviews
       />
     </View>
   );
