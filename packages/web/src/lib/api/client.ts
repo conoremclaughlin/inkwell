@@ -19,7 +19,16 @@ const apiClient = axios.create({
 
 let invalidTokenRecoveryInFlight = false;
 
-function isInvalidTokenAuthFailure(error: AxiosError<{ error?: string }>): boolean {
+/**
+ * Whether a failure means this browser's session is over.
+ *
+ * Deliberately narrow, and exported so it can be tested: it is the trigger for
+ * a full logout and redirect, and the server relies on being able to refuse a
+ * request WITHOUT setting it off. `Invalid token` is the terminal answer; a
+ * superseded cookie or an unreachable database get their own, and a request
+ * that fails for either of those reasons must leave the session alone.
+ */
+export function isInvalidTokenAuthFailure(error: AxiosError<{ error?: string }>): boolean {
   const status = error.response?.status;
   const serverMessage = error.response?.data?.error?.trim().toLowerCase();
   const requestUrl = error.config?.url || '';
@@ -32,17 +41,68 @@ function isInvalidTokenAuthFailure(error: AxiosError<{ error?: string }>): boole
   );
 }
 
+/** Where the browser asks whether the credential it holds now is alive. */
+export const SESSION_PROBE_PATH = '/api/admin/auth/session';
+
+/**
+ * Whether the session this browser holds RIGHT NOW is still good.
+ *
+ * `Invalid token` is a verdict on the credential one request carried, and that
+ * is not the same thing as a verdict on the browser. Two requests refresh at
+ * once and the loser presents a secret the winner has already replaced; a
+ * person signs in again while an older request is in flight. In both, the
+ * refusal is true about the credential it names and false about the session,
+ * and acting on it logs the browser out of a session a sibling request just
+ * renewed.
+ *
+ * The server cannot fence this for us. An unrecognised refresh secret is named
+ * by no column on the grant, so it cannot be distinguished from one that never
+ * existed — which is why the check lives here, where the current credential is.
+ *
+ * Deliberately a bare `fetch`: routing it through `apiClient` would put its own
+ * 401 back through the interceptor that called us.
+ *
+ * An unreachable or unreadable probe answers `true` — alive. The entire point
+ * of the surrounding work is that only a definite refusal licenses destroying a
+ * session, and "the network did not answer" is not one. A genuinely dead
+ * session simply asks again on the next request.
+ */
+async function sessionIsStillAlive(): Promise<boolean> {
+  try {
+    const response = await fetch(SESSION_PROBE_PATH, {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'Cache-Control': 'no-store' },
+    });
+    if (response.ok) return true;
+    // Only the same terminal verdict, reached with the CURRENT credential,
+    // means the session is over. A 503 or a 401 'Stale credential' does not.
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    return !(response.status === 401 && body?.error?.trim().toLowerCase() === 'invalid token');
+  } catch {
+    return true;
+  }
+}
+
 async function handleInvalidTokenLogout(): Promise<void> {
   if (invalidTokenRecoveryInFlight || typeof window === 'undefined') return;
   invalidTokenRecoveryInFlight = true;
 
   try {
+    if (await sessionIsStillAlive()) {
+      // The failed request was carrying a credential this browser has already
+      // moved past. Release the latch so a later failure is checked afresh
+      // rather than being swallowed by this one.
+      invalidTokenRecoveryInFlight = false;
+      return;
+    }
+
     await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
   } catch {
     // Best-effort cleanup only.
-  } finally {
-    window.location.assign('/login?reason=session-expired');
   }
+
+  window.location.assign('/login?reason=session-expired');
 }
 
 // Request interceptor - inject workspace scope header when selected.

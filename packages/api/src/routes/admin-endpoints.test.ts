@@ -1606,3 +1606,51 @@ describe('admin endpoint handlers (no-500 regression)', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// The session probe
+//
+// The dashboard's fence against ending a session on a refusal that was about a
+// credential it has already replaced. The server cannot make that distinction
+// itself — a secret two rotations back is named by no column on the grant row —
+// so the browser asks this endpoint whether what it holds NOW authenticates.
+// ---------------------------------------------------------------------------
+
+/** Where `router.use(adminAuthMiddleware)` sits in the stack. */
+function authMiddlewareIndex(): number {
+  return (router as any).stack.findIndex(
+    (entry: any) => !entry.route && entry.name === 'adminAuthMiddleware'
+  );
+}
+
+describe('GET /auth/session', () => {
+  beforeEach(() => {
+    setupDefaultSupabaseMock();
+  });
+
+  it('is registered AFTER the auth middleware', () => {
+    // The whole value of the probe is that it runs the real credential chain.
+    // Mounted above the middleware it would answer 200 to anyone, the browser
+    // would conclude every dead session was alive, and nothing would ever log
+    // out again — with every other test here still green.
+    const middleware = authMiddlewareIndex();
+    const probe = findRouteIndex('get', '/auth/session');
+
+    expect(middleware).toBeGreaterThanOrEqual(0);
+    expect(probe).toBeGreaterThanOrEqual(0);
+    expect(probe).toBeGreaterThan(middleware);
+  });
+
+  it('answers with the user the middleware resolved', async () => {
+    const handler = findRouteHandler('get', '/auth/session');
+    expect(handler).not.toBeNull();
+
+    const req = createAuthenticatedReq();
+    const res = createMockRes();
+    await handler!(req, res);
+
+    expect(res._status).toBe(200);
+    expect((res._json as any).userId).toBe(TEST_USER_ID);
+    expect((res._json as any).email).toBe('test@example.com');
+  });
+});

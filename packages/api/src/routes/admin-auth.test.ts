@@ -18,12 +18,14 @@ import type { Request, Response, NextFunction } from 'express';
 
 const mockVerifyPcpAccessToken = vi.fn();
 const mockExchangeRefreshToken = vi.fn();
+const mockExchangeRefreshTokenDetailed = vi.fn();
 const mockSignPcpAccessToken = vi.fn();
 const mockCreateRefreshToken = vi.fn();
 
 vi.mock('../auth/pcp-tokens', () => ({
   verifyPcpAccessToken: (...args: unknown[]) => mockVerifyPcpAccessToken(...args),
   exchangeRefreshToken: (...args: unknown[]) => mockExchangeRefreshToken(...args),
+  exchangeRefreshTokenDetailed: (...args: unknown[]) => mockExchangeRefreshTokenDetailed(...args),
   signPcpAccessToken: (...args: unknown[]) => mockSignPcpAccessToken(...args),
   createRefreshToken: (...args: unknown[]) => mockCreateRefreshToken(...args),
 }));
@@ -35,10 +37,13 @@ vi.mock('../auth/pcp-tokens', () => ({
 const mockGetUser = vi.fn();
 const mockSupabaseFrom = vi.fn();
 
+const mockSupabaseRpc = vi.fn();
+
 vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({
     auth: { getUser: mockGetUser },
     from: mockSupabaseFrom,
+    rpc: mockSupabaseRpc,
   })),
 }));
 
@@ -107,6 +112,7 @@ vi.mock('../utils/request-context', () => ({
 // ---------------------------------------------------------------------------
 
 import router from './admin';
+import { logger } from '../utils/logger';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -208,6 +214,16 @@ describe('adminAuthMiddleware', () => {
     capturedRunContext = null;
     middleware = getMiddleware();
     mockDefaultWorkspace();
+
+    // The middleware now asks for the classified outcome. By default that is
+    // derived from whatever a test scripted for the plain exchange, with `null`
+    // mapping to the terminal reading it always used to get — so every test
+    // written before the classification existed still means what it meant.
+    // Tests about the classification itself override this directly.
+    mockExchangeRefreshTokenDetailed.mockImplementation(async (...args: unknown[]) => {
+      const result = await mockExchangeRefreshToken(...args);
+      return result ? { status: 'rotated', result } : { status: 'rejected' };
+    });
   });
 
   // =========================================================================
@@ -420,6 +436,8 @@ describe('adminAuthMiddleware', () => {
     it('should authenticate via refresh cookie and issue new access token cookie', async () => {
       mockExchangeRefreshToken.mockResolvedValue({
         accessToken: 'new-access-jwt',
+        refreshToken: 'pcp-rt-rotated',
+        refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
         userId: 'user-456',
         email: 'refreshed@example.com',
       });
@@ -455,8 +473,9 @@ describe('adminAuthMiddleware', () => {
       // Should NOT call Supabase auth
       expect(mockGetUser).not.toHaveBeenCalled();
 
-      // Should NOT issue a new refresh cookie (stays the same)
-      expect(res._cookies['pcp-admin-refresh']).toBeUndefined();
+      // SHOULD issue a new refresh cookie: the grant rotated, so the value the
+      // browser presented is already dead.
+      expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-rotated');
     });
 
     it('should set correct user context from refresh exchange', async () => {
@@ -507,6 +526,118 @@ describe('adminAuthMiddleware', () => {
 
       expect(mockExchangeRefreshToken).not.toHaveBeenCalled();
       expect(mockGetUser).toHaveBeenCalled(); // Fell through to Tier 3
+    });
+
+    // -----------------------------------------------------------------------
+    // A failed refresh must not send OUR bearer to Supabase.
+    //
+    // Tier 3 verifies a Supabase access token — what a browser carries on its
+    // first request after signing in. A PCP-issued JWT is not one, so handing
+    // it over can only come back "Invalid token", which is the exact string the
+    // dashboard interceptor turns into a logout. A session whose refresh had
+    // just lost a race was therefore logged out by a verifier that never
+    // applied to its credential.
+    // -----------------------------------------------------------------------
+
+    /** A PCP-shaped bearer: real base64url, our `type` claim, expired. */
+    const pcpBearer = (type = 'pcp_admin') => {
+      const part = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+      return [
+        part({ alg: 'HS256', typ: 'JWT' }),
+        part({ type, sub: 'user-1', email: 'a@example.invalid', exp: 1 }),
+        'sig',
+      ].join('.');
+    };
+
+    it('should refuse without consulting Supabase when the refresh fails for a PCP bearer', async () => {
+      mockExchangeRefreshToken.mockResolvedValue(null);
+      mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
+
+      const req = createMockReq({
+        headers: { authorization: `Bearer ${pcpBearer()}` },
+        cookies: { 'pcp-admin-refresh': 'pcp-rt-dead' },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockExchangeRefreshToken).toHaveBeenCalled();
+      expect(mockGetUser).not.toHaveBeenCalled();
+      expect(res._status).toBe(401);
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('should still reach Supabase for a bearer that is NOT one of ours', async () => {
+      // The control. The guard keys on the bearer's shape, so a genuine
+      // Supabase token whose stale refresh cookie failed must still be able to
+      // sign in — otherwise first-login would break for anyone holding both.
+      mockExchangeRefreshToken.mockResolvedValue(null);
+      mockGetUser.mockResolvedValue({
+        data: { user: { email: 'tier3@example.com' } },
+        error: null,
+      });
+      mockSupabaseUserLookup({ id: 'user-tier3', telegram_id: null, whatsapp_id: null });
+      mockDefaultWorkspace();
+      mockSignPcpAccessToken.mockReturnValue('signed-admin-jwt');
+      mockCreateRefreshToken.mockResolvedValue({ refreshToken: 'pcp-rt-new' });
+
+      const req = createMockReq({
+        headers: { authorization: 'Bearer supabase-opaque-token' },
+        cookies: { 'pcp-admin-refresh': 'pcp-rt-dead' },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockGetUser).toHaveBeenCalled();
+      expect(next).toHaveBeenCalled();
+    });
+
+    it('should still reach Supabase for a PCP bearer when no refresh was attempted', async () => {
+      // The second control: the guard fires on a FAILED exchange, not on the
+      // bearer's shape alone. With no cookie there was no exchange to fail.
+      mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
+
+      const req = createMockReq({
+        headers: { authorization: `Bearer ${pcpBearer('mcp_access')}` },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockExchangeRefreshToken).not.toHaveBeenCalled();
+      expect(mockGetUser).toHaveBeenCalled();
+    });
+
+    it('should not refuse when the refresh exchange succeeds, however stale the bearer', async () => {
+      // The race this exists for: the retry overlap makes the loser's exchange
+      // succeed, and the request must then proceed normally rather than being
+      // caught by the guard on its way past.
+      mockExchangeRefreshToken.mockResolvedValue({
+        accessToken: 'new-access',
+        refreshToken: 'pcp-rt-successor',
+        refreshTokenExpiresAt: new Date(Date.now() + 86_400_000),
+        userId: 'user-raced',
+        email: 'raced@test.com',
+      });
+      mockDefaultWorkspace();
+
+      const req = createMockReq({
+        headers: { authorization: `Bearer ${pcpBearer()}` },
+        cookies: { 'pcp-admin-refresh': 'pcp-rt-previous' },
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(mockGetUser).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalled();
+      expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-successor');
+      expect((req as any).pcpUserId).toBe('user-raced');
     });
   });
 
@@ -575,6 +706,7 @@ describe('adminAuthMiddleware', () => {
         'user-tier3',
         'dashboard',
         ['admin'],
+        // The grant is issued for its full fixed lifetime; rotation never moves it.
         90
       );
     });
@@ -855,7 +987,7 @@ describe('adminAuthMiddleware', () => {
       expect(res._cookies['pcp-admin-token'].options.maxAge).toBe(3600 * 1000); // 1 hour in ms
     });
 
-    it('should set refresh token maxAge to 90 days', async () => {
+    it('should set the refresh cookie to the full fixed grant lifetime on first issue', async () => {
       mockVerifyPcpAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
@@ -876,6 +1008,10 @@ describe('adminAuthMiddleware', () => {
 
       await middleware(req, res, next);
 
+      // This is the FIRST issue of a grant, so the cookie carries its whole
+      // lifetime. The rotation path is different and must not compute a window
+      // this way — it echoes the grant's own deadline back (see the rotation
+      // cookie test below), or the cookie would outlive the grant.
       expect(res._cookies['pcp-admin-refresh'].options.maxAge).toBe(90 * 24 * 60 * 60 * 1000);
     });
   });
@@ -943,10 +1079,12 @@ describe('adminAuthMiddleware', () => {
       expect(mockCreateRefreshToken).not.toHaveBeenCalled();
     });
 
-    it('should not issue refresh cookie when Tier 2 succeeds (only access cookie)', async () => {
+    it('should rewrite the refresh cookie when Tier 2 succeeds, because the grant rotated', async () => {
       mockVerifyPcpAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue({
         accessToken: 'refreshed-jwt',
+        refreshToken: 'pcp-rt-rotated',
+        refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
         userId: 'user-t2',
         email: 't2@example.com',
       });
@@ -959,9 +1097,35 @@ describe('adminAuthMiddleware', () => {
 
       await middleware(req, res, next);
 
-      // Only access token cookie, not refresh
+      // Both cookies. Leaving the old refresh cookie in place would hand the
+      // browser a token the next exchange refuses — a silent hourly logout.
       expect(res._cookies['pcp-admin-token']).toBeDefined();
-      expect(res._cookies['pcp-admin-refresh']).toBeUndefined();
+      expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-rotated');
+    });
+
+    it('should expire the rotated refresh cookie at the GRANT deadline, not a fresh window', async () => {
+      // The deadline the grant actually holds — deliberately not 90 days out,
+      // and deliberately not a round number, so a cookie computed as
+      // `now + ADMIN_REFRESH_TOKEN_LIFETIME_DAYS` cannot coincide with it.
+      const grantDeadline = new Date(Date.now() + 11 * 24 * 60 * 60 * 1000 + 12345);
+      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockExchangeRefreshToken.mockResolvedValue({
+        accessToken: 'refreshed-jwt',
+        refreshToken: 'pcp-rt-rotated',
+        refreshTokenExpiresAt: grantDeadline,
+        userId: 'user-t2',
+        email: 't2@example.com',
+      });
+
+      const req = createMockReq({ cookies: { 'pcp-admin-refresh': 'existing-refresh' } });
+      const res = createMockRes();
+      await middleware(req, res, vi.fn());
+
+      const opts = res._cookies['pcp-admin-refresh'].options;
+      // Echoed, not recomputed. Rotating hourly against a recomputed window
+      // would renew the cookie forever while the server-side grant expired.
+      expect(opts.expires).toBe(grantDeadline);
+      expect(opts.maxAge).toBeUndefined();
     });
   });
 });
@@ -969,6 +1133,151 @@ describe('adminAuthMiddleware', () => {
 // =============================================================================
 // Logout endpoint
 // =============================================================================
+
+// ===========================================================================
+// What a failed refresh exchange is allowed to do to the browser's session
+//
+// The dashboard's client interceptor logs out and redirects on one thing: a 401
+// whose body says "Invalid token". Tier 2 used to answer every failure that
+// way, so an unreachable database ended every open session, and so did a
+// request that arrived one rotation behind — through no fault of the browser,
+// which by then already held the live cookie.
+// ===========================================================================
+
+describe('adminAuthMiddleware — Tier 2 refusals that must not end the session', () => {
+  let middleware: ReturnType<typeof getMiddleware>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    middleware = getMiddleware();
+    mockDefaultWorkspace();
+    mockVerifyPcpAccessToken.mockReturnValue(null);
+  });
+
+  /** A bearer shaped like one WE issued — a real JWT with a PCP `type`. */
+  const pcpBearer = () => {
+    const part = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    return `${part({ alg: 'HS256' })}.${part({ type: 'pcp_admin', sub: 'user-1' })}.sig`;
+  };
+
+  const requestWithStaleCookie = (authorization = `Bearer ${pcpBearer()}`) =>
+    createMockReq({
+      headers: { authorization },
+      cookies: { 'pcp-admin-refresh': 'pcp-rt-one-generation-behind' },
+    });
+
+  it('does not tell the client to log out when the cookie is merely superseded', async () => {
+    // Two tabs refreshed at once. The loser's request carries the value the
+    // winner just replaced, and the browser already holds the winner's cookie.
+    // Ending the session here means a late request revokes what its own sibling
+    // just renewed.
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({ status: 'superseded' });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie(), res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res._status).toBe(401);
+    expect(res._json).toEqual({ error: 'Stale credential' });
+    // The string is the contract. `Invalid token` is what the interceptor acts
+    // on, and this refusal must not be it.
+    expect(JSON.stringify(res._json).toLowerCase()).not.toContain('invalid token');
+    // And it must not fall through to a verifier that was never applicable.
+    expect(mockGetUser).not.toHaveBeenCalled();
+  });
+
+  it('answers 503 when nothing could be established about the grant', async () => {
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({ status: 'unavailable' });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie(), res, next);
+
+    expect(res._status).toBe(503);
+    expect(JSON.stringify(res._json).toLowerCase()).not.toContain('invalid token');
+    expect(mockGetUser).not.toHaveBeenCalled();
+  });
+
+  it('still ends the session when the grant is genuinely rejected', async () => {
+    // The control. If no refusal ended a session, a revoked grant would keep a
+    // browser in a logged-in shell that 401s on every request forever.
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({ status: 'rejected' });
+    mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'bad' } });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie(), res, next);
+
+    expect(res._status).toBe(401);
+    expect(res._json).toEqual({ error: 'Invalid token' });
+  });
+
+  it('does not refuse a caller whose own bearer was never checked', async () => {
+    // A browser can arrive with a genuine SUPABASE token AND a stale refresh
+    // cookie — signed in again while an old cookie was still on the jar. Tier 3
+    // can authenticate that request. Answering it from the cookie's problem
+    // refuses a credential nobody had yet looked at.
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({ status: 'superseded' });
+    mockGetUser.mockResolvedValue({
+      data: { user: { id: 'sb-1', email: 'tester@example.invalid' } },
+      error: null,
+    });
+    mockSupabaseFrom.mockReturnValue({
+      select: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+      single: vi.fn().mockResolvedValue({ data: { id: 'user-1' }, error: null }),
+      update: vi.fn().mockReturnThis(),
+    });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie('Bearer not-a-pcp-jwt'), res, next);
+
+    expect(mockGetUser).toHaveBeenCalled();
+    expect(res._status).not.toBe(401);
+  });
+
+  it('does not refuse an unchecked bearer when the grant could not be checked either', async () => {
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({ status: 'unavailable' });
+    mockGetUser.mockResolvedValue({
+      data: { user: { id: 'sb-1', email: 'tester@example.invalid' } },
+      error: null,
+    });
+    mockSupabaseFrom.mockReturnValue({
+      select: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+      single: vi.fn().mockResolvedValue({ data: { id: 'user-1' }, error: null }),
+      update: vi.fn().mockReturnThis(),
+    });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie('Bearer not-a-pcp-jwt'), res, next);
+
+    expect(mockGetUser).toHaveBeenCalled();
+    expect(res._status).not.toBe(503);
+  });
+
+  it('lets a rotation through untouched', async () => {
+    mockExchangeRefreshTokenDetailed.mockResolvedValue({
+      status: 'rotated',
+      result: {
+        userId: 'user-1',
+        email: 'tester@example.invalid',
+        accessToken: 'new-access',
+        refreshToken: 'pcp-rt-next',
+        refreshTokenExpiresAt: new Date(Date.now() + 86_400_000),
+      },
+    });
+
+    const res = createMockRes();
+    const next = vi.fn();
+    await middleware(requestWithStaleCookie(), res, next);
+
+    expect(next).toHaveBeenCalled();
+  });
+});
 
 describe('POST /auth/logout', () => {
   /** Extract the logout route handler from the router stack */
@@ -1003,12 +1312,8 @@ describe('POST /auth/logout', () => {
     expect(res._clearedCookies['pcp-admin-refresh'].options.path).toBe('/api/admin');
   });
 
-  it('should revoke refresh token from DB when provided in body', async () => {
-    const deleteChain: Record<string, any> = {};
-    deleteChain.delete = vi.fn(() => deleteChain);
-    deleteChain.eq = vi.fn(() => deleteChain);
-    deleteChain.in = vi.fn(() => deleteChain);
-    mockSupabaseFrom.mockReturnValue(deleteChain);
+  it('should revoke the grant by the secret it was given', async () => {
+    mockSupabaseRpc.mockResolvedValue({ data: 1, error: null });
 
     const req = createMockReq({
       body: { refreshToken: 'pcp-rt-to-revoke' },
@@ -1018,21 +1323,17 @@ describe('POST /auth/logout', () => {
 
     await logoutHandler(req, res);
 
-    expect(mockSupabaseFrom).toHaveBeenCalledWith('mcp_tokens');
-    expect(deleteChain.delete).toHaveBeenCalled();
-    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-rt-to-revoke');
     // Revocation spans BOTH client ids: a refresh token presented at logout
     // dies whether it was minted for the dashboard or the mobile app.
-    expect(deleteChain.in).toHaveBeenCalledWith('client_id', ['dashboard', 'mobile']);
+    expect(mockSupabaseRpc).toHaveBeenCalledWith('revoke_refresh_grant', {
+      p_secret: 'pcp-rt-to-revoke',
+      p_client_ids: ['dashboard', 'mobile'],
+    });
     expect(res._json).toEqual({ success: true });
   });
 
-  it('should revoke refresh token from cookie when not in body', async () => {
-    const deleteChain: Record<string, any> = {};
-    deleteChain.delete = vi.fn(() => deleteChain);
-    deleteChain.eq = vi.fn(() => deleteChain);
-    deleteChain.in = vi.fn(() => deleteChain);
-    mockSupabaseFrom.mockReturnValue(deleteChain);
+  it('should revoke the grant named by the cookie when the body carries none', async () => {
+    mockSupabaseRpc.mockResolvedValue({ data: 1, error: null });
 
     const req = createMockReq({
       body: {},
@@ -1042,8 +1343,137 @@ describe('POST /auth/logout', () => {
 
     await logoutHandler(req, res);
 
-    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-rt-from-cookie');
+    expect(mockSupabaseRpc).toHaveBeenCalledWith('revoke_refresh_grant', {
+      p_secret: 'pcp-rt-from-cookie',
+      p_client_ids: ['dashboard', 'mobile'],
+    });
     expect(res._json).toEqual({ success: true });
+  });
+
+  it('should send the token as a value, never as filter syntax', async () => {
+    // The token arrives from a request body. PostgREST's `or` filter is a
+    // parsed expression, so interpolating caller text into one is an injection
+    // surface; a function argument is a parameter. A hostile value must reach
+    // the database intact and unparsed.
+    const hostile = 'x,client_id.neq.nothing';
+    const chain: Record<string, any> = {};
+    chain.delete = vi.fn(() => chain);
+    chain.eq = vi.fn(() => chain);
+    chain.in = vi.fn(() => chain);
+    chain.or = vi.fn(() => chain);
+    mockSupabaseFrom.mockReturnValue(chain);
+    mockSupabaseRpc.mockResolvedValue({ data: 1, error: null });
+
+    const req = createMockReq({ body: { refreshToken: hostile }, cookies: {} });
+    const res = createMockRes();
+
+    await logoutHandler(req, res);
+
+    expect(chain.or).not.toHaveBeenCalled();
+    expect(mockSupabaseRpc).toHaveBeenCalledWith('revoke_refresh_grant', {
+      p_secret: hostile,
+      p_client_ids: ['dashboard', 'mobile'],
+    });
+  });
+
+  it('should say so when the secret it was given matched no grant', async () => {
+    // A logout that revoked nothing has left a live grant behind. Reporting
+    // success and logging nothing is how that goes unnoticed: the row keeps one
+    // generation, so a secret older than that cannot be matched at all, and
+    // this warning is the only place it surfaces.
+    mockSupabaseRpc.mockResolvedValue({ data: 0, error: null });
+
+    const req = createMockReq({ body: { refreshToken: 'pcp-rt-ancient' }, cookies: {} });
+    const res = createMockRes();
+
+    await logoutHandler(req, res);
+
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('matched no refresh grant'));
+  });
+
+  it('should report a revocation that failed outright', async () => {
+    mockSupabaseRpc.mockResolvedValue({ data: null, error: { message: 'connection failure' } });
+
+    const req = createMockReq({ body: { refreshToken: 'pcp-rt-x' }, cookies: {} });
+    const res = createMockRes();
+
+    await logoutHandler(req, res);
+
+    expect(logger.error).toHaveBeenCalled();
+    // The browser is still logged out locally either way.
+    expect(res._clearedCookies['pcp-admin-refresh']).toBeDefined();
+  });
+
+  it('revokes a grant that rotates while the revocation is being decided', async () => {
+    // The schedule that two statements cannot survive. The row holds
+    // current=B/previous=A and the client presents A:
+    //
+    //   delete where refresh_token = A      -> misses, A is the PREVIOUS value
+    //   ...B rotates to C, previous becomes B...
+    //   delete where previous_refresh_token = A -> misses, A is gone from the row
+    //
+    // Both statements looked at a row that held A. Neither deleted it, and the
+    // handler reported success. One statement has no in-between.
+    let row: Record<string, string> | null = {
+      client_id: 'dashboard',
+      refresh_token: 'pcp-rt-B',
+      previous_refresh_token: 'pcp-rt-A',
+    };
+    let statements = 0;
+
+    /** Applied the moment the first statement of the revocation completes. */
+    const rotateOnce = () => {
+      statements += 1;
+      if (statements === 1 && row) {
+        row = {
+          client_id: row.client_id,
+          refresh_token: 'pcp-rt-C',
+          previous_refresh_token: 'pcp-rt-B',
+        };
+      }
+    };
+
+    // The two-statement shape, faithfully: each `.eq(...)` filter is its own
+    // DELETE, and it deletes only if the row matches AT THAT MOMENT.
+    mockSupabaseFrom.mockImplementation(() => {
+      const filters: Array<[string, string]> = [];
+      const chain: Record<string, any> = {};
+      chain.delete = vi.fn(() => chain);
+      chain.in = vi.fn(() => chain);
+      chain.eq = vi.fn((col: string, val: string) => {
+        filters.push([col, val]);
+        return Promise.resolve(null).then(() => {
+          if (row && filters.every(([c, v]) => row![c] === v)) row = null;
+          rotateOnce();
+          return { data: null, error: null };
+        });
+      });
+      return chain;
+    });
+
+    // The one-statement shape: match either column and delete, indivisibly.
+    mockSupabaseRpc.mockImplementation(async (_fn: string, args: Record<string, unknown>) => {
+      const secret = args.p_secret as string;
+      const clients = args.p_client_ids as string[];
+      let deleted = 0;
+      if (
+        row &&
+        clients.includes(row.client_id) &&
+        (row.refresh_token === secret || row.previous_refresh_token === secret)
+      ) {
+        row = null;
+        deleted = 1;
+      }
+      rotateOnce();
+      return { data: deleted, error: null };
+    });
+
+    const req = createMockReq({ body: { refreshToken: 'pcp-rt-A' }, cookies: {} });
+    const res = createMockRes();
+
+    await logoutHandler(req, res);
+
+    expect(row).toBeNull();
   });
 
   it('should succeed even with no refresh token (just clears cookies)', async () => {

@@ -15,15 +15,27 @@ const mockGetUser = vi.fn();
 // Build a chainable mock for Supabase queries
 function mockChain(terminalData: unknown = null, terminalError: unknown = null) {
   const chain: Record<string, any> = {};
-  chain.select = vi.fn(() => chain);
+  // Tracks whether this chain is an update, so `.select()` can be the terminal
+  // for the rotation write (`update().eq().eq().select()`) while staying a
+  // pass-through for reads.
+  let updating = false;
+  chain.select = vi.fn(() =>
+    updating ? Promise.resolve({ data: mockUpdateRows, error: mockUpdateError }) : chain
+  );
   chain.insert = mockInsert.mockReturnValue(chain);
-  chain.update = mockUpdate.mockReturnValue(chain);
+  chain.update = mockUpdate.mockImplementation(() => {
+    updating = true;
+    return chain;
+  });
   chain.delete = mockDelete.mockReturnValue(chain);
   chain.eq = vi.fn(() => chain);
-  chain.lt = vi.fn(() => chain);
   chain.single = vi.fn(() => Promise.resolve({ data: terminalData, error: terminalError }));
   return chain;
 }
+
+/** Rows the rotation write reports as updated; [] models a lost race. */
+let mockUpdateRows: unknown = [{ id: 'token-id' }];
+let mockUpdateError: unknown = null;
 
 let currentUserChain: ReturnType<typeof mockChain>;
 let currentMcpTokensChain: ReturnType<typeof mockChain>;
@@ -398,6 +410,8 @@ describe('PcpAuthProvider', () => {
 
         expect(result.refresh_token).toMatch(/^pcp-rt-/);
         expect(result.token_type).toBe('Bearer');
+        // 30 days. Shortening this is real work with a real cost and is
+        // tracked separately — see the access-lifetime item on PR #632.
         expect(result.expires_in).toBe(30 * 24 * 60 * 60);
         expect(result.scope).toBe('mcp:tools');
       }
@@ -562,8 +576,15 @@ describe('PcpAuthProvider', () => {
         users: { email: 'test@example.com' },
       });
 
+      // Rotation writes update().eq('id').eq('refresh_token').select('id'),
+      // so the override has to stay chainable and terminate in the row list.
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self(): unknown {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+          };
+        }),
       });
 
       const result = await provider.exchangeRefreshToken({
@@ -580,8 +601,13 @@ describe('PcpAuthProvider', () => {
         expect(decoded.email).toBe('test@example.com');
         expect(decoded.scope).toBe('mcp:tools');
 
-        expect(result.refresh_token).toBe('pcp-rt-abc');
+        // The grant ROTATES: the response must carry a new secret, never the
+        // one presented, or the client is locked out at its next refresh.
+        expect(result.refresh_token).not.toBe('pcp-rt-abc');
+        expect(result.refresh_token).toMatch(/^pcp-rt-[0-9a-f]{64}$/);
         expect(result.token_type).toBe('Bearer');
+        // 30 days. Shortening this is real work with a real cost and is
+        // tracked separately — see the access-lifetime item on PR #632.
         expect(result.expires_in).toBe(30 * 24 * 60 * 60);
       }
     });
@@ -599,8 +625,15 @@ describe('PcpAuthProvider', () => {
         users: { email: 'test@example.com' },
       });
 
+      // Rotation writes update().eq('id').eq('refresh_token').select('id'),
+      // so the override has to stay chainable and terminate in the row list.
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self(): unknown {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+          };
+        }),
       });
 
       await provider.exchangeRefreshToken({
@@ -647,6 +680,65 @@ describe('PcpAuthProvider', () => {
       expect(result).toEqual({
         error: 'invalid_grant',
         error_description: 'Invalid refresh token',
+      });
+    });
+
+    it('should not call an unreachable database an invalid grant', async () => {
+      // `invalid_grant` is the one answer the CLI acts on destructively — it
+      // deletes ~/.ink/auth.json. A statement timeout is not that answer, and
+      // sending it as one logs every machine out over a busy database.
+      currentMcpTokensChain = mockChain(null, {
+        code: '57014',
+        message: 'canceling statement due to statement timeout',
+      });
+
+      const result = await provider.exchangeRefreshToken({
+        refreshToken: 'pcp-rt-abc',
+        clientId: 'test-client',
+      });
+
+      expect(result).toEqual({
+        error: 'temporarily_unavailable',
+        error_description: expect.stringContaining('Retry'),
+        http_status: 503,
+      });
+    });
+
+    it('should not call a superseded secret an invalid grant', async () => {
+      // The grant is alive; this value is spent. The client holding its
+      // successor must not be told to re-authenticate.
+      const futureDate = new Date(Date.now() + 86400000).toISOString();
+      currentMcpTokensChain = mockChain(null, { code: 'PGRST116' });
+      // The retry-overlap lookup finds the row by the column that records what
+      // it replaced, stamped long enough ago that the window has closed.
+      currentMcpTokensChain.single = vi
+        .fn()
+        .mockResolvedValueOnce({ data: null, error: { code: 'PGRST116' } })
+        .mockResolvedValue({
+          data: {
+            id: 'token-1',
+            user_id: 'user-123',
+            client_id: 'test-client',
+            refresh_token: 'pcp-rt-successor',
+            previous_refresh_token: 'pcp-rt-abc',
+            rotated_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+            supabase_refresh_token: null,
+            scopes: ['mcp:tools'],
+            expires_at: futureDate,
+            users: { email: 'test@example.com' },
+          },
+          error: null,
+        });
+
+      const result = await provider.exchangeRefreshToken({
+        refreshToken: 'pcp-rt-abc',
+        clientId: 'test-client',
+      });
+
+      expect(result).toEqual({
+        error: 'superseded_grant',
+        error_description: expect.stringContaining('still valid'),
+        http_status: 409,
       });
     });
 
@@ -797,8 +889,15 @@ describe('PcpAuthProvider', () => {
         users: { email: 'test@example.com' },
       });
 
+      // Rotation writes update().eq('id').eq('refresh_token').select('id'),
+      // so the override has to stay chainable and terminate in the row list.
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self(): unknown {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+          };
+        }),
       });
 
       const refreshResult = await provider.exchangeRefreshToken({
@@ -816,7 +915,10 @@ describe('PcpAuthProvider', () => {
       >;
       expect(refreshedDecoded.type).toBe('mcp_access');
       expect(refreshedDecoded.sub).toBe('user-123');
-      expect(refreshResult.refresh_token).toBe(tokens.refresh_token);
+      // Rotated, so the end-to-end flow hands back a different grant than the
+      // code exchange issued.
+      expect(refreshResult.refresh_token).not.toBe(tokens.refresh_token);
+      expect(refreshResult.refresh_token).toMatch(/^pcp-rt-[0-9a-f]{64}$/);
 
       // Step 5: Verify the access token
       const verified = provider.verifyAccessToken(`Bearer ${refreshResult.access_token}`);

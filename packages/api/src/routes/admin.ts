@@ -14,6 +14,8 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
+import { REFRESH_ABSOLUTE_DAYS } from '../auth/refresh-policy';
+import { isPcpIssuedJwt } from '../auth/pcp-bearer-shape';
 import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
@@ -51,6 +53,7 @@ import {
   verifyPcpAccessToken,
   createRefreshToken,
   exchangeRefreshToken,
+  exchangeRefreshTokenDetailed,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
 import { applyGraphBlockedBy } from '../data/task-graph-read-model';
@@ -115,7 +118,9 @@ type ChannelRouteRow = {
 };
 
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
-const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
+// Fixed from issue, and enforced centrally against created_at as well (see
+// refresh-policy). Rotation changes the secret, never this deadline.
+const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = REFRESH_ABSOLUTE_DAYS;
 const ADMIN_CLIENT_ID = 'dashboard';
 /** Refresh-token client_id for the native app (packages/mobile). */
 const MOBILE_CLIENT_ID = 'mobile';
@@ -1035,20 +1040,65 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     }
 
     // --- Tier 2: Refresh token exchange (1 DB call, ~once/hour) ---
+    let refreshExchangeFailed = false;
     if (!pcpUserId) {
       const refreshCookie = req.cookies?.['pcp-admin-refresh'];
       if (refreshCookie) {
-        const result = await exchangeRefreshToken(
+        refreshExchangeFailed = true;
+        const outcome = await exchangeRefreshTokenDetailed(
           supabase,
           refreshCookie,
           ADMIN_CLIENT_ID,
           'pcp_admin',
           ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
         );
+
+        // Two of the ways this can fail must NOT end the browser's session, and
+        // until now both did — the 401 below carries the one string the
+        // dashboard's interceptor turns into a logout and a redirect.
+        //
+        // `superseded`: the cookie is one generation behind. That happens on its
+        // own, without anything being wrong: two tabs refresh at once, the
+        // loser's request carries the value the winner just replaced, and by the
+        // time it arrives the browser already holds the live secret from the
+        // winner's Set-Cookie. Logging out on it means a late request revokes
+        // the session its own sibling just renewed. It gets a distinct 401 the
+        // client treats as an ordinary failure, and the next request — carrying
+        // the current cookie — succeeds.
+        //
+        // `unavailable`: nothing is known about the grant. 503, because "come
+        // back" is the only honest answer, and because a 401 of any shape
+        // invites the client to conclude something about a credential nobody
+        // checked.
+        //
+        // Both refusals are conditional on the bearer being one of OURS, and
+        // that condition is load-bearing rather than defensive. A request can
+        // arrive with a genuine SUPABASE access token AND a stale refresh
+        // cookie — a browser that just signed in again while an old cookie was
+        // still on the jar. Tier 3 can authenticate that request perfectly
+        // well, and answering it here would refuse a caller holding a
+        // credential nobody had yet looked at. The cookie's problem is not the
+        // bearer's problem.
+        const bearerIsOurs = isPcpIssuedJwt(token);
+
+        if (bearerIsOurs && outcome.status === 'superseded') {
+          logger.warn('Admin refresh cookie is a superseded generation; not ending the session', {
+            path: req.path,
+          });
+          res.status(401).json({ error: 'Stale credential' });
+          return;
+        }
+        if (bearerIsOurs && outcome.status === 'unavailable') {
+          logger.error('Admin refresh exchange could not be completed', { path: req.path });
+          res.status(503).json({ error: 'Authentication temporarily unavailable' });
+          return;
+        }
+
+        const result = 'result' in outcome ? outcome.result : null;
         if (result) {
+          refreshExchangeFailed = false;
           pcpUserId = result.userId;
           userEmail = result.email;
-          // Set new access token cookie (refresh token stays the same)
           res.cookie('pcp-admin-token', result.accessToken, {
             httpOnly: true,
             secure: env.NODE_ENV === 'production',
@@ -1056,12 +1106,48 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
             path: '/api/admin',
             maxAge: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS * 1000,
           });
+          // The grant rotated, so the refresh cookie has to be rewritten with
+          // the new secret. Leaving the old one in place would log the browser
+          // out at its next hourly refresh.
+          //
+          // `expires` is the grant's own unchanged deadline, NOT a fresh window
+          // measured from now — re-deriving it here would hand the browser a
+          // cookie that outlives the grant, and an hourly refresh would renew
+          // that cookie forever while the server-side ceiling stayed put.
+          res.cookie('pcp-admin-refresh', result.refreshToken, {
+            httpOnly: true,
+            secure: env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            path: '/api/admin',
+            expires: result.refreshTokenExpiresAt,
+          });
         }
       }
     }
 
     // --- Tier 3: Supabase verification (network call, first login only) ---
     if (!pcpUserId) {
+      // Tier 3 verifies a SUPABASE access token, which is what a browser
+      // carries on its first request after signing in. A PCP-issued JWT is not
+      // one, and handing it to Supabase can only ever come back "Invalid
+      // token" — the exact string the dashboard's interceptor turns into a
+      // logout. So a session whose refresh exchange had just failed was logged
+      // out by a verifier that was never applicable to its credential.
+      //
+      // The refusal is the same; what changes is that it is reached honestly,
+      // without putting our bearer in front of an unrelated verifier and
+      // without making the outcome depend on Supabase being reachable.
+      if (refreshExchangeFailed && isPcpIssuedJwt(token)) {
+        logger.warn(
+          'Admin refresh exchange failed for a PCP-issued bearer; not consulting Supabase',
+          {
+            path: req.path,
+          }
+        );
+        res.status(401).json({ error: 'Invalid token' });
+        return;
+      }
+
       const {
         data: { user },
         error,
@@ -1290,11 +1376,45 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
       const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
         auth: { autoRefreshToken: false, persistSession: false },
       });
-      await supabase
-        .from('mcp_tokens')
-        .delete()
-        .eq('refresh_token', refreshToken)
-        .in('client_id', [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID]);
+      const clients = [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID];
+
+      // Revoke by EITHER expression of the grant's secret, in ONE statement.
+      //
+      // Grants rotate, and a browser can easily be holding the value a
+      // rotation just replaced — a background tab refreshed, or this request
+      // was already in flight. Matching only `refresh_token` then deletes
+      // nothing: the cookies clear, the user sees a logout, and the grant is
+      // still alive on the server. Worse since the retry overlap, because for
+      // the length of that window the very secret they just "logged out" with
+      // is redeemable by anyone holding it.
+      //
+      // Done as two DELETEs, a rotation landing between them escapes both — the
+      // first misses because the value is already `previous_refresh_token`, and
+      // the second misses because a generation has since advanced past it. Both
+      // statements looked at a row that held the secret; neither deleted it.
+      // `revoke_refresh_grant` is one statement, so the two orderings are
+      // "revoked" and "the rotation committed first and the secret is genuinely
+      // no longer on the row" — no interleaving in between.
+      //
+      // A function rather than a PostgREST `.or(...)` filter: the token arrives
+      // from a request body, and `or` is a parsed expression, so interpolating
+      // caller-supplied text into one is an injection surface. A function
+      // argument is a parameter and cannot be read as syntax.
+      const { data: revokedCount, error: revokeError } = await supabase.rpc(
+        'revoke_refresh_grant',
+        { p_secret: refreshToken, p_client_ids: clients }
+      );
+
+      // Both of these are reported, never swallowed. A logout that revoked
+      // nothing has left a live grant behind, and the one place that can be
+      // noticed is here.
+      if (revokeError) {
+        logger.error('Admin logout could not revoke the refresh grant', { error: revokeError });
+      } else if (!revokedCount) {
+        logger.warn(
+          'Admin logout matched no refresh grant; the presented secret is older than the one generation a row keeps'
+        );
+      }
     }
 
     // Clear cookies regardless (same options used when setting them)
@@ -1666,8 +1786,10 @@ router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/auth/mobile-refresh
- * Body: { refreshToken } → { accessToken, expiresIn, userId, email }
- * The refresh token itself is long-lived (90 days) and stays unchanged.
+ * Body: { refreshToken } → { accessToken, refreshToken, expiresIn, userId, email }
+ *
+ * The grant ROTATES on every exchange, so the response carries a new
+ * refreshToken and the client must persist it. The presented one is dead.
  */
 router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
   try {
@@ -1694,6 +1816,7 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 
     res.json({
       accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
       expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
       userId: result.userId,
       email: result.email,
@@ -1706,6 +1829,32 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 
 // Apply auth middleware to all subsequent routes
 router.use(adminAuthMiddleware);
+
+/**
+ * Whether the credentials on THIS request authenticate. Nothing else.
+ *
+ * It exists because of a question the browser cannot otherwise ask. A refusal
+ * arrives attached to one request, and the credential that request carried may
+ * no longer be the credential the browser holds: a sibling request rotated the
+ * grant while this one was in flight, or the person signed in again. The server
+ * cannot close that gap from its side — a secret two rotations back is named by
+ * no column on the row, so it is indistinguishable from one that never existed,
+ * and answering it `superseded` would mean guessing.
+ *
+ * The browser can ask, though, and this is the question: not "was that
+ * credential good" but "is the one I hold NOW good". A success here means the
+ * refusal was about something the browser has already replaced, and ending the
+ * session on it would revoke a session that a sibling request just renewed.
+ *
+ * It must stay BELOW `router.use(adminAuthMiddleware)`. Mounted above it, it
+ * would answer 200 to anyone, the browser would read every dead session as
+ * alive, and nothing would ever log out again — silently, since the endpoint
+ * would look identical. There is a test pinning the ordering.
+ */
+router.get('/auth/session', (req: Request, res: Response) => {
+  const authReq = req as AdminAuthRequest;
+  res.json({ userId: authReq.pcpUserId, email: authReq.user?.email ?? null });
+});
 
 /**
  * Where a phone could reach this server, in the order it should try them.
