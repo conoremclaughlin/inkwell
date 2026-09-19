@@ -33,8 +33,13 @@ import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
-const PROCESS_TIMEOUT_MS =
+export const PROCESS_TIMEOUT_MS =
   parseInt(process.env.CLAUDE_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
+
+/** Time (ms) with no output from the subprocess before it is treated as stuck.
+ *  Activity-based: reset every time the process writes anything, so this
+ *  distinguishes "Claude is working and streaming" from "Claude is wedged". */
+export const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Parse usage stats from Claude Code stream output.
@@ -298,24 +303,32 @@ export class ClaudeRunner implements IRunner {
         const retryResult = await this.spawnProcess(args, fullMessage, runConfig);
 
         return {
-          success: true,
+          success: !retryResult.timedOut,
           backendSessionId: sessionId,
           responses: retryResult.responses,
           usage: retryResult.usage,
           servedModel: retryResult.servedModel,
           finalTextResponse: retryResult.finalTextResponse,
           toolCalls: retryResult.toolCalls,
+          ...(retryResult.timedOut ? { error: retryResult.timedOut.message } : {}),
         };
       }
 
+      // A killed turn is a stopped turn, whatever it managed to emit first —
+      // so any text it left behind is partial and `success` is false. The
+      // responses, usage and tool calls are still returned: the turn spent
+      // those tokens and made those calls, and the caller records them either
+      // way. What changes is that the outcome is now classified rather than
+      // inferred from the absence of a thrown error.
       return {
-        success: true,
+        success: !result.timedOut,
         backendSessionId: sessionId,
         responses: result.responses,
         usage: result.usage,
         servedModel: result.servedModel,
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
+        ...(result.timedOut ? { error: result.timedOut.message } : {}),
       };
     } catch (error) {
       logger.error('Claude Code process failed', {
@@ -388,6 +401,12 @@ export class ClaudeRunner implements IRunner {
     resumeFailedNoSession?: boolean;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
+    /**
+     * Set when WE killed the process, never when it finished on its own.
+     * `run()` decides `success` from this, so a timeout that resolves without
+     * it is reported as a completed turn. See the timers below.
+     */
+    timedOut?: { kind: 'idle' | 'hard'; message: string };
   }> {
     const claudeBin = await resolveBinaryPath('claude');
 
@@ -516,9 +535,8 @@ export class ClaudeRunner implements IRunner {
       let settled = false;
       let lastActivityAt = Date.now();
 
-      // Activity-based timeout: reset every time we get output from the process.
-      // This distinguishes "Claude is working and streaming output" from "Claude is stuck."
-      const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 min with no output = stuck
+      // Activity-based timeout (IDLE_TIMEOUT_MS, module scope): reset every time
+      // we get output from the process.
       let idleTimer: NodeJS.Timeout;
 
       const resetIdleTimer = () => {
@@ -536,8 +554,20 @@ export class ClaudeRunner implements IRunner {
             resolve({
               responses,
               usage,
+              servedModel,
               toolCalls,
               finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
+              // `timedOut`, not just the marker string. Resolving bare reports a
+              // SIGKILLed turn as a completed one: the session goes idle, a
+              // heartbeat beat records `delivered`, and the marker above is
+              // auto-forwarded to the human as if the agent had written it.
+              // The word "timeout" is load-bearing — classifyError matches on
+              // it, and without it this lands in the non-retryable `unknown`
+              // category. (Same fix Lumen made in antigravity-runner, #507.)
+              timedOut: {
+                kind: 'idle',
+                message: `Claude Code timeout: no output for ${idleSecs}s, process killed`,
+              },
             });
           }
         }, IDLE_TIMEOUT_MS);
@@ -557,8 +587,15 @@ export class ClaudeRunner implements IRunner {
           resolve({
             responses,
             usage,
+            servedModel,
             toolCalls,
             finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
+            timedOut: {
+              kind: 'hard',
+              message: `Claude Code timeout: exceeded the ${Math.round(
+                PROCESS_TIMEOUT_MS / 1000
+              )}s ceiling, process killed`,
+            },
           });
         }
       }, PROCESS_TIMEOUT_MS);
