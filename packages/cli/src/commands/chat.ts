@@ -524,6 +524,22 @@ interface SessionContextMessage {
 const LEDGER_COMPACT_CHARS = 420;
 const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
+/**
+ * Slash commands that must not run against a ledger with turns still in
+ * flight — anything that reads a position in it, reports its size, or
+ * removes from it. `/bookmark` belongs here as much as `/evict` does: it
+ * records an index, and an index recorded early is a wrong index acted on
+ * later.
+ */
+const LEDGER_SETTLED_COMMANDS: ReadonlySet<string> = new Set([
+  'bookmark',
+  'bookmarks',
+  'eject',
+  'evict',
+  'trim',
+  'context',
+  'usage',
+]);
 const CTRL_C_EXIT_WINDOW_MS = 3000;
 // Working context budget + per-model window resolution live in ../repl/
 // context-limits.js (imported above as defaultContextBudget /
@@ -2578,6 +2594,48 @@ function sanitizeArgsForApproval(tool: string, args: Record<string, unknown>): s
     default:
       return '';
   }
+}
+
+/**
+ * Ask the user a yes/no question from inside a slash command.
+ *
+ * There are three input surfaces and only one of them is `rl`. Every other
+ * in-command question already dispatches over all three, via
+ * `promptForToolApproval`; the eviction confirm reached for `rl` directly
+ * behind a `!`, and `rl` is null on the Ink path — so a large `/evict` in the
+ * TUI threw on `null.question` and took `runChat` down with it before cleanup
+ * (Lumen, PR #653). Anything that asks a question belongs here.
+ *
+ * `priority` because a background turn's approval prompt may already hold the
+ * standing reader; the slot hands the line back afterwards.
+ *
+ * No input surface at all — JSONL, non-interactive — answers NO. A removal
+ * that cannot be confirmed is not confirmed; `--force` is how a caller with
+ * nobody to ask says yes.
+ */
+async function promptYesNo(
+  question: string,
+  rl: ReturnType<typeof createInterface> | null,
+  inkRepl?: InkRepl | null
+): Promise<boolean> {
+  let answer: string;
+  if (inkRepl) {
+    inkRepl.addMessage('system', `${question} [y/N]`, { label: '⚠️  confirm' });
+    try {
+      answer = (await inkRepl.waitForInput({ priority: true })).trim();
+    } catch (error) {
+      // Exit requested mid-question: cancel rather than propagate. The REPL
+      // loop's own waitForInput rejects with the same sticky signal on the
+      // next pass and exits cleanly there.
+      if (error instanceof InkExitSignal) return false;
+      throw error;
+    }
+  } else if (rl) {
+    answer = (await rl.question(chalk.yellow(`${question} [y/N]: `))).trim();
+  } else {
+    return false;
+  }
+  return ['y', 'yes'].includes(answer.toLowerCase());
 }
 
 async function promptForToolApproval(
@@ -5696,8 +5754,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         const from = msg.from || 'unknown';
         const heading = msg.subject ? `${from} — ${msg.subject}` : from;
         const rendered = `📥 ${heading}: ${msg.content}`.trim();
-        ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-        appendTranscript(runtime.transcriptPath, {
+        const inboxEid = appendTranscript(runtime.transcriptPath, {
           type: 'inbox',
           messageId: msg.id,
           rendered,
@@ -5706,6 +5763,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           messageType: msg.messageType || null,
           relatedSessionId: msg.relatedSessionId || null,
         });
+        ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail', inboxEid);
       }
       if (inkRepl) {
         // Show one-line summaries for each collapsed message
@@ -5749,8 +5807,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
       }
       const rendered = `📥 ${heading}${delegationLabel}: ${msg.content}`.trim();
-      ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-      appendTranscript(runtime.transcriptPath, {
+      const inboxEid = appendTranscript(runtime.transcriptPath, {
         type: 'inbox',
         messageId: msg.id,
         rendered,
@@ -5759,6 +5816,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         messageType: msg.messageType || null,
         relatedSessionId: msg.relatedSessionId || null,
       });
+      ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail', inboxEid);
       if (inkRepl) {
         // Emoji in label, clean content without emoji prefix
         const inboxContent = `${heading}${delegationLabel}: ${msg.content}`.trim();
@@ -6974,16 +7032,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // typed while another turn is in flight must appear immediately, not when
     // the queue reaches it. Ledger/transcript appends stay here, sequenced
     // with the turn.
+    // Transcript first, so the ledger entry carries the eid of the event it
+    // will hydrate from. An entry without one is addressable only by content
+    // hash, and content is not unique — two identical messages could not be
+    // told apart across reattach (Lumen, PR #653).
     if (source === 'user') {
-      ledger.addEntry('user', raw, 'repl');
-      appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+      const eid = appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+      ledger.addEntry('user', raw, 'repl', eid);
     } else if (source === 'system') {
       // Synthetic turn input: heartbeat triggers, server-delivered messages,
       // continuation prompts. Recorded as system (not "you") so transcripts
       // distinguish harness prompts from the human's words.
       const label = displayLabel || 'system';
-      ledger.addEntry('system', raw, label);
-      appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
+      const eid = appendTranscript(runtime.transcriptPath, {
+        type: 'system_turn',
+        content: raw,
+        label,
+      });
+      ledger.addEntry('system', raw, label, eid);
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${raw}`, 500), 'auto-run');
       appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
@@ -7762,8 +7828,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         usage: runResult.usage || null,
       });
     } else {
-      ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-      appendTranscript(runtime.transcriptPath, {
+      const assistantEid = appendTranscript(runtime.transcriptPath, {
         type: 'assistant',
         backend: runtime.backend,
         model: runtime.model || null,
@@ -7776,6 +7841,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         approxTokens: estimateTokens(assistantDisplayText),
         usage: runResult.usage || null,
       });
+      ledger.addEntry('assistant', assistantDisplayText, runtime.backend, assistantEid);
     }
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
@@ -8622,6 +8688,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
       };
 
+      // Commands that READ OR MUTATE the ledger have to see it settled.
+      // Turns are queued (`void enqueueTurn`) while slash commands run
+      // straight off the read loop, so typing a message and then a context
+      // command runs the command against a ledger the message has not
+      // reached yet. `/usage` had its own guard for this; the removal
+      // commands did not, and the effect was worse than a stale reading:
+      // `/bookmark` marked the wrong position and `/evict bookmark:` then
+      // removed the wrong entries, reporting a token count for entries the
+      // user never chose.
+      if (LEDGER_SETTLED_COMMANDS.has(slash.name) && pendingTurns > 0) {
+        await turnQueue;
+      }
+
       switch (slash.name) {
         case 'help': {
           showInPanel([
@@ -8653,9 +8732,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             '/profile [name]            Apply security profile',
             '/bookmark [label]          Set context bookmark',
             '/bookmarks                 List bookmarks',
-            '/eject <bookmark|last>     Eject context',
             '/trim [targetPct]          Trim oldest context',
-            '/evict [sel] [--dry-run]   Evict entries (ids, source:<x>, role:<x>)',
+            '/evict [sel] [--dry-run]   Evict entries (ids, source:<x>, role:<x>, bookmark:<x>)',
             '/evicted                   Show evicted-from-context entries',
             '/context                   Show recent entries',
             '/usage                     Token estimate',
@@ -9659,72 +9737,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
           );
           break;
         }
-        case 'eject': {
-          const force = slash.args.includes('--force') || slash.args.includes('force');
-          const ref = slash.args.find((arg) => arg !== '--force' && arg !== 'force') || 'last';
-          const preview = ledger.previewEjectToBookmark(ref);
-          if (!preview) {
-            showInPanel([`Bookmark not found: ${ref}`]);
-            break;
-          }
-          const removedCount = preview.removedEntries.length;
-
-          if (!force && removedCount > 0) {
-            const maybeLargeEject = preview.removedTokens >= 1500 || removedCount >= 8;
-            if (maybeLargeEject) {
-              const previewLines = preview.removedEntries
-                .slice(-3)
-                .map(
-                  (entry) => `- ${entry.role}: ${entry.content.slice(0, 80).replace(/\\s+/g, ' ')}`
-                );
-              showInPanel([
-                `About to eject ${removedCount} entries (~${preview.removedTokens} tok) up to ${preview.bookmark.id}.`,
-                ...(previewLines.length ? ['Recent entries in eject range:', ...previewLines] : []),
-              ]);
-              const confirm = (
-                await rl!.question(chalk.yellow('Proceed with ejection? [y/N]: '))
-              ).trim();
-              if (!['y', 'yes'].includes(confirm.toLowerCase())) {
-                showInPanel(['Ejection cancelled.']);
-                break;
-              }
-            }
-          }
-
-          const result = ledger.ejectToBookmark(ref);
-          if (!result) {
-            showInPanel([`Bookmark not found: ${ref}`]);
-            break;
-          }
-
-          showInPanel([
-            `Ejected ${removedCount} entries (~${result.removedTokens} tok) up to ${result.bookmark.id}`,
-          ]);
-
-          const summary = result.removedEntries
-            .slice(-6)
-            .map((entry) => `${entry.role}: ${entry.content.slice(0, 120).replace(/\s+/g, ' ')}`)
-            .join('\n');
-          if (summary) {
-            await pcp
-              .callTool('remember', {
-                sbSlug,
-                ...(runtime.sessionId ? { sessionId: runtime.sessionId } : {}),
-                content: `Context ejection at ${result.bookmark.id} (${result.bookmark.label}).\n${summary}`,
-                topics: 'repl,context-ejection',
-                salience: 'medium',
-              })
-              .catch(() => undefined);
-          }
-          appendTranscript(runtime.transcriptPath, {
-            type: 'context_eject',
-            bookmarkId: result.bookmark.id,
-            bookmarkLabel: result.bookmark.label,
-            removedCount,
-            removedTokens: result.removedTokens,
-          });
-          break;
-        }
         case 'trim': {
           const targetPctRaw = slash.args[0] || `${DEFAULT_TRIM_TARGET_PCT}`;
           const targetPct = Number.parseInt(targetPctRaw, 10);
@@ -9743,12 +9755,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           break;
         }
+        // One verb for removal. `/eject <ref>` is the deprecated spelling of
+        // `/evict bookmark:<ref>` and runs this exact path — which matters
+        // for more than tidiness: the old command wrote a `context_eject`
+        // transcript event that NOTHING reads, so a bookmark removal was
+        // reported as tokens freed and then came straight back on the next
+        // attach, with the provider session still holding the content
+        // because it never rolled. Routing it through recordEviction — the
+        // single writer every other actor already used — is what fixes that.
+        case 'eject':
         case 'evict': {
-          const selection = parseEvictSelection(slash.args);
+          const isLegacyEject = slash.name === 'eject';
+          if (isLegacyEject) {
+            showInPanel([
+              chalk.yellow('/eject is deprecated — use /evict bookmark:<ref>.'),
+              'Removal is one verb now: /evict, with a selector. Running it as that.',
+            ]);
+          }
+          // The legacy spelling takes a bare ref and defaults to `last`; the
+          // flag it accepted was `--force`/`force`.
+          const args = isLegacyEject
+            ? [
+                `bookmark:${slash.args.find((arg) => arg !== '--force' && arg !== 'force') || 'last'}`,
+                ...(slash.args.includes('--force') || slash.args.includes('force')
+                  ? ['--force']
+                  : []),
+              ]
+            : slash.args;
+          const selection = parseEvictSelection(args);
           if (selection.error) {
             showInPanel([
               selection.error,
-              'Usage: /evict [ids | source:<name> | role:<role>] [--dry-run]',
+              'Usage: /evict [ids | source:<name> | role:<role> | bookmark:<ref>] [--dry-run] [--force]',
             ]);
             break;
           }
@@ -9763,11 +9801,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
               `Evictable entries (${entries.length}, ~${ledger.totalTokens().toLocaleString()} tok):`,
               ...entries.map((e) => formatEvictCandidate(e)),
               '',
-              'Evict with: /evict <ids> | /evict source:<name> | /evict role:<role> [--dry-run]',
+              'Evict with: /evict <ids> | source:<name> | role:<role> | bookmark:<ref> [--dry-run]',
             ]);
             break;
           }
-          const matched = selectEvictionEntries(ledger.listEntries(), selection);
+          const bookmarkPreview = selection.bookmark
+            ? ledger.previewEvictToBookmark(selection.bookmark)
+            : null;
+          const matched = selectEvictionEntries(
+            ledger.listEntries(),
+            selection,
+            () => bookmarkPreview?.removedEntries ?? null
+          );
+          if (matched === null) {
+            showInPanel([`Bookmark not found: ${selection.bookmark}`]);
+            break;
+          }
           if (matched.length === 0) {
             showInPanel(['No context entries match that selection.']);
             break;
@@ -9782,10 +9831,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ]);
             break;
           }
+          // The confirmation is about SIZE, not about which selector picked
+          // the entries — it used to guard only the bookmark spelling, which
+          // meant `/evict role:assistant` could drop the same 50k tokens with
+          // no prompt at all.
+          if (!selection.force && (matchedTokens >= 1500 || matched.length >= 8)) {
+            const previewLines = matched
+              .slice(-3)
+              .map(
+                (entry) => `- ${entry.role}: ${entry.content.slice(0, 80).replace(/\s+/g, ' ')}`
+              );
+            showInPanel([
+              `About to evict ${matched.length} entries (~${matchedTokens.toLocaleString()} tok).`,
+              ...(previewLines.length ? ['Recent entries in range:', ...previewLines] : []),
+            ]);
+            if (!(await promptYesNo('Proceed with eviction?', rl, inkRepl))) {
+              showInPanel(['Eviction cancelled.']);
+              break;
+            }
+          }
           const evictResult = ledger.evictEntries(matched.map((e) => e.id));
           recordEviction(
             'user',
-            `/evict ${slash.args.filter((a) => !a.startsWith('--')).join(' ')}`,
+            `/evict ${args.filter((a) => !a.startsWith('--')).join(' ')}`,
             evictResult.removedTokens,
             evictResult.removedEntries.map((e) => ({
               ...(e.eid !== undefined ? { eid: e.eid } : {}),
@@ -9800,6 +9868,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
               `  🗑 evicted ${evictResult.removedEntries.length} entries (~${evictResult.removedTokens.toLocaleString()} tok freed, ~${evictResult.totalAfter.toLocaleString()} tok remaining) — /evicted to review`
             )
           );
+          // A bookmark marks a phase boundary, so removing back to one is the
+          // case worth a durable note — `/eject`'s documented checkpoint,
+          // kept on the selector that inherited its meaning rather than
+          // promoted to every id-level eviction.
+          if (bookmarkPreview) {
+            const summary = evictResult.removedEntries
+              .slice(-6)
+              .map((entry) => `${entry.role}: ${entry.content.slice(0, 120).replace(/\s+/g, ' ')}`)
+              .join('\n');
+            if (summary) {
+              await pcp
+                .callTool('remember', {
+                  sbSlug,
+                  ...(runtime.sessionId ? { sessionId: runtime.sessionId } : {}),
+                  content: `Context eviction at ${bookmarkPreview.bookmark.id} (${bookmarkPreview.bookmark.label}).\n${summary}`,
+                  topics: 'repl,context-eviction',
+                  salience: 'medium',
+                })
+                .catch(() => undefined);
+            }
+          }
           break;
         }
         case 'evicted': {
