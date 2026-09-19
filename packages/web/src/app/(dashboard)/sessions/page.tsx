@@ -41,6 +41,16 @@ interface Session {
   currentPhase: string | null;
   summary: string | null;
   context: string | null;
+  currentWork: string | null;
+  currentWorkSource: 'headline' | 'context' | null;
+  currentWorkAt: string | null;
+  /**
+   * null means the age is UNKNOWN, not recent. Rows predating the timestamp
+   * columns have no age, and rendering that as "just now" is the exact failure
+   * this field exists to prevent — so it renders as nothing at all.
+   */
+  currentWorkAgeLabel: string | null;
+  currentWorkTruncated: boolean;
   backend: string | null;
   model: string | null;
   messageCount: number | null;
@@ -213,13 +223,26 @@ function SessionCard({ session }: { session: Session }) {
           {/* Phase - prominent for blocked sessions */}
           {phaseLabel && <p className={clsx('text-sm mt-1', state.phaseClass)}>{phaseLabel}</p>}
 
-          {/* Context / Summary */}
-          {session.context && (
-            <p className="text-sm text-muted-foreground mt-1 line-clamp-2">
-              {typeof session.context === 'string'
-                ? session.context
-                : JSON.stringify(session.context)}
-            </p>
+          {/* What this session is working on, and when it last said so. The age
+              is not decoration: without it a stale note reads as a live claim.
+
+              Which is why the age is a SIBLING of the clamped paragraph, not a
+              span inside it. `line-clamp-2` clips overflow rather than wrapping
+              it, so a trailing age inside the clamp is the first thing lost —
+              and it is lost exactly when the description is long, leaving the
+              undated status this feature exists to prevent. */}
+          {session.currentWork && (
+            <div className="mt-1">
+              <p className="text-sm text-muted-foreground line-clamp-2">{session.currentWork}</p>
+              {session.currentWorkAgeLabel && (
+                <p
+                  className="text-xs text-muted-foreground/70"
+                  title={session.currentWorkAt || undefined}
+                >
+                  {session.currentWorkAgeLabel}
+                </p>
+              )}
+            </div>
           )}
 
           {/* Workspace info */}
