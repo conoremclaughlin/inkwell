@@ -55,7 +55,7 @@ import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
-import { classifyError } from '@inklabs/shared';
+import { classifyError, isPreAcceptanceRefusal, type ErrorClassification } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
@@ -1948,6 +1948,12 @@ export class SessionService implements ISessionService {
 
     let result;
     let turnDurationMs: number;
+    // Classified inside the try, BEFORE the settled outcome is recorded, and
+    // declared here so the finalize payload and the boundary below can read it
+    // (Lumen's review of PR #660 P1: an unclassified `failed` recorded at the
+    // settle point is what shutdown terminalized the owner with).
+    let errorClassification: ErrorClassification | null = null;
+    let refusedBeforeAcceptance = false;
     const turnStartMs = Date.now();
 
     try {
@@ -1963,15 +1969,57 @@ export class SessionService implements ISessionService {
         mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
+      // Classified BEFORE the settled outcome is recorded, because the outcome
+      // depends on it. The backend can refuse a run before accepting it — most
+      // often because another writer already holds the thread we tried to
+      // resume — and that refusal is the one failure that says nothing about
+      // the target session's own state: no turn began, so nothing was
+      // observed. The outcome has to be right AT the settle point, because
+      // nothing downstream is guaranteed to revise it: the entry keeps the
+      // value until the run is cleared, that span contains the awaited
+      // finalize write, and on this path the finalize deliberately records no
+      // outcome at all — so a `failed` written here is simply retained, and it
+      // is what a shutdown during that span acts on. That retained value, not
+      // any gap between two adjacent statements, is the mechanism Lumen
+      // reproduced (his review of PR #660 P1, and his correction on the
+      // thread: adjacent synchronous statements are not preempted).
+      errorClassification =
+        !result.success && result.error
+          ? classifyError({ errorText: result.error, backend: resolvedBackend })
+          : null;
+      refusedBeforeAcceptance = errorClassification
+        ? isPreAcceptanceRefusal(errorClassification.category)
+        : false;
+      if (refusedBeforeAcceptance) {
+        logger.warn('Backend refused the run before accepting it; not recording an outcome', {
+          sessionId: session.id,
+          backend: resolvedBackend,
+          category: errorClassification!.category,
+          summary: errorClassification!.summary,
+        });
+      }
       // The child has exited; only bookkeeping remains. NOT a clear — the run
       // stays registered until the terminal write lands — but from here a
       // shutdown report must say "finished, unrecorded", never "still running".
       // The intended outcome rides along: a success:false result means the
       // unrecorded terminal state is `failed`, and shutdown must say so
-      // rather than stamping a quiet success (Lumen, PR #563 P1).
-      markRunnerSettled(session.id, result.success ? 'succeeded' : 'failed');
+      // rather than stamping a quiet success (Lumen, PR #563 P1) — unless the
+      // backend refused, in which case there is no terminal state to record on
+      // the owner at all and shutdown must write none.
+      markRunnerSettled(
+        session.id,
+        refusedBeforeAcceptance ? 'refused' : result.success ? 'succeeded' : 'failed'
+      );
     } catch (runnerError) {
       markRunnerSettled(session.id, 'failed');
+      // Not classified for refusal, and that is a bounded claim rather than an
+      // oversight: the only backend whose refusal signature `classifyError`
+      // knows is Codex, and CodexRunner catches its own spawn failure and
+      // RETURNS `success: false` (codex-runner.ts) instead of throwing. So an
+      // `owner_conflict` cannot reach this branch without another backend
+      // emitting Codex's thread-store/thread-resume signature verbatim. If one
+      // ever does, this write has the same defect the result path just fixed.
+      //
       // Runner threw (spawn failure, capacity error, etc.) — mark session as
       // failed, unless shutdown already owns this session's state and would
       // have its interruption record overwritten by this write.
@@ -2041,12 +2089,9 @@ export class SessionService implements ISessionService {
       throw runnerError;
     }
 
-    // 5b. Log backend CLI completion to activity stream (fire-and-forget)
-    const errorClassification =
-      !result.success && result.error
-        ? classifyError({ errorText: result.error, backend: resolvedBackend })
-        : null;
-
+    // 5b. Log backend CLI completion to activity stream (fire-and-forget).
+    // `errorClassification` was computed above, before the settled outcome was
+    // recorded; it is read here only for the payload.
     this.activityStream
       .logActivity({
         userId,
@@ -2113,16 +2158,49 @@ export class SessionService implements ISessionService {
     // Shutdown owns the state from here (Lumen, PR #490 round 3).
     // One payload for both the inline attempt and any background retry, so a
     // retry writes the identical terminal state the first attempt meant to.
-    const finalizeUpdates = {
-      ...(result.backendSessionId !== session.backendSessionId
-        ? { backendSessionId: result.backendSessionId }
-        : {}),
-      messageCount: session.messageCount + 1,
-      backend: resolvedBackend,
-      ...(servedModel ? { model: servedModel } : {}),
-      lifecycle: postRunLifecycle as Session['lifecycle'],
-      cliAttached: false,
-    };
+    //
+    // A run the backend refused before accepting writes NO outcome field
+    // (2026-09-21, spec:live-agent-surfaces). It processed no message, so
+    // `messageCount` does not move; it observed no exit of the owner's
+    // process, so `cliAttached` is left exactly as it was read — clearing it
+    // is what told the dispatcher a live owner had gone away; and it learned
+    // nothing about `lifecycle`, so it leaves that column alone too.
+    //
+    // `lifecycle` is omitted rather than restored from the snapshot this turn
+    // read, which is the opposite of what the first version of this fix did.
+    // A snapshot replay is a WRITE of a value that may already be stale: the
+    // owner can move itself `running` → `failed` while the refused runner is
+    // in flight, that transition does not rotate the row's epoch, so the
+    // replay passes the fence and resurrects `running` over a newer, truer
+    // value (Lumen's review of PR #660 P1 — his probe reproduces exactly
+    // that). Omitting cannot lose an update; replaying can.
+    //
+    // What omitting costs, stated plainly: the takeover at the top of this
+    // method already stamped `running` before the runner spawned, so the row
+    // keeps OUR `running` rather than whatever it said before. That is the
+    // pre-spawn takeover write — along with the `turnEpoch` it stole and the
+    // `updated_at` it bumped — and it is separate debt with its own fix, not
+    // a licence for a second stale write here.
+    //
+    // This also does not treat the refusal as proof the owner is alive: a held
+    // thread-store lock is not a heartbeat, and no registration is refreshed
+    // and no lease extended from it.
+    //
+    // `backend` is all that survives on the refusal path, which keeps the
+    // update non-empty so it still goes through the epoch fence rather than
+    // becoming a no-op.
+    const finalizeUpdates = refusedBeforeAcceptance
+      ? { backend: resolvedBackend }
+      : {
+          ...(result.backendSessionId !== session.backendSessionId
+            ? { backendSessionId: result.backendSessionId }
+            : {}),
+          backend: resolvedBackend,
+          ...(servedModel ? { model: servedModel } : {}),
+          messageCount: session.messageCount + 1,
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        };
     const performFinalizeWrite = () => writeTerminalFenced(finalizeUpdates);
 
     // Run-boundary steps. Invoked ONLY after the terminal write durably
@@ -2139,6 +2217,20 @@ export class SessionService implements ISessionService {
       // epoch: if a newer turn registered over us while our late write landed
       // (it can only land while the row was still ours), its entry survives.
       clearActiveRunIfOwner(session.id, turnEpoch);
+      // The registry entry above is ours and always goes. The boundary effects
+      // below are not: they exist because "the server run IS the turn", and a
+      // run the backend refused before accepting was never a turn. Their
+      // ownership gate is the row's turnEpoch, which this turn DOES hold — so
+      // it does not stop them, and releaseGraphClaimsForSession would return
+      // the live owner's claims to the pool on the strength of a refusal that
+      // told us nothing about the owner. Same rule as the finalize payload:
+      // a run that observed nothing writes nothing.
+      if (refusedBeforeAcceptance) {
+        logger.warn('Skipping boundary effects; the backend refused this run before accepting it', {
+          sessionId: session.id,
+        });
+        return;
+      }
       // A QUEUED next turn is invisible to every DB-side fence: it acquires
       // and renews the lease BEFORE the processing lock, while the row epoch
       // is still ours (Lumen rounds 7–8 — a heartbeat cutoff rejected our own
