@@ -579,6 +579,7 @@ function mockPairClaim(
   const chain: Record<string, any> = {};
   chain.delete = vi.fn(() => chain);
   chain.eq = vi.fn(() => chain);
+  chain.in = vi.fn(() => chain);
   chain.select = vi.fn(() => chain);
   chain.update = vi.fn(() => chain);
   chain.maybeSingle = vi.fn(() => Promise.resolve({ data: consumed, error: null }));
@@ -634,7 +635,13 @@ describe('POST /auth/mobile-pair/claim', () => {
     // The claim is a filtered delete that returns the row: no lookup-then-
     // delete window for two phones to both win.
     expect(chain.delete).toHaveBeenCalled();
-    expect(chain.eq).toHaveBeenCalledWith('refresh_token', 'ink-pair-ABCDEFGHJKLM');
+    // Matched against both spellings: a code handed out before #659 is stored
+    // as pcp-pair-… and an ink-pair-only lookup reports it "invalid or
+    // expired" while the row sits there unexpired.
+    expect(chain.in).toHaveBeenCalledWith('refresh_token', [
+      'ink-pair-ABCDEFGHJKLM',
+      'pcp-pair-ABCDEFGHJKLM',
+    ]);
     expect(chain.eq).toHaveBeenCalledWith('client_id', 'mobile-pair');
     expect(mockCreateRefreshToken).toHaveBeenCalledWith(
       expect.anything(),

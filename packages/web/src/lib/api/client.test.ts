@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 /**
  * The workspace scope header has to be spelled the same on both sides, and
  * nothing enforced that. 01b9047b moved the server to `x-ink-workspace-id` and
- * left this client sending `X-PCP-Workspace-Id`, so from then until #655 every
+ * left this client sending `X-PCP-Workspace-Id`, so from then until #659 every
  * workspace the user picked in the sidebar was dropped on the floor: the header
  * arrived, no handler looked for it, and the request quietly resolved to the
  * personal workspace instead. No test failed, because no test knew the two

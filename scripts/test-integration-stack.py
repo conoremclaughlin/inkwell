@@ -282,6 +282,24 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.count("supabase"), 0)
         self.assertEqual(self.count("bash"), 0)
 
+    def test_stop_reports_an_orphaned_pre_rename_stack(self):
+        # #659 renamed the default project, so a stack retained under
+        # pcp-integration lives in its own cache dir. A default --stop looked
+        # at ink-integration, found nothing, and exited 0 while the old
+        # containers kept running.
+        legacy = {"supabase_db_pcp-integration": "legacy-container"}
+        with mock.patch.object(
+            stack, "containers", lambda name: legacy if name == "pcp-integration" else {}
+        ):
+            with self.assertRaisesRegex(stack.Refusal, "pcp-integration"):
+                self.run_stack("--stop")
+
+    def test_stop_stays_quiet_when_no_legacy_stack_is_running(self):
+        # Control: the refusal must depend on the legacy stack existing, not
+        # fire on every --stop with nothing to do.
+        with mock.patch.object(stack, "containers", lambda _name: {}):
+            self.assertEqual(self.run_stack("--stop"), 0)
+
     def test_same_project_new_container_identity_is_not_adopted(self):
         self.run_stack()
         self.current[self.db] = "replacement-container"
@@ -711,6 +729,20 @@ class PrimitiveTests(unittest.TestCase):
                     {"INTEGRATION_SUPABASE_API_PORT": "55422"}):
             with self.assertRaises(stack.Refusal):
                 stack.settings(env)
+
+    def test_legacy_project_name_is_still_reachable(self):
+        # A stack created before #659 is named pcp-integration and its
+        # containers carry com.supabase.cli.project=pcp-integration. Refusing
+        # the name would strand it: no reset, and no --stop either.
+        for project in ("pcp-integration", "pcp-integration-sibling"):
+            resolved, _ports, _exclude = stack.settings(
+                {"INTEGRATION_SUPABASE_PROJECT_ID": project}
+            )
+            self.assertEqual(resolved, project)
+
+    def test_default_project_is_the_current_name(self):
+        # Control: accepting the legacy name must not make it the default.
+        self.assertEqual(stack.settings({})[0], "ink-integration")
 
     def test_locks_conflict_on_project_or_ports_and_release_without_unlinking(self):
         with tempfile.TemporaryDirectory() as directory:

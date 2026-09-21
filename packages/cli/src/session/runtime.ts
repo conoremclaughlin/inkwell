@@ -61,12 +61,23 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
     // sbSlug, so an un-normalized record never matches and the upsert inserts a
     // DUPLICATE instead of merging the previous backend-session lineage
     // (Lumen, PR #635). Normalize on read, current included.
+    // Records written before a rename carry the old key. Without this the
+    // type guard below drops them, which loses every legacy row and the
+    // `current` pointer. agentId -> sbSlug came from PR #635;
+    // pcpSessionId -> inkSessionId from #659.
+    const LEGACY_KEYS: ReadonlyArray<readonly [string, string]> = [
+      ['agentId', 'sbSlug'],
+      ['pcpSessionId', 'inkSessionId'],
+    ];
     const withSlug = (row: unknown): unknown => {
       if (!row || typeof row !== 'object') return row;
-      const r = row as { sbSlug?: unknown; agentId?: unknown };
-      return r.sbSlug === undefined && typeof r.agentId === 'string'
-        ? { ...r, sbSlug: r.agentId }
-        : row;
+      let out = row as Record<string, unknown>;
+      for (const [legacy, current] of LEGACY_KEYS) {
+        if (out[current] === undefined && typeof out[legacy] === 'string') {
+          out = { ...out, [current]: out[legacy] };
+        }
+      }
+      return out;
     };
     if (Array.isArray(parsed.sessions)) {
       parsed.sessions = parsed.sessions.map(withSlug) as typeof parsed.sessions;

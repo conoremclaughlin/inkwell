@@ -709,7 +709,7 @@ async function resolveLocalTranscriptDescriptor(options: {
 
   // 'ink' is the stored backend value; 'pcp' is the pre-rename spelling kept
   // for rows written before 01b9047b. Matching only 'pcp' made this branch
-  // unreachable, so ink-runtime transcripts never resolved (#655).
+  // unreachable, so ink-runtime transcripts never resolved (#659).
   if (normalizedBackend.includes('ink') || normalizedBackend.includes('pcp')) {
     const inkPath = await findInkTranscriptFile(options.sessionId);
     if (inkPath) {
@@ -1583,6 +1583,18 @@ function pairingCodeStorageKey(code: string): string {
   return `ink-pair-${code}`;
 }
 
+/**
+ * The same key as minted before #659.
+ *
+ * Pairing codes live in mcp_tokens.refresh_token, so a code handed out before
+ * the rename is stored under the old prefix and an `ink-pair-` equality lookup
+ * cannot find it — the claim fails as "Invalid or expired" while the row sits
+ * there unexpired. Claims match either spelling; only the new one is minted.
+ */
+function legacyPairingCodeStorageKey(code: string): string {
+  return `pcp-pair-${code}`;
+}
+
 function isLoopbackHost(hostOrUrl: string): boolean {
   return /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(hostOrUrl);
 }
@@ -1632,7 +1644,7 @@ router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
     const { data: consumed, error: consumeError } = await supabase
       .from('mcp_tokens')
       .delete()
-      .eq('refresh_token', pairingCodeStorageKey(code))
+      .in('refresh_token', [pairingCodeStorageKey(code), legacyPairingCodeStorageKey(code)])
       .eq('client_id', MOBILE_PAIR_CLIENT_ID)
       .select('user_id, expires_at')
       .maybeSingle();

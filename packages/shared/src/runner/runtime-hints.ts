@@ -50,13 +50,27 @@ export function writeRuntimeSessionHint(
           // rename carry `agentId`, the match below keys on sbSlug, and an
           // un-normalized record is duplicated rather than merged
           // (Lumen, PR #635).
-          const withSlug = (row: Record<string, unknown>): Record<string, unknown> =>
-            row &&
-            typeof row === 'object' &&
-            row.sbSlug === undefined &&
-            typeof row.agentId === 'string'
-              ? { ...row, sbSlug: row.agentId }
-              : row;
+          //
+          // #659 renamed pcpSessionId -> inkSessionId and reproduced that
+          // defect one field over: rows on disk key the session id under the
+          // old name, so the match below misses them and the reader's type
+          // guard drops them outright — losing backend lineage on the next
+          // upsert. Both migrations live in one table now, so the next rename
+          // adds a row here rather than a third copy of this shape.
+          const LEGACY_KEYS: ReadonlyArray<readonly [string, string]> = [
+            ['agentId', 'sbSlug'],
+            ['pcpSessionId', 'inkSessionId'],
+          ];
+          const withSlug = (row: Record<string, unknown>): Record<string, unknown> => {
+            if (!row || typeof row !== 'object') return row;
+            let out = row;
+            for (const [legacy, current] of LEGACY_KEYS) {
+              if (out[current] === undefined && typeof out[legacy] === 'string') {
+                out = { ...out, [current]: out[legacy] };
+              }
+            }
+            return out;
+          };
           state = {
             ...raw,
             sessions: raw.sessions.map((s) =>

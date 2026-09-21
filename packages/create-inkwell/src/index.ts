@@ -16,12 +16,19 @@ import { execSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  STATE_FILE,
+  isComplete,
+  loadState,
+  markComplete,
+  saveState,
+  type ProgressState,
+} from './progress.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const REPO_URL = 'https://github.com/conoremclaughlin/personal-context-protocol.git';
 const DEFAULT_DIR = 'personal-context-protocol';
-const STATE_FILE = '.create-inkwell-progress.json';
 const HEALTH_URL_BASE = 'http://localhost';
 const DEFAULT_API_PORT = 3001;
 const DEFAULT_WEB_PORT = 3002;
@@ -30,45 +37,7 @@ const HEALTH_INTERVAL_MS = 2000;
 
 const TOTAL_STEPS = 9;
 
-// ── Types ────────────────────────────────────────────────────────────────────
-
-interface ProgressState {
-  completedSteps: string[];
-  targetDir: string;
-  dbMode?: 'local' | 'hosted';
-  backend?: string;
-}
-
 // ── Utilities ────────────────────────────────────────────────────────────────
-
-function loadState(dir: string): ProgressState {
-  const file = join(dir, STATE_FILE);
-  if (existsSync(file)) {
-    try {
-      return JSON.parse(readFileSync(file, 'utf-8'));
-    } catch {
-      // Corrupted state — start fresh
-    }
-  }
-  return { completedSteps: [], targetDir: dir };
-}
-
-function saveState(state: ProgressState): void {
-  if (!existsSync(state.targetDir)) return; // Dir not created yet (pre-clone)
-  const file = join(state.targetDir, STATE_FILE);
-  writeFileSync(file, JSON.stringify(state, null, 2) + '\n');
-}
-
-function isComplete(state: ProgressState, step: string): boolean {
-  return state.completedSteps.includes(step);
-}
-
-function markComplete(state: ProgressState, step: string): void {
-  if (!state.completedSteps.includes(step)) {
-    state.completedSteps.push(step);
-    saveState(state);
-  }
-}
 
 /** Run a command silently and return stdout. Throws on non-zero exit. */
 function exec(cmd: string, cwd?: string): string {

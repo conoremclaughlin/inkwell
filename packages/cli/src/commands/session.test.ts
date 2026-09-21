@@ -178,7 +178,7 @@ describe('buildTranscriptInstallPlan', () => {
     ]);
   });
 
-  // This branch was unreachable until #655: it matched only the pre-rename
+  // This branch was unreachable until #659: it matched only the pre-rename
   // 'pcp' spelling while sessions store 'ink', so `ink session sync` on an ink
   // session fell past every branch and threw "Cannot infer a backend-native
   // install target". Nothing covered it, which is how it stayed that way.

@@ -1,5 +1,5 @@
 const STORAGE_KEY = 'ink:selectedWorkspaceId';
-// Written by every build before #655. Read once so an existing selection
+// Written by every build before #659. Read once so an existing selection
 // survives the rename, then retired on the next write.
 const LEGACY_STORAGE_KEY = 'pcp:selectedWorkspaceId';
 

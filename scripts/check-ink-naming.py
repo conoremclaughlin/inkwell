@@ -11,19 +11,30 @@ leftover naming — it looked like working code, and stayed broken for months:
   were still named ``logs:pcp:*``, so the documented commands did not exist
 * ``admin.ts`` matched ``backend.includes('pcp')`` when the stored value is
   ``'ink'``, making the ink-runtime transcript branch unreachable
-* the REPL command is ``/ink``; the CLI README documented ``/pcp``
+* the REPL command is ``/ink``; the dispatch switch only had ``case 'pcp'``
 * ``npx create-pcp`` in the wizard's own help; the package is
   ``@inklabs/create-inkwell``
 
 A half-finished rename is worse than no rename: both spellings look plausible,
 so nothing reads as wrong. This guard makes the residue visible.
 
-ALLOWED below are names that must keep the old spelling because something
-outside this repo already stores them — database objects, persisted JSON keys,
-claims in tokens already issued, browser cookies, keys in users' config files,
-container names, and the checkout path itself. Add to it only with a reason.
+Two rules keep the exemptions honest, both from Lumen's review of #659:
+
+1. **No whole-file exemptions.** An earlier version skipped entire files, so a
+   brand new ``PCP_NEW_THING`` in ``admin.ts`` — a file exempted for its
+   cookies — passed. Every exemption now names the literal it permits, and
+   every other line in that file is still checked.
+2. **Every exemption is boundary-anchored.** Bare literals matched as
+   substrings, so ``PCP_PORT_BASE_V2`` inherited ``PCP_PORT_BASE``'s exemption
+   anywhere in the tree.
+
+Exemptions exist for names something outside this repo already stores:
+database objects, persisted JSON keys, claims inside already-signed tokens,
+browser cookies, keys in users' config files, container names, on-disk state
+files, and the checkout path. Add one only with a reason.
 
 Run: python3 scripts/check-ink-naming.py
+Its own tests: python3 scripts/check-ink-naming.test.py
 """
 
 from __future__ import annotations
@@ -35,72 +46,183 @@ import sys
 # Paths that are history or vendored, not code we are renaming.
 EXCLUDE_PATHS = re.compile(
     r"^\.yarn/|^packages/[^/]+/dist/|^supabase/migrations/|^CHANGELOG\.md$|"
-    r"^\.mailmap$|^scripts/check-ink-naming\.py$"
+    r"^\.mailmap$|^scripts/check-ink-naming\.py$|^scripts/check-ink-naming\.test\.py$"
 )
 
-# Literals removed from a line before it is judged. Each entry is (pattern, why).
-ALLOWED = [
+# Literals permitted anywhere, each with the reason it cannot be renamed.
+ALLOWED: list[tuple[str, str]] = [
+    (r"pcp_config", "live database table"),
+    (r"pcp_admin", "type claim inside already-issued JWTs"),
+    (r"pcp_tool", "entry type in the persisted session ledger, replayed"),
     (r"pcp-admin-refresh", "cookie already set in browsers"),
     (r"pcp-admin-token", "cookie already set in browsers"),
-    (r"pcp-managed:(start|end)", "legacy markers in users' codex config.toml"),
+    (r"pcp-managed:(?:start|end)", "legacy markers in users' codex config.toml"),
     (r"plugins\.entries\.pcp", "key in users' openclaw.json"),
-    (r"supabase_(db|kong)_pcp", "local Supabase container names"),
+    (r"supabase_(?:db|kong)_pcp", "local Supabase container names"),
     (r"PCP_PORT_BASE", "legacy env var, still accepted as a fallback"),
     (r"PCP_SERVER_URL", "legacy env var, still accepted as a fallback"),
     (r"PCP_JWT_SECRET", "fixture for the credential guard's prefixed-name case"),
     (r"Personal Context Protocol", "the protocol's own name; Inkwell implements it"),
-    (r"pcp_config", "live database table"),
-    (r"pcp_admin", "type claim in already-issued JWTs"),
-    (r"pcp_tool", "entry type in the persisted session ledger, replayed"),
-    (r"(metadata|metadataRecord|rawMeta|meta)\.pcp", "persisted inbox metadata key"),
-    (r"pcp\.(sender|recipient|subject)", "persisted inbox metadata key"),
-    (r"pcp:\s*\{", "persisted inbox metadata key, as an object literal"),
-    (r"pcp\b(?=\s*metadata)", "prose about the persisted inbox metadata key"),
-    (r'"id":\s*"pcp"', "plugin id users already have in openclaw.json"),
-    (r"pcp\.dev", "frozen legacy entry in the fixture-domain allowlist"),
+    (r"(?:metadata|metadataRecord|rawMeta|meta)\.pcp", "persisted inbox metadata key"),
+    (r"pcp\.(?:sender|recipient|subject)", "persisted inbox metadata key"),
+    (r"pcp(?=:\s*\{)", "persisted inbox metadata key, as an object literal"),
     (r"project:pcp/[a-z-]+", "topic keys on memory rows already written"),
-    (r"legacy 'pcp' server name", "comment pinning the retired MCP server name"),
-    (r"/pcp/personal-context-protocol", "checkout path"),
-    (r'"pcp":\s*\{', "MCP server entry in a pre-rename config example"),
-    # The checkout lives at ~/ws/pcp/…; Claude Code and Gemini flatten that path
-    # to Users-…-ws-pcp-… for their project directories, so both spellings are
-    # filesystem paths rather than product names.
+    # The checkout lives at ~/ws/pcp/…; Claude Code and Gemini flatten that
+    # path to Users-…-ws-pcp-… for their project directories, so both spellings
+    # are filesystem paths rather than product names.
     (r"ws[/-]pcp[/-]", "checkout path"),
     (r"ws/pcp", "checkout path"),
-    (r"\.pcp(?![\w-])", "pre-rename ~/.pcp location, referenced deliberately"),
+    (r"/pcp/personal-context-protocol", "checkout path"),
+    (r"pcp\.dev", "frozen legacy entry in the fixture-domain allowlist"),
+    (r"\.pcp", "pre-rename ~/.pcp location, referenced deliberately"),
 ]
 
-# Files that pin a legacy spelling in full, with the reason.
-PINNED = {
-    "packages/api/src/services/thread-key/parser.test.ts": "pins the pcp->inkwell project alias",
-    "packages/api/src/services/thread-key/unregistered-prefix.test.ts": "pins the project alias",
-    "packages/api/src/services/thread-key/thread-key.service.ts": "documents the alias parse bug",
-    "packages/shared/src/studio/mcp-config-sync.ts": "legacy codex markers on users' disks",
-    "packages/openclaw-plugin/config-compat.test.ts": "legacy openclaw.json keys",
-    "packages/web/src/lib/workspace-selection.ts": "reads the legacy localStorage key once",
-    "packages/web/src/lib/api/client.test.ts": "names the dead header the bug sent",
-    "packages/cli/src/commands/claude.ts": "still accepts the legacy pcp:<id> session choice",
-    "packages/cli/src/cli.test.ts": "covers the legacy pcp:<id> session choice",
-    "packages/cli/src/commands/chat.ts": "keeps /pcp as a silent alias for /ink",
-    "packages/cli/src/commands/session.ts": "legacy backend value on pre-rename rows",
-    "packages/cli/src/commands/session.test.ts": "covers the legacy backend value",
-    "packages/api/src/routes/admin.ts": "legacy cookies and legacy backend value",
-    "packages/api/src/config/env.ts": "documents the INK_/PCP_ fallback",
-    "packages/mobile/app.config.js": "documents the INK_/PCP_ fallback",
-    "packages/mobile/src/lib/appConfig.test.ts": "covers the INK_/PCP_ fallback",
-    "packages/api/src/services/sessions/antigravity-runner.ts": "INK_/PCP_ fallback",
-    "packages/api/src/services/sessions/antigravity-runner.test.ts": "covers that fallback",
-    "scripts/dev-concurrently.mjs": "INK_/PCP_ fallback",
-    "scripts/check-commit-msg.sh": "credential-guard fixture",
-    "scripts/check-commit-msg.test.sh": "credential-guard fixture",
-    "packages/api/src/skills/service.ts": "explains why ~/.pcp is never read",
-    "packages/api/src/skills/service.test.ts": "asserts ~/.pcp is never read",
+# Literals permitted only in the file that needs them. The rest of that file is
+# still checked — that is the whole point of scoping them here.
+FILE_ALLOWED: dict[str, list[tuple[str, str]]] = {
+    "packages/api/src/services/thread-key/parser.test.ts": [
+        (r"pcp", "pins the pcp->inkwell project alias"),
+    ],
+    "packages/api/src/services/thread-key/unregistered-prefix.test.ts": [
+        (r"pcp", "pins the project alias"),
+    ],
+    "packages/api/src/services/thread-key/thread-key.service.ts": [
+        (r"pcp", "documents the alias parse bug"),
+    ],
+    "packages/openclaw-plugin/config-compat.test.ts": [
+        (r"pcp", "legacy openclaw.json keys"),
+    ],
+    "packages/web/src/lib/workspace-selection.ts": [
+        (r"pcp:selectedWorkspaceId", "legacy localStorage key, read once"),
+    ],
+    "packages/web/src/lib/api/client.test.ts": [
+        (r"X-PCP-Workspace-Id", "names the dead header the bug sent"),
+    ],
+    "packages/cli/src/commands/claude.ts": [
+        (r"__pcp__", "legacy session-picker prefix, still stripped"),
+        (r"pcp", "legacy pcp:<id> session choice, still accepted"),
+    ],
+    "packages/cli/src/cli.test.ts": [
+        (r"pcp", "covers the legacy pcp:<id> session choice"),
+    ],
+    "packages/cli/src/commands/chat.ts": [
+        (r"pcp", "legacy /pcp alias and the persisted pcp-activity ledger source"),
+    ],
+    "packages/cli/src/commands/session.ts": [
+        (r"pcp", "legacy backend value on pre-rename rows"),
+    ],
+    "packages/cli/src/commands/session.test.ts": [
+        (r"pcp", "covers the legacy backend value"),
+    ],
+    "packages/api/src/routes/admin.ts": [
+        (r"includes\('pcp'\)", "legacy backend value on pre-rename rows"),
+        (r"'pcp'", "names the legacy backend value in the comment above it"),
+        (r"pcp-pair", "legacy pairing token prefix already in the database"),
+    ],
+    "packages/api/src/routes/admin-mobile-auth.test.ts": [
+        (r"pcp-pair", "covers the legacy pairing token prefix"),
+    ],
+    "packages/cli/src/commands/chat-hydration.test.ts": [
+        (r"pcp-activity(?:-history)?", "covers the persisted ledger sources"),
+    ],
+    "packages/create-inkwell/src/progress.ts": [
+        (r"\.create-pcp-progress\.json", "reads the legacy resume file"),
+    ],
+    "packages/create-inkwell/src/index.test.ts": [
+        (r"\.create-pcp-progress\.json", "covers the legacy resume file"),
+        (r"LEGACY_STATE_FILE", "names the legacy resume file constant"),
+    ],
+    ".gitignore": [
+        (r"\.create-pcp-progress\.json", "still ignores the legacy resume file"),
+    ],
+    "packages/api/src/config/env.ts": [
+        (r"PCP_", "documents the INK_/PCP_ fallback"),
+    ],
+    "packages/shared/src/runner/runtime-hints.ts": [
+        (r"pcpSessionId", "migrates the legacy key in sessions.json"),
+    ],
+    "packages/cli/src/session/runtime.ts": [
+        (r"pcpSessionId", "migrates the legacy key in sessions.json"),
+    ],
+    "packages/cli/src/session/legacy-runtime-compat.test.ts": [
+        (r"pcpSessionId", "fixture must stay in the pre-rename spelling"),
+    ],
+    "packages/shared/src/security/delegation-token.ts": [
+        (r"PCP-DELEGATION", "accepts the pre-rename signed typ"),
+    ],
+    "packages/cli/src/repl/delegation-token.test.ts": [
+        (r"PCP-DELEGATION", "mints a pre-rename token by hand"),
+    ],
+    "scripts/lib/integration-stack.py": [
+        (r"pcp-integration", "keeps the legacy stack reachable, including --stop"),
+        (r"pcp", "names the legacy prefix in the refusal message and comments"),
+    ],
+    "scripts/test-integration-stack.py": [
+        (r"pcp-integration", "covers the legacy stack name"),
+        (r"pcp", "names the legacy prefix in comments"),
+    ],
+    "scripts/check-commit-msg.sh": [(r"PCP_", "credential-guard fixture")],
+    "scripts/check-commit-msg.test.sh": [(r"PCP_", "credential-guard fixture")],
+    "packages/api/src/skills/service.ts": [(r"pcp", "explains why ~/.pcp is never read")],
+    "packages/api/src/skills/service.test.ts": [(r"pcp", "asserts ~/.pcp is never read")],
+    "packages/mobile/app.config.js": [(r"PCP_", "documents the INK_/PCP_ fallback")],
+    "packages/mobile/src/lib/appConfig.test.ts": [(r"PCP_", "covers the fallback")],
+    "packages/api/src/services/sessions/antigravity-runner.ts": [
+        (r"PCP_", "INK_/PCP_ fallback"),
+    ],
+    "packages/api/src/services/sessions/antigravity-runner.test.ts": [
+        (r"PCP_", "covers that fallback"),
+    ],
+    "scripts/dev-concurrently.mjs": [(r"PCP_", "INK_/PCP_ fallback")],
+    "packages/shared/src/studio/mcp-config-sync.ts": [
+        (r"pcp-managed", "legacy codex markers on users' disks"),
+    ],
+    "packages/api/src/mcp/tools/inbox-handlers.test.ts": [
+        (r"pcp(?= metadata)", "prose about the persisted inbox metadata key"),
+    ],
+    "packages/cli/src/backends/gemini.ts": [
+        (r"'pcp'", "comment pinning the retired MCP server name"),
+    ],
+    "packages/shared/src/runner/mcp-config.ts": [
+        (r"'pcp'", "comment pinning the retired MCP server name"),
+    ],
+    "packages/openclaw-plugin/openclaw.plugin.json": [
+        (r'"pcp"', "plugin id users already have in openclaw.json"),
+    ],
+    "packages/spec/protocol-v0.1.md": [
+        (r'"pcp"', "MCP server entry in a pre-rename config example"),
+    ],
 }
 
-# Case-sensitive on purpose: with IGNORECASE, the `\.pcp` entry matched the
-# `.PCP` in `process.env.PCP_NEW_THING` and let a brand new legacy-spelled
-# env var through. Each entry below is written in the case it really has.
-ALLOWED_RE = re.compile("|".join(f"(?:{p})" for p, _ in ALLOWED))
+
+def anchor(pattern: str) -> str:
+    """Wrap a pattern so it cannot match inside a longer identifier.
+
+    Without this, `PCP_PORT_BASE` exempts `PCP_PORT_BASE_V2`, and any exemption
+    becomes a prefix others can hide behind (Lumen, #659 review).
+
+    The boundary is added only on an end that actually finishes with a word
+    character. `ws[/-]pcp[/-]` deliberately ends on a separator and is followed
+    by more path — demanding a non-word character after it would stop it
+    matching `…-ws-pcp-personal-context-protocol`, which is the checkout path
+    it exists to allow.
+    """
+    lead = r"(?<![A-Za-z0-9_])" if re.match(r"[A-Za-z0-9_]", pattern) else ""
+    trail = r"(?![A-Za-z0-9_])" if re.search(r"[A-Za-z0-9_]$", pattern) else ""
+    return rf"{lead}(?:{pattern}){trail}"
+
+
+def build(patterns: list[tuple[str, str]]) -> "re.Pattern[str] | None":
+    if not patterns:
+        return None
+    # Case-sensitive on purpose: with IGNORECASE the `\.pcp` entry matched the
+    # `.PCP` in `process.env.PCP_NEW_THING` and let a new legacy-spelled env
+    # var through. Each entry is written in the case it really has.
+    return re.compile("|".join(anchor(p) for p, _ in patterns))
+
+
+GLOBAL_RE = build(ALLOWED)
+FILE_RE = {path: build(rules) for path, rules in FILE_ALLOWED.items()}
 PCP_RE = re.compile("pcp", re.IGNORECASE)
 
 
@@ -111,33 +233,42 @@ def tracked_files() -> list[str]:
     return [f for f in out if f and not EXCLUDE_PATHS.search(f)]
 
 
+def violations_in(path: str, lines: list[str]) -> list[tuple[int, str]]:
+    scoped = FILE_RE.get(path)
+    found = []
+    for number, line in enumerate(lines, 1):
+        if not PCP_RE.search(line):
+            continue
+        stripped = GLOBAL_RE.sub("", line) if GLOBAL_RE else line
+        if scoped:
+            stripped = scoped.sub("", stripped)
+        if PCP_RE.search(stripped):
+            found.append((number, line.rstrip()))
+    return found
+
+
 def main() -> int:
     files = tracked_files()
     if not files:
         print("check-ink-naming: no files to scan", file=sys.stderr)
         return 1
 
-    violations: list[tuple[str, int, str]] = []
+    offenders: list[tuple[str, int, str]] = []
     for path in files:
-        if path in PINNED:
-            continue
         try:
             with open(path, encoding="utf-8") as handle:
                 lines = handle.readlines()
         except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
             continue
-        for number, line in enumerate(lines, 1):
-            if not PCP_RE.search(line):
-                continue
-            if PCP_RE.search(ALLOWED_RE.sub("", line)):
-                violations.append((path, number, line.rstrip()))
+        for number, line in violations_in(path, lines):
+            offenders.append((path, number, line))
 
-    if not violations:
+    if not offenders:
         print(f"check-ink-naming: clean ({len(files)} files scanned)")
         return 0
 
     current = None
-    for path, number, line in violations:
+    for path, number, line in offenders:
         if path != current:
             print(path)
             current = path
@@ -145,17 +276,18 @@ def main() -> int:
 
     print(
         "\n"
-        f"Found pre-rename \"pcp\" naming in {len({v[0] for v in violations})} file(s).\n"
+        f'Found pre-rename "pcp" naming in {len({o[0] for o in offenders})} file(s).\n'
         "\n"
         "Use Ink/Inkwell instead: INK_* for environment variables, x-ink-* for\n"
-        "headers, ink*/Ink* for identifiers, \"Inkwell\" in prose. \"Personal Context\n"
-        "Protocol\" is still correct when naming the protocol itself (packages/spec)\n"
+        'headers, ink*/Ink* for identifiers, "Inkwell" in prose. "Personal Context\n'
+        'Protocol" is still correct when naming the protocol itself (packages/spec)\n'
         "rather than the implementation.\n"
         "\n"
         "If the name has to keep its old spelling because something outside this repo\n"
         "already stores it — a database object, a persisted JSON key, a claim in an\n"
-        "issued token, a browser cookie, a key in a user's config — add it to ALLOWED\n"
-        "or PINNED in scripts/check-ink-naming.py with the reason.",
+        "issued token, a browser cookie, a key in a user's config — add the literal to\n"
+        "ALLOWED (anywhere) or FILE_ALLOWED (that file only) in\n"
+        "scripts/check-ink-naming.py, with the reason. Do not exempt a whole file.",
         file=sys.stderr,
     )
     return 1

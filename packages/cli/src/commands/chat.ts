@@ -1433,6 +1433,11 @@ const INTERNAL_SYSTEM_SOURCES = new Set([
   'compaction-history',
   'ink-activity',
   'ink-activity-history',
+  // Written before #659. Ledger entries persist and are replayed, so the old
+  // source values still arrive and must stay internal — otherwise every
+  // pre-rename activity line reappears as a visible system turn.
+  'pcp-activity',
+  'pcp-activity-history',
   'passive-recall',
   'budget-monitor',
   'auto-run',
@@ -9279,7 +9284,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'ink':
         case 'pcp': {
           // 'pcp' kept as a silent alias: it is what actually dispatched
-          // before #655, so it is the spelling in people's muscle memory.
+          // before #659, so it is the spelling in people's muscle memory.
           const tool = slash.args[0];
           if (!tool) {
             showInPanel(['Usage: /ink <tool> [jsonArgs]']);

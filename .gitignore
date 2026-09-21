@@ -173,7 +173,8 @@ output/
 packages/api/output/
 
 # create-inkwell scaffolder state
-.create-ink-progress.json
+.create-inkwell-progress.json
+.create-pcp-progress.json
 
 # Runtime state (not committed)
 packages/cli/.ink/
@@ -187,3 +188,7 @@ docs/screenshots/
 
 # Studio runtime state (contains identity + operator email — never commit)
 .pcp/
+
+# Python bytecode from scripts/
+__pycache__/
+*.pyc

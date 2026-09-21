@@ -253,7 +253,7 @@ export function buildTranscriptInstallPlan(options: {
 
   // 'ink' is the stored backend value; 'pcp' is the pre-rename spelling kept
   // for rows written before 01b9047b. Matching only 'pcp' made this branch
-  // unreachable, so the ink REPL transcript destination was never chosen (#655).
+  // unreachable, so the ink REPL transcript destination was never chosen (#659).
   if (backend.includes('ink') || backend.includes('pcp')) {
     return {
       destinationPath: join(

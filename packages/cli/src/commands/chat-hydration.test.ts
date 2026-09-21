@@ -448,6 +448,33 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
     expect(result.tailPreview.map((p) => p.content)).not.toContain('old');
   });
 
+  // Transcripts written before #659 carry the old source spelling, and they
+  // are replayed, not rewritten. If the internal set only knows the new name,
+  // every historical bookkeeping line reappears as a visible system turn.
+  it('keeps PRE-RENAME internal sources out of replay too', () => {
+    writeTranscript([
+      { type: 'user', content: 'old' },
+      {
+        type: 'compaction',
+        summary: 'the summary',
+        keptEntries: [
+          { role: 'system', content: '[HEARTBEAT TRIGGER] hourly check', source: 'heartbeat' },
+          { role: 'system', content: 'internal echo', source: 'pcp-activity' },
+          { role: 'system', content: 'hydrated echo', source: 'pcp-activity-history' },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const labels = result.tailPreview.map((p) => p.label || p.role);
+    expect(labels).toContain('heartbeat'); // control: a visible source still replays
+    expect(labels).not.toContain('pcp-activity');
+    expect(labels).not.toContain('pcp-activity-history');
+    expect(result.tailPreview.map((p) => p.content)).not.toContain('internal echo');
+  });
+
   it('skips malformed keptEntries without crashing', () => {
     writeTranscript([
       {
