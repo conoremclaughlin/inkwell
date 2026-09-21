@@ -48,9 +48,11 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'delegate-send', description: 'Send inbox with delegation' },
   { name: 'bookmark', description: 'Set context bookmark' },
   { name: 'bookmarks', description: 'List bookmarks' },
-  { name: 'eject', description: 'Eject context to bookmark' },
   { name: 'trim', description: 'Trim oldest context entries' },
-  { name: 'evict', description: 'Evict context entries (ids, source:, role:)' },
+  { name: 'evict', description: 'Evict context entries (ids, source:, role:, bookmark:)' },
+  // Deprecated spelling of `/evict bookmark:<ref>`, kept so the completion
+  // list can tell a user who types it where the verb went. Still runs.
+  { name: 'eject', description: 'Deprecated — use /evict bookmark:<ref>' },
   { name: 'evicted', description: 'Show evicted-from-context entries' },
   { name: 'context', description: 'Open context inspector (bootstrap, memories, ledger)' },
   { name: 'usage', description: 'Show context token estimate' },

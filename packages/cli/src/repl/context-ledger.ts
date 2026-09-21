@@ -54,7 +54,7 @@ export interface LedgerBookmark {
   approxTokensAtCreation: number;
 }
 
-export interface LedgerEjectResult {
+export interface LedgerBookmarkEvictResult {
   bookmark: LedgerBookmark;
   removedEntries: LedgerEntry[];
   removedTokens: number;
@@ -132,8 +132,8 @@ export class ContextLedger {
 
   /**
    * Find entry IDs matching persistent eviction refs. Matches by eid when
-   * the ref carries one (precise), otherwise by content hash (legacy /
-   * live entries — identical role+content duplicates match together).
+   * the ref carries one (precise), otherwise by content hash — bounded to as
+   * many entries as there were refs.
    */
   public findEntriesByRefs(refs: Array<{ eid?: number; hash?: string }>): number[] {
     // Three kinds of ref, three rules. A ref that carries a hash ENFORCES it:
@@ -141,29 +141,58 @@ export class ContextLedger {
     // later event both hydrate with it), so matching by eid alone whenever
     // one was present turned a hash-selected eviction back into an eid
     // eviction on replay — the neighbour went with the target (Lumen, PR
-    // #582). Eid-only refs keep their legacy behaviour; hash-only refs match
-    // by content wherever it sits.
+    // #582). Eid-only refs keep their legacy behaviour.
+    //
+    // Hash-only refs are COUNTED, not set-matched. Content is not a unique
+    // key: send the same message twice and both entries share a hash, so a
+    // set removed every copy on replay no matter how many the eviction
+    // actually took. Evicting one of two identical messages dropped the
+    // survivor too — it existed live, and came back missing (Lumen, PR #653).
+    // One ref is written per removed entry, so the ref count IS the number
+    // evicted; spending a budget per hash replays that multiplicity.
+    //
+    // Which copy gets spent is ledger order, oldest first, because that is
+    // what an eviction back to a bookmark removed. A ref that must name an
+    // exact occurrence carries an eid — that is what eids are for, and live
+    // entries from transcript-backed events now carry theirs.
+    //
+    // The two kinds resolve in two passes, named first, because one batch
+    // holds both: recordEviction writes eid+hash for a removed entry that has
+    // an eid and hash-only for one that does not, and a ledger carries both
+    // identities at once wherever a compaction's kept tail preserves eids
+    // beside entries loaded without any. Spending budgets in ledger order
+    // alongside the named matches let the named entry consume the anonymous
+    // ref intended for its twin, and the twin — a genuinely removed entry —
+    // came back on reattach (Lumen, PR #653 round 2). Reserving first is not
+    // an ordering preference: a named ref has exactly one entry it can mean,
+    // an anonymous one has a choice, so the constrained match goes first.
     const eidOnly = new Set(
       refs.filter((r) => typeof r.eid === 'number' && typeof r.hash !== 'string').map((r) => r.eid!)
     );
-    const hashOnly = new Set(
-      refs
-        .filter((r) => typeof r.eid !== 'number' && typeof r.hash === 'string')
-        .map((r) => r.hash!)
-    );
+    const hashOnlyBudget = new Map<string, number>();
+    for (const ref of refs) {
+      if (typeof ref.eid === 'number' || typeof ref.hash !== 'string') continue;
+      hashOnlyBudget.set(ref.hash, (hashOnlyBudget.get(ref.hash) ?? 0) + 1);
+    }
     const both = refs.filter((r) => typeof r.eid === 'number' && typeof r.hash === 'string');
-    const ids: number[] = [];
+    const matched = new Set<number>();
     for (const entry of this.entries) {
+      if (entry.eid === undefined) continue;
       const hash = entryRefHash(entry.role, entry.content);
-      if (entry.eid !== undefined && eidOnly.has(entry.eid)) {
-        ids.push(entry.id);
-      } else if (hashOnly.has(hash)) {
-        ids.push(entry.id);
-      } else if (both.some((r) => r.eid === entry.eid && r.hash === hash)) {
-        ids.push(entry.id);
+      if (eidOnly.has(entry.eid) || both.some((r) => r.eid === entry.eid && r.hash === hash)) {
+        matched.add(entry.id);
       }
     }
-    return ids;
+    for (const entry of this.entries) {
+      if (matched.has(entry.id)) continue;
+      const hash = entryRefHash(entry.role, entry.content);
+      const budget = hashOnlyBudget.get(hash) ?? 0;
+      if (budget > 0) {
+        hashOnlyBudget.set(hash, budget - 1);
+        matched.add(entry.id);
+      }
+    }
+    return this.entries.filter((entry) => matched.has(entry.id)).map((entry) => entry.id);
   }
 
   public listEntries(): LedgerEntry[] {
@@ -191,24 +220,18 @@ export class ContextLedger {
     return bookmark;
   }
 
-  public ejectToBookmark(ref: string): LedgerEjectResult | null {
-    const preview = this.previewEjectToBookmark(ref);
-    if (!preview) {
-      return null;
-    }
-
-    const cutoff = Math.min(preview.bookmark.entryIndex, this.entries.length - 1);
-    this.entries = cutoff < 0 ? this.entries : this.entries.slice(cutoff + 1);
-
-    // Remove bookmarks at/inside the ejected region.
-    this.bookmarks = this.bookmarks
-      .filter((b) => b.entryIndex > cutoff)
-      .map((b) => ({ ...b, entryIndex: b.entryIndex - (cutoff + 1) }));
-
-    return preview;
-  }
-
-  public previewEjectToBookmark(ref: string): LedgerEjectResult | null {
+  /**
+   * Resolve a bookmark ref to the entries at or before it — the positional
+   * SELECTOR in the evict family, alongside by-id, by-source and by-role.
+   *
+   * Selection only: everything removes through `evictEntries`. There was a
+   * mutating twin here (`ejectToBookmark`, which sliced the prefix itself)
+   * until 2026-09-17. Two removal implementations on one ledger is how the
+   * two diverged in the first place — the slicing one never recorded a
+   * `context_evict`, so its removals came back on reattach. One remover, and
+   * that cannot happen again by construction.
+   */
+  public previewEvictToBookmark(ref: string): LedgerBookmarkEvictResult | null {
     const bookmark =
       ref === 'last'
         ? this.bookmarks[this.bookmarks.length - 1]
@@ -386,9 +409,9 @@ export class ContextLedger {
   }
 
   /**
-   * Evict specific entries by ID. Unlike eject (positional) or trim (oldest-first),
-   * this removes arbitrary entries — enabling the SB to surgically drop irrelevant
-   * context while preserving everything else.
+   * Evict specific entries by ID. Unlike evictToBookmark (positional) or trim
+   * (oldest-first), this removes arbitrary entries — enabling the SB to
+   * surgically drop irrelevant context while preserving everything else.
    */
   public evictEntries(entryIds: number[]): LedgerEvictResult {
     const idSet = new Set(entryIds);

@@ -8,7 +8,30 @@ import { ContextLedger } from './context-ledger.js';
 
 describe('parseEvictSelection', () => {
   it('returns list mode when no selector given', () => {
-    expect(parseEvictSelection([])).toEqual({ list: true, dryRun: false });
+    expect(parseEvictSelection([])).toEqual({ list: true, dryRun: false, force: false });
+  });
+
+  it('parses bookmark refs, preserving label case', () => {
+    expect(parseEvictSelection(['bookmark:heavy']).bookmark).toBe('heavy');
+    expect(parseEvictSelection(['bookmark:last']).bookmark).toBe('last');
+    // Labels are user-chosen free text, unlike role: whose values are a
+    // fixed lowercase set — lowercasing here would fail to match `Big Run`.
+    expect(parseEvictSelection(['bookmark:Big Run']).bookmark).toBe('Big Run');
+  });
+
+  it('rejects an empty bookmark value', () => {
+    expect(parseEvictSelection(['bookmark:']).error).toMatch(/bookmark: requires a value/);
+  });
+
+  it('rejects two bookmark filters', () => {
+    expect(parseEvictSelection(['bookmark:a', 'bookmark:b']).error).toMatch(/Only one bookmark/);
+  });
+
+  it('parses --force', () => {
+    const sel = parseEvictSelection(['bookmark:heavy', '--force']);
+    expect(sel.force).toBe(true);
+    expect(sel.bookmark).toBe('heavy');
+    expect(parseEvictSelection(['3']).force).toBe(false);
   });
 
   it('list mode with dry-run flag alone', () => {
@@ -51,12 +74,36 @@ describe('parseEvictSelection', () => {
 
   it('rejects mixing ids with filters', () => {
     const sel = parseEvictSelection(['3', 'source:heartbeat']);
-    expect(sel.error).toMatch(/not both/);
+    expect(sel.error).toMatch(/one selector at a time/);
   });
 
   it('rejects mixing source and role', () => {
     const sel = parseEvictSelection(['source:heartbeat', 'role:inbox']);
-    expect(sel.error).toMatch(/not both/);
+    expect(sel.error).toMatch(/one selector at a time/);
+  });
+
+  // Every unordered pair of the four selector kinds. The guard is a count,
+  // so a pair it misses would be a pair that never reaches the count —
+  // enumerated rather than sampled, because "some combinations are rejected"
+  // is exactly what the old pairwise chain could claim while leaving holes.
+  it('rejects every pair of selector kinds', () => {
+    const kinds: Array<[string, string[]]> = [
+      ['ids', ['3']],
+      ['source', ['source:heartbeat']],
+      ['role', ['role:inbox']],
+      ['bookmark', ['bookmark:heavy']],
+    ];
+    const pairs: string[] = [];
+    for (let i = 0; i < kinds.length; i++) {
+      for (let j = i + 1; j < kinds.length; j++) {
+        const sel = parseEvictSelection([...kinds[i][1], ...kinds[j][1]]);
+        pairs.push(`${kinds[i][0]}+${kinds[j][0]}`);
+        expect(sel.error, `${kinds[i][0]} + ${kinds[j][0]} should be rejected`).toMatch(
+          /one selector at a time/
+        );
+      }
+    }
+    expect(pairs).toHaveLength(6);
   });
 
   it('rejects garbage selectors', () => {
@@ -102,20 +149,20 @@ describe('selectEvictionEntries', () => {
   it('selects by ids in ledger order', () => {
     const entries = buildLedger().listEntries();
     const sel = parseEvictSelection(['4,1']);
-    const matched = selectEvictionEntries(entries, sel);
+    const matched = selectEvictionEntries(entries, sel)!;
     expect(matched.map((e) => e.id)).toEqual([1, 4]);
   });
 
   it('selects by source', () => {
     const entries = buildLedger().listEntries();
-    const matched = selectEvictionEntries(entries, parseEvictSelection(['source:heartbeat']));
+    const matched = selectEvictionEntries(entries, parseEvictSelection(['source:heartbeat']))!;
     expect(matched).toHaveLength(2);
     expect(matched.every((e) => e.source === 'heartbeat')).toBe(true);
   });
 
   it('selects by role', () => {
     const entries = buildLedger().listEntries();
-    const matched = selectEvictionEntries(entries, parseEvictSelection(['role:inbox']));
+    const matched = selectEvictionEntries(entries, parseEvictSelection(['role:inbox']))!;
     expect(matched.map((e) => e.role)).toEqual(['inbox']);
   });
 
@@ -127,8 +174,46 @@ describe('selectEvictionEntries', () => {
 
   it('ignores unknown ids silently', () => {
     const entries = buildLedger().listEntries();
-    const matched = selectEvictionEntries(entries, parseEvictSelection(['99']));
+    const matched = selectEvictionEntries(entries, parseEvictSelection(['99']))!;
     expect(matched).toEqual([]);
+  });
+
+  it('selects to a bookmark through the ledger, not a second cutoff rule', () => {
+    const ledger = buildLedger();
+    const bookmark = ledger.createBookmark('halfway');
+    ledger.addEntry('user', 'after the bookmark');
+
+    const matched = selectEvictionEntries(
+      ledger.listEntries(),
+      parseEvictSelection([`bookmark:${bookmark.label}`]),
+      (ref) => ledger.previewEvictToBookmark(ref)?.removedEntries ?? null
+    )!;
+
+    expect(matched.map((e) => e.id)).toEqual([1, 2, 3, 4, 5]);
+    expect(matched.map((e) => e.content)).not.toContain('after the bookmark');
+  });
+
+  it('distinguishes an unknown bookmark from a selector that matched nothing', () => {
+    const ledger = buildLedger();
+    const unknown = selectEvictionEntries(
+      ledger.listEntries(),
+      parseEvictSelection(['bookmark:nope']),
+      (ref) => ledger.previewEvictToBookmark(ref)?.removedEntries ?? null
+    );
+    expect(unknown).toBeNull();
+
+    // Contrast: a real selector with no matches is an empty array, and the
+    // caller reports those two cases with different text.
+    const empty = selectEvictionEntries(ledger.listEntries(), parseEvictSelection(['99']));
+    expect(empty).toEqual([]);
+  });
+
+  it('reports an unwired resolver as unresolvable rather than evicting nothing', () => {
+    const ledger = buildLedger();
+    ledger.createBookmark('halfway');
+    expect(
+      selectEvictionEntries(ledger.listEntries(), parseEvictSelection(['bookmark:halfway']))
+    ).toBeNull();
   });
 });
 

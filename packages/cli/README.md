@@ -447,7 +447,11 @@ Inside REPL:
 - `/events [now|on|off]` poll or toggle merged PCP activity stream during chat
 - `/sessions [watch|off]` show active sessions (id + SB + status + thread)
 - `/bookmark [label]` create a context bookmark
-- `/eject <bookmark|last>` eject context up to bookmark (and persist a `remember` checkpoint)
+- `/evict [ids | source:<name> | role:<role> | bookmark:<ref>] [--dry-run] [--force]` remove context entries.
+  `bookmark:<ref>` removes everything up to and including that bookmark (`bookmark:last` for the most
+  recent) and persists a `remember` checkpoint. Removals over ~1,500 tokens or 8 entries confirm first;
+  `--force` skips the prompt. `/eject <bookmark|last>` is the deprecated spelling of `bookmark:` and
+  still works.
 - `/backend <claude|codex|gemini>` switch backend
 - `/model <id>` set/clear model override
 - `/tools <backend|off|privileged>` adjust tool policy mode

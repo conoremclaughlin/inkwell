@@ -20,28 +20,49 @@ describe('ContextLedger', () => {
     expect(ledger.totalTokens()).toBeGreaterThan(0);
   });
 
-  it('creates bookmarks and ejects context up to bookmark', () => {
+  it('creates bookmarks and evicts context up to bookmark', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('user', 'one');
     const bookmark = ledger.createBookmark('first');
     ledger.addEntry('assistant', 'two');
     ledger.addEntry('user', 'three');
 
-    const result = ledger.ejectToBookmark(bookmark.id);
-    expect(result).not.toBeNull();
-    expect(result?.removedEntries).toHaveLength(1);
+    const selected = ledger.previewEvictToBookmark(bookmark.id);
+    expect(selected).not.toBeNull();
+    expect(selected?.removedEntries).toHaveLength(1);
+    ledger.evictEntries(selected!.removedEntries.map((entry) => entry.id));
     expect(ledger.listEntries().map((entry) => entry.content)).toEqual(['two', 'three']);
   });
 
-  it('previews ejection without mutating entries', () => {
+  it('selecting to a bookmark does not mutate entries', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('user', 'a');
     const bookmark = ledger.createBookmark('first');
     ledger.addEntry('assistant', 'b');
 
-    const preview = ledger.previewEjectToBookmark(bookmark.id);
+    const preview = ledger.previewEvictToBookmark(bookmark.id);
     expect(preview?.removedEntries.map((entry) => entry.content)).toEqual(['a']);
     expect(ledger.listEntries().map((entry) => entry.content)).toEqual(['a', 'b']);
+  });
+
+  // The two removal paths used to differ here: the bookmark one sliced the
+  // prefix and rewrote indices itself, evictEntries remapped them. Routing
+  // bookmark removal through evictEntries has to leave bookmarks where the
+  // old slice put them.
+  it('bookmark eviction drops bookmarks inside the range and keeps later ones', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'one');
+    const inside = ledger.createBookmark('inside');
+    ledger.addEntry('assistant', 'two');
+    const after = ledger.createBookmark('after');
+    ledger.addEntry('user', 'three');
+
+    const selected = ledger.previewEvictToBookmark(inside.id);
+    ledger.evictEntries(selected!.removedEntries.map((entry) => entry.id));
+
+    expect(ledger.listBookmarks().map((b) => b.label)).toEqual(['after']);
+    const survivor = ledger.listBookmarks()[0];
+    expect(ledger.listEntries()[survivor.entryIndex].content).toBe('two');
   });
 
   it('builds transcript respecting maxTokens', () => {
@@ -190,6 +211,120 @@ describe('ContextLedger', () => {
       const c = ledger.addEntry('user', 'c');
       expect(ledger.findEntriesByRefs([{ eid: 7 }]).sort()).toEqual([a.id, b.id].sort());
       expect(ledger.findEntriesByRefs([{ hash: entryRefHash('user', 'c') }])).toEqual([c.id]);
+    });
+  });
+
+  describe('findEntriesByRefs — hash-only refs are counted, not set-matched (Lumen, PR #653)', () => {
+    // Entries that never carried an eid — a pre-eid transcript, or history
+    // loaded from the server rather than the transcript — are addressable
+    // only by content hash, and content is not a unique key.
+    it('REGRESSION: one ref over two identical entries selects one, not both', () => {
+      const ledger = new ContextLedger();
+      const first = ledger.addEntry('user', 'repeated message');
+      const second = ledger.addEntry('user', 'repeated message');
+      const ids = ledger.findEntriesByRefs([{ hash: entryRefHash('user', 'repeated message') }]);
+      expect(ids).toEqual([first.id]);
+      expect(ids).not.toContain(second.id);
+    });
+
+    it('spends one ref per entry, so evicting both copies still takes both', () => {
+      const ledger = new ContextLedger();
+      const first = ledger.addEntry('user', 'repeated message');
+      const second = ledger.addEntry('user', 'repeated message');
+      const hash = entryRefHash('user', 'repeated message');
+      expect(ledger.findEntriesByRefs([{ hash }, { hash }])).toEqual([first.id, second.id]);
+    });
+
+    it('a budget larger than the ledger is not an error — it matches what is there', () => {
+      const ledger = new ContextLedger();
+      const only = ledger.addEntry('user', 'repeated message');
+      const hash = entryRefHash('user', 'repeated message');
+      expect(ledger.findEntriesByRefs([{ hash }, { hash }, { hash }])).toEqual([only.id]);
+    });
+
+    it('budgets are per hash — one hash running out does not consume another', () => {
+      const ledger = new ContextLedger();
+      const dupA = ledger.addEntry('user', 'alpha');
+      ledger.addEntry('user', 'alpha');
+      const beta = ledger.addEntry('user', 'beta');
+      const ids = ledger.findEntriesByRefs([
+        { hash: entryRefHash('user', 'alpha') },
+        { hash: entryRefHash('user', 'beta') },
+      ]);
+      expect(ids).toEqual([dupA.id, beta.id]);
+    });
+
+    it('role is part of the key, so identical text in another role is untouched', () => {
+      const ledger = new ContextLedger();
+      const asUser = ledger.addEntry('user', 'same words');
+      const asAssistant = ledger.addEntry('assistant', 'same words');
+      const ids = ledger.findEntriesByRefs([{ hash: entryRefHash('user', 'same words') }]);
+      expect(ids).toEqual([asUser.id]);
+      expect(ids).not.toContain(asAssistant.id);
+    });
+
+    it('an eid ref still names its exact occurrence among identical copies', () => {
+      // The precision the budget cannot give: which of two identical entries.
+      // Live entries from transcript-backed events carry their eid for this.
+      const ledger = new ContextLedger();
+      ledger.addEntry('user', 'repeated message', 'repl', 4);
+      const later = ledger.addEntry('user', 'repeated message', 'repl', 9);
+      const ids = ledger.findEntriesByRefs([
+        { eid: 9, hash: entryRefHash('user', 'repeated message') },
+      ]);
+      expect(ids).toEqual([later.id]);
+    });
+
+    // A batch can mix the two identities — recordEviction writes eid+hash for
+    // an entry that has one and hash-only for an entry that does not, and a
+    // ledger holds both at once wherever a compaction's kept tail carries eids
+    // beside entries loaded without any (Lumen, PR #653 round 2).
+    it('REGRESSION: a named entry does not spend the anonymous ref meant for its twin', () => {
+      const ledger = new ContextLedger();
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const anonymous = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const hash = entryRefHash('inbox', 'identical body');
+      expect(ledger.findEntriesByRefs([{ eid: 7, hash }, { hash }])).toEqual([
+        named.id,
+        anonymous.id,
+      ]);
+    });
+
+    it('REGRESSION: the same mixed batch in the other ref order takes both too', () => {
+      const ledger = new ContextLedger();
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const anonymous = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const hash = entryRefHash('inbox', 'identical body');
+      expect(ledger.findEntriesByRefs([{ hash }, { eid: 7, hash }])).toEqual([
+        named.id,
+        anonymous.id,
+      ]);
+    });
+
+    it('reserving the named entry does not widen the anonymous budget past its count', () => {
+      // One anonymous ref stays one entry: the eid-carrying twin is claimed by
+      // its own ref, and the third copy survives.
+      const ledger = new ContextLedger();
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const firstAnonymous = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const survivor = ledger.addEntry('inbox', 'identical body', 'inkmail');
+      const hash = entryRefHash('inbox', 'identical body');
+      const ids = ledger.findEntriesByRefs([{ eid: 7, hash }, { hash }]);
+      expect(ids).toEqual([named.id, firstAnonymous.id]);
+      expect(ids).not.toContain(survivor.id);
+    });
+
+    it('an anonymous ref may still claim an eid-carrying entry no ref names', () => {
+      // The budget is not restricted to eid-less entries — it spends on
+      // whatever the named refs left behind, oldest first.
+      const ledger = new ContextLedger();
+      const unnamed = ledger.addEntry('inbox', 'identical body', 'inkmail', 4);
+      const named = ledger.addEntry('inbox', 'identical body', 'inkmail', 7);
+      const hash = entryRefHash('inbox', 'identical body');
+      expect(ledger.findEntriesByRefs([{ eid: 7, hash }, { hash }])).toEqual([
+        unnamed.id,
+        named.id,
+      ]);
     });
   });
 

@@ -6,12 +6,27 @@ import { mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
+  /**
+   * A stand-in InkRepl. Left undefined, `renderInkChat` returns nothing and
+   * the REPL takes its legacy readline path, which is what every case here
+   * but the TUI ones wants. Set it to exercise the Ink surface — where `rl`
+   * is null, so anything reaching for it directly throws.
+   */
+  ink: undefined as Record<string, unknown> | undefined,
   pcpCalls: [] as Array<{ tool: string; args: Record<string, unknown> }>,
   identity: { studioId: 'studio-test' } as { studioId?: string },
   callToolImpl: vi.fn(),
   runBackendImpl: vi.fn(),
   discoverSkillsImpl: vi.fn(),
   loadSkillInstructionImpl: vi.fn(),
+  /**
+   * Whether the (absent) server acknowledges turn ownership. The harness runs
+   * with `studioId: 'studio-test'`, which is studio-backed, so the REAL
+   * turnGateDecision — still imported unmocked below — refuses every turn when
+   * this is false. Only the HTTP post is stubbed; the predicate chain the turn
+   * queue evaluates is production's.
+   */
+  turnOpenImpl: vi.fn(),
 }));
 
 vi.mock('../backends/identity.js', async (importOriginal) => {
@@ -40,14 +55,38 @@ vi.mock('../repl/backend-runner.js', () => ({
   }),
 }));
 
+// Partial mock: `turnGateDecision` stays real so the gate is still exercised —
+// only the marker POST, which has no server here, is replaced.
+vi.mock('../repl/turn-signal.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../repl/turn-signal.js')>();
+  return {
+    ...original,
+    createTurnSignal: () => ({
+      open: async () => testState.turnOpenImpl() as boolean,
+      close: async () => true,
+      detach: async () => true,
+    }),
+  };
+});
+
 vi.mock('../repl/skills.js', () => ({
   discoverSkills: (cwd: string) => testState.discoverSkillsImpl(cwd),
   loadSkillInstruction: (skill: Record<string, unknown>, maxChars?: number) =>
     testState.loadSkillInstructionImpl(skill, maxChars),
 }));
 
+// `renderInkChat` is NOT async in production, and chat.ts does not await it —
+// an `async () => null` stub handed back a Promise, so `useInk` cases got an
+// object with none of the InkRepl methods on it. Returning testState.ink
+// directly is what lets a case exercise the Ink surface at all; undefined
+// (the default) keeps every other case on the legacy readline path.
+// The picker throws rather than stubbing a choice: cases pass `new: true` to
+// skip it, and a silent default would pick a branch on their behalf.
 vi.mock('../repl/ink/index.js', () => ({
-  renderInkChat: async () => null,
+  renderInkChat: () => testState.ink ?? null,
+  renderSessionPicker: () => {
+    throw new Error('renderSessionPicker reached — pass `new: true` to skip the session picker');
+  },
   InkExitSignal: class InkExitSignal extends Error {},
 }));
 
@@ -76,7 +115,8 @@ vi.mock('readline/promises', () => ({
   }),
 }));
 
-import { runChat } from './chat.js';
+import { hydrateLedgerFromTranscript, runChat } from './chat.js';
+import { ContextLedger, entryRefHash, type LedgerRole } from '../repl/context-ledger.js';
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
@@ -93,12 +133,15 @@ describe('runChat integration', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-02-27T00:00:00.000Z'));
     testState.inputs = [];
+    testState.ink = undefined;
     testState.pcpCalls = [];
     testState.identity = { studioId: 'studio-test' };
     testState.callToolImpl.mockReset();
     testState.runBackendImpl.mockReset();
     testState.discoverSkillsImpl.mockReset();
     testState.loadSkillInstructionImpl.mockReset();
+    testState.turnOpenImpl.mockReset();
+    testState.turnOpenImpl.mockReturnValue(true);
 
     testState.callToolImpl.mockImplementation(async (tool: string) => {
       switch (tool) {
@@ -147,6 +190,22 @@ describe('runChat integration', () => {
     else process.env.INK_DELEGATION_SECRET = originalDelegationSecret;
     process.chdir(originalCwd);
     rmSync(testCwd, { recursive: true, force: true });
+  });
+
+  // The gate this asserts is why every turn-running test in this file was
+  // silently failing: studio-backed work with no acknowledged marker refuses
+  // the turn, and with no CI job running this suite nothing said so. Keeping
+  // an explicit case means a future gate change shows up as THIS test going
+  // red, not as thirty unrelated ones.
+  it('refuses a studio-backed turn when the server does not acknowledge ownership', async () => {
+    testState.turnOpenImpl.mockReturnValue(false);
+    testState.inputs = ['hello from test', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'codex', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('Turn not started');
+    expect(testState.runBackendImpl).not.toHaveBeenCalled();
   });
 
   it('runs a real user message turn and writes transcript entries', async () => {
@@ -2318,7 +2377,7 @@ describe('runChat integration', () => {
     expect(logText).toContain('Readline closed. Exiting chat gracefully.');
   });
 
-  it('requires confirmation before large context ejection and allows cancel', async () => {
+  it('requires confirmation before a large context eviction and allows cancel', async () => {
     const huge = 'x'.repeat(7000);
     testState.inputs = [huge, '/bookmark heavy', 'follow-up', '/eject heavy', 'n', '/quit'];
 
@@ -2329,13 +2388,391 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('About to eject');
-    expect(logText).toContain('Ejection cancelled.');
+    expect(logText).toContain('About to evict');
+    expect(logText).toContain('Eviction cancelled.');
 
     const replDir = join(testCwd, '.ink', 'runtime', 'repl');
     const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
     const transcript = readFileSync(join(replDir, transcriptFiles[0]!), 'utf-8');
+    // A cancelled removal records nothing, under either event name.
     expect(transcript).not.toContain('"type":"context_eject"');
+    expect(transcript).not.toContain('"type":"context_evict"');
+  });
+
+  // Confirmation used to be reachable only through the bookmark spelling, so
+  // `/evict role:assistant` could drop the same tokens with no prompt. The
+  // guard is on size now, and this is the selector that proves it moved.
+  it('confirms a large eviction selected by role, not just by bookmark', async () => {
+    const huge = 'x'.repeat(7000);
+    testState.inputs = [huge, '/evict role:user', 'n', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('About to evict');
+    expect(logText).toContain('Eviction cancelled.');
+  });
+
+  it('warns that /eject is deprecated and names its replacement', async () => {
+    testState.inputs = ['hello', '/bookmark b', '/eject b --force', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('/eject is deprecated');
+    expect(logText).toContain('/evict bookmark:');
+  });
+
+  // A bookmark removal is an eviction. It has to be recorded in the shape a
+  // reattach replays, or the panel reports tokens freed that come straight
+  // back on the next attach. The control below is what makes the absence
+  // assertion mean anything: without the removal, hydration DOES hold the
+  // entry, so `false` here is the eviction working rather than a ledger that
+  // never had it.
+  const bookmarkEvictionCase = async (inputs: string[]) => {
+    const huge = 'x'.repeat(7000);
+    testState.inputs = [huge, '/bookmark heavy', 'follow-up', ...inputs, '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
+    const transcriptPath = join(replDir, transcriptFiles[0]!);
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    return {
+      huge,
+      survived: ledger.listEntries().some((entry) => entry.content.includes(huge)),
+      transcript: readFileSync(transcriptPath, 'utf-8'),
+    };
+  };
+
+  it('control: without a bookmark eviction the entry is present after reattach', async () => {
+    const { survived } = await bookmarkEvictionCase([]);
+    expect(survived).toBe(true);
+  });
+
+  it('a bookmark eviction stays gone on reattach', async () => {
+    const { survived } = await bookmarkEvictionCase(['/evict bookmark:heavy --force']);
+    expect(survived).toBe(false);
+  });
+
+  it('the deprecated /eject alias evicts the same way', async () => {
+    const { survived, transcript } = await bookmarkEvictionCase(['/eject heavy --force']);
+    expect(survived).toBe(false);
+    expect(transcript).toContain('"type":"context_evict"');
+  });
+
+  // The bookmark in every case above is set one input after a message that is
+  // still queued. Without the settle, `/bookmark` recorded index 0 on an
+  // empty ledger and the eviction that followed removed a single ~11-token
+  // entry while reporting success — which is exactly how the pre-existing
+  // confirmation test came to pass for years against the wrong entries.
+  it('a bookmark set right after a message covers that message', async () => {
+    const huge = 'x'.repeat(7000);
+    testState.inputs = [huge, '/bookmark heavy', '/evict bookmark:heavy --dry-run', '/quit'];
+
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    const match = logText.match(/Would evict (\d+) entries \(~([\d,]+) tok\)/);
+    expect(match, 'expected a dry-run summary line').toBeTruthy();
+    expect(Number(match![2].replace(/,/g, ''))).toBeGreaterThanOrEqual(1750);
+  });
+
+  // ── Review findings, PR #653 (Lumen) ──
+
+  // The confirmation has three possible input surfaces and `rl` is only one of
+  // them. Asking through `rl` directly threw on the Ink path, where it is null,
+  // and took runChat down before cleanup — reachable by any /evict big enough
+  // to prompt, which is the case the confirmation exists for.
+  it('REGRESSION: a large eviction can be asked and cancelled in the Ink TUI', async () => {
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    const noop = () => undefined;
+    // Ink output does not go to console.log — it goes to these. Collect it, or
+    // the assertion reads an empty stream and passes for the wrong reason.
+    const inkOutput: string[] = [];
+    const record = (...parts: unknown[]) => {
+      inkOutput.push(
+        parts.map((part) => (Array.isArray(part) ? part.join('\n') : String(part))).join(' ')
+      );
+    };
+    testState.ink = {
+      waitForInput: async () => {
+        const next = testState.inputs.shift();
+        if (next === undefined) throw new Error('No scripted input left for Ink waitForInput');
+        return next;
+      },
+      addMessage: (_role: unknown, content: unknown) => record(content),
+      printSystem: record,
+      printEvent: record,
+      setCommandOutput: record,
+      setStatus: noop,
+      setWaiting: noop,
+      setInfoItems: noop,
+      setAbortHandler: noop,
+      setSurfacedMemories: noop,
+      showContextView: noop,
+      requestExit: noop,
+      cleanup: noop,
+      handle: { setCtrlOHandler: noop, setCtrlTHandler: noop },
+    };
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+    testState.inputs = ['x'.repeat(7000), '/evict role:user', 'n', '/quit'];
+    try {
+      await expect(
+        runChat({ agent: 'lumen', backend: 'claude', new: true, pollSeconds: '999' })
+      ).resolves.toBeUndefined();
+      const text = stripAnsi(inkOutput.join('\n'));
+      // Asked on the Ink surface, and the scripted "n" was read as the answer.
+      expect(text).toContain('Proceed with eviction?');
+      expect(text).toContain('Eviction cancelled');
+      // Cancelled means cancelled: the entry is still there.
+      expect(text).not.toContain('🗑 evicted');
+    } finally {
+      if (tty) Object.defineProperty(process.stdout, 'isTTY', tty);
+      else delete (process.stdout as unknown as { isTTY?: boolean }).isTTY;
+      testState.ink = undefined;
+    }
+  });
+
+  it('a large eviction confirmed with y in the Ink TUI goes through', async () => {
+    const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    const noop = () => undefined;
+    const inkOutput: string[] = [];
+    const record = (...parts: unknown[]) => {
+      inkOutput.push(
+        parts.map((part) => (Array.isArray(part) ? part.join('\n') : String(part))).join(' ')
+      );
+    };
+    testState.ink = {
+      waitForInput: async () => {
+        const next = testState.inputs.shift();
+        if (next === undefined) throw new Error('No scripted input left for Ink waitForInput');
+        return next;
+      },
+      addMessage: (_role: unknown, content: unknown) => record(content),
+      printSystem: record,
+      printEvent: record,
+      setCommandOutput: record,
+      setStatus: noop,
+      setWaiting: noop,
+      setInfoItems: noop,
+      setAbortHandler: noop,
+      setSurfacedMemories: noop,
+      showContextView: noop,
+      requestExit: noop,
+      cleanup: noop,
+      handle: { setCtrlOHandler: noop, setCtrlTHandler: noop },
+    };
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+    testState.inputs = ['x'.repeat(7000), '/evict role:user', 'y', '/quit'];
+    try {
+      await runChat({ agent: 'lumen', backend: 'claude', new: true, pollSeconds: '999' });
+      const text = stripAnsi(inkOutput.join('\n'));
+      expect(text).toContain('Proceed with eviction?');
+      expect(text).toContain('🗑 evicted');
+      expect(text).not.toContain('Eviction cancelled');
+    } finally {
+      if (tty) Object.defineProperty(process.stdout, 'isTTY', tty);
+      else delete (process.stdout as unknown as { isTTY?: boolean }).isTTY;
+      testState.ink = undefined;
+    }
+  });
+
+  // Content is not a unique key. Two identical messages either side of a
+  // bookmark produce one eviction ref and two matching entries, so replay
+  // removed the survivor along with the target: it was there live and came
+  // back missing. The control below is what makes the count mean anything —
+  // without the eviction, hydration holds both copies.
+  const repeatedMessageCase = async (inputs: string[]) => {
+    testState.inputs = [
+      'repeated message',
+      '/bookmark boundary',
+      'repeated message',
+      ...inputs,
+      '/quit',
+    ];
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptPath = join(
+      replDir,
+      readdirSync(replDir).find((entry) => entry.endsWith('.jsonl'))!
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    return ledger
+      .listEntries()
+      .filter((entry) => entry.role === 'user')
+      .map((entry) => entry.content);
+  };
+
+  it('control: without an eviction both identical copies survive reattach', async () => {
+    expect(await repeatedMessageCase([])).toEqual(['repeated message', 'repeated message']);
+  });
+
+  it.each([['/evict bookmark:boundary --force'], ['/eject boundary --force']])(
+    'REGRESSION: %s keeps the identical message after the bookmark',
+    async (command) => {
+      expect(await repeatedMessageCase([command])).toEqual(['repeated message']);
+    }
+  );
+
+  // One eviction batch can carry both ref identities: recordEviction writes
+  // eid+hash for a removed entry that has an eid and hash-only for one that
+  // does not. A compaction's kept tail preserves eids only where they exist,
+  // so a ledger holding an eid-carrying entry beside an identical legacy one
+  // is what a transcript spanning the eid wiring replays (Lumen, PR #653
+  // round 2). Resolving the anonymous ref in ledger order alongside the named
+  // match let the named entry spend the anonymous budget, and the second
+  // removed entry came back.
+  const mixedIdentityTranscript = (events: Array<Record<string, unknown>>): ContextLedger => {
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    const transcriptPath = join(replDir, `sess-mixed-refs-1700000000000.jsonl`);
+    writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify({
+          ts: '2026-02-25T07:00:00.000Z',
+          type: 'compaction',
+          eid: 11,
+          summary: 'earlier turns summarized',
+          summaryIndex: 0,
+          keptEntries: [
+            // Kept from a session that wired eids …
+            { role: 'inbox', content: 'identical body', source: 'inkmail', eid: 7 },
+            // … beside one loaded before they existed.
+            { role: 'inbox', content: 'identical body', source: 'inkmail' },
+          ],
+        }),
+        ...events.map((event) => JSON.stringify(event)),
+      ].join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    return ledger;
+  };
+
+  const bodies = (ledger: ContextLedger): string[] =>
+    ledger
+      .listEntries()
+      .filter((entry) => entry.role === 'inbox')
+      .map((entry) => entry.content);
+
+  it('control: with no eviction both mixed-identity copies hydrate', () => {
+    expect(bodies(mixedIdentityTranscript([]))).toEqual(['identical body', 'identical body']);
+  });
+
+  it('REGRESSION: an eviction of both copies replays as both, not one', () => {
+    const hash = entryRefHash('inbox', 'identical body');
+    const ledger = mixedIdentityTranscript([
+      {
+        ts: '2026-02-25T07:00:02.000Z',
+        type: 'context_evict',
+        eid: 12,
+        refs: [
+          { eid: 7, hash, role: 'inbox' },
+          { hash, role: 'inbox' },
+        ],
+      },
+    ]);
+    expect(bodies(ledger)).toEqual([]);
+  });
+
+  it('REGRESSION: the same batch in the other ref order replays as both', () => {
+    const hash = entryRefHash('inbox', 'identical body');
+    const ledger = mixedIdentityTranscript([
+      {
+        ts: '2026-02-25T07:00:02.000Z',
+        type: 'context_evict',
+        eid: 12,
+        refs: [
+          { hash, role: 'inbox' },
+          { eid: 7, hash, role: 'inbox' },
+        ],
+      },
+    ]);
+    expect(bodies(ledger)).toEqual([]);
+  });
+
+  it('one ref of a mixed batch still removes exactly one copy', () => {
+    // The bound the count exists for, with a named ref in play: removing only
+    // the eid-carrying entry leaves its twin.
+    const hash = entryRefHash('inbox', 'identical body');
+    const ledger = mixedIdentityTranscript([
+      {
+        ts: '2026-02-25T07:00:02.000Z',
+        type: 'context_evict',
+        eid: 12,
+        refs: [{ eid: 7, hash, role: 'inbox' }],
+      },
+    ]);
+    expect(bodies(ledger)).toEqual(['identical body']);
+  });
+
+  // The precision above rests on live entries carrying the eid of the event
+  // they will hydrate from, which only helps while the two agree on content:
+  // a ref carries eid AND hash, and the hash is enforced, so a divergence
+  // makes the eviction match nothing on replay instead of too much. Pin the
+  // agreement rather than assume it — `clone_fanout` does NOT have it (live
+  // collapses whitespace, hydration truncates raw), which is why its entries
+  // are deliberately not wired.
+  it('live ledger entries agree with their hydrated twin on eid and content', async () => {
+    // Capture what the LIVE path appends, at the append itself. Reading the
+    // transcript and comparing it to a ledger hydrated from that same file
+    // only proves hydration is self-consistent: both sides come from one
+    // source, so a live append that diverges from the event it wrote is
+    // invisible to it. Measured — with `ledger.addEntry('user', raw + '…')`
+    // mutated to diverge and the transcript write left alone, the earlier
+    // transcript-vs-hydrated form of this test stayed green (Lumen, #653 r2).
+    const addEntrySpy = vi.spyOn(ContextLedger.prototype, 'addEntry');
+
+    testState.inputs = ['a user message', '/quit'];
+    await runChat({ agent: 'lumen', backend: 'claude', pollSeconds: '999' });
+
+    const liveWired = addEntrySpy.mock.calls
+      .map((call) => ({ role: call[0], content: call[1], eid: call[3] }))
+      .filter(
+        (append): append is { role: LedgerRole; content: string; eid: number } =>
+          typeof append.eid === 'number'
+      );
+    addEntrySpy.mockRestore();
+
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptPath = join(
+      replDir,
+      readdirSync(replDir).find((entry) => entry.endsWith('.jsonl'))!
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const byEid = new Map(
+      ledger
+        .listEntries()
+        .filter((entry) => entry.eid !== undefined)
+        .map((entry) => [entry.eid!, entry])
+    );
+
+    // Coverage control: an empty capture makes the loop below vacuous and
+    // green. This run drives one user turn and its assistant reply, and both
+    // of those append sites are eid-wired.
+    expect(liveWired.map((append) => append.role).sort()).toEqual(['assistant', 'user']);
+
+    for (const append of liveWired) {
+      const hydrated = byEid.get(append.eid);
+      expect(
+        hydrated,
+        `no hydrated entry for the live ${append.role} append at eid ${append.eid}`
+      ).toBeTruthy();
+      expect(hydrated!.role, `live/hydrated role drift at eid ${append.eid}`).toBe(append.role);
+      expect(
+        hydrated!.content,
+        `live/hydrated content drift for ${append.role} at eid ${append.eid} — ` +
+          `an eid ref carries the hash too, so a divergence here makes this ` +
+          `type's evictions match nothing on replay`
+      ).toBe(append.content);
+    }
   });
 
   it('sends delegated inbox message with signed token metadata', async () => {
