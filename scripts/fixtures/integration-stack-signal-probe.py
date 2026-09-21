@@ -40,7 +40,7 @@ def check_output(args, **kwargs):
     if args == ["supabase", "--version"]:
         return "2.84.2"
     if args[:2] == ["docker", "ps"]:
-        return "fixture-id supabase_db_pcp-integration" if state["started"] else ""
+        return "fixture-id supabase_db_ink-integration" if state["started"] else ""
     raise AssertionError("Unexpected mocked capture")
 
 

@@ -26,7 +26,7 @@ class DataTests(unittest.TestCase):
         self.workdir = Path(self.temp.name)
         self.project = "ink-integration"
         self.id = "a" * 64
-        self.info = {"id": self.id, "name": "/supabase_db_pcp-integration",
+        self.info = {"id": self.id, "name": "/supabase_db_ink-integration",
                      "project": self.project, "running": True, "paused": False,
                      "ports": [{"HostIp": "127.0.0.1", "HostPort": "55422"}]}
         self.baseline = "-- Synthetic fixture baseline; no real records.\nSELECT 1;\n"
@@ -80,7 +80,7 @@ class DataTests(unittest.TestCase):
 
     def test_wrong_container_identity_refuses_in_isolation(self):
         for field, value in (("id", "b" * 64), ("name", "/supabase_db_application"),
-                             ("name", "/supabase_db_pcp-integration-copy"),
+                             ("name", "/supabase_db_ink-integration-copy"),
                              ("project", "application"), ("running", False),
                              ("paused", True),
                              ("ports", [{"HostPort": "54322"}]), ("ports", []),

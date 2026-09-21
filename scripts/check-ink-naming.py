@@ -176,13 +176,14 @@ FILE_ALLOWED: dict[str, list[tuple[str, str]]] = {
         (r"\.create-pcp-progress\.json", "still ignores the legacy resume file"),
     ],
     "scripts/lib/integration-stack.py": [
-        (r"pcp-integration", "legacy stack name, supported for --stop"),
+        (r"pcp-integration(?:-[A-Za-z0-9_]+)?", "legacy stack name, supported for --stop"),
         (r"\(\?:ink\|pcp\)-integration", "the validator pattern that accepts both"),
         (r'"pcp-"', "the prefix test that makes legacy stop-only"),
         (r"_pcp_it", "names the legacy bookkeeping schema in a comment"),
     ],
     "scripts/test-integration-stack.py": [
-        (r"pcp-integration", "covers the legacy stack name"),
+        (r"pcp-integration(?:-[A-Za-z0-9_]+)?", "covers the legacy stack name"),
+        (r"supabase_db_pcp-integration", "the legacy stack's container name"),
     ],
     "packages/api/src/config/env.ts": [
         (r"PCP_", "documents the INK_/PCP_ fallback"),
@@ -199,6 +200,12 @@ def anchor(pattern: str) -> str:
     Without this, `PCP_PORT_BASE` exempts `PCP_PORT_BASE_V2`, and any exemption
     becomes a prefix others can hide behind (Lumen, #659 review).
 
+    The boundary excludes a hyphen as well as word characters, and that is not
+    cosmetic: `supabase_db_pcp` masked `supabase_db_pcp-integration`, so the
+    integration fixtures kept a container name that no longer matched their
+    own project and every identity check refused. CI caught it; I had run the
+    sibling suite locally and not that one.
+
     The boundary is added only on an end that actually finishes with a word
     character. `ws[/-]pcp[/-]` deliberately ends on a separator and is followed
     by more path — demanding a non-word character after it would stop it
@@ -206,7 +213,7 @@ def anchor(pattern: str) -> str:
     it exists to allow.
     """
     lead = r"(?<![A-Za-z0-9_])" if re.match(r"[A-Za-z0-9_]", pattern) else ""
-    trail = r"(?![A-Za-z0-9_])" if re.search(r"[A-Za-z0-9_]$", pattern) else ""
+    trail = r"(?![A-Za-z0-9_-])" if re.search(r"[A-Za-z0-9_]$", pattern) else ""
     return rf"{lead}(?:{pattern}){trail}"
 
 

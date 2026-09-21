@@ -81,6 +81,19 @@ class ExemptionsAreNarrow(unittest.TestCase):
         self.assertFalse(flags(PLAIN, "process.env.PCP_PORT_BASE"))
         self.assertTrue(flags(PLAIN, "process.env.PCP_PORT_BASE_V2"))
 
+    def test_a_hyphen_cannot_extend_an_exempted_name(self):
+        """The loophole that broke the integration fixtures.
+
+        `supabase_db_pcp` is an allowed container name, and it masked
+        `supabase_db_pcp-integration` — so the integration fixtures kept a
+        container name that no longer matched their own project, and every
+        identity check refused. Word-character boundaries alone do not catch
+        this, because a hyphen is not a word character.
+        """
+        self.assertFalse(flags(PLAIN, "docker restart supabase_db_pcp"))
+        self.assertTrue(flags(PLAIN, "docker restart supabase_db_pcp-integration"))
+        self.assertTrue(flags(PLAIN, "const t = 'pcp_admin-v2';"))
+
     def test_exemption_is_anchored_on_the_leading_side_too(self):
         # A suffix match is the same hole as a prefix match: without the
         # leading boundary, anything ending in an exempted literal inherits
