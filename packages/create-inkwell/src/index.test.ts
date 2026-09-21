@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
  * This validates the state management and resumability contract.
  */
 
-const STATE_FILE = '.create-pcp-progress.json';
+const STATE_FILE = '.create-inkwell-progress.json';
 
 interface ProgressState {
   completedSteps: string[];
@@ -47,11 +47,14 @@ function isComplete(state: ProgressState, step: string): boolean {
   return state.completedSteps.includes(step);
 }
 
-describe('create-pcp state management', () => {
+describe('create-inkwell state management', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = join(tmpdir(), `create-pcp-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    tmpDir = join(
+      tmpdir(),
+      `create-inkwell-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
     mkdirSync(tmpDir, { recursive: true });
   });
 

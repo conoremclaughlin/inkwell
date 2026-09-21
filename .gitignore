@@ -152,7 +152,7 @@ vite.config.ts.timestamp-*
 .gemini/
 .mcp.json
 
-# Local PCP identity should be machine/user-specific.
+# Local Inkwell identity should be machine/user-specific.
 # Leading **/ matters: a pattern containing a slash is anchored to this file's
 # directory, so plain `.ink/identity.json` only ever matched the repo root.
 # Hooks create a .ink/ beside whatever cwd they run in — packages/api,
@@ -160,7 +160,7 @@ vite.config.ts.timestamp-*
 # until someone's `git add -A` swept them in.
 **/.ink/identity.json
 
-# PCP hook runtime state (transient, per-session). The turn-epoch and
+# Inkwell hook runtime state (transient, per-session). The turn-epoch and
 # pending-takeover records are written by the on-prompt hook and the wrapper
 # watcher beside whatever cwd they run in, same as identity.json above.
 **/.ink/runtime/
@@ -172,8 +172,8 @@ vite.config.ts.timestamp-*
 output/
 packages/api/output/
 
-# create-pcp scaffolder state
-.create-pcp-progress.json
+# create-inkwell scaffolder state
+.create-ink-progress.json
 
 # Runtime state (not committed)
 packages/cli/.ink/
