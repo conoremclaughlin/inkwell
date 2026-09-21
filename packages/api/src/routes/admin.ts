@@ -1,7 +1,7 @@
 /**
  * Admin REST API Routes
  *
- * Provides HTTP endpoints for the PCP Admin Dashboard to manage:
+ * Provides HTTP endpoints for the Inkwell Admin Dashboard to manage:
  * - Trusted users
  * - Authorized groups
  * - Challenge codes
@@ -47,11 +47,11 @@ import type { WorkspaceMemberRole } from '../data/repositories/workspaces.reposi
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
 import { isPlausibleEmailAddress, stripTrailingSlashes } from '../utils/input-text';
 import {
-  signPcpAccessToken,
-  verifyPcpAccessToken,
+  signInkAccessToken,
+  verifyInkAccessToken,
   createRefreshToken,
   exchangeRefreshToken,
-} from '../auth/pcp-tokens';
+} from '../auth/ink-tokens';
 import type { Database } from '../data/supabase/types';
 import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
@@ -78,9 +78,9 @@ let whatsAppListener: any = null;
 
 type AdminAuthRequest = Request & {
   user: { email?: string | null };
-  pcpUserId: string;
-  pcpWorkspaceId: string;
-  pcpWorkspaceRole: WorkspaceMemberRole | 'trusted';
+  inkUserId: string;
+  inkWorkspaceId: string;
+  inkWorkspaceRole: WorkspaceMemberRole | 'trusted';
 };
 
 type CommentAuthorUser = {
@@ -681,7 +681,7 @@ async function findGeminiTranscriptFile(backendSessionId: string): Promise<strin
   return null;
 }
 
-async function findPcpTranscriptFile(sessionId: string): Promise<string | null> {
+async function findInkTranscriptFile(sessionId: string): Promise<string | null> {
   const roots = new Set<string>();
   for (const dir of getAncestorDirs(process.cwd(), 8)) {
     roots.add(path.join(dir, '.ink', 'runtime', 'repl'));
@@ -707,15 +707,18 @@ async function resolveLocalTranscriptDescriptor(options: {
   const normalizedBackend = options.backend?.toLowerCase() || '';
   const backendSessionId = options.backendSessionId;
 
-  if (normalizedBackend.includes('pcp')) {
-    const pcpPath = await findPcpTranscriptFile(options.sessionId);
-    if (pcpPath) {
+  // 'ink' is the stored backend value; 'pcp' is the pre-rename spelling kept
+  // for rows written before 01b9047b. Matching only 'pcp' made this branch
+  // unreachable, so ink-runtime transcripts never resolved (#655).
+  if (normalizedBackend.includes('ink') || normalizedBackend.includes('pcp')) {
+    const inkPath = await findInkTranscriptFile(options.sessionId);
+    if (inkPath) {
       return {
-        path: pcpPath,
+        path: inkPath,
         format: 'jsonl',
         backend: options.backend,
         backendSessionId,
-        resolvedBy: 'pcp-runtime',
+        resolvedBy: 'ink-runtime',
       };
     }
   }
@@ -982,7 +985,7 @@ export function setWhatsAppListener(listener: any): void {
 /**
  * Admin auth middleware — three-tier verification:
  *
- * Tier 1: PCP admin access JWT (local jwt.verify, ~0ms)
+ * Tier 1: Inkwell admin access JWT (local jwt.verify, ~0ms)
  * Tier 2: Refresh token exchange (1 DB call, ~once/hour)
  * Tier 3: Supabase verification (network call, first login only)
  *
@@ -1008,14 +1011,14 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    let pcpUserId: string | undefined;
+    let inkUserId: string | undefined;
     let userEmail: string | undefined;
     let issueTokenCookies = false;
 
-    // --- Tier 1: PCP admin access JWT (local, ~0ms) ---
-    const payload = verifyPcpAccessToken(token, 'pcp_admin');
+    // --- Tier 1: Inkwell admin access JWT (local, ~0ms) ---
+    const payload = verifyInkAccessToken(token, 'pcp_admin');
     if (payload) {
-      pcpUserId = payload.sub;
+      inkUserId = payload.sub;
       userEmail = payload.email;
     }
 
@@ -1023,19 +1026,19 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     // (transcript sync, 2FA approval requests) so CLI users can operate without
     // dashboard cookie auth.
     if (
-      !pcpUserId &&
+      !inkUserId &&
       (req.method === 'POST' || req.method === 'GET') &&
       (MCP_CLI_TRANSCRIPT_ROUTE.test(req.path) || MCP_CLI_APPROVAL_ROUTE.test(req.path))
     ) {
-      const mcpPayload = verifyPcpAccessToken(token, 'mcp_access');
+      const mcpPayload = verifyInkAccessToken(token, 'mcp_access');
       if (mcpPayload) {
-        pcpUserId = mcpPayload.sub;
+        inkUserId = mcpPayload.sub;
         userEmail = mcpPayload.email;
       }
     }
 
     // --- Tier 2: Refresh token exchange (1 DB call, ~once/hour) ---
-    if (!pcpUserId) {
+    if (!inkUserId) {
       const refreshCookie = req.cookies?.['pcp-admin-refresh'];
       if (refreshCookie) {
         const result = await exchangeRefreshToken(
@@ -1046,7 +1049,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
           ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
         );
         if (result) {
-          pcpUserId = result.userId;
+          inkUserId = result.userId;
           userEmail = result.email;
           // Set new access token cookie (refresh token stays the same)
           res.cookie('pcp-admin-token', result.accessToken, {
@@ -1061,7 +1064,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     }
 
     // --- Tier 3: Supabase verification (network call, first login only) ---
-    if (!pcpUserId) {
+    if (!inkUserId) {
       const {
         data: { user },
         error,
@@ -1072,17 +1075,17 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         return;
       }
 
-      // Look up (or create) PCP user by email.
+      // Look up (or create) Inkwell user by email.
       const normalizedEmail = user.email?.toLowerCase() ?? null;
-      let { data: pcpUser } = await supabase
+      let { data: inkUser } = await supabase
         .from('users')
         .select('id, telegram_id, whatsapp_id')
         .eq('email', normalizedEmail)
         .single();
 
-      if (!pcpUser) {
+      if (!inkUser) {
         if (!normalizedEmail) {
-          res.status(403).json({ error: 'User email not available for PCP provisioning' });
+          res.status(403).json({ error: 'User email not available for Inkwell provisioning' });
           return;
         }
 
@@ -1100,17 +1103,17 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
             .single();
 
           if (!racedUser) {
-            logger.error('Failed to auto-provision PCP user during admin auth', {
+            logger.error('Failed to auto-provision Inkwell user during admin auth', {
               email: normalizedEmail,
               error: createUserError.message,
             });
-            res.status(500).json({ error: 'Failed to provision PCP user' });
+            res.status(500).json({ error: 'Failed to provision Inkwell user' });
             return;
           }
 
-          pcpUser = racedUser;
+          inkUser = racedUser;
         } else {
-          pcpUser = createdUser;
+          inkUser = createdUser;
         }
       }
 
@@ -1118,9 +1121,9 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       await supabase
         .from('users')
         .update({ last_login_at: new Date().toISOString() })
-        .eq('id', pcpUser.id);
+        .eq('id', inkUser.id);
 
-      pcpUserId = pcpUser.id;
+      inkUserId = inkUser.id;
       userEmail = normalizedEmail || user.email || undefined;
       issueTokenCookies = true;
     }
@@ -1132,26 +1135,26 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     // For trusted-user resolution we need telegram/whatsapp IDs.
     // Tier 1/2 don't have them in JWT claims, so fetch when needed.
-    let pcpUserRecord: {
+    let inkUserRecord: {
       id: string;
       telegram_id: string | null;
       whatsapp_id: string | null;
     } | null = null;
 
-    const getPcpUserRecord = async () => {
-      if (!pcpUserRecord) {
+    const getInkUserRecord = async () => {
+      if (!inkUserRecord) {
         const { data } = await supabase
           .from('users')
           .select('id, telegram_id, whatsapp_id')
-          .eq('id', pcpUserId!)
+          .eq('id', inkUserId!)
           .single();
-        pcpUserRecord = data;
+        inkUserRecord = data;
       }
-      return pcpUserRecord;
+      return inkUserRecord;
     };
 
     const hasTrustedAdminAccess = async (workspaceId: string): Promise<boolean> => {
-      const record = await getPcpUserRecord();
+      const record = await getInkUserRecord();
       if (!record) return false;
 
       const authService = getAuthorizationService();
@@ -1175,7 +1178,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     let hasDirectMembership = false;
 
     if (requestedWorkspaceId) {
-      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, pcpUserId!);
+      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, inkUserId!);
       if (requestedWorkspace) {
         activeWorkspaceId = requestedWorkspace.id;
         hasDirectMembership = true;
@@ -1196,7 +1199,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         activeWorkspaceRole = 'trusted';
       }
     } else {
-      const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUserId!);
+      const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(inkUserId!);
       activeWorkspaceId = personalWorkspace.id;
       hasDirectMembership = true;
     }
@@ -1214,15 +1217,15 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     }
 
     // --- Issue cookies (Tier 3 success) ---
-    if (issueTokenCookies && pcpUserId && userEmail) {
-      const accessToken = signPcpAccessToken(
-        { type: 'pcp_admin', sub: pcpUserId, email: userEmail, scope: 'admin' },
+    if (issueTokenCookies && inkUserId && userEmail) {
+      const accessToken = signInkAccessToken(
+        { type: 'pcp_admin', sub: inkUserId, email: userEmail, scope: 'admin' },
         ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
       );
       try {
         const { refreshToken } = await createRefreshToken(
           supabase,
-          pcpUserId,
+          inkUserId,
           ADMIN_CLIENT_ID,
           ['admin'],
           ADMIN_REFRESH_TOKEN_LIFETIME_DAYS
@@ -1242,23 +1245,23 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
           maxAge: ADMIN_REFRESH_TOKEN_LIFETIME_DAYS * 24 * 60 * 60 * 1000,
         });
       } catch (cookieError) {
-        // Non-fatal: auth succeeded, just couldn't issue PCP cookies.
+        // Non-fatal: auth succeeded, just couldn't issue Inkwell cookies.
         // Next request will hit Tier 3 again.
-        logger.warn('Failed to issue PCP admin cookies', { error: cookieError });
+        logger.warn('Failed to issue Inkwell admin cookies', { error: cookieError });
       }
     }
 
-    // Attach user + PCP context to request
+    // Attach user + Inkwell context to request
     const authReq = req as AdminAuthRequest;
     authReq.user = { email: userEmail || null };
-    authReq.pcpUserId = pcpUserId!;
-    authReq.pcpWorkspaceId = activeWorkspaceId;
-    authReq.pcpWorkspaceRole = activeWorkspaceRole || 'trusted';
+    authReq.inkUserId = inkUserId!;
+    authReq.inkWorkspaceId = activeWorkspaceId;
+    authReq.inkWorkspaceRole = activeWorkspaceRole || 'trusted';
 
     // Wrap the rest of the request in context
     runWithRequestContext(
       {
-        userId: pcpUserId!,
+        userId: inkUserId!,
         email: userEmail,
         workspaceId: activeWorkspaceId,
         workspaceSource: requestedWorkspaceId ? 'header' : 'default',
@@ -1279,7 +1282,7 @@ const router: Router = Router();
 
 /**
  * POST /api/admin/auth/logout
- * Revoke PCP admin refresh token and clear auth cookies.
+ * Revoke Inkwell admin refresh token and clear auth cookies.
  * Accepts refresh token via request body (server action) or cookie (direct browser call).
  */
 router.post('/auth/logout', async (req: Request, res: Response) => {
@@ -1358,7 +1361,7 @@ function pairClaimRateLimited(ip: string): boolean {
  * Body: { email, password } → { accessToken, refreshToken, expiresIn, userId, email }
  *
  * Verifies credentials against Supabase server-side (the app never holds
- * Supabase keys), provisions the PCP user if needed (same contract as the
+ * Supabase keys), provisions the Inkwell user if needed (same contract as the
  * middleware's Tier 3), and returns a pcp_admin access/refresh token pair.
  */
 router.post('/auth/mobile-login', async (req: Request, res: Response) => {
@@ -1395,13 +1398,13 @@ router.post('/auth/mobile-login', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
-    if (!pcpUser) {
+    const inkUser = await findOrProvisionInkUserByEmail(supabase, email);
+    if (!inkUser) {
       res.status(500).json({ error: 'Failed to provision user' });
       return;
     }
 
-    res.json(await issueMobileTokens(supabase, pcpUser.id, email));
+    res.json(await issueMobileTokens(supabase, inkUser.id, email));
   } catch (error) {
     logger.error('Mobile login error:', error);
     res.status(500).json(errorJson('Login failed', error));
@@ -1409,11 +1412,11 @@ router.post('/auth/mobile-login', async (req: Request, res: Response) => {
 });
 
 /**
- * Look up (or provision) the PCP user for an email Supabase has just
+ * Look up (or provision) the Inkwell user for an email Supabase has just
  * verified — the middleware's Tier 3 contract, shared by every mobile route
  * that mints credentials so they cannot drift apart.
  */
-async function findOrProvisionPcpUserByEmail(
+async function findOrProvisionInkUserByEmail(
   supabase: SupabaseClient<Database>,
   email: string
 ): Promise<{ id: string } | null> {
@@ -1435,7 +1438,7 @@ async function findOrProvisionPcpUserByEmail(
   const { data: raced } = await supabase.from('users').select('id').eq('email', email).single();
   if (raced) return raced;
 
-  logger.error('Failed to provision PCP user for mobile auth', { error: createError?.message });
+  logger.error('Failed to provision Inkwell user for mobile auth', { error: createError?.message });
   return null;
 }
 
@@ -1451,7 +1454,7 @@ async function issueMobileTokens(
   userId: string;
   email: string;
 }> {
-  const accessToken = signPcpAccessToken(
+  const accessToken = signInkAccessToken(
     { type: 'pcp_admin', sub: userId, email, scope: 'admin' },
     ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
   );
@@ -1540,15 +1543,15 @@ router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
-    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
-    if (!pcpUser) {
+    const inkUser = await findOrProvisionInkUserByEmail(supabase, email);
+    if (!inkUser) {
       res.status(500).json({ error: 'Failed to provision user' });
       return;
     }
 
     res.json({
       confirmationRequired: false,
-      ...(await issueMobileTokens(supabase, pcpUser.id, email)),
+      ...(await issueMobileTokens(supabase, inkUser.id, email)),
     });
   } catch (error) {
     logger.error('Mobile signup error:', error);
@@ -1577,7 +1580,7 @@ function formatPairingCode(code: string): string {
 }
 
 function pairingCodeStorageKey(code: string): string {
-  return `pcp-pair-${code}`;
+  return `ink-pair-${code}`;
 }
 
 function isLoopbackHost(hostOrUrl: string): boolean {
@@ -1774,14 +1777,14 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
     await supabase
       .from('mcp_tokens')
       .delete()
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('client_id', MOBILE_PAIR_CLIENT_ID)
       .lt('expires_at', new Date().toISOString());
 
     const code = generatePairingCode();
     const expiresAt = new Date(Date.now() + MOBILE_PAIR_CODE_LIFETIME_SECONDS * 1000);
     const { error: insertError } = await supabase.from('mcp_tokens').insert({
-      user_id: authReq.pcpUserId,
+      user_id: authReq.inkUserId,
       client_id: MOBILE_PAIR_CLIENT_ID,
       refresh_token: pairingCodeStorageKey(code),
       supabase_refresh_token: null,
@@ -1829,17 +1832,17 @@ router.get('/workspaces', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
     const workspaceRepo = dataComposer.repositories.workspaces;
-    const workspaces = await workspaceRepo.listMembershipsByUser(authReq.pcpUserId, {
+    const workspaces = await workspaceRepo.listMembershipsByUser(authReq.inkUserId, {
       includeArchived: false,
     });
 
     const currentWorkspaceMembership = workspaces.find(
-      (workspace) => workspace.id === authReq.pcpWorkspaceId
+      (workspace) => workspace.id === authReq.inkWorkspaceId
     );
-    const currentWorkspaceRole = currentWorkspaceMembership?.role || authReq.pcpWorkspaceRole;
+    const currentWorkspaceRole = currentWorkspaceMembership?.role || authReq.inkWorkspaceRole;
 
     res.json({
-      currentWorkspaceId: authReq.pcpWorkspaceId,
+      currentWorkspaceId: authReq.inkWorkspaceId,
       currentWorkspaceRole,
       workspaces: workspaces.map((w) => ({
         id: w.id,
@@ -1889,14 +1892,14 @@ router.post('/workspaces', async (req: Request, res: Response) => {
         : slugifyWorkspaceName(rawName);
 
     const createdWorkspace = await workspaceRepo.create({
-      userId: authReq.pcpUserId,
+      userId: authReq.inkUserId,
       name: rawName,
       slug: workspaceSlug,
       type: workspaceType,
       description: workspaceDescription,
     });
 
-    await workspaceRepo.addMember(createdWorkspace.id, authReq.pcpUserId, 'owner');
+    await workspaceRepo.addMember(createdWorkspace.id, authReq.inkUserId, 'owner');
 
     res.status(201).json({
       workspace: {
@@ -1934,13 +1937,13 @@ router.get('/workspaces/:workspaceId/members', async (req: Request, res: Respons
     const workspaceRepo = dataComposer.repositories.workspaces;
     const workspaceId = req.params.workspaceId;
 
-    const workspace = await workspaceRepo.findById(workspaceId, authReq.pcpUserId);
+    const workspace = await workspaceRepo.findById(workspaceId, authReq.inkUserId);
     if (!workspace) {
       res.status(404).json({ error: 'Workspace not found or not accessible' });
       return;
     }
 
-    const canManage = await workspaceRepo.canManageWorkspace(workspaceId, authReq.pcpUserId);
+    const canManage = await workspaceRepo.canManageWorkspace(workspaceId, authReq.inkUserId);
     const members = await workspaceRepo.listMembersWithUsers(workspaceId);
 
     res.json({
@@ -1977,18 +1980,18 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
     const usersRepo = dataComposer.repositories.users;
     const workspaceId = req.params.workspaceId;
 
-    const workspace = await workspaceRepo.findById(workspaceId, authReq.pcpUserId);
+    const workspace = await workspaceRepo.findById(workspaceId, authReq.inkUserId);
     if (!workspace) {
       res.status(404).json({ error: 'Workspace not found or not accessible' });
       return;
     }
 
-    const canManage = await workspaceRepo.canManageWorkspace(workspaceId, authReq.pcpUserId);
+    const canManage = await workspaceRepo.canManageWorkspace(workspaceId, authReq.inkUserId);
     if (!canManage) {
       res.status(403).json({ error: 'Only workspace owners/admins can invite collaborators' });
       return;
     }
-    const actingRole = await workspaceRepo.getMemberRole(workspaceId, authReq.pcpUserId);
+    const actingRole = await workspaceRepo.getMemberRole(workspaceId, authReq.inkUserId);
 
     const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
     if (!rawEmail || !rawEmail.includes('@')) {
@@ -2058,7 +2061,7 @@ router.get('/trusted-users', async (req: Request, res: Response) => {
     const { data: users, error } = await supabase
       .from('trusted_users')
       .select('*')
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('added_at', { ascending: false });
 
     if (error) {
@@ -2107,8 +2110,8 @@ router.post('/trusted-users', async (req: Request, res: Response) => {
       platform,
       platform_user_id: platformUserId,
       trust_level: trustLevel || 'member',
-      added_by: authReq.pcpUserId,
-      workspace_id: authReq.pcpWorkspaceId,
+      added_by: authReq.inkUserId,
+      workspace_id: authReq.inkWorkspaceId,
     });
 
     if (error) {
@@ -2140,7 +2143,7 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
       .from('trusted_users')
       .select('trust_level')
       .eq('id', id)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (user?.trust_level === 'owner') {
@@ -2152,7 +2155,7 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
       .from('trusted_users')
       .delete()
       .eq('id', id)
-      .eq('workspace_id', authReq.pcpWorkspaceId);
+      .eq('workspace_id', authReq.inkWorkspaceId);
 
     if (error) {
       res.status(500).json(errorJson('Failed to delete user', error));
@@ -2182,7 +2185,7 @@ router.get('/groups', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('authorized_groups')
       .select('*')
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('authorized_at', { ascending: false });
 
     if (error) {
@@ -2223,10 +2226,10 @@ router.post('/groups/:id/revoke', async (req: Request, res: Response) => {
       .update({
         status: 'revoked',
         revoked_at: new Date().toISOString(),
-        revoked_by: authReq.pcpUserId,
+        revoked_by: authReq.inkUserId,
       })
       .eq('id', id)
-      .eq('workspace_id', authReq.pcpWorkspaceId);
+      .eq('workspace_id', authReq.inkWorkspaceId);
 
     if (error) {
       res.status(500).json(errorJson('Failed to revoke group', error));
@@ -2256,7 +2259,7 @@ router.get('/challenge-codes', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('group_challenge_codes')
       .select('*')
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('created_at', { ascending: false })
       .limit(50);
 
@@ -2295,7 +2298,7 @@ router.post('/challenge-codes', async (req: Request, res: Response) => {
     const { count } = await supabase
       .from('group_challenge_codes')
       .select('*', { count: 'exact', head: true })
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .is('used_at', null)
       .gt('expires_at', new Date().toISOString());
 
@@ -2314,8 +2317,8 @@ router.post('/challenge-codes', async (req: Request, res: Response) => {
       .from('group_challenge_codes')
       .insert({
         code,
-        created_by: authReq.pcpUserId,
-        workspace_id: authReq.pcpWorkspaceId,
+        created_by: authReq.inkUserId,
+        workspace_id: authReq.inkWorkspaceId,
       })
       .select()
       .single();
@@ -2465,7 +2468,7 @@ router.get('/events', async (req: Request, res: Response) => {
   let heartbeat: ReturnType<typeof setInterval> | undefined;
 
   const unsubscribe = activityBus.subscribe(
-    { userId: authReq.pcpUserId, sessionId, taskGroupId, sbSlug },
+    { userId: authReq.inkUserId, sessionId, taskGroupId, sbSlug },
     (activity) => {
       if (closed) return;
       if (backfilling) {
@@ -2491,7 +2494,7 @@ router.get('/events', async (req: Request, res: Response) => {
     const since = sinceRaw ? new Date(sinceRaw.replace(' ', '+')) : undefined;
     if (since && !Number.isNaN(since.getTime())) {
       const activityRepo = (await getDataComposer()).repositories.activityStream;
-      const backfill = await activityRepo.getActivity(authReq.pcpUserId, {
+      const backfill = await activityRepo.getActivity(authReq.inkUserId, {
         sessionId,
         taskGroupId,
         sbSlug,
@@ -2619,8 +2622,8 @@ router.get('/routing', async (req: Request, res: Response) => {
         )
       `
       )
-      .eq('user_id', authReq.pcpUserId)
-      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('agent_identities.workspace_id', authReq.inkWorkspaceId)
       .order('updated_at', { ascending: false });
 
     if (routesError) {
@@ -2634,8 +2637,8 @@ router.get('/routing', async (req: Request, res: Response) => {
     const { data: identitiesData, error: identitiesError } = await supabase
       .from('agent_identities')
       .select('id, agent_id, name, role, backend, studio_hint')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('agent_id', { ascending: true });
 
     if (identitiesError) {
@@ -2652,7 +2655,7 @@ router.get('/routing', async (req: Request, res: Response) => {
       const { data: remindersData, error: remindersError } = await supabase
         .from('scheduled_reminders')
         .select('sb_id, next_run_at, status')
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .in('sb_id', sbIds)
         .in('status', ['active', 'paused']);
 
@@ -2676,7 +2679,7 @@ router.get('/routing', async (req: Request, res: Response) => {
     const { count: unassignedReminderCount, error: unassignedReminderError } = await supabase
       .from('scheduled_reminders')
       .select('*', { count: 'exact', head: true })
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .is('sb_id', null)
       .in('status', ['active', 'paused']);
 
@@ -2735,8 +2738,8 @@ router.get('/routing/agents/:sbSlug', async (req: Request, res: Response) => {
       .select(
         'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at, sandbox_bypass, session_scope'
       )
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('agent_id', sbSlug)
       .single();
 
@@ -2770,9 +2773,9 @@ router.get('/routing/agents/:sbSlug', async (req: Request, res: Response) => {
         )
       `
       )
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('sb_id', identity.id)
-      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .eq('agent_identities.workspace_id', authReq.inkWorkspaceId)
       .order('updated_at', { ascending: false });
 
     if (routesError) {
@@ -2800,7 +2803,7 @@ router.get('/routing/agents/:sbSlug', async (req: Request, res: Response) => {
         studio_hint
       `
       )
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('sb_id', identity.id)
       .order('next_run_at', { ascending: true })
       .limit(100);
@@ -2830,7 +2833,7 @@ router.get('/routing/agents/:sbSlug', async (req: Request, res: Response) => {
     const { data: studiosData } = await supabase
       .from('studios')
       .select('id, slug, branch, status, route_patterns, sandbox_bypass')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('agent_id', identity.agent_id)
       .in('status', ['active', 'idle'])
       .order('slug', { ascending: true });
@@ -2898,8 +2901,8 @@ router.patch('/identities/:sbSlug/settings', async (req: Request, res: Response)
     const { data: identity, error: fetchErr } = await supabase
       .from('agent_identities')
       .select('id, metadata')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('agent_id', sbSlug)
       .maybeSingle();
 
@@ -3017,7 +3020,7 @@ router.patch('/studios/:studioId', async (req: Request, res: Response) => {
       .from('studios')
       .select('id, user_id')
       .eq('id', studioId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .maybeSingle();
 
     if (fetchErr || !studio) {
@@ -3084,8 +3087,8 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
       .from('agent_identities')
       .select('id')
       .eq('id', sbId)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (identityError || !identity) {
@@ -3096,7 +3099,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
     const { data: inserted, error: insertError } = await supabase
       .from('channel_routes')
       .insert({
-        user_id: authReq.pcpUserId,
+        user_id: authReq.inkUserId,
         sb_id: sbId,
         platform,
         platform_account_id: platformAccountId,
@@ -3176,8 +3179,8 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
       `
       )
       .eq('id', routeId)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('agent_identities.workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (existingError || !existing) {
@@ -3199,8 +3202,8 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
         .from('agent_identities')
         .select('id')
         .eq('id', sbId)
-        .eq('user_id', authReq.pcpUserId)
-        .eq('workspace_id', authReq.pcpWorkspaceId)
+        .eq('user_id', authReq.inkUserId)
+        .eq('workspace_id', authReq.inkWorkspaceId)
         .single();
 
       if (identityError || !identity) {
@@ -3253,7 +3256,7 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
       .from('channel_routes')
       .update(updates)
       .eq('id', routeId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .select(
         `
         id,
@@ -3324,8 +3327,8 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
       `
       )
       .eq('id', routeId)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('agent_identities.workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (existingError || !existing) {
@@ -3337,7 +3340,7 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
       .from('channel_routes')
       .delete()
       .eq('id', routeId)
-      .eq('user_id', authReq.pcpUserId);
+      .eq('user_id', authReq.inkUserId);
 
     if (deleteError) {
       logger.error('Failed to delete channel route:', deleteError);
@@ -3376,8 +3379,8 @@ router.patch('/routing/identities/:sbId', async (req: Request, res: Response) =>
       .from('agent_identities')
       .select('id, agent_id')
       .eq('id', sbId)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (fetchError || !identity) {
@@ -3428,7 +3431,7 @@ router.patch('/routing/reminders/:reminderId', async (req: Request, res: Respons
       .from('scheduled_reminders')
       .select('id')
       .eq('id', reminderId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (fetchError || !reminder) {
@@ -3466,8 +3469,8 @@ router.get('/reminders', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('scheduled_reminders')
       .select('*, users(email, first_name), agent_identities!inner(agent_id, name, workspace_id)')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('agent_identities.workspace_id', authReq.inkWorkspaceId)
       .order('next_run_at', { ascending: true })
       .limit(100);
 
@@ -3522,8 +3525,8 @@ router.get('/automations', async (req: Request, res: Response) => {
         .select(
           'id, title, description, cron_expression, next_run_at, last_run_at, delivery_channel, status, metadata, agent_identities!inner(agent_id, name, workspace_id)'
         )
-        .eq('user_id', authReq.pcpUserId)
-        .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+        .eq('user_id', authReq.inkUserId)
+        .eq('agent_identities.workspace_id', authReq.inkWorkspaceId)
         .order('next_run_at', { ascending: true })
         .limit(200),
       // Workspace-scoped via the owning identity, same as the reminders
@@ -3534,8 +3537,8 @@ router.get('/automations', async (req: Request, res: Response) => {
         .select(
           'id, title, status, strategy, strategy_config, strategy_started_at, strategy_paused_at, updated_at, agent_identities!inner(agent_id, name, workspace_id)'
         )
-        .eq('user_id', authReq.pcpUserId)
-        .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+        .eq('user_id', authReq.inkUserId)
+        .eq('agent_identities.workspace_id', authReq.inkWorkspaceId)
         .eq('status', 'active')
         .not('strategy', 'is', null)
         .order('updated_at', { ascending: false })
@@ -3579,8 +3582,8 @@ router.get('/user-identity', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('user_identity')
       .select('*')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (error && error.code !== 'PGRST116') {
@@ -3597,8 +3600,8 @@ router.get('/user-identity', async (req: Request, res: Response) => {
     const { data: workspaceDocs, error: workspaceError } = await supabase
       .from('workspaces')
       .select('shared_values, process')
-      .eq('id', authReq.pcpWorkspaceId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('id', authReq.inkWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (workspaceError && workspaceError.code !== 'PGRST116') {
@@ -3646,8 +3649,8 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
     const { data: identity } = await supabase
       .from('user_identity')
       .select('id')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (!identity) {
@@ -3660,7 +3663,7 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
       .from('user_identity_history')
       .select('*')
       .eq('identity_id', identity.id)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('archived_at', { ascending: false })
       .limit(20);
 
@@ -3708,8 +3711,8 @@ router.get('/individuals', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('agent_identities')
       .select('*')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('agent_id', { ascending: true });
 
     if (error) {
@@ -3763,8 +3766,8 @@ router.get('/individuals/:sbSlug/history', async (req: Request, res: Response) =
     const { data: identity } = await supabase
       .from('agent_identities')
       .select('id')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('agent_id', sbSlug)
       .single();
 
@@ -3778,7 +3781,7 @@ router.get('/individuals/:sbSlug/history', async (req: Request, res: Response) =
       .from('agent_identity_history')
       .select('*')
       .eq('sb_id', identity.id)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('archived_at', { ascending: false })
       .limit(20);
 
@@ -3848,8 +3851,8 @@ router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: R
     const { data: identity } = await supabase
       .from('agent_identities')
       .select('id')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('agent_id', sbSlug)
       .maybeSingle();
 
@@ -3868,7 +3871,7 @@ router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: R
     const { data: memories, error: memoriesError } = await supabase
       .from('memories')
       .select('*')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('sb_id', identity.id)
       .order('created_at', { ascending: false });
 
@@ -3896,7 +3899,7 @@ router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: R
     const { data: history, error: historyError } = await supabase
       .from('memory_history')
       .select('*')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .order('archived_at', { ascending: false });
 
     if (historyError) {
@@ -3918,7 +3921,7 @@ router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: R
         const metadataSlug = archivedMetadataSlug(metadata);
         const hasScopedMetadata =
           metadataIdentityId === identity.id ||
-          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId);
+          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.inkWorkspaceId);
 
         if (isAgentMemory || hasScopedMetadata) {
           timeline.push({
@@ -3942,8 +3945,8 @@ router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: R
     const { data: sessions, error: sessionsError } = await supabase
       .from('sessions')
       .select('id')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('sb_id', identity.id)
       .eq('agent_id', sbSlug);
 
@@ -4010,8 +4013,8 @@ router.get(
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('user_id', authReq.pcpUserId)
-        .eq('workspace_id', authReq.pcpWorkspaceId)
+        .eq('user_id', authReq.inkUserId)
+        .eq('workspace_id', authReq.inkWorkspaceId)
         .eq('agent_id', sbSlug)
         .maybeSingle();
 
@@ -4024,7 +4027,7 @@ router.get(
         .from('memories')
         .select('id')
         .eq('id', memoryId)
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .eq('sb_id', identity.id)
         .maybeSingle();
 
@@ -4032,7 +4035,7 @@ router.get(
       const { data, error } = await supabase
         .from('memory_history')
         .select('*')
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .eq('memory_id', memoryId)
         .order('version', { ascending: false });
 
@@ -4053,7 +4056,7 @@ router.get(
         const metadataSlug = archivedMetadataSlug(metadata);
         return (
           metadataIdentityId === identity.id ||
-          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId)
+          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.inkWorkspaceId)
         );
       });
 
@@ -4105,8 +4108,8 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
     const { data: identityRows, error: identityError } = await supabase
       .from('agent_identities')
       .select('id')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('agent_id', sbSlug);
 
     if (identityError) {
@@ -4142,7 +4145,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
     const receivedQuery = supabase
       .from('agent_inbox')
       .select('*')
-      .eq('recipient_user_id', authReq.pcpUserId)
+      .eq('recipient_user_id', authReq.inkUserId)
       .eq('recipient_agent_id', sbSlug)
       .in('recipient_sb_id', scopedIdentityIds)
       .order('created_at', { ascending: false })
@@ -4151,7 +4154,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
     const sentQuery = supabase
       .from('agent_inbox')
       .select('*')
-      .eq('recipient_user_id', authReq.pcpUserId)
+      .eq('recipient_user_id', authReq.inkUserId)
       .eq('sender_agent_id', sbSlug)
       .in('sender_sb_id', scopedIdentityIds)
       .order('created_at', { ascending: false })
@@ -4200,7 +4203,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
       let threadQuery = supabase
         .from('agent_inbox')
         .select('*')
-        .eq('recipient_user_id', authReq.pcpUserId)
+        .eq('recipient_user_id', authReq.inkUserId)
         .in('thread_key', threadKeys)
         .order('created_at', { ascending: false })
         .limit(500);
@@ -4361,7 +4364,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
         let threadQuery = (supabase as any)
           .from('inbox_threads')
           .select('*')
-          .eq('user_id', authReq.pcpUserId)
+          .eq('user_id', authReq.inkUserId)
           .in('id', threadIds)
           .order('updated_at', { ascending: false });
 
@@ -4537,8 +4540,8 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
 
     const oauthService = getOAuthService();
     const accounts = await oauthService.getConnectedAccounts(
-      authReq.pcpUserId,
-      authReq.pcpWorkspaceId
+      authReq.inkUserId,
+      authReq.inkWorkspaceId
     );
 
     // Desktop credentials (`ink google login` on the server host) bound to this
@@ -4546,7 +4549,7 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
     // the cloud row cannot serve, or first when configured that way.
     const credentialSources = oauthService.getCredentialSources();
     const desktop = credentialSources.includes('desktop')
-      ? await oauthService.describeDesktopCredentials(authReq.pcpUserId)
+      ? await oauthService.describeDesktopCredentials(authReq.inkUserId)
       : { dir: null, email: null, error: null, credentials: [] };
     const desktopUsable = desktop.credentials.some((c) => c.state !== 'unusable');
 
@@ -4613,8 +4616,8 @@ router.get('/oauth/:provider/authorize', async (req: Request, res: Response) => 
 
     // Store state with user info (expires in 10 minutes)
     oauthStateStore.set(state, {
-      userId: authReq.pcpUserId,
-      workspaceId: authReq.pcpWorkspaceId,
+      userId: authReq.inkUserId,
+      workspaceId: authReq.inkWorkspaceId,
       provider,
       expiresAt: Date.now() + 10 * 60 * 1000,
     });
@@ -4768,8 +4771,8 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
       .from('connected_accounts')
       .select('*')
       .eq('id', accountId)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (accountError || !account) {
@@ -4791,8 +4794,8 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
     // Generate state token
     const state = crypto.randomUUID();
     oauthStateStore.set(state, {
-      userId: authReq.pcpUserId,
-      workspaceId: authReq.pcpWorkspaceId,
+      userId: authReq.inkUserId,
+      workspaceId: authReq.inkWorkspaceId,
       provider,
       expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
     });
@@ -4849,8 +4852,8 @@ router.get('/artifacts', async (req: Request, res: Response) => {
       .select(
         'id, uri, title, artifact_type, visibility, edit_mode, collaborators, version, tags, created_at, updated_at'
       )
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('updated_at', { ascending: false });
 
     if (error) {
@@ -4896,8 +4899,8 @@ router.get('/artifacts/:id', async (req: Request, res: Response) => {
       .from('artifacts')
       .select('*')
       .eq('id', id)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (error || !artifact) {
@@ -4972,8 +4975,8 @@ router.patch('/artifacts/permissions', async (req: Request, res: Response) => {
     const { data: updatedRows, error } = await supabase
       .from('artifacts')
       .update(updates)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .select('id');
 
     if (error) {
@@ -5016,14 +5019,14 @@ router.patch('/artifacts/:id/permissions', async (req: Request, res: Response) =
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
-    const pcpUserId = authReq.pcpUserId;
-    const workspaceId = authReq.pcpWorkspaceId;
+    const inkUserId = authReq.inkUserId;
+    const workspaceId = authReq.inkWorkspaceId;
 
     const { data: current, error: fetchError } = await supabase
       .from('artifacts')
       .select('id, edit_mode, collaborators')
       .eq('id', id)
-      .eq('user_id', pcpUserId)
+      .eq('user_id', inkUserId)
       .eq('workspace_id', workspaceId)
       .single();
 
@@ -5049,7 +5052,7 @@ router.patch('/artifacts/:id/permissions', async (req: Request, res: Response) =
         updated_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .eq('user_id', pcpUserId)
+      .eq('user_id', inkUserId)
       .eq('workspace_id', workspaceId)
       .select('id, edit_mode, collaborators, updated_at')
       .single();
@@ -5084,14 +5087,14 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
     const { id } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const authReq = req as AdminAuthRequest;
-    const pcpUserId = authReq.pcpUserId;
-    const workspaceId = authReq.pcpWorkspaceId;
+    const inkUserId = authReq.inkUserId;
+    const workspaceId = authReq.inkWorkspaceId;
 
     const { data: artifact } = await supabase
       .from('artifacts')
       .select('id')
       .eq('id', id)
-      .eq('user_id', pcpUserId)
+      .eq('user_id', inkUserId)
       .eq('workspace_id', workspaceId)
       .single();
 
@@ -5104,7 +5107,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
       .from('artifact_comments')
       .select('*')
       .eq('artifact_id', id)
-      .eq('user_id', pcpUserId)
+      .eq('user_id', inkUserId)
       .eq('workspace_id', workspaceId)
       .is('deleted_at', null)
       .order('created_at', { ascending: true });
@@ -5234,14 +5237,14 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const authReq = req as AdminAuthRequest;
-    const pcpUserId = authReq.pcpUserId;
-    const workspaceId = authReq.pcpWorkspaceId;
+    const inkUserId = authReq.inkUserId;
+    const workspaceId = authReq.inkWorkspaceId;
 
     const { data: artifact } = await supabase
       .from('artifacts')
       .select('id')
       .eq('id', id)
-      .eq('user_id', pcpUserId)
+      .eq('user_id', inkUserId)
       .eq('workspace_id', workspaceId)
       .single();
 
@@ -5256,7 +5259,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         .select('id')
         .eq('id', parentCommentId)
         .eq('artifact_id', id)
-        .eq('user_id', pcpUserId)
+        .eq('user_id', inkUserId)
         .eq('workspace_id', workspaceId)
         .single();
 
@@ -5272,7 +5275,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
       const { data: identityRow, error: identityError } = await supabase
         .from('agent_identities')
         .select('id, agent_id, name, backend')
-        .eq('user_id', pcpUserId)
+        .eq('user_id', inkUserId)
         .eq('workspace_id', workspaceId)
         .eq('agent_id', sbSlug)
         .single();
@@ -5291,8 +5294,8 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
       .from('artifact_comments')
       .insert({
         artifact_id: id,
-        user_id: pcpUserId,
-        created_by_user_id: pcpUserId,
+        user_id: inkUserId,
+        created_by_user_id: inkUserId,
         workspace_id: workspaceId,
         created_by_sb_id: identity?.id || null,
         parent_comment_id: parentCommentId || null,
@@ -5311,7 +5314,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
     const { data: commentAuthorUser } = await supabase
       .from('users')
       .select('id, first_name, username, email')
-      .eq('id', pcpUserId)
+      .eq('id', inkUserId)
       .maybeSingle();
 
     res.json({
@@ -5322,7 +5325,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         content: comment.content,
         metadata: comment.metadata,
         createdBySlug: identity?.agent_id ?? null,
-        createdByUserId: comment.created_by_user_id || pcpUserId,
+        createdByUserId: comment.created_by_user_id || inkUserId,
         createdByUser: commentAuthorUser
           ? {
               id: commentAuthorUser.id,
@@ -5365,8 +5368,8 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
       .from('artifacts')
       .select('id')
       .eq('id', id)
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .single();
 
     if (!artifact) {
@@ -5379,7 +5382,7 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
       .from('artifact_history')
       .select('*')
       .eq('artifact_id', id)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('version', { ascending: false });
 
     if (error) {
@@ -5422,7 +5425,7 @@ router.delete('/connected-accounts/:id', async (req: Request, res: Response) => 
     const authReq = req as AdminAuthRequest;
 
     const oauthService = getOAuthService();
-    await oauthService.disconnectAccount(id, authReq.pcpUserId, authReq.pcpWorkspaceId);
+    await oauthService.disconnectAccount(id, authReq.inkUserId, authReq.inkWorkspaceId);
 
     res.json({ success: true });
   } catch (error) {
@@ -5451,8 +5454,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
     const { data: scopedIdentities, error: scopedIdentitiesError } = await supabase
       .from('agent_identities')
       .select('id, agent_id, name, role')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId);
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId);
 
     if (scopedIdentitiesError) {
       logger.error('Failed to resolve workspace identities for sessions:', scopedIdentitiesError);
@@ -5492,7 +5495,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
     let identitySessionsQuery = supabase
       .from('sessions')
       .select('*')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .in('sb_id', scopedIdentityIds)
       .order('updated_at', { ascending: false })
       .limit(200);
@@ -5519,7 +5522,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
       let legacyQuery = supabase
         .from('sessions')
         .select('*')
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .is('sb_id', null)
         .in('agent_id', scopedSlugs)
         .order('updated_at', { ascending: false })
@@ -5655,7 +5658,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
         supabase
           .from('activity_stream')
           .select('id, session_id, type, subtype, content, created_at, payload')
-          .eq('user_id', authReq.pcpUserId)
+          .eq('user_id', authReq.inkUserId)
           .in('session_id', sessionIds)
           .order('created_at', { ascending: false })
           .limit(Math.min(2000, Math.max(300, sessionIds.length * 8))),
@@ -5837,8 +5840,8 @@ router.get('/studios', async (req: Request, res: Response) => {
     const { data: identities } = await supabase
       .from('agent_identities')
       .select('id, agent_id, name, role, backend')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .order('name', { ascending: true });
 
     // 2. Fetch all non-cleaned studios for this user
@@ -5869,7 +5872,7 @@ router.get('/studios', async (req: Request, res: Response) => {
         .select(
           'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at, lease, ephemeral, parent_studio_id, expires_at, default_project_id'
         )
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .in('sb_id', sbIds)
         .neq('status', 'cleaned')
         .order('updated_at', { ascending: false });
@@ -5894,7 +5897,7 @@ router.get('/studios', async (req: Request, res: Response) => {
       const { data: sessions } = await supabase
         .from('sessions')
         .select('agent_id, lifecycle, current_phase, status, active_thread_key, updated_at')
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .in('agent_id', sbSlugs)
         .is('ended_at', null)
         .neq('lifecycle', 'failed')
@@ -5989,8 +5992,8 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
-      authReq.pcpUserId,
-      authReq.pcpWorkspaceId
+      authReq.inkUserId,
+      authReq.inkWorkspaceId
     );
 
     if (scopedIdentityError) {
@@ -6012,7 +6015,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
       .select(
         'id, session_id, backend, backend_session_id, line_count, byte_count, source_path, synced_at'
       )
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .order('synced_at', { ascending: false })
       .limit(limit);
 
@@ -6054,7 +6057,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
         .select(
           'id, sb_id, agent_id, backend, backend_session_id, claude_session_id, thread_key, started_at, updated_at, working_dir, studio_id, workspace_id'
         )
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .in('id', archiveSessionIds);
 
       if (sessionError) {
@@ -6131,8 +6134,8 @@ router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
-      authReq.pcpUserId,
-      authReq.pcpWorkspaceId
+      authReq.inkUserId,
+      authReq.inkWorkspaceId
     );
 
     if (scopedIdentityError) {
@@ -6153,7 +6156,7 @@ router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
       .from('sessions')
       .select('id, sb_id, agent_id')
       .eq('id', sessionId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (sessionError || !isSessionInWorkspace(session, scope)) {
@@ -6164,7 +6167,7 @@ router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
     const { data: archive, error: archiveError } = await supabase
       .from('session_transcript_archives')
       .select('payload')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('session_id', sessionId)
       .single();
 
@@ -6213,8 +6216,8 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
-      authReq.pcpUserId,
-      authReq.pcpWorkspaceId
+      authReq.inkUserId,
+      authReq.inkWorkspaceId
     );
 
     if (scopedIdentityError || !scope || scope.sbIds.length === 0) {
@@ -6228,7 +6231,7 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
         'id, sb_id, agent_id, backend, backend_session_id, lifecycle, current_phase, active_thread_key, started_at, updated_at, ended_at, studio_id'
       )
       .eq('id', sessionId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (sessionError || !session || !isSessionInWorkspace(session, scope)) {
@@ -6259,7 +6262,7 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
     const { data: archive } = await supabase
       .from('session_transcript_archives')
       .select('payload')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('session_id', sessionId)
       .order('synced_at', { ascending: false })
       .limit(1)
@@ -6311,7 +6314,7 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
       const { data: activities, error: actError } = await supabase
         .from('activity_stream')
         .select('id, type, direction, content, agent_id, platform, created_at, payload')
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .eq('session_id', sessionId)
         .in('type', [
           'message_in',
@@ -6377,8 +6380,8 @@ router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response)
 
     const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
       supabase,
-      authReq.pcpUserId,
-      authReq.pcpWorkspaceId
+      authReq.inkUserId,
+      authReq.inkWorkspaceId
     );
 
     if (scopedIdentityError || !scope) {
@@ -6399,7 +6402,7 @@ router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response)
       .from('sessions')
       .select('id, sb_id, agent_id, backend, backend_session_id, claude_session_id')
       .eq('id', sessionId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (sessionError || !isSessionInWorkspace(session, scope)) {
@@ -6448,7 +6451,7 @@ router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response)
 
     const { error: archiveError } = await supabase.from('session_transcript_archives').upsert(
       {
-        user_id: authReq.pcpUserId,
+        user_id: authReq.inkUserId,
         session_id: session.id,
         backend,
         backend_session_id: backendSessionId,
@@ -6511,8 +6514,8 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     const { data: scopedIdentities, error: scopedIdentityError } = await supabase
       .from('agent_identities')
       .select('id, agent_id')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId);
+      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId);
 
     if (scopedIdentityError) {
       logger.error('Failed to resolve workspace identities for session logs:', scopedIdentityError);
@@ -6529,8 +6532,8 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
 
     if (scopedIdentityIds.length === 0) {
       logger.warn('Session log lookup denied: no identities in active workspace scope', {
-        userId: authReq.pcpUserId,
-        workspaceId: authReq.pcpWorkspaceId,
+        userId: authReq.inkUserId,
+        workspaceId: authReq.inkWorkspaceId,
         sessionId,
       });
       res.status(404).json({ error: 'Session not found' });
@@ -6543,7 +6546,7 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
         'id, sb_id, agent_id, status, current_phase, started_at, updated_at, ended_at, backend, backend_session_id, claude_session_id'
       )
       .eq('id', sessionId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     const sessionInWorkspace =
@@ -6557,8 +6560,8 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     }
 
     const [cloudLogs, syncedLogs, localLogs] = await Promise.all([
-      fetchCloudSessionLogs(supabase, authReq.pcpUserId, sessionId),
-      fetchSyncedTranscriptLogs(supabase, authReq.pcpUserId, sessionId),
+      fetchCloudSessionLogs(supabase, authReq.inkUserId, sessionId),
+      fetchSyncedTranscriptLogs(supabase, authReq.inkUserId, sessionId),
       includeLocal
         ? tryReadLocalTranscript({
             sessionId: session.id,
@@ -6714,7 +6717,7 @@ router.get('/skills/registry', async (req: Request, res: Response) => {
         limit: limit ? parseInt(limit as string, 10) : undefined,
         offset: offset ? parseInt(offset as string, 10) : undefined,
       },
-      authReq.pcpUserId
+      authReq.inkUserId
     );
 
     res.json(result);
@@ -6735,7 +6738,7 @@ router.get('/skills/registry/:idOrName', async (req: Request, res: Response) => 
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
-    const skill = await cloudService.getRegistrySkill(idOrName, authReq.pcpUserId);
+    const skill = await cloudService.getRegistrySkill(idOrName, authReq.inkUserId);
 
     if (!skill) {
       res.status(404).json({ error: 'Skill not found in registry' });
@@ -6768,7 +6771,7 @@ router.post('/skills/install', async (req: Request, res: Response) => {
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.installSkill({
       skillId,
-      userId: authReq.pcpUserId,
+      userId: authReq.inkUserId,
       versionPinned,
       config,
     });
@@ -6796,7 +6799,7 @@ router.delete('/skills/install/:skillId', async (req: Request, res: Response) =>
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
-    const result = await cloudService.uninstallSkill(skillId, authReq.pcpUserId);
+    const result = await cloudService.uninstallSkill(skillId, authReq.inkUserId);
 
     if (!result.success) {
       res.status(400).json({ error: result.message });
@@ -6825,7 +6828,7 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
 
     // Toggle enabled
     if (enabled !== undefined) {
-      const result = await cloudService.toggleSkill(installationId, authReq.pcpUserId, enabled);
+      const result = await cloudService.toggleSkill(installationId, authReq.inkUserId, enabled);
       if (!result.success) {
         res.status(400).json({ error: 'Failed to toggle skill' });
         return;
@@ -6836,7 +6839,7 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
     if (versionPinned !== undefined) {
       const result = await cloudService.pinSkillVersion(
         installationId,
-        authReq.pcpUserId,
+        authReq.inkUserId,
         versionPinned
       );
       if (!result.success) {
@@ -6863,7 +6866,7 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
-    const result = await cloudService.listAllSkills(authReq.pcpUserId, {
+    const result = await cloudService.listAllSkills(authReq.inkUserId, {
       type: type as string | undefined,
       category: category as string | undefined,
       search: search as string | undefined,
@@ -6924,7 +6927,7 @@ router.post('/skills/publish', async (req: Request, res: Response) => {
       version,
       manifest: manifest || {},
       content,
-      authorUserId: authReq.pcpUserId,
+      authorUserId: authReq.inkUserId,
       repositoryUrl,
       isPublic: isPublic !== false,
     });
@@ -6966,7 +6969,7 @@ router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
     const { SkillsRepository } = await import('../skills/repository.js');
     const repository = new SkillsRepository(supabase);
 
-    const skill = await repository.updateSkillWithVersion(skillId, authReq.pcpUserId, {
+    const skill = await repository.updateSkillWithVersion(skillId, authReq.inkUserId, {
       displayName,
       description,
       category,
@@ -7000,7 +7003,7 @@ router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => 
     const { SkillsRepository } = await import('../skills/repository.js');
     const repository = new SkillsRepository(supabase);
 
-    await repository.deleteSkill(skillId, authReq.pcpUserId);
+    await repository.deleteSkill(skillId, authReq.inkUserId);
 
     res.json({ success: true });
   } catch (error) {
@@ -7027,7 +7030,7 @@ router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Respo
 
     const skill = await repository.deprecateSkill({
       skillId,
-      userId: authReq.pcpUserId,
+      userId: authReq.inkUserId,
       message,
     });
 
@@ -7062,7 +7065,7 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
       sourceSkillId: skillId,
       newName: name,
       newDisplayName: displayName,
-      forkerUserId: authReq.pcpUserId,
+      forkerUserId: authReq.inkUserId,
       customizations: { description, category, tags },
     });
 
@@ -7094,7 +7097,7 @@ router.get('/threads', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
-    const userId = authReq.pcpUserId;
+    const userId = authReq.inkUserId;
 
     // Reported caps, same contract as /tasks and /task-groups: the response
     // says what was dropped instead of silently truncating.
@@ -7401,7 +7404,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select('id, thread_key, title, status, created_by_agent_id, created_at, closed_at')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7411,7 +7414,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     }
     const studioHistory = await loadThreadStudioHistory(
       supabase as SupabaseClient<Database>,
-      authReq.pcpUserId,
+      authReq.inkUserId,
       key
     );
 
@@ -7545,13 +7548,13 @@ router.post('/threads', async (req: Request, res: Response) => {
     const { data: existing } = await supabase
       .from('inbox_threads')
       .select('id')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('thread_key', key)
       .maybeSingle();
 
     const result = await handleSendToInbox(
       {
-        userId: authReq.pcpUserId,
+        userId: authReq.inkUserId,
         threadKey: key,
         content,
         // A studio-pinned send is the handler's single-recipient form; the
@@ -7641,7 +7644,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select('id, thread_key')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7665,7 +7668,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 
     const result = await handleSendToInbox(
       {
-        userId: authReq.pcpUserId,
+        userId: authReq.inkUserId,
         threadKey: key,
         content,
         recipients: participants,
@@ -7738,7 +7741,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select('id, thread_key, status')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7788,7 +7791,7 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
-    const userId = authReq.pcpUserId;
+    const userId = authReq.inkUserId;
 
     // All statuses deliberately: a merged PR's group is 'completed' and its
     // evidence trail is exactly what the viewer exists to show. GRAPH
@@ -8103,7 +8106,7 @@ router.get('/tasks', async (req: Request, res: Response) => {
     let query = supabase
       .from('tasks')
       .select('*, projects(name), task_groups(title)', { count: 'exact' })
-      .eq('user_id', authReq.pcpUserId);
+      .eq('user_id', authReq.inkUserId);
 
     // Optional filters
     const { status, projectId, groupId, activeOnly } = req.query;
@@ -8160,7 +8163,7 @@ router.get('/tasks', async (req: Request, res: Response) => {
         const { data: archivedDeps, error: archivedError } = await supabase
           .from('tasks')
           .select('*, projects(name), task_groups(title)')
-          .eq('user_id', authReq.pcpUserId)
+          .eq('user_id', authReq.inkUserId)
           .eq('status', 'archived')
           .in('id', missingBlockers);
         if (!archivedError && archivedDeps && archivedDeps.length > 0) {
@@ -8262,7 +8265,7 @@ router.get('/activity', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('activity_stream')
       .select('id, type, subtype, agent_id, content, status, created_at')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .not('type', 'in', '(tool_call,tool_result)')
       .order('created_at', { ascending: false })
       .limit(limit);
@@ -8345,7 +8348,7 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
       .from('tasks')
       .update(updates)
       .eq('id', id)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .select('*, projects(name), task_groups(title)')
       .single();
 
@@ -8413,7 +8416,7 @@ router.get('/task-groups', async (req: Request, res: Response) => {
     } = await supabase
       .from('task_groups')
       .select('*, agent_identities(agent_id, name), projects(name)', { count: 'exact' })
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .order('created_at', { ascending: false })
       .limit(GROUPS_CAP);
 
@@ -8432,7 +8435,7 @@ router.get('/task-groups', async (req: Request, res: Response) => {
       const { data: taskCountData, error: taskCountError } = await supabase
         .from('tasks')
         .select('task_group_id')
-        .eq('user_id', authReq.pcpUserId)
+        .eq('user_id', authReq.inkUserId)
         .in('task_group_id', groupIds);
 
       if (!taskCountError && taskCountData) {
@@ -8501,7 +8504,7 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
-    const userId = authReq.pcpUserId;
+    const userId = authReq.inkUserId;
 
     // Fetch the task group with joined agent identity and project
     const { data: group, error: groupError } = await supabase
@@ -8620,7 +8623,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
       .from('task_groups')
       .select('id, user_id')
       .eq('id', id)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (groupError || !group) {
@@ -8675,7 +8678,7 @@ router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
       .from('task_groups')
       .select('id')
       .eq('id', id)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (!group) {
@@ -8687,7 +8690,7 @@ router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
       .from('task_group_comments')
       .select('*')
       .eq('task_group_id', id)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .is('deleted_at', null)
       .order('created_at', { ascending: true });
 
@@ -8773,7 +8776,7 @@ router.get('/tasks/:id/comments', async (req: Request, res: Response) => {
       .from('tasks')
       .select('id')
       .eq('id', id)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (!task) {
@@ -8785,7 +8788,7 @@ router.get('/tasks/:id/comments', async (req: Request, res: Response) => {
       .from('task_comments')
       .select('*')
       .eq('task_id', id)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .is('deleted_at', null)
       .order('created_at', { ascending: true });
 
@@ -8857,7 +8860,7 @@ router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
       .from('tasks')
       .select('id')
       .eq('id', id)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (!task) {
@@ -8869,8 +8872,8 @@ router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
       .from('task_comments')
       .insert({
         task_id: id,
-        user_id: authReq.pcpUserId,
-        workspace_id: authReq.pcpWorkspaceId || null,
+        user_id: authReq.inkUserId,
+        workspace_id: authReq.inkWorkspaceId || null,
         parent_comment_id: parentCommentId || null,
         content: content.trim(),
       } as never)
@@ -8919,7 +8922,7 @@ router.delete('/tasks/:taskId/comments/:commentId', async (req: Request, res: Re
       .update({ deleted_at: new Date().toISOString() } as never)
       .eq('id', commentId)
       .eq('task_id', taskId)
-      .eq('user_id', authReq.pcpUserId);
+      .eq('user_id', authReq.inkUserId);
 
     if (error) {
       logger.error('Failed to delete task comment:', error);
@@ -8970,14 +8973,14 @@ router.post('/contacts/resolve', async (req: Request, res: Response) => {
 
     if (autoCreate) {
       const contact = await contactsRepo.findOrCreateByPlatformId(
-        authReq.pcpUserId,
+        authReq.inkUserId,
         platform as 'telegram' | 'discord' | 'whatsapp' | 'imessage',
         platformId
       );
       res.json({ contact });
     } else {
       const contact = await contactsRepo.findByPlatformId(
-        authReq.pcpUserId,
+        authReq.inkUserId,
         platform as 'telegram' | 'discord' | 'whatsapp' | 'imessage',
         platformId
       );
@@ -9082,7 +9085,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('approval_requests')
       .insert({
-        user_id: authReq.pcpUserId,
+        user_id: authReq.inkUserId,
         studio_id: studioIdForInsert,
         session_id: sessionIdForInsert,
         requesting_agent_id: requestingSlug,
@@ -9128,7 +9131,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     // Send notification to connected platforms (non-blocking)
     notifyPlatformOfApprovalRequest({
       id: data.id,
-      userId: authReq.pcpUserId,
+      userId: authReq.inkUserId,
       tool,
       args,
       reason: req.body.reason,
@@ -9172,7 +9175,7 @@ router.get('/approval-requests/:requestId/status', async (req: Request, res: Res
       .from('approval_requests')
       .select('id, status, action, granted_tools, granted_by, expires_at, resolved_at, created_at')
       .eq('id', requestId)
-      .eq('user_id', authReq.pcpUserId)
+      .eq('user_id', authReq.inkUserId)
       .single();
 
     if (error || !data) {

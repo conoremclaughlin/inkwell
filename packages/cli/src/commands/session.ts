@@ -1,7 +1,7 @@
 /**
  * Session Commands
  *
- * Manage PCP sessions.
+ * Manage Inkwell sessions.
  *
  * Commands:
  *   session list         List recent sessions
@@ -16,7 +16,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline/promises';
-import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 
@@ -251,7 +251,10 @@ export function buildTranscriptInstallPlan(options: {
     };
   }
 
-  if (backend.includes('pcp')) {
+  // 'ink' is the stored backend value; 'pcp' is the pre-rename spelling kept
+  // for rows written before 01b9047b. Matching only 'pcp' made this branch
+  // unreachable, so the ink REPL transcript destination was never chosen (#655).
+  if (backend.includes('ink') || backend.includes('pcp')) {
     return {
       destinationPath: join(
         targetCwd,
@@ -304,7 +307,7 @@ async function fetchAdminJson<T>(options: {
   body?: Record<string, unknown>;
   workspaceId?: string;
 }): Promise<T> {
-  const serverUrl = getPcpServerUrl().replace(/\/+$/, '');
+  const serverUrl = getInkServerUrl().replace(/\/+$/, '');
   const token = await getValidAccessToken(serverUrl);
   if (!token) {
     throw new Error('Not authenticated. Run: ink auth login');
@@ -383,7 +386,7 @@ async function resolvePullTarget(options: {
     if (!options.config?.email) {
       throw new Error(NOT_SIGNED_IN_MESSAGE);
     }
-    const studio = await callPcpTool<StudioLookupResult>('get_studio', {
+    const studio = await callInkTool<StudioLookupResult>('get_studio', {
       email: options.config.email,
       studioId: options.studio,
     });
@@ -504,7 +507,7 @@ async function listCommand(options: {
   }
 
   try {
-    const result = await callPcpTool<SessionListResult>('list_sessions', {
+    const result = await callInkTool<SessionListResult>('list_sessions', {
       email: config.email,
       sbSlug: options.agent,
       limit: parseInt(options.limit || '10', 10),
@@ -528,7 +531,7 @@ async function showCommand(sessionId: string): Promise<void> {
   }
 
   try {
-    const session = await callPcpTool<Session>('get_session', {
+    const session = await callInkTool<Session>('get_session', {
       email: config.email,
       sessionId,
     });
@@ -591,7 +594,7 @@ async function resumeCommand(sessionId: string): Promise<void> {
 
   // Get session to find Claude session ID
   try {
-    const session = await callPcpTool<Session>('get_session', {
+    const session = await callInkTool<Session>('get_session', {
       email: config.email,
       sessionId,
     });
@@ -626,7 +629,7 @@ async function endCommand(sessionId?: string): Promise<void> {
   }
 
   try {
-    await callPcpTool(
+    await callInkTool(
       'end_session',
       {
         email: config.email,
@@ -913,7 +916,7 @@ function formatDuration(ms: number): string {
 // ============================================================================
 
 export function registerSessionCommands(program: Command): void {
-  const session = program.command('session').description('Manage PCP sessions');
+  const session = program.command('session').description('Manage Inkwell sessions');
 
   session
     .command('list')
@@ -933,7 +936,7 @@ export function registerSessionCommands(program: Command): void {
   session
     .command('sync [target] [value]')
     .description('Push, list, and pull synced session transcripts')
-    .option('--backend <backend>', 'Override backend resolver (claude|codex|gemini|pcp)')
+    .option('--backend <backend>', 'Override backend resolver (claude|codex|gemini|ink)')
     .option('--backend-session-id <id>', 'Override backend session id used for transcript lookup')
     .option('--limit <n>', 'Number of synced archives to list', '20')
     .option('--path <path>', 'Write pulled transcript to an explicit file path')
