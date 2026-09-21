@@ -15,6 +15,9 @@ yarn workspace @inklabs/browser-companion test
 yarn workspace @inklabs/browser-companion build
 ```
 
+Install runs `wxt prepare` to generate the ignored `.wxt` types before tests.
+Skipping install scripts requires running that preparation explicitly.
+
 In Chrome 116+, open **chrome://extensions**, enable Developer mode, and **Load
 unpacked** from `packages/browser-companion/.output/chrome-mv3`. Pin the extension.
 Build output is intentionally untracked. Reload the extension after rebuilding.
@@ -109,6 +112,15 @@ confirmed a fill. It checked value/password/query exclusion, no pre-confirm muta
 and no submit. The panel HTML ran in an extension tab: native panel geometry, real
 dashboard authentication and an actual SB roundtrip are separate manual acceptance
 checks, not covered by those assertions.
+
+A second compiled-browser probe exercised the serialized dashboard bridge against
+a synthetic loopback page: capture offer, receipt, returned proposal, explicit
+confirmation and observed field change. Its localhost permission was pre-granted
+through Chromium developer settings in an isolated profile, **not** accepted via
+the native permission prompt. This verifies the bridge, not real dashboard auth,
+mail delivery or the optional-permission dialog. It also exposed a panel refresh
+race: the saved origin could overwrite an edited dashboard port. Regression tests
+now preserve edited origins and keep actions disabled until refresh completes.
 
 Architecture and rollout live in the versioned Inkwell artifacts
 `ink://specs/browser-companion`, `ink://specs/live-agent-surfaces` and

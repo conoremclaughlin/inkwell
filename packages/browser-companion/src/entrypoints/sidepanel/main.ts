@@ -5,6 +5,10 @@ import { panelRequest, type CompanionState } from '../../state';
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 let state: CompanionState = {};
 let busy = false;
+let originEdited = false;
+element<HTMLInputElement>('origin').addEventListener('input', () => {
+  originEdited = true;
+});
 const status = (text: string) => {
   element('status').textContent = text;
 };
@@ -14,7 +18,9 @@ async function refresh() {
   element('capture').hidden = !state.snapshot;
   element('preview').textContent = state.snapshot ? JSON.stringify(state.snapshot, null, 2) : '';
   element('privacy').textContent = state.snapshot ? privacySignals(state.snapshot) : '';
-  if (state.dashboardOrigin) element<HTMLInputElement>('origin').value = state.dashboardOrigin;
+  // A worker/storage refresh must not replace a dashboard address being edited.
+  if (state.dashboardOrigin && !originEdited)
+    element<HTMLInputElement>('origin').value = state.dashboardOrigin;
   element('confirmation').hidden = !state.proposal;
   const changes = element('changes');
   changes.replaceChildren();
@@ -43,11 +49,11 @@ async function run(action: () => Promise<unknown>) {
   } catch (error) {
     status(error instanceof Error ? error.message : 'Operation failed.');
   } finally {
+    await refresh().catch(() => status('Extension unavailable. Reopen the panel.'));
     busy = false;
     document.querySelectorAll('button').forEach((button) => {
       button.disabled = false;
     });
-    await refresh().catch(() => status('Extension unavailable. Reopen the panel.'));
   }
 }
 element('selection').onclick = () =>
