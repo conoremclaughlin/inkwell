@@ -36,6 +36,8 @@ export default function BrowserCompanionPage() {
   );
   const [attempted, setAttempted] = useState(false);
   const attemptedRef = useRef(false);
+  // Keep the attempted key even if the storage receipt is lost. Recovery
+  // reads this exact thread, rather than risking a duplicate send.
   const [sentKey, setSentKey] = useState('');
   const { data: people, error: peopleError } = useApiQuery<{
     individuals: Array<{ sbSlug: string; name: string }>;
@@ -118,7 +120,8 @@ export default function BrowserCompanionPage() {
     try {
       attemptedRef.current = true;
       setAttempted(true);
-      const key = `browser:${offer.snapshot.id}`;
+      const key = `thread:browser-${offer.snapshot.id}`;
+      setSentKey(key);
       const result = await apiPost<SendResult>('/api/admin/threads', {
         key,
         recipients: [recipient],
@@ -127,7 +130,6 @@ export default function BrowserCompanionPage() {
       });
       if (offerRef.current?.snapshot.id !== offer.snapshot.id) return;
       if (!result.messageId) throw new Error('No storage receipt');
-      setSentKey(key);
       setStatus(
         result.warning
           ? `Stored in the thread. Delivery warning: ${result.warning}`

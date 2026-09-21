@@ -1,6 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { Suspense, useMemo, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -318,7 +319,23 @@ function displayTitle(spine: ThreadSpine): string | null {
 // ─── Page ───
 
 export default function ThreadsPage() {
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  return (
+    <Suspense fallback={<p>Loading threads…</p>}>
+      <ThreadsContent />
+    </Suspense>
+  );
+}
+
+function ThreadsContent() {
+  const params = useSearchParams();
+  const router = useRouter();
+  const selectedKey = params.get('key') || null;
+  const setSelectedKey = (key: string | null) => {
+    const next = new URLSearchParams(params.toString());
+    if (key) next.set('key', key);
+    else next.delete('key');
+    router.push(`/threads${next.size ? `?${next}` : ''}`, { scroll: false });
+  };
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
@@ -356,7 +373,23 @@ export default function ThreadsPage() {
   }, [spines, search, typeFilter, statusFilter]);
 
   const selected = useMemo(
-    () => spines.find((s) => s.key === selectedKey) ?? null,
+    // The aggregate feed is capped. An exact recovery link must still read
+    // its conversation even when the spine has fallen outside that feed.
+    (): ThreadSpine | null =>
+      spines.find((s) => s.key === selectedKey) ??
+      (selectedKey
+        ? {
+            key: selectedKey,
+            identity: null,
+            thread: null,
+            sessions: [],
+            studios: [],
+            taskGroups: [],
+            participants: [],
+            sources: [],
+            lastActivityAt: '',
+          }
+        : null),
     [spines, selectedKey]
   );
 
@@ -539,7 +572,12 @@ export default function ThreadsPage() {
           )}
         >
           {selected ? (
-            <SpineDetail spine={selected} onBack={() => setSelectedKey(null)} />
+            <SpineDetail
+              key={selected.key}
+              spine={selected}
+              outsideFeed={!spines.some((s) => s.key === selectedKey)}
+              onBack={() => setSelectedKey(null)}
+            />
           ) : (
             <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
               Select a thread to see everything on its key.
@@ -553,10 +591,22 @@ export default function ThreadsPage() {
 
 // ─── Detail pane ───
 
-function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void }) {
+function SpineDetail({
+  spine,
+  outsideFeed,
+  onBack,
+}: {
+  spine: ThreadSpine;
+  outsideFeed: boolean;
+  onBack: () => void;
+}) {
   // Always fetched — a key nobody ever messaged about can still have studio
   // history worth showing (the endpoint answers { thread: null } for those).
-  const { data: messagesData, isLoading: messagesLoading } = useApiQuery<ThreadMessagesResponse>(
+  const {
+    data: messagesData,
+    isLoading: messagesLoading,
+    error: messagesError,
+  } = useApiQuery<ThreadMessagesResponse>(
     ['thread-messages', spine.key],
     `/api/admin/threads/messages?key=${encodeURIComponent(spine.key)}`
   );
@@ -578,6 +628,8 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
   const pastStudios = (messagesData?.studioHistory ?? []).filter(
     (h) => !liveStudioIds.has(h.studioId)
   );
+  const thread = messagesData?.thread ?? spine.thread;
+  const hasThread = !!thread || spine.sources.includes('thread');
 
   return (
     <div className="flex flex-col gap-4 p-4">
@@ -594,25 +646,33 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
           <Hash className="h-4 w-4 text-muted-foreground" />
           <span className="font-mono text-sm font-semibold">{spine.key}</span>
           <TypeChip identity={spine.identity} />
-          {spine.thread ? (
+          {thread ? (
             <Badge
-              variant={spine.thread.status === 'open' ? 'default' : 'secondary'}
+              variant={thread.status === 'open' ? 'default' : 'secondary'}
               title="Conversation status — whether this inbox thread is open or closed, not the state of the PR/issue it references"
             >
-              thread {spine.thread.status}
+              thread {thread.status}
             </Badge>
           ) : (
             <Badge variant="outline" className="border-amber-500/50 text-amber-600">
-              no thread yet
+              {messagesError || messagesLoading || !messagesData
+                ? 'thread unconfirmed'
+                : 'no thread yet'}
             </Badge>
           )}
-          {spine.thread?.status === 'closed' && <ReopenThreadButton threadKey={spine.key} />}
+          {thread?.status === 'closed' && <ReopenThreadButton threadKey={spine.key} />}
         </div>
         {displayTitle(spine) && <div className="mt-1 text-sm">{displayTitle(spine)}</div>}
         <div className="mt-1 text-xs text-muted-foreground">
           {spine.participants.length > 0 && <>Participants: {spine.participants.join(', ')} · </>}
-          Last activity {formatRelativeTime(spine.lastActivityAt)}
+          {spine.lastActivityAt && <>Last activity {formatRelativeTime(spine.lastActivityAt)}</>}
         </div>
+        {outsideFeed && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            This key is outside the current activity feed. Reading its conversation directly;
+            session and studio details may be incomplete.
+          </p>
+        )}
       </div>
 
       {spine.taskGroups.length > 0 && (
@@ -754,12 +814,17 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
 
       <section>
         <SectionLabel icon={MessageSquare} label="Conversation" />
-        {!spine.sources.includes('thread') ? (
-          <div className="rounded-md border border-dashed p-4 text-xs text-muted-foreground">
-            No messages on this key yet — work is underway but nothing has been announced.
-          </div>
+        {messagesError ? (
+          <p role="alert">
+            Could not read this conversation. Check your connection before resending.
+          </p>
         ) : messagesLoading ? (
           <div className="p-2 text-xs text-muted-foreground">Loading messages…</div>
+        ) : !hasThread ? (
+          <div className="rounded-md border border-dashed p-4 text-xs text-muted-foreground">
+            No conversation was found on this key. This is not a delivery receipt; an in-flight
+            request may still arrive.
+          </div>
         ) : (
           <div className="flex flex-col gap-2">
             {messagesData?.meta?.truncated && (
@@ -804,7 +869,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
         )}
       </section>
 
-      {spine.sources.includes('thread') && (
+      {hasThread && (
         <section>
           <SectionLabel icon={Send} label="Reply" />
           <ReplyComposer
