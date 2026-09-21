@@ -48,6 +48,9 @@ describe('browser companion contract', () => {
     'https://fixture.test/path',
     'https://fixture.test/?token=x',
     'https://fixture.test/#x',
+    'https://*',
+    'https://*.example.com',
+    'https://%2a.example.com',
     'javascript:alert(1)',
     'file:///tmp/example',
   ])('rejects unsafe dashboard target %s', (url) => expect(() => dashboardOrigin(url)).toThrow());

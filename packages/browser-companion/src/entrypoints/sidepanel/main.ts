@@ -62,6 +62,7 @@ element('page').onclick = () =>
     return panelRequest({ type: 'capture', mode: 'page' });
   });
 element('share').onclick = () => {
+  if (busy) return;
   // permissions.request must be called directly in the user gesture.
   let origin: string;
   try {
@@ -73,6 +74,7 @@ element('share').onclick = () => {
   const snapshotId = state.snapshot?.id;
   const permission = chrome.permissions.request({ origins: [dashboardPermission(origin)] });
   void run(async () => {
+    status('Waiting for dashboard permission. Check the browser permission prompt.');
     if (!(await permission)) throw new Error('Dashboard access was not granted. Nothing shared.');
     return panelRequest({ type: 'share', origin, snapshotId });
   });
