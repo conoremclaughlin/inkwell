@@ -139,3 +139,51 @@ describe('resetQueriesForWorkspaceSwitch', () => {
     expect(transition.some((s) => s.data === 'old')).toBe(false);
   });
 });
+
+/**
+ * Why the refresh indicator is NOT bound to the query's own refetch flag.
+ *
+ * ThreadsScreen polls every 20s. It used to pass `isRefetching` to
+ * RefreshControl's `refreshing`, which made the pull-to-refresh spinner
+ * appear by itself on every poll — the app looked like it was struggling,
+ * when polling was working exactly as intended.
+ *
+ * The screen's own fix is local state, which this environment (node, no RN
+ * renderer) cannot mount. What it CAN do is pin the library fact the fix
+ * rests on: `isRefetching` is true during a background refetch of already-
+ * settled data. If that ever stopped being true, this test would fail and
+ * whoever reads it would know the workaround can go. Until then it is the
+ * reason not to re-bind the spinner to it.
+ */
+describe('isRefetching during background polling', () => {
+  it('goes true for a poll nobody asked for, which is why the spinner cannot use it', async () => {
+    const client = makeClient();
+    let served = 'first';
+    const observer = new QueryObserver(client, {
+      queryKey: ['threads'],
+      queryFn: async () => served,
+      retry: false,
+    });
+
+    const flags: Array<{ isRefetching: boolean; fetchStatus: string; data: string | undefined }> =
+      [];
+    const unsubscribe = observer.subscribe((r) => {
+      flags.push({ isRefetching: r.isRefetching, fetchStatus: r.fetchStatus, data: r.data });
+    });
+    cleanups.push(() => unsubscribe());
+
+    // Settle the first load. isRefetching is false here: an initial load is
+    // `isPending`, not a refetch — so the spinner would stay down for it.
+    await vi.waitFor(() =>
+      expect(flags.some((f) => f.fetchStatus === 'idle' && f.data === 'first')).toBe(true)
+    );
+    expect(flags.filter((f) => f.data === undefined).every((f) => !f.isRefetching)).toBe(true);
+
+    // A background refetch — what refetchInterval does every 20 seconds.
+    served = 'second';
+    flags.length = 0;
+    await observer.refetch();
+
+    expect(flags.some((f) => f.isRefetching)).toBe(true);
+  });
+});

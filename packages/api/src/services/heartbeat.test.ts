@@ -12,8 +12,11 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 // ─── Mock: node-cron ───
+// `on` is the missed-tick seam (see `heartbeat-missed-tick.test.ts`, which runs
+// the real scheduler). This stub exists only so init does not throw here; a
+// mocked scheduler cannot show whether the event ever fires.
 vi.mock('node-cron', () => ({
-  schedule: vi.fn(() => ({ start: vi.fn(), stop: vi.fn() })),
+  schedule: vi.fn(() => ({ start: vi.fn(), stop: vi.fn(), on: vi.fn() })),
 }));
 
 // ─── Mock: env ───

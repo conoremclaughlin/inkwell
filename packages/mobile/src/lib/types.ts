@@ -14,6 +14,13 @@ export interface SpineSession {
   status: string | null;
   phase: string | null;
   relation: 'anchor' | 'active' | 'both';
+  /**
+   * Whether this session is working right now. Computed by the server
+   * (isSessionLive in thread-spines.ts) because `lifecycle` alone is not
+   * evidence: nothing reaps abandoned sessions, so rows sit at `running` for
+   * months. Do not re-derive presence here — there is one owner for the rule.
+   */
+  live: boolean;
   updatedAt: string;
   studioId: string | null;
 }
@@ -41,6 +48,8 @@ export interface ThreadSpine {
   key: string;
   thread: {
     title: string | null;
+    /** One-line "what is this about" (DB-capped at 280 chars); often absent. */
+    summary: string | null;
     status: string;
     createdBySlug: string;
     participants: string[];

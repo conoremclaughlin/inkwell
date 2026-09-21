@@ -36,11 +36,11 @@ import {
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
  *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
-const PROCESS_TIMEOUT_MS =
+export const PROCESS_TIMEOUT_MS =
   parseInt(process.env.GEMINI_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
 
 /** Idle timeout: no output for this long = stuck */
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+export const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 interface GeminiUsageStats {
   contextTokens: number;
@@ -168,13 +168,20 @@ export class GeminiRunner implements IRunner {
       // Use session ID from Gemini's init event, fall back to the one we passed in
       const resolvedSessionId = result.sessionId || backendSessionId || undefined;
 
+      // A killed turn is a stopped turn, whatever it managed to emit first —
+      // so any text it left behind is partial and `success` is false. The
+      // responses, usage and tool calls are still returned: the turn spent
+      // those tokens and made those calls, and the caller records them either
+      // way. What changes is that the outcome is now classified rather than
+      // inferred from the absence of a thrown error.
       return {
-        success: true,
+        success: !result.timedOut,
         backendSessionId: resolvedSessionId || null,
         responses: result.responses,
         usage: result.usage,
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
+        ...(result.timedOut ? { error: result.timedOut.message } : {}),
       };
     } catch (error) {
       logger.error('Gemini process failed', {
@@ -239,6 +246,12 @@ export class GeminiRunner implements IRunner {
     finalTextResponse?: string;
     toolCalls: ToolCall[];
     sessionId?: string;
+    /**
+     * Set when WE killed the process, never when it finished on its own.
+     * `run()` decides `success` from this, so a timeout that resolves without
+     * it is reported as a completed turn. See the timers below.
+     */
+    timedOut?: { kind: 'idle' | 'hard'; message: string };
   }> {
     const geminiBin = await resolveBinaryPath('gemini');
     return new Promise((resolve, reject) => {
@@ -307,6 +320,17 @@ export class GeminiRunner implements IRunner {
               toolCalls,
               finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
               sessionId: resolvedSessionId,
+              // `timedOut`, not just the marker string. Resolving bare reports a
+              // SIGKILLed turn as a completed one: the session goes idle, a
+              // heartbeat beat records `delivered`, and the marker above is
+              // auto-forwarded to the human as if the agent had written it.
+              // The word "timeout" is load-bearing — classifyError matches on
+              // it, and without it this lands in the non-retryable `unknown`
+              // category. (Same fix Lumen made in antigravity-runner, #507.)
+              timedOut: {
+                kind: 'idle',
+                message: `Gemini CLI timeout: no output for ${idleSecs}s, process killed`,
+              },
             });
           }
         }, IDLE_TIMEOUT_MS);
@@ -327,6 +351,12 @@ export class GeminiRunner implements IRunner {
             toolCalls,
             finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
             sessionId: resolvedSessionId,
+            timedOut: {
+              kind: 'hard',
+              message: `Gemini CLI timeout: exceeded the ${Math.round(
+                PROCESS_TIMEOUT_MS / 1000
+              )}s ceiling, process killed`,
+            },
           });
         }
       }, PROCESS_TIMEOUT_MS);
