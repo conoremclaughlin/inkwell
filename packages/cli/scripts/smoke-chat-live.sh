@@ -6,7 +6,7 @@ set -euo pipefail
 # across configured backends.
 #
 # Prerequisites:
-# - Local PCP API server running (default: http://localhost:3101)
+# - Local Inkwell API server running (default: http://localhost:3101)
 # - Authenticated backend CLIs (claude/codex/gemini)
 # - Built CLI in this package (dist/cli.js)
 #
@@ -23,7 +23,7 @@ BACKENDS="${SB_SMOKE_BACKENDS:-claude codex gemini}"
 SB_BIN="${SB_SMOKE_BIN:-node dist/cli.js}"
 TIMEOUT_SECONDS="${SB_SMOKE_TIMEOUT_SECONDS:-20}"
 DEBUG_FILE="${SB_SMOKE_DEBUG_FILE:-/tmp/sb-chat-smoke-debug.log}"
-PCP_URL="${INK_SERVER_URL:-http://localhost:3101}"
+INK_URL="${INK_SERVER_URL:-http://localhost:3101}"
 
 if [[ ! -f "dist/cli.js" ]]; then
   echo "dist/cli.js not found. Run: yarn workspace @inklabs/cli build"
@@ -45,7 +45,7 @@ failures=0
 echo "Running sb-chat live smoke test"
 echo "  agent:    ${AGENT}"
 echo "  backends: ${BACKENDS}"
-echo "  pcp:      ${PCP_URL}"
+echo "  inkwell:  ${INK_URL}"
 echo "  timeout:  ${TIMEOUT_SECONDS}s"
 echo "  debug:    ${DEBUG_FILE}"
 echo ""
@@ -61,7 +61,7 @@ for backend in ${BACKENDS}; do
 
   set +e
   output="$(
-    INK_SERVER_URL="${PCP_URL}" \
+    INK_SERVER_URL="${INK_URL}" \
       SB_DEBUG_FILE="${DEBUG_FILE}" \
       ${SB_BIN} chat \
       -a "${AGENT}" \
@@ -94,7 +94,7 @@ for backend in ${BACKENDS}; do
   fi
 
   if grep -q "Local tool error (get_inbox)" <<<"${output}"; then
-    echo "WARN ${backend}: local tool call was routed but PCP call failed (check INK_SERVER_URL/auth)"
+    echo "WARN ${backend}: local tool call was routed but Inkwell call failed (check INK_SERVER_URL/auth)"
   fi
 
   echo "PASS ${backend}"

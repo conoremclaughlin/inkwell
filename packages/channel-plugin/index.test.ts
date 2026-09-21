@@ -16,8 +16,8 @@ function isLegacyMessageForThisStudio(
   if (!myStudioId) return true;
 
   const metadata = msg.metadata as Record<string, unknown> | undefined;
-  const pcp = metadata?.pcp as Record<string, unknown> | undefined;
-  const recipient = pcp?.recipient as Record<string, unknown> | undefined;
+  const inkMeta = metadata?.pcp as Record<string, unknown> | undefined;
+  const recipient = inkMeta?.recipient as Record<string, unknown> | undefined;
   const recipientStudioId = recipient?.studioId as string | undefined;
 
   if (!recipientStudioId) return true; // no studio scoping — broadcast

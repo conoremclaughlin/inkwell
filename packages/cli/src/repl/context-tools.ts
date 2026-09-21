@@ -2,11 +2,11 @@
  * Client-Local Context Management Tools
  *
  * These tools run entirely in the CLI — they modify the local context ledger
- * without going through the PCP MCP server. This gives the SB agency over
+ * without going through the Inkwell MCP server. This gives the SB agency over
  * its own context window: the ability to introspect what's there and
  * surgically evict what's no longer relevant.
  *
- * The SB calls these the same way as PCP tools (via ink-tool blocks),
+ * The SB calls these the same way as Inkwell tools (via ink-tool blocks),
  * but the CLI intercepts and handles them locally.
  */
 
@@ -16,7 +16,7 @@ import {
   type LedgerEntry,
   type LedgerEvictResult,
 } from './context-ledger.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 // ─── Session Status Signal ──────────────────────────────────────
 
@@ -73,7 +73,7 @@ export function clearLastSignal(): void {
   _lastSignal = null;
 }
 
-/** Tool names that are handled client-locally, not forwarded to PCP */
+/** Tool names that are handled client-locally, not forwarded to Inkwell */
 export const CLIENT_LOCAL_TOOLS = new Set([
   'list_context',
   'evict_context',
@@ -276,7 +276,7 @@ export function formatContextStamp(occ: ContextOccupancy): string {
 }
 
 /**
- * Handle a client-local tool call. Returns the result in PCP tool format,
+ * Handle a client-local tool call. Returns the result in Inkwell tool format,
  * or null if the tool isn't recognized.
  */
 export function handleClientLocalTool(
@@ -285,7 +285,7 @@ export function handleClientLocalTool(
   ledger: ContextLedger,
   signalSink: SignalSink = globalSignalSink,
   hooks: EvictionHooks = {}
-): PcpToolCallResult | null {
+): InkToolCallResult | null {
   switch (tool) {
     case 'list_context':
       return handleListContext(args, ledger, hooks);
@@ -322,6 +322,12 @@ export function handleClientLocalTool(
 export const COMPACT_CONTEXT_SUMMARY_MAX_CHARS = 20_000;
 /** Ceiling on the protected recent tail an agent may ask to keep verbatim. */
 export const COMPACT_CONTEXT_MAX_KEEP_RECENT = 200;
+/**
+ * Ceiling on a ref-selected consolidation. The refs arrive in the args of a
+ * tool call the model wrote, so the list is already bounded by what it can
+ * emit; this bounds the pathological case rather than the ordinary one.
+ */
+export const COMPACT_CONTEXT_MAX_REFS = 2_000;
 
 /**
  * A compaction must leave the window smaller than it found it. An agent may
@@ -338,6 +344,18 @@ export interface CompactContextArgs {
   summary?: string;
   /** Entries kept verbatim after the summary. Absent means the runtime default. */
   keepRecent?: number;
+  /**
+   * Content-hash refs (the `ref` values from list_context) naming EXACTLY the
+   * entries to replace. This is the second selector, not a second verb: the
+   * operation is the same remove-and-insert `compact_context` already performs,
+   * chosen by name instead of by age — the way `evict_context` already takes
+   * refs, source or role for one eviction.
+   *
+   * Refs, never entryIds: the process ordinal renumbers on reattach, so a set
+   * captured against it can resolve to different content later and still read
+   * as correct (Myra, 2026-09-03; #570).
+   */
+  refs?: string[];
 }
 
 /**
@@ -373,6 +391,33 @@ export function parseCompactContextArgs(
       return { error: `keepRecent must be at most ${COMPACT_CONTEXT_MAX_KEEP_RECENT}` };
     }
     out.keepRecent = Math.floor(n);
+  }
+  if (args.refs !== undefined) {
+    if (!Array.isArray(args.refs)) return { error: 'refs must be an array of strings' };
+    const refs = args.refs.filter((r): r is string => typeof r === 'string' && r.trim() !== '');
+    if (refs.length !== args.refs.length) {
+      return {
+        error: 'refs must contain only non-empty strings (the ref values from list_context)',
+      };
+    }
+    if (refs.length === 0) {
+      return { error: 'refs is empty — omit it to compact the oldest entries instead' };
+    }
+    if (refs.length > COMPACT_CONTEXT_MAX_REFS) {
+      return {
+        error: `refs holds ${refs.length} entries; the ceiling is ${COMPACT_CONTEXT_MAX_REFS}`,
+      };
+    }
+    // The two selectors answer the same question differently — which entries
+    // go. Honouring both would mean silently picking one, and the caller could
+    // not tell which from the result.
+    if (out.keepRecent !== undefined) {
+      return {
+        error:
+          'refs and keepRecent are alternative selectors — refs names the entries to replace, keepRecent protects a recent tail of an oldest-first compaction. Pass one.',
+      };
+    }
+    out.refs = refs;
   }
   return out;
 }
@@ -415,7 +460,7 @@ function handleListContext(
   args: Record<string, unknown>,
   ledger: ContextLedger,
   hooks: EvictionHooks = {}
-): PcpToolCallResult {
+): InkToolCallResult {
   const all = ledger.summarizeEntries();
   const totalTokens = ledger.totalTokens();
   const measured = hooks.providerUsage?.();
@@ -528,7 +573,7 @@ function handleEvictContext(
   args: Record<string, unknown>,
   ledger: ContextLedger,
   hooks: EvictionHooks
-): PcpToolCallResult {
+): InkToolCallResult {
   const refs = Array.isArray(args.refs)
     ? (args.refs as unknown[]).filter((r): r is string => typeof r === 'string')
     : undefined;
@@ -623,7 +668,7 @@ function handleEvictContext(
 
 // ─── signal_status ──────────────────────────────────────────────
 
-function handleSignalStatus(args: Record<string, unknown>, sink: SignalSink): PcpToolCallResult {
+function handleSignalStatus(args: Record<string, unknown>, sink: SignalSink): InkToolCallResult {
   const status = args.status as string | undefined;
   const reason = args.reason as string | undefined;
 

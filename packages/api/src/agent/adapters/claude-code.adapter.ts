@@ -1,7 +1,7 @@
 /**
  * Claude Code Permission Adapter
  *
- * Translates PCP permissions to Claude Code CLI flags and configuration.
+ * Translates Inkwell permissions to Claude Code CLI flags and configuration.
  * Claude Code uses --allowedTools and permission settings in .claude/settings.json
  */
 
@@ -9,7 +9,7 @@ import type { PermissionAdapter, BackendPermissionConfig } from './types';
 import type { EffectivePermissions, PermissionId } from '../../services/permissions';
 
 /**
- * Mapping from PCP permissions to Claude Code tool/permission names
+ * Mapping from Inkwell permissions to Claude Code tool/permission names
  */
 const PERMISSION_MAPPING: Record<PermissionId, string[]> = {
   web_search: ['WebSearch'],
@@ -38,7 +38,7 @@ export class ClaudeCodeAdapter implements PermissionAdapter {
   readonly backendId = 'claude-code';
 
   /**
-   * Translate PCP permissions to Claude Code configuration
+   * Translate Inkwell permissions to Claude Code configuration
    *
    * Returns:
    * - allowedTools: Array of tool patterns to allow

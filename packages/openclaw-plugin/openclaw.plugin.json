@@ -3,15 +3,15 @@
   "skills": ["skills"],
   "uiHints": {
     "serverUrl": {
-      "label": "PCP Server URL",
+      "label": "Inkwell Server URL",
       "placeholder": "http://localhost:3001",
-      "help": "URL of the running PCP server"
+      "help": "URL of the running Inkwell server"
     },
     "accessToken": {
       "label": "Access Token",
       "sensitive": true,
       "placeholder": "eyJhbGciOi...",
-      "help": "PCP access token (from ~/.ink/auth.json or 'sb login')"
+      "help": "Inkwell access token (from ~/.ink/auth.json or 'sb login')"
     },
     "sbSlug": {
       "label": "SB Slug",
@@ -20,11 +20,11 @@
     },
     "autoBootstrap": {
       "label": "Auto-Bootstrap",
-      "help": "Inject PCP identity context at the start of each agent turn"
+      "help": "Inject Inkwell identity context at the start of each agent turn"
     },
     "autoSessionEnd": {
       "label": "Auto Session End",
-      "help": "Automatically end the PCP session when the agent turn completes"
+      "help": "Automatically end the Inkwell session when the agent turn completes"
     }
   },
   "configSchema": {

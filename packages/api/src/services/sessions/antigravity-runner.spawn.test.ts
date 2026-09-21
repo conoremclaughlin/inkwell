@@ -42,7 +42,7 @@ import type { ClaudeRunnerConfig } from './types.js';
 const config = (): ClaudeRunnerConfig => ({
   workingDirectory: fixtures,
   mcpConfigPath: join(fixtures, '.mcp.json'),
-  // No pcpAccessToken: this exercises the spawn path, not global config staging.
+  // No inkAccessToken: this exercises the spawn path, not global config staging.
   inkMcpUrl: 'http://localhost:3001/mcp',
 });
 

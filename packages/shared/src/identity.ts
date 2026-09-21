@@ -59,7 +59,7 @@ export const ENV = {
   SERVER_URL: 'INK_SERVER_URL',
   /** Access token for MCP auth */
   ACCESS_TOKEN: 'INK_ACCESS_TOKEN',
-  /** PCP session ID (propagated through spawn chain) */
+  /** Inkwell session ID (propagated through spawn chain) */
   SESSION_ID: 'INK_SESSION_ID',
   /** Studio ID */
   STUDIO_ID: 'INK_STUDIO_ID',

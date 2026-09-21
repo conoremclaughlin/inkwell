@@ -1,3 +1,5 @@
+import { spawnSync } from 'child_process';
+import { existsSync } from 'fs';
 import { mkdtemp, rm, writeFile, readFile, mkdir } from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -5,6 +7,43 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { isPiTool, getPiToolNames, callPiTool, initPiTools } from './pi-tools.js';
 import { PathContainmentError } from '@inklabs/shared';
 import { executeToolCalls, type ToolCallExecutorDeps } from './tool-call-executor.js';
+
+/**
+ * Pi's `grep` and `find` shell out to ripgrep and fd. Pi looks for them in its
+ * managed bin dir (~/.pi/agent/bin) and then on PATH, and when neither has them
+ * it downloads from GitHub releases at the moment the tool first runs — a
+ * `GET api.github.com/repos/.../releases/latest` plus a tarball, inside the
+ * test.
+ *
+ * That made these two tests depend on api.github.com being reachable and
+ * un-rate-limited from the runner, and unauthenticated GitHub API calls from CI
+ * share an egress IP with every other runner. When it failed it surfaced as
+ * `grep > searches file contents` failing with "ripgrep (rg) is not available
+ * and could not be downloaded", which reads like a regression in whatever PR
+ * was running — it cost a cycle on #539, a PR touching no CLI files.
+ *
+ * CI now installs both binaries and sets PI_OFFLINE=1, so the download path is
+ * never taken there. `requireBinary` turns the remaining failure into one that
+ * names its own cause instead of looking like a broken adapter.
+ */
+function binaryAvailable(candidates: string[]): boolean {
+  const piBinDir = path.join(os.homedir(), '.pi', 'agent', 'bin');
+  if (candidates.some((name) => existsSync(path.join(piBinDir, name)))) return true;
+  return candidates.some((name) => {
+    const probe = spawnSync(name, ['--version'], { stdio: 'pipe' });
+    return !probe.error;
+  });
+}
+
+function requireBinary(candidates: string[], toolLabel: string, installHint: string): void {
+  const offline = /^(1|true|yes)$/i.test(process.env.PI_OFFLINE ?? '');
+  if (!offline || binaryAvailable(candidates)) return;
+  throw new Error(
+    `${toolLabel} is not installed and PI_OFFLINE is set, so pi cannot download it. ` +
+      'This is an environment problem, not a pi-tools regression. ' +
+      `Install it (${installHint}) or unset PI_OFFLINE to let pi fetch it.`
+  );
+}
 
 // ─── Unit Tests ──────────────────────────────────────────────────────
 
@@ -168,6 +207,7 @@ describe('pi-tools: live', () => {
 
   describe('grep', () => {
     it('searches file contents', async () => {
+      requireBinary(['rg'], 'ripgrep', 'apt-get install -y ripgrep / brew install ripgrep');
       const result = await callPiTool('grep', { pattern: 'const', path: '.' }, tmpDir);
       expect(result.success).toBe(true);
       expect(result.text).toContain('const x = 1');
@@ -176,6 +216,7 @@ describe('pi-tools: live', () => {
 
   describe('find', () => {
     it('finds files by pattern', async () => {
+      requireBinary(['fd', 'fdfind'], 'fd', 'apt-get install -y fd-find / brew install fd');
       const result = await callPiTool('find', { pattern: '*.txt', path: '.' }, tmpDir);
       expect(result.success).toBe(true);
       expect(result.text).toContain('hello.txt');
@@ -191,7 +232,7 @@ describe('pi-tools: live', () => {
   });
 
   describe('result format', () => {
-    it('returns PcpToolCallResult shape with content array', async () => {
+    it('returns InkToolCallResult shape with content array', async () => {
       const result = await callPiTool('read', { path: 'hello.txt' }, tmpDir);
       expect(result).toHaveProperty('content');
       expect(result).toHaveProperty('text');
@@ -289,10 +330,10 @@ describe('pi-tools: integration with executeToolCalls', () => {
   function makeDeps(overrides: Partial<ToolCallExecutorDeps> = {}): ToolCallExecutorDeps {
     return {
       policy: {
-        canCallPcpTool: vi.fn().mockReturnValue({ allowed: true, reason: '' }),
+        canCallInkTool: vi.fn().mockReturnValue({ allowed: true, reason: '' }),
       } as unknown as ToolCallExecutorDeps['policy'],
       callTool: (tool, args) => {
-        // Pi tools are routed in-process; non-Pi tools go to mock PCP server
+        // Pi tools are routed in-process; non-Pi tools go to mock Inkwell server
         if (isPiTool(tool)) {
           return callPiTool(tool, args, tmpDir);
         }
@@ -318,7 +359,7 @@ describe('pi-tools: integration with executeToolCalls', () => {
     expect(result.text).toContain('original content');
   });
 
-  it('routes Inkwell tools to mock PCP server', async () => {
+  it('routes Inkwell tools to mock Inkwell server', async () => {
     const deps = makeDeps();
     const results = await executeToolCalls(
       [{ tool: 'recall', args: { query: 'test' }, raw: '' }],
@@ -354,7 +395,7 @@ describe('pi-tools: integration with executeToolCalls', () => {
   it('respects tool policy for Pi tools', async () => {
     const deps = makeDeps({
       policy: {
-        canCallPcpTool: vi.fn().mockReturnValue({
+        canCallInkTool: vi.fn().mockReturnValue({
           allowed: false,
           promptable: false,
           reason: 'bash is denied',
@@ -375,7 +416,7 @@ describe('pi-tools: integration with executeToolCalls', () => {
   it('supports approval flow for Pi tools', async () => {
     const deps = makeDeps({
       policy: {
-        canCallPcpTool: vi
+        canCallInkTool: vi
           .fn()
           .mockReturnValueOnce({ allowed: false, promptable: true, reason: 'needs approval' })
           .mockReturnValueOnce({ allowed: true, reason: '' }),

@@ -209,7 +209,7 @@ program
     '--session-candidates-all',
     'Include all backend-local session sources in picker/json (debug mode)'
   )
-  .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
+  .option('--session-choice <choice>', 'Force session selection (new | ink:<id> | local:<id>)')
   .option('--sb-debug', 'Enable debug logging to ~/.ink/logs/sb-debug.log')
   .option('--sb-verbose', 'Verbose SB output')
   .option('--dangerous', 'Skip all permission prompts (maps to backend-native auto-approve)')
@@ -223,7 +223,7 @@ program
     const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
     // Machine-readable output mode: everything printed between here and the
     // payload (debug path, dangerous banner, server-update notice, hook
-    // health, PCP availability) belongs on stderr.
+    // health, Inkwell availability) belongs on stderr.
     if (resolvedOptions.sessionCandidatesJson) {
       divertConsoleLogToStderr();
     }

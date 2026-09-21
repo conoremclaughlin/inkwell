@@ -17,7 +17,7 @@
 import { Router, type Request, type Response } from 'express';
 import { ZodError } from 'zod';
 import type { DataComposer } from '../data/composer';
-import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
+import { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
 import { AlertDispatchService } from '../services/alerts/alert-dispatch.service';
 import { parseAlertPayload, secretsMatch, sourceStaleness } from '../services/alerts/alert-policy';
 import { env } from '../config/env';
@@ -33,7 +33,7 @@ import rateLimit from 'express-rate-limit';
  */
 function resolveAlertUser(
   req: Request,
-  authProvider: PcpAuthProvider
+  authProvider: InkAuthProvider
 ): { userId: string; via: 'token' | 'bearer' } | null {
   const provided = req.header('x-ink-alert-token');
   if (provided && secretsMatch(provided, env.ALERT_INGEST_TOKEN)) {
@@ -74,7 +74,7 @@ function resolveAlertUser(
 const ALERT_READ_WINDOW_MS = 60 * 1000;
 const ALERT_READS_PER_MINUTE = 60;
 
-function makeReadThrottle(authProvider: PcpAuthProvider) {
+function makeReadThrottle(authProvider: InkAuthProvider) {
   return rateLimit({
     windowMs: ALERT_READ_WINDOW_MS,
     limit: ALERT_READS_PER_MINUTE,
@@ -95,7 +95,7 @@ function makeReadThrottle(authProvider: PcpAuthProvider) {
 
 export function createAlertsRouter(dataComposer: DataComposer): Router {
   const router = Router();
-  const authProvider = new PcpAuthProvider();
+  const authProvider = new InkAuthProvider();
   const throttleReads = makeReadThrottle(authProvider);
   const dispatch = new AlertDispatchService(dataComposer);
 

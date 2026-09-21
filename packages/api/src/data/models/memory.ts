@@ -18,7 +18,7 @@ export interface Memory {
   userId: string;
   content: string;
   summary?: string; // One-liner for bootstrap injection. Falls back to truncated content.
-  topicKey?: string; // Primary structured topic key (e.g., "project:pcp/memory"). Follows type:identifier convention.
+  topicKey?: string; // Primary structured topic key (e.g., "project:inkwell/memory"). Follows type:identifier convention.
   source: MemorySource;
   salience: Salience;
   topics: string[];

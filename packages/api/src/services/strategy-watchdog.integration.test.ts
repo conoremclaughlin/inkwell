@@ -8,7 +8,7 @@
  * Requires:
  *   - .env.local with SUPABASE_URL + SUPABASE_SECRET_KEY
  *
- * Run: PCP_PORT_BASE=9998 npx vitest run packages/api/src/services/strategy-watchdog.integration.test.ts
+ * Run: INK_PORT_BASE=9998 npx vitest run packages/api/src/services/strategy-watchdog.integration.test.ts
  *
  * This test is skipped automatically if credentials are unavailable (e.g., CI).
  */
@@ -34,7 +34,7 @@ if (existsSync(envLocalPath)) {
 }
 
 // Also set test port to avoid conflicts
-if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9998';
+if (!process.env.INK_PORT_BASE) process.env.INK_PORT_BASE = '9998';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;

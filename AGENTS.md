@@ -115,7 +115,7 @@ Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths
    createClient(url, secretKey);
    ```
 
-4. **RLS is NOT our primary security layer.** The existing `auth.uid() = id` policies on the `users` table (and similar policies on `links`, `notes`, `tasks`, etc.) are non-functional because PCP user IDs (`uuid_generate_v4()`) are different from Supabase Auth UIDs (`auth.uid()`). The real security boundary is the API server's authentication middleware and application-level authorization. Some tables have permissive service policies (`USING (true)`) as a safety net — this is intentional.
+4. **RLS is NOT our primary security layer.** The existing `auth.uid() = id` policies on the `users` table (and similar policies on `links`, `notes`, `tasks`, etc.) are non-functional because Inkwell user IDs (`uuid_generate_v4()`) are different from Supabase Auth UIDs (`auth.uid()`). The real security boundary is the API server's authentication middleware and application-level authorization. Some tables have permissive service policies (`USING (true)`) as a safety net — this is intentional.
 
 5. **Never expose the service role key to the client.** It lives in `.env.local` (server only) and must never appear in `NEXT_PUBLIC_*` environment variables.
 
@@ -187,8 +187,8 @@ A workspace contains many studios. A studio belongs to one workspace.
 The primary mechanism for scope resolution is the **`x-ink-context`** header — a base64url-encoded JSON token set by CLI hooks. It carries:
 
 ```typescript
-interface PcpContextToken {
-  sessionId: string; // PCP session ID
+interface InkContextToken {
+  sessionId: string; // Inkwell session ID
   studioId: string; // Studio UUID (or "main" for root repo)
   sbSlug: string; // Agent identity
   cliAttached: boolean; // Whether a human is at the terminal
@@ -289,7 +289,7 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 | `issue:<number>` | Issue triage or debugging                   | `issue:45`                   |
 | `branch:<name>`  | Feature branch coordination                 | `branch:wren/feat/cli-hooks` |
 | `debug:<slug>`   | Collaborative debugging                     | `debug:inbox-latency`        |
-| `task:<id>`      | PCP task coordination                       | `task:abc123`                |
+| `task:<id>`      | Inkwell task coordination                   | `task:abc123`                |
 | `thread:<slug>`  | Multi-step conversation with no natural key | `thread:perf-audit`          |
 
 ### Cross-Project threadKeys (MANDATORY outside Inkwell)
@@ -369,7 +369,7 @@ More specific patterns win: exact > prefix wildcard > catch-all. Patterns are ma
 
 ## Project Overview
 
-Personal Context Protocol (PCP) is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
+Inkwell is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
 
 ## Coding Style & Conventions
 
@@ -483,7 +483,7 @@ INK_PORT_BASE=4001 \
 yarn dev
 
 # Point the CLI at your test server
-PCP_SERVER_URL=http://localhost:4001 ink mission
+INK_SERVER_URL=http://localhost:4001 ink mission
 ```
 
 **Use `INK_PORT_BASE`, not `PCP_PORT_BASE`.** The resolution is `INK_PORT_BASE || PCP_PORT_BASE` (`scripts/dev-concurrently.mjs`), and `INK_PORT_BASE=3001` is exported in the inherited shell environment on this machine — so an explicit `PCP_PORT_BASE=4001` is silently discarded and the "isolated" server starts on the main server's port.
@@ -634,7 +634,7 @@ Inkwell uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) —
 
 Skills load from four tiers. When names collide, higher tiers win:
 
-1. **Bundled** — `packages/api/src/skills/builtin/` (shipped with PCP)
+1. **Bundled** — `packages/api/src/skills/builtin/` (shipped with Inkwell)
 2. **Extra dirs** — configurable paths in `~/.ink/config.json` (ClawHub interop, etc.)
 3. **Managed** — `~/.ink/skills/` (user-installed, shared across all SBs)
 4. **Workspace** — `<cwd>/.ink/skills/` (per-worktree, per-SB)
@@ -706,13 +706,13 @@ Optional:
 
 ### Test tiers
 
-| Tier            | What it tests                                    | Server needed? | LLM called? | Example                                   |
-| --------------- | ------------------------------------------------ | -------------- | ----------- | ----------------------------------------- |
-| **Unit**        | Pure logic: scorers, loaders, schemas, repos     | No             | No          | `scorer.test.ts`, `*.repository.test.ts`  |
-| **Integration** | Tool handlers + DB/server round-trips            | Yes (PCP)      | No          | `runner.integration.test.ts`              |
-| **Live**        | End-to-end with an LLM backend generating output | Yes (PCP+LLM)  | **Yes**     | Future: live eval where SB curates recall |
+| Tier            | What it tests                                    | Server needed?    | LLM called? | Example                                   |
+| --------------- | ------------------------------------------------ | ----------------- | ----------- | ----------------------------------------- |
+| **Unit**        | Pure logic: scorers, loaders, schemas, repos     | No                | No          | `scorer.test.ts`, `*.repository.test.ts`  |
+| **Integration** | Tool handlers + DB/server round-trips            | Yes (Inkwell)     | No          | `runner.integration.test.ts`              |
+| **Live**        | End-to-end with an LLM backend generating output | Yes (Inkwell+LLM) | **Yes**     | Future: live eval where SB curates recall |
 
-**Unit tests** use mocks (mock Supabase client, stubbed recall functions) and run in CI with no external dependencies. **Integration tests** hit the running PCP server (default `http://localhost:3001`) and require valid auth (`~/.ink/auth.json`). They skip automatically when the server is unavailable. **Live tests** are the only tier where an LLM actually generates responses — they measure whether the full pipeline (recall → injection → LLM response → curation) produces correct behavior, not just whether individual components work.
+**Unit tests** use mocks (mock Supabase client, stubbed recall functions) and run in CI with no external dependencies. **Integration tests** hit the running Inkwell server (default `http://localhost:3001`) and require valid auth (`~/.ink/auth.json`). They skip automatically when the server is unavailable. **Live tests** are the only tier where an LLM actually generates responses — they measure whether the full pipeline (recall → injection → LLM response → curation) produces correct behavior, not just whether individual components work.
 
 When adding a new feature, write unit tests for the logic and integration tests for the server round-trip. Live tests are reserved for eval harnesses where the LLM's judgment is part of what's being measured.
 
@@ -761,7 +761,7 @@ An empty list is a valid opt-out. A missing one is not.
 npx vitest run
 
 # Run specific test file
-npx vitest run packages/api/src/mcp/auth/pcp-auth-provider.test.ts
+npx vitest run packages/api/src/mcp/auth/ink-auth-provider.test.ts
 
 # Run MCP Inspector (manual testing)
 npx @modelcontextprotocol/inspector packages/api/dist/index.js
@@ -818,7 +818,7 @@ These log files are written regardless of how the server is started (`yarn dev`,
 
 ## Specs & Artifacts
 
-When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored on the Inkwell server and managed via MCP tools. They are NOT local markdown files.
+When we refer to "specs" in this project, we mean **Inkwell artifacts** — versioned documents stored on the Inkwell server and managed via MCP tools. They are NOT local markdown files.
 
 - **Browse**: `list_artifacts(type: "spec")` to discover available specs
 - **Read**: `get_artifact(uri: "ink://specs/cli-session-hooks")` to view a spec by URI

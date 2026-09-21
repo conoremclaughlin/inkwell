@@ -10,7 +10,7 @@ import { applyProfile } from './tool-profiles.js';
 function makeDeps(overrides: Partial<ToolCallExecutorDeps> = {}): ToolCallExecutorDeps {
   return {
     policy: {
-      canCallPcpTool: vi.fn().mockReturnValue({ allowed: true, reason: '' }),
+      canCallInkTool: vi.fn().mockReturnValue({ allowed: true, reason: '' }),
     } as unknown as ToolCallExecutorDeps['policy'],
     callTool: vi.fn().mockResolvedValue({ success: true }),
     sessionId: 'session-1',
@@ -43,7 +43,7 @@ describe('executeToolCalls', () => {
   it('blocks non-promptable tools', async () => {
     const deps = makeDeps({
       policy: {
-        canCallPcpTool: vi.fn().mockReturnValue({
+        canCallInkTool: vi.fn().mockReturnValue({
           allowed: false,
           promptable: false,
           reason: 'Tool is denied',
@@ -62,13 +62,13 @@ describe('executeToolCalls', () => {
   });
 
   it('prompts for approval when tool is promptable', async () => {
-    const canCallPcpTool = vi
+    const canCallInkTool = vi
       .fn()
       .mockReturnValueOnce({ allowed: false, promptable: true, reason: 'Requires approval' })
       .mockReturnValueOnce({ allowed: true, reason: '' }); // after grant applied
 
     const deps = makeDeps({
-      policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+      policy: { canCallInkTool } as unknown as ToolCallExecutorDeps['policy'],
       promptForApproval: vi.fn().mockResolvedValue(true),
     });
     const calls = [makeCall('send_to_inbox', { content: 'hi' })];
@@ -91,7 +91,7 @@ describe('executeToolCalls', () => {
   it('reports denied when user rejects approval prompt', async () => {
     const deps = makeDeps({
       policy: {
-        canCallPcpTool: vi.fn().mockReturnValue({
+        canCallInkTool: vi.fn().mockReturnValue({
           allowed: false,
           promptable: true,
           reason: 'Requires approval',
@@ -109,7 +109,7 @@ describe('executeToolCalls', () => {
     expect(deps.callTool).not.toHaveBeenCalled();
   });
 
-  it('handles PcpClient errors gracefully', async () => {
+  it('handles InkClient errors gracefully', async () => {
     const deps = makeDeps({
       callTool: vi.fn().mockRejectedValue(new Error('Network timeout')),
     });
@@ -157,7 +157,7 @@ describe('executeToolCalls', () => {
 
   it('handles mixed allowed/blocked/promptable tools', async () => {
     let callCount = 0;
-    const canCallPcpTool = vi.fn().mockImplementation((tool: string) => {
+    const canCallInkTool = vi.fn().mockImplementation((tool: string) => {
       callCount++;
       if (tool === 'recall') return { allowed: true, reason: '' };
       if (tool === 'send_email') return { allowed: false, promptable: false, reason: 'Denied' };
@@ -170,7 +170,7 @@ describe('executeToolCalls', () => {
     });
 
     const deps = makeDeps({
-      policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+      policy: { canCallInkTool } as unknown as ToolCallExecutorDeps['policy'],
       promptForApproval: vi.fn().mockResolvedValue(true),
     });
     const calls = [makeCall('recall'), makeCall('send_email'), makeCall('send_to_inbox')];
@@ -187,7 +187,7 @@ describe('executeToolCalls', () => {
     // Edge case: user approves but deny rule takes precedence
     const deps = makeDeps({
       policy: {
-        canCallPcpTool: vi.fn().mockReturnValue({
+        canCallInkTool: vi.fn().mockReturnValue({
           allowed: false,
           promptable: true,
           reason: 'Deny overrides grant',
@@ -214,7 +214,7 @@ describe('executeToolCalls', () => {
 
   describe('Pi coding tools through policy', () => {
     it('allows read tools when policy allows them', async () => {
-      const canCallPcpTool = vi.fn().mockImplementation((tool: string) => {
+      const canCallInkTool = vi.fn().mockImplementation((tool: string) => {
         if (['read', 'grep', 'find', 'ls'].includes(tool)) {
           return { allowed: true, reason: 'Allowed by group:read' };
         }
@@ -222,7 +222,7 @@ describe('executeToolCalls', () => {
       });
 
       const deps = makeDeps({
-        policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+        policy: { canCallInkTool } as unknown as ToolCallExecutorDeps['policy'],
       });
 
       const results = await executeToolCalls(
@@ -232,11 +232,11 @@ describe('executeToolCalls', () => {
 
       expect(results).toHaveLength(1);
       expect(results[0].status).toBe('executed');
-      expect(canCallPcpTool).toHaveBeenCalledWith('read', 'session-1');
+      expect(canCallInkTool).toHaveBeenCalledWith('read', 'session-1');
     });
 
     it('prompts for write tools under safe profile', async () => {
-      const canCallPcpTool = vi
+      const canCallInkTool = vi
         .fn()
         .mockReturnValueOnce({
           allowed: false,
@@ -246,7 +246,7 @@ describe('executeToolCalls', () => {
         .mockReturnValueOnce({ allowed: true, reason: 'Grant applied' });
 
       const deps = makeDeps({
-        policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+        policy: { canCallInkTool } as unknown as ToolCallExecutorDeps['policy'],
         promptForApproval: vi.fn().mockResolvedValue(true),
       });
 
@@ -264,7 +264,7 @@ describe('executeToolCalls', () => {
     it('blocks write tools under minimal profile (not promptable)', async () => {
       const deps = makeDeps({
         policy: {
-          canCallPcpTool: vi.fn().mockReturnValue({
+          canCallInkTool: vi.fn().mockReturnValue({
             allowed: false,
             promptable: false,
             reason: 'Tool is explicitly denied by policy.',
@@ -285,7 +285,7 @@ describe('executeToolCalls', () => {
 
     it('mixed read + write calls with safe profile', async () => {
       let callCount = 0;
-      const canCallPcpTool = vi.fn().mockImplementation((tool: string) => {
+      const canCallInkTool = vi.fn().mockImplementation((tool: string) => {
         callCount++;
         if (tool === 'read') return { allowed: true, reason: 'group:read' };
         if (tool === 'bash') {
@@ -296,7 +296,7 @@ describe('executeToolCalls', () => {
       });
 
       const deps = makeDeps({
-        policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+        policy: { canCallInkTool } as unknown as ToolCallExecutorDeps['policy'],
         promptForApproval: vi.fn().mockResolvedValue(true),
       });
 
@@ -323,7 +323,7 @@ describe('namespaced and miscased names at the executor boundary', () => {
       deps
     );
 
-    expect(deps.policy.canCallPcpTool).not.toHaveBeenCalled();
+    expect(deps.policy.canCallInkTool).not.toHaveBeenCalled();
     expect(results[0].status).toBe('executed');
     // The result carries the bare name, so terminal-signal detection sees it.
     expect(results[0].tool).toBe('signal_status');
@@ -334,7 +334,7 @@ describe('namespaced and miscased names at the executor boundary', () => {
     // runs, and `minimal` would block the correction from ever arriving.
     const deps = makeDeps({
       policy: {
-        canCallPcpTool: vi
+        canCallInkTool: vi
           .fn()
           .mockReturnValue({ allowed: false, promptable: false, reason: 'blocked' }),
       } as unknown as ToolCallExecutorDeps['policy'],
@@ -342,7 +342,7 @@ describe('namespaced and miscased names at the executor boundary', () => {
 
     const results = await executeToolCalls([makeCall('Bash', { command: 'ls' })], deps);
 
-    expect(deps.policy.canCallPcpTool).not.toHaveBeenCalled();
+    expect(deps.policy.canCallInkTool).not.toHaveBeenCalled();
     expect(deps.promptForApproval).not.toHaveBeenCalled();
     expect(deps.callTool).not.toHaveBeenCalled();
     expect(results[0].status).toBe('executed');

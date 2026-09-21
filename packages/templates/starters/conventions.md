@@ -1,6 +1,6 @@
-# PCP Conventions
+# Inkwell Conventions
 
-Best practices for agents using the Personal Context Protocol. Loaded automatically during bootstrap.
+Best practices for agents using Inkwell. Loaded automatically during bootstrap.
 
 ## Inbox Messaging
 

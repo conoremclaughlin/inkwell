@@ -48,7 +48,7 @@ than trusting a `userId` in the request body — otherwise one leaked secret
 becomes an alerting channel for every user in the system.
 
 Requests may authenticate with **either** `x-ink-alert-token` (for dumb
-checkers) or a normal `Authorization: Bearer` PCP JWT (for SBs and services).
+checkers) or a normal `Authorization: Bearer` Inkwell JWT (for SBs and services).
 
 ### The staleness sweep
 

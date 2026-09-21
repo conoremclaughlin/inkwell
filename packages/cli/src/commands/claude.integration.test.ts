@@ -94,7 +94,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
     );
     chmodSync(fakeClaudePath, 0o755);
 
-    const pcpToolCalls: Array<{
+    const inkToolCalls: Array<{
       name: string;
       args: Record<string, unknown>;
       headers: Record<string, string>;
@@ -112,7 +112,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
         const normalizedHeaders = Object.fromEntries(
           Object.entries(rawHeaders).map(([key, value]) => [key.toLowerCase(), String(value)])
         );
-        pcpToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
+        inkToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
 
         let payload: Record<string, unknown> = { success: true };
         if (toolName === 'list_sessions') {
@@ -145,14 +145,14 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
 
     const oldHome = process.env.HOME;
     const oldPath = process.env.PATH;
-    const oldPcpUrl = process.env.INK_SERVER_URL;
+    const oldInkUrl = process.env.INK_SERVER_URL;
     const oldArgsPath = process.env.FAKE_CLAUDE_ARGS_PATH;
     const oldFakeSessionId = process.env.FAKE_CLAUDE_SESSION_ID;
     const oldCwd = process.cwd();
 
     process.env.HOME = homeDir;
     process.env.PATH = `${binDir}:${oldPath || ''}`;
-    process.env.INK_SERVER_URL = 'http://pcp.test.local';
+    process.env.INK_SERVER_URL = 'http://ink.test.local';
     process.env.FAKE_CLAUDE_ARGS_PATH = fakeClaudeArgsPath;
     process.env.FAKE_CLAUDE_SESSION_ID = 'claude-session-int-1';
     process.chdir(repoDir);
@@ -173,14 +173,14 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
       await waitForFile(runtimePath);
 
       const backendArgs = JSON.parse(readFileSync(fakeClaudeArgsPath, 'utf-8')) as string[];
-      const startSessionCall = pcpToolCalls.find((call) => call.name === 'start_session');
-      const seededPcpSessionId = String(startSessionCall?.args.sessionId || '');
-      expect(seededPcpSessionId).not.toBe('');
+      const startSessionCall = inkToolCalls.find((call) => call.name === 'start_session');
+      const seededInkSessionId = String(startSessionCall?.args.sessionId || '');
+      expect(seededInkSessionId).not.toBe('');
       expect(startSessionCall?.headers['x-ink-caller-profile']).toBe('runtime');
       expect(backendArgs).toContain('-p');
       const sessionIdFlagIndex = backendArgs.indexOf('--session-id');
       expect(sessionIdFlagIndex).toBeGreaterThanOrEqual(0);
-      expect(backendArgs[sessionIdFlagIndex + 1]).toBe(seededPcpSessionId);
+      expect(backendArgs[sessionIdFlagIndex + 1]).toBe(seededInkSessionId);
 
       const runtimeState = JSON.parse(readFileSync(runtimePath, 'utf-8')) as {
         sessions: Array<{ backendSessionId?: string }>;
@@ -190,7 +190,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
         (await waitForRuntimeBackendSessionId(runtimePath, 5_000));
       expect(persistedBackendSessionId).toBe('claude-session-int-1');
 
-      const phaseUpdatesWithBackendId = pcpToolCalls
+      const phaseUpdatesWithBackendId = inkToolCalls
         .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === 'claude-session-int-1');
       expect(phaseUpdatesWithBackendId).toBe(true);
@@ -203,8 +203,8 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
 
-      if (oldPcpUrl === undefined) delete process.env.INK_SERVER_URL;
-      else process.env.INK_SERVER_URL = oldPcpUrl;
+      if (oldInkUrl === undefined) delete process.env.INK_SERVER_URL;
+      else process.env.INK_SERVER_URL = oldInkUrl;
 
       if (oldArgsPath === undefined) delete process.env.FAKE_CLAUDE_ARGS_PATH;
       else process.env.FAKE_CLAUDE_ARGS_PATH = oldArgsPath;
@@ -259,7 +259,7 @@ console.log('fake-claude-run-complete');
     );
     chmodSync(fakeClaudePath, 0o755);
 
-    const pcpToolCalls: Array<{
+    const inkToolCalls: Array<{
       name: string;
       args: Record<string, unknown>;
       headers: Record<string, string>;
@@ -277,7 +277,7 @@ console.log('fake-claude-run-complete');
         const normalizedHeaders = Object.fromEntries(
           Object.entries(rawHeaders).map(([key, value]) => [key.toLowerCase(), String(value)])
         );
-        pcpToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
+        inkToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
 
         let payload: Record<string, unknown> = { success: true };
         if (toolName === 'list_sessions') {
@@ -310,7 +310,7 @@ console.log('fake-claude-run-complete');
 
     const oldHome = process.env.HOME;
     const oldPath = process.env.PATH;
-    const oldPcpUrl = process.env.INK_SERVER_URL;
+    const oldInkUrl = process.env.INK_SERVER_URL;
     const oldArgsPath = process.env.FAKE_CLAUDE_ARGS_PATH;
     const oldDelayedTranscriptPath = process.env.DELAYED_TRANSCRIPT_PATH;
     const oldDelayedSessionId = process.env.DELAYED_SESSION_ID;
@@ -319,7 +319,7 @@ console.log('fake-claude-run-complete');
 
     process.env.HOME = homeDir;
     process.env.PATH = `${binDir}:${oldPath || ''}`;
-    process.env.INK_SERVER_URL = 'http://pcp.test.local';
+    process.env.INK_SERVER_URL = 'http://ink.test.local';
     process.env.FAKE_CLAUDE_ARGS_PATH = fakeClaudeArgsPath;
     process.env.DELAYED_SESSION_ID = delayedSessionId;
     process.env.DELAYED_TRANSCRIPT_DELAY_MS = '120';
@@ -360,13 +360,13 @@ console.log('fake-claude-run-complete');
       const runtimePath = join(repoDir, '.ink', 'runtime', 'sessions.json');
       await waitForFile(runtimePath);
       const runtimeState = JSON.parse(readFileSync(runtimePath, 'utf-8')) as {
-        sessions?: Array<{ pcpSessionId?: string; backendSessionId?: string }>;
+        sessions?: Array<{ inkSessionId?: string; backendSessionId?: string }>;
       };
-      expect(runtimeState.sessions?.[0]?.pcpSessionId).toBeTruthy();
+      expect(runtimeState.sessions?.[0]?.inkSessionId).toBeTruthy();
       const persistedBackendSessionId = await waitForRuntimeBackendSessionId(runtimePath, 5_000);
       expect(persistedBackendSessionId).toBe(delayedSessionId);
 
-      const phaseUpdatesWithBackendId = pcpToolCalls
+      const phaseUpdatesWithBackendId = inkToolCalls
         .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === delayedSessionId);
       expect(phaseUpdatesWithBackendId).toBe(true);
@@ -379,8 +379,8 @@ console.log('fake-claude-run-complete');
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
 
-      if (oldPcpUrl === undefined) delete process.env.INK_SERVER_URL;
-      else process.env.INK_SERVER_URL = oldPcpUrl;
+      if (oldInkUrl === undefined) delete process.env.INK_SERVER_URL;
+      else process.env.INK_SERVER_URL = oldInkUrl;
 
       if (oldArgsPath === undefined) delete process.env.FAKE_CLAUDE_ARGS_PATH;
       else process.env.FAKE_CLAUDE_ARGS_PATH = oldArgsPath;
@@ -399,7 +399,7 @@ console.log('fake-claude-run-complete');
     }
   });
 
-  it('creates codex PCP session with runtime profile and persists backend session id', async () => {
+  it('creates codex Inkwell session with runtime profile and persists backend session id', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sb-codex-int-'));
     cleanupPaths.push(root);
 
@@ -433,7 +433,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
     );
     chmodSync(fakeCodexPath, 0o755);
 
-    const pcpToolCalls: Array<{
+    const inkToolCalls: Array<{
       name: string;
       args: Record<string, unknown>;
       headers: Record<string, string>;
@@ -451,7 +451,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
         const normalizedHeaders = Object.fromEntries(
           Object.entries(rawHeaders).map(([key, value]) => [key.toLowerCase(), String(value)])
         );
-        pcpToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
+        inkToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
 
         let payload: Record<string, unknown> = { success: true };
         if (toolName === 'list_sessions') {
@@ -484,14 +484,14 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
 
     const oldHome = process.env.HOME;
     const oldPath = process.env.PATH;
-    const oldPcpUrl = process.env.INK_SERVER_URL;
+    const oldInkUrl = process.env.INK_SERVER_URL;
     const oldArgsPath = process.env.FAKE_CODEX_ARGS_PATH;
     const oldFakeSessionId = process.env.FAKE_CODEX_SESSION_ID;
     const oldCwd = process.cwd();
 
     process.env.HOME = homeDir;
     process.env.PATH = `${binDir}:${oldPath || ''}`;
-    process.env.INK_SERVER_URL = 'http://pcp.test.local';
+    process.env.INK_SERVER_URL = 'http://ink.test.local';
     process.env.FAKE_CODEX_ARGS_PATH = fakeCodexArgsPath;
     process.env.FAKE_CODEX_SESSION_ID = 'codex-session-int-1';
     process.chdir(repoDir);
@@ -512,7 +512,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
       await waitForFile(runtimePath);
 
       const backendArgs = JSON.parse(readFileSync(fakeCodexArgsPath, 'utf-8')) as string[];
-      const startSessionCall = pcpToolCalls.find((call) => call.name === 'start_session');
+      const startSessionCall = inkToolCalls.find((call) => call.name === 'start_session');
       expect(startSessionCall?.headers['x-ink-caller-profile']).toBe('runtime');
       expect(startSessionCall?.args.backend).toBe('codex');
       expect(backendArgs).not.toContain('resume');
@@ -525,7 +525,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
         (await waitForRuntimeBackendSessionId(runtimePath, 5_000));
       expect(persistedBackendSessionId).toBe('codex-session-int-1');
 
-      const phaseUpdatesWithBackendId = pcpToolCalls
+      const phaseUpdatesWithBackendId = inkToolCalls
         .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === 'codex-session-int-1');
       expect(phaseUpdatesWithBackendId).toBe(true);
@@ -538,8 +538,8 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
 
-      if (oldPcpUrl === undefined) delete process.env.INK_SERVER_URL;
-      else process.env.INK_SERVER_URL = oldPcpUrl;
+      if (oldInkUrl === undefined) delete process.env.INK_SERVER_URL;
+      else process.env.INK_SERVER_URL = oldInkUrl;
 
       if (oldArgsPath === undefined) delete process.env.FAKE_CODEX_ARGS_PATH;
       else process.env.FAKE_CODEX_ARGS_PATH = oldArgsPath;
@@ -549,7 +549,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
     }
   });
 
-  it('creates gemini PCP session with runtime profile and persists backend session id', async () => {
+  it('creates gemini Inkwell session with runtime profile and persists backend session id', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sb-gemini-int-'));
     cleanupPaths.push(root);
 
@@ -583,7 +583,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
     );
     chmodSync(fakeGeminiPath, 0o755);
 
-    const pcpToolCalls: Array<{
+    const inkToolCalls: Array<{
       name: string;
       args: Record<string, unknown>;
       headers: Record<string, string>;
@@ -601,7 +601,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
         const normalizedHeaders = Object.fromEntries(
           Object.entries(rawHeaders).map(([key, value]) => [key.toLowerCase(), String(value)])
         );
-        pcpToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
+        inkToolCalls.push({ name: toolName, args: toolArgs, headers: normalizedHeaders });
 
         let payload: Record<string, unknown> = { success: true };
         if (toolName === 'list_sessions') {
@@ -634,14 +634,14 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
 
     const oldHome = process.env.HOME;
     const oldPath = process.env.PATH;
-    const oldPcpUrl = process.env.INK_SERVER_URL;
+    const oldInkUrl = process.env.INK_SERVER_URL;
     const oldArgsPath = process.env.FAKE_GEMINI_ARGS_PATH;
     const oldFakeSessionId = process.env.FAKE_GEMINI_SESSION_ID;
     const oldCwd = process.cwd();
 
     process.env.HOME = homeDir;
     process.env.PATH = `${binDir}:${oldPath || ''}`;
-    process.env.INK_SERVER_URL = 'http://pcp.test.local';
+    process.env.INK_SERVER_URL = 'http://ink.test.local';
     process.env.FAKE_GEMINI_ARGS_PATH = fakeGeminiArgsPath;
     process.env.FAKE_GEMINI_SESSION_ID = 'gemini-session-int-1';
     process.chdir(repoDir);
@@ -662,7 +662,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
       await waitForFile(runtimePath);
 
       const backendArgs = JSON.parse(readFileSync(fakeGeminiArgsPath, 'utf-8')) as string[];
-      const startSessionCall = pcpToolCalls.find((call) => call.name === 'start_session');
+      const startSessionCall = inkToolCalls.find((call) => call.name === 'start_session');
       expect(startSessionCall?.headers['x-ink-caller-profile']).toBe('runtime');
       expect(startSessionCall?.args.backend).toBe('gemini');
       expect(backendArgs).toContain('-p');
@@ -676,7 +676,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
         (await waitForRuntimeBackendSessionId(runtimePath, 5_000));
       expect(persistedBackendSessionId).toBe('gemini-session-int-1');
 
-      const phaseUpdatesWithBackendId = pcpToolCalls
+      const phaseUpdatesWithBackendId = inkToolCalls
         .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === 'gemini-session-int-1');
       expect(phaseUpdatesWithBackendId).toBe(true);
@@ -689,8 +689,8 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
 
-      if (oldPcpUrl === undefined) delete process.env.INK_SERVER_URL;
-      else process.env.INK_SERVER_URL = oldPcpUrl;
+      if (oldInkUrl === undefined) delete process.env.INK_SERVER_URL;
+      else process.env.INK_SERVER_URL = oldInkUrl;
 
       if (oldArgsPath === undefined) delete process.env.FAKE_GEMINI_ARGS_PATH;
       else process.env.FAKE_GEMINI_ARGS_PATH = oldArgsPath;

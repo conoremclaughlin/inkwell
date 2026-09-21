@@ -9,7 +9,7 @@
  * 3. strategy_trigger events written to activity_stream by triggerOwnerAgent
  * 4. task_group_id present on all strategy-related activity entries
  *
- * Run: PCP_PORT_BASE=9998 npx vitest run packages/api/src/services/strategy-observability.integration.test.ts
+ * Run: INK_PORT_BASE=9998 npx vitest run packages/api/src/services/strategy-observability.integration.test.ts
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
@@ -32,7 +32,7 @@ if (existsSync(envLocalPath)) {
   }
 }
 
-if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9998';
+if (!process.env.INK_PORT_BASE) process.env.INK_PORT_BASE = '9998';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;

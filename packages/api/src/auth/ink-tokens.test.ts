@@ -55,12 +55,12 @@ vi.mock('../utils/logger', () => ({
 // ---------------------------------------------------------------------------
 
 import {
-  signPcpAccessToken,
-  verifyPcpAccessToken,
+  signInkAccessToken,
+  verifyInkAccessToken,
   createRefreshToken,
   exchangeRefreshToken,
-  type PcpTokenPayload,
-} from './pcp-tokens';
+  type InkTokenPayload,
+} from './ink-tokens';
 import { createClient } from '@supabase/supabase-js';
 import { fakeEnv } from '../test/fake-env';
 
@@ -73,26 +73,26 @@ function getMockSupabase() {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('pcp-tokens', () => {
+describe('ink-tokens', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     currentMcpTokensChain = mockChain();
   });
 
   // =========================================================================
-  // signPcpAccessToken
+  // signInkAccessToken
   // =========================================================================
 
-  describe('signPcpAccessToken', () => {
+  describe('signInkAccessToken', () => {
     it('should return a valid JWT with correct payload', () => {
-      const payload: PcpTokenPayload = {
+      const payload: InkTokenPayload = {
         type: 'mcp_access',
         sub: 'user-123',
         email: 'test@example.com',
         scope: 'mcp:tools',
       };
 
-      const token = signPcpAccessToken(payload, 3600);
+      const token = signInkAccessToken(payload, 3600);
 
       // Valid JWT format
       expect(token.split('.')).toHaveLength(3);
@@ -106,14 +106,14 @@ describe('pcp-tokens', () => {
     });
 
     it('should sign pcp_admin tokens', () => {
-      const payload: PcpTokenPayload = {
+      const payload: InkTokenPayload = {
         type: 'pcp_admin',
         sub: 'user-456',
         email: 'admin@example.com',
         scope: 'admin',
       };
 
-      const token = signPcpAccessToken(payload, 3600);
+      const token = signInkAccessToken(payload, 3600);
       const decoded = jwt.verify(token, TEST_JWT_SECRET) as Record<string, unknown>;
       expect(decoded.type).toBe('pcp_admin');
       expect(decoded.sub).toBe('user-456');
@@ -121,14 +121,14 @@ describe('pcp-tokens', () => {
     });
 
     it('should respect expiresInSeconds', () => {
-      const payload: PcpTokenPayload = {
+      const payload: InkTokenPayload = {
         type: 'mcp_access',
         sub: 'user-123',
         email: 'test@example.com',
         scope: 'mcp:tools',
       };
 
-      const token = signPcpAccessToken(payload, 60); // 1 minute
+      const token = signInkAccessToken(payload, 60); // 1 minute
       const decoded = jwt.verify(token, TEST_JWT_SECRET) as Record<string, unknown>;
       const exp = decoded.exp as number;
       const iat = decoded.iat as number;
@@ -136,14 +136,14 @@ describe('pcp-tokens', () => {
     });
 
     it('should produce unique tokens for same payload', () => {
-      const payload: PcpTokenPayload = {
+      const payload: InkTokenPayload = {
         type: 'mcp_access',
         sub: 'user-123',
         email: 'test@example.com',
         scope: 'mcp:tools',
       };
 
-      const token1 = signPcpAccessToken(payload, 3600);
+      const token1 = signInkAccessToken(payload, 3600);
       // iat is per-second so tokens in the same second will match;
       // we're just testing they're real JWTs — not testing randomness here.
       expect(token1.split('.')).toHaveLength(3);
@@ -151,10 +151,10 @@ describe('pcp-tokens', () => {
   });
 
   // =========================================================================
-  // verifyPcpAccessToken
+  // verifyInkAccessToken
   // =========================================================================
 
-  describe('verifyPcpAccessToken', () => {
+  describe('verifyInkAccessToken', () => {
     it('should verify a valid mcp_access token', () => {
       const token = jwt.sign(
         { type: 'mcp_access', sub: 'user-123', email: 'test@example.com', scope: 'mcp:tools' },
@@ -162,7 +162,7 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      const result = verifyPcpAccessToken(token);
+      const result = verifyInkAccessToken(token);
       expect(result).toMatchObject({
         type: 'mcp_access',
         sub: 'user-123',
@@ -178,7 +178,7 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      const result = verifyPcpAccessToken(token);
+      const result = verifyInkAccessToken(token);
       expect(result).not.toBeNull();
       expect(result!.type).toBe('pcp_admin');
       expect(result!.sub).toBe('user-456');
@@ -192,10 +192,10 @@ describe('pcp-tokens', () => {
       );
 
       // Should pass when expectedType matches
-      expect(verifyPcpAccessToken(mcpToken, 'mcp_access')).not.toBeNull();
+      expect(verifyInkAccessToken(mcpToken, 'mcp_access')).not.toBeNull();
 
       // Should fail when expectedType doesn't match
-      expect(verifyPcpAccessToken(mcpToken, 'pcp_admin')).toBeNull();
+      expect(verifyInkAccessToken(mcpToken, 'pcp_admin')).toBeNull();
     });
 
     it('should reject pcp_admin token when mcp_access expected', () => {
@@ -205,7 +205,7 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      expect(verifyPcpAccessToken(adminToken, 'mcp_access')).toBeNull();
+      expect(verifyInkAccessToken(adminToken, 'mcp_access')).toBeNull();
     });
 
     it('should accept any valid type when expectedType is omitted', () => {
@@ -220,8 +220,8 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      expect(verifyPcpAccessToken(mcpToken)).not.toBeNull();
-      expect(verifyPcpAccessToken(adminToken)).not.toBeNull();
+      expect(verifyInkAccessToken(mcpToken)).not.toBeNull();
+      expect(verifyInkAccessToken(adminToken)).not.toBeNull();
     });
 
     it('should return null for expired token', () => {
@@ -231,7 +231,7 @@ describe('pcp-tokens', () => {
         { expiresIn: 0 }
       );
 
-      expect(verifyPcpAccessToken(token)).toBeNull();
+      expect(verifyInkAccessToken(token)).toBeNull();
     });
 
     it('should return null for wrong secret', () => {
@@ -241,12 +241,12 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      expect(verifyPcpAccessToken(token)).toBeNull();
+      expect(verifyInkAccessToken(token)).toBeNull();
     });
 
     it('should return null for malformed token', () => {
-      expect(verifyPcpAccessToken('not-a-jwt')).toBeNull();
-      expect(verifyPcpAccessToken('')).toBeNull();
+      expect(verifyInkAccessToken('not-a-jwt')).toBeNull();
+      expect(verifyInkAccessToken('')).toBeNull();
     });
 
     it('should return null for JWT with missing sub', () => {
@@ -256,7 +256,7 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      expect(verifyPcpAccessToken(token)).toBeNull();
+      expect(verifyInkAccessToken(token)).toBeNull();
     });
 
     it('should return null for JWT with missing type', () => {
@@ -266,13 +266,13 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      expect(verifyPcpAccessToken(token)).toBeNull();
+      expect(verifyInkAccessToken(token)).toBeNull();
     });
 
     it('should return null for string payload JWT', () => {
       // jwt.sign can produce a token with string payload
       const token = jwt.sign('string-payload', TEST_JWT_SECRET);
-      expect(verifyPcpAccessToken(token)).toBeNull();
+      expect(verifyInkAccessToken(token)).toBeNull();
     });
 
     it('should not make any network or DB calls', () => {
@@ -282,7 +282,7 @@ describe('pcp-tokens', () => {
         { expiresIn: '1h' }
       );
 
-      verifyPcpAccessToken(token);
+      verifyInkAccessToken(token);
       expect(mockFrom).not.toHaveBeenCalled();
     });
   });
@@ -303,7 +303,7 @@ describe('pcp-tokens', () => {
         90
       );
 
-      expect(result.refreshToken).toMatch(/^pcp-rt-/);
+      expect(result.refreshToken).toMatch(/^ink-rt-/);
       expect(result.expiresAt).toBeInstanceOf(Date);
       expect(result.expiresAt.getTime()).toBeGreaterThan(Date.now());
 
@@ -391,7 +391,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         scopes: ['mcp:tools'],
         expires_at: futureDate,
         users: { email: 'test@example.com' },
@@ -403,7 +403,7 @@ describe('pcp-tokens', () => {
 
       const result = await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-abc',
+        'ink-rt-abc',
         'test-client',
         'mcp_access',
         2592000
@@ -426,7 +426,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-456',
         client_id: 'dashboard',
-        refresh_token: 'pcp-rt-admin',
+        refresh_token: 'ink-rt-admin',
         scopes: ['admin'],
         expires_at: futureDate,
         users: { email: 'admin@example.com' },
@@ -438,7 +438,7 @@ describe('pcp-tokens', () => {
 
       const result = await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-admin',
+        'ink-rt-admin',
         'dashboard',
         'pcp_admin',
         3600
@@ -456,7 +456,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'dashboard',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         scopes: ['admin'],
         expires_at: futureDate,
         users: { email: 'test@example.com' },
@@ -468,7 +468,7 @@ describe('pcp-tokens', () => {
 
       const result = await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-abc',
+        'ink-rt-abc',
         'dashboard',
         'pcp_admin',
         3600 // 1 hour
@@ -485,7 +485,7 @@ describe('pcp-tokens', () => {
 
       const result = await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-nonexistent',
+        'ink-rt-nonexistent',
         'test-client',
         'mcp_access',
         3600
@@ -500,7 +500,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'original-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         scopes: ['mcp:tools'],
         expires_at: futureDate,
         users: { email: 'test@example.com' },
@@ -508,7 +508,7 @@ describe('pcp-tokens', () => {
 
       const result = await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-abc',
+        'ink-rt-abc',
         'different-client',
         'mcp_access',
         3600
@@ -523,7 +523,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         scopes: ['mcp:tools'],
         expires_at: pastDate,
         users: { email: 'test@example.com' },
@@ -535,7 +535,7 @@ describe('pcp-tokens', () => {
 
       const result = await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-abc',
+        'ink-rt-abc',
         'test-client',
         'mcp_access',
         3600
@@ -552,7 +552,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         scopes: ['mcp:tools'],
         expires_at: futureDate,
         users: { email: 'test@example.com' },
@@ -564,7 +564,7 @@ describe('pcp-tokens', () => {
 
       await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-abc',
+        'ink-rt-abc',
         'test-client',
         'mcp_access',
         3600
@@ -580,7 +580,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         scopes: ['mcp:tools'],
         expires_at: futureDate,
         users: { email: 'test@example.com' },
@@ -591,7 +591,7 @@ describe('pcp-tokens', () => {
       });
 
       const supabase = getMockSupabase();
-      await exchangeRefreshToken(supabase, 'pcp-rt-abc', 'test-client', 'mcp_access', 3600);
+      await exchangeRefreshToken(supabase, 'ink-rt-abc', 'test-client', 'mcp_access', 3600);
 
       // Supabase auth methods should never be called
       expect(supabase.auth).toBeUndefined();
@@ -603,7 +603,7 @@ describe('pcp-tokens', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         scopes: ['mcp:tools'],
         expires_at: futureDate,
         users: { email: null },
@@ -615,7 +615,7 @@ describe('pcp-tokens', () => {
 
       const result = await exchangeRefreshToken(
         getMockSupabase(),
-        'pcp-rt-abc',
+        'ink-rt-abc',
         'test-client',
         'mcp_access',
         3600
@@ -631,16 +631,16 @@ describe('pcp-tokens', () => {
   // =========================================================================
 
   describe('sign + verify round-trip', () => {
-    it('should verify a token signed by signPcpAccessToken', () => {
-      const payload: PcpTokenPayload = {
+    it('should verify a token signed by signInkAccessToken', () => {
+      const payload: InkTokenPayload = {
         type: 'mcp_access',
         sub: 'user-123',
         email: 'test@example.com',
         scope: 'mcp:tools',
       };
 
-      const token = signPcpAccessToken(payload, 3600);
-      const result = verifyPcpAccessToken(token);
+      const token = signInkAccessToken(payload, 3600);
+      const result = verifyInkAccessToken(token);
 
       expect(result).not.toBeNull();
       expect(result!.type).toBe('mcp_access');
@@ -649,38 +649,38 @@ describe('pcp-tokens', () => {
     });
 
     it('should verify pcp_admin round-trip', () => {
-      const payload: PcpTokenPayload = {
+      const payload: InkTokenPayload = {
         type: 'pcp_admin',
         sub: 'user-456',
         email: 'admin@example.com',
         scope: 'admin',
       };
 
-      const token = signPcpAccessToken(payload, 3600);
-      const result = verifyPcpAccessToken(token, 'pcp_admin');
+      const token = signInkAccessToken(payload, 3600);
+      const result = verifyInkAccessToken(token, 'pcp_admin');
 
       expect(result).not.toBeNull();
       expect(result!.type).toBe('pcp_admin');
     });
 
     it('should enforce type isolation: mcp_access token rejected as pcp_admin', () => {
-      const token = signPcpAccessToken(
+      const token = signInkAccessToken(
         { type: 'mcp_access', sub: 'user-123', email: 'test@example.com', scope: 'mcp:tools' },
         3600
       );
 
-      expect(verifyPcpAccessToken(token, 'mcp_access')).not.toBeNull();
-      expect(verifyPcpAccessToken(token, 'pcp_admin')).toBeNull();
+      expect(verifyInkAccessToken(token, 'mcp_access')).not.toBeNull();
+      expect(verifyInkAccessToken(token, 'pcp_admin')).toBeNull();
     });
 
     it('should enforce type isolation: pcp_admin token rejected as mcp_access', () => {
-      const token = signPcpAccessToken(
+      const token = signInkAccessToken(
         { type: 'pcp_admin', sub: 'user-456', email: 'admin@example.com', scope: 'admin' },
         3600
       );
 
-      expect(verifyPcpAccessToken(token, 'pcp_admin')).not.toBeNull();
-      expect(verifyPcpAccessToken(token, 'mcp_access')).toBeNull();
+      expect(verifyInkAccessToken(token, 'pcp_admin')).not.toBeNull();
+      expect(verifyInkAccessToken(token, 'mcp_access')).toBeNull();
     });
   });
 });

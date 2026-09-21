@@ -15,7 +15,7 @@
  * Requires:
  * - INK_LIVE_TESTS=1
  * - claude CLI installed with valid credentials
- * - Inkwell server running (default localhost:3001, override via PCP_SERVER_URL)
+ * - Inkwell server running (default localhost:3001, override via INK_SERVER_URL)
  * - Valid access token in ~/.ink/auth.json
  * - Supabase credentials (.env.local or env vars), pointing at LOCALHOST —
  *   this suite mutates DB rows (task groups, tasks, activity, memories,
@@ -31,7 +31,7 @@
  * integration suites run in CI; live ones never do.
  *
  * Run:
- *   INK_LIVE_TESTS=1 PCP_SERVER_URL=http://localhost:4001 \
+ *   INK_LIVE_TESTS=1 INK_SERVER_URL=http://localhost:4001 \
  *     yarn workspace @inklabs/api test:live src/services/strategy-approval-gate.live.integration.test.ts
  */
 
@@ -56,7 +56,7 @@ if (existsSync(envLocalPath)) {
   }
 }
 
-if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9998';
+if (!process.env.INK_PORT_BASE) process.env.INK_PORT_BASE = '9998';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
@@ -70,7 +70,7 @@ const accessToken: string | null = existsSync(authPath)
   ? JSON.parse(readFileSync(authPath, 'utf-8')).access_token
   : null;
 
-const INKWELL_URL = process.env.PCP_SERVER_URL || 'http://localhost:3001';
+const INKWELL_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 
 // ============================================================================
 // Prerequisite checks (same pattern as sandbox live test)

@@ -1253,7 +1253,7 @@ describe('handleUpdateSessionState', () => {
         content: 'test',
       });
       mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
-        { id: 'project-1', name: 'PCP' },
+        { id: 'project-1', name: 'Inkwell' },
       ]);
       mockDataComposer.repositories.tasks.create.mockResolvedValue({
         id: 'task-1',
@@ -1298,7 +1298,7 @@ describe('handleUpdateSessionState', () => {
         content: 'test',
       });
       mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
-        { id: 'project-1', name: 'PCP' },
+        { id: 'project-1', name: 'Inkwell' },
       ]);
       mockDataComposer.repositories.tasks.create.mockResolvedValue({
         id: 'task-2',
@@ -1362,7 +1362,7 @@ describe('handleUpdateSessionState', () => {
         content: 'test',
       });
       mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
-        { id: 'project-1', name: 'PCP' },
+        { id: 'project-1', name: 'Inkwell' },
       ]);
       mockDataComposer.repositories.tasks.create.mockRejectedValue(
         new Error('Database constraint violation')
@@ -2723,12 +2723,12 @@ describe('rememberSchema - hierarchical memory fields', () => {
     const result = rememberSchema.safeParse({
       email: 'test@test.com',
       content: 'Some memory content',
-      topicKey: 'project:pcp/memory',
-      topicSummary: 'Hierarchical memory design for PCP',
+      topicKey: 'project:inkwell/memory',
+      topicSummary: 'Hierarchical memory design for Inkwell',
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.topicSummary).toBe('Hierarchical memory design for PCP');
+      expect(result.data.topicSummary).toBe('Hierarchical memory design for Inkwell');
     }
   });
 
@@ -3038,16 +3038,16 @@ describe('buildKnowledgeSummary', () => {
     const memories = [
       makeMemory({
         content: 'Some content',
-        topicKey: 'project:pcp',
-        topics: ['project:pcp'],
-        metadata: { topicSummary: 'Personal Context Protocol' },
+        topicKey: 'project:inkwell',
+        topics: ['project:inkwell'],
+        metadata: { topicSummary: 'Inkwell' },
       }),
     ];
 
     const result = buildKnowledgeSummary(memories);
 
-    expect(result.knowledgeSummary).toContain('project:pcp — Personal Context Protocol');
-    expect(result.topicIndex[0].topicSummary).toBe('Personal Context Protocol');
+    expect(result.knowledgeSummary).toContain('project:inkwell — Inkwell');
+    expect(result.topicIndex[0].topicSummary).toBe('Inkwell');
   });
 
   it('should respect character budget', () => {

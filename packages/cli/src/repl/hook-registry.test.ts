@@ -414,7 +414,7 @@ describe('Passive recall: simulated integration', () => {
     ledger.addEntry('user', 'How does session routing work for triggered agents?');
     ledger.addEntry('assistant', 'When an agent is triggered via send_to_inbox...');
 
-    // Mock passive recall hook — would normally call PCP recall()
+    // Mock passive recall hook — would normally call Inkwell recall()
     const mockMemories = [
       {
         id: 'mem-abc',

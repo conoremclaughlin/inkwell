@@ -36,11 +36,11 @@ import {
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
  *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
-const PROCESS_TIMEOUT_MS =
+export const PROCESS_TIMEOUT_MS =
   parseInt(process.env.GEMINI_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
 
 /** Idle timeout: no output for this long = stuck */
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+export const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 interface GeminiUsageStats {
   contextTokens: number;
@@ -79,14 +79,14 @@ export class GeminiRunner implements IRunner {
       config.container?.runtimeDir
     );
 
-    // Build Gemini system settings with PCP MCP server config (including auth).
+    // Build Gemini system settings with Inkwell MCP server config (including auth).
     // Gemini CLI reads MCP config from settings.json, NOT .mcp.json.
     // We use GEMINI_CLI_SYSTEM_SETTINGS_PATH to point to a temp settings file
     // that overrides the mcpServers section. Other user settings (model, auth,
     // etc.) are preserved since system settings only override matching keys.
     let geminiSettingsEnvPath: string | undefined;
     let geminiSettingsHostPath: string | undefined;
-    if (config.pcpAccessToken) {
+    if (config.inkAccessToken) {
       const mcpJsonPath = join(config.workingDirectory, '.mcp.json');
       // Start from workspace .mcp.json servers (includes supabase, github, etc.)
       let mcpServers: Record<string, unknown> = {};
@@ -101,25 +101,25 @@ export class GeminiRunner implements IRunner {
 
       // Build consolidated context token
       const contextToken = encodeContextToken({
-        sessionId: config.pcpSessionId || '',
+        sessionId: config.inkSessionId || '',
         studioId: config.studioId || '',
         sbSlug: config.sbSlug || 'unknown',
         cliAttached: false,
         runtime: 'gemini',
       });
 
-      // Ensure PCP server has auth + session headers
-      const pcpConfig = (mcpServers.inkwell || {}) as Record<string, unknown>;
-      const existingHeaders = (pcpConfig.headers || {}) as Record<string, string>;
+      // Ensure Inkwell server has auth + session headers
+      const inkConfig = (mcpServers.inkwell || {}) as Record<string, unknown>;
+      const existingHeaders = (inkConfig.headers || {}) as Record<string, string>;
       mcpServers.inkwell = {
-        ...pcpConfig,
-        type: pcpConfig.type || 'http',
-        url: pcpConfig.url || 'http://localhost:3001/mcp',
+        ...inkConfig,
+        type: inkConfig.type || 'http',
+        url: inkConfig.url || 'http://localhost:3001/mcp',
         headers: {
           ...existingHeaders,
           Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
           'x-ink-context': contextToken,
-          ...(config.pcpSessionId ? { 'x-ink-session-id': config.pcpSessionId } : {}),
+          ...(config.inkSessionId ? { 'x-ink-session-id': config.inkSessionId } : {}),
           ...(config.studioId ? { 'x-ink-studio-id': config.studioId } : {}),
         },
       };
@@ -153,7 +153,7 @@ export class GeminiRunner implements IRunner {
         backendSessionId: backendSessionId || '(new)',
         workingDirectory: config.workingDirectory,
         messageLength: fullMessage.length,
-        hasPcpAccessToken: !!config.pcpAccessToken,
+        hasInkAccessToken: !!config.inkAccessToken,
         geminiSettingsOverride: !!geminiSettingsEnvPath,
       });
 
@@ -168,13 +168,20 @@ export class GeminiRunner implements IRunner {
       // Use session ID from Gemini's init event, fall back to the one we passed in
       const resolvedSessionId = result.sessionId || backendSessionId || undefined;
 
+      // A killed turn is a stopped turn, whatever it managed to emit first —
+      // so any text it left behind is partial and `success` is false. The
+      // responses, usage and tool calls are still returned: the turn spent
+      // those tokens and made those calls, and the caller records them either
+      // way. What changes is that the outcome is now classified rather than
+      // inferred from the absence of a thrown error.
       return {
-        success: true,
+        success: !result.timedOut,
         backendSessionId: resolvedSessionId || null,
         responses: result.responses,
         usage: result.usage,
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
+        ...(result.timedOut ? { error: result.timedOut.message } : {}),
       };
     } catch (error) {
       logger.error('Gemini process failed', {
@@ -239,6 +246,12 @@ export class GeminiRunner implements IRunner {
     finalTextResponse?: string;
     toolCalls: ToolCall[];
     sessionId?: string;
+    /**
+     * Set when WE killed the process, never when it finished on its own.
+     * `run()` decides `success` from this, so a timeout that resolves without
+     * it is reported as a completed turn. See the timers below.
+     */
+    timedOut?: { kind: 'idle' | 'hard'; message: string };
   }> {
     const geminiBin = await resolveBinaryPath('gemini');
     return new Promise((resolve, reject) => {
@@ -253,9 +266,9 @@ export class GeminiRunner implements IRunner {
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...(extraEnv || {}),
         ...buildSessionEnv({
-          pcpSessionId: config.pcpSessionId,
+          inkSessionId: config.inkSessionId,
           studioId: config.studioId,
-          accessToken: config.pcpAccessToken,
+          accessToken: config.inkAccessToken,
           sbSlug: config.sbSlug,
           runtime: 'gemini',
           repoRoot: config.repoRoot,
@@ -307,6 +320,17 @@ export class GeminiRunner implements IRunner {
               toolCalls,
               finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
               sessionId: resolvedSessionId,
+              // `timedOut`, not just the marker string. Resolving bare reports a
+              // SIGKILLed turn as a completed one: the session goes idle, a
+              // heartbeat beat records `delivered`, and the marker above is
+              // auto-forwarded to the human as if the agent had written it.
+              // The word "timeout" is load-bearing — classifyError matches on
+              // it, and without it this lands in the non-retryable `unknown`
+              // category. (Same fix Lumen made in antigravity-runner, #507.)
+              timedOut: {
+                kind: 'idle',
+                message: `Gemini CLI timeout: no output for ${idleSecs}s, process killed`,
+              },
             });
           }
         }, IDLE_TIMEOUT_MS);
@@ -327,6 +351,12 @@ export class GeminiRunner implements IRunner {
             toolCalls,
             finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
             sessionId: resolvedSessionId,
+            timedOut: {
+              kind: 'hard',
+              message: `Gemini CLI timeout: exceeded the ${Math.round(
+                PROCESS_TIMEOUT_MS / 1000
+              )}s ceiling, process killed`,
+            },
           });
         }
       }, PROCESS_TIMEOUT_MS);

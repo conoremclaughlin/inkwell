@@ -7,7 +7,7 @@
 
 ## Motivation
 
-PCP's identity system shouldn't be locked to one AI provider. Users should be able to launch any supported CLI and get the same persistent identity, memory, and context — just with a different underlying model.
+Inkwell's identity system shouldn't be locked to one AI provider. Users should be able to launch any supported CLI and get the same persistent identity, memory, and context — just with a different underlying model.
 
 ```bash
 sb                          # Default backend (claude)
@@ -65,7 +65,7 @@ All three write a temporary file with the same identity content, cleaned up on p
 
 Each backend has its own config format for MCP servers. `sb` needs to either:
 
-1. **Generate per-backend config**: Read the PCP MCP server URL and write the appropriate config format
+1. **Generate per-backend config**: Read the Inkwell MCP server URL and write the appropriate config format
 2. **Use a shared `.mcp.json`**: If backends converge on a standard (they haven't yet)
 
 For now, each backend adapter writes its own config:

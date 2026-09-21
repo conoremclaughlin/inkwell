@@ -120,7 +120,7 @@ describe('tool-profiles', () => {
 
     it('safe tools are present after profile application', () => {
       applyProfile(policy, 'safe');
-      // clearScopeRules on global re-populates DEFAULT_SAFE_PCP_TOOLS
+      // clearScopeRules on global re-populates DEFAULT_SAFE_INK_TOOLS
       expect(policy.listSafeTools()).toContain('bootstrap');
       expect(policy.listSafeTools()).toContain('recall');
       expect(policy.listSafeTools()).toContain('get_inbox');
@@ -130,19 +130,19 @@ describe('tool-profiles', () => {
       applyProfile(policy, 'safe');
 
       // Safe tool → allowed
-      const recallDecision = policy.canCallPcpTool('recall');
+      const recallDecision = policy.canCallInkTool('recall');
       expect(recallDecision.allowed).toBe(true);
 
       // MCP tool (not in any list) → allowed by default (no narrowing)
-      const rememberDecision = policy.canCallPcpTool('remember');
+      const rememberDecision = policy.canCallInkTool('remember');
       expect(rememberDecision.allowed).toBe(true);
 
       // MCP tool like list_emails → allowed by default (no narrowing)
-      const emailDecision = policy.canCallPcpTool('list_emails');
+      const emailDecision = policy.canCallInkTool('list_emails');
       expect(emailDecision.allowed).toBe(true);
 
       // Prompt tool → not allowed, promptable
-      const inboxDecision = policy.canCallPcpTool('send_to_inbox');
+      const inboxDecision = policy.canCallInkTool('send_to_inbox');
       expect(inboxDecision.allowed).toBe(false);
       expect(inboxDecision.promptable).toBe(true);
     });
@@ -150,7 +150,7 @@ describe('tool-profiles', () => {
     it('minimal profile denies comms outright', () => {
       applyProfile(policy, 'minimal');
 
-      const decision = policy.canCallPcpTool('send_to_inbox');
+      const decision = policy.canCallInkTool('send_to_inbox');
       expect(decision.allowed).toBe(false);
       expect(decision.promptable).toBe(false);
     });
@@ -161,21 +161,21 @@ describe('tool-profiles', () => {
         applyProfile(policy, 'minimal');
 
         // group:read → allowed
-        expect(policy.canCallPcpTool('read').allowed).toBe(true);
-        expect(policy.canCallPcpTool('grep').allowed).toBe(true);
-        expect(policy.canCallPcpTool('find').allowed).toBe(true);
-        expect(policy.canCallPcpTool('ls').allowed).toBe(true);
+        expect(policy.canCallInkTool('read').allowed).toBe(true);
+        expect(policy.canCallInkTool('grep').allowed).toBe(true);
+        expect(policy.canCallInkTool('find').allowed).toBe(true);
+        expect(policy.canCallInkTool('ls').allowed).toBe(true);
 
         // group:write → denied
-        const bashDecision = policy.canCallPcpTool('bash');
+        const bashDecision = policy.canCallInkTool('bash');
         expect(bashDecision.allowed).toBe(false);
         expect(bashDecision.promptable).toBe(false);
 
-        const editDecision = policy.canCallPcpTool('edit');
+        const editDecision = policy.canCallInkTool('edit');
         expect(editDecision.allowed).toBe(false);
         expect(editDecision.promptable).toBe(false);
 
-        const writeDecision = policy.canCallPcpTool('write');
+        const writeDecision = policy.canCallInkTool('write');
         expect(writeDecision.allowed).toBe(false);
         expect(writeDecision.promptable).toBe(false);
       });
@@ -184,19 +184,19 @@ describe('tool-profiles', () => {
         applyProfile(policy, 'safe');
 
         // group:read → allowed
-        expect(policy.canCallPcpTool('read').allowed).toBe(true);
-        expect(policy.canCallPcpTool('grep').allowed).toBe(true);
+        expect(policy.canCallInkTool('read').allowed).toBe(true);
+        expect(policy.canCallInkTool('grep').allowed).toBe(true);
 
         // group:write → promptable (2FA path)
-        const bashDecision = policy.canCallPcpTool('bash');
+        const bashDecision = policy.canCallInkTool('bash');
         expect(bashDecision.allowed).toBe(false);
         expect(bashDecision.promptable).toBe(true);
 
-        const editDecision = policy.canCallPcpTool('edit');
+        const editDecision = policy.canCallInkTool('edit');
         expect(editDecision.allowed).toBe(false);
         expect(editDecision.promptable).toBe(true);
 
-        const writeDecision = policy.canCallPcpTool('write');
+        const writeDecision = policy.canCallInkTool('write');
         expect(writeDecision.allowed).toBe(false);
         expect(writeDecision.promptable).toBe(true);
       });
@@ -204,19 +204,19 @@ describe('tool-profiles', () => {
       it('collaborative profile allows both read and write tools', () => {
         applyProfile(policy, 'collaborative');
 
-        expect(policy.canCallPcpTool('read').allowed).toBe(true);
-        expect(policy.canCallPcpTool('grep').allowed).toBe(true);
-        expect(policy.canCallPcpTool('bash').allowed).toBe(true);
-        expect(policy.canCallPcpTool('edit').allowed).toBe(true);
-        expect(policy.canCallPcpTool('write').allowed).toBe(true);
+        expect(policy.canCallInkTool('read').allowed).toBe(true);
+        expect(policy.canCallInkTool('grep').allowed).toBe(true);
+        expect(policy.canCallInkTool('bash').allowed).toBe(true);
+        expect(policy.canCallInkTool('edit').allowed).toBe(true);
+        expect(policy.canCallInkTool('write').allowed).toBe(true);
       });
 
       it('full profile allows everything via privileged mode', () => {
         applyProfile(policy, 'full');
 
-        expect(policy.canCallPcpTool('read').allowed).toBe(true);
-        expect(policy.canCallPcpTool('bash').allowed).toBe(true);
-        expect(policy.canCallPcpTool('edit').allowed).toBe(true);
+        expect(policy.canCallInkTool('read').allowed).toBe(true);
+        expect(policy.canCallInkTool('bash').allowed).toBe(true);
+        expect(policy.canCallInkTool('edit').allowed).toBe(true);
       });
     });
 
@@ -224,30 +224,30 @@ describe('tool-profiles', () => {
       it('safe profile allows MCP tools that are not in any group', () => {
         applyProfile(policy, 'safe');
 
-        expect(policy.canCallPcpTool('list_emails').allowed).toBe(true);
-        expect(policy.canCallPcpTool('get_integration_health').allowed).toBe(true);
-        expect(policy.canCallPcpTool('list_calendar_events').allowed).toBe(true);
-        expect(policy.canCallPcpTool('remember').allowed).toBe(true);
-        expect(policy.canCallPcpTool('save_link').allowed).toBe(true);
+        expect(policy.canCallInkTool('list_emails').allowed).toBe(true);
+        expect(policy.canCallInkTool('get_integration_health').allowed).toBe(true);
+        expect(policy.canCallInkTool('list_calendar_events').allowed).toBe(true);
+        expect(policy.canCallInkTool('remember').allowed).toBe(true);
+        expect(policy.canCallInkTool('save_link').allowed).toBe(true);
       });
 
       it('collaborative profile allows MCP tools', () => {
         applyProfile(policy, 'collaborative');
 
-        expect(policy.canCallPcpTool('list_emails').allowed).toBe(true);
-        expect(policy.canCallPcpTool('get_integration_health').allowed).toBe(true);
-        expect(policy.canCallPcpTool('remember').allowed).toBe(true);
+        expect(policy.canCallInkTool('list_emails').allowed).toBe(true);
+        expect(policy.canCallInkTool('get_integration_health').allowed).toBe(true);
+        expect(policy.canCallInkTool('remember').allowed).toBe(true);
       });
 
       it('minimal profile blocks MCP tools not in allowlist via narrowing', () => {
         applyProfile(policy, 'minimal');
 
         // MCP tools not in group:read → blocked by allowlist narrowing
-        const emailDecision = policy.canCallPcpTool('list_emails');
+        const emailDecision = policy.canCallInkTool('list_emails');
         expect(emailDecision.allowed).toBe(false);
         expect(emailDecision.promptable).toBe(true);
 
-        const healthDecision = policy.canCallPcpTool('get_integration_health');
+        const healthDecision = policy.canCallInkTool('get_integration_health');
         expect(healthDecision.allowed).toBe(false);
         expect(healthDecision.promptable).toBe(true);
       });
@@ -255,11 +255,11 @@ describe('tool-profiles', () => {
       it('minimal profile still allows safe tools despite narrowing', () => {
         applyProfile(policy, 'minimal');
 
-        // DEFAULT_SAFE_PCP_TOOLS bypass the narrowing filter
-        expect(policy.canCallPcpTool('bootstrap').allowed).toBe(true);
-        expect(policy.canCallPcpTool('recall').allowed).toBe(true);
-        expect(policy.canCallPcpTool('get_inbox').allowed).toBe(true);
-        expect(policy.canCallPcpTool('get_timezone').allowed).toBe(true);
+        // DEFAULT_SAFE_INK_TOOLS bypass the narrowing filter
+        expect(policy.canCallInkTool('bootstrap').allowed).toBe(true);
+        expect(policy.canCallInkTool('recall').allowed).toBe(true);
+        expect(policy.canCallInkTool('get_inbox').allowed).toBe(true);
+        expect(policy.canCallInkTool('get_timezone').allowed).toBe(true);
       });
     });
   });

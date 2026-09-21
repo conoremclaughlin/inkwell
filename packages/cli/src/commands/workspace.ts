@@ -11,10 +11,10 @@ import chalk from 'chalk';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { callPcpTool } from '../lib/pcp-mcp.js';
+import { callInkTool } from '../lib/ink-mcp.js';
 import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
-interface PcpConfig {
+interface InkUserConfig {
   userId?: string;
   email?: string;
   agentMapping?: Record<string, string>;
@@ -59,7 +59,7 @@ function getConfigPath(): string {
   return join(homedir(), '.ink', 'config.json');
 }
 
-function getPcpConfig(): PcpConfig | null {
+function getInkUserConfig(): InkUserConfig | null {
   const configPath = getConfigPath();
   if (!existsSync(configPath)) return null;
 
@@ -70,7 +70,7 @@ function getPcpConfig(): PcpConfig | null {
   }
 }
 
-function savePcpConfig(config: PcpConfig): void {
+function saveInkUserConfig(config: InkUserConfig): void {
   const configPath = getConfigPath();
   const configDir = join(homedir(), '.ink');
   if (!existsSync(configDir)) {
@@ -84,13 +84,13 @@ async function listWorkspaces(options: {
   type?: 'personal' | 'team';
   json?: boolean;
 }): Promise<void> {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
-  const parsed = await callPcpTool<{ workspaces?: Workspace[] }>('list_workspaces', {
+  const parsed = await callInkTool<{ workspaces?: Workspace[] }>('list_workspaces', {
     email: config.email,
     includeArchived: options.all === true,
     type: options.type,
@@ -131,13 +131,13 @@ async function listWorkspaces(options: {
 }
 
 async function useWorkspace(workspaceRef: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
-  const parsed = await callPcpTool<{ workspaces?: Workspace[] }>('list_workspaces', {
+  const parsed = await callInkTool<{ workspaces?: Workspace[] }>('list_workspaces', {
     email: config.email,
     includeArchived: false,
     ensurePersonal: true,
@@ -150,7 +150,7 @@ async function useWorkspace(workspaceRef: string): Promise<void> {
     process.exit(1);
   }
 
-  savePcpConfig({
+  saveInkUserConfig({
     ...config,
     workspaceId: match.id,
   });
@@ -159,8 +159,11 @@ async function useWorkspace(workspaceRef: string): Promise<void> {
   console.log(chalk.dim(`  id: ${match.id}`));
 }
 
-async function resolveWorkspaceByRef(workspaceRef: string, config: PcpConfig): Promise<Workspace> {
-  const parsed = await callPcpTool<{ workspaces?: Workspace[] }>('list_workspaces', {
+async function resolveWorkspaceByRef(
+  workspaceRef: string,
+  config: InkUserConfig
+): Promise<Workspace> {
+  const parsed = await callInkTool<{ workspaces?: Workspace[] }>('list_workspaces', {
     email: config.email,
     includeArchived: false,
     ensurePersonal: true,
@@ -181,13 +184,13 @@ async function createWorkspace(
   name: string,
   options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }
 ): Promise<void> {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
-  const parsed = await callPcpTool<{ workspace?: Workspace }>('create_workspace', {
+  const parsed = await callInkTool<{ workspace?: Workspace }>('create_workspace', {
     email: config.email,
     name,
     type: options.type || 'team',
@@ -202,7 +205,7 @@ async function createWorkspace(
   }
 
   if (options.use) {
-    savePcpConfig({
+    saveInkUserConfig({
       ...config,
       workspaceId: workspace.id,
     });
@@ -220,7 +223,7 @@ async function inviteWorkspaceMember(
   inviteeEmail: string,
   options: { role?: 'owner' | 'admin' | 'member' | 'viewer' }
 ): Promise<void> {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
@@ -234,7 +237,7 @@ async function inviteWorkspaceMember(
     process.exit(1);
   }
 
-  const parsed = await callPcpTool<AddWorkspaceMemberResult>('add_workspace_member', {
+  const parsed = await callInkTool<AddWorkspaceMemberResult>('add_workspace_member', {
     email: config.email,
     workspaceId: targetWorkspace.id,
     inviteeEmail,
@@ -254,13 +257,13 @@ async function inviteWorkspaceMember(
   );
   if (member?.userWasCreated) {
     console.log(
-      chalk.dim('Created placeholder PCP user for this email (will activate on first login).')
+      chalk.dim('Created placeholder Inkwell user for this email (will activate on first login).')
     );
   }
 }
 
 async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
@@ -282,7 +285,7 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
     process.exit(1);
   }
 
-  const parsed = await callPcpTool<GetWorkspaceResult>('get_workspace', {
+  const parsed = await callInkTool<GetWorkspaceResult>('get_workspace', {
     email: config.email,
     workspaceId: targetWorkspace.id,
     includeMembers: true,
@@ -311,7 +314,7 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
 }
 
 function currentWorkspace(): void {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);

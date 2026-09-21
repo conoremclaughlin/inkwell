@@ -55,7 +55,7 @@ export interface InjectedLedgerEntry {
   source: string;
   /** Hook that produced this injection */
   hookName?: string;
-  /** PCP memory ID if this came from recall */
+  /** Inkwell memory ID if this came from recall */
   memoryId?: string;
   /** Relevance score if available */
   score?: number;

@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { ToolPolicyState } from './tool-policy.js';
-import { ensurePcpToolAllowed } from './tool-gate.js';
+import { ensureInkToolAllowed } from './tool-gate.js';
 
-describe('ensurePcpToolAllowed', () => {
+describe('ensureInkToolAllowed', () => {
   it('allows already-allowed tools without prompting', async () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     let prompted = false;
-    const allowed = await ensurePcpToolAllowed({
+    const allowed = await ensureInkToolAllowed({
       policy,
       tool: 'get_inbox',
       prompt: async () => {
@@ -22,7 +22,7 @@ describe('ensurePcpToolAllowed', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.denyTool('send_to_inbox');
     let prompted = false;
-    const allowed = await ensurePcpToolAllowed({
+    const allowed = await ensureInkToolAllowed({
       policy,
       tool: 'send_to_inbox',
       prompt: async () => {
@@ -36,7 +36,7 @@ describe('ensurePcpToolAllowed', () => {
 
   it('prompts when policy marks tool as promptable and accepts approval', async () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    const allowed = await ensurePcpToolAllowed({
+    const allowed = await ensureInkToolAllowed({
       policy,
       tool: 'send_to_inbox',
       prompt: async () => true,
@@ -47,7 +47,7 @@ describe('ensurePcpToolAllowed', () => {
   it('returns false when prompt is declined', async () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.addPromptTool('send_to_inbox');
-    const allowed = await ensurePcpToolAllowed({
+    const allowed = await ensureInkToolAllowed({
       policy,
       tool: 'send_to_inbox',
       prompt: async () => false,

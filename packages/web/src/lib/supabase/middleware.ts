@@ -53,14 +53,14 @@ export async function updateSession(request: NextRequest) {
   const isProxiedApiRoute = path.startsWith('/api/') && !path.startsWith('/api/auth/');
 
   // Fast-path for proxied API routes: inject bearer token only.
-  // Prefers PCP admin JWT (local verification, no Supabase dependency).
+  // Prefers Inkwell admin JWT (local verification, no Supabase dependency).
   if (isProxiedApiRoute) {
-    const pcpToken = request.cookies.get('pcp-admin-token')?.value;
+    const inkToken = request.cookies.get('pcp-admin-token')?.value;
 
-    if (pcpToken) {
-      // PCP admin JWT available — use it directly, skip Supabase entirely.
+    if (inkToken) {
+      // Inkwell admin JWT available — use it directly, skip Supabase entirely.
       const requestHeaders = forwardHeaders();
-      requestHeaders.set('Authorization', `Bearer ${pcpToken}`);
+      requestHeaders.set('Authorization', `Bearer ${inkToken}`);
       const response = NextResponse.next({ request: { headers: requestHeaders } });
       supabaseResponse.cookies.getAll().forEach((cookie) => {
         response.cookies.set(cookie.name, cookie.value, cookie);
@@ -68,7 +68,7 @@ export async function updateSession(request: NextRequest) {
       return response;
     }
 
-    // No PCP JWT — fall back to Supabase session token (first request after login).
+    // No Inkwell JWT — fall back to Supabase session token (first request after login).
     const {
       data: { session },
     } = await supabase.auth.getSession();

@@ -22,7 +22,7 @@
  *   (`event: end`, reason `overflow`) and reconverges by reconnecting from its
  *   last processed eid — its view can never silently diverge from the ledger.
  *
- * Auth mirrors /mcp: a self-issued PCP access token (Bearer). The observer
+ * Auth mirrors /mcp: a self-issued Inkwell access token (Bearer). The observer
  * identity comes from VERIFIED JWT claims — never from the client-composed
  * x-ink-context assertion. Authorization (spec §4.6, default deny):
  *   - a user token may observe any session it owns;
@@ -33,7 +33,7 @@
  */
 
 import { Router, type Request, type Response } from 'express';
-import type { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider.js';
+import type { InkAuthProvider } from '../mcp/auth/ink-auth-provider.js';
 import type { DataComposer } from '../data/composer.js';
 import {
   sessionEventBus,
@@ -126,7 +126,7 @@ function parseAfterEid(req: Request): number | undefined {
 }
 
 export function createSessionsRouter(deps: {
-  authProvider: PcpAuthProvider;
+  authProvider: InkAuthProvider;
   dataComposer: DataComposer;
 }): Router {
   const router = Router();

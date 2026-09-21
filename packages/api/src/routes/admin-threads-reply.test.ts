@@ -25,11 +25,11 @@ vi.mock('../mcp/tools/thread-handlers', () => ({
   getParticipants: (...args: unknown[]) => mockGetParticipants(...args),
 }));
 
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 const mockSupabaseFrom = vi.fn();
@@ -75,9 +75,9 @@ function getReplyHandler(): Handler {
 }
 
 function createReq(body: Record<string, unknown>): Request {
-  // pcpUserId is what adminAuthMiddleware attaches; the handler is driven
+  // inkUserId is what adminAuthMiddleware attaches; the handler is driven
   // directly here, so it is injected.
-  return { body, headers: {}, cookies: {}, params: {}, pcpUserId: 'user-1' } as unknown as Request;
+  return { body, headers: {}, cookies: {}, params: {}, inkUserId: 'user-1' } as unknown as Request;
 }
 
 interface MockResponse extends Response {

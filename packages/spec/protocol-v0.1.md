@@ -1,4 +1,4 @@
-# Personal Context Protocol (PCP) — Specification v0.1
+# Personal Context Protocol — Specification v0.1
 
 **Status:** Draft
 **Authors:** Wren, with input from Lumen, Aster, Myra, and Conor
@@ -9,9 +9,9 @@
 
 ## 1. Introduction
 
-PCP gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces. It is designed as a layer above MCP (Model Context Protocol), adding continuity semantics to the tool-calling transport.
+Inkwell gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces. It is designed as a layer above MCP (Model Context Protocol), adding continuity semantics to the tool-calling transport.
 
-PCP is **backend-agnostic**. A conforming implementation MUST support agents running on any capable LLM backend (Claude, Gemini, Codex, etc.) without requiring backend-specific protocol extensions.
+Inkwell is **backend-agnostic**. A conforming implementation MUST support agents running on any capable LLM backend (Claude, Gemini, Codex, etc.) without requiring backend-specific protocol extensions.
 
 ### 1.1 Scope
 
@@ -439,7 +439,7 @@ Every inbox message MAY have:
 | `expiresAt`          | timestamp | Auto-expire                   |
 | `metadata`           | object    | Routing hints, sender context |
 
-> **Note:** The inbox system handles inter-agent messaging within PCP. Agent-to-user delivery via external channels (Telegram, WhatsApp, email, etc.) is handled by a **channel gateway**, which is implementation-defined and outside the scope of this specification. Implementations that support user-facing agents SHOULD provide a channel routing mechanism (e.g., `send_response(channel, conversationId, content)`) but the specific API is not standardized in v0.1.
+> **Note:** The inbox system handles inter-agent messaging within Inkwell. Agent-to-user delivery via external channels (Telegram, WhatsApp, email, etc.) is handled by a **channel gateway**, which is implementation-defined and outside the scope of this specification. Implementations that support user-facing agents SHOULD provide a channel routing mechanism (e.g., `send_response(channel, conversationId, content)`) but the specific API is not standardized in v0.1.
 
 ### 5.2 Message Types and Trigger Behavior
 
@@ -573,7 +573,7 @@ Inbox messages MUST only be readable by the designated `recipientSlug` under the
 
 ### 8.4 Authentication
 
-PCP does not define its own authentication mechanism. Implementations SHOULD use the underlying transport's authentication (e.g., MCP OAuth) and map authenticated principals to PCP user IDs.
+Inkwell does not define its own authentication mechanism. Implementations SHOULD use the underlying transport's authentication (e.g., MCP OAuth) and map authenticated principals to Inkwell user IDs.
 
 ### 8.5 Sender Authenticity
 
@@ -632,11 +632,11 @@ This model supports least-privilege SB execution in multi-agent environments whi
 
 ## 9. Relationship to MCP
 
-PCP is designed as a **layer above MCP**. MCP provides the tool-calling transport; PCP provides the continuity semantics.
+Inkwell is designed as a **layer above MCP**. MCP provides the tool-calling transport; Inkwell provides the continuity semantics.
 
-A PCP server exposes its capabilities as MCP tools (e.g., `remember`, `recall`, `start_session`, `send_to_inbox`). Any MCP-compatible client can connect to a PCP server.
+A Inkwell server exposes its capabilities as MCP tools (e.g., `remember`, `recall`, `start_session`, `send_to_inbox`). Any MCP-compatible client can connect to a Inkwell server.
 
-PCP does NOT modify or extend the MCP specification. It is purely additive.
+Inkwell does NOT modify or extend the MCP specification. It is purely additive.
 
 ---
 

@@ -231,7 +231,7 @@ describe('wrapper wiring (reachability)', () => {
       "if (backend !== 'codex' && backend !== 'gemini' && backend !== 'claude') return undefined;",
       helper
     );
-    const scoped = source.indexOf('expectedSessionId: pcpSessionId', helper);
+    const scoped = source.indexOf('expectedSessionId: inkSessionId', helper);
     const reclaim = source.indexOf('reclaimOf: markerAt', helper);
     const epoch = source.indexOf('writeCliTurnEpoch(', helper);
     expect(helper).toBeGreaterThan(-1);

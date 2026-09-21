@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 export interface RuntimeSessionRecord {
-  pcpSessionId: string;
+  inkSessionId: string;
   backend: string;
   sbSlug?: string;
   sbId?: string;
@@ -19,7 +19,7 @@ export interface RuntimeSessionRecord {
 interface RuntimeSessionState {
   version: 1;
   current?: {
-    pcpSessionId: string;
+    inkSessionId: string;
     backend: string;
     sbSlug?: string;
     sbId?: string;
@@ -61,12 +61,23 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
     // sbSlug, so an un-normalized record never matches and the upsert inserts a
     // DUPLICATE instead of merging the previous backend-session lineage
     // (Lumen, PR #635). Normalize on read, current included.
+    // Records written before a rename carry the old key. Without this the
+    // type guard below drops them, which loses every legacy row and the
+    // `current` pointer. agentId -> sbSlug came from PR #635;
+    // pcpSessionId -> inkSessionId from #659.
+    const LEGACY_KEYS: ReadonlyArray<readonly [string, string]> = [
+      ['agentId', 'sbSlug'],
+      ['pcpSessionId', 'inkSessionId'],
+    ];
     const withSlug = (row: unknown): unknown => {
       if (!row || typeof row !== 'object') return row;
-      const r = row as { sbSlug?: unknown; agentId?: unknown };
-      return r.sbSlug === undefined && typeof r.agentId === 'string'
-        ? { ...r, sbSlug: r.agentId }
-        : row;
+      let out = row as Record<string, unknown>;
+      for (const [legacy, current] of LEGACY_KEYS) {
+        if (out[current] === undefined && typeof out[legacy] === 'string') {
+          out = { ...out, [current]: out[legacy] };
+        }
+      }
+      return out;
     };
     if (Array.isArray(parsed.sessions)) {
       parsed.sessions = parsed.sessions.map(withSlug) as typeof parsed.sessions;
@@ -79,7 +90,7 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
           (s): s is RuntimeSessionRecord =>
             !!s &&
             typeof s === 'object' &&
-            typeof s.pcpSessionId === 'string' &&
+            typeof s.inkSessionId === 'string' &&
             typeof s.backend === 'string' &&
             typeof s.updatedAt === 'string'
         )
@@ -87,7 +98,7 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
 
     const current =
       parsed.current &&
-      typeof parsed.current.pcpSessionId === 'string' &&
+      typeof parsed.current.inkSessionId === 'string' &&
       typeof parsed.current.backend === 'string' &&
       typeof parsed.current.updatedAt === 'string'
         ? parsed.current
@@ -103,9 +114,33 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
   }
 }
 
+/**
+ * Mirror the session id under the pre-rename key on the way out.
+ *
+ * Reading the old key is only half of it. The global `ink` link points at one
+ * checkout, and it is not updated when a server is, so an older CLI keeps
+ * reading this file: a row written with `inkSessionId` alone looks malformed
+ * to it, gets dropped by its type guard, and its next upsert writes the file
+ * back WITHOUT that row. A read migration is one-way; this is what stops the
+ * two versions destroying each other's rows (Lumen, #659 r2).
+ *
+ * Remove once no pre-rename CLI can still be on PATH.
+ */
+function withLegacyKeys(row: object): Record<string, unknown> {
+  const record = row as Record<string, unknown>;
+  return typeof record.inkSessionId === 'string'
+    ? { ...record, pcpSessionId: record.inkSessionId }
+    : record;
+}
+
 export function writeRuntimeState(cwd: string, state: RuntimeSessionState): void {
   ensureRuntimeDir(cwd);
-  writeFileSync(getRuntimeStatePath(cwd), JSON.stringify(state, null, 2));
+  const onDisk = {
+    ...state,
+    sessions: state.sessions.map((session) => withLegacyKeys(session)),
+    ...(state.current ? { current: withLegacyKeys(state.current) } : {}),
+  };
+  writeFileSync(getRuntimeStatePath(cwd), JSON.stringify(onDisk, null, 2));
 }
 
 export function upsertRuntimeSession(
@@ -124,7 +159,7 @@ export function upsertRuntimeSession(
 
   const idx = state.sessions.findIndex(
     (s) =>
-      s.pcpSessionId === next.pcpSessionId &&
+      s.inkSessionId === next.inkSessionId &&
       s.backend === next.backend &&
       s.sbSlug === next.sbSlug &&
       s.studioId === next.studioId
@@ -177,13 +212,13 @@ export function upsertRuntimeSession(
 
 export function setCurrentRuntimeSession(
   cwd: string,
-  pcpSessionId: string,
+  inkSessionId: string,
   backend: string,
   options?: { sbSlug?: string; sbId?: string; studioId?: string }
 ): void {
   const state = readRuntimeState(cwd);
   state.current = {
-    pcpSessionId,
+    inkSessionId,
     backend,
     ...(options?.sbSlug ? { sbSlug: options.sbSlug } : {}),
     ...(options?.sbId ? { sbId: options.sbId } : {}),
@@ -224,7 +259,7 @@ export function getCurrentRuntimeSession(
   if (state.current) {
     const current = state.sessions.find(
       (s) =>
-        s.pcpSessionId === state.current!.pcpSessionId &&
+        s.inkSessionId === state.current!.inkSessionId &&
         s.backend === state.current!.backend &&
         (!state.current!.sbSlug || s.sbSlug === state.current!.sbSlug) &&
         (!state.current!.sbId || s.sbId === state.current!.sbId) &&

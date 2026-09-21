@@ -8,7 +8,7 @@
  * - Without default_session_id, threadKey misses create new sessions
  * - Ended default sessions fall through to creation
  *
- * Requires: running PCP server (default http://localhost:3001)
+ * Requires: running Inkwell server (default http://localhost:3001)
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';

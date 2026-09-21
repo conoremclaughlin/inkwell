@@ -144,7 +144,7 @@ const envSchema = z.object({
   // MCP Server
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
   MCP_HTTP_PORT: z.string().transform(Number).optional(),
-  MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://pcp.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
+  MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://inkwell.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
   MCP_REQUIRE_OAUTH: z
     .enum(['true', 'false'])
     .default('true')

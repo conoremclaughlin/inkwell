@@ -62,7 +62,7 @@ vi.mock('../../utils/logger', () => ({
 // Import after mocks
 // ---------------------------------------------------------------------------
 
-import { PcpAuthProvider } from './pcp-auth-provider';
+import { InkAuthProvider } from './ink-auth-provider';
 import { fakeEnv } from '../../test/fake-env';
 
 // ---------------------------------------------------------------------------
@@ -75,7 +75,7 @@ function generatePkceChallenge(verifier: string): string {
 }
 
 /** Create a provider with a pending auth already set up, returning the pendingId */
-function setupPendingAuth(provider: PcpAuthProvider) {
+function setupPendingAuth(provider: InkAuthProvider) {
   return provider.createPendingAuth({
     clientId: 'test-client',
     codeChallenge: generatePkceChallenge('test-verifier'),
@@ -84,7 +84,7 @@ function setupPendingAuth(provider: PcpAuthProvider) {
   });
 }
 
-/** Set up mocks for a successful auth callback (Supabase user + PCP user) */
+/** Set up mocks for a successful auth callback (Supabase user + Inkwell user) */
 function mockSuccessfulAuth() {
   mockGetUser.mockResolvedValue({
     data: { user: { email: 'test@example.com' } },
@@ -95,7 +95,7 @@ function mockSuccessfulAuth() {
 }
 
 /** Run the full auth flow through to auth code exchange, returning the tokens */
-async function runFullAuthFlow(provider: PcpAuthProvider) {
+async function runFullAuthFlow(provider: InkAuthProvider) {
   const pendingId = setupPendingAuth(provider);
   mockSuccessfulAuth();
 
@@ -125,12 +125,12 @@ async function runFullAuthFlow(provider: PcpAuthProvider) {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('PcpAuthProvider', () => {
-  let provider: PcpAuthProvider;
+describe('InkAuthProvider', () => {
+  let provider: InkAuthProvider;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    provider = new PcpAuthProvider();
+    provider = new InkAuthProvider();
     currentUserChain = mockChain();
     currentMcpTokensChain = mockChain();
   });
@@ -176,7 +176,7 @@ describe('PcpAuthProvider', () => {
 
       expect('code' in result).toBe(true);
       if ('code' in result) {
-        expect(result.code).toMatch(/^pcp-code-/);
+        expect(result.code).toMatch(/^ink-code-/);
         expect(result.redirectUri).toBe('http://localhost:3001/callback');
         expect(result.state).toBe('test-state');
       }
@@ -212,7 +212,7 @@ describe('PcpAuthProvider', () => {
       });
     });
 
-    it('should auto-create PCP user when not found and return auth code', async () => {
+    it('should auto-create Inkwell user when not found and return auth code', async () => {
       const pendingId = setupPendingAuth(provider);
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'new@example.com' } },
@@ -396,7 +396,7 @@ describe('PcpAuthProvider', () => {
         expect(decoded.email).toBe('test@example.com');
         expect(decoded.scope).toBe('mcp:tools');
 
-        expect(result.refresh_token).toMatch(/^pcp-rt-/);
+        expect(result.refresh_token).toMatch(/^ink-rt-/);
         expect(result.token_type).toBe('Bearer');
         expect(result.expires_in).toBe(30 * 24 * 60 * 60);
         expect(result.scope).toBe('mcp:tools');
@@ -555,7 +555,7 @@ describe('PcpAuthProvider', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: futureDate,
@@ -567,7 +567,7 @@ describe('PcpAuthProvider', () => {
       });
 
       const result = await provider.exchangeRefreshToken({
-        refreshToken: 'pcp-rt-abc',
+        refreshToken: 'ink-rt-abc',
         clientId: 'test-client',
       });
 
@@ -580,7 +580,7 @@ describe('PcpAuthProvider', () => {
         expect(decoded.email).toBe('test@example.com');
         expect(decoded.scope).toBe('mcp:tools');
 
-        expect(result.refresh_token).toBe('pcp-rt-abc');
+        expect(result.refresh_token).toBe('ink-rt-abc');
         expect(result.token_type).toBe('Bearer');
         expect(result.expires_in).toBe(30 * 24 * 60 * 60);
       }
@@ -592,7 +592,7 @@ describe('PcpAuthProvider', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: futureDate,
@@ -604,7 +604,7 @@ describe('PcpAuthProvider', () => {
       });
 
       await provider.exchangeRefreshToken({
-        refreshToken: 'pcp-rt-abc',
+        refreshToken: 'ink-rt-abc',
         clientId: 'test-client',
       });
 
@@ -616,7 +616,7 @@ describe('PcpAuthProvider', () => {
       currentMcpTokensChain = mockChain(null, { code: 'PGRST116' });
 
       const result = await provider.exchangeRefreshToken({
-        refreshToken: 'pcp-rt-nonexistent',
+        refreshToken: 'ink-rt-nonexistent',
         clientId: 'test-client',
       });
 
@@ -632,7 +632,7 @@ describe('PcpAuthProvider', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'original-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: futureDate,
@@ -640,7 +640,7 @@ describe('PcpAuthProvider', () => {
       });
 
       const result = await provider.exchangeRefreshToken({
-        refreshToken: 'pcp-rt-abc',
+        refreshToken: 'ink-rt-abc',
         clientId: 'different-client',
       });
 
@@ -656,7 +656,7 @@ describe('PcpAuthProvider', () => {
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
+        refresh_token: 'ink-rt-abc',
         supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: pastDate,
@@ -668,7 +668,7 @@ describe('PcpAuthProvider', () => {
       });
 
       const result = await provider.exchangeRefreshToken({
-        refreshToken: 'pcp-rt-abc',
+        refreshToken: 'ink-rt-abc',
         clientId: 'test-client',
       });
 
@@ -782,7 +782,7 @@ describe('PcpAuthProvider', () => {
       const decoded = jwt.verify(tokens.access_token, TEST_JWT_SECRET) as Record<string, unknown>;
       expect(decoded.type).toBe('mcp_access');
       expect(decoded.sub).toBe('user-123');
-      expect(tokens.refresh_token).toMatch(/^pcp-rt-/);
+      expect(tokens.refresh_token).toMatch(/^ink-rt-/);
 
       // Step 4: Refresh the token
       const futureDate = new Date(Date.now() + 86400000).toISOString();

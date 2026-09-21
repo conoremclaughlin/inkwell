@@ -27,8 +27,8 @@ vi.mock('../../utils/logger', () => ({
 
 // Authenticated callers are keyed per user; the token itself is irrelevant to
 // the throttle, so the provider is stubbed to a fixed identity per bearer.
-vi.mock('../../mcp/auth/pcp-auth-provider', () => ({
-  PcpAuthProvider: class {
+vi.mock('../../mcp/auth/ink-auth-provider', () => ({
+  InkAuthProvider: class {
     verifyAccessToken(header?: string) {
       if (!header) return null;
       return { userId: header.replace('Bearer ', '') };

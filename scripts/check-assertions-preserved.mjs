@@ -12,7 +12,7 @@
  * walks the syntax tree for every `expect(...)` call, and tags each one with the
  * describe/it titles enclosing it:
  *
- *     packages/api/src/auth/pcp-tokens.test.ts :: pcp-tokens > signPcpAccessToken > returns a valid JWT
+ *     packages/api/src/auth/ink-tokens.test.ts :: ink-tokens > signInkAccessToken > returns a valid JWT
  *
  * Comparing the two multisets catches an assertion that vanished AND one that
  * quietly relocated into a different test — which a bare total would miss.

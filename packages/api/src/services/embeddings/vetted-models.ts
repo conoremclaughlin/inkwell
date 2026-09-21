@@ -11,7 +11,7 @@ export interface VettedEmbeddingModel {
 }
 
 /**
- * Vetted models for PCP memory embeddings.
+ * Vetted models for Inkwell memory embeddings.
  * Keep this list intentionally small and operationally safe.
  */
 export const VETTED_EMBEDDING_MODELS: VettedEmbeddingModel[] = [

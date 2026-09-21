@@ -4,7 +4,7 @@
  * The trigger message is what an SB reads BEFORE deciding whether to act, and
  * for a threaded trigger it carried only the key:
  *
- *   Thread: pcp:thread:legibility-commission
+ *   Thread: inkwell:thread:legibility-commission
  *
  * which says nothing about what the thread is for. The key is a stable
  * identifier by design and therefore a poor description — one thread routinely

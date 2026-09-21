@@ -78,7 +78,7 @@ export interface SpawnBackendResult {
 /**
  * Build a clean env for backend spawning.
  *
- * Strips CLAUDECODE to prevent nested-session detection when sb/PCP
+ * Strips CLAUDECODE to prevent nested-session detection when sb/Inkwell
  * is itself running inside Claude Code (e.g., via PM2 or direct invocation).
  */
 export function buildCleanEnv(

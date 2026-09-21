@@ -1,7 +1,7 @@
 /**
  * Auth Command
  *
- * OAuth 2.0 PKCE login against the PCP MCP server.
+ * OAuth 2.0 PKCE login against the Inkwell MCP server.
  *
  * Commands:
  *   auth login    Authenticate via browser
@@ -38,7 +38,7 @@ import {
 // Helpers
 // ============================================================================
 
-function getPcpServerUrl(): string {
+function getInkServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
 }
 
@@ -187,7 +187,7 @@ async function exchangeCode(
 }
 
 async function loginCommand(options: { browser: boolean }): Promise<void> {
-  const serverUrl = getPcpServerUrl();
+  const serverUrl = getInkServerUrl();
 
   // Check if already logged in
   const existing = loadAuth();
@@ -308,7 +308,7 @@ async function logoutCommand(): Promise<void> {
 }
 
 async function delegateCommand(options: { agent: string }): Promise<void> {
-  const serverUrl = getPcpServerUrl();
+  const serverUrl = getInkServerUrl();
   const sbSlug = options.agent?.trim().toLowerCase();
   if (!sbSlug) {
     console.log(chalk.red('Missing --agent <sbSlug>'));
@@ -460,11 +460,11 @@ async function backendLoginCommand(options: { backend: string }): Promise<void> 
 // ============================================================================
 
 export function registerAuthCommands(program: Command): void {
-  const auth = program.command('auth').description('Manage PCP authentication');
+  const auth = program.command('auth').description('Manage Inkwell authentication');
 
   auth
     .command('login')
-    .description('Log in to PCP via browser')
+    .description('Log in to Inkwell via browser')
     .option('--no-browser', 'Print login URL instead of opening browser')
     .action(loginCommand);
 

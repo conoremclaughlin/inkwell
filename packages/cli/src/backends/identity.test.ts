@@ -18,7 +18,7 @@ describe('resolveSlug', () => {
     originalBackendEnv = process.env.SB_BACKEND;
     originalCwd = process.cwd();
 
-    rootDir = mkdtempSync(join(tmpdir(), 'pcp-identity-'));
+    rootDir = mkdtempSync(join(tmpdir(), 'ink-identity-'));
     workDir = join(rootDir, 'work');
     mkdirSync(workDir, { recursive: true });
     process.chdir(workDir);

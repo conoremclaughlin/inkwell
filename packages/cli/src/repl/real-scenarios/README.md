@@ -1,6 +1,6 @@
 # Real-Scenario Memory Eval
 
-Measures whether PCP's passive recall surfaces the RIGHT memories during real vocational work — not synthetic benchmarks. Built as the evaluation arm of the memory-eviction work started in PR #242.
+Measures whether Inkwell's passive recall surfaces the RIGHT memories during real vocational work — not synthetic benchmarks. Built as the evaluation arm of the memory-eviction work started in PR #242.
 
 Spec: `ink://specs/memory-real-scenario-eval` (artifact on the Inkwell server).
 
@@ -72,14 +72,14 @@ rubric:
 | `report.ts`                  | Markdown report for a batch of results                              |
 | `fixtures/*.yaml`            | Scenario definitions                                                |
 | `*.test.ts`                  | Unit tests for loader / scorer / runner                             |
-| `runner.integration.test.ts` | Live integration against the PCP server's `recall` tool             |
+| `runner.integration.test.ts` | Live integration against the Inkwell server's `recall` tool         |
 
 ## Adding a scenario
 
 1. Pick a shape (see `types.ts` `ScenarioShape`).
 2. Drop a YAML file into `fixtures/`. Use an existing one as a template.
 3. `yarn workspace @inklabs/cli exec vitest run src/repl/real-scenarios/loader.test.ts` — confirms the file validates.
-4. `yarn workspace @inklabs/cli exec vitest run src/repl/real-scenarios/runner.integration.test.ts` — runs it against live PCP and prints a report.
+4. `yarn workspace @inklabs/cli exec vitest run src/repl/real-scenarios/runner.integration.test.ts` — runs it against live Inkwell and prints a report.
 
 If the rubric fails, the finding is usually one of:
 
@@ -95,7 +95,7 @@ Unit tests (no server needed):
 yarn workspace @inklabs/cli exec vitest run src/repl/real-scenarios/
 ```
 
-Integration against live PCP (server must be up at `http://localhost:3001` with a valid `~/.ink/auth.json`):
+Integration against live Inkwell (server must be up at `http://localhost:3001` with a valid `~/.ink/auth.json`):
 
 ```bash
 # Against the default main dev server

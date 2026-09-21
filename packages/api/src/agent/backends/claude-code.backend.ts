@@ -107,7 +107,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
     // If we have a system prompt, write it to temp file now
     if (this.config.systemPrompt && !this.systemPromptFile) {
-      this.systemPromptFile = join(tmpdir(), `pcp-system-prompt-${Date.now()}.md`);
+      this.systemPromptFile = join(tmpdir(), `ink-system-prompt-${Date.now()}.md`);
       writeFileSync(this.systemPromptFile, this.config.systemPrompt, 'utf-8');
       logger.debug(`System prompt written to: ${this.systemPromptFile}`);
     }
@@ -164,7 +164,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
       logger.info(`Spawning Claude Code with args: ${args.join(' ')}`);
 
-      // Strip CLAUDECODE to prevent "nested session" detection when PCP is
+      // Strip CLAUDECODE to prevent "nested session" detection when Inkwell is
       // launched from inside a Claude Code session (e.g., via PM2).
       const { CLAUDECODE, ...cleanEnv } = process.env;
       const proc = spawn('claude', args, {
@@ -443,7 +443,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
     if (this.config.systemPrompt) {
       // Write system prompt to a temp file to avoid shell escaping issues
-      this.systemPromptFile = join(tmpdir(), `pcp-system-prompt-${Date.now()}.md`);
+      this.systemPromptFile = join(tmpdir(), `ink-system-prompt-${Date.now()}.md`);
       writeFileSync(this.systemPromptFile, this.config.systemPrompt, 'utf-8');
       args.push('--system-prompt', this.systemPromptFile);
       logger.debug(`System prompt written to: ${this.systemPromptFile}`);
@@ -452,7 +452,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     if (this.config.appendSystemPrompt) {
       // --append-system-prompt is re-injected on every invocation (including --resume),
       // so it survives compaction. Use this for identity and critical directives.
-      const appendFile = join(tmpdir(), `pcp-append-prompt-${Date.now()}.md`);
+      const appendFile = join(tmpdir(), `ink-append-prompt-${Date.now()}.md`);
       writeFileSync(appendFile, this.config.appendSystemPrompt, 'utf-8');
       args.push('--append-system-prompt', appendFile);
       logger.debug(`Append system prompt written to: ${appendFile}`);

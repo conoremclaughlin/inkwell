@@ -132,7 +132,7 @@ describe('admin artifact comments routes', () => {
     const handler = getRouteHandler('/artifacts/:id/comments', 'get');
     const req = createMockReq({
       params: { id: 'artifact-1' } as Record<string, string>,
-      pcpUserId: '550e8400-e29b-41d4-a716-446655440000',
+      inkUserId: '550e8400-e29b-41d4-a716-446655440000',
     } as unknown as Partial<Request>);
     const res = createMockRes();
 
@@ -198,7 +198,7 @@ describe('admin artifact comments routes', () => {
     const req = createMockReq({
       params: { id: 'artifact-1' } as Record<string, string>,
       body: { content: 'Adding a review comment', sbSlug: 'lumen' },
-      pcpUserId: '550e8400-e29b-41d4-a716-446655440000',
+      inkUserId: '550e8400-e29b-41d4-a716-446655440000',
     } as unknown as Partial<Request>);
     const res = createMockRes();
 

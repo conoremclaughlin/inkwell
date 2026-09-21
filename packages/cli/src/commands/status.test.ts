@@ -22,10 +22,10 @@ describe('status helpers', () => {
     const status = getClaudePermissionsStatus(root);
     expect(status.configExists).toBe(false);
     expect(status.hasPermissions).toBe(false);
-    expect(status.hasPcpMcpAllowance).toBe(false);
+    expect(status.hasInkMcpAllowance).toBe(false);
   });
 
-  it('detects configured claude permissions and MCP PCP allowance', () => {
+  it('detects configured claude permissions and MCP Inkwell allowance', () => {
     const root = mkdtempSync(join(tmpdir(), 'sb-status-'));
     cleanupPaths.push(root);
     const claudeDir = join(root, '.claude');
@@ -46,10 +46,10 @@ describe('status helpers', () => {
     expect(status.hasPermissions).toBe(true);
     expect(status.allowCount).toBe(2);
     expect(status.denyCount).toBe(1);
-    expect(status.hasPcpMcpAllowance).toBe(true);
+    expect(status.hasInkMcpAllowance).toBe(true);
   });
 
-  it('reports mcp config with pcp server url', () => {
+  it('reports mcp config with Inkwell server url', () => {
     const root = mkdtempSync(join(tmpdir(), 'sb-status-'));
     cleanupPaths.push(root);
     writeFileSync(
@@ -65,8 +65,8 @@ describe('status helpers', () => {
     const status = getMcpConfigStatus(root);
     expect(status.configExists).toBe(true);
     expect(status.parseError).toBe(false);
-    expect(status.hasPcpServer).toBe(true);
-    expect(status.pcpUrl).toBe('http://localhost:3001/mcp');
+    expect(status.hasInkServer).toBe(true);
+    expect(status.inkUrl).toBe('http://localhost:3001/mcp');
   });
 
   it('reports parse errors in mcp config', () => {
@@ -77,6 +77,6 @@ describe('status helpers', () => {
     const status = getMcpConfigStatus(root);
     expect(status.configExists).toBe(true);
     expect(status.parseError).toBe(true);
-    expect(status.hasPcpServer).toBe(false);
+    expect(status.hasInkServer).toBe(false);
   });
 });

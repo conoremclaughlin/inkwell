@@ -170,12 +170,14 @@ export function isThreadOwnedByStudio(
   if (!agentMessages.length) return true; // no messages from us — broadcast
 
   return agentMessages.some((m) => {
-    const pcp = (m.metadata as Record<string, unknown>)?.pcp as Record<string, unknown> | undefined;
+    const inkMeta = (m.metadata as Record<string, unknown>)?.pcp as
+      | Record<string, unknown>
+      | undefined;
     // Check sender studioId (standard ownership)
-    const sender = pcp?.sender as Record<string, unknown> | undefined;
+    const sender = inkMeta?.sender as Record<string, unknown> | undefined;
     if (sender?.studioId === callerStudioId) return true;
     // Check recipient studioId (cross-studio self-message targeting this studio)
-    const recipient = pcp?.recipient as Record<string, unknown> | undefined;
+    const recipient = inkMeta?.recipient as Record<string, unknown> | undefined;
     if (recipient?.studioId === callerStudioId) return true;
     return false;
   });
@@ -567,7 +569,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // can route back to the correct session/studio.
     const rawMeta =
       metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
-    const existingPcpMeta =
+    const existingInkMeta =
       rawMeta.pcp && typeof rawMeta.pcp === 'object'
         ? (rawMeta.pcp as Record<string, unknown>)
         : {};
@@ -601,7 +603,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     const threadMessageMetadata = {
       ...rawMeta,
       pcp: {
-        ...existingPcpMeta,
+        ...existingInkMeta,
         sender: {
           sbSlug: triggerSenderId,
           sessionId: senderSessionId,
@@ -769,10 +771,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
               .order('created_at', { ascending: false })
               .limit(1)
               .maybeSingle();
-            const recipientPcp = (recipientMsg?.metadata as Record<string, unknown>)?.pcp as
+            const recipientInk = (recipientMsg?.metadata as Record<string, unknown>)?.pcp as
               | Record<string, unknown>
               | undefined;
-            const recipientSender = recipientPcp?.sender as Record<string, unknown> | undefined;
+            const recipientSender = recipientInk?.sender as Record<string, unknown> | undefined;
             if (recipientSender?.sessionId && typeof recipientSender.sessionId === 'string') {
               resolvedRecipientSessionId = recipientSender.sessionId;
               logger.debug('[ThreadTrigger] Auto-resolved recipientSessionId from thread history', {
@@ -970,14 +972,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // senderSessionId and senderStudioId already resolved above (shared with thread path)
   const metadataRecord =
     metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
-  const existingPcp =
+  const existingInk =
     metadataRecord.pcp && typeof metadataRecord.pcp === 'object'
       ? (metadataRecord.pcp as Record<string, unknown>)
       : {};
   const enrichedMetadata = {
     ...metadataRecord,
     pcp: {
-      ...existingPcp,
+      ...existingInk,
       sender: {
         sbSlug: triggerSenderId,
         sessionId: senderSessionId,

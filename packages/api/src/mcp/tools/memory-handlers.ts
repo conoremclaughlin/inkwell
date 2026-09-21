@@ -20,6 +20,7 @@ import {
   getRequestContext,
 } from '../../utils/request-context';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import {
   isSessionAuthorized,
@@ -353,7 +354,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Primary structured topic key following type:identifier convention (e.g., "project:pcp/memory", "decision:jwt-auth", "convention:git"). Auto-added to topics array.'
+      'Primary structured topic key following type:identifier convention (e.g., "project:inkwell/memory", "decision:jwt-auth", "convention:git"). Auto-added to topics array.'
     ),
   topicSummary: z
     .string()
@@ -464,7 +465,7 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .guid()
     .optional()
     .describe(
-      'Optional PCP session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
+      'Optional Inkwell session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
     ),
   sbSlug: z
     .string()
@@ -604,7 +605,7 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
   createTask: z
     .boolean()
     .optional()
-    .describe('Create a PCP task for blocked/waiting phases (default: false)'),
+    .describe('Create a Inkwell task for blocked/waiting phases (default: false)'),
   // Session metadata fields (absorbed from update_session_status)
   backendSessionId: z
     .string()
@@ -1733,16 +1734,7 @@ export function shouldStampEndedAt(params: { status?: string; lifecycle?: string
  * these set produces a row that is un-ended and still reads as history
  * everywhere it matters.
  */
-export function isTerminalPhaseMarker(value: string | null | undefined): boolean {
-  const marker = (value || '').trim().toLowerCase();
-  if (!marker) return false;
-  return (
-    marker === 'complete' ||
-    marker.startsWith('complete:') ||
-    marker === 'completed' ||
-    marker.startsWith('completed:')
-  );
-}
+export { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
 
 export function shouldClearEndedAt(params: {
   reopen?: boolean;
@@ -2871,7 +2863,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Reflection status - prompt for periodic self-reflection
             reflectionStatus,
 
-            // PCP conventions — messaging best practices, loaded from
+            // Inkwell conventions — messaging best practices, loaded from
             // ~/.ink/shared/CONVENTIONS.md or bundled template fallback
             conventions: conventionsContent || null,
 
@@ -2900,7 +2892,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 /**
  * Compact session logs into memories.
  *
- * This implements the compaction strategy from the PCP spec:
+ * This implements the compaction strategy from the Inkwell spec:
  * 1. Group logs by salience
  * 2. Create summarized memories from high-value logs
  * 3. Optionally clear the original logs

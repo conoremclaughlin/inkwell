@@ -56,8 +56,8 @@ async function authorize(provider = 'google') {
   await handler('/oauth/:provider/authorize')(
     {
       params: { provider },
-      pcpUserId: 'synthetic-user',
-      pcpWorkspaceId: 'synthetic-workspace',
+      inkUserId: 'synthetic-user',
+      inkWorkspaceId: 'synthetic-workspace',
     } as unknown as Request,
     res as unknown as Response
   );

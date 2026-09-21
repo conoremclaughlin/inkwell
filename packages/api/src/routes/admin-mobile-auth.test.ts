@@ -16,16 +16,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 
-const mockSignPcpAccessToken = vi.fn();
+const mockSignInkAccessToken = vi.fn();
 const mockCreateRefreshToken = vi.fn();
 const mockExchangeRefreshToken = vi.fn();
-const mockVerifyPcpAccessToken = vi.fn();
+const mockVerifyInkAccessToken = vi.fn();
 
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: (...args: unknown[]) => mockSignPcpAccessToken(...args),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: (...args: unknown[]) => mockSignInkAccessToken(...args),
   createRefreshToken: (...args: unknown[]) => mockCreateRefreshToken(...args),
   exchangeRefreshToken: (...args: unknown[]) => mockExchangeRefreshToken(...args),
-  verifyPcpAccessToken: (...args: unknown[]) => mockVerifyPcpAccessToken(...args),
+  verifyInkAccessToken: (...args: unknown[]) => mockVerifyInkAccessToken(...args),
 }));
 
 const mockSignInWithPassword = vi.fn();
@@ -159,9 +159,9 @@ const pairClaim = getRouteHandler('post', '/auth/mobile-pair/claim');
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockSignPcpAccessToken.mockReturnValue('signed-access-jwt');
+  mockSignInkAccessToken.mockReturnValue('signed-access-jwt');
   mockCreateRefreshToken.mockResolvedValue({
-    refreshToken: 'pcp-rt-fresh',
+    refreshToken: 'ink-rt-fresh',
     expiresAt: new Date('2027-01-01'),
   });
 });
@@ -197,7 +197,7 @@ describe('POST /auth/mobile-login', () => {
       data: { user: { id: 'sb-user', email: 'a@b.co' } },
       error: null,
     });
-    mockUsersTable({ id: 'pcp-user-1' });
+    mockUsersTable({ id: 'ink-user-1' });
 
     const res = createRes();
     await login(createReq({ email: 'A@B.co', password: 'right' }), res);
@@ -205,26 +205,26 @@ describe('POST /auth/mobile-login', () => {
     expect(res._status).toBe(200);
     expect(res._json).toMatchObject({
       accessToken: 'signed-access-jwt',
-      refreshToken: 'pcp-rt-fresh',
-      userId: 'pcp-user-1',
+      refreshToken: 'ink-rt-fresh',
+      userId: 'ink-user-1',
       email: 'a@b.co', // normalized
     });
     // Type pcp_admin is what lets the token pass the middleware's Tier 1.
-    expect(mockSignPcpAccessToken).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'pcp_admin', sub: 'pcp-user-1', email: 'a@b.co' }),
+    expect(mockSignInkAccessToken).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'pcp_admin', sub: 'ink-user-1', email: 'a@b.co' }),
       expect.any(Number)
     );
     // client_id 'mobile' — separately revocable from dashboard tokens.
     expect(mockCreateRefreshToken).toHaveBeenCalledWith(
       expect.anything(),
-      'pcp-user-1',
+      'ink-user-1',
       'mobile',
       ['admin'],
       expect.any(Number)
     );
   });
 
-  it('provisions a PCP user when the email has no row yet', async () => {
+  it('provisions a Inkwell user when the email has no row yet', async () => {
     mockSignInWithPassword.mockResolvedValue({
       data: { user: { id: 'sb-user', email: 'new@b.co' } },
       error: null,
@@ -239,7 +239,7 @@ describe('POST /auth/mobile-login', () => {
     chain.single = vi
       .fn()
       .mockResolvedValueOnce({ data: null, error: null })
-      .mockResolvedValueOnce({ data: { id: 'pcp-new' }, error: null });
+      .mockResolvedValueOnce({ data: { id: 'ink-new' }, error: null });
     mockSupabaseFrom.mockImplementation(() => chain);
 
     const res = createRes();
@@ -247,7 +247,7 @@ describe('POST /auth/mobile-login', () => {
 
     expect(res._status).toBe(200);
     expect(chain.insert).toHaveBeenCalledWith(expect.objectContaining({ email: 'new@b.co' }));
-    expect((res._json as { userId: string }).userId).toBe('pcp-new');
+    expect((res._json as { userId: string }).userId).toBe('ink-new');
   });
 
   it('rate-limits repeated attempts before consulting Supabase', async () => {
@@ -308,25 +308,25 @@ describe('POST /auth/mobile-refresh', () => {
   it('returns 401 when the exchange fails', async () => {
     mockExchangeRefreshToken.mockResolvedValue(null);
     const res = createRes();
-    await refresh(createReq({ refreshToken: 'pcp-rt-dead' }), res);
+    await refresh(createReq({ refreshToken: 'ink-rt-dead' }), res);
     expect(res._status).toBe(401);
   });
 
   it('exchanges against the mobile client_id and returns the token in-body', async () => {
     mockExchangeRefreshToken.mockResolvedValue({
       accessToken: 'renewed-jwt',
-      userId: 'pcp-user-1',
+      userId: 'ink-user-1',
       email: 'a@b.co',
     });
 
     const res = createRes();
-    await refresh(createReq({ refreshToken: 'pcp-rt-live' }), res);
+    await refresh(createReq({ refreshToken: 'ink-rt-live' }), res);
 
     expect(res._status).toBe(200);
-    expect(res._json).toMatchObject({ accessToken: 'renewed-jwt', userId: 'pcp-user-1' });
+    expect(res._json).toMatchObject({ accessToken: 'renewed-jwt', userId: 'ink-user-1' });
     expect(mockExchangeRefreshToken).toHaveBeenCalledWith(
       expect.anything(),
-      'pcp-rt-live',
+      'ink-rt-live',
       'mobile',
       'pcp_admin',
       expect.any(Number)
@@ -351,7 +351,7 @@ describe('POST /auth/logout', () => {
     const res = createRes();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (res as any).clearCookie = vi.fn();
-    await logout(createReq({ refreshToken: 'pcp-rt-mobile' }), res);
+    await logout(createReq({ refreshToken: 'ink-rt-mobile' }), res);
 
     // The route must not filter to the dashboard client alone — a mobile
     // logout would then silently leave its 90-day token alive.
@@ -415,7 +415,7 @@ describe('POST /auth/mobile-signup', () => {
       data: { user: { id: 'sb-new', email: 'new@b.co' }, session: { access_token: 'sb' } },
       error: null,
     });
-    mockUsersTable({ id: 'pcp-user-9' });
+    mockUsersTable({ id: 'ink-user-9' });
 
     const res = createRes();
     await signup(createReq({ email: 'new@b.co', password: 'valid1234' }), res);
@@ -424,13 +424,13 @@ describe('POST /auth/mobile-signup', () => {
     expect(res._json).toMatchObject({
       confirmationRequired: false,
       accessToken: 'signed-access-jwt',
-      refreshToken: 'pcp-rt-fresh',
-      userId: 'pcp-user-9',
+      refreshToken: 'ink-rt-fresh',
+      userId: 'ink-user-9',
       email: 'new@b.co',
     });
     expect(mockCreateRefreshToken).toHaveBeenCalledWith(
       expect.anything(),
-      'pcp-user-9',
+      'ink-user-9',
       'mobile',
       ['admin'],
       expect.any(Number)
@@ -456,7 +456,7 @@ describe('POST /auth/mobile-pair', () => {
     const res = createRes();
     await pairStart(
       createReq({}, '1.2.3.4', {
-        pcpUserId: 'pcp-user-1',
+        inkUserId: 'ink-user-1',
         get: (name: string) => (name.toLowerCase() === 'host' ? '192.168.1.20:3001' : undefined),
       }),
       res
@@ -481,10 +481,10 @@ describe('POST /auth/mobile-pair', () => {
     // Stored form: the bare code under its own client_id, ~10 minutes of life.
     const inserted = chain.insert.mock.calls[0][0] as Record<string, unknown>;
     expect(inserted).toMatchObject({
-      user_id: 'pcp-user-1',
+      user_id: 'ink-user-1',
       client_id: 'mobile-pair',
       scopes: ['admin'],
-      refresh_token: `pcp-pair-${body.code.replace(/-/g, '')}`,
+      refresh_token: `ink-pair-${body.code.replace(/-/g, '')}`,
     });
     const ttlMs = new Date(inserted.expires_at as string).getTime() - Date.now();
     expect(ttlMs).toBeGreaterThan(9 * 60 * 1000);
@@ -519,7 +519,7 @@ describe('POST /auth/mobile-pair in production', () => {
       const res = createRes();
       await pairStart(
         createReq({}, '1.2.3.4', {
-          pcpUserId: 'pcp-user-1',
+          inkUserId: 'ink-user-1',
           get: (name: string) => (name.toLowerCase() === 'host' ? '192.168.1.20:3001' : undefined),
         }),
         res
@@ -538,7 +538,7 @@ describe('POST /auth/mobile-pair in production', () => {
       const res = createRes();
       await pairStart(
         createReq({}, '1.2.3.4', {
-          pcpUserId: 'pcp-user-1',
+          inkUserId: 'ink-user-1',
           get: (name: string) => (name.toLowerCase() === 'host' ? '192.168.1.20:3001' : undefined),
         }),
         res
@@ -553,7 +553,7 @@ describe('POST /auth/mobile-pair in production', () => {
     const res = createRes();
     await pairStart(
       createReq({}, '1.2.3.4', {
-        pcpUserId: 'pcp-user-1',
+        inkUserId: 'ink-user-1',
         get: (name: string) => {
           if (name.toLowerCase() === 'host') return 'ink.example.com';
           if (name.toLowerCase() === 'x-forwarded-proto') return 'https';
@@ -579,6 +579,7 @@ function mockPairClaim(
   const chain: Record<string, any> = {};
   chain.delete = vi.fn(() => chain);
   chain.eq = vi.fn(() => chain);
+  chain.in = vi.fn(() => chain);
   chain.select = vi.fn(() => chain);
   chain.update = vi.fn(() => chain);
   chain.maybeSingle = vi.fn(() => Promise.resolve({ data: consumed, error: null }));
@@ -605,7 +606,7 @@ describe('POST /auth/mobile-pair/claim', () => {
   });
 
   it('401s on an expired code — and it is gone, not retryable', async () => {
-    const chain = mockPairClaim({ user_id: 'pcp-user-1', expires_at: '2020-01-01T00:00:00Z' });
+    const chain = mockPairClaim({ user_id: 'ink-user-1', expires_at: '2020-01-01T00:00:00Z' });
     const res = createRes();
     await pairClaim(createReq({ code: 'ABCD-EFGH-JKLM' }), res);
     expect(res._status).toBe(401);
@@ -616,8 +617,8 @@ describe('POST /auth/mobile-pair/claim', () => {
   it('consumes the code atomically and issues mobile tokens to its owner', async () => {
     const future = new Date(Date.now() + 5 * 60 * 1000).toISOString();
     const chain = mockPairClaim(
-      { user_id: 'pcp-user-1', expires_at: future },
-      { id: 'pcp-user-1', email: 'a@b.co' }
+      { user_id: 'ink-user-1', expires_at: future },
+      { id: 'ink-user-1', email: 'a@b.co' }
     );
 
     const res = createRes();
@@ -627,18 +628,24 @@ describe('POST /auth/mobile-pair/claim', () => {
     expect(res._status).toBe(200);
     expect(res._json).toMatchObject({
       accessToken: 'signed-access-jwt',
-      refreshToken: 'pcp-rt-fresh',
-      userId: 'pcp-user-1',
+      refreshToken: 'ink-rt-fresh',
+      userId: 'ink-user-1',
       email: 'a@b.co',
     });
     // The claim is a filtered delete that returns the row: no lookup-then-
     // delete window for two phones to both win.
     expect(chain.delete).toHaveBeenCalled();
-    expect(chain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-pair-ABCDEFGHJKLM');
+    // Matched against both spellings: a code handed out before #659 is stored
+    // as pcp-pair-… and an ink-pair-only lookup reports it "invalid or
+    // expired" while the row sits there unexpired.
+    expect(chain.in).toHaveBeenCalledWith('refresh_token', [
+      'ink-pair-ABCDEFGHJKLM',
+      'pcp-pair-ABCDEFGHJKLM',
+    ]);
     expect(chain.eq).toHaveBeenCalledWith('client_id', 'mobile-pair');
     expect(mockCreateRefreshToken).toHaveBeenCalledWith(
       expect.anything(),
-      'pcp-user-1',
+      'ink-user-1',
       'mobile',
       ['admin'],
       expect.any(Number)
@@ -650,8 +657,8 @@ describe('POST /auth/mobile-pair/claim', () => {
     await inProduction(async () => {
       // Plain http from the LAN: the token would cross the network in the clear.
       mockPairClaim(
-        { user_id: 'pcp-user-1', expires_at: future },
-        { id: 'pcp-user-1', email: 'a@b.co' }
+        { user_id: 'ink-user-1', expires_at: future },
+        { id: 'ink-user-1', email: 'a@b.co' }
       );
       let res = createRes();
       await pairClaim(
@@ -665,8 +672,8 @@ describe('POST /auth/mobile-pair/claim', () => {
 
       // TLS-terminated upstream.
       mockPairClaim(
-        { user_id: 'pcp-user-1', expires_at: future },
-        { id: 'pcp-user-1', email: 'a@b.co' }
+        { user_id: 'ink-user-1', expires_at: future },
+        { id: 'ink-user-1', email: 'a@b.co' }
       );
       res = createRes();
       await pairClaim(
@@ -683,8 +690,8 @@ describe('POST /auth/mobile-pair/claim', () => {
 
       // Same machine.
       mockPairClaim(
-        { user_id: 'pcp-user-1', expires_at: future },
-        { id: 'pcp-user-1', email: 'a@b.co' }
+        { user_id: 'ink-user-1', expires_at: future },
+        { id: 'ink-user-1', email: 'a@b.co' }
       );
       res = createRes();
       await pairClaim(

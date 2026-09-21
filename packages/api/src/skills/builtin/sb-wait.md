@@ -74,7 +74,7 @@ run_in_background: sb wait --thread pr:239 --timeout 300
 | ---- | ------------------------------------------------ |
 | 0    | New message(s) found — content printed to stdout |
 | 1    | Timed out with no new messages                   |
-| 2    | Configuration error (PCP not set up)             |
+| 2    | Configuration error (Inkwell not set up)         |
 
 ## How It Works
 

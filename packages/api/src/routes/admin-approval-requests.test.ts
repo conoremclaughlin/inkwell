@@ -16,15 +16,15 @@ import type { Request, Response } from 'express';
 // Mocks
 // ---------------------------------------------------------------------------
 
-const mockVerifyPcpAccessToken = vi.fn();
+const mockVerifyInkAccessToken = vi.fn();
 const mockExchangeRefreshToken = vi.fn();
-const mockSignPcpAccessToken = vi.fn();
+const mockSignInkAccessToken = vi.fn();
 const mockCreateRefreshToken = vi.fn();
 
-vi.mock('../auth/pcp-tokens', () => ({
-  verifyPcpAccessToken: (...args: unknown[]) => mockVerifyPcpAccessToken(...args),
+vi.mock('../auth/ink-tokens', () => ({
+  verifyInkAccessToken: (...args: unknown[]) => mockVerifyInkAccessToken(...args),
   exchangeRefreshToken: (...args: unknown[]) => mockExchangeRefreshToken(...args),
-  signPcpAccessToken: (...args: unknown[]) => mockSignPcpAccessToken(...args),
+  signInkAccessToken: (...args: unknown[]) => mockSignInkAccessToken(...args),
   createRefreshToken: (...args: unknown[]) => mockCreateRefreshToken(...args),
 }));
 
@@ -111,9 +111,9 @@ function createAuthenticatedReq(overrides: Record<string, unknown> = {}): Reques
     query: {},
     path: '/test',
     user: { email: 'test@example.com' },
-    pcpUserId: USER_ID,
-    pcpWorkspaceId: 'ws-1',
-    pcpWorkspaceRole: 'member',
+    inkUserId: USER_ID,
+    inkWorkspaceId: 'ws-1',
+    inkWorkspaceRole: 'member',
     header: vi.fn(() => undefined),
     ...overrides,
   } as unknown as Request;
@@ -233,7 +233,7 @@ function pastIso(minutes = 5): string {
 describe('POST /approval-requests', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockVerifyPcpAccessToken.mockReturnValue({
+    mockVerifyInkAccessToken.mockReturnValue({
       type: 'pcp_admin',
       sub: USER_ID,
       email: 'test@example.com',
@@ -448,7 +448,7 @@ describe('POST /approval-requests', () => {
 describe('GET /approval-requests/:requestId/status', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockVerifyPcpAccessToken.mockReturnValue({
+    mockVerifyInkAccessToken.mockReturnValue({
       type: 'pcp_admin',
       sub: USER_ID,
       email: 'test@example.com',

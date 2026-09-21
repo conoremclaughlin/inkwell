@@ -12,7 +12,7 @@
  */
 
 import type { Command } from 'commander';
-import { PcpClient } from '../lib/pcp-client.js';
+import { InkClient } from '../lib/ink-client.js';
 import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
 interface WaitOptions {
@@ -45,8 +45,8 @@ export function registerWaitCommand(program: Command): void {
       const threadKey = options.thread;
       const groupId = options.group;
 
-      const pcp = new PcpClient();
-      const config = pcp.getConfig();
+      const inkClient = new InkClient();
+      const config = inkClient.getConfig();
 
       if (!config.email) {
         console.error(`[ink wait] ${NOT_SIGNED_IN_MESSAGE}`);
@@ -55,7 +55,7 @@ export function registerWaitCommand(program: Command): void {
 
       // ── Strategy/task group watch mode ──
       if (groupId) {
-        await watchStrategy(pcp, groupId, timeoutSec, intervalSec);
+        await watchStrategy(inkClient, groupId, timeoutSec, intervalSec);
         return;
       }
 
@@ -84,7 +84,7 @@ export function registerWaitCommand(program: Command): void {
           // Known limitation: threads with >200 messages will anchor on #200,
           // not the true latest. Needs server-side "latest message" support
           // or descending order in get_thread_messages to fix properly.
-          const threadResult = (await pcp.callTool('get_thread_messages', {
+          const threadResult = (await inkClient.callTool('get_thread_messages', {
             email: config.email,
             sbSlug,
             threadKey,
@@ -104,7 +104,7 @@ export function registerWaitCommand(program: Command): void {
         }
       } else {
         try {
-          const inboxResult = (await pcp.callTool('get_inbox', {
+          const inboxResult = (await inkClient.callTool('get_inbox', {
             email: config.email,
             sbSlug,
             status: 'unread',
@@ -146,7 +146,7 @@ export function registerWaitCommand(program: Command): void {
         try {
           // Check pending queue only when --pending is explicitly passed
           if (options.pending) {
-            const pendingResult = (await pcp.callTool('get_pending_messages', {
+            const pendingResult = (await inkClient.callTool('get_pending_messages', {
               channel: 'agent',
               limit: 5,
               since: startedAt,
@@ -172,7 +172,7 @@ export function registerWaitCommand(program: Command): void {
               // Mark as read so next ink wait doesn't re-trigger on them
               const ids = newPending.map((m) => m.id as string).filter(Boolean);
               if (ids.length) {
-                await pcp.callTool('mark_messages_read', { messageIds: ids }).catch(() => {});
+                await inkClient.callTool('mark_messages_read', { messageIds: ids }).catch(() => {});
               }
               process.exit(0);
             }
@@ -196,10 +196,10 @@ export function registerWaitCommand(program: Command): void {
               pollArgs.afterMessageId = baselineLastMessageId;
             }
 
-            const threadResult = (await pcp.callTool('get_thread_messages', pollArgs)) as Record<
-              string,
-              unknown
-            >;
+            const threadResult = (await inkClient.callTool(
+              'get_thread_messages',
+              pollArgs
+            )) as Record<string, unknown>;
 
             const allMessages = (threadResult.messages as Array<Record<string, unknown>>) || [];
             // Filter out own messages — we're waiting for someone ELSE to reply
@@ -215,7 +215,7 @@ export function registerWaitCommand(program: Command): void {
             }
           } else {
             // Watch inbox for any new unread
-            const inboxResult = (await pcp.callTool('get_inbox', {
+            const inboxResult = (await inkClient.callTool('get_inbox', {
               email: config.email,
               sbSlug,
               status: 'unread',
@@ -317,7 +317,7 @@ export function validateStrategyResult(result: Record<string, unknown>, context:
 }
 
 async function watchStrategy(
-  pcp: PcpClient,
+  inkClient: InkClient,
   groupId: string,
   timeoutSec: number,
   intervalSec: number
@@ -325,7 +325,7 @@ async function watchStrategy(
   const deadline = Date.now() + timeoutSec * 1000;
   let consecutiveErrors = 0;
   const maxBackoffSec = Math.max(intervalSec, 120);
-  const config = pcp.getConfig();
+  const config = inkClient.getConfig();
 
   // Fetch initial state
   let lastCompleted = 0;
@@ -333,7 +333,7 @@ async function watchStrategy(
   let lastStatus: string | undefined;
 
   try {
-    const initialRaw = await pcp.callTool('get_strategy_status', {
+    const initialRaw = await inkClient.callTool('get_strategy_status', {
       groupId,
       email: config.email,
     });
@@ -375,7 +375,7 @@ async function watchStrategy(
     await new Promise((resolve) => setTimeout(resolve, sleepMs));
 
     try {
-      const statusRaw = await pcp.callTool('get_strategy_status', {
+      const statusRaw = await inkClient.callTool('get_strategy_status', {
         groupId,
         email: config.email,
       });

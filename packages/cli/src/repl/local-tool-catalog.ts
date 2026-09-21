@@ -27,7 +27,7 @@ import { isForbiddenInClone } from './clone-policy.js';
 import { initPiTools, isPiTool } from './pi-tools.js';
 import { isClientLocalTool } from './context-tools.js';
 import { COLLECT_AGENTS_TOOL, MAX_CLONES_PER_SPAWN, SPAWN_AGENT_TOOL } from './spawn-agent.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 /** Where a local tool runs, and which prompt block it belongs to. */
 export type LocalToolGroup = 'coding' | 'client-local' | 'delegation';
@@ -156,20 +156,27 @@ export const LOCAL_TOOL_CATALOG: readonly LocalToolEntry[] = [
     name: 'compact_context',
     group: 'client-local',
     summary:
-      'Compact your context window: everything but the most recent entries is replaced by a summary, and the provider session is re-seeded from it.',
-    args: 'summary (string, optional — your own brief of what matters; omit to have the runtime summarize), keepRecent (number, optional, default 12)',
-    note: 'Prefer writing the summary yourself: you know which decisions, identifiers and open threads matter. Compaction is lossy — remember anything that must outlive the session first.',
+      'Replace context entries with a summary. By default the oldest entries go and the most recent are kept; pass refs to replace a set you name instead, wherever it sits.',
+    args: 'summary (string, optional — your own brief of what matters; omit to have the runtime summarize), keepRecent (number, optional, default 12), refs (string[], optional — replace exactly these entries instead of the oldest)',
+    note: 'Prefer writing the summary yourself: you know which decisions, identifiers and open threads matter. Compaction is lossy — remember anything that must outlive the session first. Use refs to consolidate work that has FINISHED (a merged PR, a closed thread) while leaving live work untouched; the summary takes the place of the first entry it replaces, so surrounding context keeps its order.',
     parameters: {
       type: 'object',
       properties: {
         summary: {
           type: 'string',
           description:
-            'Your own continuation brief: decisions and why, work done and in progress, key facts, open questions, identifiers. Omit to have the runtime summarize.',
+            'Your own continuation brief: decisions and why, work done and in progress, key facts, open questions, identifiers. Omit to have the runtime summarize. When consolidating with refs, keep what a later reader would act on wrongly without — especially any claim that was RETRACTED.',
         },
         keepRecent: {
           type: 'number',
-          description: 'Recent entries kept verbatim after the summary (default 12, max 200).',
+          description:
+            'Recent entries kept verbatim after the summary (default 12, max 200). Applies to the oldest-first default only — not valid with refs.',
+        },
+        refs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'The ref values from list_context naming exactly the entries to replace. They need not be contiguous or old. The summary must be smaller than what it replaces or the call is refused. Not valid with keepRecent.',
         },
       },
     },
@@ -367,7 +374,7 @@ export function isLocalRuntimeTool(name: string): boolean {
 /**
  * The server's payload, or null when it is not a shape we can merge into.
  *
- * `PcpClient.callTool` returns the tool's payload ALREADY UNWRAPPED — it parses
+ * `InkClient.callTool` returns the tool's payload ALREADY UNWRAPPED — it parses
  * the MCP envelope's text and hands back `{success, tools, …}` — so that is the
  * shape this sees in production and the shape it must return. The envelope
  * branch is for the legacy `/api/mcp/call` path, which returns whatever the
@@ -377,7 +384,7 @@ export function isLocalRuntimeTool(name: string): boolean {
  * on arrival the first time: every unit test passed against a mock that wrapped
  * its payload, and the live call fell through the merge untouched.
  */
-function parseServerPayload(result: PcpToolCallResult): Record<string, unknown> | null {
+function parseServerPayload(result: InkToolCallResult): Record<string, unknown> | null {
   const content = result.content;
   if (Array.isArray(content)) {
     const text = (content[0] as { text?: unknown } | undefined)?.text;
@@ -463,7 +470,7 @@ export interface DescribeToolLocalOptions {
   audience: LocalToolAudience;
   cwd: string;
   /** Ask the Inkwell server the same question. */
-  callServer: () => Promise<PcpToolCallResult>;
+  callServer: () => Promise<InkToolCallResult>;
   /**
    * Whether the CALLER is hard-denied this tool — no, and no approval will
    * change it. Answered by the live policy, not by a static list.
@@ -475,7 +482,7 @@ export interface DescribeToolLocalOptions {
    * move that started this PR — trusting a description of the surface over the
    * surface.
    *
-   * MUST be backed by `inspectPcpTool`, never `canCallPcpTool`: the latter
+   * MUST be backed by `inspectInkTool`, never `canCallInkTool`: the latter
    * spends one-use grants, so merely asking what exists would bill the user for
    * calls that never happen.
    *
@@ -500,7 +507,7 @@ export interface DescribeToolLocalOptions {
 export async function describeToolWithLocalSurface(
   args: Record<string, unknown>,
   opts: DescribeToolLocalOptions
-): Promise<PcpToolCallResult> {
+): Promise<InkToolCallResult> {
   const name = typeof args.name === 'string' ? args.name : undefined;
   const search = typeof args.search === 'string' ? args.search : undefined;
   // Client-local tools bypass policy AT EXECUTION (tool-call-executor.ts:119) —

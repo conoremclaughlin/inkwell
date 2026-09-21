@@ -146,7 +146,7 @@ describe('chatAuthMiddleware', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
-  it('should reject authenticated users without PCP account', async () => {
+  it('should reject authenticated users without Inkwell account', async () => {
     mockAuthGetUser.mockResolvedValue({
       data: { user: { id: 'supabase-id', email: 'nobody@example.com' } },
       error: null,
@@ -162,7 +162,7 @@ describe('chatAuthMiddleware', () => {
     await chatAuthMiddleware(req, res, next);
 
     expect(res._status).toBe(403);
-    expect((res._json as Record<string, string>).error).toBe('User not found in PCP system');
+    expect((res._json as Record<string, string>).error).toBe('User not found in Inkwell system');
     expect(next).not.toHaveBeenCalled();
   });
 
@@ -171,7 +171,7 @@ describe('chatAuthMiddleware', () => {
       data: { user: { id: 'supabase-id', email: 'test@example.com' } },
       error: null,
     });
-    mockFrom.mockReturnValue(createChainableQuery({ id: 'pcp-user-123' }));
+    mockFrom.mockReturnValue(createChainableQuery({ id: 'ink-user-123' }));
 
     const req = createMockReq({
       headers: { authorization: 'Bearer valid-token' } as Record<string, string>,
@@ -182,7 +182,7 @@ describe('chatAuthMiddleware', () => {
     await chatAuthMiddleware(req, res, next);
 
     expect(next).toHaveBeenCalled();
-    expect((req as ChatAuthRequest).userId).toBe('pcp-user-123');
+    expect((req as ChatAuthRequest).userId).toBe('ink-user-123');
     expect((req as ChatAuthRequest).userEmail).toBe('test@example.com');
   });
 });
@@ -244,7 +244,7 @@ describe('Chat Route Handlers', () => {
   describe('SessionRequest construction', () => {
     it('should build correct SessionRequest from chat message', () => {
       // Verify the expected shape of a SessionRequest built from chat input
-      const userId = 'pcp-user-123';
+      const userId = 'ink-user-123';
       const sbSlug = 'wren';
       const userEmail = 'test@example.com';
       const content = 'Hello, Wren!';
@@ -268,7 +268,7 @@ describe('Chat Route Handlers', () => {
       };
 
       expect(sessionRequest.channel).toBe('web');
-      expect(sessionRequest.conversationId).toBe('web:pcp-user-123:wren');
+      expect(sessionRequest.conversationId).toBe('web:ink-user-123:wren');
       expect(sessionRequest.sender.id).toBe(userId);
       expect(sessionRequest.metadata.chatType).toBe('direct');
     });

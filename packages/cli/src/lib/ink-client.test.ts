@@ -1,5 +1,5 @@
 /**
- * PcpClient network resilience tests.
+ * InkClient network resilience tests.
  *
  * Focus: fetchWithTimeout — the client-side deadline that turns a silent
  * network hang (observed get_inbox stalling ~159s on a hotspot blip) into a
@@ -10,7 +10,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { fetchWithTimeout, PcpClient } from './pcp-client';
+import { fetchWithTimeout, InkClient } from './ink-client';
 
 const originalFetch = global.fetch;
 
@@ -81,7 +81,7 @@ describe('fetchWithTimeout', () => {
   });
 });
 
-describe('PcpClient x-ink-context header', () => {
+describe('InkClient x-ink-context header', () => {
   let dir: string;
   let configPath: string;
 
@@ -100,14 +100,14 @@ describe('PcpClient x-ink-context header', () => {
   });
 
   const makeClient = (getContextToken?: () => string | null) => {
-    dir = mkdtempSync(join(tmpdir(), 'pcp-client-'));
+    dir = mkdtempSync(join(tmpdir(), 'ink-client-'));
     configPath = join(dir, 'config.json');
     // Far-future expiry so ensureAccessToken uses the stored token as-is.
     writeFileSync(
       configPath,
       JSON.stringify({ accessToken: 'test-token', tokenExpiresAt: '2099-01-01T00:00:00Z' })
     );
-    return new PcpClient('http://localhost:9999', configPath, { getContextToken });
+    return new InkClient('http://localhost:9999', configPath, { getContextToken });
   };
 
   it('attaches the lazily-built token to tool calls', async () => {
@@ -155,7 +155,7 @@ describe('PcpClient x-ink-context header', () => {
  * its memory write. All three looked like working features (Lumen, PR #511
  * review).
  */
-describe('PcpClient surfaces failed tool calls', () => {
+describe('InkClient surfaces failed tool calls', () => {
   let dir: string;
   let configPath: string;
 
@@ -169,13 +169,13 @@ describe('PcpClient surfaces failed tool calls', () => {
     }) as unknown as Response;
 
   const makeClient = () => {
-    dir = mkdtempSync(join(tmpdir(), 'pcp-client-err-'));
+    dir = mkdtempSync(join(tmpdir(), 'ink-client-err-'));
     configPath = join(dir, 'config.json');
     writeFileSync(
       configPath,
       JSON.stringify({ accessToken: 'test-token', tokenExpiresAt: '2099-01-01T00:00:00Z' })
     );
-    return new PcpClient('http://localhost:9999', configPath);
+    return new InkClient('http://localhost:9999', configPath);
   };
 
   afterEach(() => {
