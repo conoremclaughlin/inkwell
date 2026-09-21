@@ -18,6 +18,7 @@ export default defineConfig({
       'packages/cli/src/**/*.test.ts',
       'packages/create-inkwell/src/**/*.test.ts',
       'packages/shared/src/**/*.test.ts',
+      'packages/browser-companion/src/**/*.test.ts',
       'packages/channel-plugin/**/*.test.ts',
       // openclaw-plugin ships production code (identity + config resolution) and
       // had no coverage at all until the rename broke its persisted config key.
