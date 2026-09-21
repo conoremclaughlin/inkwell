@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { formatBrowserRequest, type BrowserSnapshot } from '@inklabs/browser-companion/protocol';
+import * as protocol from '@inklabs/browser-companion/protocol';
 import BrowserCompanionPage from './page';
 
 const post = vi.hoisted(() => vi.fn());
@@ -47,9 +48,27 @@ function offer(
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
   replyState.messages = [];
 });
 describe('browser dashboard human-send boundary', () => {
+  it('scans attention cues per capture rather than on every instruction edit', () => {
+    const scan = vi.spyOn(protocol, 'privacySignals');
+    render(<BrowserCompanionPage />);
+    act(() => offer());
+    expect(scan).toHaveBeenCalledTimes(1);
+    fireEvent.change(screen.getByLabelText('Instruction'), { target: { value: 'Draft' } });
+    fireEvent.change(screen.getByLabelText('Instruction'), { target: { value: 'Draft a reply' } });
+    expect(scan).toHaveBeenCalledTimes(1);
+    act(() =>
+      offer(window.location.origin, {
+        ...snapshot,
+        id: '00000000-0000-4000-8000-000000000003',
+      })
+    );
+    fireEvent.click(screen.getByText('Review new capture — keep my instruction'));
+    expect(scan).toHaveBeenCalledTimes(2);
+  });
   it('stages a valid offer but never sends without instruction, recipient and human action', async () => {
     render(<BrowserCompanionPage />);
     act(() => offer());

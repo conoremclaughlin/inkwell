@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   assertFresh,
   formatBrowserRequest,
@@ -39,6 +39,8 @@ export default function BrowserCompanionPage() {
   // Keep the attempted key even if the storage receipt is lost. Recovery
   // reads this exact thread, rather than risking a duplicate send.
   const [sentKey, setSentKey] = useState('');
+  const capture = offer?.snapshot;
+  const privacyHints = useMemo(() => (capture ? privacySignals(capture) : ''), [capture]);
   const { data: people, error: peopleError } = useApiQuery<{
     individuals: Array<{ sbSlug: string; name: string }>;
   }>(['companion-recipients'], '/api/admin/individuals');
@@ -235,7 +237,7 @@ export default function BrowserCompanionPage() {
               Read this before sending. Form values, cookies, query strings and URL fragments are
               excluded; visible text and URL paths may still contain sensitive material.
             </p>
-            <p className="text-sm">{privacySignals(offer.snapshot)}</p>
+            <p className="text-sm">{privacyHints}</p>
             <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-3 text-xs">
               {payload || JSON.stringify(offer.snapshot, null, 2)}
             </pre>

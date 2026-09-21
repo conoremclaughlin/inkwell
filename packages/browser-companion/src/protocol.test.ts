@@ -41,6 +41,15 @@ describe('browser companion contract', () => {
     'accepts explicit dashboard origin %s',
     (origin) => expect(dashboardOrigin(origin)).toBe(origin)
   );
+  it('bounds email-like scanning on long nonmatches and retains positive controls', () => {
+    const s = snapshot();
+    // Deliberately larger than a valid capture, also exercising direct callers.
+    s.text = 'x'.repeat(60_000) + ' fixture@example.com second@fixture.test';
+    const start = performance.now();
+    expect(privacySignals(s)).toContain('2 email-like');
+    // Broad ceiling: old unbounded pattern takes seconds; bounded scan is ms.
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
   it.each([
     'http://192.0.2.1:3002',
     'http://localhost.evil.test',
