@@ -65,7 +65,7 @@ describe('browser dashboard human-send boundary', () => {
     fireEvent.click(send);
     await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
     expect(post).toHaveBeenCalledWith('/api/admin/threads', {
-      key: `browser:${snapshot.id}`,
+      key: `thread:browser-${snapshot.id}`,
       recipients: ['fixture-sb'],
       title: 'Browser assistance',
       content: formatBrowserRequest(snapshot, 'Investigate this page'),
@@ -92,6 +92,10 @@ describe('browser dashboard human-send boundary', () => {
       expect(screen.getByRole('status').textContent).toContain('may have been stored')
     );
     expect(post).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('link', { name: 'Open thread' }).getAttribute('href')).toBe(
+      `/threads?key=${encodeURIComponent(`thread:browser-${snapshot.id}`)}`
+    );
+    expect((screen.getByText('Send reviewed context') as HTMLButtonElement).disabled).toBe(true);
   });
   it('requires a fresh review on recapture and preserves the instruction', () => {
     render(<BrowserCompanionPage />);
