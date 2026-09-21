@@ -118,7 +118,21 @@ export function writeRuntimeSessionHint(
       ...(studioId ? { studioId } : {}),
       updatedAt: now,
     };
-    writeFileSync(sessionsPath, JSON.stringify(state, null, 2));
+    // Same dual-write as the CLI's writeRuntimeState: an older `ink` on PATH
+    // drops rows it cannot parse and then writes the file back without them,
+    // so the legacy key has to keep being emitted, not just read.
+    const withLegacyKeys = (row: Record<string, unknown>): Record<string, unknown> =>
+      row && typeof row.inkSessionId === 'string'
+        ? { ...row, pcpSessionId: row.inkSessionId }
+        : row;
+    const onDisk = {
+      ...state,
+      sessions: state.sessions.map((s) => withLegacyKeys(s as Record<string, unknown>)),
+      ...(state.current
+        ? { current: withLegacyKeys(state.current as unknown as Record<string, unknown>) }
+        : {}),
+    };
+    writeFileSync(sessionsPath, JSON.stringify(onDisk, null, 2));
   } catch {
     // Best-effort only — hook will fall back to sessions.json current pointer.
   }

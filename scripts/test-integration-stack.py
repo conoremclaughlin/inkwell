@@ -294,6 +294,23 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(stack.Refusal, "pcp-integration"):
                 self.run_stack("--stop")
 
+    def test_legacy_project_is_stop_only_and_refuses_before_touching_anything(self):
+        # The rest of the harness is not legacy-aware (validate_identity wants
+        # an ink-integration name; the bookkeeping schema is _ink_it). A suite
+        # or reset against a pre-rename stack must refuse up front rather than
+        # fail somewhere past the first mutation.
+        self.env["INTEGRATION_SUPABASE_PROJECT_ID"] = "pcp-integration"
+        for args in ((), ("--reset",), ("--fresh",)):
+            with self.assertRaisesRegex(stack.Refusal, "--stop"):
+                self.run_stack(*args)
+        # Nothing ran: no supabase call, no suite, no reset.
+        self.assertEqual(self.count("supabase"), 0)
+        self.assertEqual(self.count("bash"), 0)
+
+    def test_legacy_project_may_still_be_stopped(self):
+        self.env["INTEGRATION_SUPABASE_PROJECT_ID"] = "pcp-integration"
+        self.assertEqual(self.run_stack("--stop"), 0)
+
     def test_stop_stays_quiet_when_no_legacy_stack_is_running(self):
         # Control: the refusal must depend on the legacy stack existing, not
         # fire on every --stop with nothing to do.

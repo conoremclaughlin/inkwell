@@ -240,6 +240,19 @@ def manage(root, harness, args, env):
             suite_args.append(arg)
     if stop and (reset or suite_args):
         raise Refusal("--stop cannot be combined with --reset or test arguments.")
+    # Legacy support is STOP-ONLY, and the refusal has to happen here — before
+    # the lock, before docker, before anything reads or mutates state.
+    # settings() accepts the pre-rename name so an orphaned stack can be shut
+    # down, but the rest of the harness is not legacy-aware: validate_identity
+    # requires an ink-integration name, and the bookkeeping schema is _ink_it
+    # where an old stack has _pcp_it. Running a suite or a reset against one
+    # would fail somewhere deeper, after work had already begun.
+    if project.startswith("pcp-") and not stop:
+        raise Refusal(
+            "Project " + project + " is the pre-rename name and is supported for --stop "
+            "only. Stop it with: INTEGRATION_SUPABASE_PROJECT_ID=" + project +
+            " yarn test:integration:db:local --stop, then run again without the "
+            "override to create a current stack.")
     base = Path(env.get("INTEGRATION_SUPABASE_CACHE_DIR", str(Path.home() / ".cache/inkwell/integration-db")))
     # Locks are machine-wide even when a caller selects a different cache dir.
     lock_dir = Path.home() / ".cache/inkwell/integration-db-locks"

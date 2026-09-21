@@ -114,9 +114,33 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
   }
 }
 
+/**
+ * Mirror the session id under the pre-rename key on the way out.
+ *
+ * Reading the old key is only half of it. The global `ink` link points at one
+ * checkout, and it is not updated when a server is, so an older CLI keeps
+ * reading this file: a row written with `inkSessionId` alone looks malformed
+ * to it, gets dropped by its type guard, and its next upsert writes the file
+ * back WITHOUT that row. A read migration is one-way; this is what stops the
+ * two versions destroying each other's rows (Lumen, #659 r2).
+ *
+ * Remove once no pre-rename CLI can still be on PATH.
+ */
+function withLegacyKeys(row: object): Record<string, unknown> {
+  const record = row as Record<string, unknown>;
+  return typeof record.inkSessionId === 'string'
+    ? { ...record, pcpSessionId: record.inkSessionId }
+    : record;
+}
+
 export function writeRuntimeState(cwd: string, state: RuntimeSessionState): void {
   ensureRuntimeDir(cwd);
-  writeFileSync(getRuntimeStatePath(cwd), JSON.stringify(state, null, 2));
+  const onDisk = {
+    ...state,
+    sessions: state.sessions.map((session) => withLegacyKeys(session)),
+    ...(state.current ? { current: withLegacyKeys(state.current) } : {}),
+  };
+  writeFileSync(getRuntimeStatePath(cwd), JSON.stringify(onDisk, null, 2));
 }
 
 export function upsertRuntimeSession(

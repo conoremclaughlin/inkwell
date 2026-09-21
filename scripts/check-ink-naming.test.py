@@ -88,6 +88,41 @@ class ExemptionsAreNarrow(unittest.TestCase):
         self.assertTrue(flags(PLAIN, "process.env.LEGACYPCP_PORT_BASE"))
         self.assertTrue(flags(PLAIN, "const x = mypcp_admin;"))
 
+    def test_every_exempted_file_still_rejects_a_brand_new_name(self):
+        """No exempted file may hide a new pre-rename name.
+
+        The earlier version listed a bare `pcp` per file, which covered any
+        new hyphenated literal in it — `pcp-new-tool` passed in chat.ts. Each
+        exemption is a specific literal now, and this walks every exempted
+        file to prove none of them grants a general pass.
+        """
+        probes = [
+            "const x = 'pcp-new-tool';",
+            "const u = process.env.PCP_NEW_THING;",
+            "const pcpWidgetId = 1;",
+            "// talks to the PCP server",
+        ]
+        for path in sorted(guard.FILE_ALLOWED):
+            for probe in probes:
+                with self.subTest(path=path, probe=probe):
+                    self.assertTrue(
+                        flags(path, probe),
+                        f"{path} let through: {probe}",
+                    )
+
+    def test_exemptions_are_still_honoured_in_their_own_file(self):
+        # Control for the test above: if the exemptions had simply stopped
+        # working, the sweep above would pass for the wrong reason.
+        self.assertFalse(
+            flags("packages/cli/src/commands/chat.ts", "case 'pcp': {")
+        )
+        self.assertFalse(
+            flags("packages/cli/src/session/runtime.ts", "['pcpSessionId', 'inkSessionId'],")
+        )
+        self.assertFalse(
+            flags("scripts/lib/integration-stack.py", 'if project.startswith("pcp-"):')
+        )
+
     def test_scoped_exemption_does_not_leak_to_other_files(self):
         legacy = "const header = { typ: 'PCP-DELEGATION' };"
         self.assertFalse(flags("packages/shared/src/security/delegation-token.ts", legacy))

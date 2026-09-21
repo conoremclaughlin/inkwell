@@ -80,17 +80,23 @@ ALLOWED: list[tuple[str, str]] = [
 # Literals permitted only in the file that needs them. The rest of that file is
 # still checked — that is the whole point of scoping them here.
 FILE_ALLOWED: dict[str, list[tuple[str, str]]] = {
+    # Every entry names a LITERAL, and quoted forms are preferred because the
+    # quote is itself a boundary. A bare `pcp` exemption used to sit here and
+    # it covered any new hyphenated name in the same file — `pcp-new-tool`
+    # passed in chat.ts (Lumen, #659 r2). Files whose only pre-rename text is
+    # already in ALLOWED carry no entry at all.
     "packages/api/src/services/thread-key/parser.test.ts": [
-        (r"pcp", "pins the pcp->inkwell project alias"),
+        (r"'pcp'", "pins the pcp->inkwell project alias"),
+        (r"pcp:[A-Za-z0-9:_-]*", "alias-prefixed thread keys under test"),
     ],
     "packages/api/src/services/thread-key/unregistered-prefix.test.ts": [
-        (r"pcp", "pins the project alias"),
+        (r"'pcp'", "pins the project alias"),
+        (r"`pcp`", "pins the project alias"),
+        (r"pcp:[A-Za-z0-9:_-]*", "alias-prefixed thread keys under test"),
     ],
     "packages/api/src/services/thread-key/thread-key.service.ts": [
-        (r"pcp", "documents the alias parse bug"),
-    ],
-    "packages/openclaw-plugin/config-compat.test.ts": [
-        (r"pcp", "legacy openclaw.json keys"),
+        (r"'pcp'", "documents the alias parse bug"),
+        (r"pcp:issue:x", "the key from that bug report"),
     ],
     "packages/web/src/lib/workspace-selection.ts": [
         (r"pcp:selectedWorkspaceId", "legacy localStorage key, read once"),
@@ -100,82 +106,35 @@ FILE_ALLOWED: dict[str, list[tuple[str, str]]] = {
     ],
     "packages/cli/src/commands/claude.ts": [
         (r"__pcp__", "legacy session-picker prefix, still stripped"),
-        (r"pcp", "legacy pcp:<id> session choice, still accepted"),
+        (r"pcp:", "legacy pcp:<id> session choice, still accepted"),
     ],
     "packages/cli/src/cli.test.ts": [
-        (r"pcp", "covers the legacy pcp:<id> session choice"),
+        (r"pcp:[0-9a-f]+", "covers the legacy pcp:<id> session choice"),
     ],
     "packages/cli/src/commands/chat.ts": [
-        (r"pcp", "legacy /pcp alias and the persisted pcp-activity ledger source"),
+        (r"case 'pcp'", "keeps /pcp as a silent alias for /ink"),
+        (r"'pcp' kept as a silent alias", "the comment explaining that alias"),
+        (r"'pcp-activity'", "persisted ledger source, replayed"),
+        (r"'pcp-activity-history'", "persisted ledger source, replayed"),
+    ],
+    "packages/cli/src/commands/chat-hydration.test.ts": [
+        (r"'pcp-activity'", "covers the persisted ledger sources"),
+        (r"'pcp-activity-history'", "covers the persisted ledger sources"),
     ],
     "packages/cli/src/commands/session.ts": [
-        (r"pcp", "legacy backend value on pre-rename rows"),
+        (r"includes\('pcp'\)", "legacy backend value on pre-rename rows"),
+        (r"'pcp'", "names that value in the comment above it"),
     ],
     "packages/cli/src/commands/session.test.ts": [
-        (r"pcp", "covers the legacy backend value"),
+        (r"'pcp'", "covers the legacy backend value"),
     ],
     "packages/api/src/routes/admin.ts": [
         (r"includes\('pcp'\)", "legacy backend value on pre-rename rows"),
-        (r"'pcp'", "names the legacy backend value in the comment above it"),
-        (r"pcp-pair", "legacy pairing token prefix already in the database"),
+        (r"'pcp'", "names that value in the comment above it"),
+        (r"pcp-pair-", "legacy pairing token prefix already in the database"),
     ],
     "packages/api/src/routes/admin-mobile-auth.test.ts": [
-        (r"pcp-pair", "covers the legacy pairing token prefix"),
-    ],
-    "packages/cli/src/commands/chat-hydration.test.ts": [
-        (r"pcp-activity(?:-history)?", "covers the persisted ledger sources"),
-    ],
-    "packages/create-inkwell/src/progress.ts": [
-        (r"\.create-pcp-progress\.json", "reads the legacy resume file"),
-    ],
-    "packages/create-inkwell/src/index.test.ts": [
-        (r"\.create-pcp-progress\.json", "covers the legacy resume file"),
-        (r"LEGACY_STATE_FILE", "names the legacy resume file constant"),
-    ],
-    ".gitignore": [
-        (r"\.create-pcp-progress\.json", "still ignores the legacy resume file"),
-    ],
-    "packages/api/src/config/env.ts": [
-        (r"PCP_", "documents the INK_/PCP_ fallback"),
-    ],
-    "packages/shared/src/runner/runtime-hints.ts": [
-        (r"pcpSessionId", "migrates the legacy key in sessions.json"),
-    ],
-    "packages/cli/src/session/runtime.ts": [
-        (r"pcpSessionId", "migrates the legacy key in sessions.json"),
-    ],
-    "packages/cli/src/session/legacy-runtime-compat.test.ts": [
-        (r"pcpSessionId", "fixture must stay in the pre-rename spelling"),
-    ],
-    "packages/shared/src/security/delegation-token.ts": [
-        (r"PCP-DELEGATION", "accepts the pre-rename signed typ"),
-    ],
-    "packages/cli/src/repl/delegation-token.test.ts": [
-        (r"PCP-DELEGATION", "mints a pre-rename token by hand"),
-    ],
-    "scripts/lib/integration-stack.py": [
-        (r"pcp-integration", "keeps the legacy stack reachable, including --stop"),
-        (r"pcp", "names the legacy prefix in the refusal message and comments"),
-    ],
-    "scripts/test-integration-stack.py": [
-        (r"pcp-integration", "covers the legacy stack name"),
-        (r"pcp", "names the legacy prefix in comments"),
-    ],
-    "scripts/check-commit-msg.sh": [(r"PCP_", "credential-guard fixture")],
-    "scripts/check-commit-msg.test.sh": [(r"PCP_", "credential-guard fixture")],
-    "packages/api/src/skills/service.ts": [(r"pcp", "explains why ~/.pcp is never read")],
-    "packages/api/src/skills/service.test.ts": [(r"pcp", "asserts ~/.pcp is never read")],
-    "packages/mobile/app.config.js": [(r"PCP_", "documents the INK_/PCP_ fallback")],
-    "packages/mobile/src/lib/appConfig.test.ts": [(r"PCP_", "covers the fallback")],
-    "packages/api/src/services/sessions/antigravity-runner.ts": [
-        (r"PCP_", "INK_/PCP_ fallback"),
-    ],
-    "packages/api/src/services/sessions/antigravity-runner.test.ts": [
-        (r"PCP_", "covers that fallback"),
-    ],
-    "scripts/dev-concurrently.mjs": [(r"PCP_", "INK_/PCP_ fallback")],
-    "packages/shared/src/studio/mcp-config-sync.ts": [
-        (r"pcp-managed", "legacy codex markers on users' disks"),
+        (r"pcp-pair-", "covers the legacy pairing token prefix"),
     ],
     "packages/api/src/mcp/tools/inbox-handlers.test.ts": [
         (r"pcp(?= metadata)", "prose about the persisted inbox metadata key"),
@@ -191,6 +150,45 @@ FILE_ALLOWED: dict[str, list[tuple[str, str]]] = {
     ],
     "packages/spec/protocol-v0.1.md": [
         (r'"pcp"', "MCP server entry in a pre-rename config example"),
+    ],
+    "packages/shared/src/runner/runtime-hints.ts": [
+        (r"pcpSessionId", "migrates and mirrors the legacy key in sessions.json"),
+    ],
+    "packages/cli/src/session/runtime.ts": [
+        (r"pcpSessionId", "migrates and mirrors the legacy key in sessions.json"),
+    ],
+    "packages/cli/src/session/legacy-runtime-compat.test.ts": [
+        (r"pcpSessionId", "fixture must stay in the pre-rename spelling"),
+    ],
+    "packages/shared/src/security/delegation-token.ts": [
+        (r"PCP-DELEGATION", "accepts the pre-rename signed typ"),
+    ],
+    "packages/cli/src/repl/delegation-token.test.ts": [
+        (r"PCP-DELEGATION", "mints a pre-rename token by hand"),
+    ],
+    "packages/create-inkwell/src/progress.ts": [
+        (r"\.create-pcp-progress\.json", "reads the legacy resume file"),
+    ],
+    "packages/create-inkwell/src/index.test.ts": [
+        (r"\.create-pcp-progress\.json", "covers the legacy resume file"),
+    ],
+    ".gitignore": [
+        (r"\.create-pcp-progress\.json", "still ignores the legacy resume file"),
+    ],
+    "scripts/lib/integration-stack.py": [
+        (r"pcp-integration", "legacy stack name, supported for --stop"),
+        (r"\(\?:ink\|pcp\)-integration", "the validator pattern that accepts both"),
+        (r'"pcp-"', "the prefix test that makes legacy stop-only"),
+        (r"_pcp_it", "names the legacy bookkeeping schema in a comment"),
+    ],
+    "scripts/test-integration-stack.py": [
+        (r"pcp-integration", "covers the legacy stack name"),
+    ],
+    "packages/api/src/config/env.ts": [
+        (r"PCP_", "documents the INK_/PCP_ fallback"),
+    ],
+    "packages/shared/src/studio/mcp-config-sync.ts": [
+        (r"pcp-managed", "legacy codex markers on users' disks"),
     ],
 }
 

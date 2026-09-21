@@ -175,4 +175,20 @@ describe('create-inkwell state management', () => {
       JSON.parse(readFileSync(join(tmpDir, LEGACY_STATE_FILE), 'utf-8')).completedSteps
     ).toEqual([]);
   });
+
+  // index.ts calls main() at module load, so the entry path cannot be
+  // imported and exercised. It gated the load on the CURRENT progress file
+  // existing, which meant a legacy-only resume never reached loadState at
+  // all: the helper below resumed correctly and the wizard still started from
+  // zero. The gate is gone, so loadState is the only route to a state — this
+  // asserts it stays that way.
+  it('has exactly one route to a progress state', () => {
+    const source = readFileSync(join(__dirname, 'index.ts'), 'utf-8');
+
+    expect(source).toContain('loadState(targetDir)');
+    // The inline default the gate fell back to. Its absence is what makes
+    // loadState the single decision point.
+    expect(source).not.toMatch(/completedSteps:\s*\[\]/);
+    expect(source).not.toMatch(/existsSync\([^)]*STATE_FILE/);
+  });
 });

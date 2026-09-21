@@ -16,14 +16,7 @@ import { execSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  STATE_FILE,
-  isComplete,
-  loadState,
-  markComplete,
-  saveState,
-  type ProgressState,
-} from './progress.js';
+import { isComplete, loadState, markComplete, saveState, type ProgressState } from './progress.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -681,10 +674,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Load state (for resumability)
-  const state: ProgressState = existsSync(join(targetDir, STATE_FILE))
-    ? loadState(targetDir)
-    : { completedSteps: [], targetDir };
+  // Load state (for resumability). No existsSync gate: loadState already
+  // returns the default when there is nothing to read, and gating on
+  // STATE_FILE meant a setup interrupted under the legacy name never reached
+  // the legacy branch at all — the helper resumed correctly and the entry
+  // point still started from zero (Lumen, #659 r2).
+  const state: ProgressState = loadState(targetDir);
   state.targetDir = targetDir;
 
   if (state.completedSteps.length > 0) {
