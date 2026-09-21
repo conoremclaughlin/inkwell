@@ -15,6 +15,11 @@ export function connectDashboard(
   const host = globalThis as typeof globalThis & { __inkwellBridgeCleanup?: () => void };
   host.__inkwellBridgeCleanup?.();
   const origin = location.origin;
+  let active = true;
+  const receipt = (result: unknown) => {
+    if (active && location.href === expectedUrl)
+      window.postMessage({ type: 'inkwell:proposal-receipt', bridgeId, result }, origin);
+  };
   let offered = false;
   const offer = () => {
     if (!offered && location.href === expectedUrl)
@@ -32,25 +37,15 @@ export function connectDashboard(
     if (event.data.type === 'inkwell:propose') {
       void chrome.runtime
         .sendMessage({ type: 'bridge:proposal', bridgeId, proposal: event.data.proposal })
-        .then((result) =>
-          window.postMessage({ type: 'inkwell:proposal-receipt', bridgeId, result }, origin)
-        )
-        .catch(() =>
-          window.postMessage(
-            {
-              type: 'inkwell:proposal-receipt',
-              bridgeId,
-              result: { ok: false, error: 'Extension unavailable. Reopen its panel.' },
-            },
-            origin
-          )
-        );
+        .then(receipt)
+        .catch(() => receipt({ ok: false, error: 'Extension unavailable. Reopen its panel.' }));
     }
   };
   window.addEventListener('message', handler);
   const interval = setInterval(offer, 1000);
   const timeout = setTimeout(() => cleanup(), 10 * 60 * 1000);
   function cleanup() {
+    active = false;
     clearInterval(interval);
     clearTimeout(timeout);
     window.removeEventListener('message', handler);
