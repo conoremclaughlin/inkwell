@@ -304,7 +304,7 @@ describe('classifyError', () => {
     it('matches the JSON-RPC resume refusal on its own', () => {
       const r = classifyError({
         errorText:
-          'Error: thread/resume: thread/resume failed: thread 019d0180 already has an active writer (code -32600)',
+          'Error: thread/resume: thread/resume failed: thread 01900000-0000-7000-8000-00000000beef already has an active writer (code -32600)',
       });
       expect(r.category).toBe('owner_conflict');
     });
@@ -339,6 +339,27 @@ describe('classifyError', () => {
       expect(classifyError({ errorText: 'merge conflict in thread-store.ts' }).category).not.toBe(
         'owner_conflict'
       );
+    });
+
+    // The rule is an AND of two halves, so each half alone has to miss —
+    // otherwise it is the pair of unqualified substrings it replaced (Lumen's
+    // review of PR #660). These are the texts that would classify as a refusal
+    // under an OR and must not under this rule.
+    const halfSignatures: string[] = [
+      // Context without the sentence: a real Codex startup failure that is not
+      // a writer conflict at all.
+      'failed to initialize thread persistence: thread-store conflict: database is locked',
+      // Context without the sentence, from the RPC side.
+      'Error: thread/resume: thread/resume failed: no such thread (code -32602)',
+      // The sentence's words without a thread reference and without context —
+      // an agent recounting this very incident in a turn that then crashed.
+      'I was explaining that a session already has an active writer when the process died',
+      // A thread reference and the words, but nothing that makes it Codex's
+      // refusal: the phrase lifted into prose about our own inbox threads.
+      'note: thread pr:660 already has an active writer on the review',
+    ];
+    it.each(halfSignatures)('does not fire on a half signature: %j', (errorText) => {
+      expect(classifyError({ errorText }).category).not.toBe('owner_conflict');
     });
   });
 });

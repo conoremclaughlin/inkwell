@@ -20,14 +20,19 @@
  * Deliberately NOT asserted here, because the fix does not claim it: a
  * writer-lock conflict is not evidence the owner is alive. Nothing below
  * refreshes a registration, extends a lease, or marks the session live. The
- * row is put back the way this turn found it, and no further claim is made
+ * refusal leaves the owner's columns alone, and no further claim is made
  * (Lumen, spec:live-agent-surfaces).
+ *
+ * The shutdown block at the bottom came from Lumen's review of PR #660: the
+ * finalize write is not the only path that can terminalize the owner off a
+ * refusal, and the second one is red at the PR's base too.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SessionService } from './session-service.js';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
-import { resetActiveRuns } from './active-runs.js';
+import { resetActiveRuns, closeIntakeAndDrain } from './active-runs.js';
+import { interruptActiveRuns } from './interrupt-active-runs.js';
 import { resetPendingFinalizations } from './finalize-turn.js';
 import type { Session, ISessionRepository, IContextBuilder, IRunner } from './types.js';
 import type { IActivityStream } from './session-service.js';
@@ -251,19 +256,55 @@ describe('a refused resume must not record an outcome on the target session', ()
   });
 
   /**
-   * The takeover write stamps `running` before the runner spawns, so omitting
-   * `lifecycle` on a refusal would leave OUR `running` standing on a session
-   * we learned nothing about — which thread-spines reads as live for the next
-   * thirty minutes. Restoring the pre-turn value is the only outcome that
-   * claims nothing in either direction, and an idle owner is where the two
-   * differ.
+   * The first version of this fix RESTORED the snapshot lifecycle this turn
+   * read before its takeover, on the reasoning that the takeover's `running`
+   * was itself a claim we had not earned. Lumen's review of PR #660 showed
+   * that replaying a snapshot is a write of a value that may already be
+   * stale: the owner can move itself `running` → `failed` while the refused
+   * runner is in flight, that transition does not rotate the row's epoch, so
+   * the replay passes the fence and resurrects `running` over a newer, truer
+   * value. Omitting cannot lose an update; replaying can.
+   *
+   * This is his probe, kept as the regression. It is red against a4079f20 (the
+   * reviewed head) and green here.
    */
-  it('restores the pre-turn lifecycle rather than leaving the takeover running', async () => {
+  it('does not resurrect a stale running over a newer owner failure', async () => {
+    const { send, state, codexRunner } = makeServiceFailingWith(
+      CODEX_WRITER_CONFLICT,
+      makeOwnerSession()
+    );
+    vi.mocked(codexRunner.run).mockImplementation(async () => {
+      // The owner writes its own lifecycle after the competing spawn's
+      // takeover. A running → failed update does not rotate the turn epoch,
+      // so nothing downstream fences this out.
+      state.row = { ...state.row, lifecycle: 'failed' };
+      return {
+        success: false,
+        backendSessionId: OWNER_THREAD,
+        responses: [],
+        error: CODEX_WRITER_CONFLICT,
+      };
+    });
+    await send();
+    expect(state.row.lifecycle).toBe('failed');
+  });
+
+  /**
+   * What omitting costs, pinned so it cannot be mistaken for the fix working
+   * perfectly. The takeover at the top of processMessage stamps `running`
+   * before the runner spawns, so an IDLE owner's row is left reading `running`
+   * — ours, not its own. That is the pre-spawn takeover write, which Lumen
+   * ruled separate debt with its own scope (lifecycle, turnEpoch and
+   * updated_at together) rather than something a second write here should
+   * paper over. If a snapshot restore is ever reintroduced this goes red,
+   * which is the point.
+   */
+  it('leaves the takeover running standing on an idle owner — known, separate debt', async () => {
     const { row } = await runTurnFailingWith(
       CODEX_WRITER_CONFLICT,
       makeOwnerSession({ lifecycle: 'idle' })
     );
-    expect(row.lifecycle).toBe('idle');
+    expect(row.lifecycle).toBe('running');
   });
 
   it('reports the turn as failed to the caller — the delivery did not happen', async () => {
@@ -369,6 +410,93 @@ describe('a refused resume must not record an outcome on the target session', ()
         expect.any(String),
         expect.any(String)
       );
+    });
+  });
+
+  /**
+   * The second path to the same event, found by Lumen reviewing PR #660, and
+   * red against the PR's BASE as well as against its head — an uncovered part
+   * of the original defect rather than something the PR introduced.
+   *
+   * The finalize write is not the only thing that terminalizes a session. When
+   * it does not land — shutdown refuses it, or it fails and goes to the
+   * background retry — the run stays registered, and `interruptActiveRuns`
+   * writes the terminal state the turn MEANT to write. For a refusal that read
+   * `failed`, because `markRunnerSettled` recorded `failed` from
+   * `result.success` before anything was classified. The epoch fence does not
+   * save the owner here either: the refused run genuinely holds the row's
+   * epoch, because the takeover wrote it. So shutdown's CAS matched and put
+   * `lifecycle='failed'` on a live owner, and posted a turn-failure notice
+   * about it.
+   *
+   * The fix classifies first and records `refused`, which shutdown declines to
+   * act on at all.
+   */
+  describe('shutdown must not terminalize the owner after a refusal', () => {
+    /** The row as the shutdown terminalizer sees it — snake_case, from Postgres. */
+    const rowFor = (row: Session): Row[] => [
+      {
+        id: row.id,
+        lifecycle: row.lifecycle,
+        ended_at: null,
+        metadata: {},
+        turn_epoch: (row as { turnEpoch?: string }).turnEpoch,
+      },
+    ];
+
+    it('leaves the row alone when a refusal finalize write is lost', async () => {
+      const { send, state, spies } = makeServiceFailingWith(
+        CODEX_WRITER_CONFLICT,
+        makeOwnerSession()
+      );
+      spies.updateIfTurnEpoch.mockRejectedValue(new Error('synthetic bookkeeping outage'));
+      await send();
+
+      const { runs, drained } = await closeIntakeAndDrain();
+      // The run must actually still be registered, or this asserts nothing.
+      expect(runs.map((r) => r.sessionId)).toContain('session-owner');
+
+      const rows = rowFor(state.row);
+      await interruptActiveRuns(makeFakeSupabase({ sessions: rows }), runs, 100, drained);
+      expect(rows[0].lifecycle).toBe('running');
+    });
+
+    it('does not post a turn-failure notice about a refused run', async () => {
+      const { send, state, spies } = makeServiceFailingWith(
+        CODEX_WRITER_CONFLICT,
+        makeOwnerSession()
+      );
+      spies.updateIfTurnEpoch.mockRejectedValue(new Error('synthetic bookkeeping outage'));
+      await send();
+
+      const { runs, drained } = await closeIntakeAndDrain();
+      // A notice needs an addressable thread; without one the notice path is
+      // skipped for every run and this would pass on the bug too.
+      const withThread = runs.map((r) => ({ ...r, threadKey: 'spec:live-agent-surfaces' }));
+      const outcomes = await interruptActiveRuns(
+        makeFakeSupabase({ sessions: rowFor(state.row) }),
+        withThread,
+        100,
+        drained
+      );
+      expect(outcomes[0]).toMatchObject({ state: 'never-started', marked: false, noticed: false });
+    });
+
+    /**
+     * The control, and the one that makes the two above mean something: an
+     * ordinary crash whose finalize write is lost the same way must STILL be
+     * recorded by shutdown. Without it, "shutdown wrote nothing" would read as
+     * success even if the terminalizer had simply stopped working.
+     */
+    it('still records an ordinary failed turn whose finalize write is lost', async () => {
+      const { send, state, spies } = makeServiceFailingWith(ORDINARY_CRASH, makeOwnerSession());
+      spies.updateIfTurnEpoch.mockRejectedValue(new Error('synthetic bookkeeping outage'));
+      await send();
+
+      const { runs, drained } = await closeIntakeAndDrain();
+      const rows = rowFor(state.row);
+      await interruptActiveRuns(makeFakeSupabase({ sessions: rows }), runs, 100, drained);
+      expect(rows[0].lifecycle).toBe('failed');
     });
   });
 });
