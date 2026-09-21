@@ -117,7 +117,7 @@ interface SessionRequest {
 
 interface SessionResult {
   success: boolean;
-  sessionId: string; // PCP session ID
+  sessionId: string; // Inkwell session ID
   claudeSessionId: string; // Claude Code session ID
 
   // Response routing (if send_response was called)
@@ -311,7 +311,7 @@ src/services/sessions/
 
 ## Migration Status: COMPLETE (2026-02-04)
 
-The PCP server (`src/server.ts`) now uses SessionService for:
+The Inkwell server (`src/server.ts`) now uses SessionService for:
 
 - Stateless message handling (queries DB per-request)
 - Horizontal scaling ready (no in-memory state)

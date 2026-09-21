@@ -267,7 +267,7 @@ async function deriveWorkspaceIdFromAgent(
   if (workspaceIds.length === 1) return workspaceIds[0];
   if (workspaceIds.length > 1) {
     throw new Error(
-      `Workspace is ambiguous for agent "${sbSlug}". Provide workspaceId or X-PCP-Workspace-Id.`
+      `Workspace is ambiguous for agent "${sbSlug}". Provide workspaceId or x-ink-workspace-id.`
     );
   }
 
@@ -444,7 +444,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
   });
   if (!workspaceResolution) {
     throw new Error(
-      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+      'Artifact write requires workspace scope. Provide x-ink-workspace-id, workspaceId, or a workspace-scoped agent identity.'
     );
   }
   const workspaceScope = workspaceResolution.workspaceId;
@@ -769,7 +769,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
   });
   if (!workspaceResolution) {
     throw new Error(
-      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+      'Artifact write requires workspace scope. Provide x-ink-workspace-id, workspaceId, or a workspace-scoped agent identity.'
     );
   }
   const workspaceScope = workspaceResolution.workspaceId;
@@ -1250,7 +1250,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
   });
   if (!workspaceResolution) {
     throw new Error(
-      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+      'Artifact write requires workspace scope. Provide x-ink-workspace-id, workspaceId, or a workspace-scoped agent identity.'
     );
   }
   const workspaceScope = workspaceResolution.workspaceId;

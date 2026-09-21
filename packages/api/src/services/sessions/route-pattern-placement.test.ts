@@ -59,7 +59,7 @@
  * Extending it to thread-bearing ones means driving the CAS with a live rival
  * binding, which is a different fixture and a different probe.
  *
- * Shape (Lumen's spec, thread pcp:spec:trigger-studio-routing, 2026-09-16):
+ * Shape (Lumen's spec, thread inkwell:spec:trigger-studio-routing, 2026-09-16):
  *   - the full handler path, both phases, provisioning/runner boundaries
  *     stubbed — no real worktree, no executor;
  *   - unbound participant: no recipient/alias/history/default-session reuse;
@@ -98,8 +98,8 @@ const SB_ID = 'sb-wren-uuid';
 
 /** Matches B's pattern, matches nothing else. Never registered as a key type,
  *  so it resolves through UNKNOWN_TYPE_DEFAULT — write intent, reuse-only. */
-const THREAD_KEY = 'pcp:probe:route-pattern-decides';
-const B_PATTERN = 'pcp:probe:*';
+const THREAD_KEY = 'inkwell:probe:route-pattern-decides';
+const B_PATTERN = 'inkwell:probe:*';
 
 /* ------------------------------------------------------------------------ *
  * The production handler, lifted out of server.ts without importing it.

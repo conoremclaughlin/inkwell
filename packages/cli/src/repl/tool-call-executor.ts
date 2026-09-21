@@ -9,7 +9,7 @@
  */
 
 import type { ToolPolicyState } from './tool-policy.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 import { isClientLocalTool } from './context-tools.js';
 import { impossibleCallRefusal } from './tool-dispatch.js';
 
@@ -23,7 +23,7 @@ export interface ToolCallResult {
   tool: string;
   args: Record<string, unknown>;
   status: 'executed' | 'blocked' | 'approved' | 'denied' | 'error';
-  result?: PcpToolCallResult;
+  result?: InkToolCallResult;
   reason?: string;
   error?: string;
 }
@@ -32,7 +32,7 @@ export interface ToolCallExecutorDeps {
   /** Policy engine for permission decisions */
   policy: ToolPolicyState;
   /**
-   * Execute a PCP MCP tool call.
+   * Execute a Inkwell MCP tool call.
    *
    * The cancellation signal arrives as an ARGUMENT rather than being captured
    * by the closure. That is deliberate: every dispatcher that reaches a
@@ -44,7 +44,7 @@ export interface ToolCallExecutorDeps {
     tool: string,
     args: Record<string, unknown>,
     ctx: { signal?: AbortSignal }
-  ) => Promise<PcpToolCallResult>;
+  ) => Promise<InkToolCallResult>;
   /** Current session ID for session-scoped grants */
   sessionId?: string;
   /** Prompt callback for tools requiring approval — returns true if approved */
@@ -70,7 +70,7 @@ export interface ToolCallExecutorDeps {
  * Execute a list of local tool calls sequentially with policy checks.
  *
  * For each call:
- * 1. Check policy via canCallPcpTool()
+ * 1. Check policy via canCallInkTool()
  * 2. If allowed → execute immediately
  * 3. If promptable → pause and call promptForApproval()
  *    - If approved → re-check policy (grant was applied) and execute
@@ -112,7 +112,7 @@ async function executeOneToolCall(
   const { policy, callTool, sessionId, promptForApproval } = deps;
 
   // Client-local tools (context management + signaling) always bypass policy.
-  // They operate on the in-memory ledger — no external side effects, no PCP
+  // They operate on the in-memory ledger — no external side effects, no Inkwell
   // server calls. Eviction removes from working memory but the JSONL transcript
   // retains the full immutable log. The SB must have full control over its own
   // context window without permission gates.
@@ -138,7 +138,7 @@ async function executeOneToolCall(
 
   // 1. Check policy — strip MCP namespace prefix for policy lookup
   const policyToolName = call.tool.replace(/^mcp__inkwell__/, '');
-  const decision = policy.canCallPcpTool(policyToolName, sessionId);
+  const decision = policy.canCallInkTool(policyToolName, sessionId);
 
   if (decision.allowed) {
     // Allowed — execute immediately
@@ -178,7 +178,7 @@ async function executeOneToolCall(
 
   // Re-check policy after approval (the grant was applied by the prompt handler)
   // Use the stripped name — same as the initial policy check above
-  const postApprovalDecision = policy.canCallPcpTool(policyToolName, sessionId);
+  const postApprovalDecision = policy.canCallInkTool(policyToolName, sessionId);
   if (!postApprovalDecision.allowed) {
     // Edge case: approval was granted but policy still blocks (e.g., deny overrides grant)
     return {
@@ -201,7 +201,7 @@ async function executeTool(
     tool: string,
     args: Record<string, unknown>,
     ctx: { signal?: AbortSignal }
-  ) => Promise<PcpToolCallResult>,
+  ) => Promise<InkToolCallResult>,
   signal?: AbortSignal
 ): Promise<ToolCallResult> {
   try {

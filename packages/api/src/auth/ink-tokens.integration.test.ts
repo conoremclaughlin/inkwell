@@ -1,5 +1,5 @@
 /**
- * PCP Tokens Integration Tests
+ * Inkwell Tokens Integration Tests
  *
  * Tests the full token lifecycle against a real Supabase database:
  * 1. Create refresh token (writes to mcp_tokens)
@@ -15,15 +15,15 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import jwt from 'jsonwebtoken';
 import { getDataComposer, type DataComposer } from '../data/composer';
 import {
-  signPcpAccessToken,
-  verifyPcpAccessToken,
+  signInkAccessToken,
+  verifyInkAccessToken,
   createRefreshToken,
   exchangeRefreshToken,
-} from './pcp-tokens';
+} from './ink-tokens';
 import { env } from '../config/env';
 import { ensureEchoIntegrationFixture } from '../test/integration-fixtures';
 
-describe('PCP Tokens Integration', () => {
+describe('Inkwell Tokens Integration', () => {
   let dataComposer: DataComposer;
   let testUserId: string;
   let testUserEmail: string;
@@ -55,17 +55,17 @@ describe('PCP Tokens Integration', () => {
   });
 
   // =========================================================================
-  // signPcpAccessToken + verifyPcpAccessToken round-trip
+  // signInkAccessToken + verifyInkAccessToken round-trip
   // =========================================================================
 
   describe('sign + verify (no DB)', () => {
     it('should sign and verify an mcp_access token', () => {
-      const token = signPcpAccessToken(
+      const token = signInkAccessToken(
         { type: 'mcp_access', sub: testUserId, email: testUserEmail, scope: 'mcp:tools' },
         3600
       );
 
-      const result = verifyPcpAccessToken(token, 'mcp_access');
+      const result = verifyInkAccessToken(token, 'mcp_access');
       expect(result).not.toBeNull();
       expect(result!.sub).toBe(testUserId);
       expect(result!.email).toBe(testUserEmail);
@@ -73,43 +73,43 @@ describe('PCP Tokens Integration', () => {
     });
 
     it('should sign and verify a pcp_admin token', () => {
-      const token = signPcpAccessToken(
+      const token = signInkAccessToken(
         { type: 'pcp_admin', sub: testUserId, email: testUserEmail, scope: 'admin' },
         3600
       );
 
-      const result = verifyPcpAccessToken(token, 'pcp_admin');
+      const result = verifyInkAccessToken(token, 'pcp_admin');
       expect(result).not.toBeNull();
       expect(result!.type).toBe('pcp_admin');
       expect(result!.scope).toBe('admin');
     });
 
     it('should enforce type isolation', () => {
-      const mcpToken = signPcpAccessToken(
+      const mcpToken = signInkAccessToken(
         { type: 'mcp_access', sub: testUserId, email: testUserEmail, scope: 'mcp:tools' },
         3600
       );
-      const adminToken = signPcpAccessToken(
+      const adminToken = signInkAccessToken(
         { type: 'pcp_admin', sub: testUserId, email: testUserEmail, scope: 'admin' },
         3600
       );
 
       // Cross-type verification must fail
-      expect(verifyPcpAccessToken(mcpToken, 'pcp_admin')).toBeNull();
-      expect(verifyPcpAccessToken(adminToken, 'mcp_access')).toBeNull();
+      expect(verifyInkAccessToken(mcpToken, 'pcp_admin')).toBeNull();
+      expect(verifyInkAccessToken(adminToken, 'mcp_access')).toBeNull();
 
       // Same-type verification must succeed
-      expect(verifyPcpAccessToken(mcpToken, 'mcp_access')).not.toBeNull();
-      expect(verifyPcpAccessToken(adminToken, 'pcp_admin')).not.toBeNull();
+      expect(verifyInkAccessToken(mcpToken, 'mcp_access')).not.toBeNull();
+      expect(verifyInkAccessToken(adminToken, 'pcp_admin')).not.toBeNull();
     });
 
     it('should reject expired tokens', () => {
-      const token = signPcpAccessToken(
+      const token = signInkAccessToken(
         { type: 'pcp_admin', sub: testUserId, email: testUserEmail, scope: 'admin' },
         0 // expires immediately
       );
 
-      expect(verifyPcpAccessToken(token)).toBeNull();
+      expect(verifyInkAccessToken(token)).toBeNull();
     });
 
     it('should reject tokens signed with wrong secret', () => {
@@ -119,7 +119,7 @@ describe('PCP Tokens Integration', () => {
         { expiresIn: 3600 }
       );
 
-      expect(verifyPcpAccessToken(token)).toBeNull();
+      expect(verifyInkAccessToken(token)).toBeNull();
     });
   });
 
@@ -139,7 +139,7 @@ describe('PCP Tokens Integration', () => {
         90
       );
 
-      expect(result.refreshToken).toMatch(/^pcp-rt-/);
+      expect(result.refreshToken).toMatch(/^ink-rt-/);
       expect(result.expiresAt).toBeInstanceOf(Date);
       expect(result.expiresAt.getTime()).toBeGreaterThan(Date.now());
 
@@ -228,7 +228,7 @@ describe('PCP Tokens Integration', () => {
       expect(result!.email).toBe(testUserEmail);
 
       // The returned access token should be a valid JWT
-      const decoded = verifyPcpAccessToken(result!.accessToken, 'mcp_access');
+      const decoded = verifyInkAccessToken(result!.accessToken, 'mcp_access');
       expect(decoded).not.toBeNull();
       expect(decoded!.sub).toBe(testUserId);
       expect(decoded!.type).toBe('mcp_access');
@@ -262,7 +262,7 @@ describe('PCP Tokens Integration', () => {
       );
 
       expect(result).not.toBeNull();
-      const decoded = verifyPcpAccessToken(result!.accessToken, 'pcp_admin');
+      const decoded = verifyInkAccessToken(result!.accessToken, 'pcp_admin');
       expect(decoded).not.toBeNull();
       expect(decoded!.type).toBe('pcp_admin');
       expect(decoded!.scope).toBe('admin');
@@ -299,7 +299,7 @@ describe('PCP Tokens Integration', () => {
 
       const result = await exchangeRefreshToken(
         supabase,
-        'pcp-rt-does-not-exist',
+        'ink-rt-does-not-exist',
         'integration-test',
         'mcp_access',
         3600
@@ -331,7 +331,7 @@ describe('PCP Tokens Integration', () => {
         .insert({
           user_id: testUserId,
           client_id: 'integration-test',
-          refresh_token: `pcp-rt-expired-${Date.now()}`,
+          refresh_token: `ink-rt-expired-${Date.now()}`,
           supabase_refresh_token: null,
           scopes: ['mcp:tools'],
           expires_at: new Date(Date.now() - 86400000).toISOString(), // yesterday
@@ -429,13 +429,13 @@ describe('PCP Tokens Integration', () => {
       if (t) createdTokenIds.push(t.id);
 
       // Step 2: Sign initial access token (happens in Tier 3 cookie issuance)
-      const initialAccessToken = signPcpAccessToken(
+      const initialAccessToken = signInkAccessToken(
         { type: 'pcp_admin', sub: testUserId, email: testUserEmail, scope: 'admin' },
         3600
       );
 
       // Step 3: Verify the access token (Tier 1 on next request)
-      const tier1Result = verifyPcpAccessToken(initialAccessToken, 'pcp_admin');
+      const tier1Result = verifyInkAccessToken(initialAccessToken, 'pcp_admin');
       expect(tier1Result).not.toBeNull();
       expect(tier1Result!.sub).toBe(testUserId);
       expect(tier1Result!.type).toBe('pcp_admin');
@@ -451,13 +451,13 @@ describe('PCP Tokens Integration', () => {
       expect(tier2Result).not.toBeNull();
 
       // Step 5: Verify the refreshed access token (next Tier 1)
-      const refreshedVerify = verifyPcpAccessToken(tier2Result!.accessToken, 'pcp_admin');
+      const refreshedVerify = verifyInkAccessToken(tier2Result!.accessToken, 'pcp_admin');
       expect(refreshedVerify).not.toBeNull();
       expect(refreshedVerify!.sub).toBe(testUserId);
       expect(refreshedVerify!.type).toBe('pcp_admin');
 
       // Step 6: Ensure the token is NOT accepted as mcp_access
-      expect(verifyPcpAccessToken(tier2Result!.accessToken, 'mcp_access')).toBeNull();
+      expect(verifyInkAccessToken(tier2Result!.accessToken, 'mcp_access')).toBeNull();
     });
   });
 });

@@ -416,8 +416,8 @@ export function buildDockerRunArgs(
   args.push('--workdir', plan.workdir);
   args.push('--add-host', 'host.docker.internal:host-gateway');
   args.push('--hostname', plan.containerName);
-  args.push('--label', 'pcp.studio-sandbox=true');
-  args.push('--label', `pcp.studio.path=${plan.context.studioPath}`);
+  args.push('--label', 'ink.studio-sandbox=true');
+  args.push('--label', `ink.studio.path=${plan.context.studioPath}`);
 
   if (plan.uid !== undefined && plan.gid !== undefined) {
     args.push('--user', `${plan.uid}:${plan.gid}`);

@@ -12,7 +12,7 @@ import { join } from 'path';
 import { decodeJwtPayload, isTokenExpired, loadAuth } from '../auth/tokens.js';
 import { resolveSlug, resolveBackend } from '../backends/index.js';
 import { readIdentityJson } from '../backends/identity.js';
-import { getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { getInkServerUrl } from '../lib/ink-mcp.js';
 
 type StatusBackend = 'claude' | 'codex' | 'gemini';
 
@@ -33,7 +33,7 @@ function getHookConfigPath(backend: StatusBackend): string {
   }
 }
 
-function hasPcpHookCommand(value: unknown): boolean {
+function hasInkHookCommand(value: unknown): boolean {
   const signatures = [
     'hooks on-session-start',
     'hooks on-stop',
@@ -49,10 +49,10 @@ function hasPcpHookCommand(value: unknown): boolean {
     );
   }
   if (Array.isArray(value)) {
-    return value.some((entry) => hasPcpHookCommand(entry));
+    return value.some((entry) => hasInkHookCommand(entry));
   }
   if (value && typeof value === 'object') {
-    return Object.values(value).some((entry) => hasPcpHookCommand(entry));
+    return Object.values(value).some((entry) => hasInkHookCommand(entry));
   }
   return false;
 }
@@ -82,7 +82,7 @@ function getHooksInstalled(
   try {
     const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
     return {
-      installed: hasPcpHookCommand(parsed.hooks),
+      installed: hasInkHookCommand(parsed.hooks),
       configExists: true,
       parseError: false,
     };
@@ -97,10 +97,10 @@ interface ClaudePermissionsStatus {
   hasPermissions: boolean;
   allowCount: number;
   denyCount: number;
-  hasPcpMcpAllowance: boolean;
+  hasInkMcpAllowance: boolean;
 }
 
-function hasPcpMcpAllowRule(rule: string): boolean {
+function hasInkMcpAllowRule(rule: string): boolean {
   const normalized = rule.trim();
   return (
     normalized === 'mcp__inkwell__*' ||
@@ -119,7 +119,7 @@ export function getClaudePermissionsStatus(cwd: string): ClaudePermissionsStatus
       hasPermissions: false,
       allowCount: 0,
       denyCount: 0,
-      hasPcpMcpAllowance: false,
+      hasInkMcpAllowance: false,
     };
   }
 
@@ -139,7 +139,7 @@ export function getClaudePermissionsStatus(cwd: string): ClaudePermissionsStatus
       hasPermissions: allow.length > 0 || deny.length > 0,
       allowCount: allow.length,
       denyCount: deny.length,
-      hasPcpMcpAllowance: allow.some((rule) => hasPcpMcpAllowRule(rule)),
+      hasInkMcpAllowance: allow.some((rule) => hasInkMcpAllowRule(rule)),
     };
   } catch {
     return {
@@ -148,7 +148,7 @@ export function getClaudePermissionsStatus(cwd: string): ClaudePermissionsStatus
       hasPermissions: false,
       allowCount: 0,
       denyCount: 0,
-      hasPcpMcpAllowance: false,
+      hasInkMcpAllowance: false,
     };
   }
 }
@@ -156,30 +156,30 @@ export function getClaudePermissionsStatus(cwd: string): ClaudePermissionsStatus
 interface McpConfigStatus {
   configExists: boolean;
   parseError: boolean;
-  hasPcpServer: boolean;
-  pcpUrl?: string;
+  hasInkServer: boolean;
+  inkUrl?: string;
 }
 
 export function getMcpConfigStatus(cwd: string): McpConfigStatus {
   const mcpPath = join(cwd, '.mcp.json');
   if (!existsSync(mcpPath)) {
-    return { configExists: false, parseError: false, hasPcpServer: false };
+    return { configExists: false, parseError: false, hasInkServer: false };
   }
 
   try {
     const parsed = JSON.parse(readFileSync(mcpPath, 'utf-8')) as {
       mcpServers?: Record<string, { url?: unknown }>;
     };
-    const pcpServer = parsed.mcpServers?.inkwell;
-    const pcpUrl = typeof pcpServer?.url === 'string' ? pcpServer.url : undefined;
+    const inkServer = parsed.mcpServers?.inkwell;
+    const inkUrl = typeof inkServer?.url === 'string' ? inkServer.url : undefined;
     return {
       configExists: true,
       parseError: false,
-      hasPcpServer: Boolean(pcpServer),
-      ...(pcpUrl ? { pcpUrl } : {}),
+      hasInkServer: Boolean(inkServer),
+      ...(inkUrl ? { inkUrl } : {}),
     };
   } catch {
-    return { configExists: true, parseError: true, hasPcpServer: false };
+    return { configExists: true, parseError: true, hasInkServer: false };
   }
 }
 
@@ -197,7 +197,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
   const hooks = getHooksInstalled(cwd, backend);
   const claudePermissions = backend === 'claude' ? getClaudePermissionsStatus(cwd) : undefined;
   const mcpConfig = getMcpConfigStatus(cwd);
-  const pcpServerUrl = getPcpServerUrl();
+  const inkServerUrl = getInkServerUrl();
 
   console.log(chalk.bold('\nSB Status\n'));
   console.log(`  ${chalk.bold('Agent:')}   ${sbSlug}`);
@@ -234,7 +234,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
   } else if (hooks.installed) {
     console.log(`  ${chalk.green('Installed')}`);
   } else {
-    console.log(`  ${chalk.yellow('No PCP hooks found')}`);
+    console.log(`  ${chalk.yellow('No Inkwell hooks found')}`);
     console.log(chalk.dim(`  Run: ink hooks install -b ${backend}`));
   }
   console.log('');
@@ -254,8 +254,8 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
     console.log(
       `  ${chalk.green('Configured')} (${claudePermissions.allowCount} allow, ${claudePermissions.denyCount} deny)`
     );
-    if (!claudePermissions.hasPcpMcpAllowance) {
-      console.log(chalk.yellow('  No MCP PCP allow rule detected (mcp__inkwell__*)'));
+    if (!claudePermissions.hasInkMcpAllowance) {
+      console.log(chalk.yellow('  No MCP Inkwell allow rule detected (mcp__inkwell__*)'));
     }
   }
   console.log('');
@@ -267,15 +267,15 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
     console.log(chalk.dim('  Run: ink init'));
   } else if (mcpConfig.parseError) {
     console.log(chalk.red('  Parse error'));
-  } else if (!mcpConfig.hasPcpServer) {
+  } else if (!mcpConfig.hasInkServer) {
     console.log(chalk.yellow('  Missing mcpServers.inkwell'));
     console.log(chalk.dim('  Run: ink init'));
   } else {
     console.log(
-      `  ${chalk.green('PCP server configured')} (${mcpConfig.pcpUrl || chalk.dim('<url not set>')})`
+      `  ${chalk.green('Inkwell server configured')} (${mcpConfig.inkUrl || chalk.dim('<url not set>')})`
     );
   }
-  console.log(`  ${chalk.dim('INK_SERVER_URL')} ${pcpServerUrl}`);
+  console.log(`  ${chalk.dim('INK_SERVER_URL')} ${inkServerUrl}`);
   console.log('');
 
   const permissionsHealthy =
@@ -286,10 +286,10 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
           claudePermissions.configExists &&
           !claudePermissions.parseError &&
           claudePermissions.hasPermissions &&
-          claudePermissions.hasPcpMcpAllowance
+          claudePermissions.hasInkMcpAllowance
         );
   const mcpHealthy =
-    mcpConfig.configExists && !mcpConfig.parseError && mcpConfig.hasPcpServer === true;
+    mcpConfig.configExists && !mcpConfig.parseError && mcpConfig.hasInkServer === true;
   if (!auth || expired || !hooks.installed || !permissionsHealthy || !mcpHealthy) {
     console.log(
       chalk.yellow(

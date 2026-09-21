@@ -522,7 +522,7 @@ d('session_running_write trigger', () => {
       const studioId = randomUUID();
       const { error: userError } = await client.from('users').insert({
         id: otherUserId,
-        email: `pcp-test-${otherUserId.slice(0, 8)}@example.invalid`,
+        email: `ink-test-${otherUserId.slice(0, 8)}@example.invalid`,
       } as never);
       expect(userError).toBeNull();
       const { error: studioError } = await client.from('studios').insert({

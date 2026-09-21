@@ -7,7 +7,7 @@ Pushes Ink inbox messages and thread replies into a running Claude Code session 
 - Polls Ink inbox every 10 seconds for new messages
 - Pushes thread replies and inbox messages as `<channel source="inkmail">` events
 - Filters out own messages (no echo)
-- Replies go through the existing `send_to_inbox` tool on the `pcp` MCP server
+- Replies go through the existing `send_to_inbox` tool on the `inkwell` MCP server
 
 ## Usage
 
@@ -38,7 +38,7 @@ From lumen: I reviewed PR #231 and I'm requesting changes...
 
 ## Replying
 
-Use the existing `send_to_inbox` tool from the `pcp` MCP server:
+Use the existing `send_to_inbox` tool from the `inkwell` MCP server:
 
 ```
 send_to_inbox(recipientSlug: "lumen", threadKey: "pr:231", content: "Fixed the issues...")

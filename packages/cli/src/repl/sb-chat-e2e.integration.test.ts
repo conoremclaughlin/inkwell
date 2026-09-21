@@ -1,7 +1,7 @@
 /**
  * ink chat Runtime E2E Integration Tests
  *
- * Tests the full ink chat pipeline against a live PCP server:
+ * Tests the full ink chat pipeline against a live Inkwell server:
  * 1. Bootstrap verification — identity loads, memories returned
  * 2. Hook lifecycle — hooks fire in correct order with correct context
  * 3. Passive recall in REPL context — recall fires, injects, respects budget
@@ -9,7 +9,7 @@
  * 5. Full session cycle — bootstrap → turn → recall → evict → verify
  *
  * Uses wren as the test agent (real identity + memories in the DB).
- * Requires PCP server on localhost:3001 (or INK_SERVER_URL).
+ * Requires Inkwell server on localhost:3001 (or INK_SERVER_URL).
  *
  * Run with:
  *   INK_SERVER_URL=http://localhost:3001 npx vitest run -c vitest.integration.config.ts \
@@ -26,16 +26,16 @@ import { isClientLocalTool, handleClientLocalTool } from './context-tools.js';
 
 // ─── Server check ───────────────────────────────────────────────
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 let serverAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
 }
 
-// ─── PCP Client helpers ─────────────────────────────────────────
+// ─── Inkwell Client helpers ─────────────────────────────────────────
 
 function getAccessToken(): string {
   const authPath = `${process.env.HOME}/.ink/auth.json`;
@@ -43,11 +43,11 @@ function getAccessToken(): string {
   return auth.accessToken || auth.access_token;
 }
 
-async function pcpToolCall(
+async function inkToolCall(
   tool: string,
   args: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  const resp = await fetch(`${PCP_URL}/mcp`, {
+  const resp = await fetch(`${INK_URL}/mcp`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -62,7 +62,7 @@ async function pcpToolCall(
     }),
   });
 
-  if (!resp.ok) throw new Error(`PCP ${tool} failed: ${resp.status}`);
+  if (!resp.ok) throw new Error(`Inkwell ${tool} failed: ${resp.status}`);
   const raw = await resp.text();
   const dataLine = raw.split('\n').find((l) => l.startsWith('data: '));
   if (!dataLine) throw new Error(`No SSE data in ${tool} response`);
@@ -73,7 +73,7 @@ async function pcpToolCall(
 }
 
 async function callRecallForHooks(query: string, limit: number) {
-  const result = await pcpToolCall('recall', {
+  const result = await inkToolCall('recall', {
     query,
     sbSlug: 'wren',
     includeShared: true,
@@ -93,7 +93,7 @@ async function callRecallForHooks(query: string, limit: number) {
 
 describe('E2E: Bootstrap verification', () => {
   it.skipIf(!serverAvailable)('loads identity and memories for wren', async () => {
-    const result = await pcpToolCall('bootstrap', { sbSlug: 'wren' });
+    const result = await inkToolCall('bootstrap', { sbSlug: 'wren' });
 
     // Bootstrap returns data directly (no success wrapper)
     // It should have user info and identity
@@ -110,7 +110,7 @@ describe('E2E: Bootstrap verification', () => {
   });
 
   it.skipIf(!serverAvailable)('returns constitution documents', async () => {
-    const result = await pcpToolCall('bootstrap', { sbSlug: 'wren' });
+    const result = await inkToolCall('bootstrap', { sbSlug: 'wren' });
 
     const constitution = result.constitution as Record<string, unknown> | undefined;
     if (constitution) {
@@ -305,7 +305,7 @@ describe('E2E: Context tools in simulated REPL', () => {
 describe('E2E: Full session cycle', () => {
   it.skipIf(!serverAvailable)('bootstrap → turn → recall → evict → verify', async () => {
     // Phase 1: Bootstrap
-    const bootstrapResult = await pcpToolCall('bootstrap', { sbSlug: 'wren' });
+    const bootstrapResult = await inkToolCall('bootstrap', { sbSlug: 'wren' });
     expect(
       bootstrapResult.user || bootstrapResult.identity || bootstrapResult.constitution
     ).toBeTruthy();

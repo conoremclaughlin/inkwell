@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { PcpClient } from '../lib/pcp-client.js';
+import { InkClient } from '../lib/ink-client.js';
 import { renderSessionsByAgent, type Session } from './session.js';
 import { renderInkMission, type InkMission } from '../repl/ink/index.js';
 import type { FeedEvent, FeedEventType, AgentSummary } from '../repl/ink/index.js';
@@ -162,8 +162,8 @@ export function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): F
   if (msg.messageType === 'session_resume') type = 'session';
 
   // Extract routing metadata from inbox `metadata.pcp.recipient`
-  const pcp = msg.metadata?.pcp as Record<string, unknown> | undefined;
-  const recipientMeta = pcp?.recipient as Record<string, unknown> | undefined;
+  const inkMeta = msg.metadata?.pcp as Record<string, unknown> | undefined;
+  const recipientMeta = inkMeta?.recipient as Record<string, unknown> | undefined;
   const studioHint =
     typeof recipientMeta?.studioHint === 'string' ? recipientMeta.studioHint : undefined;
   const studioId = typeof recipientMeta?.studioId === 'string' ? recipientMeta.studioId : undefined;
@@ -583,8 +583,8 @@ function inboxMessageToFeedRow(msg: InboxMessage): MissionFeedRow {
       : `inbox:${msg.messageType}`
     : 'inbox';
 
-  const pcp = msg.metadata?.pcp as Record<string, unknown> | undefined;
-  const recipientMeta = pcp?.recipient as Record<string, unknown> | undefined;
+  const inkMeta = msg.metadata?.pcp as Record<string, unknown> | undefined;
+  const recipientMeta = inkMeta?.recipient as Record<string, unknown> | undefined;
   const studioHint =
     typeof recipientMeta?.studioHint === 'string' ? recipientMeta.studioHint : undefined;
   const studioId = typeof recipientMeta?.studioId === 'string' ? recipientMeta.studioId : undefined;
@@ -719,14 +719,14 @@ function renderMissionFeed(rows: MissionFeedRow[]): string[] {
 }
 
 async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSnapshot> {
-  const pcp = new PcpClient();
-  const config = pcp.getConfig();
+  const inkClient = new InkClient();
+  const config = inkClient.getConfig();
 
   if (!config.email) {
     throw new Error(NOT_SIGNED_IN_MESSAGE);
   }
 
-  const listResult = (await pcp.callTool('list_sessions', {
+  const listResult = (await inkClient.callTool('list_sessions', {
     email: config.email,
     status: 'active',
     limit: Number.parseInt(options.limit || '40', 10),
@@ -753,7 +753,7 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   const todayByAgent: Record<string, number> = {};
   const studiosByAgent: Record<string, number> = {};
   try {
-    const summariesResult = (await pcp.callTool('get_agent_summaries', {
+    const summariesResult = (await inkClient.callTool('get_agent_summaries', {
       email: config.email,
       ...(options.agent ? { sbSlugs: [options.agent] } : {}),
     })) as Record<string, unknown>;
@@ -786,7 +786,7 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
     const agentsToQuery = options.agent ? [options.agent] : Array.from(allAgents);
     for (const sbSlug of agentsToQuery) {
       try {
-        const inboxResult = (await pcp.callTool('get_inbox', {
+        const inboxResult = (await inkClient.callTool('get_inbox', {
           email: config.email,
           sbSlug,
           status: 'unread',
@@ -807,7 +807,7 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   // Fetch inbox messages for the feed (all agents, all statuses)
   if (fetchAllInbox) {
     try {
-      const inboxResult = (await pcp.callTool('get_inbox', {
+      const inboxResult = (await inkClient.callTool('get_inbox', {
         email: config.email,
         ...(options.agent ? { sbSlug: options.agent } : {}),
         status: 'all',
@@ -824,7 +824,7 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   let feed: MissionFeedRow[] = [];
   if (fetchAllInbox) {
     // Activity-sourced rows (non-inbox types)
-    const activityResult = (await pcp
+    const activityResult = (await inkClient
       .callTool('get_activity', {
         email: config.email,
         limit: Number.parseInt(options.feedLimit || '40', 10),
@@ -1029,7 +1029,7 @@ export function activityToFeedEvent(
         content = parts.length > 0 ? `${verb} (${parts.join(', ')})` : `${verb} backend`;
       }
     } else {
-      // Individual PCP tool call — content is already "toolName(params)"
+      // Individual Inkwell tool call — content is already "toolName(params)"
       content = compactPreview(activity.content, maxPreview);
     }
   } else if (activity.type === 'agent_spawn') {
@@ -1130,8 +1130,8 @@ export function activityToFeedEvent(
 }
 
 async function runInkMission(options: MissionOptions): Promise<void> {
-  const pcp = new PcpClient();
-  const config = pcp.getConfig();
+  const inkClient = new InkClient();
+  const config = inkClient.getConfig();
   if (!config.email) {
     throw new Error(NOT_SIGNED_IN_MESSAGE);
   }
@@ -1187,7 +1187,7 @@ async function runInkMission(options: MissionOptions): Promise<void> {
       // Fetch activities for non-inbox types
       const feedLimit = Number.parseInt(options.feedLimit || '40', 10);
       const activities = extractActivities(
-        (await pcp
+        (await inkClient
           .callTool('get_activity', {
             email: config.email,
             limit: feedLimit,
@@ -1205,7 +1205,7 @@ async function runInkMission(options: MissionOptions): Promise<void> {
       );
 
       // Build sessions map for activity enrichment
-      const recentSessionsResult = (await pcp
+      const recentSessionsResult = (await inkClient
         .callTool('list_sessions', {
           email: config.email,
           limit: 50,

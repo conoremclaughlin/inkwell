@@ -988,13 +988,13 @@ export class TelegramListener extends EventEmitter {
       const path = await import('path');
       const os = await import('os');
 
-      const pcpFilesDir = path.join(os.homedir(), '.ink', 'files', 'telegram');
-      await fs.mkdir(pcpFilesDir, { recursive: true });
+      const inkFilesDir = path.join(os.homedir(), '.ink', 'files', 'telegram');
+      await fs.mkdir(inkFilesDir, { recursive: true });
 
       // Extract extension from URL or default to .jpg
       const ext = url.match(/\.(\w+)$/)?.[1] || 'jpg';
       const filename = `${fileId.substring(0, 20)}_${Date.now()}.${ext}`;
-      const filePath = path.join(pcpFilesDir, filename);
+      const filePath = path.join(inkFilesDir, filename);
 
       await fs.writeFile(filePath, Buffer.from(buffer));
 

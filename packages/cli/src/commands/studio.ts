@@ -1,7 +1,7 @@
 /**
  * Studio Commands
  *
- * Manage git worktrees for parallel development with PCP identity.
+ * Manage git worktrees for parallel development with Inkwell identity.
  *
  * Commands:
  *   studio init [name]     Initialize parent directory structure
@@ -40,7 +40,7 @@ import {
 } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
-import { installHooks, callPcpTool } from './hooks.js';
+import { installHooks, callInkTool } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { resolveSlug, normalizeIdentityJson } from '../backends/identity.js';
 import { registerStudioSandboxCommands } from './studio-sandbox.js';
@@ -154,10 +154,10 @@ function branchExists(branch: string, cwd?: string): boolean {
 }
 
 function getCurrentUser(): string | undefined {
-  const pcpConfigPath = join(homedir(), '.ink', 'config.json');
-  if (existsSync(pcpConfigPath)) {
+  const inkConfigPath = join(homedir(), '.ink', 'config.json');
+  if (existsSync(inkConfigPath)) {
     try {
-      const config = JSON.parse(readFileSync(pcpConfigPath, 'utf-8'));
+      const config = JSON.parse(readFileSync(inkConfigPath, 'utf-8'));
       return config.email || config.userId;
     } catch {
       // Fall through
@@ -653,7 +653,7 @@ async function initStudio(
   if (!parentName) {
     console.error(chalk.red('Error: Parent directory name is required.'));
     console.error(chalk.dim('Usage: ink studio init <parent-name>'));
-    console.error(chalk.dim('Example: ink studio init pcp'));
+    console.error(chalk.dim('Example: ink studio init inkwell'));
     process.exit(1);
   }
 
@@ -726,7 +726,7 @@ async function initStudio(
     console.log(chalk.dim(`  cd ${mainMove.to}`));
     console.log('');
     console.log(chalk.dim('Note: Claude Code sessions from the old path will not carry over.'));
-    console.log(chalk.dim('PCP memories persist automatically via bootstrap.'));
+    console.log(chalk.dim('Inkwell memories persist automatically via bootstrap.'));
   } catch (error) {
     spinner.fail(`Failed to initialize: ${error}`);
     console.error('');
@@ -948,9 +948,9 @@ async function createStudioInner(
     }
   }
 
-  // PCP identity
-  const pcpDir = join(wsPath, '.ink');
-  mkdirSync(pcpDir, { recursive: true });
+  // Inkwell identity
+  const inkDir = join(wsPath, '.ink');
+  mkdirSync(inkDir, { recursive: true });
 
   let sbId: string | undefined;
   const auth = loadAuth();
@@ -974,10 +974,10 @@ async function createStudioInner(
     createdBy: getCurrentUser(),
   };
 
-  writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+  writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
   if (roleContent) {
-    writeFileSync(join(pcpDir, 'ROLE.md'), roleContent);
+    writeFileSync(join(inkDir, 'ROLE.md'), roleContent);
   }
 
   // Install hooks for all backends (claude, codex, gemini) in every studio.
@@ -1058,7 +1058,7 @@ async function renameStudio(from: string, to: string): Promise<void> {
     if (studioId) {
       spinner.text = 'Syncing rename to cloud...';
       try {
-        await callPcpTool('update_studio', {
+        await callInkTool('update_studio', {
           studioId,
           sbSlug: resolveSlug() || 'unknown',
           worktreePath: toPath,
@@ -1103,7 +1103,7 @@ function listCommand(): void {
     return;
   }
 
-  console.log(chalk.bold('\nPCP Studios:\n'));
+  console.log(chalk.bold('\nInkwell Studios:\n'));
 
   for (const ws of studios) {
     console.log(chalk.cyan(`  ${ws.name}`));
@@ -1478,7 +1478,7 @@ async function registerStudioCommand(options: { agent?: string }): Promise<void>
   console.log(chalk.dim(`Registering ${repoName} for agent ${sbSlug}...`));
 
   try {
-    const result = await callPcpTool('register_studio', {
+    const result = await callInkTool('register_studio', {
       email,
       sbSlug,
       repoRoot,

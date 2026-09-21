@@ -2,7 +2,7 @@
  * Awaken Command
  *
  * Brings a new SB to life on a given backend. Fetches shared values
- * and sibling identities from PCP cloud (falling back to local files),
+ * and sibling identities from Inkwell cloud (falling back to local files),
  * builds an awakening prompt, and drops into an interactive session
  * with the chosen backend.
  *
@@ -25,7 +25,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import { getBackend, BACKEND_NAMES } from '../backends/index.js';
-import { callPcpTool } from '../lib/pcp-mcp.js';
+import { callInkTool } from '../lib/ink-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { ensureBackendAuthReady, isBackendAuthBackend } from '../lib/backend-auth.js';
@@ -80,7 +80,7 @@ interface BootstrapResponse {
  */
 async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: string } | null> {
   try {
-    const result = await callPcpTool<BootstrapResponse>(
+    const result = await callInkTool<BootstrapResponse>(
       'bootstrap',
       {
         email: config.email,
@@ -110,7 +110,7 @@ async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: strin
  */
 async function fetchSiblings(config: UserConfig): Promise<BootstrapIdentity[] | null> {
   try {
-    const result = await callPcpTool<{ identities?: BootstrapIdentity[] }>(
+    const result = await callInkTool<{ identities?: BootstrapIdentity[] }>(
       'list_identities',
       { email: config.email },
       { timeoutMs: 5000 }
@@ -486,7 +486,7 @@ async function awakenCommand(options: {
     )
   );
 
-  // 5. Resolve PCP auth token (same as ink chat) so MCP tools work
+  // 5. Resolve Inkwell auth token (same as ink chat) so MCP tools work
   const authEnv: Record<string, string> = {};
   try {
     const token = await getValidAccessToken(process.env.INK_SERVER_URL || 'http://localhost:3001');

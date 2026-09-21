@@ -59,9 +59,9 @@ describe('PR 639 recovery advice', () => {
     expect(writer).toContain('activeBackendSessionShape = undefined;');
     expect(writer).toContain('providerSample.clear();');
     const ledger = new ContextLedger();
-    ledger.addEntry('system', 'stub', 'pcp');
+    ledger.addEntry('system', 'stub', 'ink');
     let notified = false;
-    handleClientLocalTool('evict_context', { source: 'pcp' }, ledger, undefined, {
+    handleClientLocalTool('evict_context', { source: 'ink' }, ledger, undefined, {
       onEvict: ({ refs }) => {
         notified = refs.length === 1;
       },

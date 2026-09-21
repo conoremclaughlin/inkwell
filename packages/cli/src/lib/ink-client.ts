@@ -3,11 +3,11 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { getValidAccessToken } from '../auth/tokens.js';
 
-export interface PcpToolCallResult {
+export interface InkToolCallResult {
   [key: string]: unknown;
 }
 
-export interface PcpAuthConfig {
+export interface InkAuthConfig {
   userId?: string;
   email?: string;
   accessToken?: string;
@@ -67,14 +67,14 @@ export async function fetchWithTimeout(
     const name = (err as { name?: string })?.name;
     if (name === 'TimeoutError' || name === 'AbortError') {
       throw new Error(
-        `PCP request to ${url} timed out after ${Math.round(timeoutMs / 1000)}s (network stalled?)`
+        `Inkwell request to ${url} timed out after ${Math.round(timeoutMs / 1000)}s (network stalled?)`
       );
     }
     throw err;
   }
 }
 
-export interface PcpClientOptions {
+export interface InkClientOptions {
   /**
    * Lazily builds the x-ink-context token attached to every tool call.
    * Lazy because session identity (sessionId) is established after client
@@ -89,13 +89,13 @@ export interface PcpClientOptions {
   getContextToken?: () => string | null;
 }
 
-export class PcpClient {
+export class InkClient {
   private configPath: string;
   private baseUrl: string;
-  private config: PcpAuthConfig;
-  private options: PcpClientOptions;
+  private config: InkAuthConfig;
+  private options: InkClientOptions;
 
-  constructor(baseUrl?: string, configPath?: string, options: PcpClientOptions = {}) {
+  constructor(baseUrl?: string, configPath?: string, options: InkClientOptions = {}) {
     this.baseUrl = (baseUrl || process.env.INK_SERVER_URL || 'http://localhost:3001').replace(
       /\/+$/,
       ''
@@ -111,7 +111,7 @@ export class PcpClient {
     return token ? { 'x-ink-context': token } : {};
   }
 
-  public getConfig(): PcpAuthConfig {
+  public getConfig(): InkAuthConfig {
     return { ...this.config };
   }
 
@@ -119,12 +119,12 @@ export class PcpClient {
     return this.baseUrl;
   }
 
-  public reloadConfig(): PcpAuthConfig {
+  public reloadConfig(): InkAuthConfig {
     this.config = this.loadConfig();
     return { ...this.config };
   }
 
-  public async callTool(tool: string, args: Record<string, unknown>): Promise<PcpToolCallResult> {
+  public async callTool(tool: string, args: Record<string, unknown>): Promise<InkToolCallResult> {
     // Prefer authenticated /mcp JSON-RPC whenever possible.
     const result = await this.callToolJsonRpc(tool, args);
     if (result) {
@@ -138,7 +138,7 @@ export class PcpClient {
     const hasToken = Boolean(await this.ensureAccessToken());
     if (!hasToken) {
       throw new Error(
-        `Not authenticated with PCP server at ${this.baseUrl} (no ~/.ink/auth.json token).\n` +
+        `Not authenticated with Inkwell server at ${this.baseUrl} (no ~/.ink/auth.json token).\n` +
           `Run: INK_SERVER_URL=${this.baseUrl} ink auth login`
       );
     }
@@ -153,7 +153,7 @@ export class PcpClient {
         message.includes('legacy tool call failed (404)')
       ) {
         throw new Error(
-          `PCP server at ${this.baseUrl} does not expose legacy /api/mcp/call.\n` +
+          `Inkwell server at ${this.baseUrl} does not expose legacy /api/mcp/call.\n` +
             `Run 'ink auth login' and ensure INK_SERVER_URL points to the same server.\n` +
             `Original error: ${message}`
         );
@@ -162,19 +162,19 @@ export class PcpClient {
     }
   }
 
-  private loadConfig(): PcpAuthConfig {
+  private loadConfig(): InkAuthConfig {
     if (!existsSync(this.configPath)) {
       return {};
     }
 
     try {
-      return JSON.parse(readFileSync(this.configPath, 'utf-8')) as PcpAuthConfig;
+      return JSON.parse(readFileSync(this.configPath, 'utf-8')) as InkAuthConfig;
     } catch {
       return {};
     }
   }
 
-  private saveConfig(next: PcpAuthConfig): void {
+  private saveConfig(next: InkAuthConfig): void {
     this.config = next;
     try {
       writeFileSync(this.configPath, JSON.stringify(this.config, null, 2) + '\n');
@@ -251,7 +251,7 @@ export class PcpClient {
     const expiresIn = typeof payload.expires_in === 'number' ? payload.expires_in : 3600;
     const tokenExpiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
 
-    const next: PcpAuthConfig = {
+    const next: InkAuthConfig = {
       ...this.config,
       accessToken: payload.access_token,
       tokenExpiresAt,
@@ -262,16 +262,16 @@ export class PcpClient {
     return { accessToken: payload.access_token, tokenExpiresAt };
   }
 
-  private parseJsonRpcToolPayload(payload: JsonRpcResponse): PcpToolCallResult {
+  private parseJsonRpcToolPayload(payload: JsonRpcResponse): InkToolCallResult {
     if (payload.error) {
-      throw new Error(`PCP tool error (${payload.error.code}): ${payload.error.message}`);
+      throw new Error(`Inkwell tool error (${payload.error.code}): ${payload.error.message}`);
     }
 
     const toolResult = payload.result;
     const firstText = toolResult?.content?.find((item) => typeof item.text === 'string')?.text;
     if (typeof firstText === 'string') {
       try {
-        return JSON.parse(firstText) as PcpToolCallResult;
+        return JSON.parse(firstText) as InkToolCallResult;
       } catch {
         // Unparseable text on an isError result is a protocol-level failure —
         // argument validation, an unknown tool, a thrown handler. The server
@@ -284,7 +284,7 @@ export class PcpClient {
         // through here — they parse as JSON above and keep their existing
         // contract, because callers inspect `success` and expect to.
         if (toolResult?.isError) {
-          throw new Error(`PCP tool call failed: ${firstText}`);
+          throw new Error(`Inkwell tool call failed: ${firstText}`);
         }
         return { text: firstText };
       }
@@ -294,10 +294,10 @@ export class PcpClient {
     // boundary even when an error contains only media (or no content at all),
     // rather than returning the raw isError object as a successful result.
     if (toolResult?.isError) {
-      throw new Error('PCP tool call failed without a text error message');
+      throw new Error('Inkwell tool call failed without a text error message');
     }
 
-    return (toolResult as PcpToolCallResult) || {};
+    return (toolResult as InkToolCallResult) || {};
   }
 
   private parseSseJsonRpcResponse(raw: string): JsonRpcResponse {
@@ -359,7 +359,7 @@ export class PcpClient {
   private async callToolJsonRpc(
     tool: string,
     args: Record<string, unknown>
-  ): Promise<PcpToolCallResult | null> {
+  ): Promise<InkToolCallResult | null> {
     // Pick up user/email and any legacy token updates.
     this.reloadConfig();
     const token = await this.ensureAccessToken();
@@ -392,7 +392,7 @@ export class PcpClient {
 
     // If the first credential was the injected env token and it was rejected,
     // retry with the local auth.json token before giving up (mirrors the
-    // fallback in hooks.ts callPcpTool). Stale env tokens outlive their expiry
+    // fallback in hooks.ts callInkTool). Stale env tokens outlive their expiry
     // in long-running agent sessions and would otherwise 401 forever.
     if (response.status === 401 && process.env.INK_ACCESS_TOKEN?.trim() === token) {
       const localToken = await getValidAccessToken(this.baseUrl, { allowEnvToken: false });
@@ -419,7 +419,7 @@ export class PcpClient {
 
       if (response.status === 401 || response.status === 403) {
         throw new Error(
-          `PCP MCP auth failed (${response.status}) at ${this.baseUrl}/mcp.\n` +
+          `Inkwell MCP auth failed (${response.status}) at ${this.baseUrl}/mcp.\n` +
             `Run: INK_SERVER_URL=${this.baseUrl} ink auth login\n` +
             (bodySnippet ? `Server response: ${bodySnippet}` : '')
         );
@@ -431,7 +431,7 @@ export class PcpClient {
       }
 
       throw new Error(
-        `PCP MCP call failed (${response.status}) at ${this.baseUrl}/mcp` +
+        `Inkwell MCP call failed (${response.status}) at ${this.baseUrl}/mcp` +
           (bodySnippet ? `: ${bodySnippet}` : '')
       );
     }
@@ -444,7 +444,7 @@ export class PcpClient {
   private async callToolLegacy(
     tool: string,
     args: Record<string, unknown>
-  ): Promise<PcpToolCallResult> {
+  ): Promise<InkToolCallResult> {
     const response = await fetchWithTimeout(
       `${this.baseUrl}/api/mcp/call`,
       {
@@ -461,9 +461,9 @@ export class PcpClient {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`PCP legacy tool call failed (${response.status}): ${text}`);
+      throw new Error(`Inkwell legacy tool call failed (${response.status}): ${text}`);
     }
 
-    return (await response.json()) as PcpToolCallResult;
+    return (await response.json()) as InkToolCallResult;
   }
 }

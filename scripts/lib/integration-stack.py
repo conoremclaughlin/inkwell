@@ -47,11 +47,20 @@ def containers(project):
 
 
 def settings(env):
-    project = env.get("INTEGRATION_SUPABASE_PROJECT_ID", "pcp-integration")
+    project = env.get("INTEGRATION_SUPABASE_PROJECT_ID", "ink-integration")
     # This namespace is exclusively disposable test data. No app project ID
     # can be selected accidentally through an inherited override.
-    if not re.fullmatch(r"pcp-integration(?:-[a-zA-Z0-9_-]+)?", project):
-        raise Refusal("INTEGRATION_SUPABASE_PROJECT_ID must be pcp-integration or pcp-integration-<suffix>.")
+    # `pcp-integration` is still accepted, and deliberately: a stack created
+    # before #659 is named that, and its containers carry
+    # com.supabase.cli.project=pcp-integration. Refusing the name would leave
+    # an already-running stack with no way to reach it — including --stop.
+    # Both prefixes name the same disposable namespace; neither can collide
+    # with an app project ID.
+    if not re.fullmatch(r"(?:ink|pcp)-integration(?:-[a-zA-Z0-9_-]+)?", project):
+        raise Refusal(
+            "INTEGRATION_SUPABASE_PROJECT_ID must be ink-integration or "
+            "ink-integration-<suffix> (legacy pcp-integration is also accepted)."
+        )
     ports = []
     for index, name in enumerate(PORT_NAMES):
         value = env.get("INTEGRATION_SUPABASE_" + name + "_PORT", str(55421 + index))
@@ -231,6 +240,19 @@ def manage(root, harness, args, env):
             suite_args.append(arg)
     if stop and (reset or suite_args):
         raise Refusal("--stop cannot be combined with --reset or test arguments.")
+    # Legacy support is STOP-ONLY, and the refusal has to happen here — before
+    # the lock, before docker, before anything reads or mutates state.
+    # settings() accepts the pre-rename name so an orphaned stack can be shut
+    # down, but the rest of the harness is not legacy-aware: validate_identity
+    # requires an ink-integration name, and the bookkeeping schema is _ink_it
+    # where an old stack has _pcp_it. Running a suite or a reset against one
+    # would fail somewhere deeper, after work had already begun.
+    if project.startswith("pcp-") and not stop:
+        raise Refusal(
+            "Project " + project + " is the pre-rename name and is supported for --stop "
+            "only. Stop it with: INTEGRATION_SUPABASE_PROJECT_ID=" + project +
+            " yarn test:integration:db:local --stop, then run again without the "
+            "override to create a current stack.")
     base = Path(env.get("INTEGRATION_SUPABASE_CACHE_DIR", str(Path.home() / ".cache/inkwell/integration-db")))
     # Locks are machine-wide even when a caller selects a different cache dir.
     lock_dir = Path.home() / ".cache/inkwell/integration-db-locks"
@@ -278,6 +300,18 @@ def manage(root, harness, args, env):
                           ". Wait and retry. A retained stack owned by this harness can be reused "
                           "with --reuse or stopped with --stop before --fresh. Never stop someone else's run.")
         if stop:
+            # A stack retained before #659 is named pcp-integration and lives
+            # under its own cache dir, so a default --stop looks at
+            # ink-integration, finds nothing, and reports success while the
+            # old containers keep running. Say so instead of exiting 0.
+            if not owned and not state and project.startswith("ink-"):
+                legacy_project = "pcp-" + project[len("ink-"):]
+                if containers(legacy_project):
+                    raise Refusal(
+                        "Nothing to stop under " + project + ", but a pre-rename stack "
+                        + legacy_project + " is still running. Stop it by name: "
+                        "INTEGRATION_SUPABASE_PROJECT_ID=" + legacy_project +
+                        " yarn test:integration:db:local --stop")
             if owned:
                 say("Stopping the retained test stack " + project)
                 subprocess.check_call(["supabase", "stop", "--workdir", str(cache), "--no-backup"],
@@ -298,7 +332,7 @@ def manage(root, harness, args, env):
                           "once, then reuse it. Do not repeatedly reset stacks across branches.")
         if not existing:
             port_preflight(ports)
-        workdir = Path(tempfile.mkdtemp(prefix="pcp-supabase-it-", dir=env.get("INTEGRATION_SUPABASE_WORKDIR_BASE"))) if fresh else cache
+        workdir = Path(tempfile.mkdtemp(prefix="ink-supabase-it-", dir=env.get("INTEGRATION_SUPABASE_WORKDIR_BASE"))) if fresh else cache
         workdir.mkdir(parents=True, exist_ok=True, mode=0o700)
         say("Test workdir=" + str(workdir))
         marker_path = workdir / "run.json"

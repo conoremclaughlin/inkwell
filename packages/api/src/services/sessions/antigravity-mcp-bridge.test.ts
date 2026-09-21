@@ -262,7 +262,7 @@ describe('protocol edge cases', () => {
 describe('server targeting', () => {
   it('derives /mcp from INK_SERVER_URL when no explicit endpoint is given', async () => {
     // Without this the bridge defaults to localhost:3001, so an isolated server
-    // on PCP_PORT_BASE=4001 would hand its bearer token and context to the MAIN
+    // on INK_PORT_BASE=4001 would hand its bearer token and context to the MAIN
     // server — the one thing this repo is emphatic about not disturbing.
     responder = () => ({ payload: JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) });
     const base = baseUrl.replace(/\/mcp$/, '');

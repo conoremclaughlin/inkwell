@@ -1,5 +1,5 @@
 /**
- * PCP Auth Tokens
+ * Inkwell Auth Tokens
  *
  * PKCE generation, token storage (~/.ink/auth.json), refresh,
  * and JWT payload decoding for CLI OAuth flow.

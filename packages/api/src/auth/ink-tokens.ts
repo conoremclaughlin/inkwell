@@ -1,5 +1,5 @@
 /**
- * Shared PCP Token Utilities
+ * Shared Inkwell Token Utilities
  *
  * Self-issued JWT operations used by both MCP auth and admin dashboard auth.
  * All verification is local (jwt.verify with JWT_SECRET) — no network calls.
@@ -17,9 +17,9 @@ import type { Database } from '../data/supabase/types';
 // Types
 // ============================================================================
 
-export interface PcpTokenPayload {
+export interface InkTokenPayload {
   type: 'mcp_access' | 'pcp_admin';
-  sub: string; // PCP user ID
+  sub: string; // Inkwell user ID
   email: string;
   scope: string;
   sbSlug?: string; // Bound agent identity label (absent for human users)
@@ -45,10 +45,10 @@ export interface PcpTokenPayload {
 // ============================================================================
 
 /**
- * Sign a PCP access token (self-issued JWT).
+ * Sign a Inkwell access token (self-issued JWT).
  * Both MCP and admin auth use this to issue access tokens.
  */
-export function signPcpAccessToken(payload: PcpTokenPayload, expiresInSeconds: number): string {
+export function signInkAccessToken(payload: InkTokenPayload, expiresInSeconds: number): string {
   return jwt.sign(payload, env.JWT_SECRET, {
     expiresIn: expiresInSeconds,
   });
@@ -78,7 +78,7 @@ export function signRunnerAccessToken(
   },
   expiresInSeconds = 60 * 60
 ): string {
-  return signPcpAccessToken(
+  return signInkAccessToken(
     {
       type: 'mcp_access',
       sub: claims.userId,
@@ -98,21 +98,21 @@ export function signRunnerAccessToken(
 // ============================================================================
 
 /**
- * Verify a PCP access token (local jwt.verify, ~0ms).
+ * Verify a Inkwell access token (local jwt.verify, ~0ms).
  * Returns the payload if valid, null otherwise.
  *
  * @param token      Raw JWT string (not "Bearer ...")
  * @param expectedType  If provided, only accept tokens whose `type` field matches
  */
-export function verifyPcpAccessToken(
+export function verifyInkAccessToken(
   token: string,
-  expectedType?: PcpTokenPayload['type']
-): PcpTokenPayload | null {
+  expectedType?: InkTokenPayload['type']
+): InkTokenPayload | null {
   try {
     const decoded = jwt.verify(token, env.JWT_SECRET);
     if (typeof decoded === 'string') return null;
 
-    const payload = decoded as PcpTokenPayload & { agentId?: string };
+    const payload = decoded as InkTokenPayload & { agentId?: string };
     if (!payload.type || !payload.sub) return null;
 
     if (expectedType && payload.type !== expectedType) return null;
@@ -149,7 +149,7 @@ export async function createRefreshToken(
   sbSlug?: string,
   sbId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
-  const refreshToken = `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
+  const refreshToken = `ink-rt-${crypto.randomBytes(32).toString('hex')}`;
   const expiresAt = new Date(Date.now() + lifetimeDays * 24 * 60 * 60 * 1000);
 
   const { error } = await supabase.from('mcp_tokens').insert({
@@ -181,7 +181,7 @@ export async function exchangeRefreshToken(
   supabase: SupabaseClient<Database>,
   refreshToken: string,
   clientId: string,
-  tokenType: PcpTokenPayload['type'],
+  tokenType: InkTokenPayload['type'],
   accessTokenLifetimeSeconds: number
 ): Promise<{
   accessToken: string;
@@ -222,7 +222,7 @@ export async function exchangeRefreshToken(
   const sbSlug = tokenAny.agent_id as string | null;
   const sbId = tokenAny.sb_id as string | null;
 
-  const accessToken = signPcpAccessToken(
+  const accessToken = signInkAccessToken(
     {
       type: tokenType,
       sub: tokenRecord.user_id,

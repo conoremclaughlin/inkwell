@@ -1,7 +1,7 @@
 /**
  * Studio Management Tests
  *
- * Tests for the PCP Studios CLI functionality.
+ * Tests for the Inkwell Studios CLI functionality.
  * These tests verify studio creation, listing, and cleanup.
  */
 
@@ -12,7 +12,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 // Test utilities
-const TEST_DIR = join(tmpdir(), 'pcp-studio-tests');
+const TEST_DIR = join(tmpdir(), 'ink-studio-tests');
 const TEST_REPO = join(TEST_DIR, 'test-repo');
 
 /**
@@ -202,7 +202,7 @@ describe('Git Worktree Operations', () => {
   });
 });
 
-describe('Studio PCP Identity Integration', () => {
+describe('Studio Inkwell Identity Integration', () => {
   beforeEach(() => {
     initTestRepo();
   });
@@ -221,8 +221,8 @@ describe('Studio PCP Identity Integration', () => {
     });
 
     // Create .ink directory and identity
-    const pcpDir = join(worktreePath, '.ink');
-    mkdirSync(pcpDir, { recursive: true });
+    const inkDir = join(worktreePath, '.ink');
+    mkdirSync(inkDir, { recursive: true });
 
     const identity = {
       sbSlug: 'wren',
@@ -233,7 +233,7 @@ describe('Studio PCP Identity Integration', () => {
       createdAt: new Date().toISOString(),
     };
 
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
     // Verify identity file exists and is valid
     const identityPath = join(worktreePath, '.ink', 'identity.json');

@@ -57,7 +57,7 @@ export interface SpawnAndReflectResult {
   exitCode: number | null;
 }
 
-const RESULT_MARKER = 'PCP_DEBUG_RESULT:';
+const RESULT_MARKER = 'INK_DEBUG_RESULT:';
 
 /**
  * Prompt crafted to be compact and unambiguous across backends. We ask the

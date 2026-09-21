@@ -16,11 +16,11 @@ import type { Request, Response } from 'express';
 vi.mock('../mcp/tools/inbox-handlers', () => ({ handleSendToInbox: vi.fn() }));
 vi.mock('../mcp/tools/thread-handlers', () => ({ getParticipants: vi.fn() }));
 
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 // The slug registry is a DB read of its own; identity parsing is not what
@@ -194,7 +194,7 @@ async function listSpines(
   respondWith(tables);
   const res = createRes();
   await list(
-    { headers: {}, cookies: {}, params: {}, query: {}, pcpUserId: 'user-1' } as unknown as Request,
+    { headers: {}, cookies: {}, params: {}, query: {}, inkUserId: 'user-1' } as unknown as Request,
     res
   );
   expect(res._status).toBe(200);
@@ -203,8 +203,8 @@ async function listSpines(
 
 const threadRow = (over: Record<string, unknown> = {}) => ({
   id: 'thread-1',
-  thread_key: 'pcp:pr:632',
-  key_project: 'pcp',
+  thread_key: 'inkwell:pr:632',
+  key_project: 'inkwell',
   key_type: 'pr',
   key_id: '632',
   title: 'Rotating refresh grants',
@@ -222,7 +222,7 @@ const sessionRow = (over: Record<string, unknown> = {}) => ({
   lifecycle: 'running',
   status: 'active',
   current_phase: 'implementing',
-  thread_key: 'pcp:pr:632',
+  thread_key: 'inkwell:pr:632',
   active_thread_key: null,
   updated_at: ago(2),
   studio_id: 'studio-1',
@@ -238,14 +238,14 @@ describe('GET /threads', () => {
 
   it('answers liveness per session instead of leaving the client to guess', async () => {
     const spines = await listSpines({
-      inbox_threads: [threadRow(), threadRow({ id: 'thread-2', thread_key: 'pcp:pr:1' })],
+      inbox_threads: [threadRow(), threadRow({ id: 'thread-2', thread_key: 'inkwell:pr:1' })],
       sessions: [
         sessionRow(),
-        sessionRow({ id: 'session-2', thread_key: 'pcp:pr:1', updated_at: ago(60 * 24 * 30) }),
+        sessionRow({ id: 'session-2', thread_key: 'inkwell:pr:1', updated_at: ago(60 * 24 * 30) }),
       ],
     });
     const liveByKey = Object.fromEntries(spines.map((s) => [s.key, s.sessions.map((x) => x.live)]));
-    expect(liveByKey).toEqual({ 'pcp:pr:632': [true], 'pcp:pr:1': [false] });
+    expect(liveByKey).toEqual({ 'inkwell:pr:632': [true], 'inkwell:pr:1': [false] });
   });
 
   /**
@@ -282,11 +282,11 @@ describe('GET /threads', () => {
    * alone turns this test red and leaves the rest of the file green.
    */
   it('hydrates a thread outside the newest window, with its summary intact', async () => {
-    const OLD_KEY = 'pcp:pr:1';
+    const OLD_KEY = 'inkwell:pr:1';
     const filler = Array.from({ length: 500 }, (_, i) =>
       threadRow({
         id: `filler-${i}`,
-        thread_key: `pcp:pr:9${String(i).padStart(3, '0')}`,
+        thread_key: `inkwell:pr:9${String(i).padStart(3, '0')}`,
         summary: null,
         // Newer than the target, so the target is the one pushed out.
         updated_at: new Date(Date.now() - i * MINUTE).toISOString(),

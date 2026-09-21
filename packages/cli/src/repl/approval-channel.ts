@@ -10,7 +10,7 @@
  *
  * The JSONL protocol is the universal wire format. Interactive mode is a consumer
  * that renders JSONL requests as TUI prompts. Remote mode is a consumer that
- * routes requests to the PCP inbox.
+ * routes requests to the Inkwell inbox.
  *
  * ## JSONL Protocol
  *

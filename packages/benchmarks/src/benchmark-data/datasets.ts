@@ -33,7 +33,7 @@ export const SMOKE_GOLDSET_V1: BenchmarkCase[] = [
     id: 'semantic-paraphrase-rls',
     query: 'server-side access bypasses row-level security with service role',
     targetContent:
-      'PCP backend queries run with Supabase service role. RLS is bypassed server-side; authorization is enforced in app middleware.',
+      'Inkwell backend queries run with Supabase service role. RLS is bypassed server-side; authorization is enforced in app middleware.',
     distractors: [
       'Frontend queries should not use supabase-js for data access.',
       'RLS policies exist but are not the primary security boundary in this architecture.',
@@ -254,7 +254,7 @@ export const BOOTSTRAP_RELEVANCE_V1: BootstrapRelevanceCase[] = [
     targetContent:
       'Hierarchical memory phase 1 introduced summary + topicKey and budgeted topic-grouped bootstrap knowledge summaries.',
     distractors: [
-      'Tool routing executes MCP calls through authenticated PCP client connections.',
+      'Tool routing executes MCP calls through authenticated Inkwell client connections.',
       'Playwright skill sync writes SKILL.md to backend-native directories.',
       'Session lifecycle includes running, idle, completed, and failed.',
     ],

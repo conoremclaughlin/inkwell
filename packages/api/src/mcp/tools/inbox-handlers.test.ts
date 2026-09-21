@@ -716,8 +716,8 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     const insertedMeta = mockSb.getInsertedMetadata();
     expect(insertedMeta).toBeDefined();
     expect(insertedMeta!.pcp).toBeDefined();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    expect(pcpMeta.sender).toEqual({
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    expect(inkMeta.sender).toEqual({
       sbSlug: 'wren',
       sessionId: 'wren-session-123',
       studioId: 'studio-wren',
@@ -748,8 +748,8 @@ describe('Reply Routing — thread message metadata enrichment', () => {
 
     const insertedMeta = mockSb.getInsertedMetadata();
     expect(insertedMeta).toBeDefined();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
     expect(sender.sbSlug).toBe('wren');
     expect(sender.sessionId).toBeNull();
     expect(sender.studioId).toBeNull();
@@ -969,8 +969,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
     // Verify metadata has the threadKey-resolved session
     const insertedMeta = mockSb.getInsertedMetadata();
     expect(insertedMeta).toBeDefined();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
     expect(sender.sessionId).toBe('thread-scoped-session-123');
   });
 
@@ -1004,8 +1004,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
 
     // Sender session should be null, not a random most-recent session
     const insertedMeta = mockSb.getInsertedMetadata();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
     expect(sender.sessionId).toBeNull();
   });
 
@@ -1082,8 +1082,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
 
     // Sender session comes from request context header
     const insertedMeta = mockSb.getInsertedMetadata();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
     expect(sender.sessionId).toBe('header-session-xyz');
     expect(sender.studioId).toBe('header-studio-abc');
   });

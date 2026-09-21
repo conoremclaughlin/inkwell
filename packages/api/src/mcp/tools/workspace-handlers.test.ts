@@ -49,7 +49,7 @@ describe('workspace schemas', () => {
   it('accepts create payload and defaults type', () => {
     const parsed = createWorkspaceSchema.safeParse({
       email: 'test@test.com',
-      name: 'PCP Team',
+      name: 'Inkwell Team',
     });
 
     expect(parsed.success).toBe(true);
@@ -95,8 +95,8 @@ describe('workspace handlers', () => {
     mockDataComposer.repositories.workspaces.create.mockResolvedValue({
       id: 'ws-1',
       userId: 'user-123',
-      name: 'PCP Team',
-      slug: 'pcp-team',
+      name: 'Inkwell Team',
+      slug: 'ink-team',
       type: 'team',
       description: null,
       metadata: {},
@@ -113,7 +113,7 @@ describe('workspace handlers', () => {
     });
 
     const result = await handleCreateWorkspace(
-      { email: 'test@test.com', name: 'PCP Team', type: 'team' },
+      { email: 'test@test.com', name: 'Inkwell Team', type: 'team' },
       mockDataComposer as never
     );
 
@@ -151,8 +151,8 @@ describe('workspace handlers', () => {
     mockDataComposer.repositories.workspaces.findById.mockResolvedValue({
       id: 'ws-1',
       userId: 'user-123',
-      name: 'PCP Team',
-      slug: 'pcp-team',
+      name: 'Inkwell Team',
+      slug: 'ink-team',
       type: 'team',
       description: null,
       metadata: {},
@@ -189,8 +189,8 @@ describe('workspace handlers', () => {
     mockDataComposer.repositories.workspaces.update.mockResolvedValue({
       id: 'ws-1',
       userId: 'user-123',
-      name: 'PCP Team Updated',
-      slug: 'pcp-team-updated',
+      name: 'Inkwell Team Updated',
+      slug: 'ink-team-updated',
       type: 'team',
       description: 'new desc',
       metadata: { hello: 'world' },
@@ -203,7 +203,7 @@ describe('workspace handlers', () => {
       {
         email: 'test@test.com',
         workspaceId: '11111111-1111-1111-1111-111111111111',
-        name: 'PCP Team Updated',
+        name: 'Inkwell Team Updated',
         description: 'new desc',
         metadata: { hello: 'world' },
       },
@@ -212,7 +212,7 @@ describe('workspace handlers', () => {
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
-    expect(parsed.workspace.name).toBe('PCP Team Updated');
+    expect(parsed.workspace.name).toBe('Inkwell Team Updated');
     expect(mockDataComposer.repositories.workspaces.update).toHaveBeenCalled();
   });
 
@@ -220,8 +220,8 @@ describe('workspace handlers', () => {
     mockDataComposer.repositories.workspaces.findById.mockResolvedValue({
       id: 'ws-1',
       userId: 'user-123',
-      name: 'PCP Team',
-      slug: 'pcp-team',
+      name: 'Inkwell Team',
+      slug: 'ink-team',
       type: 'team',
       description: null,
       metadata: {},
@@ -267,8 +267,8 @@ describe('workspace handlers', () => {
     mockDataComposer.repositories.workspaces.findById.mockResolvedValue({
       id: 'ws-1',
       userId: 'user-123',
-      name: 'PCP Team',
-      slug: 'pcp-team',
+      name: 'Inkwell Team',
+      slug: 'ink-team',
       type: 'team',
       description: null,
       metadata: {},

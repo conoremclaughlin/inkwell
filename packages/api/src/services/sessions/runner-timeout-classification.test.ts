@@ -81,7 +81,7 @@ function makeFakeChild(): FakeChild {
   return child;
 }
 
-/** No pcpSessionId / mcpConfigPath / pcpAccessToken: the pre-spawn hint,
+/** No inkSessionId / mcpConfigPath / inkAccessToken: the pre-spawn hint,
  *  header-injection and settings-file branches stay out of the way. */
 const baseConfig = (): ClaudeRunnerConfig =>
   ({ workingDirectory: '/tmp/fake-work', sbSlug: 'wren' }) as ClaudeRunnerConfig;

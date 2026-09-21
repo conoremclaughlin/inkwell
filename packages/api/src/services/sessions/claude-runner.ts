@@ -411,12 +411,12 @@ export class ClaudeRunner implements IRunner {
     const claudeBin = await resolveBinaryPath('claude');
 
     // Write runtime hint files before spawning so the on-session-start hook
-    // picks up the correct PCP session ID (not the last sb-launched session).
+    // picks up the correct Inkwell session ID (not the last sb-launched session).
     const runtimeLinkId = randomUUID();
-    if (config.pcpSessionId && config.workingDirectory) {
+    if (config.inkSessionId && config.workingDirectory) {
       writeRuntimeSessionHint(
         config.workingDirectory,
-        config.pcpSessionId,
+        config.inkSessionId,
         config.sbSlug || 'unknown',
         'claude',
         runtimeLinkId,
@@ -424,15 +424,15 @@ export class ClaudeRunner implements IRunner {
       );
     }
 
-    // Inject PCP session headers into MCP config so the spawned agent's
-    // MCP calls carry session identity back to the PCP server.
+    // Inject Inkwell session headers into MCP config so the spawned agent's
+    // MCP calls carry session identity back to the Inkwell server.
     const mcpInjection =
-      config.mcpConfigPath && config.pcpSessionId
+      config.mcpConfigPath && config.inkSessionId
         ? injectSessionHeaders({
             mcpConfigPath: config.mcpConfigPath,
-            pcpSessionId: config.pcpSessionId,
+            inkSessionId: config.inkSessionId,
             studioId: config.studioId,
-            accessToken: config.pcpAccessToken,
+            accessToken: config.inkAccessToken,
             outputDir: config.container?.runtimeDir,
           })
         : null;
@@ -482,7 +482,7 @@ export class ClaudeRunner implements IRunner {
     }
 
     return new Promise((resolve, reject) => {
-      // Strip CLAUDECODE to prevent "nested session" detection when PCP is
+      // Strip CLAUDECODE to prevent "nested session" detection when Inkwell is
       // launched from inside a Claude Code session (e.g., via PM2).
       const { CLAUDECODE, ...cleanEnv } = process.env;
       const spawnEnv: Record<string, string> = {
@@ -496,10 +496,10 @@ export class ClaudeRunner implements IRunner {
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         // Session env vars
         ...buildSessionEnv({
-          pcpSessionId: config.pcpSessionId,
-          runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
+          inkSessionId: config.inkSessionId,
+          runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
-          accessToken: config.pcpAccessToken,
+          accessToken: config.inkAccessToken,
           sbSlug: config.sbSlug,
           runtime: 'claude',
           repoRoot: config.repoRoot,
@@ -809,20 +809,20 @@ export function buildIdentityPrompt(
   soul?: string,
   timezone?: string,
   heartbeat?: string,
-  sessionIds?: { pcpSessionId?: string; studioId?: string; threadKey?: string }
+  sessionIds?: { inkSessionId?: string; studioId?: string; threadKey?: string }
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
 **You are ${agentName}. Your slug is \`${sbSlug}\`.**
 
-When calling PCP tools (bootstrap, remember, recall, start_session, etc.), use \`sbSlug: "${sbSlug}"\`.
+When calling Inkwell tools (bootstrap, remember, recall, start_session, etc.), use \`sbSlug: "${sbSlug}"\`.
 
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
 Do NOT run \`echo $SB_SLUG\` — you are running headlessly without shell access.`;
 
   // Session identity — always in context for debugging and routing verification
-  if (sessionIds?.pcpSessionId) {
-    const idParts = [`- PCP Session: \`${sessionIds.pcpSessionId}\``];
+  if (sessionIds?.inkSessionId) {
+    const idParts = [`- Inkwell Session: \`${sessionIds.inkSessionId}\``];
     if (sessionIds.studioId) idParts.push(`- Studio: \`${sessionIds.studioId}\``);
     if (sessionIds.threadKey) idParts.push(`- Thread: \`${sessionIds.threadKey}\``);
     prompt += `\n\n### Session Identity\n${idParts.join('\n')}`;

@@ -6,7 +6,7 @@ import { mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
-  pcpCalls: [] as Array<{ tool: string; args: Record<string, unknown> }>,
+  inkCalls: [] as Array<{ tool: string; args: Record<string, unknown> }>,
   identity: { studioId: 'studio-test' } as { studioId?: string },
   callToolImpl: vi.fn(),
   runBackendImpl: vi.fn(),
@@ -23,10 +23,10 @@ vi.mock('../backends/identity.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../lib/pcp-client.js', () => ({
-  PcpClient: class MockPcpClient {
+vi.mock('../lib/ink-client.js', () => ({
+  InkClient: class MockInkClient {
     public async callTool(tool: string, args: Record<string, unknown> = {}): Promise<unknown> {
-      testState.pcpCalls.push({ tool, args });
+      testState.inkCalls.push({ tool, args });
       return testState.callToolImpl(tool, args);
     }
   },
@@ -93,7 +93,7 @@ describe('runChat integration', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-02-27T00:00:00.000Z'));
     testState.inputs = [];
-    testState.pcpCalls = [];
+    testState.inkCalls = [];
     testState.identity = { studioId: 'studio-test' };
     testState.callToolImpl.mockReset();
     testState.runBackendImpl.mockReset();
@@ -131,10 +131,10 @@ describe('runChat integration', () => {
       content: 'skill content',
     }));
 
-    testCwd = mkdtempSync(join(tmpdir(), 'pcp-chat-int-'));
+    testCwd = mkdtempSync(join(tmpdir(), 'ink-chat-int-'));
     process.chdir(testCwd);
     process.env.INK_TOOL_POLICY_PATH = join(testCwd, '.ink', 'security', 'tool-policy.json');
-    process.env.INK_DELEGATION_SECRET = 'pcp-delegation-test-secret';
+    process.env.INK_DELEGATION_SECRET = 'ink-delegation-test-secret';
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
   });
 
@@ -163,7 +163,7 @@ describe('runChat integration', () => {
     const backendRequest = testState.runBackendImpl.mock.calls[0][0] as { prompt: string };
     expect(backendRequest.prompt).toContain('Latest user message:\nhello from test');
 
-    const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+    const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
     expect(startCall?.args).toMatchObject({
       sbSlug: 'lumen',
       threadKey: 'heartbeat:myra',
@@ -196,7 +196,7 @@ describe('runChat integration', () => {
     expect(backendRequest.backend).toBe('gemini');
     expect(backendRequest.prompt).toContain('Latest user message:\nheartbeat pulse');
     // Non-interactive sessions are left resumable (update_session_state, not end_session).
-    expect(testState.pcpCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
+    expect(testState.inkCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
 
   /**
@@ -587,9 +587,9 @@ describe('runChat integration', () => {
     });
 
     // Attached mode skips start_session.
-    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'start_session')).toBe(false);
     // Attached mode should not end the existing session.
-    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'end_session')).toBe(false);
 
     const transcriptDir = join(testCwd, '.ink', 'runtime', 'repl');
     const transcriptFiles = readdirSync(transcriptDir).filter((entry) =>
@@ -638,8 +638,8 @@ describe('runChat integration', () => {
     expect(logText).toContain('history: 2 prior message(s) loaded');
   });
 
-  it('hydrates ledger context from PCP session context when no local transcript exists', async () => {
-    const sessionId = 'sess-pcp-history-1';
+  it('hydrates ledger context from Inkwell session context when no local transcript exists', async () => {
+    const sessionId = 'sess-ink-history-1';
     testState.callToolImpl.mockImplementation(async (tool: string) => {
       switch (tool) {
         case 'bootstrap':
@@ -726,8 +726,8 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
-    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'end_session')).toBe(false);
 
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).toContain('sess-b222');
@@ -928,7 +928,7 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'start_session')).toBe(false);
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).toContain('auto-attached to latest session');
     expect(sessionStatusLine).toContain('sess-latest');
@@ -1069,8 +1069,8 @@ describe('runChat integration', () => {
     }
   });
 
-  it('supports gated /pcp tool execution with inline approval', async () => {
-    testState.inputs = ['/pcp send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
+  it('supports gated /ink tool execution with inline approval', async () => {
+    testState.inputs = ['/ink send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
       agent: 'lumen',
@@ -1078,7 +1078,7 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
+    const sendCall = testState.inkCalls.find((call) => call.tool === 'send_to_inbox');
     expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(0);
 
@@ -1625,7 +1625,7 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
+    const sendCall = testState.inkCalls.find((call) => call.tool === 'send_to_inbox');
     expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Granted once.');
@@ -1674,7 +1674,7 @@ describe('runChat integration', () => {
     expect(backendRequest.passthroughArgs).toEqual(['--allowedTools', '']);
     expect(backendRequest.prompt).toContain('Tool routing: local.');
 
-    const localToolCall = testState.pcpCalls.find(
+    const localToolCall = testState.inkCalls.find(
       (call) => call.tool === 'get_inbox' && call.args.limit === 1
     );
     expect(localToolCall).toBeTruthy();
@@ -1720,7 +1720,7 @@ describe('runChat integration', () => {
       passthroughArgs: string[];
     };
     expect(backendRequest.passthroughArgs).toEqual(['--allowed-tools', '']);
-    const localToolCall = testState.pcpCalls.find(
+    const localToolCall = testState.inkCalls.find(
       (call) => call.tool === 'get_inbox' && call.args.limit === 2
     );
     expect(localToolCall).toBeTruthy();
@@ -1766,7 +1766,7 @@ describe('runChat integration', () => {
       passthroughArgs: string[];
     };
     expect(backendRequest.passthroughArgs).toEqual([]);
-    const localToolCall = testState.pcpCalls.find(
+    const localToolCall = testState.inkCalls.find(
       (call) => call.tool === 'get_inbox' && call.args.limit === 3
     );
     expect(localToolCall).toBeTruthy();
@@ -1889,7 +1889,7 @@ describe('runChat integration', () => {
     expect(secondCall.prompt).toContain('get_inbox');
 
     // The tool should have been executed locally
-    const inboxCall = testState.pcpCalls.find((call) => call.tool === 'get_inbox');
+    const inboxCall = testState.inkCalls.find((call) => call.tool === 'get_inbox');
     expect(inboxCall).toBeTruthy();
 
     // Final output should be the summary (no tool blocks)
@@ -1967,7 +1967,7 @@ describe('runChat integration', () => {
 
     // In non-interactive mode there is no readline prompt, so this tool call must be denied
     // instead of crashing from an uninitialized readline reference.
-    expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Local tool denied (send_to_inbox)');
   });
@@ -2031,7 +2031,7 @@ describe('runChat integration', () => {
     });
 
     // get_inbox should have been executed after auto-approval
-    const inboxCall = testState.pcpCalls.find((call) => call.tool === 'get_inbox');
+    const inboxCall = testState.inkCalls.find((call) => call.tool === 'get_inbox');
     expect(inboxCall).toBeTruthy();
   });
 
@@ -2057,7 +2057,7 @@ describe('runChat integration', () => {
     });
 
     // send_to_inbox should have been denied (non-interactive auto-denies promptable tools)
-    expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('send_to_inbox');
   });
@@ -2157,7 +2157,7 @@ describe('runChat integration', () => {
     expect(request.id).toBeTruthy();
 
     // send_to_inbox should have been executed after approval response was piped to stdin
-    expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
+    expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
   }, 10_000);
 
   it('leaves the hard timeout unset and applies the idle timeout for non-interactive turns', async () => {
@@ -2352,7 +2352,7 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
+    const sendCall = testState.inkCalls.find((call) => call.tool === 'send_to_inbox');
     expect(sendCall).toBeTruthy();
     const metadata = sendCall?.args?.metadata as Record<string, unknown> | undefined;
     const token = metadata?.delegationToken;
@@ -2432,7 +2432,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall).toBeDefined();
       expect(startCall!.args.contactId).toBe('contact-alice-uuid');
     });
@@ -2460,11 +2460,11 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const aliceStart = testState.pcpCalls.find((c) => c.tool === 'start_session');
+      const aliceStart = testState.inkCalls.find((c) => c.tool === 'start_session');
       expect(aliceStart!.args.contactId).toBe('contact-alice');
 
       // Reset for Sender B
-      testState.pcpCalls = [];
+      testState.inkCalls = [];
       testState.callToolImpl.mockImplementation(async (tool: string) => {
         switch (tool) {
           case 'bootstrap':
@@ -2486,7 +2486,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const bobStart = testState.pcpCalls.find((c) => c.tool === 'start_session');
+      const bobStart = testState.inkCalls.find((c) => c.tool === 'start_session');
       expect(bobStart!.args.contactId).toBe('contact-bob');
 
       // Different contacts → different session IDs requested
@@ -2502,7 +2502,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall).toBeDefined();
       expect(startCall!.args.contactId).toBeUndefined();
     });
@@ -2537,7 +2537,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall).toBeDefined();
       expect(startCall!.args.contactId).toBe('resolved-contact-123');
 
@@ -2575,7 +2575,7 @@ describe('runChat integration', () => {
       expect(backendRequest.prompt).toContain('what is my balance?');
 
       // Session should have been started with contactId
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall!.args.contactId).toBe('contact-alice');
     });
   });

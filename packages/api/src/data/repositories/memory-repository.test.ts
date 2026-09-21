@@ -1486,10 +1486,10 @@ describe('MemoryRepository', () => {
         user_id: 'user-456',
         content: 'Some content',
         summary: null,
-        topic_key: 'project:pcp',
+        topic_key: 'project:inkwell',
         source: 'observation',
         salience: 'medium',
-        topics: ['project:pcp', 'dev'],
+        topics: ['project:inkwell', 'dev'],
         agent_id: null,
         embedding: null,
         metadata: {},
@@ -1503,14 +1503,14 @@ describe('MemoryRepository', () => {
       await repo.remember({
         userId: 'user-456',
         content: 'Some content',
-        topicKey: 'project:pcp',
+        topicKey: 'project:inkwell',
         topics: ['dev'],
       });
 
       // topicKey should be prepended to topics
       expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
         expect.objectContaining({
-          topics: ['project:pcp', 'dev'],
+          topics: ['project:inkwell', 'dev'],
         })
       );
     });
@@ -1521,10 +1521,10 @@ describe('MemoryRepository', () => {
         user_id: 'user-456',
         content: 'Some content',
         summary: null,
-        topic_key: 'project:pcp',
+        topic_key: 'project:inkwell',
         source: 'observation',
         salience: 'medium',
-        topics: ['project:pcp', 'dev'],
+        topics: ['project:inkwell', 'dev'],
         agent_id: null,
         embedding: null,
         metadata: {},
@@ -1538,14 +1538,14 @@ describe('MemoryRepository', () => {
       await repo.remember({
         userId: 'user-456',
         content: 'Some content',
-        topicKey: 'project:pcp',
-        topics: ['project:pcp', 'dev'],
+        topicKey: 'project:inkwell',
+        topics: ['project:inkwell', 'dev'],
       });
 
-      // Should NOT have duplicated project:pcp
+      // Should NOT have duplicated project:inkwell
       expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
         expect.objectContaining({
-          topics: ['project:pcp', 'dev'],
+          topics: ['project:inkwell', 'dev'],
         })
       );
     });
@@ -1593,10 +1593,10 @@ describe('MemoryRepository', () => {
         user_id: 'user-456',
         content: 'A'.repeat(1800),
         summary: 'Chunked summary',
-        topic_key: 'project:pcp/memory',
+        topic_key: 'project:inkwell/memory',
         source: 'observation',
         salience: 'high',
-        topics: ['project:pcp/memory'],
+        topics: ['project:inkwell/memory'],
         agent_id: 'lumen',
         embedding: null,
         metadata: {},
@@ -1634,7 +1634,7 @@ describe('MemoryRepository', () => {
         sbSlug: 'lumen',
         content: 'A'.repeat(1800),
         summary: 'Chunked summary',
-        topicKey: 'project:pcp/memory',
+        topicKey: 'project:inkwell/memory',
         salience: 'high',
       });
 
@@ -1932,10 +1932,10 @@ describe('MemoryRepository', () => {
             user_id: 'user-456',
             content: 'Legacy semantic memory',
             summary: 'Legacy semantic memory',
-            topic_key: 'project:pcp/memory',
+            topic_key: 'project:inkwell/memory',
             source: 'observation',
             salience: 'high',
-            topics: ['project:pcp/memory'],
+            topics: ['project:inkwell/memory'],
             agent_id: 'lumen',
             embedding: '[0.1,0.2,0.3]',
             metadata: {},
@@ -2069,10 +2069,10 @@ describe('MemoryRepository', () => {
               user_id: 'user-456',
               content: 'Legacy semantic memory',
               summary: 'Legacy semantic memory',
-              topic_key: 'project:pcp/memory',
+              topic_key: 'project:inkwell/memory',
               source: 'observation',
               salience: 'high',
-              topics: ['project:pcp/memory'],
+              topics: ['project:inkwell/memory'],
               agent_id: 'lumen',
               embedding: '[0.1,0.2,0.3]',
               metadata: {},

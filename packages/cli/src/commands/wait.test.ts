@@ -48,7 +48,7 @@ describe('sb wait', () => {
     expect(output).toContain('--group');
   });
 
-  // Integration tests — require running PCP server
+  // Integration tests — require running Inkwell server
   it.skipIf(!process.env.INK_INTEGRATION)(
     'times out with exit code 1 when no new messages',
     async () => {

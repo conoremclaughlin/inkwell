@@ -11,7 +11,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import type { DataComposer } from '../data/composer';
-import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
+import { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
 import { StudioLeaseService } from '../services/studio-lease.service';
 import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { logger } from '../utils/logger';
@@ -23,7 +23,7 @@ type Lifecycle = (typeof VALID_LIFECYCLES)[number];
 
 export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
   const router = Router();
-  const authProvider = new PcpAuthProvider();
+  const authProvider = new InkAuthProvider();
   const leaseService = new StudioLeaseService(dataComposer.getClient());
 
   /**

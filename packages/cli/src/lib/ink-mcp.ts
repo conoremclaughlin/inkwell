@@ -21,11 +21,11 @@ function pickDebugArgValues(args: Record<string, unknown>): Record<string, unkno
   return picked;
 }
 
-export function getPcpServerUrl(): string {
+export function getInkServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
 }
 
-function formatPcpFetchFailure(url: string, error: unknown): string {
+function formatInkFetchFailure(url: string, error: unknown): string {
   const base =
     error instanceof Error ? error.message.trim() || error.name : String(error || 'fetch failed');
   const err = error as { cause?: unknown } | undefined;
@@ -45,10 +45,10 @@ function formatPcpFetchFailure(url: string, error: unknown): string {
   }
 
   const causeSuffix = causeParts.length > 0 ? ` (${causeParts.join(', ')})` : '';
-  return `PCP fetch failed for ${url}: ${base}${causeSuffix}`;
+  return `Inkwell fetch failed for ${url}: ${base}${causeSuffix}`;
 }
 
-export async function callPcpTool<T = Record<string, unknown>>(
+export async function callInkTool<T = Record<string, unknown>>(
   tool: string,
   args: Record<string, unknown>,
   options?: {
@@ -58,7 +58,7 @@ export async function callPcpTool<T = Record<string, unknown>>(
     studioId?: string;
   }
 ): Promise<T> {
-  const serverUrl = getPcpServerUrl();
+  const serverUrl = getInkServerUrl();
   const url = `${serverUrl}/mcp`;
 
   const headers: Record<string, string> = {
@@ -80,7 +80,7 @@ export async function callPcpTool<T = Record<string, unknown>>(
     headers['x-ink-studio-id'] = options.studioId;
   }
 
-  sbDebugLog('pcp-mcp', 'call_start', {
+  sbDebugLog('ink-mcp', 'call_start', {
     tool,
     serverUrl,
     timeoutMs: options?.timeoutMs || null,
@@ -102,8 +102,8 @@ export async function callPcpTool<T = Record<string, unknown>>(
       ...(options?.timeoutMs ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}),
     });
   } catch (error) {
-    const diagnostic = formatPcpFetchFailure(url, error);
-    sbDebugLog('pcp-mcp', 'call_fetch_error', {
+    const diagnostic = formatInkFetchFailure(url, error);
+    sbDebugLog('ink-mcp', 'call_fetch_error', {
       tool,
       serverUrl,
       url,
@@ -114,19 +114,21 @@ export async function callPcpTool<T = Record<string, unknown>>(
           ? String((error as { cause?: unknown }).cause)
           : null,
     });
-    throw new Error(`${diagnostic}. Ensure PCP server is running and INK_SERVER_URL is correct.`);
+    throw new Error(
+      `${diagnostic}. Ensure Inkwell server is running and INK_SERVER_URL is correct.`
+    );
   }
 
   if (!response.ok) {
     const body = await response.text();
-    sbDebugLog('pcp-mcp', 'call_http_error', {
+    sbDebugLog('ink-mcp', 'call_http_error', {
       tool,
       serverUrl,
       status: response.status,
       statusText: response.statusText,
       responseBody: body.slice(0, 1500),
     });
-    throw new Error(`PCP call failed (${response.status}): ${body}`);
+    throw new Error(`Inkwell call failed (${response.status}): ${body}`);
   }
 
   const contentType = response.headers.get('content-type') || '';
@@ -140,24 +142,24 @@ export async function callPcpTool<T = Record<string, unknown>>(
       .map((line) => line.slice(6));
     const lastData = dataLines[dataLines.length - 1];
     if (!lastData) {
-      sbDebugLog('pcp-mcp', 'call_sse_no_data', { tool, serverUrl });
-      throw new Error('PCP SSE response contained no data lines');
+      sbDebugLog('ink-mcp', 'call_sse_no_data', { tool, serverUrl });
+      throw new Error('Inkwell SSE response contained no data lines');
     }
     payload = JSON.parse(lastData) as Record<string, unknown>;
-    sbDebugLog('pcp-mcp', 'call_success', { tool, mode: 'sse' });
+    sbDebugLog('ink-mcp', 'call_success', { tool, mode: 'sse' });
   } else {
     payload = (await response.json()) as Record<string, unknown>;
-    sbDebugLog('pcp-mcp', 'call_success', { tool, mode: 'json-content' });
+    sbDebugLog('ink-mcp', 'call_success', { tool, mode: 'json-content' });
   }
 
   if (payload.error) {
     const err = payload.error as { message?: string; code?: number };
-    sbDebugLog('pcp-mcp', 'call_tool_error', {
+    sbDebugLog('ink-mcp', 'call_tool_error', {
       tool,
       code: err.code ?? null,
       message: err.message ?? null,
     });
-    throw new Error(`PCP tool error (${err.code}): ${err.message}`);
+    throw new Error(`Inkwell tool error (${err.code}): ${err.message}`);
   }
 
   const result = payload.result as
@@ -184,11 +186,11 @@ export async function callPcpTool<T = Record<string, unknown>>(
       }
     }
 
-    sbDebugLog('pcp-mcp', 'call_result_error', {
+    sbDebugLog('ink-mcp', 'call_result_error', {
       tool,
       message,
     });
-    throw new Error(`PCP tool error: ${message}`);
+    throw new Error(`Inkwell tool error: ${message}`);
   }
 
   const mcpText = result?.content?.[0]?.text;

@@ -1004,7 +1004,7 @@ describe('SessionService', () => {
 
   describe('MCP endpoint propagation', () => {
     it('hands the runner the endpoint the server bound, not a config file', async () => {
-      // The standard isolation recipe (`PCP_PORT_BASE=4001 yarn dev`) does not
+      // The standard isolation recipe (`INK_PORT_BASE=4001 yarn dev`) does not
       // rewrite the committed .mcp.json, so a runner that trusts that file
       // sends an isolated server's bearer token to the MAIN server on 3001.
       // server.ts derives this from env.MCP_HTTP_PORT — the port the listener

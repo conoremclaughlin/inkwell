@@ -230,7 +230,7 @@ export const MAX_TOOL_CALLS_PER_ITERATION = 5;
  *
  * The split is deliberate: the LOOP sequences, the HOST authorizes. Nothing here
  * exposes `ToolPolicyState`, because a shadow clone must run under a narrowed,
- * immutable policy snapshot rather than the parent's live one — `canCallPcpTool`
+ * immutable policy snapshot rather than the parent's live one — `canCallInkTool`
  * consumes one-use grants as a side effect (tool-policy.ts), so concurrent
  * clones sharing a policy object would consume the parent's grants
  * nondeterministically. A clone supplies its own `tools.execute` closure over

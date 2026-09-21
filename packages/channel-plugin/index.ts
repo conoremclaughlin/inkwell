@@ -8,7 +8,7 @@
  * Features:
  * - Polls InkMail inbox for new unread messages
  * - Polls specific threads for new replies
- * - Pushes events as <channel source="pcp" ...> tags
+ * - Pushes events as <channel source="inkmail" ...> tags
  * - Exposes reply tool for two-way communication
  *
  * Usage:
@@ -103,7 +103,7 @@ function resolveAccessToken(): string | undefined {
   return undefined;
 }
 
-// ─── PCP Client ─────────────────────────────────────────────
+// ─── Inkwell Client ─────────────────────────────────────────────
 
 const sbSlug = resolveSlug();
 const email = resolveEmail();
@@ -121,8 +121,8 @@ function isLegacyMessageForThisStudio(msg: Record<string, unknown>): boolean {
   if (!studioId) return true;
 
   const metadata = msg.metadata as Record<string, unknown> | undefined;
-  const pcp = metadata?.pcp as Record<string, unknown> | undefined;
-  const recipient = pcp?.recipient as Record<string, unknown> | undefined;
+  const inkMeta = metadata?.pcp as Record<string, unknown> | undefined;
+  const recipient = inkMeta?.recipient as Record<string, unknown> | undefined;
   const recipientStudioId = recipient?.studioId as string | undefined;
 
   if (!recipientStudioId) return true; // no studio scoping — broadcast
@@ -139,7 +139,7 @@ log('info', 'Channel plugin starting', {
   pollIntervalMs: POLL_INTERVAL_MS,
 });
 
-async function callPcp(
+async function callInk(
   tool: string,
   args: Record<string, unknown>
 ): Promise<Record<string, unknown> | null> {
@@ -207,7 +207,7 @@ const mcp = new Server(
     capabilities: {
       experimental: {
         'claude/channel': {},
-        // TODO: permission relay needs to integrate with PCP's existing
+        // TODO: permission relay needs to integrate with Inkwell's existing
         // permission_grant contract (messageType: 'permission_grant' +
         // metadata.permissionGrant). See permission-grant.ts for the
         // current approval flow. Uncomment when integrated:
@@ -221,15 +221,15 @@ These are real-time notifications from the Ink inbox — thread replies, task re
 When you receive a channel message:
 - Read and understand the content
 - If it requires action, act on it
-- To reply, use the existing send_to_inbox tool (from the pcp MCP server) with the thread_key from the channel tag metadata
+- To reply, use the existing send_to_inbox tool (from the inkwell MCP server) with the thread_key from the channel tag metadata
 
 Do NOT ignore channel messages — they are from your teammates and deserve timely responses.`,
   }
 );
 
-// No tools exposed — Claude already has send_to_inbox via the pcp HTTP MCP
+// No tools exposed — Claude already has send_to_inbox via the inkwell HTTP MCP
 // server. This channel plugin is purely for push notifications (one-way in,
-// replies go through the existing pcp MCP tools).
+// replies go through the existing inkwell MCP tools).
 
 // ─── Polling Loop ───────────────────────────────────────────
 
@@ -312,7 +312,7 @@ async function pollInbox(): Promise<void> {
       // markRead:false serves the OLDEST unseen batch; only the exact-id ack
       // below advances delivery state, so truncation/ack failure simply
       // re-serves the same batch next poll.
-      const result = await callPcp('get_inbox', {
+      const result = await callInk('get_inbox', {
         email,
         sbSlug,
         status: 'unread',
@@ -336,7 +336,7 @@ async function pollInbox(): Promise<void> {
       // one drain-time summary per process.
       const drained = await drainThreads(
         {
-          callPcp,
+          callInk,
           notify: async (content, meta) => {
             await mcp.notification({
               method: 'notifications/claude/channel',
@@ -375,17 +375,17 @@ async function pollInbox(): Promise<void> {
         // Own messages are skipped unless cross-studio (same as threads).
         if (msg.senderSlug === sbSlug) {
           if (!studioId) return 'skip' as const;
-          const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
+          const msgInk = (msg.metadata as Record<string, unknown>)?.pcp as
             | Record<string, unknown>
             | undefined;
-          const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
+          const msgSender = msgInk?.sender as Record<string, unknown> | undefined;
           const msgStudioId = msgSender?.studioId as string | undefined;
           if (!msgStudioId || msgStudioId === studioId) return 'skip' as const;
         }
         return 'deliver' as const;
       };
       const legacyDeps = {
-        callPcp,
+        callInk,
         notify: async (content: string, meta: Record<string, unknown>) => {
           await mcp.notification({
             method: 'notifications/claude/channel',
@@ -422,7 +422,7 @@ async function pollInbox(): Promise<void> {
         ) {
           break;
         }
-        const next = await callPcp('get_inbox', {
+        const next = await callInk('get_inbox', {
           email,
           sbSlug,
           status: 'unread',

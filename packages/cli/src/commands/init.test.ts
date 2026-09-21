@@ -135,7 +135,7 @@ describe('init: hooks installation', () => {
     expect(result).toBe('already-installed');
   });
 
-  it('should report conflict and not overwrite non-PCP hooks', () => {
+  it('should report conflict and not overwrite non-Inkwell hooks', () => {
     const claudeDir = join(TEST_DIR, '.claude');
     mkdirSync(claudeDir, { recursive: true });
     writeFileSync(

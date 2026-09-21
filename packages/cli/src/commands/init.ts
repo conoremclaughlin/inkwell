@@ -23,12 +23,12 @@ import { resolveChannelPluginPath } from '../lib/skill-mcp.js';
 // Helpers
 // ============================================================================
 
-interface PcpConfig {
+interface InkUserConfig {
   userId?: string;
   email?: string;
 }
 
-function getPcpConfig(): PcpConfig | null {
+function getInkUserConfig(): InkUserConfig | null {
   const configPath = join(homedir(), '.ink', 'config.json');
   if (existsSync(configPath)) {
     try {
@@ -40,7 +40,7 @@ function getPcpConfig(): PcpConfig | null {
   return null;
 }
 
-function getPcpServerUrl(): string {
+function getInkServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
 }
 
@@ -74,12 +74,12 @@ interface InitStepResult {
   detail?: string;
 }
 
-function ensurePcpDir(cwd: string): InitStepResult {
-  const pcpDir = join(cwd, '.ink');
-  if (existsSync(pcpDir)) {
+function ensureInkDir(cwd: string): InitStepResult {
+  const inkDir = join(cwd, '.ink');
+  if (existsSync(inkDir)) {
     return { label: '.ink/', status: 'exists' };
   }
-  mkdirSync(pcpDir, { recursive: true });
+  mkdirSync(inkDir, { recursive: true });
   return { label: '.ink/', status: 'created' };
 }
 
@@ -111,7 +111,7 @@ function ensureMcpJson(cwd: string): InitStepResult {
         return { label: '.mcp.json', status: 'exists', detail: 'inkwell server configured' };
       }
       // Add inkwell server to existing config
-      const serverUrl = getPcpServerUrl();
+      const serverUrl = getInkServerUrl();
       const updated = {
         ...existing,
         mcpServers: {
@@ -129,7 +129,7 @@ function ensureMcpJson(cwd: string): InitStepResult {
     }
   }
 
-  const serverUrl = getPcpServerUrl();
+  const serverUrl = getInkServerUrl();
   writeFileSync(mcpPath, JSON.stringify(buildDefaultMcpJson(serverUrl, cwd), null, 2) + '\n');
   return { label: '.mcp.json', status: 'created', detail: `inkwell → ${serverUrl}/mcp` };
 }
@@ -191,7 +191,7 @@ function syncBackendConfigs(cwd: string): InitStepResult {
 
 async function initCommand(options: { force?: boolean }): Promise<void> {
   const cwd = process.cwd();
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
 
   console.log(chalk.bold('\nInitializing Inkwell...\n'));
 
@@ -216,7 +216,7 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
   const authenticated = Boolean(auth && !isTokenExpired(auth));
 
   const steps: InitStepResult[] = [
-    ensurePcpDir(cwd),
+    ensureInkDir(cwd),
     ensureMcpJson(cwd),
     ...runInstallHooks(cwd, options.force),
     syncBackendConfigs(cwd),

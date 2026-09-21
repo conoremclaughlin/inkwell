@@ -16,7 +16,7 @@
  *        PATH="<worktree>/node_modules/.bin:$PATH" \
  *        ENABLE_HEARTBEAT_SERVICE=false ENABLE_TELEGRAM=false \
  *        ENABLE_WHATSAPP=false ENABLE_DISCORD=false \
- *        PCP_PORT_BASE=4001 yarn workspace @inklabs/api server
+ *        INK_PORT_BASE=4001 yarn workspace @inklabs/api server
  *   3. Drive one turn through the server (send_to_inbox with a threadKey and
  *      an ink-backed session), wait for "ink chat non-interactive exit".
  *   4. Run:  INK_LIVE_OBSERVE=1 \

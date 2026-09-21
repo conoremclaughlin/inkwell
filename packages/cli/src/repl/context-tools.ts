@@ -2,11 +2,11 @@
  * Client-Local Context Management Tools
  *
  * These tools run entirely in the CLI — they modify the local context ledger
- * without going through the PCP MCP server. This gives the SB agency over
+ * without going through the Inkwell MCP server. This gives the SB agency over
  * its own context window: the ability to introspect what's there and
  * surgically evict what's no longer relevant.
  *
- * The SB calls these the same way as PCP tools (via ink-tool blocks),
+ * The SB calls these the same way as Inkwell tools (via ink-tool blocks),
  * but the CLI intercepts and handles them locally.
  */
 
@@ -16,7 +16,7 @@ import {
   type LedgerEntry,
   type LedgerEvictResult,
 } from './context-ledger.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 // ─── Session Status Signal ──────────────────────────────────────
 
@@ -73,7 +73,7 @@ export function clearLastSignal(): void {
   _lastSignal = null;
 }
 
-/** Tool names that are handled client-locally, not forwarded to PCP */
+/** Tool names that are handled client-locally, not forwarded to Inkwell */
 export const CLIENT_LOCAL_TOOLS = new Set([
   'list_context',
   'evict_context',
@@ -276,7 +276,7 @@ export function formatContextStamp(occ: ContextOccupancy): string {
 }
 
 /**
- * Handle a client-local tool call. Returns the result in PCP tool format,
+ * Handle a client-local tool call. Returns the result in Inkwell tool format,
  * or null if the tool isn't recognized.
  */
 export function handleClientLocalTool(
@@ -285,7 +285,7 @@ export function handleClientLocalTool(
   ledger: ContextLedger,
   signalSink: SignalSink = globalSignalSink,
   hooks: EvictionHooks = {}
-): PcpToolCallResult | null {
+): InkToolCallResult | null {
   switch (tool) {
     case 'list_context':
       return handleListContext(args, ledger, hooks);
@@ -460,7 +460,7 @@ function handleListContext(
   args: Record<string, unknown>,
   ledger: ContextLedger,
   hooks: EvictionHooks = {}
-): PcpToolCallResult {
+): InkToolCallResult {
   const all = ledger.summarizeEntries();
   const totalTokens = ledger.totalTokens();
   const measured = hooks.providerUsage?.();
@@ -573,7 +573,7 @@ function handleEvictContext(
   args: Record<string, unknown>,
   ledger: ContextLedger,
   hooks: EvictionHooks
-): PcpToolCallResult {
+): InkToolCallResult {
   const refs = Array.isArray(args.refs)
     ? (args.refs as unknown[]).filter((r): r is string => typeof r === 'string')
     : undefined;
@@ -668,7 +668,7 @@ function handleEvictContext(
 
 // ─── signal_status ──────────────────────────────────────────────
 
-function handleSignalStatus(args: Record<string, unknown>, sink: SignalSink): PcpToolCallResult {
+function handleSignalStatus(args: Record<string, unknown>, sink: SignalSink): InkToolCallResult {
   const status = args.status as string | undefined;
   const reason = args.reason as string | undefined;
 

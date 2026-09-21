@@ -141,7 +141,7 @@ async function routeResponses(responses: ChannelResponse[], sessionId?: string):
 }
 
 /**
- * Start the PCP server
+ * Start the Inkwell server
  */
 async function startServer(config: ServerConfig = {}): Promise<void> {
   logger.info('Starting Inkwell Server...');
@@ -178,7 +178,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       ? { defaultAntigravityModel: env.DEFAULT_ANTIGRAVITY_MODEL }
       : {}),
     // The port this process actually bound, not whatever a checked-in config
-    // file claims — an isolated server started with PCP_PORT_BASE must not hand
+    // file claims — an isolated server started with INK_PORT_BASE must not hand
     // its credentials to the main server on 3001.
     inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
   };
@@ -450,7 +450,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
   }
 
-  // Force HTTP mode for the PCP server
+  // Force HTTP mode for the Inkwell server
   const originalTransport = env.MCP_TRANSPORT;
   (env as { MCP_TRANSPORT: string }).MCP_TRANSPORT = 'http';
   await mcpServer.start();
@@ -1114,7 +1114,7 @@ Type: ${payload.triggerType}`;
       triggerMessage += `\n\nThread: ${payload.threadKey}`;
 
       // The thread's own description, on the surface an SB reads BEFORE
-      // deciding whether to act. A key alone ("pcp:thread:legibility-commission")
+      // deciding whether to act. A key alone ("inkwell:thread:legibility-commission")
       // says nothing about what the thread became, and one thread routinely
       // spans several PRs and specs. Each line carries its age, so a
       // description nobody has touched since the thread opened cannot be read

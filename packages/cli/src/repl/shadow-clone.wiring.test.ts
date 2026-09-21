@@ -34,7 +34,7 @@ import {
 } from './context-tools.js';
 import { ContextLedger } from './context-ledger.js';
 import { boundSummary, describeCloneToolResult, screenIteration } from './spawn-agent.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 let workdir: string;
 
@@ -126,7 +126,7 @@ function buildClone(opts: {
                   return {
                     content: [{ type: 'text', text: `${tool} is not available to a clone.` }],
                     isError: true,
-                  } as PcpToolCallResult;
+                  } as InkToolCallResult;
                 }
                 if (isClientLocalTool(tool)) {
                   const local = handleClientLocalTool(tool, args, ledger, signalSink);
@@ -137,7 +137,7 @@ function buildClone(opts: {
                   return callPiTool(tool, args, workdir, callCtx.signal);
                 }
                 executed.push(tool);
-                return { content: [{ type: 'text', text: '{}' }] } as PcpToolCallResult;
+                return { content: [{ type: 'text', text: '{}' }] } as InkToolCallResult;
               },
               promptForApproval: (tool, reason, args) =>
                 opts.coordinator
@@ -494,7 +494,7 @@ describe('shadow clone wiring', () => {
 
     // The grant is untouched, and the parent can still spend it itself.
     expect(parent.listGrants()).toEqual([{ tool: 'save_link', uses: 1 }]);
-    expect(parent.canCallPcpTool('save_link').allowed).toBe(true);
+    expect(parent.canCallInkTool('save_link').allowed).toBe(true);
   });
 
   it('applies an approved clone escalation to the CLONE, and executes it', async () => {
@@ -534,7 +534,7 @@ describe('shadow clone wiring', () => {
     // And the parent is untouched — no grant, no widened allowlist.
     expect(parent.listGrants()).toEqual([]);
     expect(parent.listAllowTools()).not.toContain('save_link');
-    expect(parent.canCallPcpTool('save_link').allowed).toBe(true); // parent default, not a grant
+    expect(parent.canCallInkTool('save_link').allowed).toBe(true); // parent default, not a grant
   });
 
   it('does not let one clone escalation widen a sibling', async () => {
@@ -595,7 +595,7 @@ describe('shadow clone wiring', () => {
     // A sibling derived from the same parent starts from the parent envelope,
     // not from whatever its sibling accumulated.
     const { policy: sibling } = deriveClonePolicy(parent);
-    expect(sibling.canCallPcpTool('save_link').allowed).toBe(false);
+    expect(sibling.canCallInkTool('save_link').allowed).toBe(false);
   });
 });
 
@@ -735,7 +735,7 @@ describe('shadow clone cancellation reaches the tools themselves', () => {
       signal: controller.signal,
       callTool: async (tool, _args, callCtx) => {
         seen.push({ tool, signal: callCtx.signal });
-        return { content: [{ type: 'text', text: 'ok' }] } as PcpToolCallResult;
+        return { content: [{ type: 'text', text: 'ok' }] } as InkToolCallResult;
       },
       promptForApproval: async () => false,
     });
@@ -757,10 +757,10 @@ describe('shadow clone cancellation reaches the tools themselves', () => {
       policy,
       signal: controller.signal,
       callTool: (_tool, _args, callCtx) =>
-        new Promise<PcpToolCallResult>((resolve) => {
+        new Promise<InkToolCallResult>((resolve) => {
           callCtx.signal?.addEventListener('abort', () => {
             observed = 'aborted';
-            resolve({ content: [{ type: 'text', text: 'interrupted' }] } as PcpToolCallResult);
+            resolve({ content: [{ type: 'text', text: 'interrupted' }] } as InkToolCallResult);
           });
         }),
       promptForApproval: async () => false,
@@ -790,7 +790,7 @@ describe('shadow clone cancellation reaches the tools themselves', () => {
           ran.push(tool);
           // Cancel while the first call is in flight.
           controller.abort();
-          return { content: [{ type: 'text', text: 'ok' }] } as PcpToolCallResult;
+          return { content: [{ type: 'text', text: 'ok' }] } as InkToolCallResult;
         },
         promptForApproval: async () => false,
       }

@@ -2,7 +2,7 @@
  * Admin Auth Middleware Tests
  *
  * Tests the three-tier authentication flow:
- * - Tier 1: PCP admin access JWT (local verify, ~0ms)
+ * - Tier 1: Inkwell admin access JWT (local verify, ~0ms)
  * - Tier 2: Refresh token exchange via cookie (1 DB call)
  * - Tier 3: Supabase verification (network call, first login only)
  *
@@ -13,18 +13,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
 
 // ---------------------------------------------------------------------------
-// Mocks for pcp-tokens (the shared auth module)
+// Mocks for ink-tokens (the shared auth module)
 // ---------------------------------------------------------------------------
 
-const mockVerifyPcpAccessToken = vi.fn();
+const mockVerifyInkAccessToken = vi.fn();
 const mockExchangeRefreshToken = vi.fn();
-const mockSignPcpAccessToken = vi.fn();
+const mockSignInkAccessToken = vi.fn();
 const mockCreateRefreshToken = vi.fn();
 
-vi.mock('../auth/pcp-tokens', () => ({
-  verifyPcpAccessToken: (...args: unknown[]) => mockVerifyPcpAccessToken(...args),
+vi.mock('../auth/ink-tokens', () => ({
+  verifyInkAccessToken: (...args: unknown[]) => mockVerifyInkAccessToken(...args),
   exchangeRefreshToken: (...args: unknown[]) => mockExchangeRefreshToken(...args),
-  signPcpAccessToken: (...args: unknown[]) => mockSignPcpAccessToken(...args),
+  signInkAccessToken: (...args: unknown[]) => mockSignInkAccessToken(...args),
   createRefreshToken: (...args: unknown[]) => mockCreateRefreshToken(...args),
 }));
 
@@ -174,13 +174,13 @@ function createMockRes(): MockResponse {
 }
 
 /** Set up mocks for Supabase queries used during Tier 3 (user lookup) */
-function mockSupabaseUserLookup(pcpUser: Record<string, unknown>) {
+function mockSupabaseUserLookup(inkUser: Record<string, unknown>) {
   const userChain: Record<string, any> = {};
   userChain.select = vi.fn(() => userChain);
   userChain.insert = vi.fn(() => userChain);
   userChain.update = vi.fn(() => userChain);
   userChain.eq = vi.fn(() => userChain);
-  userChain.single = vi.fn(() => Promise.resolve({ data: pcpUser, error: null }));
+  userChain.single = vi.fn(() => Promise.resolve({ data: inkUser, error: null }));
 
   mockSupabaseFrom.mockImplementation((table: string) => {
     if (table === 'users') return userChain;
@@ -257,12 +257,12 @@ describe('adminAuthMiddleware', () => {
   });
 
   // =========================================================================
-  // Tier 1: PCP admin JWT
+  // Tier 1: Inkwell admin JWT
   // =========================================================================
 
-  describe('Tier 1: PCP admin access JWT', () => {
-    it('should authenticate via valid PCP admin JWT and call next()', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue({
+  describe('Tier 1: Inkwell admin access JWT', () => {
+    it('should authenticate via valid Inkwell admin JWT and call next()', async () => {
+      mockVerifyInkAccessToken.mockReturnValue({
         type: 'pcp_admin',
         sub: 'user-123',
         email: 'test@example.com',
@@ -276,15 +276,15 @@ describe('adminAuthMiddleware', () => {
       await middleware(req, res, next);
 
       expect(next).toHaveBeenCalled();
-      expect(mockVerifyPcpAccessToken).toHaveBeenCalledWith('test-token', 'pcp_admin');
+      expect(mockVerifyInkAccessToken).toHaveBeenCalledWith('test-token', 'pcp_admin');
       // Should NOT call Supabase
       expect(mockGetUser).not.toHaveBeenCalled();
       // Should NOT issue new cookies
       expect(Object.keys(res._cookies)).toHaveLength(0);
     });
 
-    it('should set pcpUserId and email from JWT claims', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue({
+    it('should set inkUserId and email from JWT claims', async () => {
+      mockVerifyInkAccessToken.mockReturnValue({
         type: 'pcp_admin',
         sub: 'user-abc',
         email: 'admin@test.com',
@@ -298,12 +298,12 @@ describe('adminAuthMiddleware', () => {
       await middleware(req, res, next);
 
       const authReq = req as any;
-      expect(authReq.pcpUserId).toBe('user-abc');
+      expect(authReq.inkUserId).toBe('user-abc');
       expect(authReq.user.email).toBe('admin@test.com');
     });
 
     it('should set request context with correct userId and email', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue({
+      mockVerifyInkAccessToken.mockReturnValue({
         type: 'pcp_admin',
         sub: 'user-ctx',
         email: 'ctx@example.com',
@@ -325,8 +325,8 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should NOT accept mcp_access tokens as admin auth', async () => {
-      // verifyPcpAccessToken returns null when type doesn't match
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      // verifyInkAccessToken returns null when type doesn't match
+      mockVerifyInkAccessToken.mockReturnValue(null);
       // No refresh cookie, no Supabase
       mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
 
@@ -341,7 +341,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should accept mcp_access tokens only for transcript sync route', async () => {
-      mockVerifyPcpAccessToken
+      mockVerifyInkAccessToken
         .mockReturnValueOnce(null) // pcp_admin check
         .mockReturnValueOnce({
           type: 'mcp_access',
@@ -361,11 +361,11 @@ describe('adminAuthMiddleware', () => {
 
       expect(next).toHaveBeenCalled();
       expect(mockGetUser).not.toHaveBeenCalled();
-      expect((req as any).pcpUserId).toBe('user-mcp');
+      expect((req as any).inkUserId).toBe('user-mcp');
     });
 
     it('should accept mcp_access tokens for transcript list/export routes', async () => {
-      mockVerifyPcpAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
+      mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
         type: 'mcp_access',
         sub: 'user-mcp',
         email: 'mcp@example.com',
@@ -384,8 +384,8 @@ describe('adminAuthMiddleware', () => {
       expect(listNext).toHaveBeenCalled();
       expect(mockGetUser).not.toHaveBeenCalled();
 
-      mockVerifyPcpAccessToken.mockReset();
-      mockVerifyPcpAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
+      mockVerifyInkAccessToken.mockReset();
+      mockVerifyInkAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
         type: 'mcp_access',
         sub: 'user-mcp',
         email: 'mcp@example.com',
@@ -403,7 +403,7 @@ describe('adminAuthMiddleware', () => {
 
       expect(exportNext).toHaveBeenCalled();
       expect(mockGetUser).not.toHaveBeenCalled();
-      expect((exportReq as any).pcpUserId).toBe('user-mcp');
+      expect((exportReq as any).inkUserId).toBe('user-mcp');
     });
   });
 
@@ -414,7 +414,7 @@ describe('adminAuthMiddleware', () => {
   describe('Tier 2: Refresh token exchange', () => {
     beforeEach(() => {
       // Tier 1 fails
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
     });
 
     it('should authenticate via refresh cookie and issue new access token cookie', async () => {
@@ -425,7 +425,7 @@ describe('adminAuthMiddleware', () => {
       });
 
       const req = createMockReq({
-        cookies: { 'pcp-admin-refresh': 'pcp-rt-existing' },
+        cookies: { 'pcp-admin-refresh': 'ink-rt-existing' },
       });
       const res = createMockRes();
       const next = vi.fn();
@@ -437,7 +437,7 @@ describe('adminAuthMiddleware', () => {
       // Should have called exchangeRefreshToken with correct args
       expect(mockExchangeRefreshToken).toHaveBeenCalledWith(
         expect.anything(), // supabase client
-        'pcp-rt-existing',
+        'ink-rt-existing',
         'dashboard',
         'pcp_admin',
         3600
@@ -467,7 +467,7 @@ describe('adminAuthMiddleware', () => {
       });
 
       const req = createMockReq({
-        cookies: { 'pcp-admin-refresh': 'pcp-rt-test' },
+        cookies: { 'pcp-admin-refresh': 'ink-rt-test' },
       });
       const res = createMockRes();
       const next = vi.fn();
@@ -475,7 +475,7 @@ describe('adminAuthMiddleware', () => {
       await middleware(req, res, next);
 
       const authReq = req as any;
-      expect(authReq.pcpUserId).toBe('user-refreshed');
+      expect(authReq.inkUserId).toBe('user-refreshed');
       expect(authReq.user.email).toBe('refreshed@test.com');
     });
 
@@ -484,7 +484,7 @@ describe('adminAuthMiddleware', () => {
       mockGetUser.mockResolvedValue({ data: { user: null }, error: { message: 'invalid' } });
 
       const req = createMockReq({
-        cookies: { 'pcp-admin-refresh': 'pcp-rt-expired' },
+        cookies: { 'pcp-admin-refresh': 'ink-rt-expired' },
       });
       const res = createMockRes();
       const next = vi.fn();
@@ -517,11 +517,11 @@ describe('adminAuthMiddleware', () => {
   describe('Tier 3: Supabase verification', () => {
     beforeEach(() => {
       // Tiers 1 and 2 fail
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
     });
 
-    it('should authenticate via Supabase and issue PCP cookies', async () => {
+    it('should authenticate via Supabase and issue Inkwell cookies', async () => {
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'tier3@example.com' } },
         error: null,
@@ -531,9 +531,9 @@ describe('adminAuthMiddleware', () => {
         telegram_id: null,
         whatsapp_id: null,
       });
-      mockSignPcpAccessToken.mockReturnValue('signed-admin-jwt');
+      mockSignInkAccessToken.mockReturnValue('signed-admin-jwt');
       mockCreateRefreshToken.mockResolvedValue({
-        refreshToken: 'pcp-rt-new',
+        refreshToken: 'ink-rt-new',
         expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000),
       });
 
@@ -556,7 +556,7 @@ describe('adminAuthMiddleware', () => {
       });
 
       expect(res._cookies['pcp-admin-refresh']).toBeDefined();
-      expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-new');
+      expect(res._cookies['pcp-admin-refresh'].value).toBe('ink-rt-new');
       expect(res._cookies['pcp-admin-refresh'].options).toMatchObject({
         httpOnly: true,
         path: '/api/admin',
@@ -564,7 +564,7 @@ describe('adminAuthMiddleware', () => {
       });
 
       // Should sign with correct payload
-      expect(mockSignPcpAccessToken).toHaveBeenCalledWith(
+      expect(mockSignInkAccessToken).toHaveBeenCalledWith(
         { type: 'pcp_admin', sub: 'user-tier3', email: 'tier3@example.com', scope: 'admin' },
         3600
       );
@@ -596,7 +596,7 @@ describe('adminAuthMiddleware', () => {
       expect(next).not.toHaveBeenCalled();
     });
 
-    it('should auto-provision PCP user on first login', async () => {
+    it('should auto-provision Inkwell user on first login', async () => {
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'new@example.com' } },
         error: null,
@@ -621,9 +621,9 @@ describe('adminAuthMiddleware', () => {
       });
       mockSupabaseFrom.mockReturnValue(chain);
 
-      mockSignPcpAccessToken.mockReturnValue('admin-jwt');
+      mockSignInkAccessToken.mockReturnValue('admin-jwt');
       mockCreateRefreshToken.mockResolvedValue({
-        refreshToken: 'pcp-rt-new',
+        refreshToken: 'ink-rt-new',
         expiresAt: new Date(),
       });
 
@@ -647,7 +647,7 @@ describe('adminAuthMiddleware', () => {
         telegram_id: null,
         whatsapp_id: null,
       });
-      mockSignPcpAccessToken.mockReturnValue('signed-jwt');
+      mockSignInkAccessToken.mockReturnValue('signed-jwt');
       mockCreateRefreshToken.mockRejectedValue(new Error('DB error'));
 
       const req = createMockReq();
@@ -668,7 +668,7 @@ describe('adminAuthMiddleware', () => {
   describe('workspace resolution', () => {
     beforeEach(() => {
       // Use Tier 1 for simplicity
-      mockVerifyPcpAccessToken.mockReturnValue({
+      mockVerifyInkAccessToken.mockReturnValue({
         type: 'pcp_admin',
         sub: 'user-ws',
         email: 'ws@example.com',
@@ -686,8 +686,8 @@ describe('adminAuthMiddleware', () => {
       await middleware(req, res, next);
 
       expect(mockEnsurePersonalWorkspace).toHaveBeenCalledWith('user-ws');
-      expect((req as any).pcpWorkspaceId).toBe('personal-ws');
-      expect((req as any).pcpWorkspaceRole).toBe('member');
+      expect((req as any).inkWorkspaceId).toBe('personal-ws');
+      expect((req as any).inkWorkspaceRole).toBe('member');
     });
 
     it('should use requested workspace when user is a member', async () => {
@@ -704,8 +704,8 @@ describe('adminAuthMiddleware', () => {
 
       await middleware(req, res, next);
 
-      expect((req as any).pcpWorkspaceId).toBe('requested-ws');
-      expect((req as any).pcpWorkspaceRole).toBe('member');
+      expect((req as any).inkWorkspaceId).toBe('requested-ws');
+      expect((req as any).inkWorkspaceRole).toBe('member');
     });
 
     it('should set request context workspaceSource=header when x-ink-workspace-id is used', async () => {
@@ -757,7 +757,7 @@ describe('adminAuthMiddleware', () => {
 
   describe('cookie security properties', () => {
     it('should set httpOnly on all admin cookies', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'test@example.com' } },
@@ -768,7 +768,7 @@ describe('adminAuthMiddleware', () => {
         telegram_id: null,
         whatsapp_id: null,
       });
-      mockSignPcpAccessToken.mockReturnValue('jwt');
+      mockSignInkAccessToken.mockReturnValue('jwt');
       mockCreateRefreshToken.mockResolvedValue({ refreshToken: 'rt', expiresAt: new Date() });
 
       const req = createMockReq();
@@ -782,7 +782,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should scope cookies to /api/admin path', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'test@example.com' } },
@@ -793,7 +793,7 @@ describe('adminAuthMiddleware', () => {
         telegram_id: null,
         whatsapp_id: null,
       });
-      mockSignPcpAccessToken.mockReturnValue('jwt');
+      mockSignInkAccessToken.mockReturnValue('jwt');
       mockCreateRefreshToken.mockResolvedValue({ refreshToken: 'rt', expiresAt: new Date() });
 
       const req = createMockReq();
@@ -807,7 +807,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should set sameSite=lax on all admin cookies', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'test@example.com' } },
@@ -818,7 +818,7 @@ describe('adminAuthMiddleware', () => {
         telegram_id: null,
         whatsapp_id: null,
       });
-      mockSignPcpAccessToken.mockReturnValue('jwt');
+      mockSignInkAccessToken.mockReturnValue('jwt');
       mockCreateRefreshToken.mockResolvedValue({ refreshToken: 'rt', expiresAt: new Date() });
 
       const req = createMockReq();
@@ -832,7 +832,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should set access token maxAge to 1 hour', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'test@example.com' } },
@@ -843,7 +843,7 @@ describe('adminAuthMiddleware', () => {
         telegram_id: null,
         whatsapp_id: null,
       });
-      mockSignPcpAccessToken.mockReturnValue('jwt');
+      mockSignInkAccessToken.mockReturnValue('jwt');
       mockCreateRefreshToken.mockResolvedValue({ refreshToken: 'rt', expiresAt: new Date() });
 
       const req = createMockReq();
@@ -856,7 +856,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should set refresh token maxAge to 90 days', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'test@example.com' } },
@@ -867,7 +867,7 @@ describe('adminAuthMiddleware', () => {
         telegram_id: null,
         whatsapp_id: null,
       });
-      mockSignPcpAccessToken.mockReturnValue('jwt');
+      mockSignInkAccessToken.mockReturnValue('jwt');
       mockCreateRefreshToken.mockResolvedValue({ refreshToken: 'rt', expiresAt: new Date() });
 
       const req = createMockReq();
@@ -886,7 +886,7 @@ describe('adminAuthMiddleware', () => {
 
   describe('tier priority', () => {
     it('should not call Tier 2 or Tier 3 when Tier 1 succeeds', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue({
+      mockVerifyInkAccessToken.mockReturnValue({
         type: 'pcp_admin',
         sub: 'user-fast',
         email: 'fast@example.com',
@@ -906,7 +906,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should not call Tier 3 when Tier 2 succeeds', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue({
         accessToken: 'new-jwt',
         userId: 'user-mid',
@@ -925,7 +925,7 @@ describe('adminAuthMiddleware', () => {
     });
 
     it('should not issue new cookies when Tier 1 succeeds', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue({
+      mockVerifyInkAccessToken.mockReturnValue({
         type: 'pcp_admin',
         sub: 'user-no-cookies',
         email: 'nc@example.com',
@@ -939,12 +939,12 @@ describe('adminAuthMiddleware', () => {
       await middleware(req, res, next);
 
       expect(Object.keys(res._cookies)).toHaveLength(0);
-      expect(mockSignPcpAccessToken).not.toHaveBeenCalled();
+      expect(mockSignInkAccessToken).not.toHaveBeenCalled();
       expect(mockCreateRefreshToken).not.toHaveBeenCalled();
     });
 
     it('should not issue refresh cookie when Tier 2 succeeds (only access cookie)', async () => {
-      mockVerifyPcpAccessToken.mockReturnValue(null);
+      mockVerifyInkAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue({
         accessToken: 'refreshed-jwt',
         userId: 'user-t2',
@@ -1011,7 +1011,7 @@ describe('POST /auth/logout', () => {
     mockSupabaseFrom.mockReturnValue(deleteChain);
 
     const req = createMockReq({
-      body: { refreshToken: 'pcp-rt-to-revoke' },
+      body: { refreshToken: 'ink-rt-to-revoke' },
       cookies: {},
     });
     const res = createMockRes();
@@ -1020,7 +1020,7 @@ describe('POST /auth/logout', () => {
 
     expect(mockSupabaseFrom).toHaveBeenCalledWith('mcp_tokens');
     expect(deleteChain.delete).toHaveBeenCalled();
-    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-rt-to-revoke');
+    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'ink-rt-to-revoke');
     // Revocation spans BOTH client ids: a refresh token presented at logout
     // dies whether it was minted for the dashboard or the mobile app.
     expect(deleteChain.in).toHaveBeenCalledWith('client_id', ['dashboard', 'mobile']);
@@ -1036,13 +1036,13 @@ describe('POST /auth/logout', () => {
 
     const req = createMockReq({
       body: {},
-      cookies: { 'pcp-admin-refresh': 'pcp-rt-from-cookie' },
+      cookies: { 'pcp-admin-refresh': 'ink-rt-from-cookie' },
     });
     const res = createMockRes();
 
     await logoutHandler(req, res);
 
-    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-rt-from-cookie');
+    expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'ink-rt-from-cookie');
     expect(res._json).toEqual({ success: true });
   });
 
@@ -1062,7 +1062,7 @@ describe('POST /auth/logout', () => {
     });
 
     const req = createMockReq({
-      body: { refreshToken: 'pcp-rt-fail' },
+      body: { refreshToken: 'ink-rt-fail' },
       cookies: {},
     });
     const res = createMockRes();

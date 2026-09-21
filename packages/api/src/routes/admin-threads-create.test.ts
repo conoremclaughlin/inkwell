@@ -20,11 +20,11 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
 }));
 vi.mock('../mcp/tools/thread-handlers', () => ({ getParticipants: vi.fn() }));
 
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 const mockSupabaseFrom = vi.fn();
@@ -70,7 +70,7 @@ function getCreateHandler(): Handler {
 }
 
 function createReq(body: Record<string, unknown>): Request {
-  return { body, headers: {}, cookies: {}, params: {}, pcpUserId: 'user-1' } as unknown as Request;
+  return { body, headers: {}, cookies: {}, params: {}, inkUserId: 'user-1' } as unknown as Request;
 }
 
 interface MockResponse extends Response {

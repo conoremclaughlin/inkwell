@@ -16,7 +16,7 @@
  * not granted), the backend cannot name the fixture's color.
  *
  * Requirements: INK_LIVE_TESTS=1, `ink` + `claude` binaries on PATH,
- * valid ink auth, and a reachable PCP server for session bootstrap.
+ * valid ink auth, and a reachable Inkwell server for session bootstrap.
  *
  *   INK_LIVE_TESTS=1 yarn test:live packages/api/src/services/sessions/ink-runner-attachments.live.test.ts
  */

@@ -86,7 +86,7 @@ d('grant_studio_lease — path serialization (real DB)', () => {
     });
     if (error) throw error;
     // Two rows, one working tree — the exact resolveMainStudio shape that
-    // motivated path serialization (3 SBs share the pcp checkout today).
+    // motivated path serialization (3 SBs share the main checkout today).
     studioA = await makeStudio('echo');
     studioB = await makeStudio('echo-b');
   });

@@ -21,7 +21,7 @@ import {
   type RuntimePreferences,
 } from '../backends/identity.js';
 import { promptTransportFor } from '../backends/index.js';
-import { PcpClient, type PcpToolCallResult } from '../lib/pcp-client.js';
+import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
 import {
   CloneRegistry,
@@ -115,7 +115,7 @@ import {
 } from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
-import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
+import { ensureInkToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
 import {
   resolveCredentialRefs,
@@ -481,7 +481,7 @@ interface SessionTranscriptMetadata {
 interface HistoryHydrationResult {
   loaded: number;
   messageCount: number;
-  source: 'repl-transcript' | 'pcp-session-context' | 'none';
+  source: 'repl-transcript' | 'ink-session-context' | 'none';
   transcriptPath?: string;
   tailPreview: Array<{
     /** 'event' rows are dim progress lines (tool calls) — not messages */
@@ -1209,7 +1209,7 @@ export function hydrateLedgerFromTranscript(
       const entry = ledger.addEntry(
         'system',
         compactForLedger(`⚡ ${actor} ${activityType} — ${event.content}`, 320),
-        'pcp-activity-history',
+        'ink-activity-history',
         eid,
         replayMeta
       );
@@ -1431,6 +1431,11 @@ const INTERNAL_SYSTEM_SOURCES = new Set([
   'continuation',
   'compaction-tail',
   'compaction-history',
+  'ink-activity',
+  'ink-activity-history',
+  // Written before #659. Ledger entries persist and are replayed, so the old
+  // source values still arrive and must stay internal — otherwise every
+  // pre-rename activity line reappears as a visible system turn.
   'pcp-activity',
   'pcp-activity-history',
   'passive-recall',
@@ -1754,13 +1759,13 @@ export function reopenSucceeded(session: SessionSummary | null | undefined): Reo
  * Ask the server to reopen a finished session, and verify it did.
  */
 export async function reopenSelectedSession(
-  pcp: { callTool: (tool: string, args: Record<string, unknown>) => Promise<unknown> },
+  inkClient: { callTool: (tool: string, args: Record<string, unknown>) => Promise<unknown> },
   sbSlug: string,
   sessionId: string
 ): Promise<ReopenOutcome> {
   let raw: unknown;
   try {
-    raw = await pcp.callTool('update_session_state', {
+    raw = await inkClient.callTool('update_session_state', {
       sbSlug,
       sessionId,
       reopen: true,
@@ -1813,11 +1818,11 @@ export function mergeSessionsWithHistory(
  * callers can tell "no sessions" from "could not ask".
  */
 export async function listAttachableSessions(
-  pcp: Pick<PcpClient, 'callTool'>,
+  inkClient: Pick<InkClient, 'callTool'>,
   params: Record<string, unknown>
 ): Promise<Record<string, unknown> | null> {
   try {
-    return (await pcp.callTool('list_sessions', {
+    return (await inkClient.callTool('list_sessions', {
       ...params,
       status: 'attachable',
     })) as Record<string, unknown>;
@@ -1832,7 +1837,7 @@ export async function listAttachableSessions(
     if (!looksLikeUnknownStatus) return null;
     sbDebugLog('chat', 'list_sessions_attachable_unsupported', { message });
     try {
-      return (await pcp.callTool('list_sessions', params)) as Record<string, unknown>;
+      return (await inkClient.callTool('list_sessions', params)) as Record<string, unknown>;
     } catch {
       return null;
     }
@@ -1971,21 +1976,21 @@ function hydrateLedgerFromSessionContext(
 
   for (const message of messages) {
     if (message.role === 'user') {
-      ledger.addEntry('user', message.content, `pcp-history:${message.source}`);
+      ledger.addEntry('user', message.content, `ink-history:${message.source}`);
       loaded += 1;
       messageCount += 1;
       pushPreview('user', message.content, message.ts);
       continue;
     }
     if (message.role === 'assistant') {
-      ledger.addEntry('assistant', message.content, `pcp-history:${message.source}`);
+      ledger.addEntry('assistant', message.content, `ink-history:${message.source}`);
       loaded += 1;
       messageCount += 1;
       pushPreview('assistant', message.content, message.ts);
       continue;
     }
     if (message.role === 'inbox') {
-      ledger.addEntry('inbox', compactForLedger(message.content), `pcp-history:${message.source}`);
+      ledger.addEntry('inbox', compactForLedger(message.content), `ink-history:${message.source}`);
       loaded += 1;
       messageCount += 1;
       pushPreview('inbox', message.content, message.ts);
@@ -1995,7 +2000,7 @@ function hydrateLedgerFromSessionContext(
     ledger.addEntry(
       'system',
       compactForLedger(message.content, 320),
-      `pcp-history:${message.source}`
+      `ink-history:${message.source}`
     );
     loaded += 1;
   }
@@ -2003,7 +2008,7 @@ function hydrateLedgerFromSessionContext(
   return {
     loaded,
     messageCount,
-    source: 'pcp-session-context',
+    source: 'ink-session-context',
     tailPreview: preview,
   };
 }
@@ -3557,13 +3562,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // correction. cliAttached is false for ANY one-shot mode: --message runs
   // headless even without --non-interactive, and persisting cliAttached=true
   // from such a run would wrongly suppress concurrent trigger spawns.
-  let currentPcpSessionId: () => string | undefined = () => undefined;
-  let currentPcpStudioId: () => string | undefined = () => identity?.studioId;
-  const pcp = new PcpClient(undefined, undefined, {
+  let currentInkSessionId: () => string | undefined = () => undefined;
+  let currentInkStudioId: () => string | undefined = () => identity?.studioId;
+  const inkClient = new InkClient(undefined, undefined, {
     getContextToken: () =>
       encodeContextToken({
-        sessionId: currentPcpSessionId() || '',
-        studioId: currentPcpStudioId() || 'main',
+        sessionId: currentInkSessionId() || '',
+        studioId: currentInkStudioId() || 'main',
         sbSlug,
         cliAttached: !options.nonInteractive && !options.message,
         runtime: 'ink',
@@ -3649,9 +3654,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             : 'interactive',
   };
   // From here, ink-routed tool calls carry the live session and studio ids
-  // in their x-ink-context header (see PcpClient construction above).
-  currentPcpSessionId = () => runtime.sessionId;
-  currentPcpStudioId = () => runtime.studioId || identity?.studioId;
+  // in their x-ink-context header (see InkClient construction above).
+  currentInkSessionId = () => runtime.sessionId;
+  currentInkStudioId = () => runtime.studioId || identity?.studioId;
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {
     runtime.contactId = options.contactId;
@@ -3665,9 +3670,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const platform = options.sender.split(':')[0];
     const platformId = options.sender.slice(colonIdx + 1);
     try {
-      const { getPcpServerUrl } = await import('../lib/pcp-mcp.js');
+      const { getInkServerUrl } = await import('../lib/ink-mcp.js');
       const { getValidAccessToken } = await import('../auth/tokens.js');
-      const serverUrl = getPcpServerUrl().replace(/\/+$/, '');
+      const serverUrl = getInkServerUrl().replace(/\/+$/, '');
       const token = await getValidAccessToken(serverUrl);
       if (!token) throw new Error('Not authenticated');
 
@@ -3768,12 +3773,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // invocation exits instead of blocking on stdin forever.
   if (options.sessionCandidates || options.sessionCandidatesJson) {
     const [sessionsResult, historyResult] = await Promise.all([
-      listAttachableSessions(pcp, {
+      listAttachableSessions(inkClient, {
         sbSlug,
         backend: 'ink',
         limit: 50,
       }),
-      pcp
+      inkClient
         .callTool('list_sessions', { sbSlug, backend: 'ink', limit: 50 })
         .catch(() => null) as Promise<Record<string, unknown> | null>,
     ]);
@@ -3786,7 +3791,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       'attach'
     );
     const candidates = sessions.map((session) => ({
-      type: 'pcp' as const,
+      type: 'ink' as const,
       id: session.id,
       sbSlug: session.sbSlug || null,
       backend: session.backend || 'ink',
@@ -3804,8 +3809,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           {
             backend: 'ink',
             sbSlug,
-            pcpAvailable: sessionsResult !== null,
-            counts: { pcp: candidates.length },
+            inkAvailable: sessionsResult !== null,
+            counts: { ink: candidates.length },
             candidates: [{ type: 'new' as const }, ...candidates],
           },
           null,
@@ -3879,7 +3884,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   };
 
   /**
-   * Away-mode approval: create a request on the PCP server, which notifies the
+   * Away-mode approval: create a request on the Inkwell server, which notifies the
    * user's connected platforms (Telegram, etc.) and intercepts their reply. The
    * server owns routing; we create and poll.
    */
@@ -3967,7 +3972,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   /**
    * Ask the user about one tool call. Two very different waits hide behind this:
    * the local prompt (Ink / readline / JSONL) and the away-mode 2FA round-trip
-   * through the PCP server. The coordinator below decides *when* this runs; this
+   * through the Inkwell server. The coordinator below decides *when* this runs; this
    * function only decides *how* to ask.
    */
   const askForToolApproval = async (
@@ -4016,13 +4021,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // the non-consuming inspect — a query that spends a one-use grant would
     // charge the parent for a clone's call that has not happened yet.
     recheck: (ticket) => {
-      const decision = (ticket.policy ?? toolPolicy).inspectPcpTool(
+      const decision = (ticket.policy ?? toolPolicy).inspectInkTool(
         ticket.tool.replace(/^mcp__inkwell__/, ''),
         runtime.sessionId
       );
       if (decision.allowed) {
         // An allow resting on a one-use grant is NOT a free pass: leaving it to
-        // the executor's own canCallPcpTool keeps the grant accounting in one
+        // the executor's own canCallInkTool keeps the grant accounting in one
         // place instead of spending it here.
         return decision.wouldConsumeGrant ? 'prompt' : 'allow';
       }
@@ -4058,7 +4063,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   };
 
   // Register the live obs mirror: EVERY projection-type ledger append (user,
-  // system turns, pcp/local tools, assistant results, backend events, session
+  // system turns, inkClient/local tools, assistant results, backend events, session
   // markers) is emitted as an `obs` line from inside appendTranscriptEntry —
   // one place, all paths, so the live view can never diverge from replay
   // (spec:observer-attach §4.2; the e2e caught exactly this gap when only
@@ -4332,18 +4337,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const sessionEvictedEntries: EvictedEntryRecord[] = [];
 
   // Register built-in hooks (passive recall + budget monitor).
-  // callRecall wraps pcp.callTool('recall', ...) into the shape hooks expect.
+  // callRecall wraps inkClient.callTool('recall', ...) into the shape hooks expect.
   const { passiveRecall: passiveRecallHandle } = registerBuiltinHooks(hookRegistry, {
     callRecall: async (query, limit) => {
       try {
-        const result = await pcp.callTool('recall', {
+        const result = await inkClient.callTool('recall', {
           query,
           sbSlug,
           includeShared: true,
           limit,
           recallMode: 'hybrid',
         });
-        // PcpClient.callTool() parses the JSON-RPC response and returns
+        // InkClient.callTool() parses the JSON-RPC response and returns
         // the tool result directly (e.g., { success, memories, ... })
         const parsed = result as Record<string, unknown>;
         if (!parsed.success) return [];
@@ -4432,7 +4437,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   const bootstrapResult = identitySuppliedByCaller
     ? ({} as Record<string, unknown>)
-    : ((await pcp
+    : ((await inkClient
         .callTool('bootstrap', { sbSlug })
         .catch((error) => ({ error: String(error) }))) as Record<string, unknown>);
 
@@ -4502,7 +4507,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const attachLatestQuery =
       typeof options.attachLatest === 'string' ? options.attachLatest.trim() : undefined;
     const query = attachLatestQuery || attachQuery;
-    const listed = await listAttachableSessions(pcp, { sbSlug, limit: 50 });
+    const listed = await listAttachableSessions(inkClient, { sbSlug, limit: 50 });
     const sessionsResult: Record<string, unknown> = listed ?? {
       error: 'could not fetch attachable sessions',
     };
@@ -4561,12 +4566,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !runtime.threadKey
   ) {
     const [sessionsResult, historyResult] = await Promise.all([
-      listAttachableSessions(pcp, {
+      listAttachableSessions(inkClient, {
         sbSlug,
         backend: 'ink',
         limit: 50,
       }),
-      pcp
+      inkClient
         .callTool('list_sessions', { sbSlug, backend: 'ink', limit: 50 })
         .catch(() => null) as Promise<Record<string, unknown> | null>,
     ]);
@@ -4654,7 +4659,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // the post-state is checked rather than the acknowledgement: an old
             // server ignoring an unknown field still answers `success: true`.
             // Only a row that actually comes back attachable counts.
-            const reopened = await reopenSelectedSession(pcp, sbSlug, selected.id);
+            const reopened = await reopenSelectedSession(inkClient, sbSlug, selected.id);
             if (!reopened.ok) {
               console.log(
                 chalk.yellow(
@@ -4724,14 +4729,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
     if (runtime.contactId) startArgs.contactId = runtime.contactId;
 
-    const sessionStartResult = (await pcp
+    const sessionStartResult = (await inkClient
       .callTool('start_session', startArgs)
       .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
     runtime.sessionId = extractSessionId(sessionStartResult);
   }
 
   if (attachedToExistingSession && runtime.sessionId && !attachedSessionSummary) {
-    const sessionsResult = (await pcp
+    const sessionsResult = (await inkClient
       .callTool('list_sessions', { sbSlug, status: 'active', limit: 80 })
       .catch(() => null)) as Record<string, unknown> | null;
     attachedSessionSummary = extractSessionSummaries(sessionsResult).find(
@@ -4764,7 +4769,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // across processes. Seeded on the first backend spawn, resumed thereafter,
   // and reset at every ink-owned context-boundary change (compaction, trim,
   // eviction). Recovered from the reattached transcript below so a fresh
-  // process (e.g. the next Myra heartbeat, which reattaches the same pcp
+  // process (e.g. the next Myra heartbeat, which reattaches the same inkClient
   // session) RESUMES the same native session — the jsonl accumulates one
   // coherent thread instead of fragmenting into a new file per message. ink
   // owns compaction; the provider never runs its own.
@@ -4910,7 +4915,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       passiveRecallHandle.seedBootstrapIds(hydrated.recoveredMemoryIds);
     }
   } else if (attachedToExistingSession && runtime.sessionId) {
-    const sessionContextResult = (await pcp
+    const sessionContextResult = (await inkClient
       .callTool('get_session_context', { sessionId: runtime.sessionId, limit: 120 })
       .catch(() => null)) as Record<string, unknown> | null;
     const contextMessages = extractSessionContextMessages(sessionContextResult);
@@ -4940,7 +4945,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   });
 
   if (runtime.sessionId && !attachedToExistingSession) {
-    await pcp
+    await inkClient
       .callTool('update_session_state', {
         sbSlug,
         sessionId: runtime.sessionId,
@@ -5206,7 +5211,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const refreshSessionsSnapshot = async (force = false): Promise<SessionSummary[]> => {
     const stale = Date.now() - sessionsCacheAt > 15_000;
     if (!force && !stale) return sessionsCache;
-    const result = (await pcp
+    const result = (await inkClient
       .callTool('list_sessions', { limit: 20, status: 'active' })
       .catch(() => null)) as Record<string, unknown> | null;
     sessionsCache = filterSessionsByPolicy(
@@ -5507,8 +5512,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const runSbCompaction = async (
     args: Record<string, unknown>,
     ctx?: { signal?: AbortSignal }
-  ): Promise<PcpToolCallResult> => {
-    const asResult = (payload: Record<string, unknown>, isError = false): PcpToolCallResult => ({
+  ): Promise<InkToolCallResult> => {
+    const asResult = (payload: Record<string, unknown>, isError = false): InkToolCallResult => ({
       content: [{ type: 'text', text: JSON.stringify(payload) }],
       ...(isError ? { isError: true } : {}),
     });
@@ -5584,7 +5589,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const collectInbox = async (
     force: boolean
   ): Promise<{ freshCount: number; autoRunMessages: InboxMessage[] }> => {
-    const inboxResult = (await pcp
+    const inboxResult = (await inkClient
       .callTool('get_inbox', { sbSlug, status: 'unread', limit: 10 })
       .catch(() => null)) as Record<string, unknown> | null;
     const messages = extractInboxMessages(inboxResult);
@@ -5827,7 +5832,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   // Activity polls have no backend-turn phase — the whole body is gated.
   const collectActivity = async (force: boolean): Promise<number> => {
-    const activityResult = (await pcp
+    const activityResult = (await inkClient
       .callTool('get_activity', {
         sbSlug,
         limit: 40,
@@ -5926,7 +5931,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ledger.addEntry(
         'system',
         compactForLedger(rendered, 320),
-        'pcp-activity',
+        'ink-activity',
         activityEid,
         replayMeta
       );
@@ -6028,7 +6033,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     task: SpawnAgentTask,
     ctx: { index: number; total: number; signal?: AbortSignal }
   ): Promise<void> => {
-    // Derived per clone, never shared: canCallPcpTool mutates, so two clones on
+    // Derived per clone, never shared: canCallInkTool mutates, so two clones on
     // one policy object would consume the parent's grants by interleaving.
     const { policy: clonePolicy } = deriveClonePolicy(toolPolicy, {
       sessionId: runtime.sessionId,
@@ -6306,7 +6311,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   ): void => {
     const record = cloneRegistry.get(cloneId);
     if (!record || !runtime.sessionId) return;
-    void pcp
+    void inkClient
       .callTool('log_activity', {
         sbSlug,
         type: status === 'completed' ? 'agent_complete' : 'error',
@@ -6355,7 +6360,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         callTool: createLocalToolDispatcher({
           cwd: process.cwd(),
           callPi: callPiTool,
-          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
           resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
           // A clone asking what it can call gets its own narrower surface —
           // the same one its prompt described, not the parent's.
@@ -6363,10 +6368,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // And what its OWN policy will refuse, which is not the same thing:
           // a derived clone policy inherits the parent's denials on top of the
           // clone's, so a parent that denies `read` yields a clone that cannot
-          // read. inspectPcpTool, never canCallPcpTool — asking what exists must
+          // read. inspectInkTool, never canCallInkTool — asking what exists must
           // not spend the parent's one-use grants.
           isHardDenied: (tool) => {
-            const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            const decision = opts.policy.inspectInkTool(bareToolName(tool), runtime.sessionId);
             return !decision.allowed && !decision.promptable;
           },
           head: (tool, args) => {
@@ -6382,7 +6387,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                   },
                 ],
                 isError: true,
-              } as PcpToolCallResult;
+              } as InkToolCallResult;
             }
             if (isClientLocalTool(tool)) {
               // A throwaway ledger AND a private signal sink. The sink is the
@@ -6476,13 +6481,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const runSpawnAgent = async (
     args: Record<string, unknown>,
     ctx: { signal?: AbortSignal }
-  ): Promise<PcpToolCallResult> => {
+  ): Promise<InkToolCallResult> => {
     const parsed = parseSpawnAgentArgs(args);
     if (!parsed.ok) {
       return {
         content: [{ type: 'text', text: parsed.error }],
         isError: true,
-      } as PcpToolCallResult;
+      } as InkToolCallResult;
     }
 
     const { tasks, wait } = parsed.request;
@@ -6493,7 +6498,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return {
         content: [{ type: 'text', text: admission.reason }],
         isError: true,
-      } as PcpToolCallResult;
+      } as InkToolCallResult;
     }
 
     const records: CloneRecord[] = tasks.map((task) => {
@@ -6557,7 +6562,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             }),
           },
         ],
-      } as PcpToolCallResult;
+      } as InkToolCallResult;
     }
 
     await running;
@@ -6571,7 +6576,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * and pick the results up when it actually needs them — including in a later
    * turn, since the registry outlives the turn that spawned them.
    */
-  const runCollectAgents = async (args: Record<string, unknown>): Promise<PcpToolCallResult> => {
+  const runCollectAgents = async (args: Record<string, unknown>): Promise<InkToolCallResult> => {
     const requested = Array.isArray(args.ids)
       ? args.ids.filter((id): id is string => typeof id === 'string')
       : undefined;
@@ -6580,7 +6585,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (ids.length === 0) {
       return {
         content: [{ type: 'text', text: 'No shadow clones have been spawned in this session.' }],
-      } as PcpToolCallResult;
+      } as InkToolCallResult;
     }
 
     const unknown = ids.filter((id) => !cloneRegistry.get(id));
@@ -6588,7 +6593,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return {
         content: [{ type: 'text', text: `Unknown clone id(s): ${unknown.join(', ')}` }],
         isError: true,
-      } as PcpToolCallResult;
+      } as InkToolCallResult;
     }
 
     if (args.wait !== false) {
@@ -6663,7 +6668,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const ledgeredClones = new Set<string>();
 
   /** Read back what clones produced, as one bounded payload. */
-  const summarizeClones = (ids: string[]): PcpToolCallResult => {
+  const summarizeClones = (ids: string[]): InkToolCallResult => {
     const outcomes: CloneOutcomeSummary[] = ids.map((id) => {
       const record = cloneRegistry.get(id);
       if (!record) return { id, label: '(unknown)', status: 'missing' };
@@ -6696,7 +6701,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     return {
       content: [{ type: 'text', text: JSON.stringify({ clones: outcomes }) }],
-    } as PcpToolCallResult;
+    } as InkToolCallResult;
   };
 
   /**
@@ -6726,7 +6731,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         callTool: createLocalToolDispatcher({
           cwd: process.cwd(),
           callPi: callPiTool,
-          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
           // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
           // emits references; actual values are injected at the execution layer
           // so credentials never enter transcripts or context.
@@ -6745,7 +6750,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           },
           audience: 'parent',
           isHardDenied: (tool) => {
-            const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            const decision = toolPolicy.inspectInkTool(bareToolName(tool), runtime.sessionId);
             return !decision.allowed && !decision.promptable;
           },
           head: (tool, args, ctx) => {
@@ -6990,7 +6995,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (runtime.sessionId && !options.nonInteractive) {
-      await pcp
+      await inkClient
         .callTool('update_session_state', {
           sbSlug,
           sessionId: runtime.sessionId,
@@ -7531,7 +7536,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             : null;
 
           const runnerLabel = 'ink';
-          pcp
+          inkClient
             .callTool('log_activity', {
               sbSlug,
               type: runResult.success ? 'agent_complete' : 'error',
@@ -7985,9 +7990,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // the same prompt/stop events the backend lifecycle hooks send.
   const turnSignal = createTurnSignal({
     getSessionId: () => runtime.sessionId,
-    getStudioId: () => currentPcpStudioId(),
+    getStudioId: () => currentInkStudioId(),
     sbSlug,
-    getServerUrl: async () => (await import('../lib/pcp-mcp.js')).getPcpServerUrl(),
+    getServerUrl: async () => (await import('../lib/ink-mcp.js')).getInkServerUrl(),
     getToken: async (serverUrl) =>
       (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),
     workingDir: process.cwd(),
@@ -8050,7 +8055,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // of running unprotected.
       const turnProtected = await turnSignal.open();
       try {
-        const gate = turnGateDecision(runtime.sessionId, turnProtected, currentPcpStudioId());
+        const gate = turnGateDecision(runtime.sessionId, turnProtected, currentInkStudioId());
         if (!gate.allow) {
           printLine(chalk.red(`Turn not started: ${gate.reason}`));
           return;
@@ -8108,9 +8113,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     runtime.sessionId
   ) {
     try {
-      const { getPcpServerUrl } = await import('../lib/pcp-mcp.js');
+      const { getInkServerUrl } = await import('../lib/ink-mcp.js');
       const { getValidAccessToken } = await import('../auth/tokens.js');
-      const streamServerUrl = getPcpServerUrl().replace(/\/+$/, '');
+      const streamServerUrl = getInkServerUrl().replace(/\/+$/, '');
       const streamToken = await getValidAccessToken(streamServerUrl);
       if (streamToken) {
         const renderSessionEvent = (evt: SessionEvent): void => {
@@ -8248,7 +8253,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : 'idle:awaiting-input';
 
     if (runtime.sessionId) {
-      await pcp
+      await inkClient
         .callTool('update_session_state', {
           sbSlug,
           sessionId: runtime.sessionId,
@@ -8672,7 +8677,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'inbox':
           if (slash.args[0] === 'full' && inkRepl) {
             // Show all inbox messages fully expanded (re-fetch and display)
-            const fullResult = (await pcp
+            const fullResult = (await inkClient
               .callTool('get_inbox', { sbSlug, status: 'unread', limit: 20 })
               .catch(() => null)) as Record<string, unknown> | null;
             const allInbox = extractInboxMessages(fullResult).sort(
@@ -8696,7 +8701,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         case 'refresh': {
           showInPanel(['Refreshing identity context from Inkwell...']);
-          const refreshResult = (await pcp
+          const refreshResult = (await inkClient
             .callTool('bootstrap', { sbSlug })
             .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
           if (refreshResult.error) {
@@ -9028,7 +9033,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             showInPanel([`Unknown scope: ${scopeArg}. Use: once, session, always, deny, revoke`]);
             break;
           }
-          const grantResult = await pcp
+          const grantResult = await inkClient
             .callTool('send_to_inbox', {
               recipientSlug: targetAgent,
               senderSlug: sbSlug,
@@ -9164,17 +9169,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
               showInPanel(['Usage: /mcp call <tool> [jsonArgs]']);
               break;
             }
-            let pcpArgs: Record<string, unknown> = {};
+            let inkArgs: Record<string, unknown> = {};
             const rawArgs = raw.split(/\s+/).slice(3).join(' ').trim();
             if (rawArgs) {
               try {
-                pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
+                inkArgs = JSON.parse(rawArgs) as Record<string, unknown>;
               } catch {
                 showInPanel(['Invalid JSON args. Example: /mcp call get_inbox {"sbSlug":"lumen"}']);
                 break;
               }
             }
-            const approved = await ensurePcpToolAllowed({
+            const approved = await ensureInkToolAllowed({
               policy: toolPolicy,
               tool,
               sessionId: runtime.sessionId,
@@ -9193,15 +9198,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
               showInPanel([`Skipped ${tool}`]);
               break;
             }
-            const result = await pcp
-              .callTool(tool, pcpArgs)
+            const result = await inkClient
+              .callTool(tool, inkArgs)
               .catch((error) => ({ error: String(error) }));
             const rendered = JSON.stringify(result, null, 2);
-            ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'pcp');
+            ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'ink');
             appendTranscript(runtime.transcriptPath, {
               type: 'pcp_tool',
               tool,
-              args: pcpArgs,
+              args: inkArgs,
               result,
             });
             showInPanel(rendered.split('\n'));
@@ -9276,23 +9281,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
           showInPanel(capLines);
           break;
         }
+        case 'ink':
         case 'pcp': {
+          // 'pcp' kept as a silent alias: it is what actually dispatched
+          // before #659, so it is the spelling in people's muscle memory.
           const tool = slash.args[0];
           if (!tool) {
             showInPanel(['Usage: /ink <tool> [jsonArgs]']);
             break;
           }
-          let pcpArgs: Record<string, unknown> = {};
+          let inkArgs: Record<string, unknown> = {};
           const rawArgs = raw.split(/\s+/).slice(2).join(' ').trim();
           if (rawArgs) {
             try {
-              pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
+              inkArgs = JSON.parse(rawArgs) as Record<string, unknown>;
             } catch {
-              showInPanel(['Invalid JSON args. Example: /pcp get_inbox {"sbSlug":"lumen"}']);
+              showInPanel(['Invalid JSON args. Example: /inkClient get_inbox {"sbSlug":"lumen"}']);
               break;
             }
           }
-          const approved = await ensurePcpToolAllowed({
+          const approved = await ensureInkToolAllowed({
             policy: toolPolicy,
             tool,
             sessionId: runtime.sessionId,
@@ -9311,15 +9319,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
             showInPanel([`Skipped ${tool}`]);
             break;
           }
-          const result = await pcp
-            .callTool(tool, pcpArgs)
+          const result = await inkClient
+            .callTool(tool, inkArgs)
             .catch((error) => ({ error: String(error) }));
           const rendered = JSON.stringify(result, null, 2);
-          ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'pcp');
+          ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'ink');
           appendTranscript(runtime.transcriptPath, {
             type: 'pcp_tool',
             tool,
-            args: pcpArgs,
+            args: inkArgs,
             result,
           });
           showInPanel(rendered.split('\n'));
@@ -9573,7 +9581,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const payload = decodeDelegationToken(token);
           lastDelegation = { token, payload };
 
-          const approved = await ensurePcpToolAllowed({
+          const approved = await ensureInkToolAllowed({
             policy: toolPolicy,
             tool: 'send_to_inbox',
             sessionId: runtime.sessionId,
@@ -9615,7 +9623,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               },
             },
           };
-          const result = await pcp
+          const result = await inkClient
             .callTool('send_to_inbox', inboxArgs)
             .catch((error) => ({ error: String(error) }));
           appendTranscript(runtime.transcriptPath, {
@@ -9706,7 +9714,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             .map((entry) => `${entry.role}: ${entry.content.slice(0, 120).replace(/\s+/g, ' ')}`)
             .join('\n');
           if (summary) {
-            await pcp
+            await inkClient
               .callTool('remember', {
                 sbSlug,
                 ...(runtime.sessionId ? { sessionId: runtime.sessionId } : {}),
@@ -9888,7 +9896,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   const summary = summarizeForSessionEnd(ledger);
   if (runtime.sessionId && !attachedToExistingSession) {
-    await pcp
+    await inkClient
       .callTool('end_session', { sbSlug, sessionId: runtime.sessionId, summary })
       .catch(() => undefined);
   }

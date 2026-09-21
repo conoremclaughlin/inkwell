@@ -1935,7 +1935,7 @@ describe('a session holding multiple studios (leak)', () => {
           id: 's-two',
           user_id: 'u',
           status: 'active',
-          lease: mk('pcp:issue:x'),
+          lease: mk('inkwell:issue:x'),
           worktree_path: null,
         },
       ],
@@ -2398,13 +2398,13 @@ describe('claim attribution never adopts a claim token (PR #650 round 1)', () =>
 
     const retry = await service.claimForTeardown('s-1', 'u', {
       reason: 'close_studio',
-      expectedThreadKey: 'pcp:pr:650',
+      expectedThreadKey: 'inkwell:pr:650',
     });
-    expect(retry!.heldThreadKey).toBe('pcp:pr:650');
+    expect(retry!.heldThreadKey).toBe('inkwell:pr:650');
     expect(retry!.heldThreadKey).not.toBe(QUARANTINE_THREAD_KEY);
 
     const claimed = tables.studio_lease_events.find((e) => e.reason === 'teardown-claimed');
-    expect(claimed!.thread_key).toBe('pcp:pr:650');
+    expect(claimed!.thread_key).toBe('inkwell:pr:650');
   });
 
   it('retireMissingWorktree attributes a stale vacant-origin claim to no session', async () => {

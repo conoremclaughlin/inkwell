@@ -39,8 +39,8 @@ import { runWithRequestContext, tokenIdentityContext } from '../utils/request-co
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { getHeartbeatTickHealth } from '../services/heartbeat';
-import { PcpAuthProvider } from './auth/pcp-auth-provider';
-import { signPcpAccessToken } from '../auth/pcp-tokens';
+import { InkAuthProvider } from './auth/ink-auth-provider';
+import { signInkAccessToken } from '../auth/ink-tokens';
 
 export { setWhatsAppListener, getAgentGateway };
 
@@ -74,12 +74,12 @@ export class MCPServer {
   private toolsVersion = 0;
   private channelGateway: ChannelGateway | null = null;
   private config: MCPServerConfig;
-  private authProvider: PcpAuthProvider;
+  private authProvider: InkAuthProvider;
 
   constructor(dataComposer: DataComposer, config: MCPServerConfig = {}) {
     this.dataComposer = dataComposer;
     this.config = config;
-    this.authProvider = new PcpAuthProvider();
+    this.authProvider = new InkAuthProvider();
 
     // Load mini-apps once (shared across all sessions)
     this.miniApps = loadMiniApps();
@@ -446,7 +446,7 @@ export class MCPServer {
 
       // Parse x-ink-context early so we can use it for auth fallback.
       const contextHeader = req.header('x-ink-context')?.trim();
-      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
+      let contextToken: import('@inklabs/shared').InkContextToken | null = null;
       if (contextHeader) {
         const { decodeContextToken } = await import('@inklabs/shared');
         contextToken = decodeContextToken(contextHeader);
@@ -481,7 +481,7 @@ export class MCPServer {
 
       if (shouldChallenge) {
         const challengeParts = [
-          'Bearer realm="pcp"',
+          'Bearer realm="inkwell"',
           'scope="mcp:tools"',
           `authorization_uri="${baseUrl}/authorize"`,
           `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
@@ -737,11 +737,11 @@ export class MCPServer {
     app.post('/register', express.json(), (req, res) => {
       logger.info('MCP /register called', { body: req.body });
 
-      const clientId = req.body.client_id || `pcp-client-${Date.now()}`;
+      const clientId = req.body.client_id || `ink-client-${Date.now()}`;
 
       res.json({
         client_id: clientId,
-        client_secret: 'pcp-local-secret',
+        client_secret: 'ink-local-secret',
         redirect_uris: req.body.redirect_uris || ['http://localhost:3001/callback'],
         token_endpoint_auth_method: 'client_secret_post',
         grant_types: ['authorization_code', 'refresh_token'],
@@ -929,7 +929,7 @@ export class MCPServer {
         return;
       }
 
-      const accessToken = signPcpAccessToken(
+      const accessToken = signInkAccessToken(
         {
           type: 'mcp_access',
           sub: userData.userId,

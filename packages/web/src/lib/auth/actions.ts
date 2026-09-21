@@ -2,7 +2,7 @@
 
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
-import { provisionPcpUserAndWorkspace } from '@/lib/auth/provision';
+import { provisionInkUserAndWorkspace } from '@/lib/auth/provision';
 
 type AuthResult = { success: true } | { error: string } | { mcpRedirectUrl: string };
 
@@ -23,7 +23,7 @@ export async function signInWithPassword(
   }
 
   if (data.session?.access_token) {
-    await provisionPcpUserAndWorkspace(data.session.access_token);
+    await provisionInkUserAndWorkspace(data.session.access_token);
   }
 
   // MCP OAuth flow: build callback URL with tokens
@@ -105,7 +105,7 @@ export async function signUpWithPassword(
 }
 
 export async function signOut(): Promise<never> {
-  // Revoke PCP admin tokens (self-issued JWTs independent of Supabase session)
+  // Revoke Inkwell admin tokens (self-issued JWTs independent of Supabase session)
   const { cookies } = await import('next/headers');
   const cookieStore = await cookies();
   const refreshToken = cookieStore.get('pcp-admin-refresh')?.value;
@@ -123,7 +123,7 @@ export async function signOut(): Promise<never> {
     }
   }
 
-  // Clear PCP admin cookies from browser
+  // Clear Inkwell admin cookies from browser
   cookieStore.delete({ name: 'pcp-admin-token', path: '/api/admin' });
   cookieStore.delete({ name: 'pcp-admin-refresh', path: '/api/admin' });
 

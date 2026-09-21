@@ -24,9 +24,9 @@ class DataTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.workdir = Path(self.temp.name)
-        self.project = "pcp-integration"
+        self.project = "ink-integration"
         self.id = "a" * 64
-        self.info = {"id": self.id, "name": "/supabase_db_pcp-integration",
+        self.info = {"id": self.id, "name": "/supabase_db_ink-integration",
                      "project": self.project, "running": True, "paused": False,
                      "ports": [{"HostIp": "127.0.0.1", "HostPort": "55422"}]}
         self.baseline = "-- Synthetic fixture baseline; no real records.\nSELECT 1;\n"
@@ -80,7 +80,7 @@ class DataTests(unittest.TestCase):
 
     def test_wrong_container_identity_refuses_in_isolation(self):
         for field, value in (("id", "b" * 64), ("name", "/supabase_db_application"),
-                             ("name", "/supabase_db_pcp-integration-copy"),
+                             ("name", "/supabase_db_ink-integration-copy"),
                              ("project", "application"), ("running", False),
                              ("paused", True),
                              ("ports", [{"HostPort": "54322"}]), ("ports", []),
@@ -99,7 +99,7 @@ class DataTests(unittest.TestCase):
                 data.validate_identity(bad, self.project, self.id, 55422)
 
     def test_project_namespace_and_recorded_id_are_not_prefix_matches(self):
-        for project, recorded in (("application", self.id), ("pcp-integrationX", self.id),
+        for project, recorded in (("application", self.id), ("ink-integrationX", self.id),
                                   (self.project, ""), (self.project, None), (self.project, self.id[:11]),
                                   (self.project, "--all")):
             with self.subTest(project=project, recorded=recorded), self.assertRaises(data.Refusal):
@@ -220,7 +220,7 @@ class DataTests(unittest.TestCase):
 
     def test_same_connection_identity_guard_precedes_marker_and_mutation(self):
         self.clean()
-        updates = [opts["input"] for _, opts in self.calls if "UPDATE _pcp_it.stack" in (opts.get("input") or "")]
+        updates = [opts["input"] for _, opts in self.calls if "UPDATE _ink_it.stack" in (opts.get("input") or "")]
         self.assertEqual(len(updates), 1)
         update = updates[0]
         for sql in (update, self.mutations()[0]):
@@ -229,7 +229,7 @@ class DataTests(unittest.TestCase):
             self.assertIn("FOR UPDATE", sql)
             self.assertIn("IF NOT FOUND", sql)
             self.assertIn("RAISE EXCEPTION 'Fixture stack identity mismatch'", sql)
-        self.assertLess(update.index("Fixture stack identity mismatch"), update.index("UPDATE _pcp_it.stack"))
+        self.assertLess(update.index("Fixture stack identity mismatch"), update.index("UPDATE _ink_it.stack"))
         self.assertIn("run_id = " + data.literal(self.run_id), self.mutations()[0])
 
     def test_checksum_queries_do_not_depend_on_dump_search_path(self):
@@ -237,7 +237,7 @@ class DataTests(unittest.TestCase):
         for table in data.FIXTURE_TABLES + data.EXCLUDED_TABLES:
             with self.subTest(table=table):
                 self.assertIn("FROM public." + table + " AS t", sql)
-        self.assertIn("FROM _pcp_it.stack", sql)
+        self.assertIn("FROM _ink_it.stack", sql)
 
     def test_excluded_and_full_checksums_bracket_the_mutation(self):
         self.clean()
@@ -249,7 +249,7 @@ class DataTests(unittest.TestCase):
     def test_cold_capture_initializes_database_marker_before_returning(self):
         result = data.capture_baseline(self.workdir, self.project, self.id, 55422, [7], self.signature, self.run_id)
         sql = self.calls[-1][1]["input"]
-        self.assertIn("CREATE SCHEMA IF NOT EXISTS _pcp_it", sql)
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS _ink_it", sql)
         self.assertIn("REVOKE ALL ON SCHEMA", sql)
         for value in (result["token"], self.signature, self.id, self.project, self.run_id):
             self.assertIn(data.literal(value), sql)
@@ -261,7 +261,7 @@ class DataTests(unittest.TestCase):
         sql = self.calls[-1][1]["input"]
         self.assertIn("run_id = " + data.literal(self.run_id), sql)
         self.assertIn("Fixture stack identity mismatch", sql)
-        self.assertIn("UPDATE _pcp_it.stack SET run_id = NULL", sql)
+        self.assertIn("UPDATE _ink_it.stack SET run_id = NULL", sql)
         self.assertFalse(self.mutations())
 
     def test_libpq_service_is_unset_not_assigned_an_empty_name(self):
@@ -282,7 +282,7 @@ class DataTests(unittest.TestCase):
         self.assertNotIn("synthetic-private-detail", message)
 
     def test_self_consistent_application_identity_is_refused_by_namespace(self):
-        for project in ("application", "pcp-integrationX"):
+        for project in ("application", "ink-integrationX"):
             info = dict(self.info, project=project, name="/supabase_db_" + project,
                         ports=[{"HostPort": "54322"}])
             with self.subTest(project=project), self.assertRaisesRegex(data.Refusal, "integration project name"):

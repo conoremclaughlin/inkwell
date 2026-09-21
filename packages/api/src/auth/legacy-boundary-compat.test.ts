@@ -28,7 +28,7 @@ vi.mock('../utils/logger', () => ({
 // package's built dist/, so a test using it exercises the last build rather than
 // the code under review. Mutating the source left such a test green.
 import { decodeContextToken, encodeContextToken } from '../../../shared/src/runner/mcp-config';
-import { normalizePendingAuth } from '../mcp/auth/pcp-auth-provider';
+import { normalizePendingAuth } from '../mcp/auth/ink-auth-provider';
 // NOT from '../routes/admin': that module registers ~100 Express routes and
 // an auth middleware at module scope.
 import { archivedMetadataSlug } from '../utils/archived-metadata';
@@ -112,7 +112,7 @@ describe('pending-auth JWTs issued before the rename', () => {
     ) as never;
 
     // handleAuthCallback verifies with jwt.verify() directly, so it never
-    // reaches verifyPcpAccessToken's normalization. Losing the slug here mints
+    // reaches verifyInkAccessToken's normalization. Losing the slug here mints
     // an access AND refresh credential with no SB binding at all.
     expect(normalizePendingAuth(payload).sbSlug).toBe('aster');
   });

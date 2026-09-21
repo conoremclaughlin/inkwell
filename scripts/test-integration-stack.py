@@ -36,7 +36,7 @@ class LifecycleTests(unittest.TestCase):
         self.harness = self.root / "scripts/test-integration-db-local.sh"
         self.env = {"INTEGRATION_SUPABASE_CACHE_DIR": str(self.root / "cache"),
                     "INTEGRATION_SUPABASE_WORKDIR_BASE": str(self.root)}
-        self.project = "pcp-integration"
+        self.project = "ink-integration"
         self.db = "supabase_db_" + self.project
         self.current = {}
         self.calls = []
@@ -282,6 +282,41 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.count("supabase"), 0)
         self.assertEqual(self.count("bash"), 0)
 
+    def test_stop_reports_an_orphaned_pre_rename_stack(self):
+        # #659 renamed the default project, so a stack retained under
+        # pcp-integration lives in its own cache dir. A default --stop looked
+        # at ink-integration, found nothing, and exited 0 while the old
+        # containers kept running.
+        legacy = {"supabase_db_pcp-integration": "legacy-container"}
+        with mock.patch.object(
+            stack, "containers", lambda name: legacy if name == "pcp-integration" else {}
+        ):
+            with self.assertRaisesRegex(stack.Refusal, "pcp-integration"):
+                self.run_stack("--stop")
+
+    def test_legacy_project_is_stop_only_and_refuses_before_touching_anything(self):
+        # The rest of the harness is not legacy-aware (validate_identity wants
+        # an ink-integration name; the bookkeeping schema is _ink_it). A suite
+        # or reset against a pre-rename stack must refuse up front rather than
+        # fail somewhere past the first mutation.
+        self.env["INTEGRATION_SUPABASE_PROJECT_ID"] = "pcp-integration"
+        for args in ((), ("--reset",), ("--fresh",)):
+            with self.assertRaisesRegex(stack.Refusal, "--stop"):
+                self.run_stack(*args)
+        # Nothing ran: no supabase call, no suite, no reset.
+        self.assertEqual(self.count("supabase"), 0)
+        self.assertEqual(self.count("bash"), 0)
+
+    def test_legacy_project_may_still_be_stopped(self):
+        self.env["INTEGRATION_SUPABASE_PROJECT_ID"] = "pcp-integration"
+        self.assertEqual(self.run_stack("--stop"), 0)
+
+    def test_stop_stays_quiet_when_no_legacy_stack_is_running(self):
+        # Control: the refusal must depend on the legacy stack existing, not
+        # fire on every --stop with nothing to do.
+        with mock.patch.object(stack, "containers", lambda _name: {}):
+            self.assertEqual(self.run_stack("--stop"), 0)
+
     def test_same_project_new_container_identity_is_not_adopted(self):
         self.run_stack()
         self.current[self.db] = "replacement-container"
@@ -445,7 +480,7 @@ class LifecycleTests(unittest.TestCase):
             expected = expected.replace(str(port), "PORT_" + str(index))
         for index, port in enumerate(ports):
             expected = expected.replace("PORT_" + str(index), str(port))
-        self.assertEqual(self.state()["config"], 'project_id = "pcp-integration"\n' + expected)
+        self.assertEqual(self.state()["config"], 'project_id = "ink-integration"\n' + expected)
 
     def test_missing_port_diagnostic_names_each_missing_section_and_key(self):
         config = TEST_CONFIG.replace("port = 54321\n", "").replace("smtp_port = 54325\n", "")
@@ -633,7 +668,7 @@ class LifecycleTests(unittest.TestCase):
         self.run_stack()
         path = self.root / "cache" / self.project / "state.json"
         state = self.state()
-        state["project"] = "pcp-integration-sibling"
+        state["project"] = "ink-integration-sibling"
         path.write_text(json.dumps(state))
         self.current = {}
         with self.assertRaisesRegex(stack.Refusal, "different project"):
@@ -686,17 +721,17 @@ class PrimitiveTests(unittest.TestCase):
             path = Path(directory)
             child = None
             try:
-                with stack.locks(path, "pcp-integration", [55000]) as fds:
+                with stack.locks(path, "ink-integration", [55000]) as fds:
                     # Harmless child waits on its pipe; no executor, DB, or real suite.
                     child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
                                              stdin=subprocess.PIPE, pass_fds=fds)
                 with self.assertRaises(stack.Refusal) as error:
-                    with stack.locks(path, "pcp-integration", [55000]):
+                    with stack.locks(path, "ink-integration", [55000]):
                         self.fail("child lost the ownership lock")
                 self.assertIn("lsof -nP " + str(path / "port-55000.lock"), str(error.exception))
                 self.assertIn("never delete the lock file", str(error.exception))
                 child.communicate(timeout=5)
-                with stack.locks(path, "pcp-integration", [55000]):
+                with stack.locks(path, "ink-integration", [55000]):
                     pass
             finally:
                 if child and child.poll() is None:
@@ -705,25 +740,39 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_project_namespace_and_ports(self):
         for env in ({"INTEGRATION_SUPABASE_PROJECT_ID": "application"},
-                    {"INTEGRATION_SUPABASE_PROJECT_ID": "../pcp-integration"},
+                    {"INTEGRATION_SUPABASE_PROJECT_ID": "../ink-integration"},
                     {"INTEGRATION_SUPABASE_API_PORT": "54321/path"},
                     {"INTEGRATION_SUPABASE_API_PORT": "0"},
                     {"INTEGRATION_SUPABASE_API_PORT": "55422"}):
             with self.assertRaises(stack.Refusal):
                 stack.settings(env)
 
+    def test_legacy_project_name_is_still_reachable(self):
+        # A stack created before #659 is named pcp-integration and its
+        # containers carry com.supabase.cli.project=pcp-integration. Refusing
+        # the name would strand it: no reset, and no --stop either.
+        for project in ("pcp-integration", "pcp-integration-sibling"):
+            resolved, _ports, _exclude = stack.settings(
+                {"INTEGRATION_SUPABASE_PROJECT_ID": project}
+            )
+            self.assertEqual(resolved, project)
+
+    def test_default_project_is_the_current_name(self):
+        # Control: accepting the legacy name must not make it the default.
+        self.assertEqual(stack.settings({})[0], "ink-integration")
+
     def test_locks_conflict_on_project_or_ports_and_release_without_unlinking(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            with stack.locks(path, "pcp-integration-a", [55000]):
-                for project, ports in (("pcp-integration-a", [55001]),
-                                       ("pcp-integration-b", [55000])):
+            with stack.locks(path, "ink-integration-a", [55000]):
+                for project, ports in (("ink-integration-a", [55001]),
+                                       ("ink-integration-b", [55000])):
                     with self.assertRaisesRegex(stack.Refusal, "Wait.*sparingly"):
                         with stack.locks(path, project, ports):
                             self.fail("contending lock acquired")
-                with stack.locks(path, "pcp-integration-b", [55002]):
+                with stack.locks(path, "ink-integration-b", [55002]):
                     pass
-            with stack.locks(path, "pcp-integration-a", [55000]):
+            with stack.locks(path, "ink-integration-a", [55000]):
                 pass
 
     def test_busy_port_names_owner_and_wait_guidance(self):

@@ -1,7 +1,7 @@
 /**
- * PCP CLI
+ * Inkwell CLI
  *
- * Programmatic API for PCP CLI functionality.
+ * Programmatic API for Inkwell CLI functionality.
  * For CLI usage, see cli.ts
  */
 
@@ -32,7 +32,7 @@ export interface StudioInfo {
 /** @deprecated Use StudioInfo */
 export type WorkspaceInfo = StudioInfo;
 
-export interface PcpConfig {
+export interface InkUserConfig {
   userId?: string;
   email?: string;
   agentMapping?: Record<string, string>;

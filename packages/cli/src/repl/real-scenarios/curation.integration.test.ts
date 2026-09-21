@@ -1,5 +1,5 @@
 /**
- * Recall curation — live PCP integration.
+ * Recall curation — live Inkwell integration.
  *
  * Exercises the full recall → score → curate_recall pipeline:
  * 1. Run scenario (which calls recall internally with its topicSignal)
@@ -23,14 +23,14 @@ import { runScenario, type RecallFn } from './runner.js';
 import { loadScenariosFromDir, defaultFixturesDir } from './loader.js';
 import type { ScenarioResult } from './types.js';
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const AGENT_ID = process.env.AGENT_ID || 'wren';
 const PERSIST_ENABLED = process.env.CURATE_PERSIST === 'true';
 
 let serverAvailable = false;
 let curateToolAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
@@ -42,7 +42,7 @@ if (serverAvailable && PERSIST_ENABLED) {
     const auth = JSON.parse(readFileSync(authPath, 'utf-8'));
     const token = auth.accessToken || auth.access_token;
     const resp = execSync(
-      `curl -sf -m 5 ${PCP_URL}/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'Authorization: Bearer ${token}' -d '${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'curate_recall', arguments: { query: 'probe', accepted: [], dismissed: [], sbSlug: 'wren' } } })}'`,
+      `curl -sf -m 5 ${INK_URL}/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'Authorization: Bearer ${token}' -d '${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'curate_recall', arguments: { query: 'probe', accepted: [], dismissed: [], sbSlug: 'wren' } } })}'`,
       { encoding: 'utf-8' }
     );
     curateToolAvailable = !resp.includes('Tool curate_recall not found');
@@ -90,7 +90,7 @@ function getAccessToken(): string {
 }
 
 async function mcpCall<T>(toolName: string, args: Record<string, unknown>): Promise<T> {
-  const resp = await fetch(`${PCP_URL}/mcp`, {
+  const resp = await fetch(`${INK_URL}/mcp`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -117,7 +117,7 @@ async function mcpCall<T>(toolName: string, args: Record<string, unknown>): Prom
   return JSON.parse(text) as T;
 }
 
-async function pcpRecallWithScores(query: string, limit: number): Promise<ScoredRecallMemory[]> {
+async function inkRecallWithScores(query: string, limit: number): Promise<ScoredRecallMemory[]> {
   const parsed = await mcpCall<RecallResponse>('recall', {
     query,
     sbSlug: AGENT_ID,
@@ -128,7 +128,7 @@ async function pcpRecallWithScores(query: string, limit: number): Promise<Scored
   return parsed.memories;
 }
 
-async function pcpCurateRecall(
+async function inkCurateRecall(
   query: string,
   accepted: CurateEntry[],
   dismissed: CurateEntry[]
@@ -180,7 +180,7 @@ function classifyMemories(
   return { accepted, dismissed };
 }
 
-describe('real-scenarios: recall curation (live PCP)', () => {
+describe('real-scenarios: recall curation (live Inkwell)', () => {
   it.skipIf(!serverAvailable)(
     'recall → score → curate pipeline for all fixtures',
     { timeout: 120_000 },
@@ -203,7 +203,7 @@ describe('real-scenarios: recall curation (live PCP)', () => {
 
         const scoredRecallFn: RecallFn = async (query, limit) => {
           lastQuery = query;
-          const memories = await pcpRecallWithScores(query, limit);
+          const memories = await inkRecallWithScores(query, limit);
           lastScoredResults.length = 0;
           lastScoredResults.push(...memories);
           return memories.map((m) => ({ id: m.id, content: m.content, summary: m.summary }));
@@ -217,7 +217,7 @@ describe('real-scenarios: recall curation (live PCP)', () => {
         // 3. Optionally persist via curate_recall (same query the runner used)
         let feedbackSaved = 0;
         if (PERSIST_ENABLED && curateToolAvailable && accepted.length + dismissed.length > 0) {
-          const curationResult = await pcpCurateRecall(lastQuery, accepted, dismissed);
+          const curationResult = await inkCurateRecall(lastQuery, accepted, dismissed);
           expect(curationResult.success).toBe(true);
           expect(curationResult.dismissedMemoryIds).toHaveLength(dismissed.length);
           feedbackSaved = curationResult.feedbackSaved;

@@ -103,7 +103,7 @@ export class CodexRunner implements IRunner {
         isResume,
         workingDirectory: config.workingDirectory,
         messageLength: fullMessage.length,
-        hasPcpAccessToken: !!config.pcpAccessToken,
+        hasInkAccessToken: !!config.inkAccessToken,
       });
 
       const result = await this.spawnProcess(args, runConfig);
@@ -243,10 +243,10 @@ export class CodexRunner implements IRunner {
     const codexBin = await resolveBinaryPath('codex');
 
     const runtimeLinkId = randomUUID();
-    if (config.pcpSessionId && config.workingDirectory) {
+    if (config.inkSessionId && config.workingDirectory) {
       writeRuntimeSessionHint(
         config.workingDirectory,
-        config.pcpSessionId,
+        config.inkSessionId,
         config.sbSlug || 'unknown',
         'codex',
         runtimeLinkId,
@@ -265,10 +265,10 @@ export class CodexRunner implements IRunner {
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
-          pcpSessionId: config.pcpSessionId,
-          runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
+          inkSessionId: config.inkSessionId,
+          runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
-          accessToken: config.pcpAccessToken,
+          accessToken: config.inkAccessToken,
           sbSlug: config.sbSlug,
           runtime: 'codex',
           repoRoot: config.repoRoot,
@@ -545,7 +545,7 @@ export class CodexRunner implements IRunner {
     containerPath?: string;
     cleanup: () => void;
   } {
-    const dir = runtimeDir || mkdtempSync(join(tmpdir(), 'pcp-codex-'));
+    const dir = runtimeDir || mkdtempSync(join(tmpdir(), 'ink-codex-'));
     const filename = `identity-${process.pid}-${Date.now()}.md`;
     const promptPath = join(dir, filename);
     writeFileSync(promptPath, content || 'Follow system identity instructions.');
@@ -581,7 +581,7 @@ export class CodexRunner implements IRunner {
 
     // Fallback: BFS scan for common session ID keys.
     // Only match session/thread IDs — NOT conversationId, which often
-    // contains PCP routing keys (e.g., "trigger:lumen:thread:foo")
+    // contains Inkwell routing keys (e.g., "trigger:lumen:thread:foo")
     // that are unrelated to the backend session.
     const queue: unknown[] = [event];
     const sessionKeys = new Set(['session_id', 'sessionId', 'thread_id', 'threadId']);

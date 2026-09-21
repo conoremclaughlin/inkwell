@@ -24,7 +24,7 @@ import { homedir } from 'os';
 import { getBackend, resolveSlug } from '../backends/index.js';
 import { classifyError } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
-import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
 import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
@@ -49,7 +49,7 @@ export interface SbOptions {
   dangerous?: boolean;
 }
 
-interface PcpConfig {
+interface InkUserConfig {
   email?: string;
 }
 
@@ -60,7 +60,7 @@ interface BootstrapContextResult {
   activeSessions?: Array<Record<string, unknown>>;
 }
 
-interface PcpSessionSummary {
+interface InkSessionSummary {
   id: string;
   sbSlug?: string | null;
   studioId?: string | null;
@@ -79,7 +79,7 @@ interface PcpSessionSummary {
 }
 
 interface ListSessionsResult {
-  sessions?: PcpSessionSummary[];
+  sessions?: InkSessionSummary[];
 }
 
 interface BackendLocalSessionSummary {
@@ -272,15 +272,15 @@ export function resolveAdoptableLocalBackendSessionId(options: {
   backend: string;
   backendSessionId?: string;
   selectedLocalBackendSessionId?: string;
-  createdNewPcpSession?: boolean;
-  chosen?: PcpSessionSummary;
+  createdNewInkSession?: boolean;
+  chosen?: InkSessionSummary;
   localSessions: BackendLocalSessionSummary[];
 }): string | undefined {
   const {
     backend,
     backendSessionId,
     selectedLocalBackendSessionId,
-    createdNewPcpSession,
+    createdNewInkSession,
     chosen,
     localSessions,
   } = options;
@@ -289,7 +289,7 @@ export function resolveAdoptableLocalBackendSessionId(options: {
   // Never auto-adopt an existing backend-local session when the user explicitly
   // created a brand-new Inkwell session from the picker. "Start new session" must
   // launch a fresh backend conversation, not resume a prior local one.
-  if (createdNewPcpSession) return undefined;
+  if (createdNewInkSession) return undefined;
   if (!chosen?.id || localSessions.length === 0) return undefined;
   if (localSessions.length === 1) return localSessions[0].sessionId;
 
@@ -327,13 +327,13 @@ interface CodexSessionMetaLine {
 }
 
 interface BackendExecutionLogContext {
-  pcpConfig: PcpConfig | null;
+  inkConfig: InkUserConfig | null;
   sbSlug: string;
   backend: string;
   binary: string;
   args: string[];
   promptParts?: string[];
-  pcpSessionId?: string;
+  inkSessionId?: string;
   backendSessionId?: string;
   studioId?: string;
   runtimeLinkId?: string;
@@ -349,7 +349,7 @@ type LogActivityResult = {
   activity?: { id?: string };
 };
 
-function getSessionBackendId(session: PcpSessionSummary): string | undefined {
+function getSessionBackendId(session: InkSessionSummary): string | undefined {
   return session.backendSessionId || session.claudeSessionId || undefined;
 }
 
@@ -362,7 +362,7 @@ function normalizeSessionBackendName(backend: string | null | undefined): string
   return normalized;
 }
 
-function isSessionResumable(session: PcpSessionSummary): boolean {
+function isSessionResumable(session: InkSessionSummary): boolean {
   if (session.endedAt) return false;
 
   const phase = (session.currentPhase || '').trim().toLowerCase();
@@ -376,10 +376,10 @@ function isSessionResumable(session: PcpSessionSummary): boolean {
 
 export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string }>(
   localSessions: T[],
-  activePcpSessions: PcpSessionSummary[]
+  activeInkSessions: InkSessionSummary[]
 ): T[] {
   const trackedSessionIds = new Set(
-    activePcpSessions
+    activeInkSessions
       .map((session) => getSessionBackendId(session))
       .filter((sessionId): sessionId is string => Boolean(sessionId))
   );
@@ -389,13 +389,13 @@ export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string
 
 export function filterUntrackedLocalBackendSessions<T extends { sessionId: string }>(
   localSessions: T[],
-  activePcpSessions: PcpSessionSummary[]
+  activeInkSessions: InkSessionSummary[]
 ): T[] {
-  return filterUntrackedLocalClaudeSessions(localSessions, activePcpSessions);
+  return filterUntrackedLocalClaudeSessions(localSessions, activeInkSessions);
 }
 
 export function shouldAutoResumeRuntimeSession(
-  existing: { pcpSessionId?: string; backendSessionId?: string } | undefined,
+  existing: { inkSessionId?: string; backendSessionId?: string } | undefined,
   isTty: boolean
 ): boolean {
   // CRITICAL UX NOTE:
@@ -413,7 +413,7 @@ export function shouldAutoResumeRuntimeSession(
   // If you modify this function, manually verify both:
   //   ink -a <agent> -b <backend>          # TTY: picker appears
   //   echo "prompt" | ink -a <agent> ...   # non-TTY: no picker, deterministic auto behavior
-  return Boolean(existing?.pcpSessionId && !isTty);
+  return Boolean(existing?.inkSessionId && !isTty);
 }
 
 function isPromptCancelError(err: unknown): boolean {
@@ -429,9 +429,9 @@ function isPromptCancelError(err: unknown): boolean {
   );
 }
 
-async function resolvePcpAuthEnv(verbose: boolean): Promise<Record<string, string>> {
+async function resolveInkAuthEnv(verbose: boolean): Promise<Record<string, string>> {
   try {
-    const token = await getValidAccessToken(getPcpServerUrl());
+    const token = await getValidAccessToken(getInkServerUrl());
     if (token) {
       if (verbose) console.log(chalk.dim('Inkwell auth: token injected'));
       return { INK_ACCESS_TOKEN: token };
@@ -450,7 +450,7 @@ function truncateForStartupContext(value: string, maxChars: number): string {
 
 function buildInjectedStartupContext(
   bootstrap: BootstrapContextResult,
-  sessionIds?: { pcpSessionId?: string; studioId?: string; studioName?: string }
+  sessionIds?: { inkSessionId?: string; studioId?: string; studioName?: string }
 ): string {
   const sections: string[] = [
     '_Generated by `ink` at session start from Inkwell `bootstrap`._',
@@ -458,8 +458,8 @@ function buildInjectedStartupContext(
   ];
 
   // Session identity — always-available IDs for debugging and routing verification
-  if (sessionIds?.pcpSessionId) {
-    const idParts: string[] = [`- Inkwell Session: \`${sessionIds.pcpSessionId}\``];
+  if (sessionIds?.inkSessionId) {
+    const idParts: string[] = [`- Inkwell Session: \`${sessionIds.inkSessionId}\``];
     if (sessionIds.studioId) {
       const label = sessionIds.studioName
         ? `${sessionIds.studioId} (${sessionIds.studioName})`
@@ -532,28 +532,28 @@ function buildInjectedStartupContext(
 async function resolveCodexStartupContextBlock(options: {
   backend: string;
   sbSlug: string;
-  pcpConfig: PcpConfig | null;
+  inkConfig: InkUserConfig | null;
   hasAuthToken: boolean;
   verbose: boolean;
-  pcpSessionId?: string;
+  inkSessionId?: string;
 }): Promise<string | undefined> {
-  const { backend, sbSlug, pcpConfig, hasAuthToken, verbose, pcpSessionId } = options;
+  const { backend, sbSlug, inkConfig, hasAuthToken, verbose, inkSessionId } = options;
   if (backend !== 'codex') return undefined;
   if (!hasAuthToken) {
     sbDebugLog('sb', 'codex_startup_context_skipped', {
       reason: 'no_auth_token',
       sbSlug,
       backend,
-      pcpSessionId: pcpSessionId || null,
+      inkSessionId: inkSessionId || null,
     });
     return undefined;
   }
 
   try {
-    const bootstrap = await callPcpTool<BootstrapContextResult>(
+    const bootstrap = await callInkTool<BootstrapContextResult>(
       'bootstrap',
       {
-        email: pcpConfig?.email,
+        email: inkConfig?.email,
         sbSlug,
       },
       { timeoutMs: 5000, callerProfile: 'runtime' }
@@ -563,14 +563,14 @@ async function resolveCodexStartupContextBlock(options: {
       process.cwd()
     );
     const startupContextBlock = buildInjectedStartupContext(bootstrap, {
-      pcpSessionId,
+      inkSessionId,
       studioId: ctxStudioId,
       studioName: ctxStudioName,
     });
     sbDebugLog('sb', 'codex_startup_context_injected', {
       sbSlug,
       backend,
-      pcpSessionId: pcpSessionId || null,
+      inkSessionId: inkSessionId || null,
       bytes: Buffer.byteLength(startupContextBlock, 'utf-8'),
     });
     if (verbose)
@@ -580,7 +580,7 @@ async function resolveCodexStartupContextBlock(options: {
     sbDebugLog('sb', 'codex_startup_context_failed', {
       sbSlug,
       backend,
-      pcpSessionId: pcpSessionId || null,
+      inkSessionId: inkSessionId || null,
       error: error instanceof Error ? error.message : String(error),
     });
     if (verbose) console.log(chalk.dim('Inkwell startup context: unavailable (continuing)'));
@@ -588,11 +588,11 @@ async function resolveCodexStartupContextBlock(options: {
   }
 }
 
-function getPcpConfig(): PcpConfig | null {
+function getInkUserConfig(): InkUserConfig | null {
   const configPath = join(homedir(), '.ink', 'config.json');
   if (!existsSync(configPath)) return null;
   try {
-    return JSON.parse(readFileSync(configPath, 'utf-8')) as PcpConfig;
+    return JSON.parse(readFileSync(configPath, 'utf-8')) as InkUserConfig;
   } catch {
     return null;
   }
@@ -635,7 +635,7 @@ async function resolveStudioId(cwd: string): Promise<{
 
   // No UUID in identity.json — try resolving via Inkwell API by worktree path
   try {
-    const result = await callPcpTool<{ studio?: { id?: string } }>(
+    const result = await callInkTool<{ studio?: { id?: string } }>(
       'get_studio',
       { path: cwd },
       { timeoutMs: 3000 }
@@ -885,7 +885,7 @@ function withAgentPreviewSpeaker(
  * the lookup limit, but go stale rather than being re-registered.
  */
 export function buildBackendSessionOwnerIndex(
-  allAgentSessions: PcpSessionSummary[],
+  allAgentSessions: InkSessionSummary[],
   runtimeRecords: RuntimeSessionRecord[]
 ): Map<string, string> {
   const owners = new Map<string, string>();
@@ -916,7 +916,7 @@ export function withSessionFileSize(
   return `${size} · ${normalized}`;
 }
 
-function getSessionPhaseLabel(session: PcpSessionSummary): string | undefined {
+function getSessionPhaseLabel(session: InkSessionSummary): string | undefined {
   const currentPhase = (session.currentPhase || '').trim();
   if (currentPhase) return currentPhase;
 
@@ -977,7 +977,7 @@ function extractLatestPreviewFromCodexRolloutJsonl(
   return latest;
 }
 
-export function extractLatestPreviewFromPcpTranscriptJsonl(
+export function extractLatestPreviewFromInkTranscriptJsonl(
   jsonl: string
 ): SessionPreviewSummary | undefined {
   const events = parseJsonl(jsonl);
@@ -1039,7 +1039,7 @@ export function extractLatestPreviewFromClaudeSessionJsonl(
   return latest;
 }
 
-function findLatestPcpReplTranscriptForSession(
+function findLatestInkReplTranscriptForSession(
   sessionId: string,
   cwd = process.cwd()
 ): string | undefined {
@@ -1101,16 +1101,16 @@ function findLatestPcpReplTranscriptForSession(
   return candidates[0];
 }
 
-function getPcpSessionPreviewLabel(
-  session: PcpSessionSummary,
+function getInkSessionPreviewLabel(
+  session: InkSessionSummary,
   assistantLabel: string,
   cwd = process.cwd()
 ): string | undefined {
-  const transcriptPath = findLatestPcpReplTranscriptForSession(session.id, cwd);
+  const transcriptPath = findLatestInkReplTranscriptForSession(session.id, cwd);
   if (!transcriptPath) return undefined;
   try {
     const content = readFileSync(transcriptPath, 'utf-8');
-    const summary = extractLatestPreviewFromPcpTranscriptJsonl(content);
+    const summary = extractLatestPreviewFromInkTranscriptJsonl(content);
     if (!summary) return undefined;
     return formatSessionPreviewText(summary, { assistantLabel });
   } catch {
@@ -1162,12 +1162,12 @@ export function sanitizeBackendExecutionArgs(
   return sanitized;
 }
 
-export function filterPcpSessionsForContext(
-  sessions: PcpSessionSummary[],
+export function filterInkSessionsForContext(
+  sessions: InkSessionSummary[],
   backend: string,
   cwd = process.cwd(),
   localBackendSessionIds: Set<string> = new Set()
-): PcpSessionSummary[] {
+): InkSessionSummary[] {
   const normalizedCwd = normalizePath(cwd);
   const normalizedBackend = normalizeSessionBackendName(backend);
   const nowMs = Date.now();
@@ -1185,8 +1185,8 @@ export function filterPcpSessionsForContext(
     return backendMatched;
   }
 
-  const pathScoped: PcpSessionSummary[] = [];
-  const ambiguous: PcpSessionSummary[] = [];
+  const pathScoped: InkSessionSummary[] = [];
+  const ambiguous: InkSessionSummary[] = [];
 
   for (const session of backendMatched) {
     const localMatchedId = session.backendSessionId || session.claudeSessionId;
@@ -1217,7 +1217,7 @@ export function filterPcpSessionsForContext(
   if (backend === 'claude') return pathScoped;
   if (pathScoped.length === 0 && ambiguous.length === 0) return [];
 
-  const deduped = new Map<string, PcpSessionSummary>();
+  const deduped = new Map<string, InkSessionSummary>();
   for (const session of [...pathScoped, ...ambiguous]) {
     deduped.set(session.id, session);
   }
@@ -1226,7 +1226,7 @@ export function filterPcpSessionsForContext(
 
 export function resolveBackendSessionIdForResume(options: {
   backend: string;
-  chosen?: PcpSessionSummary;
+  chosen?: InkSessionSummary;
   selectedLocalBackendSessionId?: string;
   localBackendSessionIds: Set<string>;
   knownBackendSessionIds?: Set<string>;
@@ -1235,7 +1235,7 @@ export function resolveBackendSessionIdForResume(options: {
 }): {
   backendSessionId?: string;
   staleTrackedBackendSessionId?: string;
-  fallbackMode?: 'resume_pcp_session_id';
+  fallbackMode?: 'resume_ink_session_id';
 } {
   const {
     backend,
@@ -1274,7 +1274,7 @@ export function resolveBackendSessionIdForResume(options: {
       return {
         backendSessionId: chosen.id,
         staleTrackedBackendSessionId: candidate,
-        fallbackMode: 'resume_pcp_session_id',
+        fallbackMode: 'resume_ink_session_id',
       };
     }
     return { staleTrackedBackendSessionId: candidate };
@@ -1287,16 +1287,16 @@ export function resolveBackendSessionSeedId(options: {
   backend: string;
   chosenSessionId?: string;
   backendSessionId?: string;
-  createdNewPcpSession: boolean;
+  createdNewInkSession: boolean;
 }): string | undefined {
-  const { backend, chosenSessionId, backendSessionId, createdNewPcpSession } = options;
+  const { backend, chosenSessionId, backendSessionId, createdNewInkSession } = options;
 
   if (backend !== 'claude') return undefined;
   if (!chosenSessionId) return undefined;
   if (backendSessionId) return undefined;
 
   // Seed Claude session ID only on first run when Inkwell session is created now.
-  if (createdNewPcpSession) {
+  if (createdNewInkSession) {
     return chosenSessionId;
   }
 
@@ -1306,7 +1306,7 @@ export function resolveBackendSessionSeedId(options: {
 export function resolveCapturedBackendSessionIdFromRuntime(options: {
   cwd?: string;
   backend: string;
-  pcpSessionId?: string;
+  inkSessionId?: string;
   runtimeLinkId?: string;
   sbSlug?: string;
   studioId?: string;
@@ -1316,7 +1316,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   const {
     cwd = process.cwd(),
     backend,
-    pcpSessionId,
+    inkSessionId,
     runtimeLinkId,
     sbSlug,
     studioId,
@@ -1333,11 +1333,11 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
     return typeof last === 'string' && last.trim() ? last : undefined;
   };
 
-  if (!pcpSessionId) return fallbackBackendSessionId;
+  if (!inkSessionId) return fallbackBackendSessionId;
 
   const scopedRecords = listRuntimeSessions(cwd, backend).filter(
     (record) =>
-      record.pcpSessionId === pcpSessionId &&
+      record.inkSessionId === inkSessionId &&
       (!sbSlug || record.sbSlug === sbSlug) &&
       (!studioId || record.studioId === studioId)
   );
@@ -1350,7 +1350,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
 
   const current = getCurrentRuntimeSession(cwd, backend);
   if (
-    current?.pcpSessionId === pcpSessionId &&
+    current?.inkSessionId === inkSessionId &&
     (!sbSlug || current.sbSlug === sbSlug) &&
     (!studioId || current.studioId === studioId)
   ) {
@@ -1379,7 +1379,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
 export async function resolveCapturedBackendSessionIdWithRetry(options: {
   cwd?: string;
   backend: string;
-  pcpSessionId?: string;
+  inkSessionId?: string;
   runtimeLinkId?: string;
   sbSlug?: string;
   studioId?: string;
@@ -1405,7 +1405,7 @@ export async function resolveCapturedBackendSessionIdWithRetry(options: {
 
 export function extractSessionFromStartSessionResponse(
   payload: unknown
-): PcpSessionSummary | undefined {
+): InkSessionSummary | undefined {
   if (!payload || typeof payload !== 'object') return undefined;
   const record = payload as Record<string, unknown>;
 
@@ -1413,12 +1413,12 @@ export function extractSessionFromStartSessionResponse(
   if (nested && typeof nested === 'object') {
     const nestedSession = nested as Record<string, unknown>;
     if (typeof nestedSession.id === 'string' && typeof nestedSession.startedAt === 'string') {
-      return nestedSession as unknown as PcpSessionSummary;
+      return nestedSession as unknown as InkSessionSummary;
     }
   }
 
   if (typeof record.id === 'string' && typeof record.startedAt === 'string') {
-    return record as unknown as PcpSessionSummary;
+    return record as unknown as InkSessionSummary;
   }
 
   if (typeof record.text === 'string') {
@@ -1436,8 +1436,8 @@ export function extractSessionFromStartSessionResponse(
 export function resolveStartedSessionFromList(options: {
   beforeSessionIds: Set<string>;
   requestedSessionId?: string;
-  listedSessions: PcpSessionSummary[];
-}): PcpSessionSummary | undefined {
+  listedSessions: InkSessionSummary[];
+}): InkSessionSummary | undefined {
   const { beforeSessionIds, requestedSessionId, listedSessions } = options;
 
   if (requestedSessionId) {
@@ -2107,8 +2107,8 @@ export function getBackendLocalSessionsForProject(
   return [];
 }
 
-function printPcpUnavailableWarning(reason: string, cwd = process.cwd()): void {
-  const serverUrl = getPcpServerUrl();
+function printInkUnavailableWarning(reason: string, cwd = process.cwd()): void {
+  const serverUrl = getInkServerUrl();
   console.log(chalk.yellow(`\n⚠ Inkwell session service unavailable (${reason}).`));
   console.log(chalk.yellow(`  INK_SERVER_URL: ${serverUrl}`));
   const mcpPath = join(cwd, '.mcp.json');
@@ -2133,7 +2133,7 @@ function printPcpUnavailableWarning(reason: string, cwd = process.cwd()): void {
   console.log(chalk.dim('    ink status'));
 }
 
-function hasPcpHookCommand(value: unknown): boolean {
+function hasInkHookCommand(value: unknown): boolean {
   const signatures = [
     'hooks on-session-start',
     'hooks on-stop',
@@ -2149,10 +2149,10 @@ function hasPcpHookCommand(value: unknown): boolean {
     );
   }
   if (Array.isArray(value)) {
-    return value.some((entry) => hasPcpHookCommand(entry));
+    return value.some((entry) => hasInkHookCommand(entry));
   }
   if (value && typeof value === 'object') {
-    return Object.values(value).some((entry) => hasPcpHookCommand(entry));
+    return Object.values(value).some((entry) => hasInkHookCommand(entry));
   }
   return false;
 }
@@ -2177,7 +2177,7 @@ function getHookHealthForBackend(
     if (!existsSync(configPath)) return { installed: false, configPath: '.gemini/settings.json' };
     try {
       const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
-      return { installed: hasPcpHookCommand(parsed.hooks), configPath: '.gemini/settings.json' };
+      return { installed: hasInkHookCommand(parsed.hooks), configPath: '.gemini/settings.json' };
     } catch {
       return { installed: false, configPath: '.gemini/settings.json' };
     }
@@ -2189,7 +2189,7 @@ function getHookHealthForBackend(
   try {
     const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
     return {
-      installed: hasPcpHookCommand(parsed.hooks),
+      installed: hasInkHookCommand(parsed.hooks),
       configPath: '.claude/settings.local.json',
     };
   } catch {
@@ -2274,7 +2274,7 @@ function extractActivityIdFromLogResult(result: unknown): string | undefined {
 async function logBackendExecutionStart(
   context: BackendExecutionLogContext
 ): Promise<string | undefined> {
-  if (!context.pcpConfig?.email) return undefined;
+  if (!context.inkConfig?.email) return undefined;
 
   try {
     const argsSanitized = sanitizeBackendExecutionArgs(
@@ -2283,13 +2283,13 @@ async function logBackendExecutionStart(
       context.promptParts || []
     );
 
-    const result = await callPcpTool<LogActivityResult>('log_activity', {
-      email: context.pcpConfig.email,
+    const result = await callInkTool<LogActivityResult>('log_activity', {
+      email: context.inkConfig.email,
       sbSlug: context.sbSlug,
       type: 'tool_call',
       subtype: `backend_cli:${context.backend}`,
       status: 'running',
-      ...(context.pcpSessionId ? { sessionId: context.pcpSessionId } : {}),
+      ...(context.inkSessionId ? { sessionId: context.inkSessionId } : {}),
       ...(context.runtimeLinkId ? { correlationId: context.runtimeLinkId } : {}),
       content: `Spawned backend CLI (${context.binary})`,
       payload: {
@@ -2300,7 +2300,7 @@ async function logBackendExecutionStart(
         argsSanitized,
         cwd: context.cwd,
         studioId: context.studioId || null,
-        pcpSessionId: context.pcpSessionId || null,
+        inkSessionId: context.inkSessionId || null,
         backendSessionId: context.backendSessionId || null,
         retryAttempt: context.retryAttempt,
         maxAttempts: context.maxAttempts,
@@ -2323,18 +2323,18 @@ async function logBackendExecutionResult(options: {
   error?: string;
   backendSessionId?: string;
 }): Promise<void> {
-  if (!options.context.pcpConfig?.email) return;
+  if (!options.context.inkConfig?.email) return;
 
   const status = options.exitCode === 0 && !options.error ? 'completed' : 'failed';
 
   try {
-    await callPcpTool('log_activity', {
-      email: options.context.pcpConfig.email,
+    await callInkTool('log_activity', {
+      email: options.context.inkConfig.email,
       sbSlug: options.context.sbSlug,
       type: 'tool_result',
       subtype: `backend_cli:${options.context.backend}`,
       status,
-      ...(options.context.pcpSessionId ? { sessionId: options.context.pcpSessionId } : {}),
+      ...(options.context.inkSessionId ? { sessionId: options.context.inkSessionId } : {}),
       ...(options.parentActivityId ? { parentId: options.parentActivityId } : {}),
       ...(options.context.runtimeLinkId ? { correlationId: options.context.runtimeLinkId } : {}),
       content:
@@ -2349,7 +2349,7 @@ async function logBackendExecutionResult(options: {
           binary: options.context.binary,
           cwd: options.context.cwd,
           studioId: options.context.studioId || null,
-          pcpSessionId: options.context.pcpSessionId || null,
+          inkSessionId: options.context.inkSessionId || null,
           backendSessionId: options.backendSessionId || null,
           retryAttempt: options.context.retryAttempt,
           maxAttempts: options.context.maxAttempts,
@@ -2436,7 +2436,7 @@ export function shouldRetryWithFreshBackendSession(options: {
 }
 
 async function persistBackendSessionLink(options: {
-  pcpSessionId?: string;
+  inkSessionId?: string;
   backendSessionId?: string;
   backend: string;
   sbSlug: string;
@@ -2445,11 +2445,11 @@ async function persistBackendSessionLink(options: {
   sbId?: string;
   email?: string;
 }): Promise<void> {
-  if (!options.pcpSessionId || !options.backendSessionId) return;
+  if (!options.inkSessionId || !options.backendSessionId) return;
   const gitBranch = getCurrentGitBranch(process.cwd());
 
   upsertRuntimeSession(process.cwd(), {
-    pcpSessionId: options.pcpSessionId,
+    inkSessionId: options.inkSessionId,
     backend: options.backend,
     sbSlug: options.sbSlug,
     ...(options.sbId ? { sbId: options.sbId } : {}),
@@ -2461,7 +2461,7 @@ async function persistBackendSessionLink(options: {
   });
 
   try {
-    const updateResult = await callPcpTool<{
+    const updateResult = await callInkTool<{
       sessionConflict?: {
         backendSessionId?: string;
         conflictingSessionId?: string;
@@ -2471,7 +2471,7 @@ async function persistBackendSessionLink(options: {
     }>('update_session_state', {
       email: options.email,
       sbSlug: options.sbSlug,
-      sessionId: options.pcpSessionId,
+      sessionId: options.inkSessionId,
       backendSessionId: options.backendSessionId,
       status: 'active',
       workingDir: process.cwd(),
@@ -2481,14 +2481,14 @@ async function persistBackendSessionLink(options: {
       sbDebugLog('claude', 'persist_backend_link_conflict_warning', {
         backend: options.backend,
         sbSlug: options.sbSlug,
-        pcpSessionId: options.pcpSessionId,
+        inkSessionId: options.inkSessionId,
         backendSessionId: options.backendSessionId,
         conflict: updateResult.sessionConflict,
       });
     }
     if (updateResult?.sessionTrace?.changedFields?.length) {
       sbDebugLog('claude', 'persist_backend_link_session_trace', {
-        pcpSessionId: options.pcpSessionId,
+        inkSessionId: options.inkSessionId,
         changedFields: updateResult.sessionTrace.changedFields,
       });
     }
@@ -2497,7 +2497,7 @@ async function persistBackendSessionLink(options: {
   }
 }
 
-async function ensurePcpSessionContext(
+async function ensureInkSessionContext(
   sbSlug: string,
   backend: string,
   passthroughArgs: string[],
@@ -2510,7 +2510,7 @@ async function ensurePcpSessionContext(
     selectionOverride?: string;
   } = {}
 ): Promise<{
-  pcpSessionId?: string;
+  inkSessionId?: string;
   backendSessionId?: string;
   backendSessionSeedId?: string;
   threadKey?: string;
@@ -2529,13 +2529,13 @@ async function ensurePcpSessionContext(
     promptParts
   );
 
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   const email = config?.email;
   const cwd = process.cwd();
   const { studioId, sbId } = await resolveStudioId(cwd);
   const currentGitBranch = getCurrentGitBranch(cwd);
   const localSessionLimit = options.listCandidates || options.listCandidatesJson ? 120 : 40;
-  const pcpSessionLimit = options.listCandidates || options.listCandidatesJson ? 80 : 40;
+  const inkSessionLimit = options.listCandidates || options.listCandidatesJson ? 80 : 40;
   const localBackendSessions = getBackendLocalSessionsForProject(backend, cwd, localSessionLimit, {
     includeAllSources: options.listCandidatesAll,
   });
@@ -2556,56 +2556,56 @@ async function ensurePcpSessionContext(
     selectionOverride: options.selectionOverride || null,
     localCount: localBackendSessions.length,
     knownCount: knownBackendSessionIds.size,
-    existingPcpSessionId: existing?.pcpSessionId || null,
+    existingInkSessionId: existing?.inkSessionId || null,
     existingBackendSessionId: existing?.backendSessionId || null,
   });
 
   // Fast path: runtime already knows current session for this backend.
   if (
     !explicitSelection &&
-    existing?.pcpSessionId &&
+    existing?.inkSessionId &&
     shouldAutoResumeRuntimeSession(existing, process.stdin.isTTY)
   ) {
     sbDebugLog('claude', 'ensure_context_fast_path_resume', {
       backend,
       sbSlug,
-      pcpSessionId: existing.pcpSessionId,
+      inkSessionId: existing.inkSessionId,
       backendSessionId: existing.backendSessionId || null,
       isTty: process.stdin.isTTY,
     });
     return {
-      pcpSessionId: existing.pcpSessionId,
+      inkSessionId: existing.inkSessionId,
       backendSessionId: existing.backendSessionId,
     };
   }
 
   // Pull active session list so caller can resume or start new.
-  let activeSessions: PcpSessionSummary[] = [];
-  let allAgentSessions: PcpSessionSummary[] = [];
-  let pcpAvailable = Boolean(email);
-  let pcpUnavailableReason: string | undefined;
+  let activeSessions: InkSessionSummary[] = [];
+  let allAgentSessions: InkSessionSummary[] = [];
+  let inkAvailable = Boolean(email);
+  let inkUnavailableReason: string | undefined;
 
   if (!email) {
-    pcpAvailable = false;
-    pcpUnavailableReason = 'not authenticated';
+    inkAvailable = false;
+    inkUnavailableReason = 'not authenticated';
   } else {
     try {
       const [listed, allAgentListed] = await Promise.all([
-        callPcpTool<ListSessionsResult>('list_sessions', {
+        callInkTool<ListSessionsResult>('list_sessions', {
           email,
           sbSlug,
           ...(studioId ? { studioId } : {}),
-          limit: pcpSessionLimit,
+          limit: inkSessionLimit,
         }),
         // Cross-agent view, used only for ownership attribution. Local
         // backend transcripts in a shared directory can belong to any agent
         // (a sibling's heartbeat spawns land in the same encoded-cwd dir),
         // and the agent-scoped list above can never name those owners.
         // Best-effort: attribution degrades to unlabeled rows on failure.
-        callPcpTool<ListSessionsResult>('list_sessions', { email, limit: 100 }).catch(() => null),
+        callInkTool<ListSessionsResult>('list_sessions', { email, limit: 100 }).catch(() => null),
       ]);
       allAgentSessions = allAgentListed?.sessions || [];
-      activeSessions = filterPcpSessionsForContext(
+      activeSessions = filterInkSessionsForContext(
         (listed.sessions || []).filter((s) => isSessionResumable(s)),
         backend,
         cwd,
@@ -2632,19 +2632,19 @@ async function ensurePcpSessionContext(
         })),
       });
     } catch (err) {
-      pcpAvailable = false;
-      pcpUnavailableReason = err instanceof Error ? err.message : 'request failed';
+      inkAvailable = false;
+      inkUnavailableReason = err instanceof Error ? err.message : 'request failed';
     }
   }
 
-  if (!pcpAvailable) {
-    sbDebugLog('sb', 'pcp_unavailable', {
+  if (!inkAvailable) {
+    sbDebugLog('sb', 'ink_unavailable', {
       backend,
       sbSlug,
-      reason: pcpUnavailableReason || 'unknown error',
+      reason: inkUnavailableReason || 'unknown error',
       studioId: studioId || null,
     });
-    printPcpUnavailableWarning(pcpUnavailableReason || 'unknown error', cwd);
+    printInkUnavailableWarning(inkUnavailableReason || 'unknown error', cwd);
   }
 
   if (process.stdin.isTTY || options.listCandidates) {
@@ -2664,25 +2664,25 @@ async function ensurePcpSessionContext(
     activeSessions
   );
   const runtimeSessionsForBackend = listRuntimeSessions(cwd, backend);
-  const runtimeBackendSessionIdByPcpSessionId = new Map<string, string>();
-  const runtimeBranchByPcpSessionId = new Map<string, string>();
+  const runtimeBackendSessionIdByInkSessionId = new Map<string, string>();
+  const runtimeBranchByInkSessionId = new Map<string, string>();
   for (const session of runtimeSessionsForBackend) {
     if (
       session.backendSessionId &&
-      !runtimeBackendSessionIdByPcpSessionId.has(session.pcpSessionId)
+      !runtimeBackendSessionIdByInkSessionId.has(session.inkSessionId)
     ) {
-      runtimeBackendSessionIdByPcpSessionId.set(session.pcpSessionId, session.backendSessionId);
+      runtimeBackendSessionIdByInkSessionId.set(session.inkSessionId, session.backendSessionId);
     }
-    if (session.gitBranch && !runtimeBranchByPcpSessionId.has(session.pcpSessionId)) {
-      runtimeBranchByPcpSessionId.set(session.pcpSessionId, session.gitBranch);
+    if (session.gitBranch && !runtimeBranchByInkSessionId.has(session.inkSessionId)) {
+      runtimeBranchByInkSessionId.set(session.inkSessionId, session.gitBranch);
     }
   }
-  const pcpSessionByBackendSessionId = new Map<string, PcpSessionSummary>();
+  const inkSessionByBackendSessionId = new Map<string, InkSessionSummary>();
   for (const session of activeSessions) {
     const backendSessionId =
-      getSessionBackendId(session) || runtimeBackendSessionIdByPcpSessionId.get(session.id);
-    if (!backendSessionId || pcpSessionByBackendSessionId.has(backendSessionId)) continue;
-    pcpSessionByBackendSessionId.set(backendSessionId, session);
+      getSessionBackendId(session) || runtimeBackendSessionIdByInkSessionId.get(session.id);
+    if (!backendSessionId || inkSessionByBackendSessionId.has(backendSessionId)) continue;
+    inkSessionByBackendSessionId.set(backendSessionId, session);
   }
   const ownerAgentByBackendSessionId = buildBackendSessionOwnerIndex(
     allAgentSessions,
@@ -2692,26 +2692,29 @@ async function ensurePcpSessionContext(
   // wins (it carries phase/thread context), then the cross-agent index. Null
   // means unknown — render honestly as unlabeled rather than guessing.
   const resolveLocalSessionOwner = (backendSessionId: string): string | null =>
-    pcpSessionByBackendSessionId.get(backendSessionId)?.sbSlug ||
+    inkSessionByBackendSessionId.get(backendSessionId)?.sbSlug ||
     ownerAgentByBackendSessionId.get(backendSessionId) ||
     null;
   // Keep the picker de-duplicated: linked locals are rendered through the Inkwell row
   // (with linked preview/timestamp), while untracked locals remain independently selectable.
   const displayLocalBackendSessions = untrackedLocalBackendSessions;
   const existingSessionIds = new Set(activeSessions.map((session) => session.id));
-  const pcpPreviewBySessionId = new Map<string, string>();
+  const inkPreviewBySessionId = new Map<string, string>();
   for (const session of activeSessions) {
-    const preview = getPcpSessionPreviewLabel(session, session.sbSlug || sbSlug, cwd);
-    if (preview) pcpPreviewBySessionId.set(session.id, preview);
+    const preview = getInkSessionPreviewLabel(session, session.sbSlug || sbSlug, cwd);
+    if (preview) inkPreviewBySessionId.set(session.id, preview);
   }
 
-  let chosen: PcpSessionSummary | undefined;
+  let chosen: InkSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
-  let createdNewPcpSession = false;
+  let createdNewInkSession = false;
 
   const normalizedSelectionOverride = options.selectionOverride?.trim();
-  const pcpSelection = (selection: string): string | undefined => {
-    const value = selection.replace(/^__pcp__:/, '').replace(/^pcp:/, '');
+  const inkSelection = (selection: string): string | undefined => {
+    const value = selection
+      .replace(/^__ink__:/, '')
+      .replace(/^ink:/, '')
+      .replace(/^pcp:/, '');
     const found = activeSessions.find(
       (session) => session.id === value || session.id.startsWith(value)
     );
@@ -2725,25 +2728,25 @@ async function ensurePcpSessionContext(
     return found?.sessionId;
   };
 
-  const startNewPcpSession = async (): Promise<PcpSessionSummary | undefined> => {
-    if (!pcpAvailable || !email) return undefined;
+  const startNewInkSession = async (): Promise<InkSessionSummary | undefined> => {
+    if (!inkAvailable || !email) return undefined;
 
     const resolveCreatedSessionFromList = async (
       requestedSessionId: string | undefined,
       mode: 'with_session_id' | 'legacy_without_session_id'
-    ): Promise<PcpSessionSummary | undefined> => {
+    ): Promise<InkSessionSummary | undefined> => {
       try {
-        const listed = await callPcpTool<ListSessionsResult>(
+        const listed = await callInkTool<ListSessionsResult>(
           'list_sessions',
           {
             email,
             sbSlug,
             ...(studioId ? { studioId } : {}),
-            limit: pcpSessionLimit,
+            limit: inkSessionLimit,
           },
           { callerProfile: 'runtime' }
         );
-        const listedActive = filterPcpSessionsForContext(
+        const listedActive = filterInkSessionsForContext(
           (listed.sessions || []).filter((session) => isSessionResumable(session)),
           backend,
           cwd,
@@ -2754,7 +2757,7 @@ async function ensurePcpSessionContext(
             ? listedActive.filter((session) => {
                 const linkedBackendSessionId =
                   getSessionBackendId(session) ||
-                  runtimeBackendSessionIdByPcpSessionId.get(session.id);
+                  runtimeBackendSessionIdByInkSessionId.get(session.id);
                 if (!linkedBackendSessionId) return true;
                 return knownBackendSessionIds.has(linkedBackendSessionId);
               })
@@ -2764,7 +2767,7 @@ async function ensurePcpSessionContext(
           requestedSessionId,
           listedSessions: scopedActive,
         });
-        sbDebugLog('sb', 'pcp_start_session_resolve_from_list', {
+        sbDebugLog('sb', 'ink_start_session_resolve_from_list', {
           backend,
           sbSlug,
           studioId: studioId || null,
@@ -2776,7 +2779,7 @@ async function ensurePcpSessionContext(
         if (resolved) activeSessions = scopedActive;
         return resolved;
       } catch (error) {
-        sbDebugLog('sb', 'pcp_start_session_resolve_from_list_failed', {
+        sbDebugLog('sb', 'ink_start_session_resolve_from_list_failed', {
           backend,
           sbSlug,
           studioId: studioId || null,
@@ -2790,7 +2793,7 @@ async function ensurePcpSessionContext(
 
     const newSessionId = randomUUID();
     try {
-      const started = await callPcpTool<{ session?: PcpSessionSummary }>(
+      const started = await callInkTool<{ session?: InkSessionSummary }>(
         'start_session',
         {
           email,
@@ -2805,7 +2808,7 @@ async function ensurePcpSessionContext(
       const directSession = extractSessionFromStartSessionResponse(started);
       const resolvedSession =
         directSession || (await resolveCreatedSessionFromList(newSessionId, 'with_session_id'));
-      sbDebugLog('sb', 'pcp_start_session_success', {
+      sbDebugLog('sb', 'ink_start_session_success', {
         backend,
         sbSlug,
         studioId: studioId || null,
@@ -2819,7 +2822,7 @@ async function ensurePcpSessionContext(
       // Backward compatibility: older Inkwell servers may reject the newer `sessionId`
       // parameter. Retry once without it so "start new session" still creates a
       // real server-side Inkwell session instead of a synthetic local-only UUID.
-      sbDebugLog('sb', 'pcp_start_session_retry_legacy', {
+      sbDebugLog('sb', 'ink_start_session_retry_legacy', {
         backend,
         sbSlug,
         studioId: studioId || null,
@@ -2831,7 +2834,7 @@ async function ensurePcpSessionContext(
       });
 
       try {
-        const startedLegacy = await callPcpTool<{ session?: PcpSessionSummary }>(
+        const startedLegacy = await callInkTool<{ session?: InkSessionSummary }>(
           'start_session',
           {
             email,
@@ -2846,7 +2849,7 @@ async function ensurePcpSessionContext(
         const resolvedSession =
           directSession ||
           (await resolveCreatedSessionFromList(undefined, 'legacy_without_session_id'));
-        sbDebugLog('sb', 'pcp_start_session_success', {
+        sbDebugLog('sb', 'ink_start_session_success', {
           backend,
           sbSlug,
           studioId: studioId || null,
@@ -2856,7 +2859,7 @@ async function ensurePcpSessionContext(
         });
         return resolvedSession;
       } catch (legacyError) {
-        sbDebugLog('sb', 'pcp_start_session_failed', {
+        sbDebugLog('sb', 'ink_start_session_failed', {
           backend,
           sbSlug,
           studioId: studioId || null,
@@ -2882,7 +2885,7 @@ async function ensurePcpSessionContext(
     }
 
     const matchedByBackendId =
-      pcpSessionByBackendSessionId.get(overrideBackendSessionId) ||
+      inkSessionByBackendSessionId.get(overrideBackendSessionId) ||
       activeSessions.find(
         (session) =>
           session.id === overrideBackendSessionId ||
@@ -2892,13 +2895,13 @@ async function ensurePcpSessionContext(
 
     chosen = matchedByBackendId;
     if (!chosen) {
-      chosen = await startNewPcpSession();
-      createdNewPcpSession = Boolean(chosen?.id);
+      chosen = await startNewInkSession();
+      createdNewInkSession = Boolean(chosen?.id);
     }
 
     if (chosen?.id) {
       await persistBackendSessionLink({
-        pcpSessionId: chosen.id,
+        inkSessionId: chosen.id,
         backendSessionId: overrideBackendSessionId,
         backend,
         sbSlug,
@@ -2909,12 +2912,12 @@ async function ensurePcpSessionContext(
       sbDebugLog('claude', 'ensure_context_override_linked', {
         backend,
         sbSlug,
-        pcpSessionId: chosen.id,
+        inkSessionId: chosen.id,
         backendSessionId: overrideBackendSessionId,
-        createdNewPcpSession,
+        createdNewInkSession,
       });
       return {
-        pcpSessionId: chosen.id,
+        inkSessionId: chosen.id,
         ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
       };
     }
@@ -2931,9 +2934,9 @@ async function ensurePcpSessionContext(
     localBackendSessions.map((session) => [session.sessionId, session])
   );
   if (options.listCandidates || options.listCandidatesJson) {
-    const pcpCandidates = activeSessions.map((session) => {
+    const inkCandidates = activeSessions.map((session) => {
       const linkedBackendSessionId =
-        getSessionBackendId(session) || runtimeBackendSessionIdByPcpSessionId.get(session.id);
+        getSessionBackendId(session) || runtimeBackendSessionIdByInkSessionId.get(session.id);
       const linkedLocalSession = linkedBackendSessionId
         ? localBySessionId.get(linkedBackendSessionId)
         : undefined;
@@ -2948,7 +2951,7 @@ async function ensurePcpSessionContext(
       const sortTimestamp = linkedLocalSession?.latestPromptAt || linkedLocalSession?.modified;
       const sortMs = toEpochMs(sortTimestamp || session.startedAt) ?? 0;
       return {
-        type: 'pcp' as const,
+        type: 'ink' as const,
         id: session.id,
         sessionSlug,
         threadKey: session.threadKey || null,
@@ -2961,12 +2964,12 @@ async function ensurePcpSessionContext(
         linkedLocalPreview: linkedPreviewText || null,
         linkedLocalFileSizeBytes: linkedLocalSession?.fileSizeBytes || null,
         linkedLocalFileSize: formatFileSize(linkedLocalSession?.fileSizeBytes) || null,
-        pcpPreview: pcpPreviewBySessionId.get(session.id) || null,
+        inkPreview: inkPreviewBySessionId.get(session.id) || null,
         sortMs,
       };
     });
     const localCandidates = displayLocalBackendSessions.map((session) => {
-      const linkedPcpSession = pcpSessionByBackendSessionId.get(session.sessionId);
+      const linkedInkSession = inkSessionByBackendSessionId.get(session.sessionId);
       const ownerSlug = resolveLocalSessionOwner(session.sessionId);
       // Preview speaker is the resolved owner or nothing — never the
       // requesting agent. Labeling a sibling's transcript with the
@@ -2988,17 +2991,17 @@ async function ensurePcpSessionContext(
         fileSize: formatFileSize(session.fileSizeBytes) || null,
         gitBranch: session.gitBranch || null,
         ownerSlug: ownerSlug || null,
-        linkedPcpSessionId: linkedPcpSession?.id || null,
-        linkedPcpSlug: linkedPcpSession?.sbSlug || null,
-        linkedPcpPhase: linkedPcpSession ? getSessionPhaseLabel(linkedPcpSession) || null : null,
-        selectable: !linkedPcpSession,
+        linkedInkSessionId: linkedInkSession?.id || null,
+        linkedInkSlug: linkedInkSession?.sbSlug || null,
+        linkedInkPhase: linkedInkSession ? getSessionPhaseLabel(linkedInkSession) || null : null,
+        selectable: !linkedInkSession,
         sortMs,
       };
     });
     const interleavedCandidates = sortSessionEntriesByRecency([
-      ...pcpCandidates.map((candidate) => ({
-        key: `pcp:${candidate.id}`,
-        kind: 'pcp' as const,
+      ...inkCandidates.map((candidate) => ({
+        key: `ink:${candidate.id}`,
+        kind: 'ink' as const,
         sortMs: candidate.sortMs,
         candidate,
       })),
@@ -3018,14 +3021,14 @@ async function ensurePcpSessionContext(
             backend,
             sbSlug,
             cwd,
-            pcpAvailable,
-            pcpUnavailableReason: pcpUnavailableReason || null,
+            inkAvailable,
+            inkUnavailableReason: inkUnavailableReason || null,
             limits: {
               local: localSessionLimit,
-              pcp: pcpSessionLimit,
+              ink: inkSessionLimit,
             },
             counts: {
-              pcp: pcpCandidates.length,
+              ink: inkCandidates.length,
               local: localCandidates.length,
               localSelectable: localCandidates.filter((candidate) => candidate.selectable).length,
             },
@@ -3049,18 +3052,18 @@ async function ensurePcpSessionContext(
           phase: '-',
           thread: '-',
           link: '-',
-          preview: pcpAvailable ? 'Start new session' : 'Start new backend session',
+          preview: inkAvailable ? 'Start new session' : 'Start new backend session',
         },
         ...interleavedCandidates.map((entry) => {
-          if (entry.kind === 'pcp') {
+          if (entry.kind === 'ink') {
             const session = entry.candidate;
             const showOwner = Boolean(session.sessionSlug && session.sessionSlug !== sbSlug);
             const ownerPhase = showOwner
               ? `${session.sessionSlug} · ${session.phase || '-'}`
               : session.phase || '-';
             return {
-              type: showOwner ? `pcp:${session.sessionSlug}` : 'pcp',
-              choice: `pcp:${session.id.slice(0, 8)}`,
+              type: showOwner ? `ink:${session.sessionSlug}` : 'ink',
+              choice: `ink:${session.id.slice(0, 8)}`,
               updated: formatCandidateTimestamp(session.linkedLocalModified || session.startedAt),
               phase: ownerPhase,
               thread: session.threadKey || '-',
@@ -3068,20 +3071,20 @@ async function ensurePcpSessionContext(
                 ? `${backendLabel} ${session.backendSessionId.slice(0, 8)}`
                 : '-',
               preview:
-                session.linkedLocalPreview || session.pcpPreview || session.contextPreview || '-',
+                session.linkedLocalPreview || session.inkPreview || session.contextPreview || '-',
             };
           }
           const localSession = entry.candidate;
-          const localOwner = localSession.linkedPcpSlug || localSession.ownerSlug;
+          const localOwner = localSession.linkedInkSlug || localSession.ownerSlug;
           const showOwner = Boolean(localOwner && localOwner !== sbSlug);
           const ownerPhase = showOwner
-            ? `${localOwner} · ${localSession.linkedPcpPhase || '-'}`
-            : localSession.linkedPcpPhase || '-';
+            ? `${localOwner} · ${localSession.linkedInkPhase || '-'}`
+            : localSession.linkedInkPhase || '-';
           return {
-            type: localSession.linkedPcpSessionId
+            type: localSession.linkedInkSessionId
               ? showOwner
                 ? `local:${localOwner}`
-                : 'local+pcp'
+                : 'local+ink'
               : showOwner
                 ? `local:${localOwner}`
                 : 'local',
@@ -3089,8 +3092,8 @@ async function ensurePcpSessionContext(
             updated: formatCandidateTimestamp(localSession.modified),
             phase: ownerPhase,
             thread: '-',
-            link: localSession.linkedPcpSessionId
-              ? `pcp:${localSession.linkedPcpSessionId.slice(0, 8)}`
+            link: localSession.linkedInkSessionId
+              ? `ink:${localSession.linkedInkSessionId.slice(0, 8)}`
               : localSession.gitBranch || '-',
             preview: localSession.preview || '-',
           };
@@ -3122,20 +3125,24 @@ async function ensurePcpSessionContext(
   if (normalizedSelectionOverride) {
     const selection = normalizedSelectionOverride.toLowerCase();
     if (selection === 'new' || selection === '__new__') {
-      chosen = await startNewPcpSession();
-      createdNewPcpSession = Boolean(chosen?.id);
-    } else if (selection.startsWith('pcp:') || selection.startsWith('__pcp__:')) {
-      const matchedSessionId = pcpSelection(selection);
+      chosen = await startNewInkSession();
+      createdNewInkSession = Boolean(chosen?.id);
+    } else if (
+      selection.startsWith('ink:') ||
+      selection.startsWith('pcp:') || // legacy spelling, still accepted
+      selection.startsWith('__ink__:')
+    ) {
+      const matchedSessionId = inkSelection(selection);
       chosen = activeSessions.find((session) => session.id === matchedSessionId);
     } else if (selection.startsWith('local:') || selection.startsWith('__local__:')) {
       selectedLocalBackendSessionId = localSelection(selection);
-      if (selectedLocalBackendSessionId && pcpAvailable) {
+      if (selectedLocalBackendSessionId && inkAvailable) {
         // Find-or-link: prefer an existing Inkwell session linked to this backend
         // session, then try an unlinked Inkwell session in the same studio, and
         // only create new as a last resort.
-        const linkedPcpSession = pcpSessionByBackendSessionId.get(selectedLocalBackendSessionId);
-        if (linkedPcpSession) {
-          chosen = linkedPcpSession;
+        const linkedInkSession = inkSessionByBackendSessionId.get(selectedLocalBackendSessionId);
+        if (linkedInkSession) {
+          chosen = linkedInkSession;
         } else {
           // Try to find an unlinked Inkwell session for this agent+studio that
           // can be adopted instead of creating an orphan.
@@ -3147,22 +3154,22 @@ async function ensurePcpSessionContext(
           );
           if (unlinkable) {
             chosen = unlinkable;
-            sbDebugLog('claude', 'adopting_unlinked_pcp_session', {
+            sbDebugLog('claude', 'adopting_unlinked_ink_session', {
               backend,
               sbSlug,
-              pcpSessionId: unlinkable.id,
+              inkSessionId: unlinkable.id,
               selectedLocalBackendSessionId,
             });
           } else {
-            chosen = await startNewPcpSession();
-            createdNewPcpSession = Boolean(chosen?.id);
+            chosen = await startNewInkSession();
+            createdNewInkSession = Boolean(chosen?.id);
           }
         }
       }
     } else {
       console.error(
         chalk.red(
-          `Unknown session choice "${options.selectionOverride}". Use "new", "pcp:<id>", or "local:<id>".`
+          `Unknown session choice "${options.selectionOverride}". Use "new", "ink:<id>", or "local:<id>".`
         )
       );
       process.exit(1);
@@ -3170,7 +3177,7 @@ async function ensurePcpSessionContext(
   } else if (process.stdin.isTTY) {
     const choices: Array<{ name: string; value: string }> = [
       {
-        name: pcpAvailable ? 'Start new session' : 'Start new backend session',
+        name: inkAvailable ? 'Start new session' : 'Start new backend session',
         value: '__new__',
       },
     ];
@@ -3184,9 +3191,9 @@ async function ensurePcpSessionContext(
     }> = [];
 
     for (const session of activeSessions) {
-      const value = `__pcp__:${session.id}`;
+      const value = `__ink__:${session.id}`;
       const linkedBackendSessionId =
-        getSessionBackendId(session) || runtimeBackendSessionIdByPcpSessionId.get(session.id);
+        getSessionBackendId(session) || runtimeBackendSessionIdByInkSessionId.get(session.id);
       const linkedLocalSession = linkedBackendSessionId
         ? localBySessionId.get(linkedBackendSessionId)
         : undefined;
@@ -3203,12 +3210,12 @@ async function ensurePcpSessionContext(
       const ownerLabel = session.sbSlug || null;
       const showOwner = Boolean(ownerLabel && ownerLabel !== sbSlug);
       const sourceLabel = showOwner ? `Ink/${ownerLabel}` : 'Ink';
-      const preview = pcpPreviewBySessionId.get(session.id);
+      const preview = inkPreviewBySessionId.get(session.id);
       const phaseLabel = getSessionPhaseLabel(session);
       const pickerPreview = linkedPreviewWithSize || preview || session.context || undefined;
       const branchLabel =
         linkedLocalSession?.gitBranch ||
-        runtimeBranchByPcpSessionId.get(session.id) ||
+        runtimeBranchByInkSessionId.get(session.id) ||
         session.studio?.branch ||
         '-';
       const stateTokens = [
@@ -3238,7 +3245,7 @@ async function ensurePcpSessionContext(
       const value = `__local__:${localSession.sessionId}`;
       const previewAt = localSession.latestPromptAt || localSession.modified;
       const backendLabel = localSession.backend[0].toUpperCase() + localSession.backend.slice(1);
-      const linkedPcpSession = pcpSessionByBackendSessionId.get(localSession.sessionId);
+      const linkedInkSession = inkSessionByBackendSessionId.get(localSession.sessionId);
       const ownerLabel = resolveLocalSessionOwner(localSession.sessionId);
       const showOwner = Boolean(ownerLabel && ownerLabel !== sbSlug);
       // Speaker prefix comes from the resolved owner only — an unowned
@@ -3252,10 +3259,10 @@ async function ensurePcpSessionContext(
         localSession.fileSizeBytes
       );
       const sourceLabel = showOwner ? `${backendLabel}/${ownerLabel}` : backendLabel;
-      const stateLabel = linkedPcpSession
+      const stateLabel = linkedInkSession
         ? showOwner
-          ? `owner ${ownerLabel} · linked pcp:${linkedPcpSession.id.slice(0, 8)}`
-          : `linked pcp:${linkedPcpSession.id.slice(0, 8)}`
+          ? `owner ${ownerLabel} · linked ink:${linkedInkSession.id.slice(0, 8)}`
+          : `linked ink:${linkedInkSession.id.slice(0, 8)}`
         : showOwner
           ? `owner ${ownerLabel} · local`
           : 'local';
@@ -3290,18 +3297,18 @@ async function ensurePcpSessionContext(
         pageSize,
       });
       if (selection === '__new__') {
-        chosen = await startNewPcpSession();
-        createdNewPcpSession = Boolean(chosen?.id);
-      } else if (selection.startsWith('__pcp__:')) {
+        chosen = await startNewInkSession();
+        createdNewInkSession = Boolean(chosen?.id);
+      } else if (selection.startsWith('__ink__:')) {
         const sessionId = sessionChoiceByValue.get(selection);
         chosen = activeSessions.find((session) => session.id === sessionId);
       } else if (selection.startsWith('__local__:')) {
         selectedLocalBackendSessionId = sessionChoiceByValue.get(selection);
-        if (selectedLocalBackendSessionId && pcpAvailable) {
+        if (selectedLocalBackendSessionId && inkAvailable) {
           // Find-or-link: prefer linked Inkwell session, then adopt unlinked, then create new
-          const linkedPcpSession = pcpSessionByBackendSessionId.get(selectedLocalBackendSessionId);
-          if (linkedPcpSession) {
-            chosen = linkedPcpSession;
+          const linkedInkSession = inkSessionByBackendSessionId.get(selectedLocalBackendSessionId);
+          if (linkedInkSession) {
+            chosen = linkedInkSession;
           } else {
             const unlinkable = activeSessions.find(
               (s) =>
@@ -3311,15 +3318,15 @@ async function ensurePcpSessionContext(
             );
             if (unlinkable) {
               chosen = unlinkable;
-              sbDebugLog('claude', 'adopting_unlinked_pcp_session', {
+              sbDebugLog('claude', 'adopting_unlinked_ink_session', {
                 backend,
                 sbSlug,
-                pcpSessionId: unlinkable.id,
+                inkSessionId: unlinkable.id,
                 selectedLocalBackendSessionId,
               });
             } else {
-              chosen = await startNewPcpSession();
-              createdNewPcpSession = Boolean(chosen?.id);
+              chosen = await startNewInkSession();
+              createdNewInkSession = Boolean(chosen?.id);
             }
           }
         }
@@ -3333,9 +3340,9 @@ async function ensurePcpSessionContext(
     }
   }
 
-  if (!chosen && !selectedLocalBackendSessionId && pcpAvailable) {
-    chosen = await startNewPcpSession();
-    createdNewPcpSession = Boolean(chosen?.id);
+  if (!chosen && !selectedLocalBackendSessionId && inkAvailable) {
+    chosen = await startNewInkSession();
+    createdNewInkSession = Boolean(chosen?.id);
   }
 
   if (!chosen?.id && !selectedLocalBackendSessionId) return {};
@@ -3354,7 +3361,7 @@ async function ensurePcpSessionContext(
       localBackendSessionIds,
       knownBackendSessionIds,
       runtimeCachedSessionId: chosen?.id
-        ? runtimeBackendSessionIdByPcpSessionId.get(chosen.id)
+        ? runtimeBackendSessionIdByInkSessionId.get(chosen.id)
         : undefined,
     });
   // ═══════════════════════════════════════════════════════════════════════
@@ -3373,12 +3380,12 @@ async function ensurePcpSessionContext(
   // - Gemini: Session semantics are different and largely untested for
   //   this path. Do NOT assume Codex patterns apply to Gemini.
   // ═══════════════════════════════════════════════════════════════════════
-  const preserveTrackedBackendSessionId = !createdNewPcpSession || backend === 'claude';
+  const preserveTrackedBackendSessionId = !createdNewInkSession || backend === 'claude';
   let resolvedTrackedBackendSessionId = preserveTrackedBackendSessionId
     ? backendSessionId
     : undefined;
   if (
-    createdNewPcpSession &&
+    createdNewInkSession &&
     backend === 'codex' &&
     backendSessionId &&
     !selectedLocalBackendSessionId
@@ -3389,7 +3396,7 @@ async function ensurePcpSessionContext(
     sbDebugLog('claude', 'new_session_ignoring_prelinked_backend_session', {
       backend,
       sbSlug,
-      pcpSessionId: chosen.id,
+      inkSessionId: chosen.id,
       ignoredBackendSessionId: backendSessionId,
     });
   }
@@ -3401,14 +3408,14 @@ async function ensurePcpSessionContext(
       backend,
       sbSlug,
       selectedLocalBackendSessionId,
-      createdNewPcpSession,
+      createdNewInkSession,
     });
   }
   const adoptedLocalBackendSessionId = resolveAdoptableLocalBackendSessionId({
     backend,
     backendSessionId: resolvedTrackedBackendSessionId,
     selectedLocalBackendSessionId,
-    createdNewPcpSession,
+    createdNewInkSession,
     chosen,
     localSessions: untrackedLocalBackendSessions,
   });
@@ -3417,11 +3424,11 @@ async function ensurePcpSessionContext(
     backend,
     chosenSessionId: chosen.id,
     backendSessionId: effectiveBackendSessionId,
-    createdNewPcpSession,
+    createdNewInkSession,
   });
 
   if (staleTrackedBackendSessionId && process.stdin.isTTY) {
-    if (fallbackMode === 'resume_pcp_session_id' && chosen.id) {
+    if (fallbackMode === 'resume_ink_session_id' && chosen.id) {
       console.log(
         chalk.yellow(
           `\nLinked Claude session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; retrying with Inkwell-linked Claude session ${chosen.id.slice(0, 8)}.`
@@ -3438,7 +3445,7 @@ async function ensurePcpSessionContext(
   }
 
   upsertRuntimeSession(cwd, {
-    pcpSessionId: chosen.id,
+    inkSessionId: chosen.id,
     backend,
     sbSlug,
     ...(sbId ? { sbId } : {}),
@@ -3463,7 +3470,7 @@ async function ensurePcpSessionContext(
 
   if (email) {
     try {
-      await callPcpTool('update_session_state', {
+      await callInkTool('update_session_state', {
         email,
         sbSlug,
         sessionId: chosen.id,
@@ -3479,16 +3486,16 @@ async function ensurePcpSessionContext(
   sbDebugLog('claude', 'ensure_context_result', {
     backend,
     sbSlug,
-    pcpSessionId: chosen.id,
+    inkSessionId: chosen.id,
     backendSessionId: effectiveBackendSessionId || null,
     backendSessionSeedId: backendSessionSeedId || null,
-    createdNewPcpSession,
+    createdNewInkSession,
     selectedLocalBackendSessionId: selectedLocalBackendSessionId || null,
     threadKey: chosen.threadKey || null,
   });
 
   return {
-    pcpSessionId: chosen.id,
+    inkSessionId: chosen.id,
     backendSessionId: effectiveBackendSessionId,
     ...(backendSessionSeedId ? { backendSessionSeedId } : {}),
     ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
@@ -3509,7 +3516,7 @@ async function ensurePcpSessionContext(
  */
 function startSessionTakeoverWatcher(
   backend: string,
-  pcpSessionId: string | undefined,
+  inkSessionId: string | undefined,
   studioId?: string,
   /** Round 18: this wrapper's generation (runtimeLinkId) — markers, records,
    * and scope finalization bind to it so a stale wrapper can neither consume
@@ -3524,10 +3531,10 @@ function startSessionTakeoverWatcher(
   onUnprotected?: () => void
 ): { stop: () => void } | undefined {
   if (backend !== 'codex' && backend !== 'gemini' && backend !== 'claude') return undefined;
-  if (!pcpSessionId) return undefined;
+  if (!inkSessionId) return undefined;
   const cwd = process.cwd();
   const postLifecycle = async (body: Record<string, unknown>) => {
-    const serverUrl = getPcpServerUrl();
+    const serverUrl = getInkServerUrl();
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const token = await getValidAccessToken(serverUrl);
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -3544,7 +3551,7 @@ function startSessionTakeoverWatcher(
   };
   return startTakeoverWatcher({
     cwd,
-    expectedSessionId: pcpSessionId,
+    expectedSessionId: inkSessionId,
     generation,
     onUnprotected,
     // Round 17: scope end is a real boundary. A turn this watcher claimed is
@@ -3553,7 +3560,7 @@ function startSessionTakeoverWatcher(
     // the server is refused when it lands.
     finalizeScope: async (turnEpoch, fenceAttempts) => {
       await postLifecycle({
-        sessionId: pcpSessionId,
+        sessionId: inkSessionId,
         lifecycle: 'idle',
         event: 'stop',
         ...(turnEpoch
@@ -3570,7 +3577,7 @@ function startSessionTakeoverWatcher(
     },
     claim: async (markerSessionId, markerAt, attemptId) => {
       try {
-        const serverUrl = getPcpServerUrl();
+        const serverUrl = getInkServerUrl();
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
         const token = await getValidAccessToken(serverUrl);
         if (token) headers.Authorization = `Bearer ${token}`;
@@ -3643,7 +3650,7 @@ export async function runClaude(
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(
+    ? await ensureInkSessionContext(
         sbSlug,
         options.backend,
         passthroughArgs,
@@ -3661,9 +3668,9 @@ export async function runClaude(
   const currentGitBranch = getCurrentGitBranch(process.cwd());
   const { studioId, sbId } = await resolveStudioId(process.cwd());
 
-  if (sessionContext.pcpSessionId && runtimeLinkId) {
+  if (sessionContext.inkSessionId && runtimeLinkId) {
     upsertRuntimeSession(process.cwd(), {
-      pcpSessionId: sessionContext.pcpSessionId,
+      inkSessionId: sessionContext.inkSessionId,
       backend: options.backend,
       sbSlug,
       ...(sbId ? { sbId } : {}),
@@ -3687,15 +3694,15 @@ export async function runClaude(
     }
   }
 
-  const authEnv = await resolvePcpAuthEnv(options.verbose);
-  const pcpConfig = getPcpConfig();
+  const authEnv = await resolveInkAuthEnv(options.verbose);
+  const inkConfig = getInkUserConfig();
   const startupContextBlock = await resolveCodexStartupContextBlock({
     backend: options.backend,
     sbSlug,
-    pcpConfig,
+    inkConfig,
     hasAuthToken: Boolean(authEnv.INK_ACCESS_TOKEN || process.env.INK_ACCESS_TOKEN),
     verbose: options.verbose,
-    pcpSessionId: sessionContext.pcpSessionId,
+    inkSessionId: sessionContext.inkSessionId,
   });
 
   const prepared = adapter.prepare({
@@ -3715,13 +3722,13 @@ export async function runClaude(
   }
 
   const executionContext: BackendExecutionLogContext = {
-    pcpConfig,
+    inkConfig,
     sbSlug,
     backend: options.backend,
     binary: prepared.binary,
     args: prepared.args,
     promptParts,
-    pcpSessionId: sessionContext.pcpSessionId,
+    inkSessionId: sessionContext.inkSessionId,
     backendSessionId: sessionContext.backendSessionId,
     studioId,
     runtimeLinkId,
@@ -3782,7 +3789,7 @@ export async function runClaude(
   let takeoverEnforced = false;
   const takeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
-    sessionContext.pcpSessionId,
+    sessionContext.inkSessionId,
     studioId,
     runtimeLinkId,
     () => {
@@ -3835,7 +3842,7 @@ export async function runClaude(
     if (!capturedBackendSessionId) {
       capturedBackendSessionId = await resolveCapturedBackendSessionIdWithRetry({
         backend: options.backend,
-        pcpSessionId: sessionContext.pcpSessionId,
+        inkSessionId: sessionContext.inkSessionId,
         runtimeLinkId,
         sbSlug,
         studioId,
@@ -3845,14 +3852,14 @@ export async function runClaude(
     }
 
     await persistBackendSessionLink({
-      pcpSessionId: sessionContext.pcpSessionId,
+      inkSessionId: sessionContext.inkSessionId,
       backendSessionId: capturedBackendSessionId,
       backend: options.backend,
       sbSlug,
       runtimeLinkId,
       studioId,
       sbId,
-      email: pcpConfig?.email,
+      email: inkConfig?.email,
     });
     await finalizeExecution(code ?? null);
 
@@ -3892,7 +3899,7 @@ export async function runClaudeInteractive(
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(sbSlug, options.backend, passthroughArgs, options.verbose, [], {
+    ? await ensureInkSessionContext(sbSlug, options.backend, passthroughArgs, options.verbose, [], {
         listCandidates: options.sessionCandidates || options.sessionCandidatesJson,
         listCandidatesJson: options.sessionCandidatesJson,
         listCandidatesAll: options.sessionCandidatesAll,
@@ -3903,9 +3910,9 @@ export async function runClaudeInteractive(
   const currentGitBranch = getCurrentGitBranch(process.cwd());
   const { studioId, sbId } = await resolveStudioId(process.cwd());
 
-  if (sessionContext.pcpSessionId && runtimeLinkId) {
+  if (sessionContext.inkSessionId && runtimeLinkId) {
     upsertRuntimeSession(process.cwd(), {
-      pcpSessionId: sessionContext.pcpSessionId,
+      inkSessionId: sessionContext.inkSessionId,
       backend: options.backend,
       sbSlug,
       ...(sbId ? { sbId } : {}),
@@ -3928,15 +3935,15 @@ export async function runClaudeInteractive(
     }
   }
 
-  const authEnv = await resolvePcpAuthEnv(options.verbose);
-  const pcpConfig = getPcpConfig();
+  const authEnv = await resolveInkAuthEnv(options.verbose);
+  const inkConfig = getInkUserConfig();
   const startupContextBlock = await resolveCodexStartupContextBlock({
     backend: options.backend,
     sbSlug,
-    pcpConfig,
+    inkConfig,
     hasAuthToken: Boolean(authEnv.INK_ACCESS_TOKEN || process.env.INK_ACCESS_TOKEN),
     verbose: options.verbose,
-    pcpSessionId: sessionContext.pcpSessionId,
+    inkSessionId: sessionContext.inkSessionId,
   });
   const knownLocalSessionSnapshot = options.session
     ? new Map(
@@ -3971,12 +3978,12 @@ export async function runClaudeInteractive(
     }
 
     const executionContext: BackendExecutionLogContext = {
-      pcpConfig,
+      inkConfig,
       sbSlug,
       backend: options.backend,
       binary: prepared.binary,
       args: prepared.args,
-      pcpSessionId: sessionContext.pcpSessionId,
+      inkSessionId: sessionContext.inkSessionId,
       backendSessionId: attemptBackendSessionId,
       studioId,
       runtimeLinkId,
@@ -4012,7 +4019,7 @@ export async function runClaudeInteractive(
         prepared.cleanup();
         finalCapturedBackendSessionId = await resolveCapturedBackendSessionIdWithRetry({
           backend: options.backend,
-          pcpSessionId: sessionContext.pcpSessionId,
+          inkSessionId: sessionContext.inkSessionId,
           runtimeLinkId,
           sbSlug,
           studioId,
@@ -4052,7 +4059,7 @@ export async function runClaudeInteractive(
   // the same session's scope); it is stopped before the wrapper exits.
   const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
-    sessionContext.pcpSessionId,
+    sessionContext.inkSessionId,
     studioId,
     runtimeLinkId,
     () => {
@@ -4099,14 +4106,14 @@ export async function runClaudeInteractive(
     }
 
     await persistBackendSessionLink({
-      pcpSessionId: sessionContext.pcpSessionId,
+      inkSessionId: sessionContext.inkSessionId,
       backendSessionId: finalCapturedBackendSessionId,
       backend: options.backend,
       sbSlug,
       runtimeLinkId,
       studioId,
       sbId,
-      email: pcpConfig?.email,
+      email: inkConfig?.email,
     });
 
     await interactiveTakeoverWatcher?.stop();

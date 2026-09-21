@@ -60,7 +60,7 @@ REFUSAL_CODES = {
 
 def validate_identity(info, project, recorded_id, db_port):
     """Pure refusal guard; tests must never execute a wrong-target payload."""
-    if not re.fullmatch(r"pcp-integration(?:-[a-zA-Z0-9_-]+)?", project):
+    if not re.fullmatch(r"ink-integration(?:-[a-zA-Z0-9_-]+)?", project):
         raise Refusal("Fixture cleanup requires an integration project name.")
     if not isinstance(recorded_id, str) or not re.fullmatch(r"[a-f0-9]{12}(?:[a-f0-9]{52})?", recorded_id):
         raise Refusal("Fixture cleanup has no recorded database container ID; use --reset.")
@@ -167,7 +167,7 @@ def checksum_guard(tables):
     code = "PC003" if tuple(tables) == EXCLUDED_TABLES else "PC004"
     # The full set exceeds jsonb_build_object's argument limit too.
     expected = " || ".join("jsonb_build_object(" + literal(t) +
-                           ", (SELECT checksums -> " + literal(t) + " FROM _pcp_it.stack))" for t in tables)
+                           ", (SELECT checksums -> " + literal(t) + " FROM _ink_it.stack))" for t in tables)
     return ("DO $checks$ BEGIN IF (" + checksum_expression(tables) + ") IS DISTINCT FROM (" + expected +
             ") THEN RAISE EXCEPTION 'Fixture baseline checksum mismatch' USING ERRCODE = " +
             literal(code) + "; END IF; END $checks$;\n")
@@ -183,7 +183,7 @@ def identity_guard(project, container_id, signature, token, run_id=None):
                   "fingerprint = " + literal(signature), "token = " + literal(token) + "::uuid"]
     if run_id is not None:
         predicates.append("run_id = " + literal(run_id) + "::uuid")
-    return DATABASE_GUARD + ("DO $identity$ BEGIN PERFORM 1 FROM _pcp_it.stack WHERE singleton AND " +
+    return DATABASE_GUARD + ("DO $identity$ BEGIN PERFORM 1 FROM _ink_it.stack WHERE singleton AND " +
                             " AND ".join(predicates) + " FOR UPDATE; IF NOT FOUND THEN "
                             "RAISE EXCEPTION 'Fixture stack identity mismatch' USING ERRCODE = 'PC002'; END IF; END $identity$;\n")
 
@@ -234,15 +234,15 @@ def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature
     # Test-only metadata, not an application migration. Never exposed to REST;
     # a reset replaces it before another suite can start. An app DB lacks it.
     transaction(container_id, DATABASE_GUARD + """
-CREATE SCHEMA IF NOT EXISTS _pcp_it;
-REVOKE ALL ON SCHEMA _pcp_it FROM PUBLIC, anon, authenticated, service_role;
-CREATE TABLE IF NOT EXISTS _pcp_it.stack (
+CREATE SCHEMA IF NOT EXISTS _ink_it;
+REVOKE ALL ON SCHEMA _ink_it FROM PUBLIC, anon, authenticated, service_role;
+CREATE TABLE IF NOT EXISTS _ink_it.stack (
   singleton boolean PRIMARY KEY CHECK (singleton), project text NOT NULL,
   db_id text NOT NULL, fingerprint text NOT NULL, token uuid NOT NULL,
   checksums jsonb NOT NULL, run_id uuid, started_at timestamptz
 );
-DELETE FROM _pcp_it.stack;
-INSERT INTO _pcp_it.stack VALUES (true, """ + ", ".join(map(literal, (
+DELETE FROM _ink_it.stack;
+INSERT INTO _ink_it.stack VALUES (true, """ + ", ".join(map(literal, (
         project, container_id, signature, token, json.dumps(checksums), run_id))) + ", now());\n", lock_fds,
                 phase="marker initialization")
     return {"hash": hashlib.sha256(baseline.encode()).hexdigest(), "token": token}
@@ -263,7 +263,7 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     verify_catalog(container_id, lock_fds)
     guard = identity_guard(project, container_id, signature, baseline_state["token"])
     # Commit the diagnostic marker BEFORE cleanup; failed cleanup/suite leaves it.
-    transaction(container_id, guard + "UPDATE _pcp_it.stack SET run_id = " + literal(run_id) +
+    transaction(container_id, guard + "UPDATE _ink_it.stack SET run_id = " + literal(run_id) +
                 "::uuid, started_at = now();\n", lock_fds, phase="run marker acquisition")
     guard = identity_guard(project, container_id, signature, baseline_state["token"], run_id)
     # ONLY excludes descendants; RESTRICT prevents cleanup expanding via FKs.
@@ -283,4 +283,4 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
 def finish_run(project, recorded_id, db_port, baseline_state, lock_fds, signature, run_id):
     container_id = checked_container(project, recorded_id, db_port)
     transaction(container_id, identity_guard(project, container_id, signature, baseline_state["token"], run_id) +
-                "UPDATE _pcp_it.stack SET run_id = NULL, started_at = NULL;\n", lock_fds, phase="run marker completion")
+                "UPDATE _ink_it.stack SET run_id = NULL, started_at = NULL;\n", lock_fds, phase="run marker completion")

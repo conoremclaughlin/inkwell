@@ -160,7 +160,7 @@ export function resolveChannelPluginPath(cwd: string): string | null {
 
 /**
  * Build a merged MCP config that includes both the project's .mcp.json
- * and any skill-provided MCP servers. Also injects PCP session/studio
+ * and any skill-provided MCP servers. Also injects Inkwell session/studio
  * headers via the shared injectSessionHeaders utility.
  *
  * Two layers:
@@ -179,7 +179,7 @@ export function resolveChannelPluginPath(cwd: string): string | null {
  */
 export function buildMergedMcpConfig(
   cwd: string,
-  options?: { pcpSessionId?: string; studioId?: string; omitToolServers?: boolean }
+  options?: { inkSessionId?: string; studioId?: string; omitToolServers?: boolean }
 ): {
   mcpConfigPath: string | null;
   cleanup: () => void;
@@ -272,7 +272,7 @@ export function buildMergedMcpConfig(
   const cleanups: Array<() => void> = [];
   let effectivePath = hasProjectConfig ? projectMcpPath : null;
 
-  const sessionId = options?.pcpSessionId || process.env.INK_SESSION_ID;
+  const sessionId = options?.inkSessionId || process.env.INK_SESSION_ID;
   const studioId = options?.studioId || process.env.INK_STUDIO_ID;
 
   // Always run injection when we have a config path. The x-ink-context header
@@ -282,7 +282,7 @@ export function buildMergedMcpConfig(
   if (effectivePath) {
     const injection = injectSessionHeaders({
       mcpConfigPath: effectivePath,
-      pcpSessionId: sessionId,
+      inkSessionId: sessionId,
       studioId,
     });
     if (injection.modified) {

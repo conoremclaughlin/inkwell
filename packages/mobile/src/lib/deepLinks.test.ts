@@ -39,9 +39,9 @@ describe('parseDeepLink', () => {
   });
 
   it('decodes a percent-encoded path key', () => {
-    expect(parseDeepLink('/thread/pcp%3Apr%3A632')).toEqual({
+    expect(parseDeepLink('/thread/inkwell%3Apr%3A632')).toEqual({
       screen: 'Thread',
-      threadKey: 'pcp:pr:632',
+      threadKey: 'inkwell:pr:632',
     });
   });
 

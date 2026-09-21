@@ -10,7 +10,7 @@
  * failures shared a shape: verified somewhere, inert where it counts.
  *
  *   1. The merge read the MCP envelope. Thirteen unit tests passed against
- *      mocks that wrapped their payload; `PcpClient.callTool` returns it
+ *      mocks that wrapped their payload; `InkClient.callTool` returns it
  *      already unwrapped, so against a live server the merge did nothing.
  *   2. The integration test then constructed the dispatcher itself. Deleting
  *      the wiring from `chat.ts` — the `audience`, the dispatcher, the policy
@@ -34,18 +34,18 @@ import { handleClientLocalTool, isClientLocalTool, createSignalSink } from './co
 import { ContextLedger } from './context-ledger.js';
 import { listLocalTools, type LocalToolAudience } from './local-tool-catalog.js';
 import { applyProfile, type ToolProfileId } from './tool-profiles.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 function inkTool(tool: string, args: Record<string, unknown> = {}): string {
   return '```ink-tool\n' + JSON.stringify({ tool, args }) + '\n```';
 }
 
 /**
- * The Inkwell server's half, in the shape `PcpClient.callTool` hands back —
+ * The Inkwell server's half, in the shape `InkClient.callTool` hands back —
  * the payload, already unwrapped from the MCP envelope. Mocking the envelope
  * instead is failure (1) above.
  */
-function serverDescribeTool(args: Record<string, unknown>): PcpToolCallResult {
+function serverDescribeTool(args: Record<string, unknown>): InkToolCallResult {
   if (typeof args.name === 'string') {
     return {
       success: false,
@@ -124,17 +124,17 @@ async function runDiscoveryTurn(opts: {
             callTool: createLocalToolDispatcher({
               cwd: process.cwd(),
               callPi: callPiTool,
-              callPcp: async (tool, args) =>
+              callInk: async (tool, args) =>
                 tool === 'describe_tool'
                   ? serverDescribeTool(args)
-                  : ({ success: true } as PcpToolCallResult),
+                  : ({ success: true } as InkToolCallResult),
               resolveCredentials: (args) => args,
               audience: opts.audience ?? 'parent',
               // What chat.ts wires: the LIVE policy decides visibility, so a
               // denial the static list never heard of still hides the tool.
-              // inspectPcpTool — asking what exists must not spend grants.
+              // inspectInkTool — asking what exists must not spend grants.
               isHardDenied: (tool) => {
-                const decision = policy.inspectPcpTool(tool, 'sess-discovery');
+                const decision = policy.inspectInkTool(tool, 'sess-discovery');
                 return !decision.allowed && !decision.promptable;
               },
               // The head chat.ts gives each host, refusal included.
@@ -145,7 +145,7 @@ async function runDiscoveryTurn(opts: {
                       { type: 'text', text: `${tool} is not available to a shadow clone.` },
                     ],
                     isError: true,
-                  } as PcpToolCallResult;
+                  } as InkToolCallResult;
                 }
                 return isClientLocalTool(tool)
                   ? handleClientLocalTool(tool, args, ledger, createSignalSink())
@@ -196,7 +196,7 @@ describe('a turn that asks what it can call', () => {
   });
 
   it('does not have to ask permission to find out, even under the minimal profile', async () => {
-    // The `minimal` profile narrows the PCP surface to `group:ink-safe`, so
+    // The `minimal` profile narrows the Inkwell surface to `group:ink-safe`, so
     // this is the seat where the safe-tools entry earns itself: without it
     // `describe_tool` is outside the allowlist and gets refused.
     //

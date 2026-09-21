@@ -3,7 +3,7 @@
  *
  * Phase 1 provider abstraction for loading user skills from deterministic sources.
  * Current providers:
- * - cloud: PCP skills registry installations
+ * - cloud: Inkwell skills registry installations
  * - local: ~/.ink/skills filesystem directory
  */
 

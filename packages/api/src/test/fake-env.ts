@@ -7,7 +7,7 @@
  * somebody working around the alarm instead of removing its cause. Twelve test
  * files had drifted onto the same 51-character look-alike string.
  *
- * Nothing under test reads these values. `pcp-tokens` only needs `jwt.sign` and
+ * Nothing under test reads these values. `ink-tokens` only needs `jwt.sign` and
  * `jwt.verify` to agree on the same string, so the values are chosen to be
  * unmistakably fake to a person, a reviewer and a scanner alike.
  */
