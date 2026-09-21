@@ -65,6 +65,11 @@ jobs:
       - name: Ink naming guard controls
         run: python3 scripts/check-ink-naming.test.py
 
+      - name: Browser companion typecheck and production build
+        run: |
+          yarn workspace @inklabs/browser-companion type-check
+          yarn workspace @inklabs/browser-companion build
+
       # Shell, so it is not collected by vitest and would never run otherwise.
       # Covers the commit-message credential guard and the hook that invokes it.
       - name: Commit-message credential guard
