@@ -24,7 +24,8 @@ BASELINE_FILE = "fixture-baseline.sql"
 # are deliberately not reset. The baseline preserves migration-seeded templates.
 FIXTURE_TABLES = tuple("""
 activity_stream agent_identities agent_identity_history agent_inbox
-agent_inbox_read_status agent_sessions approval_requests artifact_comments
+agent_inbox_read_status agent_sessions alert_events alert_sources alert_webhooks
+approval_requests artifact_comments
 artifact_history artifact_uri_aliases artifacts audit_log authorized_groups
 channel_routes connected_accounts contacts conversations group_challenge_codes
 heartbeat_notifications heartbeat_state inbox_thread_messages
