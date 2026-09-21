@@ -170,10 +170,12 @@ export function widenActiveRunCandidates(sessionId: string, previousEpochs: stri
  * the run must stay registered until its terminal state durably persists —
  * but it changes what a shutdown may truthfully claim about the run.
  *
- * The outcome must be the CLASSIFIED one. Callers that record `failed` first
- * and refine it afterwards leave a window in which a shutdown acts on the
- * unrefined value, which is how a refused resume terminalized a live owner
- * (Lumen's review of PR #660 P1).
+ * The outcome must be the CLASSIFIED one, because nothing is guaranteed to
+ * revise it afterwards: the entry keeps this value until the run is cleared,
+ * and the finalize write in between can be rejected by the epoch fence or
+ * (on a refusal) deliberately record no outcome. A shutdown during that span
+ * reads whatever was written here, which is how a refused resume terminalized
+ * a live owner (Lumen's review of PR #660 P1).
  */
 export function markRunnerSettled(sessionId: string, outcome: SettledOutcome): void {
   const run = active.get(sessionId);

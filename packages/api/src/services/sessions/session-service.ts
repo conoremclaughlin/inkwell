@@ -1950,8 +1950,8 @@ export class SessionService implements ISessionService {
     let turnDurationMs: number;
     // Classified inside the try, BEFORE the settled outcome is recorded, and
     // declared here so the finalize payload and the boundary below can read it
-    // (Lumen's review of PR #660 P1: recording `failed` first and correcting it
-    // afterwards left a window in which shutdown terminalized the owner).
+    // (Lumen's review of PR #660 P1: an unclassified `failed` recorded at the
+    // settle point is what shutdown terminalized the owner with).
     let errorClassification: ErrorClassification | null = null;
     let refusedBeforeAcceptance = false;
     const turnStartMs = Date.now();
@@ -1974,9 +1974,15 @@ export class SessionService implements ISessionService {
       // often because another writer already holds the thread we tried to
       // resume — and that refusal is the one failure that says nothing about
       // the target session's own state: no turn began, so nothing was
-      // observed. Recording `failed` here and correcting it a few lines later
-      // is not enough, because the recorded outcome is what a shutdown between
-      // the two would act on (Lumen's review of PR #660 P1).
+      // observed. The outcome has to be right AT the settle point, because
+      // nothing downstream is guaranteed to revise it: the entry keeps the
+      // value until the run is cleared, that span contains the awaited
+      // finalize write, and on this path the finalize deliberately records no
+      // outcome at all — so a `failed` written here is simply retained, and it
+      // is what a shutdown during that span acts on. That retained value, not
+      // any gap between two adjacent statements, is the mechanism Lumen
+      // reproduced (his review of PR #660 P1, and his correction on the
+      // thread: adjacent synchronous statements are not preempted).
       errorClassification =
         !result.success && result.error
           ? classifyError({ errorText: result.error, backend: resolvedBackend })
