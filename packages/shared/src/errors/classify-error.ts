@@ -7,6 +7,7 @@
  */
 
 export type ErrorCategory =
+  | 'owner_conflict'
   | 'capacity'
   | 'quota'
   | 'timeout'
@@ -15,6 +16,20 @@ export type ErrorCategory =
   | 'auth'
   | 'crash'
   | 'unknown';
+
+/**
+ * Categories where the backend refused the run BEFORE accepting it — no turn
+ * began, so the run observed nothing about the target session's own state.
+ *
+ * Callers use this to decide whether a failure may be written onto the target
+ * session as an outcome. It must not be read as "the owner is alive": the
+ * refusal proves a writer/lock exists on the backend thread, which is not a
+ * heartbeat, not an authenticated endpoint, and not authority to refresh
+ * owner registration or extend a lease (Lumen, spec:live-agent-surfaces).
+ */
+export function isPreAcceptanceRefusal(category: ErrorCategory): boolean {
+  return category === 'owner_conflict';
+}
 
 export interface ErrorClassification {
   category: ErrorCategory;
@@ -34,6 +49,37 @@ const RULES: Array<{
   retryable: boolean;
   test: (input: ClassifyInput) => boolean;
 }> = [
+  {
+    // FIRST, deliberately: the backend refused to start because another writer
+    // already holds the thread. It is the most specific signature we receive
+    // and the only one that says something about a session OTHER than the
+    // spawn's own health, so a looser rule must never claim it first.
+    //
+    // Measured on spec:live-agent-surfaces, 2026-09-21: four resumes into
+    // Codex thread 019d0180 were refused this way while its owner was working,
+    // and each one landed `lifecycle='failed', cli_attached=false` on the live
+    // owner's row. Classified `unknown` at the time — the `crash` rule's
+    // exit-code test is the one that would otherwise have caught it, and
+    // session-service calls classifyError without an exitCode.
+    //
+    // Patterns are the signatures we have actually observed. Codex 0.154 emits
+    // the thread-store conflict on stderr and the JSON-RPC refusal on stdout;
+    // both appear in the same captured text. Other backends get added here
+    // when a real refusal from them has been seen, not guessed at.
+    category: 'owner_conflict',
+    // Not retryable, matching what this text already classified as: an
+    // immediate re-dispatch would re-resume the same held thread and be
+    // refused again. Recovery belongs to reconciliation, not to the runner.
+    //
+    // Naming it does change one downstream behaviour, deliberately.
+    // session-service's flushQueueOnNonRetryableError acts on classifications
+    // that are non-retryable AND not `unknown`, so this text used to fall
+    // through it and every queued message took its own turn at resuming the
+    // held thread. Now the queue is flushed with a named reason instead.
+    retryable: false,
+    test: ({ errorText }) =>
+      /already has an active writer/i.test(errorText) || /thread-store conflict/i.test(errorText),
+  },
   {
     category: 'capacity',
     retryable: true,

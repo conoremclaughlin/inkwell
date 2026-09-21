@@ -55,7 +55,7 @@ import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
-import { classifyError } from '@inklabs/shared';
+import { classifyError, isPreAcceptanceRefusal } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
@@ -2047,6 +2047,23 @@ export class SessionService implements ISessionService {
         ? classifyError({ errorText: result.error, backend: resolvedBackend })
         : null;
 
+    // The backend refused this run before accepting it — most often because
+    // another writer already holds the thread we tried to resume. Nothing ran,
+    // so this turn observed NOTHING about the target session's own state, and
+    // the terminal write below must not pretend otherwise. See the finalize
+    // payload for what that costs and what it deliberately does not claim.
+    const refusedBeforeAcceptance = errorClassification
+      ? isPreAcceptanceRefusal(errorClassification.category)
+      : false;
+    if (refusedBeforeAcceptance) {
+      logger.warn('Backend refused the run before accepting it; not recording an outcome', {
+        sessionId: session.id,
+        backend: resolvedBackend,
+        category: errorClassification!.category,
+        summary: errorClassification!.summary,
+      });
+    }
+
     this.activityStream
       .logActivity({
         userId,
@@ -2113,15 +2130,42 @@ export class SessionService implements ISessionService {
     // Shutdown owns the state from here (Lumen, PR #490 round 3).
     // One payload for both the inline attempt and any background retry, so a
     // retry writes the identical terminal state the first attempt meant to.
+    //
+    // A run the backend refused before accepting contributes none of the
+    // outcome fields (2026-09-21, spec:live-agent-surfaces). It processed no
+    // message, so `messageCount` does not move; it observed no exit of the
+    // owner's process, so `cliAttached` is left exactly as it was read —
+    // clearing it is what told the dispatcher a live owner had gone away.
+    //
+    // `lifecycle` is the one field that is RESTORED rather than omitted,
+    // because this turn already overwrote it: the takeover above stamps
+    // `running` before the runner spawns. Omitting it here would leave our own
+    // `running` standing on a session we know nothing about, which
+    // thread-spines reads as live for the next 30 minutes — a liveness claim
+    // manufactured out of a refusal. Writing back the value this same turn
+    // read is the only option that asserts nothing new in either direction.
+    //
+    // Two things this deliberately does NOT do. It does not treat the refusal
+    // as proof the owner is alive — a held thread-store lock is not a
+    // heartbeat, and no registration or lease is refreshed from it. And it
+    // does not revert the takeover's `turnEpoch` or the `updated_at` bump the
+    // takeover already caused; both are real and both are out of this slice.
+    //
+    // `backend` stays in the payload on every path, so the refusal case still
+    // sends a non-empty update through the epoch fence rather than a no-op.
     const finalizeUpdates = {
       ...(result.backendSessionId !== session.backendSessionId
         ? { backendSessionId: result.backendSessionId }
         : {}),
-      messageCount: session.messageCount + 1,
       backend: resolvedBackend,
       ...(servedModel ? { model: servedModel } : {}),
-      lifecycle: postRunLifecycle as Session['lifecycle'],
-      cliAttached: false,
+      ...(refusedBeforeAcceptance
+        ? { lifecycle: session.lifecycle }
+        : {
+            messageCount: session.messageCount + 1,
+            lifecycle: postRunLifecycle as Session['lifecycle'],
+            cliAttached: false,
+          }),
     };
     const performFinalizeWrite = () => writeTerminalFenced(finalizeUpdates);
 
@@ -2139,6 +2183,20 @@ export class SessionService implements ISessionService {
       // epoch: if a newer turn registered over us while our late write landed
       // (it can only land while the row was still ours), its entry survives.
       clearActiveRunIfOwner(session.id, turnEpoch);
+      // The registry entry above is ours and always goes. The boundary effects
+      // below are not: they exist because "the server run IS the turn", and a
+      // run the backend refused before accepting was never a turn. Their
+      // ownership gate is the row's turnEpoch, which this turn DOES hold — so
+      // it does not stop them, and releaseGraphClaimsForSession would return
+      // the live owner's claims to the pool on the strength of a refusal that
+      // told us nothing about the owner. Same rule as the finalize payload:
+      // a run that observed nothing writes nothing.
+      if (refusedBeforeAcceptance) {
+        logger.warn('Skipping boundary effects; the backend refused this run before accepting it', {
+          sessionId: session.id,
+        });
+        return;
+      }
       // A QUEUED next turn is invisible to every DB-side fence: it acquires
       // and renews the lease BEFORE the processing lock, while the row epoch
       // is still ours (Lumen rounds 7–8 — a heartbeat cutoff rejected our own
