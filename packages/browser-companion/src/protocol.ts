@@ -201,7 +201,9 @@ export function privacySignals(snapshot: BrowserSnapshot): string {
     ...snapshot.fields.map((f) => f.label),
   ].join('\n');
   const counts = [
-    ['email-like strings', (data.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) || []).length],
+    // Untrusted page text must not cause an unbounded backtracking scan on
+    // the panel/dashboard main thread. These are hints, not email validation.
+    ['email-like strings', (data.match(/[\w.+-]{1,64}@[\w.-]{1,255}\.[a-z]{2,63}/gi) || []).length],
     ['phone-like strings', (data.match(/\b\d{3}[-. ]\d{3}[-. ]\d{4}\b/g) || []).length],
     ['long digit runs', (data.match(/\d{6,}/g) || []).length],
     ['currency amounts', (data.match(/[$€£¥]\s*\d/g) || []).length],
