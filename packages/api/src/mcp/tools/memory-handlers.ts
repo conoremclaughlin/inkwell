@@ -20,6 +20,7 @@ import {
   getRequestContext,
 } from '../../utils/request-context';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import {
   isSessionAuthorized,
@@ -1733,16 +1734,7 @@ export function shouldStampEndedAt(params: { status?: string; lifecycle?: string
  * these set produces a row that is un-ended and still reads as history
  * everywhere it matters.
  */
-export function isTerminalPhaseMarker(value: string | null | undefined): boolean {
-  const marker = (value || '').trim().toLowerCase();
-  if (!marker) return false;
-  return (
-    marker === 'complete' ||
-    marker.startsWith('complete:') ||
-    marker === 'completed' ||
-    marker.startsWith('completed:')
-  );
-}
+export { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
 
 export function shouldClearEndedAt(params: {
   reopen?: boolean;

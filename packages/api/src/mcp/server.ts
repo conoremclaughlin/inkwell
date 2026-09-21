@@ -38,6 +38,7 @@ import {
 import { runWithRequestContext, tokenIdentityContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
+import { getHeartbeatTickHealth } from '../services/heartbeat';
 import { InkAuthProvider } from './auth/ink-auth-provider';
 import { signInkAccessToken } from '../auth/ink-tokens';
 
@@ -693,6 +694,25 @@ export class MCPServer {
           toolsVersion: this.toolsVersion,
           miniApps: this.miniAppsInfo.map((m) => m.name),
         },
+      };
+
+      /**
+       * Scheduler liveness, reported from outside the scheduler.
+       *
+       * A heartbeat that stops ticking cannot report itself — the failure IS
+       * the inability to run code on time, so any check scheduled by the thing
+       * under test goes quiet with it. What survives is the timestamp of the
+       * last tick, read by whoever asks. Stale `lastTickAt` with a healthy
+       * process is the signature of a suspended host, and it is invisible in
+       * `uptime` and `startedAt`, both of which count straight through a sleep.
+       *
+       * Advisory only: it never moves the 200/503, which stays the database's
+       * call. A laptop closed overnight is not an unhealthy server.
+       */
+      const tickHealth = getHeartbeatTickHealth();
+      checks.heartbeat = {
+        status: 'ok',
+        details: tickHealth,
       };
 
       const dbOk = checks.database?.status === 'ok';
