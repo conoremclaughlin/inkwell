@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inkwell · Browser Companion</title>
+  </head>
+  <body>
+    <header>
+      <span class="eyebrow">INKWELL / COMPANION</span>
+      <h1>A second pair<br />of eyes.</h1>
+      <p>Bring a page into the conversation.<br />Keep the final say.</p>
+    </header>
+    <main>
+      <section>
+        <h2>01 · Capture deliberately</h2>
+        <p>
+          Click the extension icon on your source page first. Selected text is the default; nothing
+          is read in the background.
+        </p>
+        <button id="selection">Selected text</button>
+        <details>
+          <summary>Share a larger part of this page</summary>
+          <p>
+            Whole-page text may contain private account or personal information that is easy to miss
+            in a long preview.
+          </p>
+          <label
+            ><input type="checkbox" id="whole-page-consent" /> I want to review a whole-page
+            capture</label
+          ><button id="page" class="secondary">Capture visible page text</button>
+        </details>
+      </section>
+      <section id="capture" hidden>
+        <h2>02 · What you will share</h2>
+        <p>
+          Includes page title, URL path, excerpt and eligible field labels. No form values. These
+          can still be private—inspect the complete payload.
+        </p>
+        <p id="privacy" class="warning"></p>
+        <pre id="preview"></pre>
+        <label for="origin">Inkwell dashboard (web port)</label
+        ><input id="origin" value="http://localhost:3002" spellcheck="false" /><button id="share">
+          Review in Inkwell ↗
+        </button>
+        <p class="small">
+          Access is granted only to this dashboard host. Chrome host grants cover all ports; the
+          companion uses the exact origin above. No account token is stored in the extension.
+          Sending shares context with the SB and its model provider; copies may remain in
+          transcripts, logs or later summaries. Do not share credentials.
+        </p>
+      </section>
+      <section>
+        <h2>03 · Suggested changes</h2>
+        <p>Use “Review in extension” on a reply, or paste a proposal JSON below.</p>
+        <textarea
+          id="proposal-json"
+          rows="3"
+          placeholder='{"version":1,"snapshotId":"…","changes":[…]}'
+        ></textarea
+        ><button id="import" class="secondary">Preview proposal</button>
+        <div id="changes"></div>
+        <div id="confirmation" hidden>
+          <p class="warning">
+            Applying sends input/change events. The site may autosave or make requests immediately.
+            We never click Submit, but cannot prevent site scripts from doing so.
+          </p>
+          <button id="apply">Apply these exact changes</button>
+        </div>
+      </section>
+      <button id="clear" class="secondary">Forget this capture</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+    <footer>One capture · ten minutes · no passive browsing history</footer>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
