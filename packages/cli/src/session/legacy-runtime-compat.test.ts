@@ -19,7 +19,7 @@ describe('legacy runtime session records', () => {
     version: 1,
     sessions: [
       {
-        pcpSessionId: 'pcp-1',
+        inkSessionId: 'ink-1',
         backend: 'claude',
         agentId: 'aster',
         studioId: 'studio-1',
@@ -28,7 +28,7 @@ describe('legacy runtime session records', () => {
       },
     ],
     current: {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'claude',
       agentId: 'aster',
       updatedAt: '2026-09-01T00:00:00.000Z',
@@ -61,7 +61,7 @@ describe('legacy runtime session records', () => {
     write(legacyState);
 
     upsertRuntimeSession(root, {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'claude',
       sbSlug: 'aster',
       studioId: 'studio-1',
@@ -80,7 +80,7 @@ describe('legacy runtime session records', () => {
     write(legacyState);
 
     upsertRuntimeSession(root, {
-      pcpSessionId: 'pcp-2',
+      inkSessionId: 'ink-2',
       backend: 'claude',
       sbSlug: 'aster',
       studioId: 'studio-1',
@@ -96,7 +96,7 @@ describe('legacy runtime session records', () => {
       version: 1,
       sessions: [
         {
-          pcpSessionId: 'pcp-9',
+          inkSessionId: 'ink-9',
           backend: 'claude',
           sbSlug: 'wren',
           updatedAt: '2026-09-14T00:00:00.000Z',

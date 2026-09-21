@@ -79,14 +79,14 @@ export class GeminiRunner implements IRunner {
       config.container?.runtimeDir
     );
 
-    // Build Gemini system settings with PCP MCP server config (including auth).
+    // Build Gemini system settings with Inkwell MCP server config (including auth).
     // Gemini CLI reads MCP config from settings.json, NOT .mcp.json.
     // We use GEMINI_CLI_SYSTEM_SETTINGS_PATH to point to a temp settings file
     // that overrides the mcpServers section. Other user settings (model, auth,
     // etc.) are preserved since system settings only override matching keys.
     let geminiSettingsEnvPath: string | undefined;
     let geminiSettingsHostPath: string | undefined;
-    if (config.pcpAccessToken) {
+    if (config.inkAccessToken) {
       const mcpJsonPath = join(config.workingDirectory, '.mcp.json');
       // Start from workspace .mcp.json servers (includes supabase, github, etc.)
       let mcpServers: Record<string, unknown> = {};
@@ -101,25 +101,25 @@ export class GeminiRunner implements IRunner {
 
       // Build consolidated context token
       const contextToken = encodeContextToken({
-        sessionId: config.pcpSessionId || '',
+        sessionId: config.inkSessionId || '',
         studioId: config.studioId || '',
         sbSlug: config.sbSlug || 'unknown',
         cliAttached: false,
         runtime: 'gemini',
       });
 
-      // Ensure PCP server has auth + session headers
-      const pcpConfig = (mcpServers.inkwell || {}) as Record<string, unknown>;
-      const existingHeaders = (pcpConfig.headers || {}) as Record<string, string>;
+      // Ensure Inkwell server has auth + session headers
+      const inkConfig = (mcpServers.inkwell || {}) as Record<string, unknown>;
+      const existingHeaders = (inkConfig.headers || {}) as Record<string, string>;
       mcpServers.inkwell = {
-        ...pcpConfig,
-        type: pcpConfig.type || 'http',
-        url: pcpConfig.url || 'http://localhost:3001/mcp',
+        ...inkConfig,
+        type: inkConfig.type || 'http',
+        url: inkConfig.url || 'http://localhost:3001/mcp',
         headers: {
           ...existingHeaders,
           Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
           'x-ink-context': contextToken,
-          ...(config.pcpSessionId ? { 'x-ink-session-id': config.pcpSessionId } : {}),
+          ...(config.inkSessionId ? { 'x-ink-session-id': config.inkSessionId } : {}),
           ...(config.studioId ? { 'x-ink-studio-id': config.studioId } : {}),
         },
       };
@@ -153,7 +153,7 @@ export class GeminiRunner implements IRunner {
         backendSessionId: backendSessionId || '(new)',
         workingDirectory: config.workingDirectory,
         messageLength: fullMessage.length,
-        hasPcpAccessToken: !!config.pcpAccessToken,
+        hasInkAccessToken: !!config.inkAccessToken,
         geminiSettingsOverride: !!geminiSettingsEnvPath,
       });
 
@@ -253,9 +253,9 @@ export class GeminiRunner implements IRunner {
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...(extraEnv || {}),
         ...buildSessionEnv({
-          pcpSessionId: config.pcpSessionId,
+          inkSessionId: config.inkSessionId,
           studioId: config.studioId,
-          accessToken: config.pcpAccessToken,
+          accessToken: config.inkAccessToken,
           sbSlug: config.sbSlug,
           runtime: 'gemini',
           repoRoot: config.repoRoot,

@@ -47,11 +47,11 @@ def containers(project):
 
 
 def settings(env):
-    project = env.get("INTEGRATION_SUPABASE_PROJECT_ID", "pcp-integration")
+    project = env.get("INTEGRATION_SUPABASE_PROJECT_ID", "ink-integration")
     # This namespace is exclusively disposable test data. No app project ID
     # can be selected accidentally through an inherited override.
-    if not re.fullmatch(r"pcp-integration(?:-[a-zA-Z0-9_-]+)?", project):
-        raise Refusal("INTEGRATION_SUPABASE_PROJECT_ID must be pcp-integration or pcp-integration-<suffix>.")
+    if not re.fullmatch(r"ink-integration(?:-[a-zA-Z0-9_-]+)?", project):
+        raise Refusal("INTEGRATION_SUPABASE_PROJECT_ID must be ink-integration or ink-integration-<suffix>.")
     ports = []
     for index, name in enumerate(PORT_NAMES):
         value = env.get("INTEGRATION_SUPABASE_" + name + "_PORT", str(55421 + index))
@@ -298,7 +298,7 @@ def manage(root, harness, args, env):
                           "once, then reuse it. Do not repeatedly reset stacks across branches.")
         if not existing:
             port_preflight(ports)
-        workdir = Path(tempfile.mkdtemp(prefix="pcp-supabase-it-", dir=env.get("INTEGRATION_SUPABASE_WORKDIR_BASE"))) if fresh else cache
+        workdir = Path(tempfile.mkdtemp(prefix="ink-supabase-it-", dir=env.get("INTEGRATION_SUPABASE_WORKDIR_BASE"))) if fresh else cache
         workdir.mkdir(parents=True, exist_ok=True, mode=0o700)
         say("Test workdir=" + str(workdir))
         marker_path = workdir / "run.json"

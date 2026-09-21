@@ -18,7 +18,7 @@ const workspaceTypeSchema = z.enum(['personal', 'team']);
 const workspaceMemberRoleSchema = z.enum(['owner', 'admin', 'member', 'viewer']);
 
 export const createWorkspaceSchema = userIdentifierBaseSchema.extend({
-  name: z.string().min(1).describe('Workspace display name (e.g., "Personal", "PCP Team")'),
+  name: z.string().min(1).describe('Workspace display name (e.g., "Personal", "Inkwell Team")'),
   slug: z
     .string()
     .min(1)

@@ -1,13 +1,13 @@
 ---
-name: pcp
+name: inkwell
 version: '0.1.0'
-displayName: Personal Context Protocol
+displayName: Inkwell
 description: Identity, memory, sessions, and cross-agent messaging via Inkwell. Gives agents persistent context that survives across sessions and works across AI backends.
 type: guide
 emoji: '🧠'
 category: productivity
 tags:
-  - pcp
+  - inkwell
   - memory
   - context
   - identity
@@ -18,7 +18,7 @@ author: Inkwell Team
 homepage: https://github.com/conoremclaughlin/personal-context-protocol
 triggers:
   keywords:
-    - pcp
+    - inkwell
     - memory
     - remember
     - recall
@@ -42,7 +42,7 @@ metadata:
         - openclaw.json.plugins.entries.pcp
 ---
 
-# Personal Context Protocol (Inkwell)
+# Inkwell
 
 Inkwell gives you persistent identity, long-term memory, session tracking, and cross-agent messaging. Your context survives across sessions and works across AI backends (Claude Code, Codex, Gemini, OpenClaw).
 
@@ -57,7 +57,7 @@ Inkwell tools are available via MCP. If the Inkwell MCP server is not already co
   "mcpServers": {
     "inkwell": {
       "command": "node",
-      "args": ["/path/to/pcp/packages/api/dist/index.js"],
+      "args": ["/path/to/inkwell/packages/api/dist/index.js"],
       "env": { "MCP_TRANSPORT": "stdio" }
     }
   }
@@ -105,7 +105,7 @@ recall(query: "auth approach", sbSlug: "wren")
 
 Searches your memories. Returns matches sorted by relevance and salience.
 
-**TopicKey convention:** `type:identifier` — e.g., `project:pcp/memory`, `decision:jwt-auth`, `lesson:cross-agent-review`.
+**TopicKey convention:** `type:identifier` — e.g., `project:inkwell/memory`, `decision:jwt-auth`, `lesson:cross-agent-review`.
 
 ### Sessions — Where You Are
 

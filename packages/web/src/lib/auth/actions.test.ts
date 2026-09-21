@@ -149,7 +149,7 @@ describe('auth server actions', () => {
       expect(mockRedirect).toHaveBeenCalledWith('/login');
     });
 
-    it('clears PCP admin cookies on signOut', async () => {
+    it('clears Inkwell admin cookies on signOut', async () => {
       mockSignOut.mockResolvedValue({ error: null });
 
       await expect(signOut()).rejects.toThrow('NEXT_REDIRECT');
@@ -167,7 +167,7 @@ describe('auth server actions', () => {
     it('calls logout API to revoke refresh token when cookie exists', async () => {
       mockSignOut.mockResolvedValue({ error: null });
       mockCookieGet.mockImplementation((name: string) => {
-        if (name === 'pcp-admin-refresh') return { value: 'pcp-rt-test-token' };
+        if (name === 'pcp-admin-refresh') return { value: 'ink-rt-test-token' };
         return undefined;
       });
 
@@ -177,7 +177,7 @@ describe('auth server actions', () => {
         expect.stringContaining('/api/admin/auth/logout'),
         expect.objectContaining({
           method: 'POST',
-          body: JSON.stringify({ refreshToken: 'pcp-rt-test-token' }),
+          body: JSON.stringify({ refreshToken: 'ink-rt-test-token' }),
         })
       );
     });
@@ -194,7 +194,7 @@ describe('auth server actions', () => {
     it('still signs out even if logout API call fails', async () => {
       mockSignOut.mockResolvedValue({ error: null });
       mockCookieGet.mockImplementation((name: string) => {
-        if (name === 'pcp-admin-refresh') return { value: 'pcp-rt-fail' };
+        if (name === 'pcp-admin-refresh') return { value: 'ink-rt-fail' };
         return undefined;
       });
       vi.spyOn(global, 'fetch').mockRejectedValue(new Error('Network error'));

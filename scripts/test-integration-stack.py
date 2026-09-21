@@ -36,7 +36,7 @@ class LifecycleTests(unittest.TestCase):
         self.harness = self.root / "scripts/test-integration-db-local.sh"
         self.env = {"INTEGRATION_SUPABASE_CACHE_DIR": str(self.root / "cache"),
                     "INTEGRATION_SUPABASE_WORKDIR_BASE": str(self.root)}
-        self.project = "pcp-integration"
+        self.project = "ink-integration"
         self.db = "supabase_db_" + self.project
         self.current = {}
         self.calls = []
@@ -445,7 +445,7 @@ class LifecycleTests(unittest.TestCase):
             expected = expected.replace(str(port), "PORT_" + str(index))
         for index, port in enumerate(ports):
             expected = expected.replace("PORT_" + str(index), str(port))
-        self.assertEqual(self.state()["config"], 'project_id = "pcp-integration"\n' + expected)
+        self.assertEqual(self.state()["config"], 'project_id = "ink-integration"\n' + expected)
 
     def test_missing_port_diagnostic_names_each_missing_section_and_key(self):
         config = TEST_CONFIG.replace("port = 54321\n", "").replace("smtp_port = 54325\n", "")
@@ -633,7 +633,7 @@ class LifecycleTests(unittest.TestCase):
         self.run_stack()
         path = self.root / "cache" / self.project / "state.json"
         state = self.state()
-        state["project"] = "pcp-integration-sibling"
+        state["project"] = "ink-integration-sibling"
         path.write_text(json.dumps(state))
         self.current = {}
         with self.assertRaisesRegex(stack.Refusal, "different project"):
@@ -686,17 +686,17 @@ class PrimitiveTests(unittest.TestCase):
             path = Path(directory)
             child = None
             try:
-                with stack.locks(path, "pcp-integration", [55000]) as fds:
+                with stack.locks(path, "ink-integration", [55000]) as fds:
                     # Harmless child waits on its pipe; no executor, DB, or real suite.
                     child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
                                              stdin=subprocess.PIPE, pass_fds=fds)
                 with self.assertRaises(stack.Refusal) as error:
-                    with stack.locks(path, "pcp-integration", [55000]):
+                    with stack.locks(path, "ink-integration", [55000]):
                         self.fail("child lost the ownership lock")
                 self.assertIn("lsof -nP " + str(path / "port-55000.lock"), str(error.exception))
                 self.assertIn("never delete the lock file", str(error.exception))
                 child.communicate(timeout=5)
-                with stack.locks(path, "pcp-integration", [55000]):
+                with stack.locks(path, "ink-integration", [55000]):
                     pass
             finally:
                 if child and child.poll() is None:
@@ -705,7 +705,7 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_project_namespace_and_ports(self):
         for env in ({"INTEGRATION_SUPABASE_PROJECT_ID": "application"},
-                    {"INTEGRATION_SUPABASE_PROJECT_ID": "../pcp-integration"},
+                    {"INTEGRATION_SUPABASE_PROJECT_ID": "../ink-integration"},
                     {"INTEGRATION_SUPABASE_API_PORT": "54321/path"},
                     {"INTEGRATION_SUPABASE_API_PORT": "0"},
                     {"INTEGRATION_SUPABASE_API_PORT": "55422"}):
@@ -715,15 +715,15 @@ class PrimitiveTests(unittest.TestCase):
     def test_locks_conflict_on_project_or_ports_and_release_without_unlinking(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            with stack.locks(path, "pcp-integration-a", [55000]):
-                for project, ports in (("pcp-integration-a", [55001]),
-                                       ("pcp-integration-b", [55000])):
+            with stack.locks(path, "ink-integration-a", [55000]):
+                for project, ports in (("ink-integration-a", [55001]),
+                                       ("ink-integration-b", [55000])):
                     with self.assertRaisesRegex(stack.Refusal, "Wait.*sparingly"):
                         with stack.locks(path, project, ports):
                             self.fail("contending lock acquired")
-                with stack.locks(path, "pcp-integration-b", [55002]):
+                with stack.locks(path, "ink-integration-b", [55002]):
                     pass
-            with stack.locks(path, "pcp-integration-a", [55000]):
+            with stack.locks(path, "ink-integration-a", [55000]):
                 pass
 
     def test_busy_port_names_owner_and_wait_guidance(self):

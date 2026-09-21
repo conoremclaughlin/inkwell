@@ -1,5 +1,5 @@
 /**
- * PCP OAuth Provider for MCP Authentication
+ * Inkwell OAuth Provider for MCP Authentication
  *
  * Issues self-signed JWTs as MCP access tokens (30-day expiry).
  * Supabase is used only for initial identity verification during login.
@@ -15,17 +15,17 @@ import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 import type { Database } from '../../data/supabase/types';
 import {
-  signPcpAccessToken,
-  verifyPcpAccessToken,
+  signInkAccessToken,
+  verifyInkAccessToken,
   createRefreshToken,
   exchangeRefreshToken as exchangeRefreshTokenShared,
-} from '../../auth/pcp-tokens';
+} from '../../auth/ink-tokens';
 
 /**
  * Carry an SB binding across the rename on a pending-auth JWT.
  *
  * handleAuthCallback verifies this JWT with jwt.verify() directly, so it never
- * reaches the normalization inside verifyPcpAccessToken(). A pending request
+ * reaches the normalization inside verifyInkAccessToken(). A pending request
  * created before the deploy is still valid; dropping its slug mints the access
  * and refresh credentials with no SB binding at all (Lumen, PR #635).
  */
@@ -99,7 +99,7 @@ const PENDING_AUTH_LIFETIME_SECONDS = 600; // 10 minutes
 // Provider
 // ============================================================================
 
-export class PcpAuthProvider {
+export class InkAuthProvider {
   private authCodes = new Map<string, AuthCode>();
   private supabase: SupabaseClient<Database>;
 
@@ -164,7 +164,7 @@ export class PcpAuthProvider {
     }
 
     try {
-      // Verify Supabase token and resolve PCP user
+      // Verify Supabase token and resolve Inkwell user
       const {
         data: { user },
         error: authError,
@@ -174,16 +174,16 @@ export class PcpAuthProvider {
         return { error: 'access_denied', error_description: 'Authentication failed' };
       }
 
-      // Look up or create PCP user
-      let { data: pcpUser, error: userError } = await this.supabase
+      // Look up or create Inkwell user
+      let { data: inkUser, error: userError } = await this.supabase
         .from('users')
         .select('id, email')
         .eq('email', user.email!)
         .single();
 
-      // Auto-create PCP user on first OAuth login (if not found)
+      // Auto-create Inkwell user on first OAuth login (if not found)
       if (userError?.code === 'PGRST116') {
-        logger.info('Auto-creating PCP user on first MCP auth', { email: user.email });
+        logger.info('Auto-creating Inkwell user on first MCP auth', { email: user.email });
         const { data: newUser, error: createError } = await this.supabase
           .from('users')
           .insert({ email: user.email })
@@ -210,35 +210,38 @@ export class PcpAuthProvider {
               return { error: 'server_error', error_description: 'User lookup failed' };
             }
 
-            pcpUser = existingUser;
+            inkUser = existingUser;
           } else {
-            logger.error('Failed to create PCP user', { email: user.email, error: createError });
+            logger.error('Failed to create Inkwell user', {
+              email: user.email,
+              error: createError,
+            });
             return { error: 'server_error', error_description: 'Failed to create user account' };
           }
         } else {
-          pcpUser = newUser;
+          inkUser = newUser;
         }
-      } else if (userError || !pcpUser) {
-        logger.error('PCP user lookup failed', { email: user.email, error: userError });
+      } else if (userError || !inkUser) {
+        logger.error('Inkwell user lookup failed', { email: user.email, error: userError });
         return { error: 'access_denied', error_description: 'User lookup failed' };
       }
 
       // Create authorization code
-      const code = `pcp-code-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+      const code = `ink-code-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
 
       this.authCodes.set(code, {
         clientId: pending.clientId,
         codeChallenge: pending.codeChallenge,
         redirectUri: pending.redirectUri,
-        userId: pcpUser.id,
-        userEmail: pcpUser.email || '',
+        userId: inkUser.id,
+        userEmail: inkUser.email || '',
         ...(pending.sbSlug ? { sbSlug: pending.sbSlug } : {}),
         expiresAt: Date.now() + AUTH_CODE_LIFETIME_MS,
       });
 
       this.cleanupExpired(this.authCodes);
 
-      logger.info('MCP auth callback complete', { userId: pcpUser.id, email: pcpUser.email });
+      logger.info('MCP auth callback complete', { userId: inkUser.id, email: inkUser.email });
 
       return {
         code,
@@ -339,7 +342,7 @@ export class PcpAuthProvider {
     this.authCodes.delete(params.code);
 
     // Sign our own JWT as the access token (with optional identity binding)
-    const accessToken = signPcpAccessToken(
+    const accessToken = signInkAccessToken(
       {
         type: 'mcp_access',
         sub: codeData.userId,
@@ -419,7 +422,7 @@ export class PcpAuthProvider {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
-    const payload = verifyPcpAccessToken(token, 'mcp_access');
+    const payload = verifyInkAccessToken(token, 'mcp_access');
     if (!payload) return null;
 
     return {

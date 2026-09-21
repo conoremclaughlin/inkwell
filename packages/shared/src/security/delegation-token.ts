@@ -38,7 +38,7 @@ export interface VerifyDelegationTokenResult {
   error?: string;
 }
 
-const TOKEN_TYPE = 'PCP-DELEGATION';
+const TOKEN_TYPE = 'Inkwell-DELEGATION';
 const DEFAULT_TTL_SECONDS = 15 * 60;
 const MAX_TTL_SECONDS = 24 * 60 * 60;
 

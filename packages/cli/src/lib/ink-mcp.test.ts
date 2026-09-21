@@ -5,7 +5,7 @@ vi.mock('../auth/tokens.js', () => ({
 }));
 
 import * as tokensMod from '../auth/tokens.js';
-import { callPcpTool } from './pcp-mcp.js';
+import { callInkTool } from './ink-mcp.js';
 
 const mockedGetValidAccessToken = vi.mocked(tokensMod.getValidAccessToken);
 
@@ -18,7 +18,7 @@ function mockJsonResponse(payload: Record<string, unknown>): Partial<Response> {
   };
 }
 
-describe('pcp-mcp callPcpTool', () => {
+describe('ink-mcp callInkTool', () => {
   const originalServerUrl = process.env.INK_SERVER_URL;
 
   beforeEach(() => {
@@ -42,7 +42,7 @@ describe('pcp-mcp callPcpTool', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool<{ success: boolean }>('list_sessions', { limit: 1 });
+    const result = await callInkTool<{ success: boolean }>('list_sessions', { limit: 1 });
 
     expect(result).toEqual({ success: true });
     expect(fetchSpy).toHaveBeenCalledOnce();
@@ -76,7 +76,7 @@ describe('pcp-mcp callPcpTool', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool<{ final: boolean }>('bootstrap', { sbSlug: 'lumen' });
+    const result = await callInkTool<{ final: boolean }>('bootstrap', { sbSlug: 'lumen' });
     expect(result).toEqual({ final: true });
   });
 
@@ -91,7 +91,7 @@ describe('pcp-mcp callPcpTool', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await callPcpTool('bootstrap', { sbSlug: 'lumen' });
+    await callInkTool('bootstrap', { sbSlug: 'lumen' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).toMatchObject({
@@ -113,8 +113,8 @@ describe('pcp-mcp callPcpTool', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('start_session', { forceNew: true })).rejects.toThrow(
-      'PCP tool error: start_session unavailable'
+    await expect(callInkTool('start_session', { forceNew: true })).rejects.toThrow(
+      'Inkwell tool error: start_session unavailable'
     );
   });
 
@@ -128,7 +128,7 @@ describe('pcp-mcp callPcpTool', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await callPcpTool('start_session', { forceNew: true }, { callerProfile: 'runtime' });
+    await callInkTool('start_session', { forceNew: true }, { callerProfile: 'runtime' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).toMatchObject({
@@ -136,7 +136,7 @@ describe('pcp-mcp callPcpTool', () => {
     });
   });
 
-  it('reports fetch failures with PCP url and network diagnostics', async () => {
+  it('reports fetch failures with Inkwell url and network diagnostics', async () => {
     const fetchError = new TypeError('fetch failed', {
       cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:3999'), {
         code: 'ECONNREFUSED',
@@ -147,12 +147,12 @@ describe('pcp-mcp callPcpTool', () => {
     const fetchSpy = vi.fn().mockRejectedValue(fetchError);
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('list_sessions', { limit: 1 })).rejects.toThrow(
-      'PCP fetch failed for http://localhost:3999/mcp'
+    await expect(callInkTool('list_sessions', { limit: 1 })).rejects.toThrow(
+      'Inkwell fetch failed for http://localhost:3999/mcp'
     );
-    await expect(callPcpTool('list_sessions', { limit: 1 })).rejects.toThrow('ECONNREFUSED');
-    await expect(callPcpTool('list_sessions', { limit: 1 })).rejects.toThrow(
-      'Ensure PCP server is running and INK_SERVER_URL is correct.'
+    await expect(callInkTool('list_sessions', { limit: 1 })).rejects.toThrow('ECONNREFUSED');
+    await expect(callInkTool('list_sessions', { limit: 1 })).rejects.toThrow(
+      'Ensure Inkwell server is running and INK_SERVER_URL is correct.'
     );
   });
 });

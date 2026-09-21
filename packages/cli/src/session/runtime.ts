@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 export interface RuntimeSessionRecord {
-  pcpSessionId: string;
+  inkSessionId: string;
   backend: string;
   sbSlug?: string;
   sbId?: string;
@@ -19,7 +19,7 @@ export interface RuntimeSessionRecord {
 interface RuntimeSessionState {
   version: 1;
   current?: {
-    pcpSessionId: string;
+    inkSessionId: string;
     backend: string;
     sbSlug?: string;
     sbId?: string;
@@ -79,7 +79,7 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
           (s): s is RuntimeSessionRecord =>
             !!s &&
             typeof s === 'object' &&
-            typeof s.pcpSessionId === 'string' &&
+            typeof s.inkSessionId === 'string' &&
             typeof s.backend === 'string' &&
             typeof s.updatedAt === 'string'
         )
@@ -87,7 +87,7 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
 
     const current =
       parsed.current &&
-      typeof parsed.current.pcpSessionId === 'string' &&
+      typeof parsed.current.inkSessionId === 'string' &&
       typeof parsed.current.backend === 'string' &&
       typeof parsed.current.updatedAt === 'string'
         ? parsed.current
@@ -124,7 +124,7 @@ export function upsertRuntimeSession(
 
   const idx = state.sessions.findIndex(
     (s) =>
-      s.pcpSessionId === next.pcpSessionId &&
+      s.inkSessionId === next.inkSessionId &&
       s.backend === next.backend &&
       s.sbSlug === next.sbSlug &&
       s.studioId === next.studioId
@@ -177,13 +177,13 @@ export function upsertRuntimeSession(
 
 export function setCurrentRuntimeSession(
   cwd: string,
-  pcpSessionId: string,
+  inkSessionId: string,
   backend: string,
   options?: { sbSlug?: string; sbId?: string; studioId?: string }
 ): void {
   const state = readRuntimeState(cwd);
   state.current = {
-    pcpSessionId,
+    inkSessionId,
     backend,
     ...(options?.sbSlug ? { sbSlug: options.sbSlug } : {}),
     ...(options?.sbId ? { sbId: options.sbId } : {}),
@@ -224,7 +224,7 @@ export function getCurrentRuntimeSession(
   if (state.current) {
     const current = state.sessions.find(
       (s) =>
-        s.pcpSessionId === state.current!.pcpSessionId &&
+        s.inkSessionId === state.current!.inkSessionId &&
         s.backend === state.current!.backend &&
         (!state.current!.sbSlug || s.sbSlug === state.current!.sbSlug) &&
         (!state.current!.sbId || s.sbId === state.current!.sbId) &&

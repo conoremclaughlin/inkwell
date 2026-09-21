@@ -217,7 +217,7 @@ describe('delegated auth storage', () => {
 
   beforeEach(() => {
     origHome = process.env.HOME;
-    tempHome = join(tmpdir(), `pcp-delegated-auth-test-${Date.now()}`);
+    tempHome = join(tmpdir(), `ink-delegated-auth-test-${Date.now()}`);
     mkdirSync(tempHome, { recursive: true });
     process.env.HOME = tempHome;
   });

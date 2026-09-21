@@ -2,7 +2,7 @@
  * Runtime Session Hints
  *
  * Writes session state to .ink/runtime/sessions.json so the on-session-start
- * hook can find the correct PCP session ID for server-spawned runs.
+ * hook can find the correct Inkwell session ID for server-spawned runs.
  *
  * Without these hints, the hook picks up the last sb-launched session (wrong)
  * instead of the server-triggered one.
@@ -22,13 +22,13 @@ interface RuntimeSessionState {
 
 /**
  * Write a runtime session hint so the on-session-start hook can resolve
- * the correct PCP session ID for a spawned backend process.
+ * the correct Inkwell session ID for a spawned backend process.
  *
  * Best-effort: silently catches errors since the hook has fallbacks.
  */
 export function writeRuntimeSessionHint(
   workingDirectory: string,
-  pcpSessionId: string,
+  inkSessionId: string,
   sbSlug: string,
   backend: string,
   runtimeLinkId: string,
@@ -78,7 +78,7 @@ export function writeRuntimeSessionHint(
 
     const now = new Date().toISOString();
     const record: Record<string, unknown> = {
-      pcpSessionId,
+      inkSessionId,
       backend,
       sbSlug,
       runtimeLinkId,
@@ -89,7 +89,7 @@ export function writeRuntimeSessionHint(
 
     const idx = state.sessions.findIndex(
       (s) =>
-        s['pcpSessionId'] === pcpSessionId && s['backend'] === backend && s['sbSlug'] === sbSlug
+        s['inkSessionId'] === inkSessionId && s['backend'] === backend && s['sbSlug'] === sbSlug
     );
     if (idx >= 0) {
       state.sessions[idx] = { ...state.sessions[idx], ...record };
@@ -98,7 +98,7 @@ export function writeRuntimeSessionHint(
     }
 
     state.current = {
-      pcpSessionId,
+      inkSessionId,
       backend,
       sbSlug,
       ...(studioId ? { studioId } : {}),

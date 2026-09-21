@@ -11,7 +11,7 @@ fi
 SUPABASE_WORKDIR="${INTEGRATION_MANAGED_WORKDIR:?Use the managed harness entry point}"
 API_PORT="${INTEGRATION_MANAGED_API_PORT:?Missing managed API port}"
 DB_PORT="${INTEGRATION_MANAGED_DB_PORT:?Missing managed DB port}"
-PROJECT_ID="${INTEGRATION_SUPABASE_PROJECT_ID:-pcp-integration}"
+PROJECT_ID="${INTEGRATION_SUPABASE_PROJECT_ID:-ink-integration}"
 
 echo "[integration-db] Exporting local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"

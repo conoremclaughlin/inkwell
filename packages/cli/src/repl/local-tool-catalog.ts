@@ -27,7 +27,7 @@ import { isForbiddenInClone } from './clone-policy.js';
 import { initPiTools, isPiTool } from './pi-tools.js';
 import { isClientLocalTool } from './context-tools.js';
 import { COLLECT_AGENTS_TOOL, MAX_CLONES_PER_SPAWN, SPAWN_AGENT_TOOL } from './spawn-agent.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 /** Where a local tool runs, and which prompt block it belongs to. */
 export type LocalToolGroup = 'coding' | 'client-local' | 'delegation';
@@ -374,7 +374,7 @@ export function isLocalRuntimeTool(name: string): boolean {
 /**
  * The server's payload, or null when it is not a shape we can merge into.
  *
- * `PcpClient.callTool` returns the tool's payload ALREADY UNWRAPPED — it parses
+ * `InkClient.callTool` returns the tool's payload ALREADY UNWRAPPED — it parses
  * the MCP envelope's text and hands back `{success, tools, …}` — so that is the
  * shape this sees in production and the shape it must return. The envelope
  * branch is for the legacy `/api/mcp/call` path, which returns whatever the
@@ -384,7 +384,7 @@ export function isLocalRuntimeTool(name: string): boolean {
  * on arrival the first time: every unit test passed against a mock that wrapped
  * its payload, and the live call fell through the merge untouched.
  */
-function parseServerPayload(result: PcpToolCallResult): Record<string, unknown> | null {
+function parseServerPayload(result: InkToolCallResult): Record<string, unknown> | null {
   const content = result.content;
   if (Array.isArray(content)) {
     const text = (content[0] as { text?: unknown } | undefined)?.text;
@@ -470,7 +470,7 @@ export interface DescribeToolLocalOptions {
   audience: LocalToolAudience;
   cwd: string;
   /** Ask the Inkwell server the same question. */
-  callServer: () => Promise<PcpToolCallResult>;
+  callServer: () => Promise<InkToolCallResult>;
   /**
    * Whether the CALLER is hard-denied this tool — no, and no approval will
    * change it. Answered by the live policy, not by a static list.
@@ -482,7 +482,7 @@ export interface DescribeToolLocalOptions {
    * move that started this PR — trusting a description of the surface over the
    * surface.
    *
-   * MUST be backed by `inspectPcpTool`, never `canCallPcpTool`: the latter
+   * MUST be backed by `inspectInkTool`, never `canCallInkTool`: the latter
    * spends one-use grants, so merely asking what exists would bill the user for
    * calls that never happen.
    *
@@ -507,7 +507,7 @@ export interface DescribeToolLocalOptions {
 export async function describeToolWithLocalSurface(
   args: Record<string, unknown>,
   opts: DescribeToolLocalOptions
-): Promise<PcpToolCallResult> {
+): Promise<InkToolCallResult> {
   const name = typeof args.name === 'string' ? args.name : undefined;
   const search = typeof args.search === 'string' ? args.search : undefined;
   // Client-local tools bypass policy AT EXECUTION (tool-call-executor.ts:119) —

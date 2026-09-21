@@ -127,7 +127,7 @@ export class WhatsAppListener extends EventEmitter {
       version,
       logger: baileysLogger,
       printQRInTerminal: false,
-      browser: ['PCP', 'Chrome', '1.0.0'],
+      browser: ['Inkwell', 'Chrome', '1.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: false,
     });

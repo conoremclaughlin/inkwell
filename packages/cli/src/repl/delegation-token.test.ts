@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { decodeDelegationToken, mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
 
 describe('delegation token helpers', () => {
-  const secret = 'pcp-delegation-test-secret';
+  const secret = 'ink-delegation-test-secret';
 
   it('mints + verifies valid token with scope/thread constraints', () => {
     const token = mintDelegationToken(

@@ -1238,7 +1238,7 @@ export class ChannelGateway extends EventEmitter {
     // attachment.filename collided when two attachments shared a name
     // (e.g. an album of two photo.jpg items) — the later download
     // overwrote the earlier and the album uploaded duplicate bytes.
-    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media', randomUUID());
+    const tmpDir = pathMod.join(os.tmpdir(), 'ink-media', randomUUID());
     await fs.mkdir(tmpDir, { recursive: true });
 
     const safeName = (filename || 'media').replace(/[^a-zA-Z0-9._-]/g, '_') || 'media';

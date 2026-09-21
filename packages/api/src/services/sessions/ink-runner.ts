@@ -150,7 +150,7 @@ export class InkRunner implements IRunner {
     const { backendSessionId, injectedContext, config, mediaAttachments } = options;
 
     const isResume = !!backendSessionId;
-    const sessionId = config.pcpSessionId || backendSessionId || randomUUID();
+    const sessionId = config.inkSessionId || backendSessionId || randomUUID();
 
     // Two things can go wrong that we can do something about: the child refuses
     // to answer without identity context, and a resume finds no local session.
@@ -187,7 +187,7 @@ export class InkRunner implements IRunner {
     const noContextFailure = (): RunnerResult => {
       logger.error('ink chat has no identity context and none to supply', {
         sessionId,
-        pcpSessionId: config.pcpSessionId,
+        inkSessionId: config.inkSessionId,
       });
       return {
         success: false,
@@ -210,7 +210,7 @@ export class InkRunner implements IRunner {
 
         logger.info('Spawning ink chat (non-interactive)', {
           sessionId,
-          pcpSessionId: config.pcpSessionId,
+          inkSessionId: config.inkSessionId,
           isResume,
           attempt,
           suppliedContext,
@@ -224,7 +224,7 @@ export class InkRunner implements IRunner {
           if (usedContextFallback || !injectedContext) return noContextFailure();
           logger.warn('ink chat could not load identity context; retrying with server copy', {
             sessionId,
-            pcpSessionId: config.pcpSessionId,
+            inkSessionId: config.inkSessionId,
             attempt,
           });
           usedContextFallback = true;
@@ -377,10 +377,10 @@ export class InkRunner implements IRunner {
       : { command: await resolveBinaryPath('ink'), args: [] as string[] };
     const inkBin = launch.command;
 
-    if (config.pcpSessionId && config.workingDirectory) {
+    if (config.inkSessionId && config.workingDirectory) {
       writeRuntimeSessionHint(
         config.workingDirectory,
-        config.pcpSessionId,
+        config.inkSessionId,
         config.sbSlug || 'unknown',
         'ink',
         randomUUID(),
@@ -389,12 +389,12 @@ export class InkRunner implements IRunner {
     }
 
     const mcpInjection =
-      config.mcpConfigPath && config.pcpSessionId
+      config.mcpConfigPath && config.inkSessionId
         ? injectSessionHeaders({
             mcpConfigPath: config.mcpConfigPath,
-            pcpSessionId: config.pcpSessionId,
+            inkSessionId: config.inkSessionId,
             studioId: config.studioId,
-            accessToken: config.pcpAccessToken,
+            accessToken: config.inkAccessToken,
           })
         : null;
 
@@ -403,7 +403,7 @@ export class InkRunner implements IRunner {
 
     const spawnPath = buildSpawnPath(inkBin);
     const sessionEnv = buildSessionEnv({
-      pcpSessionId: config.pcpSessionId,
+      inkSessionId: config.inkSessionId,
       studioId: config.studioId,
       sbSlug: config.sbSlug,
     });
@@ -416,10 +416,10 @@ export class InkRunner implements IRunner {
       AGENT_ID: config.sbSlug || '',
       // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
       NODE_ENV: 'production',
-      // Server-minted access token so the ink CLI's PcpClient can call /mcp
+      // Server-minted access token so the ink CLI's InkClient can call /mcp
       // (bootstrap, tools) without depending on the human's ~/.ink/auth.json.
       // getValidAccessToken() checks INK_ACCESS_TOKEN before any file source.
-      ...(config.pcpAccessToken ? { INK_ACCESS_TOKEN: config.pcpAccessToken } : {}),
+      ...(config.inkAccessToken ? { INK_ACCESS_TOKEN: config.inkAccessToken } : {}),
     } as Record<string, string>;
 
     // Strip CLAUDECODE to prevent nested-session detection
@@ -428,7 +428,7 @@ export class InkRunner implements IRunner {
     // Turn-scope the observer replay tail: drop anything buffered from a prior
     // turn so an attach mid-turn replays only THIS turn's events, and an attach
     // while idle replays nothing (a finished turn must never re-render as live).
-    if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
+    if (config.inkSessionId) sessionEventBus.clearReplay(config.inkSessionId);
 
     return new Promise((resolve, reject) => {
       const child: ChildProcess = spawn(inkBin, fullArgs, {
@@ -453,7 +453,7 @@ export class InkRunner implements IRunner {
       // human-readable chrome are ignored; the authoritative RunnerResult is
       // still assembled from the full stdout in parseOutput on close.
       const publishStreamEvents = (text: string): void => {
-        if (!config.pcpSessionId) return;
+        if (!config.inkSessionId) return;
         stdoutLineBuffer += text;
         let nl: number;
         while ((nl = stdoutLineBuffer.indexOf('\n')) >= 0) {
@@ -477,17 +477,17 @@ export class InkRunner implements IRunner {
               // appended transcript object, ledger eid included. Publish on the
               // observer channel, preserving the eid; the bus never mints one.
               sessionEventBus.publishObserverEntry(
-                config.pcpSessionId,
+                config.inkSessionId,
                 typed.entry as import('./session-event-bus.js').ObserverEntry
               );
             } else if (typed.type === 'session_meta') {
               // The runtime announces its own ledger location at startup —
               // the server-owned locator for durable observer replay.
               if (typeof typed.transcriptPath === 'string') {
-                sessionEventBus.registerLedgerPath(config.pcpSessionId, typed.transcriptPath);
+                sessionEventBus.registerLedgerPath(config.inkSessionId, typed.transcriptPath);
               }
             } else {
-              sessionEventBus.publish(config.pcpSessionId, typed.type, typed);
+              sessionEventBus.publish(config.inkSessionId, typed.type, typed);
             }
           }
         }
@@ -497,7 +497,7 @@ export class InkRunner implements IRunner {
         if (killed) return;
         killed = true;
         logger.warn(`ink chat process ${reason}, killing`, {
-          sessionId: config.pcpSessionId,
+          sessionId: config.inkSessionId,
           inactivityMs: INACTIVITY_TIMEOUT_MS,
           absoluteMs: PROCESS_TIMEOUT_MS,
           ...detail,
@@ -554,12 +554,12 @@ export class InkRunner implements IRunner {
         mcpInjection?.cleanup();
         // Turn over: the buffered tail now describes a COMPLETED turn, so drop
         // it. A later idle attach must not replay it as live activity.
-        if (config.pcpSessionId) {
-          sessionEventBus.clearReplay(config.pcpSessionId);
+        if (config.inkSessionId) {
+          sessionEventBus.clearReplay(config.inkSessionId);
           // Observer channel: start the retention window; observers detach
           // after it unless a new turn re-registers the session. The durable
           // ledger remains the replay source regardless.
-          sessionEventBus.releaseObserverSession(config.pcpSessionId);
+          sessionEventBus.releaseObserverSession(config.inkSessionId);
         }
 
         if (code !== 0) {

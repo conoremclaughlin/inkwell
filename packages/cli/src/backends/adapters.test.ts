@@ -70,18 +70,18 @@ describe('backend adapters session resume wiring', () => {
     expect(prepared.args).toContain('claude-session-789');
   });
 
-  it('does not force claude --session-id from pcp session id', () => {
+  it('does not force claude --session-id from Inkwell session id', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'pcp-session-123',
+      inkSessionId: 'ink-session-123',
     });
 
     expect(prepared.args).not.toContain('--session-id');
-    expect(prepared.args).not.toContain('pcp-session-123');
+    expect(prepared.args).not.toContain('ink-session-123');
   });
 
   it('passes claude backendSessionSeedId through --session-id', () => {
@@ -91,13 +91,13 @@ describe('backend adapters session resume wiring', () => {
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'pcp-session-123',
-      backendSessionSeedId: 'pcp-session-123',
+      inkSessionId: 'ink-session-123',
+      backendSessionSeedId: 'ink-session-123',
     });
 
     const sessionIdFlagIndex = prepared.args.indexOf('--session-id');
     expect(sessionIdFlagIndex).toBeGreaterThanOrEqual(0);
-    expect(prepared.args[sessionIdFlagIndex + 1]).toBe('pcp-session-123');
+    expect(prepared.args[sessionIdFlagIndex + 1]).toBe('ink-session-123');
   });
 
   it('passes backendSessionId through codex resume subcommand', () => {
@@ -428,21 +428,21 @@ describe('backend adapters session resume wiring', () => {
   // the CLI backends must inject INK_SESSION_ID into the spawned process's
   // environment so hooks + buildMergedMcpConfig can propagate it to the server.
 
-  it('injects INK_SESSION_ID into claude env when pcpSessionId is provided', () => {
+  it('injects INK_SESSION_ID into claude env when inkSessionId is provided', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'wren',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'pcp-sess-abc-123',
+      inkSessionId: 'ink-sess-abc-123',
     });
 
     expect(prepared.env).toBeDefined();
-    expect(prepared.env!.INK_SESSION_ID).toBe('pcp-sess-abc-123');
+    expect(prepared.env!.INK_SESSION_ID).toBe('ink-sess-abc-123');
   });
 
-  it('does not inject INK_SESSION_ID into claude env when pcpSessionId is absent', () => {
+  it('does not inject INK_SESSION_ID into claude env when inkSessionId is absent', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'wren',
@@ -454,25 +454,25 @@ describe('backend adapters session resume wiring', () => {
     expect(prepared.env?.INK_SESSION_ID).toBeUndefined();
   });
 
-  it('injects INK_SESSION_ID into codex env when pcpSessionId is provided', () => {
+  it('injects INK_SESSION_ID into codex env when inkSessionId is provided', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'lumen',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'pcp-sess-def-456',
+      inkSessionId: 'ink-sess-def-456',
     });
 
     try {
       expect(prepared.env).toBeDefined();
-      expect(prepared.env!.INK_SESSION_ID).toBe('pcp-sess-def-456');
+      expect(prepared.env!.INK_SESSION_ID).toBe('ink-sess-def-456');
     } finally {
       prepared.cleanup();
     }
   });
 
-  it('does not inject INK_SESSION_ID into codex env when pcpSessionId is absent', () => {
+  it('does not inject INK_SESSION_ID into codex env when inkSessionId is absent', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'lumen',
@@ -488,25 +488,25 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('injects INK_SESSION_ID into gemini env when pcpSessionId is provided', () => {
+  it('injects INK_SESSION_ID into gemini env when inkSessionId is provided', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'aster',
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'pcp-sess-ghi-789',
+      inkSessionId: 'ink-sess-ghi-789',
     });
 
     try {
       expect(prepared.env).toBeDefined();
-      expect(prepared.env!.INK_SESSION_ID).toBe('pcp-sess-ghi-789');
+      expect(prepared.env!.INK_SESSION_ID).toBe('ink-sess-ghi-789');
     } finally {
       prepared.cleanup();
     }
   });
 
-  it('does not inject INK_SESSION_ID into gemini env when pcpSessionId is absent', () => {
+  it('does not inject INK_SESSION_ID into gemini env when inkSessionId is absent', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'aster',
@@ -535,13 +535,13 @@ describe('backend adapters session resume wiring', () => {
         model: undefined,
         promptParts: [],
         passthroughArgs: [],
-        pcpSessionId: 'pcp-sess-shared',
+        inkSessionId: 'ink-sess-shared',
       });
 
       try {
         expect(prepared.env).toBeDefined();
         expect(prepared.env!.AGENT_ID).toBe(sbSlug);
-        expect(prepared.env!.INK_SESSION_ID).toBe('pcp-sess-shared');
+        expect(prepared.env!.INK_SESSION_ID).toBe('ink-sess-shared');
       } finally {
         if (cleanup) prepared.cleanup();
       }
@@ -570,7 +570,7 @@ describe('backend adapters session resume wiring', () => {
   // ── INK_CONTEXT + auth header regression ──
   // Codex and Gemini adapters must produce INK_CONTEXT in env and
   // wire x-ink-context + Authorization via env_http_headers. Without these,
-  // MCP tool calls go to PCP unauthenticated and without session context,
+  // MCP tool calls go to Inkwell unauthenticated and without session context,
   // causing "Session context missing — triggers suppressed."
 
   it('claude adapter produces INK_CONTEXT with session/studio/agent', () => {
@@ -580,7 +580,7 @@ describe('backend adapters session resume wiring', () => {
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'sess-claude-123',
+      inkSessionId: 'sess-claude-123',
       studioId: 'studio-wren-456',
     });
 
@@ -605,7 +605,7 @@ describe('backend adapters session resume wiring', () => {
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'sess-codex-123',
+      inkSessionId: 'sess-codex-123',
       studioId: 'studio-lumen-456',
     });
 
@@ -630,7 +630,7 @@ describe('backend adapters session resume wiring', () => {
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'sess-codex-123',
+      inkSessionId: 'sess-codex-123',
     });
 
     try {
@@ -660,7 +660,7 @@ describe('backend adapters session resume wiring', () => {
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'sess-gemini-789',
+      inkSessionId: 'sess-gemini-789',
       studioId: 'studio-aster-012',
     });
 
@@ -685,7 +685,7 @@ describe('backend adapters session resume wiring', () => {
       model: undefined,
       promptParts: [],
       passthroughArgs: [],
-      pcpSessionId: 'sess-gemini-789',
+      inkSessionId: 'sess-gemini-789',
     });
 
     try {
@@ -694,7 +694,7 @@ describe('backend adapters session resume wiring', () => {
       const settingsContent = readFileSync(prepared.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, 'utf-8');
       const settings = JSON.parse(settingsContent);
 
-      // PCP server should have auth + context headers
+      // Inkwell server should have auth + context headers
       expect(settings.mcpServers.inkwell).toBeDefined();
       expect(settings.mcpServers.inkwell.headers.Authorization).toBe('Bearer ${INK_ACCESS_TOKEN}');
       const contextToken = settings.mcpServers.inkwell.headers['x-ink-context'];

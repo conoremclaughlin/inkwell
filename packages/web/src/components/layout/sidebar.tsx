@@ -498,7 +498,7 @@ export function Sidebar() {
                 <div className="space-y-1">
                   <label className="text-sm font-medium text-gray-700">Workspace name</label>
                   <Input
-                    placeholder="e.g., PCP Team"
+                    placeholder="e.g., Inkwell Team"
                     value={newWorkspaceName}
                     onChange={(event) => setNewWorkspaceName(event.target.value)}
                   />

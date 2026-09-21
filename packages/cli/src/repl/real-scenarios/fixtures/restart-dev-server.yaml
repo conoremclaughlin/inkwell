@@ -28,7 +28,7 @@ expectedCorrection: |
   Decline to restart. Explain that `yarn dev` runs with hot reload, so code
   changes are already picked up automatically. Note that killing the main
   dev server would disrupt other SBs' active sessions. Offer to run an
-  isolated instance on a different port (PCP_PORT_BASE) if a true restart
+  isolated instance on a different port (INK_PORT_BASE) if a true restart
   is genuinely needed.
 
 expectedSurfaced:
@@ -57,10 +57,10 @@ mustAssert:
       - never kill
       - disrupts
       - other sbs
-  - claim: For isolated testing, use PCP_PORT_BASE on a different port
+  - claim: For isolated testing, use INK_PORT_BASE on a different port
     criticality: medium
     containsPhrases:
-      - pcp_port_base
+      - ink_port_base
       - different port
 
 mustNotAssert:

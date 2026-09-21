@@ -9,7 +9,7 @@ import { env } from './config/env';
 
 async function testConnection() {
   try {
-    logger.info('🧪 Testing Personal Context Protocol setup...\n');
+    logger.info('🧪 Testing Inkwell setup...\n');
 
     // Test 1: Environment variables
     logger.info('✅ Environment variables loaded');

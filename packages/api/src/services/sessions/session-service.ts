@@ -12,7 +12,7 @@ import { randomUUID } from 'crypto';
 import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
-import { signRunnerAccessToken } from '../../auth/pcp-tokens';
+import { signRunnerAccessToken } from '../../auth/ink-tokens';
 import type { Database } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -1065,7 +1065,7 @@ export class SessionService implements ISessionService {
       // VERIFIED conflict + overflow failure: HOLD, do not degrade (Lumen
       // #517 r1 blocker 6). Clearing the binding sends the runner to
       // defaultWorkingDirectory — which on this server is routinely the SAME
-      // occupied root the conflict is about (three SBs share the pcp main
+      // occupied root the conflict is about (three SBs share the main
       // checkout). A held message is recoverable; a writer executing inside
       // the occupied tree via the fallback cwd is the exact stomp the lease
       // exists to prevent. The session row stays idle; the next delivery
@@ -1273,7 +1273,7 @@ export class SessionService implements ISessionService {
         logger.info('Session routing resolved', {
           channel: request.channel,
           conversationId: request.conversationId,
-          pcpSessionId: session.id,
+          inkSessionId: session.id,
           backendSessionId: session.backendSessionId || null,
           studioId: session.studioId || null,
           sbSlug,
@@ -1566,7 +1566,7 @@ export class SessionService implements ISessionService {
     );
 
     // 3. Build runner config
-    const pcpAccessToken = this.createRunnerAccessToken(
+    const inkAccessToken = this.createRunnerAccessToken(
       userId,
       sbSlug,
       injectedContext.user.email,
@@ -1667,15 +1667,15 @@ export class SessionService implements ISessionService {
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat,
         {
-          pcpSessionId: session.id,
+          inkSessionId: session.id,
           studioId: session.studioId || undefined,
           threadKey: session.threadKey || undefined,
         }
       ),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
-      ...(pcpAccessToken ? { pcpAccessToken } : {}),
-      pcpSessionId: session.id,
+      ...(inkAccessToken ? { inkAccessToken } : {}),
+      inkSessionId: session.id,
       sbSlug,
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
@@ -2215,8 +2215,8 @@ export class SessionService implements ISessionService {
       });
     } else {
       if (result.backendSessionId !== session.backendSessionId) {
-        logger.info('Backend session ID linked to PCP session', {
-          pcpSessionId: session.id,
+        logger.info('Backend session ID linked to Inkwell session', {
+          inkSessionId: session.id,
           backendSessionId: result.backendSessionId,
           previousBackendSessionId: session.backendSessionId || null,
           backend: resolvedBackend,
@@ -2394,7 +2394,7 @@ export class SessionService implements ISessionService {
     session: { id: string; sbId?: string; contactId?: string }
   ): string | undefined {
     if (!email) {
-      logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
+      logger.warn('Cannot inject Inkwell access token for backend runner: missing user email', {
         userId,
         sbSlug,
       });
@@ -2402,7 +2402,7 @@ export class SessionService implements ISessionService {
     }
 
     if (!process.env.JWT_SECRET) {
-      logger.warn('Cannot inject PCP access token for backend runner: JWT_SECRET missing', {
+      logger.warn('Cannot inject Inkwell access token for backend runner: JWT_SECRET missing', {
         userId,
         sbSlug,
       });
@@ -3280,7 +3280,7 @@ export class SessionService implements ISessionService {
           // matches.length === 0 — the common silent fall-through case: studios
           // exist for this agent but none of their patterns match this threadKey.
           // Previously invisible; now log so dispatch-routing failures are
-          // traceable (see thread:pcp-to-ink-rename 2026-04-17 post-mortem).
+          // traceable (see thread:ink-to-ink-rename 2026-04-17 post-mortem).
           logger.warn('[StudioResolve] No studio pattern matched threadKey, falling through', {
             threadKey: options.threadKey,
             sbSlug,
@@ -3950,7 +3950,7 @@ This session will continue with a fresh context after compaction. Your identity,
           context.agent.heartbeat
         ),
         ...(runtimeModel ? { model: runtimeModel } : {}),
-        ...(compactionToken ? { pcpAccessToken: compactionToken } : {}),
+        ...(compactionToken ? { inkAccessToken: compactionToken } : {}),
         repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
       };
 

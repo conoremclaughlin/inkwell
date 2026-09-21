@@ -9,7 +9,7 @@ import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs
 import { join } from 'path';
 import { homedir, tmpdir } from 'os';
 
-interface PcpConfig {
+interface InkUserConfig {
   userId?: string;
   email?: string;
   sbMapping?: Record<string, string>;
@@ -157,7 +157,7 @@ export function resolveSlug(cliAgent?: string, backendHint?: string): string | n
   const configPath = join(homedir(), '.ink', 'config.json');
   if (existsSync(configPath)) {
     try {
-      const config: PcpConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
+      const config: InkUserConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
       // ~/.ink/config.json belongs to the user and nothing rewrites it, so the
       // pre-rename key keeps working indefinitely.
       const mapping = config.sbMapping || config.agentMapping || {};

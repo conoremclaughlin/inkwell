@@ -58,12 +58,12 @@ def main():
         residue_id = "00000000-0000-4000-8000-000000000649"
         # This dedicated test schema is outside the public cleanup allowlist.
         data.transaction(container_id, guard + """
-CREATE TABLE _pcp_it.cleanup_probe (value text PRIMARY KEY);
-INSERT INTO _pcp_it.cleanup_probe VALUES ('must-survive');
+CREATE TABLE _ink_it.cleanup_probe (value text PRIMARY KEY);
+INSERT INTO _ink_it.cleanup_probe VALUES ('must-survive');
 INSERT INTO public.notes (id, user_id, title, content)
 VALUES ('00000000-0000-4000-8000-000000000649', '550e8400-e29b-41d4-a716-446655440000',
         'Synthetic interrupted fixture', 'must-be-cleaned');
-UPDATE _pcp_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
+UPDATE _ink_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
 """, fds)
 
         def residue_count():
@@ -83,12 +83,12 @@ UPDATE _pcp_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
         refused(lambda: clean(wrong), "SQLSTATE=PC002")
         assert residue_count() == "1"
 
-        data.transaction(container_id, guard + "ALTER TABLE _pcp_it.stack RENAME TO missing_marker_probe;", fds)
+        data.transaction(container_id, guard + "ALTER TABLE _ink_it.stack RENAME TO missing_marker_probe;", fds)
         refused(clean, "SQLSTATE=42P01")
         assert residue_count() == "1"
         # The assertion is missing by design; restoration targets this pinned CI
         # container only. No fallback to a host URL or a production database.
-        data.transaction(container_id, data.DATABASE_GUARD + "ALTER TABLE _pcp_it.missing_marker_probe RENAME TO stack;", fds)
+        data.transaction(container_id, data.DATABASE_GUARD + "ALTER TABLE _ink_it.missing_marker_probe RENAME TO stack;", fds)
 
         # Classification must fail for an independent table with NO foreign keys.
         data.transaction(container_id, guard + "CREATE TABLE public.cleanup_unclassified_probe (value text);", fds)
@@ -116,13 +116,13 @@ UPDATE _pcp_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
 
         clean()
         assert residue_count() == "0"
-        assert sql("SELECT value FROM _pcp_it.cleanup_probe;").strip() == "must-survive"
+        assert sql("SELECT value FROM _ink_it.cleanup_probe;").strip() == "must-survive"
         # One comparison across ALL classified public tables, including exclusions,
         # against hashes captured on the cold reset before the first test wrote.
         data.transaction(container_id, guard + data.checksum_guard(data.FIXTURE_TABLES + data.EXCLUDED_TABLES), fds)
-        assert sql("SELECT run_id FROM _pcp_it.stack;").strip() == run_id
+        assert sql("SELECT run_id FROM _ink_it.stack;").strip() == run_id
         data.finish_run(project, state["dbId"], ports[1], state["baseline"], fds, state["fingerprint"], run_id)
-        assert sql("SELECT run_id IS NULL FROM _pcp_it.stack;").strip() == "t"
+        assert sql("SELECT run_id IS NULL FROM _ink_it.stack;").strip() == "t"
         print("PASS: cold-baseline row checksums match all 72 public tables after warm cleanup;")
         print("wrong DB/token, unknown table, excluded drift and rollback controls passed; outside sentinel survived.")
 

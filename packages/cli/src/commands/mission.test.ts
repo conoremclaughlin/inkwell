@@ -994,7 +994,7 @@ describe('activityToFeedEvent tool_call/tool_result', () => {
     expect(event.content).toBe('spawned (claude-code)');
   });
 
-  it('renders individual PCP tool calls compactly', () => {
+  it('renders individual Inkwell tool calls compactly', () => {
     const event = activityToFeedEvent(
       activity({
         type: 'tool_call',

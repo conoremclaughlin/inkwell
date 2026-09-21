@@ -36,7 +36,7 @@ describe('MediaUnderstandingService', () => {
   });
 
   it('uses provider chain and truncates analysis output', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-analysis-test-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-media-analysis-test-'));
     const filePath = path.join(tmpDir, 'image.png');
     await writeFile(filePath, Buffer.from('fake image bytes'));
 
@@ -93,7 +93,7 @@ describe('MediaUnderstandingService — CLI provider wiring', () => {
   }
 
   it('delivers the input path and mime type to the command', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-cli-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-media-cli-'));
     const filePath = path.join(tmpDir, 'an image.png');
     await writeFile(filePath, Buffer.from('fake image bytes'));
 
@@ -108,7 +108,7 @@ describe('MediaUnderstandingService — CLI provider wiring', () => {
   });
 
   it('treats a hostile content type as text, not as a command', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-cli-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-media-cli-'));
     const filePath = path.join(tmpDir, 'image.png');
     const marker = path.join(tmpDir, 'executed');
     await writeFile(filePath, Buffer.from('fake image bytes'));

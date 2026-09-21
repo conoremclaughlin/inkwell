@@ -13,7 +13,7 @@ vi.mock('../../utils/logger', () => ({
 
 describe('InkRunner', () => {
   describe('buildArgs', () => {
-    it('always includes --session-id with the PCP session ID', () => {
+    it('always includes --session-id with the Inkwell session ID', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-123', {
         workingDirectory: '/tmp',

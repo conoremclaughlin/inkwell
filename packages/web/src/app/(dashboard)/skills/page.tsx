@@ -520,7 +520,7 @@ export default function SkillsPage() {
                   <div>
                     <code className="text-sm font-mono text-gray-800">Built-in skills</code>
                     <p className="text-xs text-gray-500 mt-1">
-                      Ships with PCP, updated via releases
+                      Ships with Inkwell, updated via releases
                     </p>
                   </div>
                 </div>

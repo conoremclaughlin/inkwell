@@ -1,7 +1,7 @@
 /**
- * Real-scenario memory eval — live PCP integration.
+ * Real-scenario memory eval — live Inkwell integration.
  *
- * Runs the bundled fixtures against the running PCP server's `recall` tool
+ * Runs the bundled fixtures against the running Inkwell server's `recall` tool
  * and asserts that the curated memory set supports each scenario's rubric.
  *
  * This is the actual signal: does passive recall surface the memories we
@@ -18,11 +18,11 @@ import { loadScenariosFromDir, defaultFixturesDir } from './loader.js';
 import { writeMarkdownReport } from './report.js';
 import type { SurfacedMemory } from './scorer.js';
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 
 let serverAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
@@ -40,13 +40,13 @@ interface RecallResponse {
   memories: RecallMemory[];
 }
 
-async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]> {
+async function inkRecall(query: string, limit: number): Promise<SurfacedMemory[]> {
   const authPath = `${process.env.HOME}/.ink/auth.json`;
   const auth = JSON.parse(readFileSync(authPath, 'utf-8'));
   const accessToken = auth.accessToken || auth.access_token;
   if (!accessToken) throw new Error(`No access token at ${authPath}`);
 
-  const resp = await fetch(`${PCP_URL}/mcp`, {
+  const resp = await fetch(`${INK_URL}/mcp`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -83,9 +83,9 @@ async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]
   return parsed.memories.map((m) => ({ id: m.id, content: m.content, summary: m.summary }));
 }
 
-const recall: RecallFn = (query, limit) => pcpRecall(query, limit);
+const recall: RecallFn = (query, limit) => inkRecall(query, limit);
 
-describe('real-scenarios: live PCP', () => {
+describe('real-scenarios: live Inkwell', () => {
   it.skipIf(!serverAvailable)(
     'runs all bundled fixtures and reports results',
     { timeout: 60_000 },
@@ -99,7 +99,7 @@ describe('real-scenarios: live PCP', () => {
         results.push(result);
       }
 
-      const report = writeMarkdownReport(results, { title: 'Real-Scenario Eval (live PCP)' });
+      const report = writeMarkdownReport(results, { title: 'Real-Scenario Eval (live Inkwell)' });
       console.log('\n' + report + '\n');
 
       // This is a REPORTING test, not a rubric gate. The point is to measure

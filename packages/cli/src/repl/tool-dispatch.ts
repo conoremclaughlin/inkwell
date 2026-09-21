@@ -1,7 +1,7 @@
 /**
  * Local Tool Dispatch
  *
- * Where a local tool call actually goes: in-process Pi coding tools, or the PCP
+ * Where a local tool call actually goes: in-process Pi coding tools, or the Inkwell
  * server.
  *
  * This exists as a factory rather than two inline closures because the two
@@ -18,7 +18,7 @@
  * the same dispatcher production does.
  */
 
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 import { isPiTool } from './pi-tools.js';
 import { describeToolWithLocalSurface, type LocalToolAudience } from './local-tool-catalog.js';
 
@@ -31,7 +31,7 @@ export type LocalToolDispatcher = (
   tool: string,
   args: Record<string, unknown>,
   ctx: ToolDispatchContext
-) => Promise<PcpToolCallResult>;
+) => Promise<InkToolCallResult>;
 
 export interface LocalToolDispatchDeps {
   /** Working directory Pi tools are scoped to. */
@@ -42,9 +42,9 @@ export interface LocalToolDispatchDeps {
     args: Record<string, unknown>,
     cwd: string,
     signal?: AbortSignal
-  ) => Promise<PcpToolCallResult>;
-  /** Call a tool on the PCP server. */
-  callPcp: (tool: string, args: Record<string, unknown>) => Promise<PcpToolCallResult>;
+  ) => Promise<InkToolCallResult>;
+  /** Call a tool on the Inkwell server. */
+  callInk: (tool: string, args: Record<string, unknown>) => Promise<InkToolCallResult>;
   /**
    * Resolve `$VAR` / `${VAR}` references in args.
    *
@@ -62,7 +62,7 @@ export interface LocalToolDispatchDeps {
     tool: string,
     args: Record<string, unknown>,
     ctx: ToolDispatchContext
-  ) => Promise<PcpToolCallResult | null> | PcpToolCallResult | null;
+  ) => Promise<InkToolCallResult | null> | InkToolCallResult | null;
   /**
    * Which local surface this host exposes, for `describe_tool`. A clone's is
    * narrower, and telling it otherwise produces calls that only get refused.
@@ -72,13 +72,13 @@ export interface LocalToolDispatchDeps {
   /**
    * Whether the caller is hard-denied a tool — for `describe_tool`, so the
    * answer reflects what policy will actually refuse rather than what this
-   * host advertises. Must be backed by `inspectPcpTool`; `canCallPcpTool`
+   * host advertises. Must be backed by `inspectInkTool`; `canCallInkTool`
    * spends one-use grants, and asking what exists must not bill the user.
    */
   isHardDenied?: (tool: string) => boolean;
 }
 
-/** Strip the MCP namespace the model may emit; PcpClient wants bare names. */
+/** Strip the MCP namespace the model may emit; InkClient wants bare names. */
 export function bareToolName(tool: string): string {
   return tool.replace(/^mcp__inkwell__/, '');
 }
@@ -100,7 +100,7 @@ export function bareToolName(tool: string): string {
  */
 const FOREIGN_MCP_NAMESPACE = /^mcp__([a-z0-9_-]+)__(.+)$/i;
 
-function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
+function foreignNamespaceRefusal(tool: string): InkToolCallResult | null {
   const match = FOREIGN_MCP_NAMESPACE.exec(tool);
   if (!match) return null;
   const [, server] = match;
@@ -120,7 +120,7 @@ function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
       },
     ],
     isError: true,
-  } as PcpToolCallResult;
+  } as InkToolCallResult;
 }
 
 /**
@@ -143,7 +143,7 @@ function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
  * that made this diagnosable — the Aug 24 regime change was only visible
  * because the miscased calls were logged under the name actually emitted.
  */
-export function miscasedPiToolCorrection(tool: string): PcpToolCallResult | null {
+export function miscasedPiToolCorrection(tool: string): InkToolCallResult | null {
   const lower = tool.toLowerCase();
   if (lower === tool || !isPiTool(lower)) return null;
   return {
@@ -157,7 +157,7 @@ export function miscasedPiToolCorrection(tool: string): PcpToolCallResult | null
       },
     ],
     isError: true,
-  } as PcpToolCallResult;
+  } as InkToolCallResult;
 }
 
 /**
@@ -179,7 +179,7 @@ export function miscasedPiToolCorrection(tool: string): PcpToolCallResult | null
  * Called before the policy check in the executor, and again in the dispatcher
  * as a backstop, since the dispatcher is also a callable boundary.
  */
-export function impossibleCallRefusal(tool: string): PcpToolCallResult | null {
+export function impossibleCallRefusal(tool: string): InkToolCallResult | null {
   return foreignNamespaceRefusal(tool) ?? miscasedPiToolCorrection(tool);
 }
 
@@ -191,7 +191,7 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
     // drifts toward its priors: after weeks on one native session Myra began
     // emitting `mcp__inkwell__bash` and `mcp__inkwell__signal_status` instead
     // of the bare names she had been taught. Every branch below used to test
-    // the RAW name, so only the last one — the PCP fallthrough — stripped the
+    // the RAW name, so only the last one — the Inkwell fallthrough — stripped the
     // namespace. A namespaced coding tool or ledger tool therefore sailed past
     // its own handler and was posted to the server, which has no `bash` and no
     // `signal_status`, and came back `-32602 tool not found`.
@@ -228,10 +228,10 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
         audience: deps.audience ?? 'parent',
         cwd: deps.cwd,
         isHardDenied: deps.isHardDenied,
-        callServer: () => deps.callPcp(name, deps.resolveCredentials(args)),
+        callServer: () => deps.callInk(name, deps.resolveCredentials(args)),
       });
     }
 
-    return deps.callPcp(name, deps.resolveCredentials(args));
+    return deps.callInk(name, deps.resolveCredentials(args));
   };
 }

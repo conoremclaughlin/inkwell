@@ -70,9 +70,9 @@ vi.mock('../../services/user-resolver', async (importOriginal) => {
   };
 });
 
-// Deliberately NOT mocked: ./tools (real handlers), ../auth/pcp-auth-provider
+// Deliberately NOT mocked: ./tools (real handlers), ../auth/ink-auth-provider
 // (real verification), ../../utils/request-context (real AsyncLocalStorage),
-// ../../auth/pcp-tokens (real signing), and SessionService's token minter.
+// ../../auth/ink-tokens (real signing), and SessionService's token minter.
 import { MCPServer } from '../server';
 import { fakeProcessEnv } from '../../test/fake-env';
 import { SessionService } from '../../services/sessions/session-service';

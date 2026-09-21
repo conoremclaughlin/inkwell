@@ -131,7 +131,7 @@ export function ChatContainer() {
       <div className="flex h-full items-center justify-center text-gray-400">
         <div className="text-center">
           <p className="text-lg">No agents available</p>
-          <p className="mt-1 text-sm">Create an agent identity using the PCP tools first.</p>
+          <p className="mt-1 text-sm">Create an agent identity using the Inkwell tools first.</p>
         </div>
       </div>
     );

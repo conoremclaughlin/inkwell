@@ -1,7 +1,7 @@
 /**
  * LIVE test project setup — env loading ONLY.
  *
- * Live suites talk to real services (a running PCP server, real LLM
+ * Live suites talk to real services (a running Inkwell server, real LLM
  * backends, local hardware) and each gates itself on an explicit env flag
  * (INK_LIVE_TESTS=1 etc.). Unlike setup.ts, this file provides NO fake
  * credential fallbacks — a fake SUPABASE_URL would make a DB-dependent live

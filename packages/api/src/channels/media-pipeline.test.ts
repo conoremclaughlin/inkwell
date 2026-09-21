@@ -30,7 +30,7 @@ function createMessage(overrides: Partial<InboundMessage> = {}): InboundMessage 
 
 describe('InboundMediaPipeline', () => {
   it('injects audio transcript for placeholder-only body', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-pipeline-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-media-pipeline-'));
     const audioPath = path.join(tmpDir, 'voice.ogg');
     await writeFile(audioPath, Buffer.from('audio-bytes'));
 
@@ -170,7 +170,7 @@ describe('InboundMediaPipeline', () => {
   });
 
   it('injects a setup hint when audio arrives with no transcription provider', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-pipeline-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-media-pipeline-'));
     const audioPath = path.join(tmpDir, 'voice.ogg');
     await writeFile(audioPath, Buffer.from('audio-bytes'));
 

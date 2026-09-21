@@ -8,20 +8,20 @@ import { tmpdir } from 'os';
 describe('ToolPolicyState', () => {
   it('allows safe tools in backend mode', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    const decision = policy.canCallPcpTool('get_inbox');
+    const decision = policy.canCallInkTool('get_inbox');
     expect(decision.allowed).toBe(true);
   });
 
   it('blocks tools in deny list', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.denyTool('send_to_inbox');
-    const decision = policy.canCallPcpTool('send_to_inbox');
+    const decision = policy.canCallInkTool('send_to_inbox');
     expect(decision.allowed).toBe(false);
   });
 
   it('allows unlisted tools by default (no narrowing without allowlist)', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    const decision = policy.canCallPcpTool('send_to_inbox');
+    const decision = policy.canCallInkTool('send_to_inbox');
     expect(decision.allowed).toBe(true);
   });
 
@@ -30,15 +30,15 @@ describe('ToolPolicyState', () => {
     policy.addPromptTool('send_to_inbox');
     policy.grantTool('send_to_inbox', 2);
 
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
   });
 
   it('allows all tools in privileged mode', () => {
     const policy = new ToolPolicyState('privileged', { persist: false });
     expect(policy.canUseBackendTools()).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
   });
 
   it('disables backend tools in off mode', () => {
@@ -50,15 +50,15 @@ describe('ToolPolicyState', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.addPromptTool('send_to_inbox');
     policy.grantToolForSession('sess-1', 'send_to_inbox');
-    expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox', 'sess-2').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox', 'sess-1').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox', 'sess-2').allowed).toBe(false);
   });
 
   it('expands group rules for allow', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.allowTool('group:ink-comms');
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
-    expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('trigger_agent').allowed).toBe(true);
   });
 
   it('persists allow rules and grants', () => {
@@ -70,8 +70,8 @@ describe('ToolPolicyState', () => {
     initial.grantTool('create_task', 3);
 
     const reloaded = new ToolPolicyState('off', { persist: true, policyPath });
-    expect(reloaded.canCallPcpTool('send_to_inbox').allowed).toBe(true);
-    expect(reloaded.canCallPcpTool('create_task').allowed).toBe(true);
+    expect(reloaded.canCallInkTool('send_to_inbox').allowed).toBe(true);
+    expect(reloaded.canCallInkTool('create_task').allowed).toBe(true);
     expect(reloaded.listGrants().find((entry) => entry.tool === 'create_task')?.uses).toBe(2);
     rmSync(dir, { recursive: true, force: true });
   });
@@ -109,19 +109,19 @@ describe('ToolPolicyState', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.allowTool('group:ink-comms');
     policy.denyTool('send_to_inbox');
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
-    expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('trigger_agent').allowed).toBe(true);
   });
 
   it('supports prompt rule and removal', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.addPromptTool('send_to_inbox');
-    const blocked = policy.canCallPcpTool('send_to_inbox');
+    const blocked = policy.canCallInkTool('send_to_inbox');
     expect(blocked.allowed).toBe(false);
     expect(blocked.promptable).toBe(true);
 
     policy.removeToolRule('send_to_inbox');
-    const postRemove = policy.canCallPcpTool('send_to_inbox');
+    const postRemove = policy.canCallInkTool('send_to_inbox');
     // After removing the prompt rule, the tool is allowed by default
     expect(postRemove.allowed).toBe(true);
   });
@@ -129,9 +129,9 @@ describe('ToolPolicyState', () => {
   it('supports wildcard allow and deny patterns', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     policy.allowTool('send_*');
-    expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_response').allowed).toBe(true);
     policy.denyTool('send_r*');
-    expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_response').allowed).toBe(false);
   });
 
   it('tracks path allowlists', () => {
@@ -173,7 +173,7 @@ describe('ToolPolicyState', () => {
     // Intentionally malformed JSON
     writeFileSync(policyPath, '{not-json', 'utf-8');
     const policy = new ToolPolicyState('backend', { persist: true, policyPath });
-    expect(policy.canCallPcpTool('get_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('get_inbox').allowed).toBe(true);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -192,15 +192,15 @@ describe('ToolPolicyState', () => {
     );
 
     const policy = new ToolPolicyState('backend', { persist: true, policyPath });
-    expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
-    const triggerDecision = policy.canCallPcpTool('trigger_agent');
+    expect(policy.canCallInkTool('send_response').allowed).toBe(false);
+    const triggerDecision = policy.canCallInkTool('trigger_agent');
     expect(triggerDecision.allowed).toBe(false);
     expect(triggerDecision.promptable).toBe(true);
     expect(policy.listGrants().find((entry) => entry.tool === 'create_task')?.uses).toBe(0);
     // remember has 2 grants + prompt rule — grants consumed first, then blocked
-    expect(policy.canCallPcpTool('remember').allowed).toBe(true);
-    expect(policy.canCallPcpTool('remember').allowed).toBe(true);
-    expect(policy.canCallPcpTool('remember').allowed).toBe(false);
+    expect(policy.canCallInkTool('remember').allowed).toBe(true);
+    expect(policy.canCallInkTool('remember').allowed).toBe(true);
+    expect(policy.canCallInkTool('remember').allowed).toBe(false);
 
     rmSync(dir, { recursive: true, force: true });
   });
@@ -214,7 +214,7 @@ describe('ToolPolicyState', () => {
     expect(policy.listSessionGrants('missing')).toEqual([]);
 
     policy.grantToolForSession('sess-1', 'send_to_inbox');
-    expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox', 'sess-1').allowed).toBe(true);
 
     // Exercise finite decrement branch inside hasSessionGrant.
     // Add a prompt rule so the tool is blocked after the grant is consumed.
@@ -224,11 +224,11 @@ describe('ToolPolicyState', () => {
         sessionGrants: Map<string, Map<string, number>>;
       }
     ).sessionGrants.set('finite', new Map([['send_to_inbox', 1]]));
-    expect(policy.canCallPcpTool('send_to_inbox', 'finite').allowed).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox', 'finite').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox', 'finite').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox', 'finite').allowed).toBe(false);
   });
 
-  describe('inspectPcpTool (non-consuming)', () => {
+  describe('inspectInkTool (non-consuming)', () => {
     it('does not spend a scoped one-use grant', () => {
       const policy = new ToolPolicyState('off', { persist: false });
       policy.addPromptTool('send_to_inbox');
@@ -236,14 +236,14 @@ describe('ToolPolicyState', () => {
 
       // Ten looks, zero spend.
       for (let i = 0; i < 10; i++) {
-        expect(policy.inspectPcpTool('send_to_inbox').allowed).toBe(true);
+        expect(policy.inspectInkTool('send_to_inbox').allowed).toBe(true);
       }
       expect(policy.listGrants()).toEqual([{ tool: 'send_to_inbox', uses: 2 }]);
 
       // The consuming path still counts down from the untouched balance.
-      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
-      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
-      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+      expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
     });
 
     it('flags that the allow verdict rests on a one-use grant', () => {
@@ -251,12 +251,12 @@ describe('ToolPolicyState', () => {
       policy.addPromptTool('send_to_inbox');
       policy.grantTool('send_to_inbox', 1);
 
-      const inspected = policy.inspectPcpTool('send_to_inbox');
+      const inspected = policy.inspectInkTool('send_to_inbox');
       expect(inspected.allowed).toBe(true);
       expect(inspected.wouldConsumeGrant).toBe(true);
 
       // The consuming path has already spent it, so there is nothing to warn about.
-      expect(policy.canCallPcpTool('send_to_inbox').wouldConsumeGrant).toBeUndefined();
+      expect(policy.canCallInkTool('send_to_inbox').wouldConsumeGrant).toBeUndefined();
     });
 
     it('does not decrement a finite session grant', () => {
@@ -267,13 +267,13 @@ describe('ToolPolicyState', () => {
         new Map([['send_to_inbox', 1]])
       );
 
-      expect(policy.inspectPcpTool('send_to_inbox', 'finite').allowed).toBe(true);
-      expect(policy.inspectPcpTool('send_to_inbox', 'finite').allowed).toBe(true);
-      expect(policy.inspectPcpTool('send_to_inbox', 'finite').wouldConsumeGrant).toBe(true);
+      expect(policy.inspectInkTool('send_to_inbox', 'finite').allowed).toBe(true);
+      expect(policy.inspectInkTool('send_to_inbox', 'finite').allowed).toBe(true);
+      expect(policy.inspectInkTool('send_to_inbox', 'finite').wouldConsumeGrant).toBe(true);
 
       // Still exactly one use left for the real call.
-      expect(policy.canCallPcpTool('send_to_inbox', 'finite').allowed).toBe(true);
-      expect(policy.canCallPcpTool('send_to_inbox', 'finite').allowed).toBe(false);
+      expect(policy.canCallInkTool('send_to_inbox', 'finite').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_to_inbox', 'finite').allowed).toBe(false);
     });
 
     it('treats a session-wide grant as standing permission, not a countdown', () => {
@@ -281,7 +281,7 @@ describe('ToolPolicyState', () => {
       policy.addPromptTool('send_to_inbox');
       policy.grantToolForSession('sess-1', 'send_to_inbox');
 
-      const inspected = policy.inspectPcpTool('send_to_inbox', 'sess-1');
+      const inspected = policy.inspectInkTool('send_to_inbox', 'sess-1');
       expect(inspected.allowed).toBe(true);
       expect(inspected.wouldConsumeGrant).toBeUndefined();
     });
@@ -295,26 +295,26 @@ describe('ToolPolicyState', () => {
         policy.grantTool('send_to_inbox', 3);
 
         const before = readFileSync(policyPath, 'utf8');
-        expect(policy.inspectPcpTool('send_to_inbox').allowed).toBe(true);
+        expect(policy.inspectInkTool('send_to_inbox').allowed).toBe(true);
         expect(readFileSync(policyPath, 'utf8')).toBe(before);
 
         // Contrast: the consuming path does persist the decrement.
-        expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+        expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
         expect(readFileSync(policyPath, 'utf8')).not.toBe(before);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
     });
 
-    it('agrees with canCallPcpTool on every non-grant verdict', () => {
+    it('agrees with canCallInkTool on every non-grant verdict', () => {
       const policy = new ToolPolicyState('backend', { persist: false });
       policy.denyTool('send_to_inbox');
       policy.addPromptTool('remember');
       policy.allowTool('group:ink-comms', { scope: 'global' });
 
       for (const tool of ['get_inbox', 'send_to_inbox', 'remember', 'trigger_agent', '   ']) {
-        const inspected = policy.inspectPcpTool(tool);
-        const decided = policy.canCallPcpTool(tool);
+        const inspected = policy.inspectInkTool(tool);
+        const decided = policy.canCallInkTool(tool);
         expect({ tool, allowed: inspected.allowed, promptable: inspected.promptable }).toEqual({
           tool,
           allowed: decided.allowed,
@@ -326,7 +326,7 @@ describe('ToolPolicyState', () => {
 
   it('rejects invalid tool names and sorts grants deterministically', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    const invalid = policy.canCallPcpTool('   ');
+    const invalid = policy.canCallInkTool('   ');
     expect(invalid.allowed).toBe(false);
     expect(invalid.promptable).toBe(false);
 
@@ -340,12 +340,12 @@ describe('ToolPolicyState', () => {
     policy.allowTool('group:ink-comms', { scope: 'global' });
     policy.setContext({ workspaceId: 'ws-1' });
     policy.allowTool('send_to_inbox', { scope: 'workspace', id: 'ws-1' });
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
 
     policy.setContext({ workspaceId: 'ws-1', sbSlug: 'lumen' });
     policy.allowTool('trigger_agent', { scope: 'agent', id: 'lumen' });
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
-    expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('trigger_agent').allowed).toBe(false);
   });
 
   it('applies scoped deny rules only within matching scope', () => {
@@ -354,10 +354,10 @@ describe('ToolPolicyState', () => {
     policy.denyTool('send_response', { scope: 'workspace', id: 'ws-1' });
 
     policy.setContext({ workspaceId: 'ws-1' });
-    expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_response').allowed).toBe(false);
 
     policy.setContext({ workspaceId: 'ws-2' });
-    expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_response').allowed).toBe(true);
   });
 
   it('intersects skill and path policies across active scopes', () => {
@@ -397,10 +397,10 @@ describe('ToolPolicyState', () => {
     expect(policy.setMutationScope('workspace').success).toBe(true);
     policy.denyTool('send_to_inbox');
 
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
 
     policy.setContext({ workspaceId: 'ws-2' });
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
   });
 
   it('resolves effective mode using most restrictive active scope', () => {
@@ -470,11 +470,11 @@ describe('ToolPolicyState', () => {
     policy.setContext({ workspaceId: 'ws-1' });
     policy.setMutationScope('workspace');
     policy.denyTool('send_to_inbox');
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
 
     const reset = policy.clearScopeRules();
     expect(reset.success).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
   });
 
   it('runs visibility matrix across all visibility modes and actions', () => {
@@ -601,7 +601,7 @@ describe('ToolPolicyState', () => {
     }
   });
 
-  it('runs PCP tool decision matrix for safe/allow/prompt/deny/scoped cases', () => {
+  it('runs Inkwell tool decision matrix for safe/allow/prompt/deny/scoped cases', () => {
     type Case = {
       name: string;
       setup?: (policy: ToolPolicyState) => void;
@@ -658,7 +658,7 @@ describe('ToolPolicyState', () => {
     for (const testCase of cases) {
       const policy = new ToolPolicyState('backend', { persist: false });
       testCase.setup?.(policy);
-      const decision = policy.canCallPcpTool(testCase.tool);
+      const decision = policy.canCallInkTool(testCase.tool);
       expect(decision.allowed, testCase.name).toBe(testCase.expected.allowed);
       if (typeof testCase.expected.promptable !== 'undefined') {
         expect(decision.promptable, testCase.name).toBe(testCase.expected.promptable);
@@ -670,13 +670,13 @@ describe('ToolPolicyState', () => {
     it('persistentGrant prevents addPromptTool from re-adding tool', () => {
       const policy = new ToolPolicyState('backend', { persist: false });
       policy.addPromptTool('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(false);
 
       policy.persistentGrant('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
 
       policy.addPromptTool('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
       expect(policy.listPermanentGrants()).toContain('send_response');
     });
 
@@ -689,7 +689,7 @@ describe('ToolPolicyState', () => {
 
       expect(policy.listPermanentGrants()).toContain('send_response');
       policy.addPromptTool('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
     });
 
     it('permanentGrants survive clearScopeRules for scoped scope', () => {
@@ -705,7 +705,7 @@ describe('ToolPolicyState', () => {
 
       expect(policy.listPermanentGrants()).toContain('send_response');
       policy.addPromptTool('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
     });
 
     it('simulates full heartbeat cycle: applyProfile does not undo grants', () => {
@@ -717,14 +717,14 @@ describe('ToolPolicyState', () => {
       });
 
       applyProfile(policy, 'safe');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
-      expect(policy.canCallPcpTool('send_response').promptable).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(false);
+      expect(policy.canCallInkTool('send_response').promptable).toBe(true);
 
       policy.persistentGrant('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
 
       applyProfile(policy, 'safe');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
       expect(policy.listPromptTools()).not.toContain('send_response');
     });
 
@@ -739,21 +739,21 @@ describe('ToolPolicyState', () => {
       expect(grants).toContain('send_response');
 
       policy.addPromptTool('group:ink-comms');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
-      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
     });
 
     it('revokePermanentGrant allows re-adding to promptTools', () => {
       const policy = new ToolPolicyState('backend', { persist: false });
       policy.addPromptTool('send_response');
       policy.persistentGrant('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
 
       policy.revokePermanentGrant('send_response');
       expect(policy.listPermanentGrants()).not.toContain('send_response');
 
       policy.addPromptTool('send_response');
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(false);
     });
 
     it('persistentGrant does not cause narrowing of other tools', () => {
@@ -761,9 +761,9 @@ describe('ToolPolicyState', () => {
       policy.addPromptTool('send_response');
       policy.persistentGrant('send_response');
 
-      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
-      expect(policy.canCallPcpTool('get_integration_health').allowed).toBe(true);
-      expect(policy.canCallPcpTool('remember').allowed).toBe(true);
+      expect(policy.canCallInkTool('send_response').allowed).toBe(true);
+      expect(policy.canCallInkTool('get_integration_health').allowed).toBe(true);
+      expect(policy.canCallInkTool('remember').allowed).toBe(true);
     });
 
     it('permanentGrants persist to disk and load back', () => {
@@ -818,7 +818,7 @@ describe('ToolPolicyState', () => {
 
         // applyProfile imported at top of file
         applyProfile(policy2, 'safe');
-        expect(policy2.canCallPcpTool('send_response').allowed).toBe(true);
+        expect(policy2.canCallInkTool('send_response').allowed).toBe(true);
       } finally {
         rmSync(tmpDir, { recursive: true, force: true });
       }

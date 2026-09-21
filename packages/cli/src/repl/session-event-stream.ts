@@ -60,7 +60,7 @@ export function parseSseBuffer(buffer: string): { frames: RawSseFrame[]; rest: s
 export interface SessionEventStreamOptions {
   serverUrl: string;
   sessionId: string;
-  /** Bearer access token (self-issued PCP token). */
+  /** Bearer access token (self-issued Inkwell token). */
   token: string;
   onEvent: (event: SessionEvent) => void;
   onError?: (err: Error) => void;

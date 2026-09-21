@@ -5,7 +5,7 @@
  * a studio row and writes a real UUID to the session's studio_id.
  * Simulates the hook→start_session flow against the real database.
  *
- * Requires: running PCP server (default http://localhost:3001)
+ * Requires: running Inkwell server (default http://localhost:3001)
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -17,7 +17,7 @@ import {
   INTEGRATION_TEST_AGENT_ID,
 } from '../../test/integration-fixtures';
 
-const TEST_REPO_ROOT = `/tmp/pcp-test-repo-${Date.now()}`;
+const TEST_REPO_ROOT = `/tmp/ink-test-repo-${Date.now()}`;
 
 describe('Auto-Create Main Studio Integration', () => {
   let dataComposer: DataComposer;

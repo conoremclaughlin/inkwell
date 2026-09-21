@@ -1,5 +1,5 @@
 /**
- * isPcpHookCommand decides whether an existing hook line is Inkwell-managed.
+ * isInkHookCommand decides whether an existing hook line is Inkwell-managed.
  * Two writers produce those lines: `ink hooks install` (this CLI, which pins
  * its own node binary and cli.js) and the server's studio settings generator
  * (`node <checkout>/packages/cli/dist/cli.js hooks ...`). Recognition is by
@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { isPcpHookCommand } from './hooks.js';
+import { isInkHookCommand } from './hooks.js';
 
 const SERVER_HOOK_NAMES = [
   'pre-compact',
@@ -20,18 +20,18 @@ const SERVER_HOOK_NAMES = [
   'on-stop',
 ];
 
-describe('isPcpHookCommand', () => {
+describe('isInkHookCommand', () => {
   it('accepts every hook the server generates, in the form the server writes', () => {
     for (const name of SERVER_HOOK_NAMES) {
       const line = `node /srv/checkout/packages/cli/dist/cli.js hooks ${name} --backend claude-code`;
-      expect(isPcpHookCommand(line), line).toBe(true);
+      expect(isInkHookCommand(line), line).toBe(true);
     }
   });
 
   it('accepts a hook name neither writer knows yet', () => {
-    expect(isPcpHookCommand('ink hooks on-some-future-event --backend claude-code')).toBe(true);
+    expect(isInkHookCommand('ink hooks on-some-future-event --backend claude-code')).toBe(true);
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         'node /srv/checkout/packages/cli/dist/cli.js hooks on-some-future-event --backend codex'
       )
     ).toBe(true);
@@ -39,17 +39,17 @@ describe('isPcpHookCommand', () => {
 
   it('accepts the form this CLI writes: a pinned node binary and cli.js, single-quoted when needed', () => {
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         '/Users/o/.nvm/versions/node/v22.21.0/bin/node /Users/o/ws/ink/packages/cli/dist/cli.js hooks on-stop --backend claude-code'
       )
     ).toBe(true);
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         "'/Users/o b/.nvm/versions/node/v22.21.0/bin/node' '/Users/o b/ws/ink/packages/cli/dist/cli.js' hooks on-prompt --backend claude-code"
       )
     ).toBe(true);
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         '/Users/o/ws/ink/node_modules/.bin/ink hooks pre-compact --backend claude-code'
       )
     ).toBe(true);
@@ -57,71 +57,71 @@ describe('isPcpHookCommand', () => {
 
   it('accepts the server form with a double-quoted whitespace path', () => {
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         'node "/Users/o b/ink/packages/cli/dist/cli.js" hooks on-tool-approval --backend claude-code'
       )
     ).toBe(true);
   });
 
   it('accepts bare ink, a path to ink, and an agent-suffixed ink', () => {
-    expect(isPcpHookCommand('ink hooks on-session-start --backend claude-code')).toBe(true);
-    expect(isPcpHookCommand('/Users/o/.local/bin/ink hooks post-compact --backend gemini')).toBe(
+    expect(isInkHookCommand('ink hooks on-session-start --backend claude-code')).toBe(true);
+    expect(isInkHookCommand('/Users/o/.local/bin/ink hooks post-compact --backend gemini')).toBe(
       true
     );
-    expect(isPcpHookCommand('ink-lumen hooks on-stop --backend codex')).toBe(true);
+    expect(isInkHookCommand('ink-lumen hooks on-stop --backend codex')).toBe(true);
   });
 
   it('accepts any launcher when the line carries the managed marker the server writes', () => {
     expect(
-      isPcpHookCommand('/opt/tools/launch-ink hooks on-prompt --backend claude-code # ink-managed')
+      isInkHookCommand('/opt/tools/launch-ink hooks on-prompt --backend claude-code # ink-managed')
     ).toBe(true);
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         'node /opt/tools/entry.mjs hooks on-tool-approval --backend claude-code # ink-managed'
       )
     ).toBe(true);
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         'node "/Users/o b/tools/entry.mjs" hooks on-stop --backend claude-code # ink-managed'
       )
     ).toBe(true);
   });
 
   it('does not let the marker stand in for the managed grammar', () => {
-    expect(isPcpHookCommand('custom-tool audit # ink-managed')).toBe(false);
-    expect(isPcpHookCommand('/opt/tools/launch-ink hooks # ink-managed')).toBe(false);
+    expect(isInkHookCommand('custom-tool audit # ink-managed')).toBe(false);
+    expect(isInkHookCommand('/opt/tools/launch-ink hooks # ink-managed')).toBe(false);
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         '/opt/tools/launch-ink hooks on-prompt --backend claude-code # ink-managed-by-me'
       )
     ).toBe(false);
     expect(
-      isPcpHookCommand('/opt/tools/launch-ink # ink-managed hooks on-prompt --backend claude-code')
+      isInkHookCommand('/opt/tools/launch-ink # ink-managed hooks on-prompt --backend claude-code')
     ).toBe(false);
   });
 
   it('preserves an unrelated CLI that merely shares the command shape', () => {
     expect(
-      isPcpHookCommand('node /opt/project/scripts/cli.js hooks audit --backend claude-code')
+      isInkHookCommand('node /opt/project/scripts/cli.js hooks audit --backend claude-code')
     ).toBe(false);
     expect(
-      isPcpHookCommand(
+      isInkHookCommand(
         '/usr/local/bin/node /opt/project/scripts/cli.js hooks on-prompt --backend claude-code'
       )
     ).toBe(false);
   });
 
   it('rejects hooks that are not ours', () => {
-    expect(isPcpHookCommand(undefined)).toBe(false);
-    expect(isPcpHookCommand('')).toBe(false);
-    expect(isPcpHookCommand('custom-tool cleanup')).toBe(false);
-    expect(isPcpHookCommand('echo hooks on-prompt')).toBe(false);
-    expect(isPcpHookCommand('node /opt/other/tool.js hooks on-prompt --backend claude-code')).toBe(
+    expect(isInkHookCommand(undefined)).toBe(false);
+    expect(isInkHookCommand('')).toBe(false);
+    expect(isInkHookCommand('custom-tool cleanup')).toBe(false);
+    expect(isInkHookCommand('echo hooks on-prompt')).toBe(false);
+    expect(isInkHookCommand('node /opt/other/tool.js hooks on-prompt --backend claude-code')).toBe(
       false
     );
-    expect(isPcpHookCommand('hooks on-prompt --backend claude-code')).toBe(false);
-    expect(isPcpHookCommand('ink hooks')).toBe(false);
-    expect(isPcpHookCommand('ink hooks --backend claude-code')).toBe(false);
-    expect(isPcpHookCommand('my-ink-thing hooks on-prompt')).toBe(false);
+    expect(isInkHookCommand('hooks on-prompt --backend claude-code')).toBe(false);
+    expect(isInkHookCommand('ink hooks')).toBe(false);
+    expect(isInkHookCommand('ink hooks --backend claude-code')).toBe(false);
+    expect(isInkHookCommand('my-ink-thing hooks on-prompt')).toBe(false);
   });
 });

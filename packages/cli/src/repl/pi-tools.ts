@@ -10,7 +10,7 @@ import { resolve, basename } from 'path';
 import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { PathContainmentError, validatePathArgs } from '@inklabs/shared';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 // Pi tool types — we use the AgentTool shape from pi-agent-core
 interface PiToolResult {
@@ -73,7 +73,7 @@ const DOCUMENT_EXTENSIONS: Record<string, string> = {
   '.pdf': 'application/pdf',
 };
 
-async function tryReadDocument(filePath: string, cwd: string): Promise<PcpToolCallResult | null> {
+async function tryReadDocument(filePath: string, cwd: string): Promise<InkToolCallResult | null> {
   const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
   if (!DOCUMENT_EXTENSIONS[ext]) return null;
 
@@ -116,7 +116,7 @@ async function tryReadDocument(filePath: string, cwd: string): Promise<PcpToolCa
 }
 
 /**
- * Execute a Pi coding tool and return the result in PcpToolCallResult format.
+ * Execute a Pi coding tool and return the result in InkToolCallResult format.
  * This is the adapter between Pi's tool interface and the ink CLI's tool routing.
  */
 export async function callPiTool(
@@ -124,7 +124,7 @@ export async function callPiTool(
   args: Record<string, unknown>,
   cwd: string,
   signal?: AbortSignal
-): Promise<PcpToolCallResult> {
+): Promise<InkToolCallResult> {
   const tools = await initPiTools(cwd);
   const tool = tools.get(toolName);
   if (!tool) {
@@ -148,9 +148,9 @@ export async function callPiTool(
   const callId = `pi-${toolName}-${Date.now()}`;
   const result = await tool.execute(callId, args, signal);
 
-  // Transform Pi's result format to PcpToolCallResult
+  // Transform Pi's result format to InkToolCallResult
   // Pi returns { content: [{ type: 'text', text: '...' }], details: {...} }
-  // PcpToolCallResult is Record<string, unknown> — pass through content array
+  // InkToolCallResult is Record<string, unknown> — pass through content array
   // in MCP-compatible shape so the existing result formatting works
   const textContent = result.content
     .filter((c) => c.type === 'text' && c.text)

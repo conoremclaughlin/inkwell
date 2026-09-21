@@ -14,11 +14,11 @@ import {
   LIST_CONTEXT_DEFAULT_LIMIT,
   LIST_CONTEXT_MAX_LIMIT,
 } from './context-tools.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 /** Extract parsed JSON from a tool call result */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseResult(result: PcpToolCallResult | null): any {
+function parseResult(result: InkToolCallResult | null): any {
   const content = result?.content as Array<{ type: string; text: string }> | undefined;
   return JSON.parse(content?.[0]?.text || '{}');
 }
@@ -31,7 +31,7 @@ describe('isClientLocalTool', () => {
     expect(isClientLocalTool('evict_context')).toBe(true);
   });
 
-  it('rejects PCP server tools', () => {
+  it('rejects Inkwell server tools', () => {
     expect(isClientLocalTool('remember')).toBe(false);
     expect(isClientLocalTool('recall')).toBe(false);
     expect(isClientLocalTool('send_to_inbox')).toBe(false);

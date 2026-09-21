@@ -13,21 +13,21 @@ import { ToolPolicyState } from './tool-policy.js';
 import { applyProfile } from './tool-profiles.js';
 import { isClientLocalTool } from './context-tools.js';
 import { isPiTool } from './pi-tools.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 /**
- * What `PcpClient.callTool` actually hands back: the payload, already unwrapped
+ * What `InkClient.callTool` actually hands back: the payload, already unwrapped
  * from the MCP envelope. Mocking the envelope instead is how the first cut of
  * this merge passed every unit test and did nothing at all in production.
  */
-const serverPayload = (data: object): PcpToolCallResult => ({ ...data });
+const serverPayload = (data: object): InkToolCallResult => ({ ...data });
 
 /** The legacy `/api/mcp/call` path, which returns whatever the endpoint gives. */
-const enveloped = (data: object): PcpToolCallResult => ({
+const enveloped = (data: object): InkToolCallResult => ({
   content: [{ type: 'text', text: JSON.stringify(data) }],
 });
 
-const payloadOf = (result: PcpToolCallResult): any => result;
+const payloadOf = (result: InkToolCallResult): any => result;
 
 const serverList = () =>
   serverPayload({
@@ -253,7 +253,7 @@ describe('describeToolWithLocalSurface', () => {
           audience: 'clone',
           cwd: '/work',
           isHardDenied: (tool) => {
-            const decision = policy.inspectPcpTool(tool);
+            const decision = policy.inspectInkTool(tool);
             return !decision.allowed && !decision.promptable;
           },
           callServer: async () =>
@@ -269,7 +269,7 @@ describe('describeToolWithLocalSurface', () => {
   });
 
   it('never spends a grant to answer what exists', async () => {
-    // The predicate MUST be inspectPcpTool, never canCallPcpTool: the latter
+    // The predicate MUST be inspectInkTool, never canCallInkTool: the latter
     // decrements one-use grants, so merely asking what exists would bill the
     // user for calls that never happen — on the one call an agent makes
     // precisely when it is unsure.
@@ -285,7 +285,7 @@ describe('describeToolWithLocalSurface', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     applyProfile(policy, 'safe');
     policy.grantTool('send_response', 1);
-    expect(policy.inspectPcpTool('send_response').wouldConsumeGrant).toBe(true);
+    expect(policy.inspectInkTool('send_response').wouldConsumeGrant).toBe(true);
 
     await describeToolWithLocalSurface(
       {},
@@ -293,7 +293,7 @@ describe('describeToolWithLocalSurface', () => {
         audience: 'parent',
         cwd: '/work',
         isHardDenied: (tool) => {
-          const decision = policy.inspectPcpTool(tool);
+          const decision = policy.inspectInkTool(tool);
           return !decision.allowed && !decision.promptable;
         },
         callServer: async () =>
@@ -302,7 +302,7 @@ describe('describeToolWithLocalSurface', () => {
     );
 
     // Still unspent. A consuming predicate leaves this false and allowed:false.
-    const after = policy.inspectPcpTool('send_response');
+    const after = policy.inspectInkTool('send_response');
     expect(after.allowed).toBe(true);
     expect(after.wouldConsumeGrant).toBe(true);
   });
@@ -372,7 +372,7 @@ describe('describeToolWithLocalSurface', () => {
           isHardDenied: (tool) => {
             const decision = deriveClonePolicy(
               new ToolPolicyState('backend', { persist: false })
-            ).policy.inspectPcpTool(tool);
+            ).policy.inspectInkTool(tool);
             return !decision.allowed && !decision.promptable;
           },
           callServer: async () =>
@@ -439,7 +439,7 @@ describe('describeToolWithLocalSurface', () => {
   it('leaves the server response alone when it cannot be parsed', async () => {
     // Discovery degrading to the old, incomplete answer is bad. Discovery
     // throwing where a caller expected a list is worse.
-    const opaque = { content: [{ type: 'text', text: '<html>502</html>' }] } as PcpToolCallResult;
+    const opaque = { content: [{ type: 'text', text: '<html>502</html>' }] } as InkToolCallResult;
     expect(
       await describeToolWithLocalSurface(
         {},

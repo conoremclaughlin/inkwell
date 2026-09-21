@@ -415,7 +415,7 @@ stack on each job. Neither path uses an application database.
 
 ```bash
 # Focus on the affected integration file rather than repeatedly running everything.
-yarn test:integration:db:local src/auth/pcp-tokens.integration.test.ts
+yarn test:integration:db:local src/auth/ink-tokens.integration.test.ts
 # Rebuild test data/schema after migration/seed changes, or for a clean rerun.
 yarn test:integration:db:local --reset
 # Release the retained containers and their test data when finished.
@@ -442,7 +442,7 @@ recorded Docker ID, project label, running/unpaused state, and reserved DB port.
 SQL executes inside that immutable container ID over an explicit local socket,
 never via an inherited connection URL. `current_database() = 'postgres'` is also
 required, but is only a typo guard: application stacks can share that SQL name.
-The additional `_pcp_it.stack` row, installed only after a managed reset, must match
+The additional `_ink_it.stack` row, installed only after a managed reset, must match
 the project, full container ID, fingerprint, and random token **in the same
 transaction** before cleanup. Missing or mismatching identity refuses; do not
 create this marker by hand to force adoption. The restore remains on the `postgres`
@@ -493,11 +493,11 @@ Existing `INTEGRATION_SUPABASE_*_PORT` overrides remain supported;
 the six source config port fields must retain their repository defaults, or the
 harness refuses before starting containers. Use the overrides rather than editing
 `supabase/config.toml` to select integration ports.
-Project IDs must be `pcp-integration` or `pcp-integration-<suffix>`. `--reuse` explicitly
+Project IDs must be `ink-integration` or `ink-integration-<suffix>`. `--reuse` explicitly
 selects retained mode (including in a CI-marked shell). The legacy
 `INTEGRATION_KEEP_SUPABASE=1` with `--fresh` retains a temporary inspection stack;
 release it with the printed `supabase stop --workdir ... --no-backup` command before
-using the same project again. If that output is lost, inspect `pcp-supabase-it-*`
+using the same project again. If that output is lost, inspect `ink-supabase-it-*`
 directories under `INTEGRATION_SUPABASE_WORKDIR_BASE` (or the system temp directory
 when unset). Verify `supabase/config.toml` names your test project before selecting
 a workdir; the prefix alone does not establish ownership.

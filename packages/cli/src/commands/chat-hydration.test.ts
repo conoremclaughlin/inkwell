@@ -434,7 +434,7 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
         keptEntries: [
           { role: 'system', content: '[HEARTBEAT TRIGGER] hourly check', source: 'heartbeat' },
           { role: 'assistant', content: 'cycle complete', source: 'claude' },
-          { role: 'system', content: 'internal echo', source: 'pcp-activity' },
+          { role: 'system', content: 'internal echo', source: 'ink-activity' },
         ],
       },
     ]);
@@ -444,7 +444,7 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
 
     const labels = result.tailPreview.map((p) => p.label || p.role);
     expect(labels).toContain('heartbeat');
-    expect(labels).not.toContain('pcp-activity'); // internal sources stay out of replay
+    expect(labels).not.toContain('ink-activity'); // internal sources stay out of replay
     expect(result.tailPreview.map((p) => p.content)).not.toContain('old');
   });
 
@@ -977,7 +977,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
           {
             role: 'system',
             content: '⚡ myra sent — Post-session catch-up…',
-            source: 'pcp-activity',
+            source: 'ink-activity',
             eid: 3,
             replay: {
               role: 'assistant',
@@ -1003,7 +1003,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
 
     // …while the LEDGER keeps the compact ⚡ line (context unchanged) with
     // the replay metadata restored for the NEXT compaction cycle.
-    const ledgerEntry = ledger.listEntries().find((e) => e.source === 'pcp-activity');
+    const ledgerEntry = ledger.listEntries().find((e) => e.source === 'ink-activity');
     expect(ledgerEntry).toBeDefined();
     expect(ledgerEntry!.content).toContain('⚡ myra sent');
     expect(ledgerEntry!.replay?.label).toBe('📤 myra → telegram');
@@ -1016,7 +1016,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
         type: 'compaction',
         summary: 'summary',
         keptEntries: [
-          { role: 'system', content: '⚡ myra tool call — list_emails', source: 'pcp-activity' },
+          { role: 'system', content: '⚡ myra tool call — list_emails', source: 'ink-activity' },
         ],
         removedCount: 1,
       },
@@ -1031,7 +1031,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
     write([sendActivity]);
     const ledger = new ContextLedger();
     hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
-    const hydratedEntry = ledger.listEntries().find((e) => e.source === 'pcp-activity-history');
+    const hydratedEntry = ledger.listEntries().find((e) => e.source === 'ink-activity-history');
     expect(hydratedEntry?.replay?.label).toBe('📤 myra → telegram');
 
     // Live compaction in this process: the production keptEntries writer
@@ -1039,7 +1039,7 @@ describe('platform message replay survives compaction (PR #478 round 2)', () => 
     ledger.compactToSummary('[Conversation summary]', 12);
     const kept = keptEntriesForCompaction(ledger);
     const keptSend = kept.find(
-      (k) => (k as { source?: string }).source === 'pcp-activity-history'
+      (k) => (k as { source?: string }).source === 'ink-activity-history'
     ) as { replay?: { label?: string; body?: string } } | undefined;
     expect(keptSend?.replay?.label).toBe('📤 myra → telegram');
     expect(keptSend?.replay?.body).toContain('Ruoshan emailed');

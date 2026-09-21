@@ -1863,7 +1863,7 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
 Use topicKey to categorize memories with structured topic keys following type:identifier convention. This builds the knowledge map loaded at bootstrap.
 
 Common types: project, decision, convention, person, reflection, lesson, beauty, growth, value, family, domain
-Examples: "project:pcp/memory", "decision:jwt-auth", "person:conor", "reflection:session-existence", "lesson:cross-agent-review"
+Examples: "project:inkwell/memory", "decision:jwt-auth", "person:conor", "reflection:session-existence", "lesson:cross-agent-review"
 
 Use summary to provide a one-liner when the full content is long/detailed. The summary is what appears in the bootstrap knowledge summary.
 
@@ -2132,7 +2132,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .guid()
             .optional()
             .describe(
-              'Optional PCP session UUID to use when creating a new session (typically with forceNew=true).'
+              'Optional Inkwell session UUID to use when creating a new session (typically with forceNew=true).'
             ),
           studioId: z
             .string()
@@ -6031,7 +6031,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'add_workspace_member',
     {
       description: `Invite/add a collaborator to a workspace by email.
-Creates a placeholder PCP user if needed, then grants workspace membership.
+Creates a placeholder Inkwell user if needed, then grants workspace membership.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: addWorkspaceMemberSchema,

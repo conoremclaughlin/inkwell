@@ -1,7 +1,7 @@
 /**
  * 2FA Approval API Client
  *
- * Shared client for creating and polling approval requests via the PCP
+ * Shared client for creating and polling approval requests via the Inkwell
  * server's HTTP API. The server handles all notification routing (Telegram,
  * WhatsApp) and response interception — the CLI only needs to create the
  * request and poll for status.
@@ -67,7 +67,7 @@ function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Create an approval request on the PCP server and poll until resolved.
+ * Create an approval request on the Inkwell server and poll until resolved.
  *
  * The server handles notification routing:
  * - Looks up user's connected platforms (Telegram, WhatsApp) from trusted_users

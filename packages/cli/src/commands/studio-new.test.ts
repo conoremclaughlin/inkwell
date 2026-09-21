@@ -12,7 +12,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { copyClaudePermissionsFromSource, installHooksForAllBackends } from './studio.js';
 
-const TEST_DIR = join(tmpdir(), 'pcp-ws-new-test-' + Date.now());
+const TEST_DIR = join(tmpdir(), 'ink-ws-new-test-' + Date.now());
 const TEST_REPO = join(TEST_DIR, 'test-repo');
 
 function git(args: string, cwd: string): string {
@@ -90,8 +90,8 @@ describe('Branch naming convention: sbSlug/studio/name', () => {
 
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
 
-    const pcpDir = join(wsPath, '.ink');
-    mkdirSync(pcpDir, { recursive: true });
+    const inkDir = join(wsPath, '.ink');
+    mkdirSync(inkDir, { recursive: true });
 
     const identity = {
       sbSlug,
@@ -102,9 +102,9 @@ describe('Branch naming convention: sbSlug/studio/name', () => {
       createdAt: new Date().toISOString(),
       createdBy: 'test@test.com',
     };
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
-    const saved = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
+    const saved = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
     expect(saved.branch).toBe('benson/studio/api-v2');
     expect(saved.sbSlug).toBe('benson');
     expect(saved.studio).toBe('api-v2');
@@ -118,8 +118,8 @@ describe('Branch naming convention: sbSlug/studio/name', () => {
 
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
 
-    const pcpDir = join(wsPath, '.ink');
-    mkdirSync(pcpDir, { recursive: true });
+    const inkDir = join(wsPath, '.ink');
+    mkdirSync(inkDir, { recursive: true });
 
     // Old format with workspace field
     const identity = {
@@ -130,9 +130,9 @@ describe('Branch naming convention: sbSlug/studio/name', () => {
       branch,
       createdAt: new Date().toISOString(),
     };
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
-    const saved = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
+    const saved = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
     expect(saved.workspace).toBe('legacy-ws');
     expect(saved.branch).toBe('wren/workspace/legacy-ws');
   });
@@ -160,12 +160,12 @@ describe('cleanStudio: branch from identity.json', () => {
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
 
     // Write identity.json with the branch
-    const pcpDir = join(wsPath, '.ink');
-    mkdirSync(pcpDir, { recursive: true });
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify({ branch }));
+    const inkDir = join(wsPath, '.ink');
+    mkdirSync(inkDir, { recursive: true });
+    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify({ branch }));
 
     // Read it back — simulating what cleanStudio does
-    const identity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
+    const identity = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
     expect(identity.branch).toBe(branch);
 
     // Actually clean up using the branch from identity
@@ -213,11 +213,11 @@ describe('cleanStudio: branch from identity.json', () => {
 
     git(`worktree add -b "${legacyBranch}" "${wsPath}"`, realRepo);
 
-    const pcpDir = join(wsPath, '.ink');
-    mkdirSync(pcpDir, { recursive: true });
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify({ branch: legacyBranch }));
+    const inkDir = join(wsPath, '.ink');
+    mkdirSync(inkDir, { recursive: true });
+    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify({ branch: legacyBranch }));
 
-    const identity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
+    const identity = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
 
     git(`worktree remove "${wsPath}" --force`, realRepo);
     git(`branch -D "${identity.branch}"`, realRepo);
@@ -266,10 +266,10 @@ describe('Config directory copying', () => {
 
   it('should always write fresh .ink/identity.json, never copy from source', () => {
     // Create .ink/ with an identity in the main repo
-    const srcPcp = join(realRepo, '.ink');
-    mkdirSync(srcPcp, { recursive: true });
+    const srcInk = join(realRepo, '.ink');
+    mkdirSync(srcInk, { recursive: true });
     writeFileSync(
-      join(srcPcp, 'identity.json'),
+      join(srcInk, 'identity.json'),
       JSON.stringify({
         sbSlug: 'wren',
         studio: 'main',
@@ -282,8 +282,8 @@ describe('Config directory copying', () => {
     git(`worktree add -b "wren/studio/fresh-id" "${wsPath}"`, realRepo);
 
     // Write fresh identity (simulating createStudio behavior)
-    const wsPcp = join(wsPath, '.ink');
-    mkdirSync(wsPcp, { recursive: true });
+    const wsInk = join(wsPath, '.ink');
+    mkdirSync(wsInk, { recursive: true });
     const freshIdentity = {
       sbSlug: 'wren',
       context: 'studio-fresh-id',
@@ -291,14 +291,14 @@ describe('Config directory copying', () => {
       branch: 'wren/studio/fresh-id',
       createdAt: new Date().toISOString(),
     };
-    writeFileSync(join(wsPcp, 'identity.json'), JSON.stringify(freshIdentity, null, 2));
+    writeFileSync(join(wsInk, 'identity.json'), JSON.stringify(freshIdentity, null, 2));
 
-    const wsIdentity = JSON.parse(readFileSync(join(wsPcp, 'identity.json'), 'utf-8'));
+    const wsIdentity = JSON.parse(readFileSync(join(wsInk, 'identity.json'), 'utf-8'));
     expect(wsIdentity.studio).toBe('fresh-id');
     expect(wsIdentity.branch).toBe('wren/studio/fresh-id');
 
     // Confirm main repo identity wasn't touched
-    const mainIdentity = JSON.parse(readFileSync(join(srcPcp, 'identity.json'), 'utf-8'));
+    const mainIdentity = JSON.parse(readFileSync(join(srcInk, 'identity.json'), 'utf-8'));
     expect(mainIdentity.studio).toBe('main');
   });
 

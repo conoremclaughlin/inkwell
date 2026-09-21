@@ -1,8 +1,8 @@
 /**
- * Best-effort bootstrap of PCP user + personal workspace after auth.
+ * Best-effort bootstrap of Inkwell user + personal workspace after auth.
  * This intentionally swallows errors so login/signup UX is never blocked.
  */
-export async function provisionPcpUserAndWorkspace(accessToken: string): Promise<void> {
+export async function provisionInkUserAndWorkspace(accessToken: string): Promise<void> {
   if (!accessToken) return;
   if (process.env.NODE_ENV === 'test') return;
 

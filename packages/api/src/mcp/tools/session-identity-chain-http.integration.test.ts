@@ -27,7 +27,7 @@ import {
   INTEGRATION_TEST_USER_EMAIL,
   INTEGRATION_TEST_AGENT_ID,
 } from '../../test/integration-fixtures';
-import { signPcpAccessToken } from '../../auth/pcp-tokens';
+import { signInkAccessToken } from '../../auth/ink-tokens';
 import { createMCPServer, type MCPServer } from '../server';
 import { env } from '../../config/env';
 
@@ -45,7 +45,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
     await ensureEchoIntegrationFixture(dataComposer);
 
     // Sign a test JWT for the integration test user + echo agent
-    testToken = signPcpAccessToken(
+    testToken = signInkAccessToken(
       {
         type: 'mcp_access',
         sub: INTEGRATION_TEST_USER_ID,
@@ -348,8 +348,8 @@ describe('Session Identity Chain — HTTP Integration', () => {
 
     const msg = (messages as Array<{ metadata: Record<string, unknown> }>)[0];
     const metadata = msg.metadata as Record<string, unknown>;
-    const pcp = metadata.pcp as Record<string, unknown>;
-    const sender = pcp?.sender as Record<string, unknown>;
+    const inkMeta = metadata.pcp as Record<string, unknown>;
+    const sender = inkMeta?.sender as Record<string, unknown>;
 
     // The sender metadata should have been enriched with session context
     // from the x-ink-session-id header → request context → send_to_inbox handler
@@ -389,7 +389,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
   // ── Codex env_http_headers simulation ──
   // Codex injects headers via `-c mcp_servers.inkwell.env_http_headers.<header>="ENV_VAR"`.
   // This test verifies the server correctly processes those headers on MCP calls,
-  // proving the full chain: env var → Codex → HTTP header → PCP server → request context.
+  // proving the full chain: env var → Codex → HTTP header → Inkwell server → request context.
 
   it('should process session headers as Codex would inject them via env_http_headers', async () => {
     const studioId = await createTestStudio('codex-env-headers');
@@ -443,8 +443,8 @@ describe('Session Identity Chain — HTTP Integration', () => {
     expect((messages as Array<{ metadata: unknown }>).length).toBeGreaterThan(0);
 
     const msg = (messages as Array<{ metadata: Record<string, unknown> }>)[0];
-    const pcp = msg.metadata.pcp as Record<string, unknown>;
-    const sender = pcp?.sender as Record<string, unknown>;
+    const inkMeta = msg.metadata.pcp as Record<string, unknown>;
+    const sender = inkMeta?.sender as Record<string, unknown>;
 
     // Prove the full chain: HTTP headers → request context → sender metadata
     expect(sender).toBeDefined();

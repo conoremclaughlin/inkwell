@@ -34,7 +34,7 @@ export interface SessionStreamEvent {
    * otherwise render the same tool_call twice.
    */
   id: number;
-  /** Session the event belongs to (pcpSessionId). */
+  /** Session the event belongs to (inkSessionId). */
   sessionId: string;
   /** ISO timestamp stamped at publish time. */
   ts: string;

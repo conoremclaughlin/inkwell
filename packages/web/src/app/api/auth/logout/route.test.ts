@@ -17,7 +17,7 @@ describe('POST /api/auth/logout', () => {
     vi.clearAllMocks();
   });
 
-  it('signs out supabase and clears PCP auth cookies', async () => {
+  it('signs out supabase and clears Inkwell auth cookies', async () => {
     mockSignOut.mockResolvedValue({});
 
     const response = await POST();
@@ -28,10 +28,10 @@ describe('POST /api/auth/logout', () => {
     expect(mockSignOut).toHaveBeenCalledTimes(1);
 
     const cookies = response.cookies.getAll();
-    const pcpAccessCookie = cookies.find((cookie) => cookie.name === 'pcp-admin-token');
-    const pcpRefreshCookie = cookies.find((cookie) => cookie.name === 'pcp-admin-refresh');
+    const inkAccessCookie = cookies.find((cookie) => cookie.name === 'pcp-admin-token');
+    const inkRefreshCookie = cookies.find((cookie) => cookie.name === 'pcp-admin-refresh');
 
-    expect(pcpAccessCookie?.value).toBe('');
-    expect(pcpRefreshCookie?.value).toBe('');
+    expect(inkAccessCookie?.value).toBe('');
+    expect(inkRefreshCookie?.value).toBe('');
   });
 });

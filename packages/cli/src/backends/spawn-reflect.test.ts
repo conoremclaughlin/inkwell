@@ -5,7 +5,7 @@ describe('parseReflectedOutput', () => {
   it('extracts reflected context from a single marker line', () => {
     const stdout = [
       'some banner noise',
-      'PCP_DEBUG_RESULT: {"transport":"http","pinnedSlug":"wren","requestContext":{"sbSlug":"wren","runtime":"claude"},"sessionContext":null}',
+      'INK_DEBUG_RESULT: {"transport":"http","pinnedSlug":"wren","requestContext":{"sbSlug":"wren","runtime":"claude"},"sessionContext":null}',
     ].join('\n');
 
     const parsed = parseReflectedOutput(stdout);
@@ -17,7 +17,7 @@ describe('parseReflectedOutput', () => {
 
   it('tolerates leading whitespace before the marker', () => {
     const stdout =
-      '   PCP_DEBUG_RESULT: {"transport":"stdio","pinnedSlug":null,"requestContext":null,"sessionContext":null}';
+      '   INK_DEBUG_RESULT: {"transport":"stdio","pinnedSlug":null,"requestContext":null,"sessionContext":null}';
     const parsed = parseReflectedOutput(stdout);
     expect(parsed.transport).toBe('stdio');
   });
@@ -29,13 +29,13 @@ describe('parseReflectedOutput', () => {
   });
 
   it('throws when the backend reports UNAVAILABLE', () => {
-    expect(() => parseReflectedOutput('PCP_DEBUG_RESULT: UNAVAILABLE')).toThrow(
+    expect(() => parseReflectedOutput('INK_DEBUG_RESULT: UNAVAILABLE')).toThrow(
       /tool unavailable/i
     );
   });
 
   it('throws when the payload after the marker is not JSON', () => {
-    expect(() => parseReflectedOutput('PCP_DEBUG_RESULT: not json')).toThrow(
+    expect(() => parseReflectedOutput('INK_DEBUG_RESULT: not json')).toThrow(
       /Could not parse JSON/
     );
   });

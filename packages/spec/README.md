@@ -1,16 +1,16 @@
-# PCP Protocol Specification
+# Inkwell Protocol Specification
 
-This package contains the formal specification for the Personal Context Protocol (PCP).
+This package contains the formal specification for the Personal Context Protocol, the protocol Inkwell implements.
 
 ## Current Version
 
 - **[v0.1](./protocol-v0.1.md)** — Draft specification covering identity, memory, sessions, inbox, threadKey semantics, heartbeat/reminders, bootstrap, and security.
 
-## What is PCP?
+## What is Inkwell?
 
-PCP gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces. It sits above [MCP](https://modelcontextprotocol.io/) (Model Context Protocol), adding continuity semantics to the tool-calling transport.
+Inkwell gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces. It sits above [MCP](https://modelcontextprotocol.io/) (Model Context Protocol), adding continuity semantics to the tool-calling transport.
 
-PCP is **backend-agnostic** — agents running on any capable LLM (Claude, Gemini, Codex, etc.) can participate as first-class citizens.
+Inkwell is **backend-agnostic** — agents running on any capable LLM (Claude, Gemini, Codex, etc.) can participate as first-class citizens.
 
 ## License
 

@@ -2,7 +2,7 @@
  * Scenario runner — orchestrates a single real-scenario eval run.
  *
  * Pure function over (scenario, recallFn): the caller wires the recall
- * function (HTTP to PCP, in-memory stub for tests, etc.) and the runner
+ * function (HTTP to Inkwell, in-memory stub for tests, etc.) and the runner
  * handles signal extraction, recall invocation, and scoring.
  *
  * v1 handles simple recall / correction / convention shapes. Eviction,

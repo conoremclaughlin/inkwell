@@ -16,7 +16,7 @@ export {
   decodeContextToken,
   type InjectSessionHeadersOptions,
   type InjectSessionHeadersResult,
-  type PcpContextToken,
+  type InkContextToken,
 } from './mcp-config.js';
 
 export { writeRuntimeSessionHint } from './runtime-hints.js';
