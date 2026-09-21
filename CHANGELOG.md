@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+### Finishing the PCP → Inkwell rename
+
+0.4.0 below records this rename as done. It was not, and the leftovers did not
+read as leftovers — they read as working code, because both spellings looked
+plausible. Five of them were live breakage:
+
+- **Workspace selection did nothing.** The dashboard sent `X-PCP-Workspace-Id`;
+  the server reads `x-ink-workspace-id`. The header arrived, no handler looked
+  for it, and the request silently fell back to the personal workspace.
+- **`yarn logs:ink:raw` and `logs:ink:errors` did not exist.** Both are
+  documented in AGENTS.md; the scripts were still named `logs:pcp:*`.
+- **Transcript sync was dead for ink sessions**, in two places. `admin.ts` and
+  `session.ts` both matched `backend.includes('pcp')` while sessions store
+  `'ink'`, so `ink session sync` threw "Cannot infer a backend-native install
+  target" and the dashboard's archive flow resolved nothing.
+- **The REPL's `/ink` command was unreachable.** `slash-commands.ts` registers
+  and autocompletes `ink`, but the dispatch switch only had `case 'pcp'`, so
+  `/ink` hit "Unknown command" while `/pcp` — listed nowhere, and printing
+  `Usage: /ink <tool>` — was the one that worked. Both now dispatch.
+- **`npx create-pcp`** in the setup wizard's own help; the package is
+  `@inklabs/create-inkwell`.
+
+Also renamed: ~2,300 identifiers, the `pcp-*` source files, `PCP_*` constants,
+log and warning strings, `project:pcp/*` examples, and the bundled skill.
+
+Names that keep the old spelling are the ones something outside this repo
+already stores — the `pcp_config` table, `pcp_admin` JWT claims, the `pcp_tool`
+ledger entry type, `metadata.pcp`, the `pcp-admin-*` cookies, `plugins.entries.pcp`
+in users' `openclaw.json`, and `PCP_PORT_BASE`/`PCP_SERVER_URL` as env fallbacks.
+`scripts/check-ink-naming.py` now fails CI on new residue and carries that list
+with a reason per entry, so the next person does not have to re-derive it.
+
+### CI
+
+- **pi coding tools no longer download binaries mid-test.** pi's `grep`/`find`
+  fetch ripgrep and fd from GitHub releases on first use, which put an
+  unauthenticated `api.github.com` call inside the test run and surfaced
+  throttling as `pi-tools > grep > searches file contents` failing — a flake
+  that reads like a regression in whichever PR is running. CI installs both and
+  sets `PI_OFFLINE=1`.
+
 ## [0.4.0] — 2026-04-05
 
 138 commits since v0.3.0 by Conor, Wren, Lumen, and Aster. This release completes the rebrand from PCP to **Inkwell**, adds per-sender session isolation, studio sandbox controls, and patches three security vulnerabilities.
