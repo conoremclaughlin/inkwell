@@ -144,7 +144,10 @@ class DataTests(unittest.TestCase):
         names = tuple(part.removeprefix("ONLY public.") for part in truncate[9:].split(", "))
         self.assertEqual(names, data.FIXTURE_TABLES)
         self.assertEqual(len(set(names)), len(names))
-        self.assertEqual(len(names), 70)
+        # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539).
+        # This literal exists so a new table cannot join the truncate set
+        # without someone saying so in a diff.
+        self.assertEqual(len(names), 73)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
