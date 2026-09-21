@@ -49,7 +49,11 @@ async function handleInvalidTokenLogout(): Promise<void> {
 apiClient.interceptors.request.use(async (config) => {
   const workspaceId = getSelectedWorkspaceId();
   if (workspaceId) {
-    config.headers['X-PCP-Workspace-Id'] = workspaceId;
+    // Must match what the server reads (server.ts, admin.ts): `x-ink-workspace-id`.
+    // This said `X-Inkwell-Workspace-Id` until #655 — a name the server stopped
+    // reading in 01b9047b, so every workspace selection here was silently
+    // dropped and the request fell back to the personal workspace.
+    config.headers['x-ink-workspace-id'] = workspaceId;
   }
 
   return config;
