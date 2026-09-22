@@ -1320,7 +1320,7 @@ export class SessionService implements ISessionService {
         // flush queued messages before processQueueOrReleaseLock runs —
         // every queued message would fail the same way.
         if (!result.success && result.error) {
-          this.flushQueueOnNonRetryableError(lockKey, result.error);
+          this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
         }
         // Routing admitted this message whether or not the turn succeeded —
         // a runner failure here is a backend outcome, not a routing one.
@@ -1477,7 +1477,7 @@ export class SessionService implements ISessionService {
         pending.resolve({ ...result, admitted: true });
         // Flush on non-retryable success:false results (e.g. InkRunner session limit)
         if (!result.success && result.error) {
-          this.flushQueueOnNonRetryableError(lockKey, result.error);
+          this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
         }
       } catch (error) {
         pending.reject(error instanceof Error ? error : new Error(String(error)));
@@ -1500,9 +1500,21 @@ export class SessionService implements ISessionService {
   /**
    * Flush remaining queued messages when the error is non-retryable (quota, auth, config).
    * Every pending message would fail the same way — flushing prevents budget burn.
+   *
+   * `carried` is the runner's own verdict, reached on everything the process
+   * said. Prefer it: `errorText` from a runner is a bounded excerpt, and this
+   * decision discards queued work in one direction and burns budget on a
+   * doomed queue in the other. Both directions were measured by Lumen (r3) —
+   * a carried `quota` whose excerpt reads `unknown` failed to flush, and a
+   * carried `capacity` whose excerpt reads `quota` flushed a queue that should
+   * have run. A throw carries no verdict and still classifies its text.
    */
-  private flushQueueOnNonRetryableError(lockKey: string, errorText: string): void {
-    const errorClass = classifyError({ errorText });
+  private flushQueueOnNonRetryableError(
+    lockKey: string,
+    errorText: string,
+    carried?: ErrorClassification
+  ): void {
+    const errorClass = carried ?? classifyError({ errorText });
     if (!errorClass.retryable && errorClass.category !== 'unknown') {
       const remaining = this.pendingQueues.get(lockKey);
       if (remaining && remaining.length > 0) {

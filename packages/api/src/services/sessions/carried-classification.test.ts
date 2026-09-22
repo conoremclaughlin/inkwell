@@ -29,7 +29,7 @@ import { resetActiveRuns } from './active-runs.js';
 import { resetPendingFinalizations } from './finalize-turn.js';
 import type { Session, ISessionRepository, IContextBuilder, IRunner } from './types.js';
 import type { IActivityStream } from './session-service.js';
-import type { ErrorClassification } from '@inklabs/shared';
+import { describeExitResult, classifyError, type ErrorClassification } from '@inklabs/shared';
 
 vi.mock('../../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -46,6 +46,17 @@ vi.mock('../graph-executor.service', async (importOriginal) => {
 });
 
 const OWNER_THREAD = '01900000-0000-7000-8000-00000000beef';
+
+/**
+ * Enough stack to push the error line out of a 2000-character excerpt's head
+ * and off the end of its tail — the shape that made a budget decide a
+ * category. Synthetic paths under a reserved TLD.
+ */
+const STACK_FRAMES = Array.from(
+  { length: 40 },
+  (_, i) =>
+    `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+);
 
 /**
  * What a bounded excerpt of a Codex refusal looks like once the refusal itself
@@ -213,6 +224,96 @@ async function runTurn(error: string, classification?: ErrorClassification) {
   return { result, row: state.row };
 }
 
+/**
+ * Two turns on one lock: the first fails, the second is queued behind it.
+ *
+ * The flush decision reads a category and either discards the queue or lets it
+ * run, so `runs` is the whole assertion — 1 means the queued turn was thrown
+ * away, 2 means it was dispatched. The first run parks on a gate so the second
+ * call reaches the queue rather than the lock, which is the only way to get a
+ * message waiting at the moment the flush decision is made.
+ *
+ * Harness from Lumen's r3 countertest.
+ */
+async function runQueuedTurn(error: string, classification?: ErrorClassification) {
+  const { state, repo } = makeStatefulRepo(makeOwnerSession());
+  const tables: Record<string, Row[]> = {
+    sessions: [{ id: 'session-owner', user_id: 'user-456', studio_id: null }],
+    studios: [],
+    agent_identities: [],
+    inbox_threads: [],
+    studio_lease_events: [],
+    tasks: [],
+  };
+
+  let started!: () => void;
+  let release!: () => void;
+  const startGate = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const finishGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  let runs = 0;
+  const failingRunner: IRunner = {
+    run: vi.fn(async () => {
+      runs++;
+      // The queued turn, if it is ever dispatched, succeeds — so a flush is
+      // the only thing that can keep `runs` at 1.
+      if (runs > 1) return { success: true, responses: [], backendSessionId: OWNER_THREAD };
+      started();
+      await finishGate;
+      return {
+        success: false,
+        backendSessionId: OWNER_THREAD,
+        responses: [],
+        error,
+        ...(classification ? { classification } : {}),
+      };
+    }),
+  };
+
+  const service = new SessionService(
+    repo,
+    contextBuilder,
+    { run: vi.fn() } as unknown as IRunner,
+    activityStream,
+    {
+      defaultWorkingDirectory: '/test',
+      mcpConfigPath: '/test/.mcp.json',
+      compactionThreshold: 150000,
+    },
+    failingRunner,
+    makeFakeSupabase(tables) as never
+  );
+
+  const request = {
+    userId: 'user-456',
+    sbSlug: 'lumen',
+    channel: 'agent',
+    conversationId: 'trigger:lumen:pr:662',
+    sender: { id: 'wren', name: 'Wren' },
+    content: 'Review request',
+    metadata: {},
+  } as never;
+
+  const first = service.handleMessage(request);
+  await startGate;
+  const second = service.handleMessage(request);
+  await vi.waitFor(() => {
+    const queues = (service as unknown as { pendingQueues: Map<string, unknown[]> }).pendingQueues;
+    expect(queues.get('lumen:session-owner')).toHaveLength(1);
+  });
+  release();
+
+  // Both resolve: a flushed queue entry is rejected into handleMessage's own
+  // catch, which is why that call awaits its queue promise rather than
+  // returning it. So a flush shows up as `success: false`, not as a throw.
+  const [result, queued] = await Promise.all([first, second]);
+  return { result, queued, runs, row: state.row };
+}
+
 /** The category session-service recorded for the turn, as the activity stream saw it. */
 function recordedCategory(): string | undefined {
   const turnEntry = logActivity.mock.calls
@@ -293,5 +394,63 @@ describe('session-service acts on the carried verdict, not on the excerpt', () =
     const { result } = await runTurn(EXCERPT_WITHOUT_ITS_CAUSE, REFUSAL_VERDICT);
 
     expect(result.classification).toMatchObject({ category: 'owner_conflict' });
+  });
+
+  /**
+   * The queue flush, both directions (Lumen, r3).
+   *
+   * `flushQueueOnNonRetryableError` re-derived its own category from
+   * `result.error`, so the excerpt decided whether queued work was discarded.
+   * Both of these build their text through the real `describeExitResult`, and
+   * both assert the excerpt genuinely disagrees with the verdict first — so
+   * neither can be satisfied by the text happening to contain the answer.
+   *
+   * `runs` is the consequence: 1 means the queued turn was thrown away, 2
+   * means it ran. Getting that wrong in one direction discards a user's
+   * queued message, and in the other burns budget on a queue that cannot
+   * succeed.
+   */
+  it('flushes the queue on a carried verdict its own excerpt cannot support', async () => {
+    const raw = [
+      'startup one',
+      'startup two',
+      'startup three',
+      'Error: quota exceeded',
+      ...STACK_FRAMES,
+    ].join('\n');
+    const failure = describeExitResult({ command: 'ink chat', exitCode: 1, stderr: raw });
+
+    expect(failure.classification.category).toBe('quota');
+    expect(classifyError({ errorText: failure.text }).category).toBe('unknown');
+
+    const { result, queued, runs } = await runQueuedTurn(failure.text, failure.classification);
+
+    expect(result.classification?.category).toBe('quota');
+    expect(runs).toBe(1);
+    expect(queued.success).toBe(false);
+  });
+
+  it('does not flush the queue on a retryable verdict whose excerpt reads worse', async () => {
+    // The control, and the direction that costs a user real work: the excerpt
+    // classifies `quota` (non-retryable, flush) while the verdict says
+    // `capacity` (retryable, keep). A guard that flushed on everything would
+    // pass the test above and fail this one.
+    const raw = [
+      'startup one',
+      'startup two',
+      'startup three',
+      'Error: 503 service unavailable',
+      ...STACK_FRAMES,
+      'additional diagnostic: quota',
+    ].join('\n');
+    const failure = describeExitResult({ command: 'ink chat', exitCode: 1, stderr: raw });
+
+    expect(failure.classification.category).toBe('capacity');
+    expect(classifyError({ errorText: failure.text }).category).toBe('quota');
+
+    const { queued, runs } = await runQueuedTurn(failure.text, failure.classification);
+
+    expect(runs).toBe(2);
+    expect(queued.success).toBe(true);
   });
 });

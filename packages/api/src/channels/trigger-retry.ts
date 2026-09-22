@@ -84,6 +84,51 @@ export function isRoutingRefusal(error: unknown): boolean {
   );
 }
 
+/**
+ * A backend failure that already knows what it was, thrown so the verdict
+ * survives the boundary.
+ *
+ * The runner reaches its verdict on everything the process said; the text it
+ * hands back is a bounded excerpt of that. Between them sits a `throw` — the
+ * default trigger handler turns a failed `SessionResult` into an error for the
+ * `trigger:error` listener — and a plain `new Error(result.error)` carries the
+ * excerpt and drops the verdict, so the listener re-derives a category from
+ * whatever survived the cut. Measured by Lumen (r3): a `fetch failed` whose
+ * error line fell into the elided middle scheduled ZERO retries where the
+ * verdict says one, because the excerpt reads `unknown` and `unknown` is not
+ * retryable.
+ */
+export class BackendFailureError extends Error {
+  constructor(
+    message: string,
+    readonly classification: ErrorClassification
+  ) {
+    super(message);
+    this.name = 'BackendFailureError';
+  }
+}
+
+/**
+ * The verdict an error is carrying, or undefined if it carries none.
+ *
+ * Duck-typed for the same reason `isRoutingRefusal` is: this module is loaded
+ * in isolation by the listener harness, and an `instanceof` would make the
+ * reader depend on the one throw site happening to import the same class
+ * identity. A spawn failure or an internal throw legitimately carries nothing,
+ * and callers fall back to classifying the text — so the shape is validated
+ * rather than trusted, and an object with an unrelated `classification`
+ * property does not get to supply a category.
+ */
+export function carriedClassification(error: unknown): ErrorClassification | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const candidate = (error as { classification?: unknown }).classification;
+  if (typeof candidate !== 'object' || candidate === null) return undefined;
+  const { category, summary, retryable } = candidate as Record<string, unknown>;
+  if (typeof category !== 'string' || typeof summary !== 'string') return undefined;
+  if (typeof retryable !== 'boolean') return undefined;
+  return candidate as ErrorClassification;
+}
+
 export interface TriggerRetrySchedulerOptions {
   maxAttempts?: number;
   delaysMs?: number[];
