@@ -138,12 +138,15 @@ const ELISION = '…';
 export const DISPLAY_EXCERPT = { maxLines: 12, maxChars: 800 } as const;
 
 /**
- * What a machine reads. Wider, because the string a runner returns is the
- * one `classifyError` matches against, and a category decided by a display
- * budget is a category decided by nothing. Still bounded — this text reaches
- * a log field and a DB column — but bounded for the classifier, and at both
- * ends, so a signature at either edge survives. Compare what it replaced in
- * `InkRunner`: 1000 characters of the HEAD, raw escape sequences included.
+ * What goes in a log field and a DB column: wider than an alert, because the
+ * reader is someone debugging afterwards rather than someone glancing at a
+ * phone. Both ends are kept, so a signature at either edge survives.
+ *
+ * It is NOT the budget a classifier reads, and the name no longer claims it
+ * is. An earlier round of PR #662 justified this number as the one that kept
+ * the text classifiable, which held only until a failure outran it — at which
+ * point a wider budget was still a budget deciding a category. Classification
+ * reads `readableOutput` and takes no budget at all; see `describeExitResult`.
  */
 export const DIAGNOSTIC_EXCERPT = { maxLines: 40, maxChars: 2000 } as const;
 

@@ -612,30 +612,28 @@ export class InkRunner implements IRunner {
             return;
           }
 
-          // Both ends, sanitised, at the DIAGNOSTIC budget — `describeExit`'s
-          // default, and load-bearing here. This string is the only carrier
-          // of the failure: session-service classifies it, the heartbeat
-          // escalation classifies it again, and only then is it excerpted for
-          // the outage alert. Trimming it to alert size here would decide the
-          // category by a display budget — measured, `Error: fetch failed`
-          // over a long stack classified `unknown` instead of `network`
-          // (Lumen, review of PR #662). Taking `.slice(0, 1000)` of the head
-          // failed the same classifier the other way round: with stderr empty
-          // (common — ink reports fatal errors on stdout) it sent the first
-          // 1000 bytes of stdout, which is the profile line, the
-          // identity-context line, a session_meta blob and then several
-          // hundred bytes of banner escape codes. Both escalations in the log
-          // on 2026-09-22 classified `unknown` for want of any diagnostic.
+          // Bounded text, unbounded verdict, and the split is the point.
+          //
+          // The text is both ends of the output, sanitised, at the diagnostic
+          // budget: it reaches a log field, a DB column and — excerpted again
+          // — the outage alert a human reads. What it replaced was
+          // `.slice(0, 1000)` of the head, and with stderr empty (common; ink
+          // reports fatal errors on stdout) that head was the profile line,
+          // the identity-context line, a session_meta blob and several hundred
+          // bytes of banner escape codes. Both escalations in the log on
+          // 2026-09-22 classified `unknown` for want of any diagnostic in it.
           // The idle-timeout path 70 lines up already took a tail
           // (`stderr.slice(-500)`); this one had not followed it.
           //
-          // Bounded text, unbounded verdict. A wider budget only moves where a
-          // display policy breaks the classifier — measured, a 3527-character
-          // failure puts `Error: fetch failed` in the elided middle of a
-          // 2000-character excerpt and the category falls to `unknown`
-          // (Lumen, second review of PR #662). So the category is decided
-          // here, on everything the process said, and travels with the error
-          // rather than being re-derived from the excerpt downstream.
+          // The verdict does not come from that text, and this is round two's
+          // correction. Widening the budget only moves where a display policy
+          // breaks the classifier: a 3527-character failure puts `Error: fetch
+          // failed` in the elided middle of a 2000-character excerpt, and the
+          // category falls to `unknown`/non-retryable with the run never
+          // retried (Lumen, second review of PR #662 — measured through this
+          // runner). So the category is decided here, on everything the
+          // process said, and travels on the result. Downstream prefers it
+          // over re-reading the excerpt.
           const described = describeExitResult({
             command: 'ink chat',
             exitCode: code,
