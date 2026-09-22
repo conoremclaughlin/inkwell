@@ -92,7 +92,7 @@ import type {
 import type { ChannelResponse, ChannelType } from './sessions/types.js';
 import type { HeartbeatNotificationStore, NoticeKey } from './heartbeat-notification-store.js';
 import { createHeartbeatNotificationStore } from './heartbeat-notification-store.js';
-import { classifyError } from '@inklabs/shared';
+import { classifyError, failureExcerpt } from '@inklabs/shared';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -270,7 +270,24 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     context: HeartbeatEscalationContext
   ): Promise<{ alerted: boolean }> => {
     const failedSlug = await resolveFailedSlug(reminder);
+
+    // Classify on the FULL, untouched text. Deliberately not the excerpt
+    // below: `failureExcerpt` keeps the tail, and a signature that needs the
+    // front of a long buffer would stop matching — `owner_conflict` wants the
+    // refusal sentence AND the thread-store context, and those arrive at the
+    // head of a Codex stderr dump. Classification reads everything; only the
+    // text a human is shown gets trimmed.
     const classification = classifyError({ errorText: error });
+
+    // What a person actually reads. Every backend funnels here, and they
+    // compose their failure text differently — ink now sends a sanitised
+    // tail, but Claude and Gemini still reject with their whole raw stderr
+    // — so the sanitising is repeated at this seam rather than trusted to
+    // each runner. An alert is the last place a terminal escape sequence
+    // should survive: nothing downstream renders one, and on 2026-09-22 a
+    // screenful of them went to Conor's phone under a heading telling him
+    // his monitor had stopped.
+    const readableError = failureExcerpt(error) || '(no diagnostic output)';
 
     // DESTINATION ONE: the durable copy. Kept even though it cannot be the only
     // destination — it is what survives a restart and what the dashboard reads.
@@ -296,7 +313,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
             `Your scheduled heartbeat "${reminder.title}" did not run.\n\n` +
             `Consecutive failures: ${consecutive}\n` +
             `Category: ${classification.category} (retryable: ${classification.retryable})\n` +
-            `Error: ${error}\n\n` +
+            `Error: ${readableError}\n\n` +
             `Whatever this beat monitors has NOT been checked since it started failing. ` +
             `If a human depends on it, tell them — a monitor that fails quietly is worse ` +
             `than no monitor, because they believe they are covered.`,
@@ -331,7 +348,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
         alertSent: false,
         alertSkipped: reachable.reason,
         ...(inboxError ? { inboxError } : {}),
-        error: error.slice(0, 500),
+        error: readableError,
       });
       return { alerted: false };
     }
@@ -371,7 +388,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     const alert = await alertOwnerDirectly(
       reminder,
       `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
-        `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${error}\n\n` +
+        `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
         `Whatever this beat monitors is NOT being checked. ` +
         `I will send one more message when it runs again.`
     );
@@ -388,7 +405,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       alertSent: alert.sent,
       ...(alert.reason ? { alertSkipped: alert.reason } : {}),
       ...(inboxError ? { inboxError } : {}),
-      error: error.slice(0, 500),
+      error: readableError,
     });
 
     return { alerted: alert.sent };

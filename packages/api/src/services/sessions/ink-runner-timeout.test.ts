@@ -9,6 +9,10 @@
  *   - stdout/stderr activity keeps a long-but-working turn alive,
  *   - the absolute backstop still reaps a process that emits forever,
  *   - provider-stall stderr signatures are classified in the kill log.
+ *
+ * The second block covers what the runner SAYS when a turn fails, which is a
+ * separate contract from when it reaps one: that text is quoted verbatim into
+ * the heartbeat outage alert a human reads.
  */
 
 import { EventEmitter } from 'events';
@@ -30,7 +34,11 @@ vi.mock('./resolve-binary', () => ({
   resolveBinaryPath: vi.fn(async () => '/fake/bin/ink'),
   buildSpawnPath: vi.fn(() => '/usr/bin:/bin'),
 }));
-vi.mock('@inklabs/shared', () => ({
+// Only the three side-effecting helpers are stubbed. Everything else is the
+// real module: `describeExit` is pure, and stubbing it would mean these tests
+// no longer observe the text the runner actually rejects with.
+vi.mock('@inklabs/shared', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@inklabs/shared')>()),
   injectSessionHeaders: vi.fn(() => null),
   buildSessionEnv: vi.fn(() => ({})),
   writeRuntimeSessionHint: vi.fn(),
@@ -188,5 +196,67 @@ describe('InkRunner inactivity timeout', () => {
 
     child.emit('close', 143);
     await runPromise;
+  });
+});
+
+describe('InkRunner failure text', () => {
+  let child: FakeChild;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    child = makeFakeChild();
+    spawnMock.mockReturnValue(child);
+    warnMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it('quotes the cause from the tail of stdout, not the banner at its head', async () => {
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The shape that produced the unreadable alert: ink reports the fatal
+    // error on STDOUT with stderr empty, behind a banner long enough to fill
+    // the old 1000-char HEAD slice on its own — so the head never reached the
+    // cause, and what it did reach was mostly escape sequences.
+    const banner =
+      '\x1b[2mApplied "Safe" profile\x1b[0m\n' +
+      '\x1b[36mIdentity context loaded:\x1b[0m wren\n' +
+      '{"type":"session_meta","id":"sess-1"}\n' +
+      '\x1b[38;5;213m▛▀▀▜\x1b[0m\n'.repeat(80);
+    const cause = 'Error: backend refused the run: no writer available';
+
+    expect(banner.length).toBeGreaterThan(1000); // else the old head slice would have caught the cause anyway
+
+    child.stdout.emit('data', Buffer.from(`${banner}${cause}\n`));
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    // The diagnostic survives...
+    expect(result.error).toContain('no writer available');
+    // ...and the noise that buried it does not.
+    expect(result.error).not.toContain('\x1b');
+    expect(result.error).not.toContain('Applied "Safe" profile');
+    expect(result.error).not.toContain('session_meta');
+  });
+
+  it('says so explicitly when a failed turn produced no output at all', async () => {
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    // An empty quote reads as "no error given"; this has to be unambiguous.
+    expect(result.error).toContain('no diagnostic output');
   });
 });

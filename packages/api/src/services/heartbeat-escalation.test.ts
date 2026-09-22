@@ -286,6 +286,104 @@ describe('heartbeat escalation', () => {
     });
   });
 
+  /**
+   * Myra, on `pcp:debug:myra-heartbeat-failures`, 2026-09-22: the alerting
+   * worked — a beat failed, it was caught, Conor was told — and what landed on
+   * his phone was the ink startup banner as raw escape sequences, a
+   * `session_meta` blob, and no cause, under a heading telling him his monitor
+   * had stopped.
+   *
+   * The root cause is fixed upstream in ink-runner (it now sends a sanitised
+   * tail). These cover the seam instead: every backend funnels through here and
+   * they compose failure text differently — Claude and Gemini still reject with
+   * their whole raw stderr — so an alert must be readable regardless of which
+   * one produced the string.
+   *
+   * The fixture is invented; only its shape is copied from the real payload.
+   */
+  describe('the alert is readable by the human who receives it', () => {
+    const BANNER_CELL = '\u001b[38;2;10;10;26m\u001b[48;2;10;10;26m▄\u001b[49m\u001b[39m';
+    const NOISY_FAILURE =
+      '\u001b[32mApplied "Safe" profile (All tools allowed except comms and file writes.)\u001b[39m\n' +
+      '\u001b[2mIdentity context loaded: ~21,793 tokens injected into prompt\u001b[22m\n' +
+      '{"type":"session_meta","transcriptPath":"/tmp/example.test/repl/session.jsonl"}\n' +
+      BANNER_CELL.repeat(60) +
+      '\nError: backend refused the turn (no credentials)';
+
+    async function alertContentFor(error: string): Promise<string> {
+      const { client } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+      await onFailure(makeReminder(), error, 1, FIRST_FOR_DESTINATION);
+      return sendToChannel.mock.calls[0][0].content as string;
+    }
+
+    it('strips the terminal escape sequences before they reach the channel', async () => {
+      // Control: the fixture really does carry what we are claiming to remove.
+      // Without this the assertion below would pass on an empty string.
+      expect(NOISY_FAILURE).toMatch(/\u001b/);
+
+      const content = await alertContentFor(NOISY_FAILURE);
+      expect(content).not.toMatch(/\u001b/);
+    });
+
+    it('leads with the cause rather than the startup preamble', async () => {
+      const content = await alertContentFor(NOISY_FAILURE);
+
+      expect(content).toContain('backend refused the turn');
+      expect(content).not.toContain('Applied "Safe" profile');
+      expect(content).not.toContain('session_meta');
+    });
+
+    it('keeps the alert short enough to read on a phone', async () => {
+      const content = await alertContentFor(NOISY_FAILURE);
+
+      // The real one ran to a screenful. The heading and closing sentence are
+      // ~200 chars, so this bounds the quoted excerpt, not the message.
+      expect(content.length).toBeLessThan(600);
+      expect(NOISY_FAILURE.length).toBeGreaterThan(600);
+    });
+
+    it('says so explicitly when the backend gave no diagnostic at all', async () => {
+      const content = await alertContentFor('');
+      expect(content).toContain('(no diagnostic output)');
+    });
+
+    // The durable copy is read by a human too, and on the dashboard.
+    it('sanitises the inbox copy as well as the channel alert', async () => {
+      const { client, insert } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      await onFailure(makeReminder(), NOISY_FAILURE, 1, FIRST_FOR_DESTINATION);
+
+      const row = insert.mock.calls[0][0] as { content: string };
+      expect(row.content).not.toMatch(/\u001b/);
+      expect(row.content).toContain('backend refused the turn');
+    });
+
+    // Classification reads the FULL text, deliberately not the trimmed excerpt.
+    // `owner_conflict` needs the refusal sentence AND the thread-store context,
+    // and those arrive at the head of a long Codex stderr dump — the excerpt
+    // keeps the tail, so classifying off it would silently stop matching.
+    it('still classifies on the full text, not on the trimmed excerpt', async () => {
+      const codexRefusal =
+        'failed to initialize thread persistence: thread-store conflict\n' +
+        'thread thr_01 already has an active writer\n' +
+        `${'filler line\n'.repeat(200)}` +
+        'stream closed';
+
+      const content = await alertContentFor(codexRefusal);
+      expect(content).toContain('owner_conflict');
+    });
+  });
+
   describe('one outage is two messages, not two per beat', () => {
     it('alerts on the first failure only', async () => {
       const { client } = makeClient();

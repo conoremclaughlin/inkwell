@@ -27,7 +27,12 @@ import { logger } from '../../utils/logger.js';
 import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { resolveInkCli, inkCliSpawn } from '../ink-cli.js';
-import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
+import {
+  injectSessionHeaders,
+  buildSessionEnv,
+  writeRuntimeSessionHint,
+  describeExit,
+} from '@inklabs/shared';
 
 // Absolute wall-clock backstop for a single ink turn — a final safety net for a
 // truly wedged process (dead loop, unkillable I/O), NOT a working limit. It
@@ -584,8 +589,18 @@ export class InkRunner implements IRunner {
             return;
           }
 
-          const errorText = stderr.trim() || stdout.trim() || `exit code ${code}`;
-          reject(new Error(`ink chat exited with code ${code}: ${errorText.slice(0, 1000)}`));
+          // The TAIL, sanitised. This text is quoted verbatim into the
+          // heartbeat outage alert, which is the one artifact guaranteed to
+          // reach a human — so it has to carry the cause, not the startup
+          // banner. Taking `.slice(0, 1000)` of the head did the opposite:
+          // with stderr empty (common — ink reports fatal errors on stdout)
+          // it sent the first 1000 bytes of stdout, which is the profile
+          // line, the identity-context line, a session_meta blob and then
+          // several hundred bytes of banner escape codes. Both escalations
+          // in the log on 2026-09-22 classified `unknown` for want of any
+          // diagnostic. The idle-timeout path 70 lines up already took a
+          // tail (`stderr.slice(-500)`); this one had not followed it.
+          reject(new Error(describeExit({ command: 'ink chat', exitCode: code, stdout, stderr })));
           return;
         }
 

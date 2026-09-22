@@ -20,3 +20,10 @@ export {
 } from './mcp-config.js';
 
 export { writeRuntimeSessionHint } from './runtime-hints.js';
+
+export {
+  stripAnsi,
+  failureExcerpt,
+  describeExit,
+  type FailureExcerptOptions,
+} from './terminal-output.js';
