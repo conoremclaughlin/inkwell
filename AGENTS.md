@@ -46,17 +46,13 @@ This returns:
 - **Recent Memories**: High-salience memories filtered by your sbSlug (plus shared memories)
 - **Active Sessions**: Array of all active sessions (use `studioId` to find yours)
 
-### Step 4: Start or Resume Session
+### Step 4: Find Your Session
 
-Read `studioId` from `.ink/identity.json` (if present) and pass it to `start_session`:
+**Do not call `start_session` — you cannot.** Session lifecycle is owned by the CLI hooks, and `start_session`/`end_session` are registered only for the `runtime` caller profile (`includeInternalLifecycleTools: callerProfile === 'runtime'` in `packages/api/src/mcp/server.ts`). They are absent from the tool list an SB connection receives, so calling one fails with "tool not found". By the time you are reading this, your session already exists.
 
-```
-start_session(userId: "<from config>", sbSlug: "<your identity>", studioId: "<from identity.json>")
-```
+Your own session IDs come back on bootstrap's top-level `callerSession` field, which is the durable source because it survives compaction. The session is already scoped to your studio (worktree), which is how several agents hold active sessions at once in different studios.
 
-This scopes the session to your studio (worktree). Multiple agents can have active sessions simultaneously in different studios.
-
-To find your session from bootstrap's `activeSessions` array, match by `studioId`:
+To find your session from bootstrap's `activeSessions` array instead, match by `studioId`:
 
 ```javascript
 const mySession = activeSessions.find((s) => s.studioId === identityJson.studioId);
@@ -353,8 +349,8 @@ When setting up a new repo or agent, configure your studios with these common pa
 Example:
 
 ```
-update_studio(studioId: "<main-studio-id>", routePatterns: ["pr:*", "spec:*"])
-update_studio(studioId: "<feature-studio-id>", routePatterns: ["branch:wren/feat/auth"])
+update_studio(studioId: "<main-studio-id>", sbSlug: "<your identity>", routePatterns: ["pr:*", "spec:*"])
+update_studio(studioId: "<feature-studio-id>", sbSlug: "<your identity>", routePatterns: ["branch:wren/feat/auth"])
 ```
 
 ### Pattern Syntax
@@ -820,10 +816,10 @@ These log files are written regardless of how the server is started (`yarn dev`,
 
 When we refer to "specs" in this project, we mean **Inkwell artifacts** — versioned documents stored on the Inkwell server and managed via MCP tools. They are NOT local markdown files.
 
-- **Browse**: `list_artifacts(type: "spec")` to discover available specs
+- **Browse**: `list_artifacts(artifactType: "spec")` to discover available specs
 - **Read**: `get_artifact(uri: "ink://specs/cli-session-hooks")` to view a spec by URI
 - **Update**: `update_artifact(...)` to revise content (auto-increments version)
-- **Create**: `create_artifact(type: "spec", uri: "ink://specs/<slug>", ...)` for new specs
+- **Create**: `create_artifact(artifactType: "spec", uri: "ink://specs/<slug>", title: "...", content: "...")` for new specs
 
 Spec URIs follow the pattern `ink://specs/<slug>`. When referencing a spec in conversation, threadKeys, or code comments, use the URI slug (e.g., `spec:cli-session-hooks`).
 
