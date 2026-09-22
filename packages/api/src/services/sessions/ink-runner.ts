@@ -589,17 +589,22 @@ export class InkRunner implements IRunner {
             return;
           }
 
-          // The TAIL, sanitised. This text is quoted verbatim into the
-          // heartbeat outage alert, which is the one artifact guaranteed to
-          // reach a human — so it has to carry the cause, not the startup
-          // banner. Taking `.slice(0, 1000)` of the head did the opposite:
-          // with stderr empty (common — ink reports fatal errors on stdout)
-          // it sent the first 1000 bytes of stdout, which is the profile
-          // line, the identity-context line, a session_meta blob and then
-          // several hundred bytes of banner escape codes. Both escalations
-          // in the log on 2026-09-22 classified `unknown` for want of any
-          // diagnostic. The idle-timeout path 70 lines up already took a
-          // tail (`stderr.slice(-500)`); this one had not followed it.
+          // Both ends, sanitised, at the DIAGNOSTIC budget — `describeExit`'s
+          // default, and load-bearing here. This string is the only carrier
+          // of the failure: session-service classifies it, the heartbeat
+          // escalation classifies it again, and only then is it excerpted for
+          // the outage alert. Trimming it to alert size here would decide the
+          // category by a display budget — measured, `Error: fetch failed`
+          // over a long stack classified `unknown` instead of `network`
+          // (Lumen, review of PR #662). Taking `.slice(0, 1000)` of the head
+          // failed the same classifier the other way round: with stderr empty
+          // (common — ink reports fatal errors on stdout) it sent the first
+          // 1000 bytes of stdout, which is the profile line, the
+          // identity-context line, a session_meta blob and then several
+          // hundred bytes of banner escape codes. Both escalations in the log
+          // on 2026-09-22 classified `unknown` for want of any diagnostic.
+          // The idle-timeout path 70 lines up already took a tail
+          // (`stderr.slice(-500)`); this one had not followed it.
           reject(new Error(describeExit({ command: 'ink chat', exitCode: code, stdout, stderr })));
           return;
         }

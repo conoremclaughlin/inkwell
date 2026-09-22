@@ -199,6 +199,21 @@ describe('InkRunner inactivity timeout', () => {
   });
 });
 
+/**
+ * A runtime error whose cause is on the first line and whose stack runs past
+ * any alert-sized budget — ~1.1KB of frames under one 19-character sentence.
+ * Kept verbatim from Lumen's review of PR #662 so the red/green evidence he
+ * measured and the check that shipped are the same check.
+ */
+function errorOverLongStack(): string {
+  const frames = Array.from(
+    { length: 10 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+  return `Error: fetch failed\n${frames.join('\n')}`;
+}
+
 describe('InkRunner failure text', () => {
   let child: FakeChild;
 
@@ -258,5 +273,26 @@ describe('InkRunner failure text', () => {
     expect(result.success).toBe(false);
     // An empty quote reads as "no error given"; this has to be unambiguous.
     expect(result.error).toContain('no diagnostic output');
+  });
+
+  it('leaves the error line classifiable under a stack long enough to bury it', async () => {
+    const { classifyError } = await import('@inklabs/shared');
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Lumen's fixture, review of PR #662. An ordinary Node failure: the cause
+    // is the FIRST line and the stack that follows it is longer than a display
+    // budget. Asserted through `classifyError` on the real result rather than
+    // on the excerpt directly, because the defect was that this string is what
+    // session-service classifies — a test that fed the classifier its own text
+    // would pass against the bug.
+    child.stderr.emit('data', Buffer.from(errorOverLongStack()));
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    expect(classifyError({ errorText: result.error || '' }).category).toBe('network');
   });
 });

@@ -25,5 +25,7 @@ export {
   stripAnsi,
   failureExcerpt,
   describeExit,
+  DISPLAY_EXCERPT,
+  DIAGNOSTIC_EXCERPT,
   type FailureExcerptOptions,
 } from './terminal-output.js';

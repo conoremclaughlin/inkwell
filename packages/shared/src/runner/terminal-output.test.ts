@@ -12,7 +12,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { stripAnsi, failureExcerpt, describeExit } from './terminal-output.js';
+import {
+  stripAnsi,
+  failureExcerpt,
+  describeExit,
+  DISPLAY_EXCERPT,
+  DIAGNOSTIC_EXCERPT,
+} from './terminal-output.js';
 import { classifyError } from '../errors/classify-error.js';
 
 /** One cell of the ink startup banner: ~45 bytes to render a single block. */
@@ -55,12 +61,14 @@ describe('stripAnsi', () => {
 });
 
 describe('failureExcerpt', () => {
-  it('keeps the tail, where a failed process says why', () => {
+  // The middle is what gets dropped. Both ends are load-bearing and which one
+  // holds the cause depends on the runtime: Node announces it first, most CLIs
+  // print it last, and this module cannot tell them apart.
+  it('keeps both ends and elides the middle', () => {
     const output = Array.from({ length: 40 }, (_, i) => `line ${i}`).join('\n');
-    const excerpt = failureExcerpt(output, { maxLines: 3 });
+    const excerpt = failureExcerpt(output, { maxLines: 3, headLines: 1 });
 
-    expect(excerpt).toBe('line 37\nline 38\nline 39');
-    expect(excerpt).not.toContain('line 0');
+    expect(excerpt).toBe('line 0\n…\nline 37\nline 38\nline 39');
   });
 
   // The tail and the noise filter are redundant for ink, whose banner we
@@ -68,6 +76,11 @@ describe('failureExcerpt', () => {
   // do NOT have a pattern for — Claude and Gemini reject with their whole raw
   // stderr — and for the day ink's banner changes. This is that case: chatty
   // startup output that matches no filter, with the cause last.
+  //
+  // The head budget costs three lines of that preamble, and that cost is the
+  // deliberate side of the trade: unrecognised noise at the front is
+  // recoverable by reading past it, an error header dropped off the front is
+  // not (Lumen, review of PR #662). The bulk of it still goes.
   it('surfaces the cause under preamble it does not recognise', () => {
     const unknownPreamble = Array.from(
       { length: 30 },
@@ -76,7 +89,8 @@ describe('failureExcerpt', () => {
     const excerpt = failureExcerpt(`${unknownPreamble}\n${REAL_CAUSE}`);
 
     expect(excerpt).toContain(REAL_CAUSE);
-    expect(excerpt).not.toContain('subsystem 0');
+    expect(excerpt).not.toContain('subsystem 5');
+    expect(excerpt).not.toContain('subsystem 12');
   });
 
   it('drops the startup banner and surfaces the cause underneath it', () => {
@@ -115,13 +129,113 @@ describe('failureExcerpt', () => {
     expect(excerpt.length).toBeLessThanOrEqual(120);
   });
 
-  it('trims a too-long excerpt from the front, keeping the last line intact', () => {
+  it('trims from the middle, keeping the last line intact', () => {
     const raw = 'noise '.repeat(400) + '\n' + REAL_CAUSE;
     const excerpt = failureExcerpt(raw, { maxChars: 200 });
 
     expect(excerpt.length).toBeLessThanOrEqual(200);
     expect(excerpt.endsWith(REAL_CAUSE)).toBe(true);
-    expect(excerpt.startsWith('…')).toBe(true);
+    // The cut moved to the middle when the head stopped being expendable; the
+    // marker moved with it. A leading `…` was the old contract.
+    expect(excerpt).toContain('\n…\n');
+    expect(excerpt.startsWith('…')).toBe(false);
+  });
+});
+
+/**
+ * The second defect, found in review (Lumen, PR #662): an unconditional tail
+ * is the same bug as an unconditional head, pointed the other way. A runtime
+ * announces the fault BEFORE its stack, so the one sentence worth reading is
+ * the one a long enough stack pushes out of the budget.
+ *
+ * Fixture is Lumen's, kept verbatim across all three files that pin this.
+ */
+describe('regression: a long stack used to push its own error message out', () => {
+  const FRAMES = Array.from(
+    { length: 10 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+  const STACK = `Error: fetch failed\n${FRAMES.join('\n')}`;
+
+  /** The control: the fixture has to actually overrun the display budget. */
+  it('is a fixture that does not fit, or it proves nothing', () => {
+    expect(STACK.length).toBeGreaterThan(DISPLAY_EXCERPT.maxChars);
+  });
+
+  it('keeps the error line and the last frame, and says what it dropped', () => {
+    const excerpt = failureExcerpt(STACK);
+
+    expect(excerpt).toContain('Error: fetch failed');
+    expect(excerpt).toContain('at step9');
+    expect(excerpt).toContain('\n…\n');
+    expect(excerpt.length).toBeLessThanOrEqual(DISPLAY_EXCERPT.maxChars);
+  });
+
+  // The consequence that made this a bug rather than a presentation choice:
+  // `classifyError` matches prose, and the only matchable prose was the line
+  // being dropped.
+  it('used to classify unknown once trimmed, and now reads network', () => {
+    const TAIL_ONLY = FRAMES.join('\n').slice(-DISPLAY_EXCERPT.maxChars);
+
+    expect(classifyError({ errorText: TAIL_ONLY }).category).toBe('unknown');
+    expect(classifyError({ errorText: failureExcerpt(STACK) }).category).toBe('network');
+  });
+
+  // Producers take the diagnostic budget, which this fixture fits whole — so
+  // the string a classifier reads is not even an excerpt.
+  it('reaches a classifier untrimmed through describeExit', () => {
+    const text = describeExit({ command: 'ink chat', exitCode: 1, stderr: STACK });
+
+    expect(text).toContain('Error: fetch failed');
+    expect(text).toContain('at step9');
+    expect(text).not.toContain('…');
+    expect(classifyError({ errorText: text }).category).toBe('network');
+  });
+
+  // Both ends survive even when the budget cannot hold the whole thing.
+  it('keeps both ends when even the diagnostic budget overruns', () => {
+    const huge = `Error: fetch failed\n${Array.from(
+      { length: 400 },
+      (_, i) =>
+        `    at step${i} (/tmp/example.test/dist/runtime/transport/request-handler.js:100:20)`
+    ).join('\n')}`;
+    const text = describeExit({ command: 'ink chat', exitCode: 1, stderr: huge });
+
+    expect(huge.length).toBeGreaterThan(DIAGNOSTIC_EXCERPT.maxChars);
+    expect(text).toContain('Error: fetch failed');
+    expect(text).toContain('at step399');
+    expect(classifyError({ errorText: text }).category).toBe('network');
+  });
+});
+
+/**
+ * The budgets are separate numbers because they answer to different readers.
+ * A display budget deciding an error category is the defect above; this pins
+ * the ordering that prevents it.
+ */
+describe('display and diagnostic budgets', () => {
+  it('gives a classifier more room than a phone screen', () => {
+    expect(DIAGNOSTIC_EXCERPT.maxChars).toBeGreaterThan(DISPLAY_EXCERPT.maxChars);
+    expect(DIAGNOSTIC_EXCERPT.maxLines).toBeGreaterThan(DISPLAY_EXCERPT.maxLines);
+  });
+
+  it('never returns more than the budget it was given', () => {
+    const raw = Array.from({ length: 200 }, (_, i) => `line ${i} ${'x'.repeat(80)}`).join('\n');
+
+    for (const maxChars of [40, 120, 200, 800, 2000]) {
+      expect(failureExcerpt(raw, { maxChars }).length).toBeLessThanOrEqual(maxChars);
+    }
+  });
+
+  // The head must never crowd out the end, however tight the budget is or how
+  // long the first line runs.
+  it('keeps the tail reachable under a tight budget and a very long first line', () => {
+    const raw = `${'x'.repeat(5000)}\nECONNREFUSED`;
+    const excerpt = failureExcerpt(raw, { maxChars: 60 });
+
+    expect(excerpt.length).toBeLessThanOrEqual(60);
+    expect(excerpt).toContain('ECONNREFUSED');
   });
 });
 

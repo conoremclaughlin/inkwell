@@ -1052,4 +1052,32 @@ describe('heartbeat escalation', () => {
       expect(insert.mock.calls[0][0].recipient_agent_id).toBe('unrelated-sb');
     });
   });
+
+  it('keeps the error line in the alert when the stack under it is longer than the budget', async () => {
+    const { client } = makeClient();
+    const { onFailure } = createHeartbeatEscalation({ client, sendToChannel, defaultSlug: 'myra' });
+
+    // Lumen's fixture, review of PR #662: an ordinary Node failure names its
+    // cause on the FIRST line. An unconditional tail sent Conor ten stack
+    // frames and no sentence — the mirror of the head-slice bug this PR
+    // replaced. Asserted on the real channel payload, not on the excerpt.
+    const frames = Array.from(
+      { length: 10 },
+      (_, i) =>
+        `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+    );
+
+    await onFailure(
+      makeReminder(),
+      `Error: fetch failed\n${frames.join('\n')}`,
+      1,
+      FIRST_FOR_DESTINATION
+    );
+
+    const content = sendToChannel.mock.calls[0][0].content;
+    expect(content).toContain('fetch failed');
+    // The tail is still there — this keeps both ends, it does not swap which
+    // end gets lost.
+    expect(content).toContain('at step9');
+  });
 });

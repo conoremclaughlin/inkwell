@@ -92,7 +92,7 @@ import type {
 import type { ChannelResponse, ChannelType } from './sessions/types.js';
 import type { HeartbeatNotificationStore, NoticeKey } from './heartbeat-notification-store.js';
 import { createHeartbeatNotificationStore } from './heartbeat-notification-store.js';
-import { classifyError, failureExcerpt } from '@inklabs/shared';
+import { classifyError, failureExcerpt, DISPLAY_EXCERPT } from '@inklabs/shared';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -271,12 +271,13 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
   ): Promise<{ alerted: boolean }> => {
     const failedSlug = await resolveFailedSlug(reminder);
 
-    // Classify on the FULL, untouched text. Deliberately not the excerpt
-    // below: `failureExcerpt` keeps the tail, and a signature that needs the
-    // front of a long buffer would stop matching — `owner_conflict` wants the
-    // refusal sentence AND the thread-store context, and those arrive at the
-    // head of a Codex stderr dump. Classification reads everything; only the
-    // text a human is shown gets trimmed.
+    // Classify on the text as received, before the display excerpt below
+    // narrows it. That ordering is necessary and it is not sufficient: what
+    // arrives here is whatever the producer composed, so a runner that had
+    // already trimmed for display would have decided this category before
+    // the string reached us. `describeExit` takes the diagnostic budget for
+    // exactly that reason — classifying ahead of OUR trim cannot recover
+    // what someone else's trim removed (Lumen, review of PR #662).
     const classification = classifyError({ errorText: error });
 
     // What a person actually reads. Every backend funnels here, and they
@@ -286,8 +287,10 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     // each runner. An alert is the last place a terminal escape sequence
     // should survive: nothing downstream renders one, and on 2026-09-22 a
     // screenful of them went to Conor's phone under a heading telling him
-    // his monitor had stopped.
-    const readableError = failureExcerpt(error) || '(no diagnostic output)';
+    // his monitor had stopped. This is the seam where the DISPLAY budget is
+    // applied — the last one before a phone — and nothing reads its output
+    // but a person.
+    const readableError = failureExcerpt(error, DISPLAY_EXCERPT) || '(no diagnostic output)';
 
     // DESTINATION ONE: the durable copy. Kept even though it cannot be the only
     // destination — it is what survives a restart and what the dashboard reads.
