@@ -287,7 +287,7 @@ describe('heartbeat escalation', () => {
   });
 
   /**
-   * Myra, on `pcp:debug:myra-heartbeat-failures`, 2026-09-22: the alerting
+   * Myra, on `debug:myra-heartbeat-failures`, 2026-09-22: the alerting
    * worked — a beat failed, it was caught, Conor was told — and what landed on
    * his phone was the ink startup banner as raw escape sequences, a
    * `session_meta` blob, and no cause, under a heading telling him his monitor

@@ -4,7 +4,7 @@
  * The bug these pin: on 2026-09-22 a heartbeat outage alert reached Conor's
  * phone carrying the ink startup banner as raw escape sequences, a
  * `session_meta` blob, and no cause — because the capture took the HEAD of
- * the process output. Myra reported it on `pcp:debug:myra-heartbeat-failures`.
+ * the process output. Myra reported it on `debug:myra-heartbeat-failures`.
  *
  * Fixtures below are invented. The shape is copied from the real payload (the
  * line order, the SGR-per-cell banner); the transcript path, ids and the
