@@ -721,6 +721,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       return {
         status: 'failed',
         error: result.error || 'session reported failure',
+        // Carried, not re-derived. `result.error` is an excerpt by the time it
+        // reaches here; the escalation prints a category to a human and would
+        // otherwise read it off that excerpt and disagree with the verdict the
+        // server acted on (Lumen, review of PR #662).
+        ...(result.classification ? { classification: result.classification } : {}),
       };
     } catch (error) {
       logger.error(`Failed to deliver reminder ${reminder.id}:`, error);

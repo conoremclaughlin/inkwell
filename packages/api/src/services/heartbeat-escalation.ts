@@ -271,14 +271,22 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
   ): Promise<{ alerted: boolean }> => {
     const failedSlug = await resolveFailedSlug(reminder);
 
-    // Classify on the text as received, before the display excerpt below
-    // narrows it. That ordering is necessary and it is not sufficient: what
-    // arrives here is whatever the producer composed, so a runner that had
-    // already trimmed for display would have decided this category before
-    // the string reached us. `describeExit` takes the diagnostic budget for
-    // exactly that reason — classifying ahead of OUR trim cannot recover
-    // what someone else's trim removed (Lumen, review of PR #662).
-    const classification = classifyError({ errorText: error });
+    // The producer's verdict when it reached one, our own reading of the text
+    // otherwise.
+    //
+    // Classifying ahead of the display trim below is necessary and is not
+    // sufficient, and round one of PR #662 answered only the first half. What
+    // arrives here is already an excerpt: a runner bounded it for a log field
+    // several layers up, and no budget chosen there is one a classifier should
+    // inherit — measured, `Error: fetch failed` above a long enough stack
+    // falls into the elided middle and arrives as text with nothing in it to
+    // match (Lumen, second review). Classifying ahead of OUR trim cannot
+    // recover what someone else's trim removed; only a verdict formed before
+    // any trim can, and that is what `context.classification` carries.
+    //
+    // Every backend still reaches this seam, and most of them do not classify.
+    // For those the fallback is exactly the behaviour that shipped.
+    const classification = context.classification ?? classifyError({ errorText: error });
 
     // What a person actually reads. Every backend funnels here, and they
     // compose their failure text differently — ink now sends a sanitised

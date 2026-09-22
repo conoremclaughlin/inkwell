@@ -384,6 +384,102 @@ describe('heartbeat escalation', () => {
     });
   });
 
+  /**
+   * Classifying before OUR trim is necessary and is not sufficient, which is
+   * the correction Lumen's second review of PR #662 made.
+   *
+   * By the time a failure reaches this hook it has already been bounded: a
+   * runner composed it for a log field and a DB column several layers up. The
+   * text below is what a 2000-character diagnostic excerpt leaves of a 3.5KB
+   * Node failure — warnings at the head, frames at the tail, `Error: fetch
+   * failed` gone with the elided middle. No ordering at this seam can recover
+   * it, because it is not in the string. Only a verdict formed before the trim
+   * can, and that is what the escalation context now carries.
+   */
+  describe('a category the excerpt can no longer support', () => {
+    const TRIMMED_TO_DEATH = [
+      'ink chat exited with code 1: (node:123) Warning: Example optional feature is experimental',
+      '(Use node --trace-warnings to show where the warning was created)',
+      '…',
+      '    at step29 (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)',
+    ].join('\n');
+
+    const NETWORK_VERDICT = {
+      category: 'network' as const,
+      summary: 'Error: fetch failed',
+      retryable: true,
+    };
+
+    async function alertFor(
+      error: string,
+      context: typeof FIRST_FOR_DESTINATION & { classification?: typeof NETWORK_VERDICT }
+    ): Promise<string> {
+      const { client } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+      await onFailure(makeReminder(), error, 1, context);
+      return sendToChannel.mock.calls[0][0].content as string;
+    }
+
+    /**
+     * The control, and the whole reason the carried value is needed: this seam
+     * cannot do better than `unknown` on this text, however early it classifies.
+     */
+    it('reads unknown off the excerpt, because there is nothing left to match', async () => {
+      const content = await alertFor(TRIMMED_TO_DEATH, FIRST_FOR_DESTINATION);
+
+      expect(content).toContain('unknown:');
+      expect(content).not.toContain('retryable');
+    });
+
+    it('reports the carried verdict instead of re-reading the excerpt', async () => {
+      const content = await alertFor(TRIMMED_TO_DEATH, {
+        ...FIRST_FOR_DESTINATION,
+        classification: NETWORK_VERDICT,
+      });
+
+      expect(content).toContain('network (retryable):');
+    });
+
+    // The durable copy is the one the dashboard reads, and it must not carry a
+    // different category from the message that went to a phone.
+    it('uses the carried verdict for the inbox copy too', async () => {
+      const { client, insert } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      await onFailure(makeReminder(), TRIMMED_TO_DEATH, 1, {
+        ...FIRST_FOR_DESTINATION,
+        classification: NETWORK_VERDICT,
+      });
+
+      const row = insert.mock.calls[0][0] as { content: string };
+      expect(row.content).toContain('Category: network (retryable: true)');
+    });
+
+    /**
+     * Bounded claim: the carried value decides the CATEGORY, never the text.
+     * A human still reads the excerpt, elision and all — what was dropped is
+     * dropped, and this is not a claim to have recovered it.
+     */
+    it('changes the verdict without changing a byte of what a human reads', async () => {
+      const carried = await alertFor(TRIMMED_TO_DEATH, {
+        ...FIRST_FOR_DESTINATION,
+        classification: NETWORK_VERDICT,
+      });
+      sendToChannel.mockClear();
+      const derived = await alertFor(TRIMMED_TO_DEATH, FIRST_FOR_DESTINATION);
+
+      expect(carried.replace('network (retryable):', 'unknown:')).toBe(derived);
+    });
+  });
+
   describe('one outage is two messages, not two per beat', () => {
     it('alerts on the first failure only', async () => {
       const { client } = makeClient();

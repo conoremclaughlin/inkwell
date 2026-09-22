@@ -33,9 +33,21 @@
  * prose in the same string a runner hands back, so trimming that string for
  * display decides a category — on 2026-09-22 an excerpt cut to alert size
  * turned `network`/retryable into `unknown`/non-retryable before anything
- * downstream had looked at it. Hence the two budgets below: producers take
- * DIAGNOSTIC, and the trim to DISPLAY happens only where a human reads.
+ * downstream had looked at it.
+ *
+ * A wider budget does not hold that rule, it only moves where it breaks: give
+ * the diagnostic excerpt 2000 characters and a 3527-character failure puts the
+ * error line in the elided middle, and the category is decided by a text
+ * policy again (Lumen, second review of PR #662 — measured, not argued). So
+ * the classification is not derived from the excerpt at all. `describeExitResult`
+ * classifies `readableOutput`, which is everything the process said with the
+ * terminal noise gone and NOTHING truncated, and returns that verdict
+ * alongside the bounded text for a human. Producers carry the verdict;
+ * consumers prefer it and fall back to classifying the text they were given.
+ * The two budgets below bound only what is read, never what is decided.
  */
+
+import { classifyError, type ErrorClassification } from '../errors/classify-error.js';
 
 /**
  * CSI (`ESC[` … final byte), OSC (`ESC]` … BEL or ST), and the two-character
@@ -85,6 +97,35 @@ export function stripAnsi(text: string): string {
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .replace(CONTROL_PATTERN, '');
+}
+
+/**
+ * Everything readable the process said, in order: control bytes stripped,
+ * banner and startup-noise lines dropped, blank lines removed — and nothing
+ * truncated.
+ *
+ * This is the sanitising half of `failureExcerpt`, split out because two
+ * callers need the same text at different lengths. A human gets a budgeted
+ * excerpt of it; `classifyError` gets all of it. Sharing the step is what
+ * makes the pair honest: the classifier reads exactly the text the excerpt
+ * was cut from, so a category and the sentence supporting it can never come
+ * from differently-filtered inputs.
+ *
+ * Falls back to the unfiltered lines when filtering leaves nothing, on the
+ * same reasoning as the excerpt: if every line looked like startup chatter,
+ * the chatter IS the whole output.
+ */
+export function readableOutput(raw: string): string {
+  const lines = stripAnsi(raw)
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+
+  const meaningful = lines.filter(
+    (line) => !STARTUP_NOISE.some((p) => p.test(line)) && !BANNER_ONLY.test(line)
+  );
+
+  return (meaningful.length > 0 ? meaningful : lines).join('\n');
 }
 
 /** Marks where text was removed, on its own line between the two ends. */
@@ -141,22 +182,13 @@ export function failureExcerpt(raw: string, options: FailureExcerptOptions = {})
     Math.max(1, Math.floor(maxChars / 2))
   );
 
-  const lines = stripAnsi(raw)
-    .split('\n')
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim().length > 0);
+  // Sanitised once, shared with the classifier. The noise-filter fallback —
+  // if every line looked like startup chatter, the chatter IS the whole
+  // output — lives in `readableOutput`.
+  const whole = readableOutput(raw);
+  if (!whole) return '';
 
-  const meaningful = lines.filter(
-    (line) => !STARTUP_NOISE.some((p) => p.test(line)) && !BANNER_ONLY.test(line)
-  );
-
-  // Never let the noise filter be the reason a human gets nothing. If every
-  // line looked like startup chatter, the chatter IS the whole output and is
-  // better shown than swallowed.
-  const kept = meaningful.length > 0 ? meaningful : lines;
-  if (kept.length === 0) return '';
-
-  const whole = kept.join('\n');
+  const kept = whole.split('\n');
   if (kept.length <= maxLines && whole.length <= maxChars) return whole;
 
   // The head: whole lines while they fit the head budget. A first line longer
@@ -189,31 +221,83 @@ export function failureExcerpt(raw: string, options: FailureExcerptOptions = {})
   return elided ? `${headText}\n${ELISION}\n${tailText}` : `${headText}\n${tailText}`;
 }
 
-/**
- * Compose the failure text for a backend that exited non-zero.
- *
- * `stderr` is preferred when it carries anything readable, falling back to
- * `stdout` — many CLIs report fatal errors on stdout, which is exactly the
- * case that produced the banner-only alert.
- *
- * Defaults to the DIAGNOSTIC budget, not the display one, and that is the
- * whole point of the distinction: what this returns becomes a runner's
- * `error`, which `classifyError` reads at two seams before any human sees
- * it. Callers that display this text excerpt it again at their own seam.
- */
-export function describeExit(params: {
+export interface ExitDescription {
+  /**
+   * What a human (and a log field, and a DB column) gets: bounded, sanitised,
+   * both ends kept. Lossy by design.
+   */
+  text: string;
+  /**
+   * What a machine should act on: computed from the FULL readable output
+   * before any budget was applied, so no text policy can change it.
+   */
+  classification: ErrorClassification;
+}
+
+interface ExitParams {
   command: string;
   exitCode: number | null;
   stdout?: string;
   stderr?: string;
   options?: FailureExcerptOptions;
-}): string {
+  /** Passed through to `classifyError`. No rule reads it today. */
+  backend?: string;
+}
+
+/**
+ * Describe a backend that exited non-zero: the text to show, and the verdict
+ * to act on.
+ *
+ * `stderr` is preferred when it carries anything readable, falling back to
+ * `stdout` — many CLIs report fatal errors on stdout, which is exactly the
+ * case that produced the banner-only alert. The same stream feeds both halves,
+ * so the category and the sentence a human reads describe one thing.
+ *
+ * The excerpt takes the DIAGNOSTIC budget and the classification takes no
+ * budget at all. That difference is the fix: a producer that classified its
+ * own excerpt would decide the category with a text policy, which is the
+ * defect this module already had twice — once at 1000 characters of head, once
+ * at 2000 characters of head-and-tail.
+ *
+ * Two bounded claims, so this is not read as more than it is:
+ *
+ *  - `exitCode` is deliberately NOT passed to the classifier, though it is in
+ *    the text. The `crash` rule matches any non-zero exit, so passing it would
+ *    make every failed turn `crash` instead of `unknown` — and non-retryable
+ *    non-unknown is the condition session-service flushes a message queue on.
+ *    That is a behaviour change with nothing to do with truncation. Consumers
+ *    that want it classify with the exit code themselves, as they do today.
+ *  - The classifier now reads the whole readable output rather than its first
+ *    kilobyte, so prose the run itself printed — an agent quoting `fetch
+ *    failed`, a diff mentioning a 429 — can match a rule it would previously
+ *    have been truncated past. That widening is inherent to matching prose and
+ *    is the price of not deciding the category by budget; it is the reason the
+ *    rules are written as signatures rather than keywords.
+ */
+export function describeExitResult(params: ExitParams): ExitDescription {
   const { command, exitCode, stdout = '', stderr = '', options = DIAGNOSTIC_EXCERPT } = params;
 
   const fromStderr = failureExcerpt(stderr, options);
-  const excerpt = fromStderr || failureExcerpt(stdout, options);
+  const usingStderr = fromStderr.length > 0;
+  const excerpt = usingStderr ? fromStderr : failureExcerpt(stdout, options);
+  const full = readableOutput(usingStderr ? stderr : stdout);
 
-  return excerpt
-    ? `${command} exited with code ${exitCode}: ${excerpt}`
-    : `${command} exited with code ${exitCode} (no diagnostic output)`;
+  return {
+    text: excerpt
+      ? `${command} exited with code ${exitCode}: ${excerpt}`
+      : `${command} exited with code ${exitCode} (no diagnostic output)`,
+    classification: classifyError({ errorText: full, backend: params.backend }),
+  };
+}
+
+/**
+ * The text half of `describeExitResult`, for callers with no classification
+ * seam downstream.
+ *
+ * A caller whose result IS classified later should use `describeExitResult`
+ * and carry the verdict: this returns a bounded string, and a bounded string
+ * is exactly what cannot be trusted to classify.
+ */
+export function describeExit(params: ExitParams): string {
+  return describeExitResult(params).text;
 }

@@ -31,8 +31,27 @@ import {
   injectSessionHeaders,
   buildSessionEnv,
   writeRuntimeSessionHint,
-  describeExit,
+  describeExitResult,
+  type ErrorClassification,
 } from '@inklabs/shared';
+
+/**
+ * A non-zero exit, carrying the verdict computed on the full output.
+ *
+ * The text this error's message holds is bounded, so it cannot be relied on to
+ * classify — that is the whole finding behind PR #662. The classification
+ * travels with it instead of being re-derived from it, and `run` puts it on
+ * the `RunnerResult` for consumers that would otherwise re-read the excerpt.
+ */
+class BackendExitError extends Error {
+  constructor(
+    message: string,
+    readonly classification: ErrorClassification
+  ) {
+    super(message);
+    this.name = 'BackendExitError';
+  }
+}
 
 // Absolute wall-clock backstop for a single ink turn — a final safety net for a
 // truly wedged process (dead loop, unkillable I/O), NOT a working limit. It
@@ -283,6 +302,10 @@ export class InkRunner implements IRunner {
         backendSessionId: sessionId,
         responses: [],
         error: error instanceof Error ? error.message : 'Unknown error',
+        // Present only for a non-zero exit, where we saw the full output.
+        // A spawn failure or an internal throw carries no classification and
+        // consumers fall back to classifying the message, as they always have.
+        ...(error instanceof BackendExitError ? { classification: error.classification } : {}),
       };
     }
   }
@@ -605,7 +628,22 @@ export class InkRunner implements IRunner {
           // on 2026-09-22 classified `unknown` for want of any diagnostic.
           // The idle-timeout path 70 lines up already took a tail
           // (`stderr.slice(-500)`); this one had not followed it.
-          reject(new Error(describeExit({ command: 'ink chat', exitCode: code, stdout, stderr })));
+          //
+          // Bounded text, unbounded verdict. A wider budget only moves where a
+          // display policy breaks the classifier — measured, a 3527-character
+          // failure puts `Error: fetch failed` in the elided middle of a
+          // 2000-character excerpt and the category falls to `unknown`
+          // (Lumen, second review of PR #662). So the category is decided
+          // here, on everything the process said, and travels with the error
+          // rather than being re-derived from the excerpt downstream.
+          const described = describeExitResult({
+            command: 'ink chat',
+            exitCode: code,
+            stdout,
+            stderr,
+            backend: 'ink',
+          });
+          reject(new BackendExitError(described.text, described.classification));
           return;
         }
 

@@ -1983,9 +1983,20 @@ export class SessionService implements ISessionService {
       // any gap between two adjacent statements, is the mechanism Lumen
       // reproduced (his review of PR #660 P1, and his correction on the
       // thread: adjacent synchronous statements are not preempted).
+      //
+      // The runner's own verdict wins when it has one. `result.error` is an
+      // excerpt — bounded for a log field and a DB column — so classifying it
+      // here means classifying whatever survived a text budget, and a budget
+      // is not a diagnosis: measured, `Error: fetch failed` above a long
+      // enough stack lands in the elided middle and comes out `unknown`
+      // /non-retryable instead of `network`/retryable (Lumen, second review of
+      // PR #662). A runner that saw the whole output classified it there.
+      // Runners without that seam carry nothing, and this falls back to
+      // exactly what it did before.
       errorClassification =
         !result.success && result.error
-          ? classifyError({ errorText: result.error, backend: resolvedBackend })
+          ? (result.classification ??
+            classifyError({ errorText: result.error, backend: resolvedBackend }))
           : null;
       refusedBeforeAcceptance = errorClassification
         ? isPreAcceptanceRefusal(errorClassification.category)
@@ -2466,6 +2477,11 @@ export class SessionService implements ISessionService {
       compactionTriggered: false,
       finalTextResponse: result.finalTextResponse,
       error: result.error,
+      // The verdict this turn was judged by, not a fresh reading of `error`.
+      // The heartbeat outage alert prints a category to a human; deriving it
+      // again from the excerpt is how the alert could name one category while
+      // the server acted on another.
+      ...(errorClassification ? { classification: errorClassification } : {}),
     };
   }
 

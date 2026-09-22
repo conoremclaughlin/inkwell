@@ -23,9 +23,12 @@ export { writeRuntimeSessionHint } from './runtime-hints.js';
 
 export {
   stripAnsi,
+  readableOutput,
   failureExcerpt,
   describeExit,
+  describeExitResult,
   DISPLAY_EXCERPT,
   DIAGNOSTIC_EXCERPT,
   type FailureExcerptOptions,
+  type ExitDescription,
 } from './terminal-output.js';

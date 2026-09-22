@@ -214,6 +214,27 @@ function errorOverLongStack(): string {
   return `Error: fetch failed\n${frames.join('\n')}`;
 }
 
+/**
+ * The same failure with ordinary Node startup noise in front of it and three
+ * times the stack — Lumen's second fixture, kept verbatim for the same reason.
+ * ~3.5KB, so it overruns the diagnostic budget too: the head holds the
+ * warnings, the tail holds frames, and `Error: fetch failed` is in neither.
+ */
+function noisyStartupOverLongStack(): string {
+  const frames = Array.from(
+    { length: 30 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+  return [
+    '(node:123) Warning: Example optional feature is experimental',
+    '(Use node --trace-warnings to show where the warning was created)',
+    '[startup] initialising backend',
+    'Error: fetch failed',
+    ...frames,
+  ].join('\n');
+}
+
 describe('InkRunner failure text', () => {
   let child: FakeChild;
 
@@ -294,5 +315,54 @@ describe('InkRunner failure text', () => {
 
     expect(result.success).toBe(false);
     expect(classifyError({ errorText: result.error || '' }).category).toBe('network');
+  });
+
+  /**
+   * Lumen's second fixture, same review, and the one that showed a bigger
+   * budget is still a budget: ordinary Node startup noise ahead of the cause,
+   * and a stack long enough that the whole thing overruns the DIAGNOSTIC
+   * excerpt. The head keeps the warnings, the tail keeps frames, and the only
+   * line naming the fault is what the elision drops.
+   *
+   * Both assertions are load-bearing together. The first is the control: it
+   * establishes that the text genuinely cannot be classified, so the second
+   * cannot be satisfied by the excerpt happening to contain the answer.
+   */
+  it('carries a verdict its own excerpt can no longer support', async () => {
+    const { classifyError } = await import('@inklabs/shared');
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.stderr.emit('data', Buffer.from(noisyStartupOverLongStack()));
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    expect(result.error).not.toContain('fetch failed');
+    expect(classifyError({ errorText: result.error || '' }).category).toBe('unknown');
+
+    expect(result.classification).toMatchObject({ category: 'network', retryable: true });
+  });
+
+  /**
+   * Bounded claim, pinned so the field is not read as more than it is: it is
+   * populated for a non-zero exit, where the runner saw the whole output. A
+   * spawn failure never had output to classify, so it carries nothing and
+   * consumers fall back to reading the message.
+   */
+  it('carries nothing when there was no process output to judge', async () => {
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.emit('error', new Error('spawn ENOENT'));
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Failed to spawn ink');
+    expect(result.classification).toBeUndefined();
   });
 });

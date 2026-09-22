@@ -14,8 +14,10 @@
 import { describe, it, expect } from 'vitest';
 import {
   stripAnsi,
+  readableOutput,
   failureExcerpt,
   describeExit,
+  describeExitResult,
   DISPLAY_EXCERPT,
   DIAGNOSTIC_EXCERPT,
 } from './terminal-output.js';
@@ -313,5 +315,119 @@ describe('regression: the alert used to carry the banner instead of the cause', 
   it('is dramatically shorter, because the banner was most of it', () => {
     expect(HEAD_SLICE.length).toBeGreaterThan(900);
     expect(FIXED.length).toBeLessThan(200);
+  });
+});
+
+/**
+ * The second half of the same bug: a wider budget does not stop a text policy
+ * deciding an error category, it only raises the length at which it does.
+ *
+ * Lumen measured it on the second review of PR #662. The fixture below is his:
+ * an ordinary Node startup — two experimental-feature warnings and a
+ * `[startup]` line — then the cause, then a stack long enough that the whole
+ * thing overruns the DIAGNOSTIC budget. The head keeps the warnings, the tail
+ * keeps frames, and `Error: fetch failed` is what the elision ate. Nothing in
+ * the excerpt names a network fault, so a consumer reading the excerpt calls
+ * it `unknown`/non-retryable, and the run is not retried.
+ *
+ * So the verdict is no longer taken from the excerpt at all. It is taken from
+ * `readableOutput`, which has no budget.
+ */
+describe('regression: a verdict taken from the excerpt inherits the excerpt budget', () => {
+  const NOISY_STARTUP = [
+    '(node:123) Warning: Example optional feature is experimental',
+    '(Use node --trace-warnings to show where the warning was created)',
+    '[startup] initialising backend',
+  ].join('\n');
+  const FRAMES = Array.from(
+    { length: 30 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+  const NOISY_STACK = `${NOISY_STARTUP}\nError: fetch failed\n${FRAMES.join('\n')}`;
+
+  /**
+   * The control, and it is doing real work: if this fixture fit the diagnostic
+   * budget, everything below would pass against the bug.
+   */
+  it('is a fixture that overruns the diagnostic budget, or it proves nothing', () => {
+    expect(NOISY_STACK.length).toBeGreaterThan(DIAGNOSTIC_EXCERPT.maxChars);
+  });
+
+  /**
+   * The failure being fixed, stated as a property of the text rather than as
+   * an assertion about the old code: the excerpt is not merely shorter, it has
+   * lost the only line a classifier could match. This going red would mean the
+   * fixture had stopped exercising the case.
+   */
+  it('drops the cause into the elided middle, where nothing can match it', () => {
+    const { text } = describeExitResult({ command: 'ink chat', exitCode: 1, stderr: NOISY_STACK });
+
+    expect(text).toContain('…');
+    expect(text).not.toContain('fetch failed');
+    expect(classifyError({ errorText: text }).category).toBe('unknown');
+  });
+
+  it('classifies what the process said, not what fit in the excerpt', () => {
+    const { classification } = describeExitResult({
+      command: 'ink chat',
+      exitCode: 1,
+      stderr: NOISY_STACK,
+    });
+
+    expect(classification.category).toBe('network');
+    expect(classification.retryable).toBe(true);
+  });
+
+  /**
+   * The summary is why the classifier reads `readableOutput` rather than the
+   * raw output. Both are unbounded; only one has the banner removed, and a
+   * verdict whose summary line is `Applied "Safe" profile` is useless in the
+   * activity stream however right its category is.
+   */
+  it('summarises from the sanitised text, not the first byte of the raw output', () => {
+    const { classification } = describeExitResult({
+      command: 'ink chat',
+      exitCode: 1,
+      stdout: `${STARTUP_NOISE}Error: fetch failed`,
+    });
+
+    expect(classification.category).toBe('network');
+    expect(classification.summary).toBe('Error: fetch failed');
+  });
+
+  /**
+   * The exit code is in the text and deliberately not in the verdict: the
+   * `crash` rule matches any non-zero exit, so feeding it here would make
+   * every failed turn `crash` and change what session-service flushes message
+   * queues on. That is a behaviour change with nothing to do with truncation.
+   */
+  it('does not let a non-zero exit code alone decide a category', () => {
+    const { classification } = describeExitResult({
+      command: 'ink chat',
+      exitCode: 1,
+      stdout: 'the turn ended and said nothing a rule matches',
+    });
+
+    expect(classification.category).toBe('unknown');
+    expect(classifyError({ errorText: 'the turn ended', exitCode: 1 }).category).toBe('crash');
+  });
+
+  /** `readableOutput` is the excerpt's own sanitising step, minus the budget. */
+  it('shares its sanitising with the excerpt and differs only in length', () => {
+    const full = readableOutput(NOISY_STACK);
+
+    expect(stripAnsi(full)).toBe(full);
+    expect(full).toContain('Error: fetch failed');
+    expect(full).toContain('at step29');
+    expect(full.length).toBeGreaterThan(DIAGNOSTIC_EXCERPT.maxChars);
+    expect(readableOutput(`${STARTUP_NOISE}Error: fetch failed`)).toBe('Error: fetch failed');
+  });
+
+  /** `describeExit` stays the text half, byte for byte. */
+  it('leaves the text half unchanged for callers that only display it', () => {
+    const params = { command: 'ink chat', exitCode: 1, stderr: NOISY_STACK } as const;
+
+    expect(describeExit(params)).toBe(describeExitResult(params).text);
   });
 });

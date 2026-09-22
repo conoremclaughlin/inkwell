@@ -24,6 +24,7 @@ import {
   type EpisodeBoundary,
 } from './heartbeat-notification-store.js';
 import type { Database, Json } from '../data/supabase/types.js';
+import type { ErrorClassification } from '@inklabs/shared';
 
 // DueReminder is the subset of fields we need for processing
 export interface DueReminder {
@@ -356,8 +357,17 @@ export function stopHeartbeatService(): void {
  */
 export type HeartbeatDeliveryOutcome =
   | { status: 'delivered' }
-  /** The failure as the delivery path saw it. Recorded and escalated verbatim. */
-  | { status: 'failed'; error?: string }
+  /**
+   * The failure as the delivery path saw it. Recorded and escalated verbatim.
+   *
+   * `error` is an excerpt by the time it gets here — a runner bounded it for a
+   * log field and a DB column. `classification` is the verdict reached on the
+   * full output before that bounding, when the path that produced the failure
+   * had one; absent otherwise, and the escalation falls back to reading the
+   * text. Carrying it is what stops the outage alert naming a different
+   * category from the one the server acted on (Lumen, review of PR #662).
+   */
+  | { status: 'failed'; error?: string; classification?: ErrorClassification }
   /** A deliberate no-op. Recorded for the trail, reported to nobody. */
   | { status: 'skipped'; reason: string };
 
@@ -392,6 +402,18 @@ export interface HeartbeatEscalationContext {
   destinationAlreadyAlerted: boolean;
   episodeKey: string;
   destination: string | null;
+  /**
+   * What the failure was classified as by whoever could still see all of it.
+   *
+   * The hook receives `error` as a string, and by then it is an excerpt: a
+   * runner bounded it for a log field long before this. Classifying that
+   * string is classifying what survived a budget, which is precisely how an
+   * outage alert reported `unknown` for a failure the server had already
+   * judged retryable. Absent when the failure came from a path that does not
+   * classify — a throw, a runner without the seam — and the hook falls back
+   * to reading the text, as it did before.
+   */
+  classification?: ErrorClassification;
 }
 
 /**
@@ -660,7 +682,10 @@ export async function processHeartbeat(
           // every beat after that — but only while it is provably part of THIS
           // run of failures. See `EpisodeBoundary`.
           await resolveEpisodeKey(reminder.id, history.boundary),
-          alertDestination(reminder)
+          alertDestination(reminder),
+          // Whatever judged this failure while it could still see all of it.
+          // `reason` above is the same text with a budget already applied.
+          outcome.classification
         );
         if (alerted) markDestinationTold(alertedThisRun, reminder);
       }
@@ -709,7 +734,8 @@ async function escalate(
   onFailure?: HeartbeatFailureHook,
   destinationAlreadyAlerted = false,
   episodeKey = new Date().toISOString(),
-  destination: string | null = null
+  destination: string | null = null,
+  classification?: ErrorClassification
 ): Promise<boolean> {
   if (!onFailure) return false;
   try {
@@ -717,6 +743,7 @@ async function escalate(
       destinationAlreadyAlerted,
       episodeKey,
       destination,
+      ...(classification ? { classification } : {}),
     });
     return typeof result === 'object' && result !== null && result.alerted === true;
   } catch (err) {
