@@ -12,7 +12,11 @@ SUPABASE_WORKDIR="${INTEGRATION_MANAGED_WORKDIR:?Use the managed harness entry p
 API_PORT="${INTEGRATION_MANAGED_API_PORT:?Missing managed API port}"
 DB_PORT="${INTEGRATION_MANAGED_DB_PORT:?Missing managed DB port}"
 PROJECT_ID="${INTEGRATION_SUPABASE_PROJECT_ID:-ink-integration}"
-DIAGNOSTICS_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Include a five-minute prelude: low-volume REST reset/reconnect events can
+# predate this sourced suite (especially on warm runs). This is a bounded
+# lookback, not the complete retained stack history. Python is portable across
+# GNU/BSD date implementations and is already required by the parent harness.
+DIAGNOSTICS_SINCE="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
 
 echo "[integration-db] Exporting local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
@@ -82,7 +86,7 @@ if [[ "${STEADY}" -lt 3 ]]; then
   echo "[integration-db] REST gateway did not answer three times in a row within 20s (last HTTP ${CODE}); continuing anyway." >&2
 fi
 
-# Capture the entire invocation, not the last N lines: later successes pushed
+# Capture the invocation plus its prelude, not the last N lines: later successes pushed
 # the #662 failing request outside the old 150-line gateway tail. Only emit
 # allowlisted diagnostic metadata; raw URLs, query tokens and SQL stay private.
 dump_stack_diagnostics() {

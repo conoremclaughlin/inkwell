@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Synthetic parsing controls only: no Docker, DB, executor or credentials."""
+"""Synthetic logs and fake executables; no Docker daemon or live database."""
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
@@ -77,7 +78,7 @@ class LogSummaryTests(unittest.TestCase):
         self.assertIsNone(rows[-1]['firstTimestamp'])
         self.assertNotIn('fixture-', json.dumps(rows))
 
-    def test_real_harness_failure_keeps_early_event_without_raw_log_values(self):
+    def run_harness(self):
         # Fake executables only. Even if the behavior regresses, no Docker or
         # database is available through this test's command path.
         with tempfile.TemporaryDirectory() as directory:
@@ -92,7 +93,8 @@ class LogSummaryTests(unittest.TestCase):
             fake = root / 'bin'
             fake.mkdir()
             shim = fake / 'shim'
-            shim.write_text('#!' + sys.executable + '\n' + r'''import os, pathlib, sys
+            shim.write_text('#!' + sys.executable + '\n' + r'''import json, os, pathlib, sys
+from datetime import datetime, timezone
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 if name == 'supabase':
@@ -102,16 +104,32 @@ if name == 'supabase':
 elif name == 'curl':
     print('200')
 elif name == 'yarn':
+    pathlib.Path(os.environ['FIXTURE_SUITE_STAMP']).write_text(datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
     print('fixture-suite-failed')
     sys.exit(7)
 elif name == 'docker':
-    if args[0] == 'inspect':
-        print('fixture-container-id' if '{{.Id}}' in args else 'status=running restarts=0 oomKilled=false')
+    with open(os.environ['FIXTURE_DOCKER_TRACE'], 'a') as trace:
+        trace.write(json.dumps(args) + '\n')
+    if args[0] == 'ps':
+        for service in ('db', 'rest', 'kong'):
+            print('supabase_' + service + '_' + os.environ['INTEGRATION_SUPABASE_PROJECT_ID'])
+    elif args[0] == 'inspect':
+        print(args[-1] if '{{.Id}}' in args else 'status=running restarts=0 oomKilled=false')
     elif args[0] == 'logs':
-        stamp = '2026-01-01T00:00:00.000000000Z '
+        stamp = pathlib.Path(os.environ['FIXTURE_SUITE_STAMP']).read_text() + ' '
         bad = stamp + 'client "POST /rest/v1/rpc/probe?token=fixture-hidden HTTP/1.1" 502 20 "-" "node"'
         good = stamp + 'client "GET /rest/v1/probe?token=fixture-hidden HTTP/1.1" 200 2 "-" "node"'
-        lines = [bad] + [good] * 200
+        if '_rest_' in args[-1]:
+            lines = [os.environ['FIXTURE_OLD_STAMP'] + ' PGRST003 fixture-hidden',
+                     os.environ['FIXTURE_PRELUDE_STAMP'] + ' Received a schema cache reload message fixture-hidden',
+                     stamp + 'Schema cache loaded in 1 milliseconds fixture-hidden']
+        elif '_db_' in args[-1]:
+            lines = [stamp + 'LOG: database system is ready to accept connections']
+        else:
+            lines = [bad] + [good] * 200
+        if '--since' in args:
+            since = datetime.fromisoformat(args[args.index('--since') + 1].replace('Z', '+00:00'))
+            lines = [line for line in lines if datetime.fromisoformat(line.split(' ', 1)[0].replace('Z', '+00:00')) >= since]
         if '--tail' in args:
             lines = lines[-int(args[args.index('--tail') + 1]):]
         print('\n'.join(lines))
@@ -122,15 +140,50 @@ elif name == 'docker':
             env = dict(PATH=str(fake) + ':/usr/bin:/bin', HOME=directory,
                        INTEGRATION_MANAGED_WORKDIR=directory,
                        INTEGRATION_MANAGED_API_PORT='55421', INTEGRATION_MANAGED_DB_PORT='55422',
-                       INTEGRATION_SUPABASE_PROJECT_ID='ink-integration-summary-test')
+                       INTEGRATION_SUPABASE_PROJECT_ID='ink-integration-summary-test',
+                       FIXTURE_DOCKER_TRACE=str(root / 'docker-trace.jsonl'),
+                       FIXTURE_SUITE_STAMP=str(root / 'suite-stamp'),
+                       FIXTURE_OLD_STAMP=(datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat().replace('+00:00', 'Z'),
+                       FIXTURE_PRELUDE_STAMP=(datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat().replace('+00:00', 'Z'))
             run = subprocess.run(['bash', '-c', 'source "$1"', '_', str(harness)],
                                  env=env, capture_output=True, text=True, timeout=15)
+            trace = [json.loads(line) for line in (root / 'docker-trace.jsonl').read_text().splitlines()]
             self.assertNotEqual(run.returncode, 0)
-            # Assert the contract, not just exit status: old tail also exits 1.
-            self.assertIn('"event": "http_failure"', run.stdout)
-            self.assertIn('"status": 502', run.stdout)
-            self.assertNotIn('fixture-hidden', run.stdout + run.stderr)
             self.assertIn('fixture-suite-failed', run.stdout)
+            return run, trace
+
+    def assert_all_logs_collected(self, trace):
+        # A/B controls must actually reach the old loop and the new collector.
+        # Missing docker ps used to let the old control fail vacuously here.
+        logs = [args for args in trace if args[0] == 'logs']
+        self.assertEqual([args[-1] for args in logs], [
+            'supabase_' + service + '_ink-integration-summary-test'
+            for service in ('db', 'rest', 'kong')
+        ])
+        return logs
+
+    def test_real_harness_failure_keeps_early_event_without_raw_log_values(self):
+        run, trace = self.run_harness()
+        self.assert_all_logs_collected(trace)
+        # Assert the contract, not just exit status: old tail also exits 1.
+        # Accept the original raw access record OR the sanitized metadata:
+        # otherwise a formatting change alone would make the old control red.
+        self.assertRegex(run.stdout, r'(?:"status": 502|HTTP/1\.1" 502 )')
+
+    def test_real_harness_failure_never_dumps_raw_log_values(self):
+        run, trace = self.run_harness()
+        self.assert_all_logs_collected(trace)
+        self.assertNotIn('fixture-hidden', run.stdout + run.stderr)
+
+    def test_real_harness_keeps_pre_invocation_schema_reload(self):
+        run, trace = self.run_harness()
+        self.assert_all_logs_collected(trace)
+        self.assertIn('"event": "schema_reload_requested"', run.stdout)
+
+    def test_real_harness_excludes_history_older_than_prelude(self):
+        run, trace = self.run_harness()
+        self.assert_all_logs_collected(trace)
+        self.assertNotIn('PGRST003', run.stdout)
 
     def test_wiring_captures_window_not_tail_and_keeps_failure(self):
         harness = (ROOT / 'test-integration-db-local.sh').read_text()
