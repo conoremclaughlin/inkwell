@@ -8,6 +8,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { homedir, tmpdir } from 'os';
+import { lookupAgentBackend } from './agent-backend.js';
 
 interface InkUserConfig {
   userId?: string;
@@ -191,15 +192,52 @@ export function resolveSlug(cliAgent?: string, backendHint?: string): string | n
   return null;
 }
 
+export interface BackendResolution {
+  backend: string;
+  source: 'flag' | 'agent' | 'identity-json' | 'default';
+  /** A line worth showing the user — currently only the unrunnable case. */
+  note?: string;
+}
+
 /**
- * Resolve backend from multiple sources:
- * 1. CLI --backend flag (if provided)
- * 2. .ink/identity.json → backend field
- * 3. Default: 'claude'
+ * Resolve backend from multiple sources, most explicit first:
+ * 1. CLI --backend flag
+ * 2. The named agent's own backend, from their identity record
+ * 3. .ink/identity.json → backend field
+ * 4. Default: 'claude'
+ *
+ * The agent sits ABOVE identity.json deliberately. `-a lumen` is an explicit
+ * request for Lumen; the directory's recorded backend describes whichever agent
+ * that studio was made for, so letting it win would leave `ink -a lumen` inside
+ * a wren studio starting claude — which is the bug this ordering fixes.
  */
-export function resolveBackend(cliBackend?: string): string {
-  if (cliBackend) {
-    return cliBackend;
+export async function resolveBackend(options: {
+  cliBackend?: string;
+  agentSlug?: string;
+}): Promise<BackendResolution> {
+  if (options.cliBackend) {
+    return { backend: options.cliBackend, source: 'flag' };
+  }
+
+  let note: string | undefined;
+  if (options.agentSlug) {
+    const lookup = await lookupAgentBackend(options.agentSlug);
+    if (lookup.backend) {
+      return { backend: lookup.backend, source: 'agent' };
+    }
+    if (lookup.unrunnable) {
+      // Say it rather than quietly starting them on something else. Aster's
+      // record says 'antigravity', which this CLI has no adapter for.
+      note =
+        `${options.agentSlug}'s identity record says backend '${lookup.unrunnable}', ` +
+        `which this CLI cannot launch — falling back. Use -b to choose one.`;
+    } else if (lookup.ambiguous) {
+      // A slug is unique within one workspace, not globally. Picking one of
+      // several identities would be a guess, and a silent one.
+      note =
+        `'${options.agentSlug}' names more than one identity, so their backend ` +
+        `is ambiguous — falling back. Use -b to choose one.`;
+    }
   }
 
   let cwd: string | null = null;
@@ -211,10 +249,10 @@ export function resolveBackend(cliBackend?: string): string {
 
   if (cwd) {
     const identity = readIdentityJson(cwd);
-    if (identity?.backend) return identity.backend;
+    if (identity?.backend) return { backend: identity.backend, source: 'identity-json', note };
   }
 
-  return 'claude';
+  return { backend: 'claude', source: 'default', note };
 }
 
 /**

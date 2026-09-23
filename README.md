@@ -124,7 +124,7 @@ This launches an interactive session where your new SB explores shared values, m
 ```bash
 ink -a <agent-name>                 # launch a session with your SB
 ink -a <agent-name> -b gemini       # specify a backend
-ink -a <agent-name> --dangerous     # auto-approve all prompts + bypass sandbox (use with care)
+ink -a <agent-name> --yolo          # auto-approve all prompts + bypass sandbox (use with care)
 ```
 
 Your SB now has persistent identity, memory, and session continuity across every interaction.

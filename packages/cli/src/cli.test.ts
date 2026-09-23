@@ -83,10 +83,34 @@ describe('extractArgs', () => {
     expect(result.promptParts).toEqual(['hello']);
   });
 
-  it('parses --dangerous flag', () => {
+  it('parses --yolo flag', () => {
+    const result = extractArgs(['--yolo', 'hello']);
+    expect(result.sbOptions.dangerous).toBe(true);
+    expect(result.promptParts).toEqual(['hello']);
+  });
+
+  it('still parses --dangerous, the pre-rename spelling', () => {
+    // Kept indefinitely: it is in shell history and in hook commands already
+    // written to disk, where an "unknown option" would surface at the worst
+    // possible moment. Both spellings must set the SAME internal key.
     const result = extractArgs(['--dangerous', 'hello']);
     expect(result.sbOptions.dangerous).toBe(true);
     expect(result.promptParts).toEqual(['hello']);
+  });
+
+  it('reports which spelling was used, so only the old one is nudged', () => {
+    expect(extractArgs(['--dangerous']).sbOptions.dangerousAlias).toBe(true);
+    expect(extractArgs(['--yolo']).sbOptions.dangerousAlias).toBe(false);
+    expect(extractArgs(['hello']).sbOptions.dangerousAlias).toBe(false);
+  });
+
+  it('neither spelling leaks through to the backend as a passthrough arg', () => {
+    // An unrecognised flag is forwarded to the underlying tool, so a flag we
+    // failed to register would silently become `claude --yolo`.
+    for (const spelling of ['--yolo', '--dangerous']) {
+      const result = extractArgs([spelling, 'hello']);
+      expect(result.passthroughArgs, spelling).toEqual([]);
+    }
   });
 
   it('defaults dangerous to false', () => {

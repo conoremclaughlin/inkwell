@@ -179,17 +179,37 @@ echo "explain this" | sb        # Pipe input as prompt
 
 ### SB Options
 
-| Flag                        | Description                                                | Default                                |
-| --------------------------- | ---------------------------------------------------------- | -------------------------------------- |
-| `-a, --agent <id>`          | Agent identity                                             | from `.ink/identity.json`              |
-| `-b, --backend <name>`      | AI backend                                                 | from `.ink/identity.json`, or `claude` |
-| `--no-session`              | Disable session tracking                                   | enabled                                |
-| `--sb-verbose`              | Show SB verbose output                                     | off                                    |
-| `--session-candidates`      | Print picker candidates and exit                           | off                                    |
-| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                    |
-| `--dangerous`               | Skip all permission prompts (maps to backend auto-approve) | off                                    |
+| Flag                        | Description                                                | Default                                                                |
+| --------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `-a, --agent <id>`          | Agent identity                                             | from `.ink/identity.json`                                              |
+| `-b, --backend <name>`      | AI backend                                                 | the `-a` agent's own backend, else `.ink/identity.json`, else `claude` |
+| `--no-session`              | Disable session tracking                                   | enabled                                                                |
+| `--sb-verbose`              | Show SB verbose output                                     | off                                                                    |
+| `--session-candidates`      | Print picker candidates and exit                           | off                                                                    |
+| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                                                    |
+| `--yolo`                    | Skip all permission prompts (maps to backend auto-approve) | off                                                                    |
 
 Any flag not listed above is forwarded to the backend.
+
+#### How the backend is chosen
+
+Most explicit wins:
+
+1. `-b/--backend`
+2. **The `-a` agent's own backend**, read from their identity record (`agent_identities.backend`) and cached at `~/.ink/agent-backends.json` for a day
+3. `.ink/identity.json` → `backend`, i.e. whatever this studio was made for
+4. `claude`
+
+The agent sits above `.ink/identity.json` on purpose. `-a lumen` is an explicit
+request for Lumen; the directory's recorded backend describes whichever SB the
+studio was created for, so letting it win would mean `ink -a lumen` inside a
+wren studio still starting claude.
+
+The cache means the usual path costs nothing and keeps working offline. When
+the server is unreachable a stale entry is still used — an SB's runtime changes
+about once a year, and the alternative is silently launching them on the wrong
+one. If a record names a backend this CLI has no adapter for, it says so and
+falls through rather than quietly substituting another.
 
 Testing and regression workflows for session-candidate resolution live in [`packages/cli/TESTS.md`](./TESTS.md).
 
@@ -403,7 +423,9 @@ sb permissions reset         # Remove all rules (Claude will prompt for everythi
 - **Allow**: `Bash(*)`, `Edit(*)`, `Write(*)`, `Read(*)`, `WebFetch(*)`, MCP tools — no prompts for normal dev work
 - **Deny**: `rm -rf`, `git push --force`, `git reset --hard`, `git clean -f` — always blocked
 
-> ⚠️ **`--dangerous` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
+> ⚠️ **`--yolo` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
+>
+> It was called `--dangerous` until 2026-09-22. That spelling still works and always will — it is in shell history and in hook commands already written to disk — but it is hidden from `--help`, and using it prints a one-line note. The banner the flag prints still says DANGEROUS: the shorter name does not make the behaviour milder. Codex and Gemini both call their equivalent `--yolo`, so this also stops `ink` being the odd one out.
 
 ### Mission Control (`sb mission`)
 

@@ -587,6 +587,10 @@ export async function handleListIdentities(args: unknown, dataComposer: DataComp
               values: row.values,
               relationships: row.relationships,
               capabilities: row.capabilities,
+              // The runtime this SB actually runs on. The column has been here
+              // all along; not projecting it meant every consumer had to guess,
+              // and `ink -a lumen` guessed 'claude' for an SB that runs codex.
+              backend: row.backend,
               hasHeartbeat: !!row.heartbeat,
               hasSoul: !!row.soul,
               version: row.version,

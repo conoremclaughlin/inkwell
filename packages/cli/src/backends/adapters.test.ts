@@ -216,7 +216,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('maps --dangerous to claude --dangerously-skip-permissions', () => {
+  it('maps --yolo to claude --dangerously-skip-permissions', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'wren',
@@ -229,7 +229,7 @@ describe('backend adapters session resume wiring', () => {
     expect(prepared.args).toContain('--dangerously-skip-permissions');
   });
 
-  it('maps --dangerous to codex --dangerously-bypass-approvals-and-sandbox', () => {
+  it('maps --yolo to codex --dangerously-bypass-approvals-and-sandbox', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'lumen',
@@ -246,7 +246,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('maps --dangerous to gemini --yolo', () => {
+  it('maps --yolo to gemini --yolo', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
       sbSlug: 'aster',
