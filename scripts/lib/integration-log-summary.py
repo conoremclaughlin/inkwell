@@ -30,6 +30,8 @@ REST_EVENTS = {
     'Config reloaded': 'config_reloaded',
 }
 DB_EVENTS = {
+    # This is the DB's client connection, not Kong's upstream connection.
+    'Connection reset by peer': 'client_connection_reset',
     'too many clients already': 'too_many_clients',
     'remaining connection slots are reserved': 'connection_slots_reserved',
     'deadlock detected': 'deadlock',
@@ -81,12 +83,16 @@ def summarize(stream, service, emit):
             code = re.search(r'\bPGRST[0-9]{3}\b', line)
             if kind or code:
                 emit(dict(event, event=kind or 'postgrest_error', **({'code': code.group(0)} if code else {})))
+            else:
+                counts['other_rest_lines_omitted'] += 1
         else:
             kind = next((value for key, value in DB_EVENTS.items() if key in line), None)
             if kind:
                 emit(dict(event, event=kind))
             elif re.search(r'\b(?:ERROR|FATAL|PANIC):', line):
                 counts['other_db_errors_omitted'] += 1
+            else:
+                counts['other_db_lines_omitted'] += 1
     emit({'service': service, 'event': 'summary', 'firstTimestamp': first,
           'lastTimestamp': last, 'counts': dict(sorted(counts.items()))})
 

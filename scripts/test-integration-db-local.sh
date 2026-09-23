@@ -16,7 +16,8 @@ PROJECT_ID="${INTEGRATION_SUPABASE_PROJECT_ID:-ink-integration}"
 # predate this sourced suite (especially on warm runs). This is a bounded
 # lookback, not the complete retained stack history. Python is portable across
 # GNU/BSD date implementations and is already required by the parent harness.
-DIAGNOSTICS_SINCE="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+DIAGNOSTICS_INVOKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DIAGNOSTICS_SINCE="$(python3 -c 'import sys; from datetime import datetime, timedelta; print((datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ") - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))' "${DIAGNOSTICS_INVOKED_AT}")"
 
 echo "[integration-db] Exporting local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
@@ -91,6 +92,8 @@ fi
 # allowlisted diagnostic metadata; raw URLs, query tokens and SQL stay private.
 dump_stack_diagnostics() {
   echo "[integration-db] ❌ Suite failed — dumping isolated stack diagnostics (project ${PROJECT_ID})."
+  echo "[integration-db] window_start=${DIAGNOSTICS_SINCE} invocation_start=${DIAGNOSTICS_INVOKED_AT} (UTC; through capture)."
+  echo "[integration-db] Prelude may include events from an earlier run; timestamps are not causal attribution."
   echo "[integration-db] --- containers ---"
   docker ps -a --filter "name=${PROJECT_ID}" --format '{{.Names}}\t{{.Status}}' 2>/dev/null || true
   echo "[integration-db] --- resource snapshot ---"

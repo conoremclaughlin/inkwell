@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,7 +15,9 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('summary', ROOT / 'lib/integration-log-summary.py')
+MODULE_PATH = Path(os.environ.get(
+    'INTEGRATION_SUMMARY_UNDER_TEST', ROOT / 'lib/integration-log-summary.py'))
+spec = importlib.util.spec_from_file_location('summary', MODULE_PATH)
 summary = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(summary)
 STAMP = '2026-01-01T00:00:00.000000000Z '
@@ -65,6 +68,23 @@ class LogSummaryTests(unittest.TestCase):
         rows = self.parse(STAMP + 'FATAL: terminating connection due to administrator command\n', 'db')
         self.assertEqual(rows[0]['event'], 'connection_terminated')
 
+    def test_unclassified_rest_lines_are_counted_without_payloads(self):
+        rows = self.parse(STAMP + 'Attempting to reconnect to the database in 1.0 seconds... fixture-hidden\n' +
+                          STAMP + 'Connection is no longer available fixture-hidden\n', 'rest')
+        self.assertEqual(rows[-1]['counts'].get('other_rest_lines_omitted'), 2)
+        self.assertNotIn('fixture-hidden', json.dumps(rows))
+
+    def test_unclassified_db_lines_are_counted_without_payloads(self):
+        rows = self.parse(STAMP + 'WARNING: there is already a transaction in progress fixture-hidden\n' +
+                          STAMP + 'LOG: fixture-hidden\n', 'db')
+        self.assertEqual(rows[-1]['counts'].get('other_db_lines_omitted'), 2)
+        self.assertNotIn('fixture-hidden', json.dumps(rows))
+
+    def test_database_client_reset_is_classified_without_payloads(self):
+        rows = self.parse(STAMP + 'LOG: could not receive data from client: Connection reset by peer fixture-hidden\n', 'db')
+        self.assertEqual(rows[0]['event'], 'client_connection_reset')
+        self.assertNotIn('fixture-hidden', json.dumps(rows))
+
     def test_oversized_record_is_omitted_whole_not_as_fake_lines(self):
         rows = self.parse(STAMP + 'x' * 50000 + 'fixture-private-payload\n' + STAMP + '[error] upstream timed out\n')
         self.assertEqual(rows[0]['event'], 'upstream_timeout')
@@ -86,7 +106,8 @@ class LogSummaryTests(unittest.TestCase):
             (root / 'scripts/lib').mkdir(parents=True)
             for name in ('derive-isolated-supabase-env.sh', 'assert-isolated-supabase-url.sh',
                          'integration-log-summary.py'):
-                shutil.copy(ROOT / 'lib' / name, root / 'scripts/lib' / name)
+                source = MODULE_PATH if name == 'integration-log-summary.py' else ROOT / 'lib' / name
+                shutil.copy(source, root / 'scripts/lib' / name)
             source = Path(os.environ.get('INTEGRATION_HARNESS_UNDER_TEST', ROOT / 'test-integration-db-local.sh'))
             harness = root / 'scripts/test-integration-db-local.sh'
             shutil.copy(source, harness)
@@ -178,7 +199,22 @@ elif name == 'docker':
     def test_real_harness_keeps_pre_invocation_schema_reload(self):
         run, trace = self.run_harness()
         self.assert_all_logs_collected(trace)
+        # A capture/--since parsing failure is not the expected red control.
+        self.assertNotIn('capture_incomplete', run.stdout)
+        self.assertIn('"event": "schema_loaded"', run.stdout)
         self.assertIn('"event": "schema_reload_requested"', run.stdout)
+
+    def test_real_harness_prints_resolved_window_and_invocation_bounds(self):
+        run, trace = self.run_harness()
+        logs = self.assert_all_logs_collected(trace)
+        since = logs[0][logs[0].index('--since') + 1]
+        self.assertIn('window_start=' + since, run.stdout)
+        invoked = re.search(r'invocation_start=(\S+)', run.stdout)
+        self.assertIsNotNone(invoked)
+        start = datetime.fromisoformat(since.replace('Z', '+00:00'))
+        current = datetime.fromisoformat(invoked.group(1).replace('Z', '+00:00'))
+        self.assertEqual((current - start).total_seconds(), 300)
+        self.assertIn('Prelude may include events from an earlier run', run.stdout)
 
     def test_real_harness_excludes_history_older_than_prelude(self):
         run, trace = self.run_harness()
