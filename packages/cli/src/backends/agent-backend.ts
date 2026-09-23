@@ -31,7 +31,7 @@ import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { createHash } from 'crypto';
 import { callInkTool } from '../lib/ink-mcp.js';
-import { decodeJwtPayload, loadAuth } from '../auth/tokens.js';
+import { decodeJwtPayload, selectCredential } from '../auth/tokens.js';
 
 /**
  * Backends this CLI can actually launch: the three adapters plus `ink`, which
@@ -122,8 +122,13 @@ export interface AgentBackendFetch {
  * answer a question that only needs "same or not".
  */
 export function currentPrincipal(): string | undefined {
-  const token = process.env.INK_ACCESS_TOKEN?.trim() || loadAuth()?.access_token;
-  const sub = token ? decodeJwtPayload(token)?.sub : undefined;
+  // selectCredential, not a restatement of its precedence. Round 2 read
+  // INK_ACCESS_TOKEN unconditionally; the real selector SKIPS a provably
+  // expired env token and falls back to stored auth. With an expired env token
+  // for one account and valid stored auth for another, the request went out as
+  // the second while the cache was keyed to the first — serving and storing
+  // under the wrong identity. (Lumen, #665 r3.)
+  const sub = decodeJwtPayload(selectCredential()?.token ?? '')?.sub;
   return sub ? createHash('sha256').update(sub).digest('hex').slice(0, 16) : undefined;
 }
 
@@ -364,11 +369,18 @@ export async function lookupAgentBackend(
       return { source: 'none' };
     }
 
+    // Bind the write to the principal in force AFTER the request, not the one
+    // computed before it. They are normally the same; when they are not, the
+    // response belongs to whoever the request actually authenticated as, and
+    // storing it under the earlier guess files one account's answers under
+    // another. An injected scope still wins, so tests stay in control.
+    const writeScope = deps.scope ?? currentScope();
+
     // Replace the cache before answering. A slug that has BECOME ambiguous is
     // absent from the fresh map, so writing it removes the old unambiguous
     // entry — otherwise the next offline lookup would resurrect an answer the
     // server has already stopped standing behind. (Lumen, #665 r2.)
-    writeCache(entry, scope);
+    writeCache(entry, writeScope);
     if (ambiguous.includes(slug)) {
       return { source: 'server', ambiguous: true };
     }

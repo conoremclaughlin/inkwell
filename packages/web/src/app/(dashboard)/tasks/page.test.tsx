@@ -111,8 +111,15 @@ describe('tasks page with values outside the declared unions', () => {
       task({ title: 'B', status: 'archived', priority: 'urgent' }),
       task({ title: 'C', status: 'deferred', priority: null }),
       task({ title: 'D', status: 'constructor', priority: 'constructor' }),
+      // __proto__ is the one that hides rather than throws: assigning it on an
+      // ordinary object invokes the inherited setter, so hasOwnProperty stays
+      // false, Object.keys never sees the bucket, and each task silently
+      // replaces the last. Two of them, so a bucket that swallows one would
+      // still lose the other.
+      task({ title: 'E', status: '__proto__', priority: '__proto__' }),
+      task({ title: 'F', status: '__proto__', priority: 'low' }),
     ]);
-    for (const title of ['A', 'B', 'C', 'D']) {
+    for (const title of ['A', 'B', 'C', 'D', 'E', 'F']) {
       expect(screen.getByText(title), title).toBeTruthy();
     }
   });

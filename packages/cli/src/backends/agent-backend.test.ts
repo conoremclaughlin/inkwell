@@ -229,6 +229,58 @@ describe('principal, derived from the real credential', () => {
     expect(theirs.backend, "another account read this account's cache").toBeUndefined();
   });
 
+  it('ignores a provably expired env token, as the real selector does', () => {
+    // Round 2 read INK_ACCESS_TOKEN unconditionally. getValidAccessToken skips
+    // an expired one and falls back to stored auth, so restating the rule
+    // without the expiry check names a different account than the request uses.
+    const expired = (sub: string) =>
+      [
+        Buffer.from(JSON.stringify({ alg: 'none' })).toString('base64url'),
+        Buffer.from(JSON.stringify({ sub, exp: Math.floor(Date.now() / 1000) - 3600 })).toString(
+          'base64url'
+        ),
+        'synthetic-signature',
+      ].join('.');
+
+    process.env.INK_ACCESS_TOKEN = token('synthetic-user-a');
+    const live = currentPrincipal();
+    process.env.INK_ACCESS_TOKEN = expired('synthetic-user-a');
+    const dead = currentPrincipal();
+
+    // With no stored auth on this machine the expired token yields nothing;
+    // with stored auth it yields THAT account. Either way it must not report
+    // the expired token's account.
+    expect(dead, 'an expired env token still named its account').not.toBe(live);
+  });
+
+  it('binds the cache write to the principal in force after the request', async () => {
+    // The pre-request principal and the post-request one are normally equal.
+    // When they are not — the credential changed while the call was in flight —
+    // the response belongs to whoever the request authenticated as, and filing
+    // it under the earlier guess puts one account's answers under another.
+    let stored: { scope?: { principal?: string }; backends: Record<string, string> } | null = null;
+    const writeCache = (entry: unknown, scope?: object) => {
+      stored = { scope, ...(entry as object) } as typeof stored;
+    };
+
+    process.env.INK_ACCESS_TOKEN = token('synthetic-user-a');
+    const before = currentPrincipal();
+
+    await lookupAgentBackend('fixture', {
+      readCache: () => null,
+      writeCache,
+      // The credential changes during the call, as a re-login elsewhere would.
+      fetch: async () => {
+        process.env.INK_ACCESS_TOKEN = token('synthetic-user-b');
+        return { backends: { fixture: 'codex' }, ambiguous: [], sawAnyBackend: true };
+      },
+    });
+
+    const after = currentPrincipal();
+    expect(after).not.toBe(before);
+    expect(stored!.scope?.principal, 'the write used the pre-request principal').toBe(after);
+  });
+
   it('records different principals for different accounts', () => {
     process.env.INK_ACCESS_TOKEN = token('synthetic-user-a');
     const a = currentPrincipal();

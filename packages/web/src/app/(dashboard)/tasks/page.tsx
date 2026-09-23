@@ -908,12 +908,14 @@ export default function TasksPage() {
   // silently omitting a task from every column is how you lose work without
   // anything appearing wrong.
   const ungroupedByStatus = useMemo(() => {
-    const groups: Record<string, Task[]> = {
-      in_progress: [],
-      pending: [],
-      blocked: [],
-      completed: [],
-    };
+    // Object.create(null), not an object literal. On an ordinary object,
+    // `groups['__proto__'] = []` invokes the inherited prototype SETTER instead
+    // of creating a property: hasOwnProperty stays false, Object.keys never
+    // sees the bucket, and every task with that status disappears — each one
+    // replacing the previous. A null-prototype map has no setter to invoke, so
+    // the key behaves like any other. (Lumen, #665 r3.)
+    const groups: Record<string, Task[]> = Object.create(null);
+    for (const known of STATUS_DISPLAY_ORDER) groups[known] = [];
     for (const task of ungrouped) {
       const key = task.status;
       if (!Object.prototype.hasOwnProperty.call(groups, key)) groups[key] = [];
