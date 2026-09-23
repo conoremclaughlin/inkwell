@@ -56,6 +56,17 @@ export async function callInkTool<T = Record<string, unknown>>(
     callerProfile?: 'agent' | 'runtime';
     sessionId?: string;
     studioId?: string;
+    /**
+     * Reports the exact token this call put on the wire, before the request.
+     *
+     * Callers that scope a cached result to an account cannot derive that
+     * account by asking the selector themselves: between their question and
+     * this one, an env token can cross its expiry buffer or a login can
+     * change, and then the answer is filed under a credential that did not
+     * make the request. This is the only place that knows, so it is the only
+     * place that should say. (Lumen, #665 r4.)
+     */
+    onCredential?: (token: string | null) => void;
   }
 ): Promise<T> {
   const serverUrl = getInkServerUrl();
@@ -67,6 +78,7 @@ export async function callInkTool<T = Record<string, unknown>>(
   };
 
   const token = await getValidAccessToken(serverUrl);
+  options?.onCredential?.(token);
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }

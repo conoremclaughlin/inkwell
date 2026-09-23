@@ -26,6 +26,7 @@ import {
   RUNNABLE_BACKENDS,
   currentScope,
   currentPrincipal,
+  principalOf,
 } from './agent-backend.js';
 import { BACKEND_NAMES } from './index.js';
 
@@ -35,15 +36,25 @@ const OTHER_ACCOUNT = { serverUrl: 'https://server-a.example.test', principal: '
 
 /** A fetch result in the shape the server path returns. */
 const fetched = (backends: Record<string, string>, ambiguous: string[] = []) =>
-  vi.fn().mockResolvedValue({
+  // `principal` is resolved when the fetch is CALLED, not when the stub is
+  // built, because the real fetch reports whoever it authenticated as at that
+  // moment. Tests that inject an explicit scope are unaffected — the injected
+  // one wins on the write path.
+  vi.fn().mockImplementation(async () => ({
     backends,
     ambiguous,
     sawAnyBackend: Object.keys(backends).length > 0 || ambiguous.length > 0,
-  });
+    principal: currentPrincipal() ?? SCOPE.principal,
+  }));
 
 /** What an older server looks like: identities, none of them with a backend. */
 const oldServer = () =>
-  vi.fn().mockResolvedValue({ backends: {}, ambiguous: [], sawAnyBackend: false });
+  vi.fn().mockImplementation(async () => ({
+    backends: {},
+    ambiguous: [],
+    sawAnyBackend: false,
+    principal: currentPrincipal() ?? SCOPE.principal,
+  }));
 
 const cacheOf = (
   backends: Record<string, string>,
@@ -253,32 +264,90 @@ describe('principal, derived from the real credential', () => {
     expect(dead, 'an expired env token still named its account').not.toBe(live);
   });
 
-  it('binds the cache write to the principal in force after the request', async () => {
-    // The pre-request principal and the post-request one are normally equal.
-    // When they are not — the credential changed while the call was in flight —
-    // the response belongs to whoever the request authenticated as, and filing
-    // it under the earlier guess puts one account's answers under another.
-    let stored: { scope?: { principal?: string }; backends: Record<string, string> } | null = null;
-    const writeCache = (entry: unknown, scope?: object) => {
-      stored = { scope, ...(entry as object) } as typeof stored;
-    };
+  it('files the answer under the credential that was ON THE WIRE', async () => {
+    // The previous version of this test changed the credential inside an
+    // injected fetch and then asserted the write matched currentPrincipal()
+    // afterwards — which asserts the code does what it does. It never measured
+    // which credential authenticated. Lumen said so, and he was right.
+    //
+    // This one reads the Authorization header the real client sent, and
+    // requires the cache scope to match THAT, not whatever the selector says
+    // once the response is back.
+    const realFetch = globalThis.fetch;
+    const originalEnv = process.env.INK_ACCESS_TOKEN;
+    let sentAuthorization: string | null = null;
+    let stored: { scope?: { principal?: string } } | null = null;
 
-    process.env.INK_ACCESS_TOKEN = token('synthetic-user-a');
-    const before = currentPrincipal();
+    try {
+      process.env.INK_ACCESS_TOKEN = token('synthetic-user-a');
 
+      globalThis.fetch = (async (_url: string, init?: { headers?: Record<string, string> }) => {
+        sentAuthorization = init?.headers?.Authorization ?? null;
+        // The credential changes while the response is in flight — a login
+        // elsewhere, or an env token crossing its expiry buffer.
+        process.env.INK_ACCESS_TOKEN = token('synthetic-user-b');
+        return {
+          ok: true,
+          headers: { get: () => 'application/json' },
+          json: async () => ({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    identities: [{ id: 'i1', sbSlug: 'fixture', backend: 'codex' }],
+                  }),
+                },
+              ],
+            },
+          }),
+          text: async () => '',
+        };
+      }) as unknown as typeof globalThis.fetch;
+
+      const result = await lookupAgentBackend('fixture', {
+        readCache: () => null,
+        writeCache: (_entry, scope) => {
+          stored = { scope };
+        },
+      });
+
+      expect(result.backend, 'the lookup did not complete').toBe('codex');
+      expect(sentAuthorization, 'no Authorization header was sent').toBeTruthy();
+
+      const onTheWire = principalOf(String(sentAuthorization).replace(/^Bearer /, ''));
+      const afterTheCall = currentPrincipal();
+
+      // The premise of the test: the two genuinely differ here.
+      expect(afterTheCall, 'the credential did not change mid-call').not.toBe(onTheWire);
+      expect(
+        stored!.scope?.principal,
+        'the answer was filed under a credential that never made the request'
+      ).toBe(onTheWire);
+    } finally {
+      globalThis.fetch = realFetch;
+      if (originalEnv === undefined) delete process.env.INK_ACCESS_TOKEN;
+      else process.env.INK_ACCESS_TOKEN = originalEnv;
+    }
+  });
+
+  it('declines to cache when nothing can say who the request spoke for', async () => {
+    // Filing an answer under a guess is the failure this whole thread is
+    // about. One uncached lookup is the cheaper mistake.
+    const writeCache = vi.fn();
     await lookupAgentBackend('fixture', {
       readCache: () => null,
       writeCache,
-      // The credential changes during the call, as a re-login elsewhere would.
-      fetch: async () => {
-        process.env.INK_ACCESS_TOKEN = token('synthetic-user-b');
-        return { backends: { fixture: 'codex' }, ambiguous: [], sawAnyBackend: true };
-      },
+      fetch: async () => ({
+        backends: { fixture: 'codex' },
+        ambiguous: [],
+        sawAnyBackend: true,
+        // no principal — the fetch could not report one
+      }),
     });
-
-    const after = currentPrincipal();
-    expect(after).not.toBe(before);
-    expect(stored!.scope?.principal, 'the write used the pre-request principal').toBe(after);
+    expect(writeCache).not.toHaveBeenCalled();
   });
 
   it('records different principals for different accounts', () => {

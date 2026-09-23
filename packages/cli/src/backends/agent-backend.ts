@@ -98,6 +98,15 @@ export interface Scope {
 }
 
 export interface AgentBackendFetch {
+  /**
+   * The account this fetch ACTUALLY authenticated as, reported by the call
+   * that set the Authorization header. Not derived by asking the selector
+   * again: between two questions an env token can cross its expiry buffer or
+   * a login can change, and the second answer is then a different account from
+   * the one that made the request. Round 3 moved that guess from before the
+   * request to after it, which is the same guess. (Lumen, #665 r4.)
+   */
+  principal?: string;
   backends: Record<string, string>;
   /** Slugs that resolved to more than one identity — deliberately unanswerable. */
   ambiguous: string[];
@@ -121,6 +130,12 @@ export interface AgentBackendFetch {
  * Hashed because the cache file has no business holding a user id in order to
  * answer a question that only needs "same or not".
  */
+/** Fingerprint of whoever a given token speaks for. */
+export function principalOf(token: string | null | undefined): string | undefined {
+  const sub = decodeJwtPayload(token ?? '')?.sub;
+  return sub ? createHash('sha256').update(sub).digest('hex').slice(0, 16) : undefined;
+}
+
 export function currentPrincipal(): string | undefined {
   // selectCredential, not a restatement of its precedence. Round 2 read
   // INK_ACCESS_TOKEN unconditionally; the real selector SKIPS a provably
@@ -128,8 +143,7 @@ export function currentPrincipal(): string | undefined {
   // for one account and valid stored auth for another, the request went out as
   // the second while the cache was keyed to the first — serving and storing
   // under the wrong identity. (Lumen, #665 r3.)
-  const sub = decodeJwtPayload(selectCredential()?.token ?? '')?.sub;
-  return sub ? createHash('sha256').update(sub).digest('hex').slice(0, 16) : undefined;
+  return principalOf(selectCredential()?.token);
 }
 
 /**
@@ -265,10 +279,17 @@ interface IdentityRow {
  * answer than an arbitrary one. (Lumen, #665 r1.)
  */
 export async function fetchAgentBackends(): Promise<AgentBackendFetch> {
+  let authenticatedAs: string | undefined;
   const result = await callInkTool<{ identities?: IdentityRow[]; user?: { id?: string } }>(
     'list_identities',
     {},
-    { timeoutMs: FETCH_TIMEOUT_MS, callerProfile: 'runtime' }
+    {
+      timeoutMs: FETCH_TIMEOUT_MS,
+      callerProfile: 'runtime',
+      onCredential: (token) => {
+        authenticatedAs = principalOf(token);
+      },
+    }
   );
 
   const seen = new Map<string, string | null>();
@@ -294,7 +315,7 @@ export async function fetchAgentBackends(): Promise<AgentBackendFetch> {
     sawAnyBackend = true;
     if (!ambiguous.has(slug)) backends[slug] = backend;
   }
-  return { backends, ambiguous: [...ambiguous], sawAnyBackend };
+  return { principal: authenticatedAs, backends, ambiguous: [...ambiguous], sawAnyBackend };
 }
 
 export interface AgentBackendLookup {
@@ -369,18 +390,23 @@ export async function lookupAgentBackend(
       return { source: 'none' };
     }
 
-    // Bind the write to the principal in force AFTER the request, not the one
-    // computed before it. They are normally the same; when they are not, the
-    // response belongs to whoever the request actually authenticated as, and
-    // storing it under the earlier guess files one account's answers under
-    // another. An injected scope still wins, so tests stay in control.
-    const writeScope = deps.scope ?? currentScope();
-
-    // Replace the cache before answering. A slug that has BECOME ambiguous is
-    // absent from the fresh map, so writing it removes the old unambiguous
-    // entry — otherwise the next offline lookup would resurrect an answer the
-    // server has already stopped standing behind. (Lumen, #665 r2.)
-    writeCache(entry, writeScope);
+    // File the answer under the account that ACTUALLY made the request, as
+    // reported by the call that set the Authorization header. Round 3 asked
+    // the selector again after the response, which is not the same thing: an
+    // env token crossing its expiry buffer mid-flight, or a login changing,
+    // makes the post-request answer a different account from the one on the
+    // wire. If nothing can say who the request spoke for, we decline to cache
+    // rather than file it under a guess — the cost is one uncached lookup.
+    // (Lumen, #665 r4.)
+    const writeScope =
+      deps.scope ?? (fresh?.principal ? { ...scope, principal: fresh.principal } : null);
+    if (writeScope) {
+      // Replace the cache before answering. A slug that has BECOME ambiguous
+      // is absent from the fresh map, so writing it removes the old
+      // unambiguous entry — otherwise the next offline lookup would resurrect
+      // an answer the server has already stopped standing behind. (r2.)
+      writeCache(entry, writeScope);
+    }
     if (ambiguous.includes(slug)) {
       return { source: 'server', ambiguous: true };
     }
