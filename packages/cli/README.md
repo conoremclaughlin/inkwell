@@ -187,7 +187,7 @@ echo "explain this" | sb        # Pipe input as prompt
 | `--sb-verbose`              | Show SB verbose output                                     | off                                    |
 | `--session-candidates`      | Print picker candidates and exit                           | off                                    |
 | `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                    |
-| `--dangerous`               | Skip all permission prompts (maps to backend auto-approve) | off                                    |
+| `--yolo`                    | Skip all permission prompts (maps to backend auto-approve) | off                                    |
 
 Any flag not listed above is forwarded to the backend.
 
@@ -403,7 +403,9 @@ sb permissions reset         # Remove all rules (Claude will prompt for everythi
 - **Allow**: `Bash(*)`, `Edit(*)`, `Write(*)`, `Read(*)`, `WebFetch(*)`, MCP tools — no prompts for normal dev work
 - **Deny**: `rm -rf`, `git push --force`, `git reset --hard`, `git clean -f` — always blocked
 
-> ⚠️ **`--dangerous` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
+> ⚠️ **`--yolo` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
+>
+> It was called `--dangerous` until 2026-09-22. That spelling still works and always will — it is in shell history and in hook commands already written to disk — but it is hidden from `--help`, and using it prints a one-line note. The banner the flag prints still says DANGEROUS: the shorter name does not make the behaviour milder. Codex and Gemini both call their equivalent `--yolo`, so this also stops `ink` being the odd one out.
 
 ### Mission Control (`sb mission`)
 

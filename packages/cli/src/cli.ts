@@ -16,7 +16,7 @@
  *   ink session list            List sessions
  */
 
-import { program } from 'commander';
+import { program, Option } from 'commander';
 import chalk from 'chalk';
 import { registerStudioCommands } from './commands/studio.js';
 import { registerWorkspaceCommands } from './commands/workspace.js';
@@ -68,6 +68,10 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
   '--session-candidates-all': { hasValue: false, key: 'sessionCandidatesAll' },
   '--session-choice': { hasValue: true, key: 'sessionChoice' },
   '--sb-debug': { hasValue: false, key: 'sbDebug' },
+  '--yolo': { hasValue: false, key: 'dangerous' },
+  // Kept forever, hidden from help. It is in muscle memory, in shell
+  // history, and baked into hook commands already written to disk — a
+  // hard removal turns those into "unknown option" at the worst moment.
   '--dangerous': { hasValue: false, key: 'dangerous' },
 };
 
@@ -84,6 +88,8 @@ interface ParsedArgs {
     sessionChoice: string | undefined;
     sbDebug: boolean;
     dangerous: boolean;
+    /** True when the deprecated `--dangerous` spelling was the one used. */
+    dangerousAlias: boolean;
   };
   passthroughArgs: string[];
   promptParts: string[];
@@ -132,6 +138,7 @@ export function extractArgs(argv: string[]): ParsedArgs {
     sessionChoice: undefined,
     sbDebug: false,
     dangerous: false,
+    dangerousAlias: false,
   };
   const passthroughArgs: string[] = [];
   const promptParts: string[] = [];
@@ -156,7 +163,10 @@ export function extractArgs(argv: string[]): ParsedArgs {
         else if (flag.key === 'sessionCandidatesJson') sbOptions.sessionCandidatesJson = true;
         else if (flag.key === 'sessionCandidatesAll') sbOptions.sessionCandidatesAll = true;
         else if (flag.key === 'sbDebug') sbOptions.sbDebug = true;
-        else if (flag.key === 'dangerous') sbOptions.dangerous = true;
+        else if (flag.key === 'dangerous') {
+          sbOptions.dangerous = true;
+          if (arg === '--dangerous') sbOptions.dangerousAlias = true;
+        }
       }
     } else if (arg === '--') {
       // Explicit passthrough boundary — everything after goes to claude
@@ -212,7 +222,8 @@ program
   .option('--session-choice <choice>', 'Force session selection (new | ink:<id> | local:<id>)')
   .option('--sb-debug', 'Enable debug logging to ~/.ink/logs/sb-debug.log')
   .option('--sb-verbose', 'Verbose SB output')
-  .option('--dangerous', 'Skip all permission prompts (maps to backend-native auto-approve)')
+  .option('--yolo', 'Skip all permission prompts (maps to backend-native auto-approve)')
+  .addOption(new Option('--dangerous', 'Deprecated alias for --yolo').hideHelp())
   .argument('[prompt...]', 'Prompt to send (omit for interactive)')
   .action(async () => {
     // We parse argv ourselves for clean passthrough — Commander's parsed
@@ -245,6 +256,13 @@ program
             ' All permission prompts will be skipped. The backend can execute any tool without confirmation.'
           )
       );
+      // The banner keeps the old word deliberately. --yolo is easier to type;
+      // what it switches off is not less dangerous for having a shorter name.
+      if (resolvedOptions.dangerousAlias) {
+        console.log(
+          chalk.dim('           --dangerous is now --yolo (the old spelling still works)')
+        );
+      }
     }
     await maybeWarnServerUpdate();
     sbDebugLog('sb', 'parsed_args', {
