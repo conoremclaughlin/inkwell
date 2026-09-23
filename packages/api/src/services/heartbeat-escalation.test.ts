@@ -666,11 +666,11 @@ describe('heartbeat escalation', () => {
     });
 
     /**
-     * The regression for 2026-09-23. Three `scheduled_reminders` rows were
-     * titled "Daily check-in" — two active, owned by different SBs, on
-     * different slots. The alert quoted the title alone, so the SB who received
-     * one read it as her own beat and published a timeline explaining why a
-     * reminder she owned had run at a time it never ran at. It was not her beat.
+     * The regression for 2026-09-23. Several `scheduled_reminders` rows shared
+     * one title across two different owners, and the alert quoted the title
+     * alone — so the SB who received one read it as her own beat and published a
+     * timeline explaining why a reminder she owned had run at a time it never
+     * ran at. It was not her beat.
      *
      * The discriminating input is two reminders that differ ONLY in the fields
      * the alert used to drop. A fixture varying the title as well would pass
@@ -688,15 +688,15 @@ describe('heartbeat escalation', () => {
 
       const hers = makeReminder({
         id: 'rem-hers',
-        title: 'Daily check-in',
+        title: 'Morning sweep',
         sb_id: 'sb-myra-uuid',
-        cron_expression: '0 9 * * *',
+        cron_expression: '20 4 * * *',
       });
       const mine = makeReminder({
         id: 'rem-mine',
-        title: 'Daily check-in',
+        title: 'Morning sweep',
         sb_id: 'sb-wren-uuid',
-        cron_expression: '45 8 * * *',
+        cron_expression: '5 3 * * *',
       });
 
       await onFailure(hers, AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
@@ -706,9 +706,9 @@ describe('heartbeat escalation', () => {
 
       // Each alert names its own owner and slot...
       expect(first).toContain('myra');
-      expect(first).toContain('0 9 * * *');
+      expect(first).toContain('20 4 * * *');
       expect(second).toContain('wren');
-      expect(second).toContain('45 8 * * *');
+      expect(second).toContain('5 3 * * *');
 
       // ...and does not claim the other's. This is the half that fails against
       // a title-only alert: both messages were byte-identical, so a reader had
@@ -730,18 +730,18 @@ describe('heartbeat escalation', () => {
 
       await onRecovery(
         makeReminder({
-          title: 'Daily check-in',
+          title: 'Morning sweep',
           sb_id: 'sb-wren-uuid',
-          cron_expression: '45 8 * * *',
+          cron_expression: '5 3 * * *',
         }),
         3,
         FIRST_FOR_DESTINATION
       );
 
       const content = sendToChannel.mock.calls[0][0].content as string;
-      expect(content).toContain('Daily check-in');
+      expect(content).toContain('Morning sweep');
       expect(content).toContain('wren');
-      expect(content).toContain('45 8 * * *');
+      expect(content).toContain('5 3 * * *');
     });
 
     /**
@@ -759,14 +759,14 @@ describe('heartbeat escalation', () => {
       });
 
       await onFailure(
-        makeReminder({ title: 'Daily check-in', sb_id: 'sb-unknown' }),
+        makeReminder({ title: 'Morning sweep', sb_id: 'sb-unknown' }),
         AUTH_ERROR,
         1,
         FIRST_FOR_DESTINATION
       );
 
       const content = sendToChannel.mock.calls[0][0].content as string;
-      expect(content).toContain('Daily check-in');
+      expect(content).toContain('Morning sweep');
       expect(content).toContain('0 * * * *');
       expect(content).not.toContain('null');
       expect(content).not.toContain('undefined');
@@ -782,14 +782,14 @@ describe('heartbeat escalation', () => {
       });
 
       await onFailure(
-        makeReminder({ title: 'Daily check-in', sb_id: 'sb-unknown', cron_expression: null }),
+        makeReminder({ title: 'Morning sweep', sb_id: 'sb-unknown', cron_expression: null }),
         AUTH_ERROR,
         1,
         FIRST_FOR_DESTINATION
       );
 
       const content = sendToChannel.mock.calls[0][0].content as string;
-      expect(content).toContain('"Daily check-in"');
+      expect(content).toContain('"Morning sweep"');
       expect(content).not.toContain('()');
     });
 

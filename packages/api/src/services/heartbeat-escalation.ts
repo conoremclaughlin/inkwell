@@ -228,25 +228,30 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
   };
 
   /**
-   * Which beat this is — because the title alone does not say.
+   * Narrow which beat this is — because the title alone does not.
    *
    * A reminder title is free text with no uniqueness constraint, and in practice
-   * it is not unique. On 2026-09-23 three `scheduled_reminders` rows were titled
-   * "Daily check-in": two active, owned by different SBs, on different slots and
-   * different backends. The alert quoted the title and nothing else, so the SB
-   * who received it read it as her own and spent an entire investigation
-   * explaining why a beat she owned had run at a time it never ran at. The
-   * answer was that it was somebody else's beat.
+   * it is not unique. On 2026-09-23 several `scheduled_reminders` rows shared one
+   * title across two different owners. The alert quoted the title and nothing
+   * else, so the SB who received one read it as her own and spent an entire
+   * investigation explaining why a beat she owned had run at a time it never ran
+   * at. It was somebody else's beat.
    *
-   * Legibility and unambiguity are different properties, and #662 only bought
-   * the first. An alert can be perfectly readable and still name the wrong beat.
+   * #662 made these alerts legible. Legibility did not settle *whose* beat the
+   * alert was about, which is a separate property and the one that failed here.
    *
-   * The owner is what actually disambiguates; the slot is what answers "which
-   * occurrence" once you know whose it is. Both are already on the row — this
-   * costs no extra lookup on the failure path, where the slug is resolved for
-   * the inbox copy regardless. Qualifiers are dropped individually when absent
-   * rather than rendering an empty bracket, because an unresolved owner is a
-   * case this path already handles and must not turn into `(null)` on a phone.
+   * These are qualifiers, not a key. Owner and slot are both already on the row,
+   * so they cost no extra lookup on the failure path, where the slug is resolved
+   * for the inbox copy regardless. Two rows agreeing on title, owner AND cron
+   * still render identically — such rows exist — and the cron names a recurring
+   * slot, not a run, so every occurrence of one beat carries the same label.
+   * What this closes is the collision that actually fired: one title, two
+   * owners. Uniquely identifying a row or a run would take the reminder id or
+   * the fire time, which is a bigger message for a smaller gain.
+   *
+   * Qualifiers are dropped individually when absent rather than rendering an
+   * empty bracket, because an unresolved owner is a case this path already
+   * handles and must not turn into `(null)` on a phone.
    */
   const beatLabel = (reminder: DueReminder, slug: string | null): string => {
     const qualifiers = [slug, reminder.cron_expression].filter((value): value is string => !!value);
@@ -506,9 +511,9 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     const alert = await alertOwnerDirectly(
       reminder,
       // The all-clear has to name the same beat the alarm did. Labelling only
-      // the alarm would leave a reader holding "FAILED: X (wren · 45 8 * * *)"
-      // and a bare "recovered: X" that could be any of the rows sharing that
-      // title — the ambiguity moves rather than closing.
+      // the alarm would leave a reader holding a qualified failure and a bare
+      // "recovered: X" that could be any of the rows sharing that title — the
+      // ambiguity moves rather than closing.
       `✅ Heartbeat recovered: ${beatLabel(reminder, recoveredSlug)}\n\n` +
         `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`
     );
