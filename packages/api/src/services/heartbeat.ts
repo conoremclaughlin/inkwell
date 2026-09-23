@@ -164,6 +164,11 @@ let heartbeatCallback: (() => Promise<void>) | null = null;
  * delivery.
  */
 let lastTickAt: Date | null = null;
+/**
+ * The tick before `lastTickAt`. Only the missed-tick record reads it, and
+ * only to survive the drain ordering described where it is used.
+ */
+let previousTickAt: Date | null = null;
 let lastTickCompletedAt: Date | null = null;
 let lastMissedTickAt: Date | null = null;
 let missedTickCount = 0;
@@ -250,6 +255,7 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
   // clearing the fields is not enough while its last tick is still in flight.
   const generation = ++schedulerGeneration;
   lastTickAt = null;
+  previousTickAt = null;
   lastTickCompletedAt = null;
   lastMissedTickAt = null;
   missedTickCount = 0;
@@ -258,7 +264,10 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
     logger.info('Starting local heartbeat cron scheduler', { interval });
 
     cronTask = cron.schedule(interval, async () => {
-      if (generation === schedulerGeneration) lastTickAt = new Date();
+      if (generation === schedulerGeneration) {
+        previousTickAt = lastTickAt;
+        lastTickAt = new Date();
+      }
       if (heartbeatRunning) {
         logger.debug('Heartbeat tick skipped — previous tick still running');
         return;
@@ -309,10 +318,35 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
       const detectedAt = new Date();
       missedTickCount += 1;
       lastMissedTickAt = detectedAt;
+      /*
+       * How long we were silent — and the reason it is not simply
+       * `detectedAt - lastTickAt`.
+       *
+       * When the event loop unblocks, the missed events and the recovery tick
+       * both come off the queue, and node-cron decides the order. We have seen
+       * both. If the events drain first, `lastTickAt` is still the last HEALTHY
+       * tick and the subtraction is the gap. If the recovery tick drains first,
+       * `lastTickAt` IS that tick — it landed a millisecond ago — and the same
+       * subtraction reports a two-millisecond gap for a host that was asleep
+       * for an hour. That is the field's entire job, inverted, and it is how
+       * this surfaced: CI caught `expected 2 to be >= 2000` while the same test
+       * passed six times out of six locally, because the ordering is timing.
+       *
+       * The distance from `previousTickAt` to `lastTickAt` covers the second
+       * case exactly, so the larger of the two is right in both, with no
+       * tolerance window and no dependence on an ordering we do not control.
+       */
+      const sinceLastTick = lastTickAt ? detectedAt.getTime() - lastTickAt.getTime() : null;
+      const acrossRecoveryTick =
+        lastTickAt && previousTickAt ? lastTickAt.getTime() - previousTickAt.getTime() : null;
+      const observedGaps = [sinceLastTick, acrossRecoveryTick].filter(
+        (value): value is number => value !== null
+      );
+
       logger.warn('Heartbeat tick missed — the scheduler did not run on schedule', {
         detectedAt: detectedAt.toISOString(),
         lastTickAt: lastTickAt?.toISOString() ?? null,
-        sinceLastTickMs: lastTickAt ? detectedAt.getTime() - lastTickAt.getTime() : null,
+        sinceLastTickMs: observedGaps.length ? Math.max(...observedGaps) : null,
         missedTickCount,
         // The overwhelmingly likely cause on a laptop, and the one worth ruling
         // in or out first: check `pmset -g log` for a Sleep spanning the gap.

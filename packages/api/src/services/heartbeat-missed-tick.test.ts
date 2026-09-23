@@ -94,10 +94,22 @@ describe('heartbeat scheduler liveness (real node-cron)', () => {
 
     // The record has to say how long the gap was, or it cannot distinguish a
     // one-slot hiccup from a host asleep for an hour.
-    const [, meta] = missedWarnings()[0] as [string, Record<string, unknown>];
-    expect(meta.sinceLastTickMs).toBeGreaterThanOrEqual(2000);
-    expect(meta.lastTickAt).toEqual(expect.any(String));
-    expect(meta.missedTickCount).toBeGreaterThan(0);
+    //
+    // EVERY record in the burst, not just the first. This assertion used to
+    // read missedWarnings()[0] and assume it carried the big number, which is
+    // how it failed in CI with `expected 2 to be >= 2000` while passing six
+    // times out of six locally: the order node-cron drains the missed events
+    // and the recovery tick is timing, and when the tick wins, a naive
+    // `now - lastTickAt` measures from the recovery rather than from the last
+    // healthy beat. Both orderings are driven deliberately in
+    // heartbeat-missed-tick-gap.test.ts; here we just require that whichever
+    // one this run happened to take, every record is right.
+    for (const [i, call] of missedWarnings().entries()) {
+      const [, meta] = call as [string, Record<string, unknown>];
+      expect(meta.sinceLastTickMs as number, `record ${i}`).toBeGreaterThanOrEqual(2000);
+      expect(meta.lastTickAt, `record ${i}`).toEqual(expect.any(String));
+      expect(meta.missedTickCount as number, `record ${i}`).toBeGreaterThan(0);
+    }
   }, 30000);
 
   it('stays silent while ticks are landing on time', async () => {
