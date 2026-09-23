@@ -25,15 +25,25 @@ import {
   writeAgentBackendCache,
   RUNNABLE_BACKENDS,
   currentScope,
+  currentPrincipal,
 } from './agent-backend.js';
 import { BACKEND_NAMES } from './index.js';
 
-const SCOPE = { serverUrl: 'https://server-a.example.test' };
-const OTHER_SCOPE = { serverUrl: 'https://server-b.example.test' };
+const SCOPE = { serverUrl: 'https://server-a.example.test', principal: 'principal-one' };
+const OTHER_SERVER = { serverUrl: 'https://server-b.example.test', principal: 'principal-one' };
+const OTHER_ACCOUNT = { serverUrl: 'https://server-a.example.test', principal: 'principal-two' };
 
 /** A fetch result in the shape the server path returns. */
 const fetched = (backends: Record<string, string>, ambiguous: string[] = []) =>
-  vi.fn().mockResolvedValue({ backends, ambiguous, userId: 'user-1' });
+  vi.fn().mockResolvedValue({
+    backends,
+    ambiguous,
+    sawAnyBackend: Object.keys(backends).length > 0 || ambiguous.length > 0,
+  });
+
+/** What an older server looks like: identities, none of them with a backend. */
+const oldServer = () =>
+  vi.fn().mockResolvedValue({ backends: {}, ambiguous: [], sawAnyBackend: false });
 
 const cacheOf = (
   backends: Record<string, string>,
@@ -126,10 +136,10 @@ describe('cache file', () => {
 
   it('round-trips, scope included', () => {
     const path = join(dir, 'agent-backends.json');
-    writeAgentBackendCache({ lumen: 'codex' }, { ...SCOPE, userId: 'user-1' }, path);
+    writeAgentBackendCache({ backends: { lumen: 'codex' }, ambiguous: [] }, SCOPE, path);
     const back = readAgentBackendCache(path);
     expect(back?.backends).toEqual({ lumen: 'codex' });
-    expect(back?.scope).toEqual({ ...SCOPE, userId: 'user-1' });
+    expect(back?.scope).toEqual(SCOPE);
   });
 
   it('treats a syntactically corrupt file as a miss instead of throwing', () => {
@@ -146,10 +156,89 @@ describe('cache file', () => {
     expect(readAgentBackendCache(path)).toBeNull();
   });
 
+  it('preserves refusals through a real write/read round-trip', () => {
+    // Every lookup test injects its own writeCache, so the REAL writer is
+    // unexercised there — dropping `ambiguous` from it turned nothing red.
+    const path = join(dir, 'agent-backends.json');
+    writeAgentBackendCache({ backends: { lumen: 'codex' }, ambiguous: ['echo'] }, SCOPE, path);
+    expect(readAgentBackendCache(path)?.ambiguous).toEqual(['echo']);
+  });
+
   it('creates the directory when ~/.ink does not exist yet', () => {
     const path = join(dir, 'nested', 'agent-backends.json');
-    writeAgentBackendCache({ wren: 'claude-code' }, SCOPE, path);
+    writeAgentBackendCache({ backends: { wren: 'claude-code' }, ambiguous: [] }, SCOPE, path);
     expect(existsSync(path)).toBe(true);
+  });
+});
+
+/** A synthetic unsigned JWT — only the `sub` claim is read. */
+const token = (sub: string) =>
+  [
+    Buffer.from(JSON.stringify({ alg: 'none' })).toString('base64url'),
+    Buffer.from(JSON.stringify({ sub, exp: Math.floor(Date.now() / 1000) + 3600 })).toString(
+      'base64url'
+    ),
+    'synthetic-signature',
+  ].join('.');
+
+describe('principal, derived from the real credential', () => {
+  // Every other test injects `scope`, which would stay green if the token were
+  // never read at all. These drive it the way production does, and they need
+  // BOTH poles: "a different account misses" is also satisfied by a cache that
+  // is never usable, so the same-account HIT is what proves derivation works.
+  const original = process.env.INK_ACCESS_TOKEN;
+  afterEach(() => {
+    if (original === undefined) delete process.env.INK_ACCESS_TOKEN;
+    else process.env.INK_ACCESS_TOKEN = original;
+  });
+
+  it('reuses its own cache offline, and refuses another account\u2019s', async () => {
+    let stored: unknown = null;
+    const readCache = () => stored as never;
+    const writeCache = (entry: unknown, scope?: object) => {
+      stored = { fetchedAt: new Date().toISOString(), scope, ...(entry as object) };
+    };
+
+    process.env.INK_ACCESS_TOKEN = token('synthetic-user-a');
+    const filled = await lookupAgentBackend('fixture', {
+      readCache,
+      writeCache,
+      fetch: fetched({ fixture: 'codex' }),
+    });
+    expect(filled.backend).toBe('codex');
+    expect(
+      (stored as { scope?: { principal?: string } }).scope?.principal,
+      'no principal was recorded, so the token is not being read'
+    ).toBeTruthy();
+
+    // POSITIVE pole: same account, server unreachable — the cache is ours.
+    const mine = await lookupAgentBackend('fixture', {
+      readCache,
+      writeCache,
+      fetch: vi.fn().mockRejectedValue(new Error('offline')),
+    });
+    expect(mine.backend, 'an account could not read back its own cache').toBe('codex');
+
+    // NEGATIVE pole: different account on the same server.
+    process.env.INK_ACCESS_TOKEN = token('synthetic-user-b');
+    const theirs = await lookupAgentBackend('fixture', {
+      readCache,
+      writeCache,
+      fetch: vi.fn().mockRejectedValue(new Error('offline')),
+    });
+    expect(theirs.backend, "another account read this account's cache").toBeUndefined();
+  });
+
+  it('records different principals for different accounts', () => {
+    process.env.INK_ACCESS_TOKEN = token('synthetic-user-a');
+    const a = currentPrincipal();
+    process.env.INK_ACCESS_TOKEN = token('synthetic-user-b');
+    const b = currentPrincipal();
+    expect(a).toBeTruthy();
+    expect(b).toBeTruthy();
+    expect(a).not.toBe(b);
+    // Hashed: the file has no business holding a user id to answer "same or not".
+    expect(a).not.toContain('synthetic-user-a');
   });
 });
 
@@ -183,7 +272,7 @@ describe('lookupAgentBackend', () => {
       scope: SCOPE,
     });
     expect(r).toEqual({ backend: 'codex', source: 'server' });
-    expect(writeCache).toHaveBeenCalledWith({ lumen: 'codex' }, { ...SCOPE, userId: 'user-1' });
+    expect(writeCache).toHaveBeenCalledWith({ backends: { lumen: 'codex' }, ambiguous: [] }, SCOPE);
   });
 
   it('falls back to a STALE but in-scope cache when the server is unreachable', async () => {
@@ -201,7 +290,7 @@ describe('lookupAgentBackend', () => {
   it('does NOT use another server’s cache, fresh or stale', async () => {
     // A backend is only meaningful inside the scope that produced it. Pointing
     // the CLI at a different server makes the same slug a different being.
-    const other = cacheOf({ lumen: 'codex' }, { scope: OTHER_SCOPE });
+    const other = cacheOf({ lumen: 'codex' }, { scope: OTHER_SERVER });
 
     const served = await lookupAgentBackend('lumen', {
       readCache: () => other,
@@ -230,8 +319,8 @@ describe('lookupAgentBackend', () => {
     const original = process.env.INK_SERVER_URL;
     let stored: { scope?: object; backends: Record<string, string> } | null = null;
     const readCache = () => (stored ? { fetchedAt: new Date().toISOString(), ...stored } : null);
-    const writeCache = (backends: Record<string, string>, scope?: object) => {
-      stored = { scope, backends };
+    const writeCache = (entry: { backends: Record<string, string> }, scope?: object) => {
+      stored = { scope, backends: entry.backends };
     };
     try {
       process.env.INK_SERVER_URL = 'https://server-a.example.test';
@@ -253,6 +342,118 @@ describe('lookupAgentBackend', () => {
       if (original === undefined) delete process.env.INK_SERVER_URL;
       else process.env.INK_SERVER_URL = original;
     }
+  });
+
+  it('does NOT use another ACCOUNT\u2019s cache on the same server', async () => {
+    // Round 2 recorded a userId and never compared it, so a re-login on the
+    // same server still hit the previous account's cache — fresh AND stale.
+    // The field made the record look scoped while doing nothing.
+    const theirs = cacheOf({ lumen: 'codex' }, { scope: OTHER_ACCOUNT });
+
+    const served = await lookupAgentBackend('lumen', {
+      readCache: () => theirs,
+      writeCache: vi.fn(),
+      fetch: fetched({ lumen: 'claude' }),
+      scope: SCOPE,
+    });
+    expect(served).toEqual({ backend: 'claude', source: 'server' });
+
+    const offline = await lookupAgentBackend('lumen', {
+      readCache: () => theirs,
+      writeCache: vi.fn(),
+      fetch: vi.fn().mockRejectedValue(new Error('ECONNREFUSED')),
+      scope: SCOPE,
+    });
+    expect(offline, "another account's cache answered").toEqual({ source: 'none' });
+  });
+
+  it('fails closed when either side cannot name its principal', async () => {
+    // An unauthenticated CLI cannot claim a cache. It costs nothing: it could
+    // not have reached the server to fill one either.
+    const anonymousNow = await lookupAgentBackend('lumen', {
+      readCache: () => cacheOf({ lumen: 'codex' }),
+      writeCache: vi.fn(),
+      fetch: vi.fn().mockRejectedValue(new Error('ECONNREFUSED')),
+      scope: { serverUrl: SCOPE.serverUrl },
+    });
+    expect(anonymousNow).toEqual({ source: 'none' });
+
+    const anonymousCache = await lookupAgentBackend('lumen', {
+      readCache: () => cacheOf({ lumen: 'codex' }, { scope: { serverUrl: SCOPE.serverUrl } }),
+      writeCache: vi.fn(),
+      fetch: vi.fn().mockRejectedValue(new Error('ECONNREFUSED')),
+      scope: SCOPE,
+    });
+    expect(anonymousCache).toEqual({ source: 'none' });
+  });
+
+  it('drops a cached backend once the slug becomes ambiguous', async () => {
+    // Otherwise the next OFFLINE lookup resurrects an answer the server has
+    // already stopped standing behind. (Lumen, #665 r2.)
+    let stored = cacheOf({ lumen: 'codex', other: 'claude' }, { age: '2020-01-01T00:00:00Z' });
+    const readCache = () => stored;
+    const writeCache = (
+      entry: { backends: Record<string, string>; ambiguous: string[] },
+      scope?: object
+    ) => {
+      stored = { fetchedAt: new Date().toISOString(), scope, ...entry } as typeof stored;
+    };
+
+    const refused = await lookupAgentBackend('lumen', {
+      readCache,
+      writeCache,
+      fetch: fetched({ other: 'claude' }, ['lumen']),
+      scope: SCOPE,
+    });
+    expect(refused.ambiguous).toBe(true);
+    expect(stored.backends, 'the stale entry survived the refusal').not.toHaveProperty('lumen');
+
+    const offline = await lookupAgentBackend('lumen', {
+      readCache,
+      writeCache: vi.fn(),
+      fetch: vi.fn().mockRejectedValue(new Error('ECONNREFUSED')),
+      scope: SCOPE,
+    });
+    expect(offline.backend, 'an ambiguous slug was resurrected offline').toBeUndefined();
+  });
+
+  it('keeps the ambiguity marker when another slug repopulates the cache', async () => {
+    // Look up 'other', which succeeds and writes the cache. The refusal for
+    // 'fixture' travelled in the same response and must land in the cache with
+    // it, or the next lookup of 'fixture' degrades from "ambiguous" to silence.
+    let stored: unknown = null;
+    const readCache = () => stored as never;
+    const writeCache = (entry: unknown, scope?: object) => {
+      stored = { fetchedAt: new Date().toISOString(), scope, ...(entry as object) };
+    };
+
+    await lookupAgentBackend('other', {
+      readCache,
+      writeCache,
+      fetch: fetched({ other: 'claude' }, ['fixture']),
+      scope: SCOPE,
+    });
+
+    const result = await lookupAgentBackend('fixture', {
+      readCache,
+      writeCache,
+      fetch: vi.fn(), // must not be needed: the cache is fresh and in scope
+      scope: SCOPE,
+    });
+    expect(result.ambiguous, 'the refusal was lost when the cache was written').toBe(true);
+  });
+
+  it('caches a real answer even when every slug in it is ambiguous', async () => {
+    // An empty map is NOT the old-server signal — all-ambiguous empties it too,
+    // and that is a real answer whose absence must reach the cache.
+    const writeCache = vi.fn();
+    await lookupAgentBackend('lumen', {
+      readCache: () => null,
+      writeCache,
+      fetch: fetched({}, ['lumen']),
+      scope: SCOPE,
+    });
+    expect(writeCache).toHaveBeenCalled();
   });
 
   it('treats a cache with no recorded scope as inapplicable', async () => {
@@ -289,7 +490,7 @@ describe('lookupAgentBackend', () => {
     const r = await lookupAgentBackend('lumen', {
       readCache: () => null,
       writeCache,
-      fetch: fetched({}),
+      fetch: oldServer(),
       scope: SCOPE,
     });
     expect(writeCache).not.toHaveBeenCalled();
@@ -301,7 +502,7 @@ describe('lookupAgentBackend', () => {
     const r = await lookupAgentBackend('lumen', {
       readCache: () => cacheOf({ lumen: 'codex' }, { age: '2020-01-01T00:00:00Z' }),
       writeCache,
-      fetch: fetched({}),
+      fetch: oldServer(),
       scope: SCOPE,
     });
     expect(writeCache).not.toHaveBeenCalled();

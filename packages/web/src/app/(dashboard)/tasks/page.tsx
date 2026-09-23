@@ -739,7 +739,10 @@ function UngroupedStatusSection({
   onStatusChange,
   defaultCollapsed,
 }: {
-  status: Task['status'];
+  // `string`, not Task['status']: the server can send a status outside the
+  // union and this section exists to render it rather than drop it. The union
+  // is what we intend, not what arrives.
+  status: string;
   tasks: Task[];
   onStatusChange: (id: string, status: Task['status']) => void;
   defaultCollapsed?: boolean;
@@ -891,17 +894,49 @@ export default function TasksPage() {
     });
   }, [grouped]);
 
-  // Group ungrouped by status
+  // Group ungrouped by status.
+  //
+  // A task whose status is outside the four keys below used to throw here —
+  // `groups[task.status]` is undefined and `.push` takes the page down, the
+  // same failure as the priority badge and in the same render. The display
+  // lookups were fixed by routing them through resolveStatus; this one is a
+  // GROUPING lookup and my audit grep, which searched for names ending in
+  // Config/COLORS, never had it in the population. Found by rendering a task
+  // with an unrecognised status rather than by reading.
+  //
+  // Unknown statuses are collected under their own key rather than dropped:
+  // silently omitting a task from every column is how you lose work without
+  // anything appearing wrong.
   const ungroupedByStatus = useMemo(() => {
-    const groups: Record<Task['status'], Task[]> = {
+    const groups: Record<string, Task[]> = {
       in_progress: [],
       pending: [],
       blocked: [],
       completed: [],
     };
-    for (const task of ungrouped) groups[task.status].push(task);
+    for (const task of ungrouped) {
+      const key = task.status;
+      if (!Object.prototype.hasOwnProperty.call(groups, key)) groups[key] = [];
+      groups[key].push(task);
+    }
     return groups;
   }, [ungrouped]);
+
+  /**
+   * The four known statuses in their usual order, followed by any others the
+   * data actually contains.
+   *
+   * Without the tail, a task with an unrecognised status is grouped and then
+   * never rendered, because the column list is a fixed array — it would vanish
+   * from the board while still existing. A task you cannot see is worse than
+   * an oddly-labelled one.
+   */
+  const ungroupedSections = useMemo(() => {
+    const extra = Object.keys(ungroupedByStatus).filter(
+      (status) => !STATUS_DISPLAY_ORDER.includes(status as Task['status'])
+    );
+    return [...STATUS_DISPLAY_ORDER, ...extra];
+  }, [ungroupedByStatus]);
 
   const filterButtons: { key: StatusFilter; label: string; count: number }[] = [
     { key: 'all', label: 'All', count: stats.total },
@@ -1044,11 +1079,11 @@ export default function TasksPage() {
                 </h3>
               </div>
             )}
-            {STATUS_DISPLAY_ORDER.map((status) => (
+            {ungroupedSections.map((status) => (
               <UngroupedStatusSection
                 key={status}
                 status={status}
-                tasks={ungroupedByStatus[status]}
+                tasks={ungroupedByStatus[status] ?? []}
                 onStatusChange={handleStatusChange}
                 defaultCollapsed={status === 'completed'}
               />

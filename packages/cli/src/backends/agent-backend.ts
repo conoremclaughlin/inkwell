@@ -29,7 +29,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
+import { createHash } from 'crypto';
 import { callInkTool } from '../lib/ink-mcp.js';
+import { decodeJwtPayload, loadAuth } from '../auth/tokens.js';
 
 /**
  * Backends this CLI can actually launch: the three adapters plus `ink`, which
@@ -61,15 +63,68 @@ export interface AgentBackendCache {
    * different being. Without this the CLI answered for server B out of server
    * A's cache. (Lumen, #665 r1.)
    */
-  scope?: { serverUrl: string; userId?: string };
+  scope?: Scope;
   backends: Record<string, string>;
+  /**
+   * Slugs the server refused to answer because they name more than one
+   * identity. Persisted, because a refusal is an ANSWER and has to survive the
+   * same way a backend does: without it, an offline lookup after a refusal
+   * degrades from "ambiguous" to "no idea", and a lookup of some other slug
+   * that repopulates the cache silently drops the marker. (Lumen, #665 r2.)
+   */
+  ambiguous?: string[];
+}
+
+/** What a fetch contributes to the cache: answers AND refusals. */
+export interface AgentBackendEntry {
+  backends: Record<string, string>;
+  ambiguous: string[];
+}
+
+export interface Scope {
+  serverUrl: string;
+  /**
+   * Fingerprint of the account the CLI authenticates as — the `sub` of the
+   * token it will actually present, hashed so the file holds something
+   * comparable rather than a user id.
+   *
+   * Round 2 stored a `userId` copied out of the previous RESPONSE and then
+   * never compared it. That is worse than omitting it: the field made the
+   * record look account-scoped while a re-login on the same server still hit
+   * the previous account's cache, fresh or stale. Derived from the current
+   * credential, never from cached data. (Lumen, #665 r2.)
+   */
+  principal?: string;
 }
 
 export interface AgentBackendFetch {
   backends: Record<string, string>;
   /** Slugs that resolved to more than one identity — deliberately unanswerable. */
   ambiguous: string[];
-  userId?: string;
+  /**
+   * Whether ANY identity reported a backend. Distinguishes a server that does
+   * not project the column yet from one where every slug happens to be
+   * ambiguous — both leave `backends` empty, and only the first must suppress
+   * caching.
+   */
+  sawAnyBackend: boolean;
+}
+
+/**
+ * Fingerprint of the account this process will authenticate as.
+ *
+ * Read from the credential the CLI is about to present — the injected
+ * INK_ACCESS_TOKEN if there is one, otherwise the stored token — and never
+ * from anything the cache told us. A principal copied out of a cached response
+ * would only ever prove the cache agrees with itself.
+ *
+ * Hashed because the cache file has no business holding a user id in order to
+ * answer a question that only needs "same or not".
+ */
+export function currentPrincipal(): string | undefined {
+  const token = process.env.INK_ACCESS_TOKEN?.trim() || loadAuth()?.access_token;
+  const sub = token ? decodeJwtPayload(token)?.sub : undefined;
+  return sub ? createHash('sha256').update(sub).digest('hex').slice(0, 16) : undefined;
 }
 
 /**
@@ -83,14 +138,24 @@ export interface AgentBackendFetch {
  * probe hit exactly that. `currentScope.test` pins this against the real
  * getInkServerUrl so the duplicated default cannot drift.
  */
-export function currentScope(): { serverUrl: string } {
-  return { serverUrl: process.env.INK_SERVER_URL || 'http://localhost:3001' };
+export function currentScope(): Scope {
+  return {
+    serverUrl: process.env.INK_SERVER_URL || 'http://localhost:3001',
+    principal: currentPrincipal(),
+  };
 }
 
-function sameScope(cached: AgentBackendCache['scope'], now: { serverUrl: string }): boolean {
-  // An unscoped cache is from before this field existed, or from a writer that
-  // did not record one. Either way we cannot say it belongs here.
-  return !!cached && cached.serverUrl === now.serverUrl;
+/**
+ * Fails closed. A cache is only ours if it names the same server AND the same
+ * principal, and if either side cannot name its principal we cannot claim it.
+ * An unauthenticated CLI therefore never reads the cache — which costs nothing,
+ * because it cannot reach the server to have filled it either.
+ */
+function sameScope(cached: Scope | undefined, now: Scope): boolean {
+  if (!cached) return false;
+  if (cached.serverUrl !== now.serverUrl) return false;
+  if (!cached.principal || !now.principal) return false;
+  return cached.principal === now.principal;
 }
 
 export function agentBackendCachePath(): string {
@@ -143,15 +208,24 @@ export function readAgentBackendCache(path = agentBackendCachePath()): AgentBack
 }
 
 export function writeAgentBackendCache(
-  backends: Record<string, string>,
-  scope?: { serverUrl: string; userId?: string },
+  entry: AgentBackendEntry,
+  scope?: Scope,
   path = agentBackendCachePath()
 ): void {
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(
       path,
-      JSON.stringify({ fetchedAt: new Date().toISOString(), scope, backends }, null, 2),
+      JSON.stringify(
+        {
+          fetchedAt: new Date().toISOString(),
+          scope,
+          backends: entry.backends,
+          ambiguous: entry.ambiguous,
+        },
+        null,
+        2
+      ),
       'utf-8'
     );
   } catch {
@@ -209,10 +283,13 @@ export async function fetchAgentBackends(): Promise<AgentBackendFetch> {
   }
 
   const backends: Record<string, string> = Object.create(null);
+  let sawAnyBackend = false;
   for (const [slug, backend] of seen) {
-    if (backend && !ambiguous.has(slug)) backends[slug] = backend;
+    if (!backend) continue;
+    sawAnyBackend = true;
+    if (!ambiguous.has(slug)) backends[slug] = backend;
   }
-  return { backends, ambiguous: [...ambiguous], userId: result.user?.id };
+  return { backends, ambiguous: [...ambiguous], sawAnyBackend };
 }
 
 export interface AgentBackendLookup {
@@ -238,7 +315,8 @@ export async function lookupAgentBackend(
     writeCache?: typeof writeAgentBackendCache;
     fetch?: typeof fetchAgentBackends;
     now?: number;
-    scope?: { serverUrl: string };
+    /** Full Scope, principal included — sameScope depends on it. */
+    scope?: Scope;
   } = {}
 ): Promise<AgentBackendLookup> {
   const readCache = deps.readCache ?? readAgentBackendCache;
@@ -256,6 +334,7 @@ export async function lookupAgentBackend(
   const usable = cached && sameScope(cached.scope, scope) ? cached : null;
 
   if (usable && isCacheFresh(usable, deps.now)) {
+    if (usable.ambiguous?.includes(slug)) return { source: 'cache', ambiguous: true };
     return classify(pick(usable.backends, slug), 'cache');
   }
 
@@ -266,24 +345,41 @@ export async function lookupAgentBackend(
     // from the server being down.
     const ambiguous = fresh?.ambiguous ?? [];
     const backends = fresh?.backends ?? {};
+    const sawAnyBackend = fresh?.sawAnyBackend ?? Object.keys(backends).length > 0;
+
+    const entry: AgentBackendEntry = { backends, ambiguous };
+
+    if (!sawAnyBackend && ambiguous.length === 0) {
+      // No identity reported a backend at all — what an older server looks
+      // like, deployed before `list_identities` projected the column. Caching
+      // it would pin "nobody has a backend" for a full day, so `ink -a lumen`
+      // would keep starting claude for 24 hours AFTER the upgrade.
+      //
+      // Note this is NOT "backends is empty": every slug being ambiguous also
+      // empties the map, and that IS a real answer which must be cached.
+      if (usable) {
+        if (usable.ambiguous?.includes(slug)) return { source: 'cache', ambiguous: true };
+        return classify(pick(usable.backends, slug), 'cache');
+      }
+      return { source: 'none' };
+    }
+
+    // Replace the cache before answering. A slug that has BECOME ambiguous is
+    // absent from the fresh map, so writing it removes the old unambiguous
+    // entry — otherwise the next offline lookup would resurrect an answer the
+    // server has already stopped standing behind. (Lumen, #665 r2.)
+    writeCache(entry, scope);
     if (ambiguous.includes(slug)) {
       return { source: 'server', ambiguous: true };
     }
-    if (Object.keys(backends).length === 0) {
-      // The server answered, and named no backends at all. That is what an
-      // older server looks like — one deployed before `list_identities`
-      // projected the column. Caching it would pin "nobody has a backend" for
-      // a full day, so `ink -a lumen` would keep starting claude for 24 hours
-      // AFTER the server was upgraded. Treat it exactly like a failed fetch.
-      if (usable) return classify(pick(usable.backends, slug), 'cache');
-      return { source: 'none' };
-    }
-    writeCache(backends, { ...scope, userId: fresh?.userId });
     return classify(pick(backends, slug), 'server');
   } catch {
     // Offline, unauthenticated, or the server is down. A stale cache from THIS
     // scope is still the best information anyone has.
-    if (usable) return classify(pick(usable.backends, slug), 'cache');
+    if (usable) {
+      if (usable.ambiguous?.includes(slug)) return { source: 'cache', ambiguous: true };
+      return classify(pick(usable.backends, slug), 'cache');
+    }
     return { source: 'none' };
   }
 }
