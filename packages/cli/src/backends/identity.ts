@@ -231,6 +231,12 @@ export async function resolveBackend(options: {
       note =
         `${options.agentSlug}'s identity record says backend '${lookup.unrunnable}', ` +
         `which this CLI cannot launch — falling back. Use -b to choose one.`;
+    } else if (lookup.ambiguous) {
+      // A slug is unique within one workspace, not globally. Picking one of
+      // several identities would be a guess, and a silent one.
+      note =
+        `'${options.agentSlug}' names more than one identity, so their backend ` +
+        `is ambiguous — falling back. Use -b to choose one.`;
     }
   }
 

@@ -106,7 +106,13 @@ describe('heartbeat scheduler liveness (real node-cron)', () => {
     // one this run happened to take, every record is right.
     for (const [i, call] of missedWarnings().entries()) {
       const [, meta] = call as [string, Record<string, unknown>];
-      expect(meta.sinceLastTickMs as number, `record ${i}`).toBeGreaterThanOrEqual(2000);
+      // One stall in this test, so exactly one of the two exact intervals
+      // carries it — which one depends on the drain order this run took.
+      const widest = Math.max(
+        (meta.sinceLastTickMs as number) ?? 0,
+        (meta.lastTickGapMs as number) ?? 0
+      );
+      expect(widest, `record ${i}`).toBeGreaterThanOrEqual(2000);
       expect(meta.lastTickAt, `record ${i}`).toEqual(expect.any(String));
       expect(meta.missedTickCount as number, `record ${i}`).toBeGreaterThan(0);
     }

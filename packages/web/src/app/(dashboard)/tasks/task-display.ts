@@ -141,9 +141,27 @@ function rawLabel(value: string): string {
   return trimmed.length > 24 ? `${trimmed.slice(0, 24)}…` : trimmed;
 }
 
+/**
+ * Own properties only.
+ *
+ * `statusConfig[status]` on an ordinary object hands back INHERITED members
+ * too: a task whose status is the string "constructor" retrieves
+ * Object.prototype.constructor, which is a function, so `?? fallback` never
+ * fires — the value is not nullish — and the caller reads `.icon` off a
+ * function and gets undefined. That is the same crash this file exists to
+ * prevent, arriving through the one door the fallback does not cover.
+ *
+ * Lumen fixed this exact shape in deprecatedBackendReason (#585) and found it
+ * here in review of #665, after I had applied the rule in agent-backend.ts and
+ * not in this file — in the same PR.
+ */
+function lookup<T>(table: Record<string, T>, key: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
 export function resolveStatus(status: string | null | undefined): StatusStyle {
   if (!status) return { ...UNKNOWN_STATUS, label: 'Unknown' };
-  return statusConfig[status] ?? { ...UNKNOWN_STATUS, label: rawLabel(status) };
+  return lookup(statusConfig, status) ?? { ...UNKNOWN_STATUS, label: rawLabel(status) };
 }
 
 /**
@@ -153,5 +171,5 @@ export function resolveStatus(status: string | null | undefined): StatusStyle {
  */
 export function resolvePriority(priority: string | null | undefined): PriorityStyle | null {
   if (!priority || priority === DEFAULT_PRIORITY) return null;
-  return priorityConfig[priority] ?? { ...UNKNOWN_PRIORITY, label: rawLabel(priority) };
+  return lookup(priorityConfig, priority) ?? { ...UNKNOWN_PRIORITY, label: rawLabel(priority) };
 }

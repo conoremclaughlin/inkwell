@@ -100,16 +100,40 @@ describe('missed-tick gap, under both drain orderings', () => {
     expect(record.sinceLastTickMs as number).toBeGreaterThanOrEqual(50);
   });
 
-  it('B: still reports the stall when the recovery tick drains first', async () => {
-    // This is the CI failure. Without the fix the record says ~0ms, because
-    // `lastTickAt` is the recovery tick rather than the last healthy one.
+  it('B: the stall is in lastTickGapMs when the recovery tick drains first', async () => {
+    // This is the CI failure. sinceLastTickMs is genuinely tiny here — the last
+    // tick WAS a millisecond ago — and that is the honest number for what it
+    // names. The silence is the interval the recovery tick closed.
     await tick(); // the last healthy tick
     await sleep(60); // the stall
     await tick(); // the RECOVERY tick lands first
     await missed(); // ...and only then does the missed event drain
 
     const [record] = missedRecords();
-    expect(record.sinceLastTickMs as number).toBeGreaterThanOrEqual(50);
+    expect(record.sinceLastTickMs as number).toBeLessThan(50);
+    expect(record.lastTickGapMs as number).toBeGreaterThanOrEqual(50);
+  });
+
+  it('does not reuse a previous larger stall for a new shorter one', async () => {
+    // Lumen's case, and the reason max() of the two is wrong: a 10s stall
+    // followed by a 3s one must report 3s for the second miss. max() reports
+    // 10s, because the first stall's interval is still the larger number and
+    // has nothing to do with the miss being recorded.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      await tick();
+      vi.setSystemTime(new Date('2026-01-01T00:00:10Z'));
+      await missed();
+      expect(missedRecords().at(-1)?.sinceLastTickMs).toBe(10000);
+
+      await tick(); // recovery for the 10s stall
+      vi.setSystemTime(new Date('2026-01-01T00:00:13Z'));
+      await missed();
+      expect(missedRecords().at(-1)?.sinceLastTickMs).toBe(3000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('every record in a burst carries the gap, not just the first', async () => {
@@ -126,7 +150,13 @@ describe('missed-tick gap, under both drain orderings', () => {
     const records = missedRecords();
     expect(records).toHaveLength(3);
     for (const [i, record] of records.entries()) {
-      expect(record.sinceLastTickMs as number, `record ${i}`).toBeGreaterThanOrEqual(50);
+      // One stall, so exactly one of the two intervals carries it — which one
+      // depends on the drain order this run happened to take.
+      const widest = Math.max(
+        (record.sinceLastTickMs as number) ?? 0,
+        (record.lastTickGapMs as number) ?? 0
+      );
+      expect(widest, `record ${i}`).toBeGreaterThanOrEqual(50);
     }
   });
 
@@ -135,6 +165,7 @@ describe('missed-tick gap, under both drain orderings', () => {
     // must say so rather than report a gap measured from the epoch.
     await missed();
     expect(missedRecords()[0].sinceLastTickMs).toBeNull();
+    expect(missedRecords()[0].lastTickGapMs).toBeNull();
     expect(missedRecords()[0].lastTickAt).toBeNull();
   });
 

@@ -248,52 +248,12 @@ export default function SkillsPage() {
             </div>
 
             {/* Type Filter */}
-            <div className="flex items-center gap-2">
-              <Filter className="h-4 w-4 shrink-0 text-gray-400" />
-              <div className="flex min-w-0 flex-wrap gap-1">
-                <Button
-                  variant={typeFilter === 'all' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setTypeFilter('all')}
-                >
-                  All
-                </Button>
-                {Object.entries(typeConfig).map(([type, config]) => (
-                  <Button
-                    key={type}
-                    variant={typeFilter === type ? 'default' : 'outline'}
-                    size="sm"
-                    onClick={() => setTypeFilter(type as SkillType)}
-                    className="gap-1"
-                  >
-                    {config.icon}
-                    {config.label}
-                  </Button>
-                ))}
-              </div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Filters */}
-      <Card className="mt-6">
-        <CardContent className="p-4">
-          <div className="flex flex-col sm:flex-row gap-4">
-            {/* Search */}
-            <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
-              <Input
-                placeholder="Search skills..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="pl-10"
-              />
-            </div>
-
-            {/* Type Filter */}
-            <div className="flex items-center gap-2">
-              <Filter className="h-4 w-4 shrink-0 text-gray-400" />
+            {/* items-start, not items-center: once the buttons wrap to a second
+                row the icon would otherwise float in the vertical middle,
+                detached from the row it labels. mt-2.5 aligns it with the
+                first button's text. */}
+            <div className="flex items-start gap-2">
+              <Filter className="mt-2.5 h-4 w-4 shrink-0 text-gray-400" />
               <div className="flex min-w-0 flex-wrap gap-1">
                 <Button
                   variant={typeFilter === 'all' ? 'default' : 'outline'}

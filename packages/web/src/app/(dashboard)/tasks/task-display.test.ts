@@ -74,6 +74,20 @@ describe('resolvePriority', () => {
     expect(resolvePriority('')).toBeNull();
   });
 
+  it('does not hand back an inherited member for a prototype-named value', () => {
+    // priorityConfig['constructor'] returns Object.prototype.constructor — a
+    // function, so `?? fallback` never fires and the caller reads .bgColor off
+    // it. Same crash, through the one door the fallback does not cover.
+    for (const value of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      const style = resolvePriority(value);
+      expect(style, value).not.toBeNull();
+      expect(style!.label, value).toBe(value);
+      for (const field of PRIORITY_FIELDS) {
+        expect(typeof style![field], `${value}.${field}`).toBe('string');
+      }
+    }
+  });
+
   it('clamps a value long enough to wreck the layout', () => {
     const style = resolvePriority('x'.repeat(500));
     expect(style!.label.length).toBeLessThanOrEqual(25);
@@ -99,6 +113,17 @@ describe('resolveStatus', () => {
       for (const field of STATUS_FIELDS) {
         expect(typeof style[field], `${unknown}.${field}`).toBe('string');
         expect(style[field].length, `${unknown}.${field}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('does not hand back an inherited member for a prototype-named status', () => {
+    for (const value of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      const style = resolveStatus(value);
+      expect(style.icon, value).toBeTruthy();
+      expect(style.label, value).toBe(value);
+      for (const field of STATUS_FIELDS) {
+        expect(typeof style[field], `${value}.${field}`).toBe('string');
       }
     }
   });

@@ -319,34 +319,40 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
       missedTickCount += 1;
       lastMissedTickAt = detectedAt;
       /*
-       * How long we were silent — and the reason it is not simply
-       * `detectedAt - lastTickAt`.
+       * Two exact measurements, and deliberately no third number derived from
+       * them.
        *
        * When the event loop unblocks, the missed events and the recovery tick
-       * both come off the queue, and node-cron decides the order. We have seen
-       * both. If the events drain first, `lastTickAt` is still the last HEALTHY
-       * tick and the subtraction is the gap. If the recovery tick drains first,
-       * `lastTickAt` IS that tick — it landed a millisecond ago — and the same
-       * subtraction reports a two-millisecond gap for a host that was asleep
-       * for an hour. That is the field's entire job, inverted, and it is how
-       * this surfaced: CI caught `expected 2 to be >= 2000` while the same test
-       * passed six times out of six locally, because the ordering is timing.
+       * both come off the queue and node-cron decides the order. If the events
+       * drain first, `lastTickAt` is still the last HEALTHY tick and
+       * `sinceLastTickMs` is the silence. If the recovery tick drains first,
+       * `lastTickAt` IS that tick and the silence is `lastTickGapMs` instead.
        *
-       * The distance from `previousTickAt` to `lastTickAt` covers the second
-       * case exactly, so the larger of the two is right in both, with no
-       * tolerance window and no dependence on an ordering we do not control.
+       * Round 1 of #665 reported max() of the two, which reads as "the gap"
+       * and is not. Consecutive stalls of different lengths break it: a 10s
+       * stall followed by a 3s one reports 10s for the second, because the
+       * first stall's interval is still the larger number and has nothing to
+       * do with the miss being recorded. Lumen built that case; it is now a
+       * test.
+       *
+       * So both intervals are reported under names that say exactly what they
+       * measure, with the timestamps they were measured from. A reader
+       * attributes a stall by comparing timestamps, which is the only thing
+       * that distinguishes consecutive stalls. Inventing a single "gap" field
+       * would be pretending to a precision the drain order does not allow.
        */
-      const sinceLastTick = lastTickAt ? detectedAt.getTime() - lastTickAt.getTime() : null;
-      const acrossRecoveryTick =
+      const sinceLastTickMs = lastTickAt ? detectedAt.getTime() - lastTickAt.getTime() : null;
+      const lastTickGapMs =
         lastTickAt && previousTickAt ? lastTickAt.getTime() - previousTickAt.getTime() : null;
-      const observedGaps = [sinceLastTick, acrossRecoveryTick].filter(
-        (value): value is number => value !== null
-      );
 
       logger.warn('Heartbeat tick missed — the scheduler did not run on schedule', {
         detectedAt: detectedAt.toISOString(),
         lastTickAt: lastTickAt?.toISOString() ?? null,
-        sinceLastTickMs: observedGaps.length ? Math.max(...observedGaps) : null,
+        previousTickAt: previousTickAt?.toISOString() ?? null,
+        /** detectedAt − lastTickAt. The silence, when the events drained first. */
+        sinceLastTickMs,
+        /** lastTickAt − previousTickAt. The silence, when the recovery tick drained first. */
+        lastTickGapMs,
         missedTickCount,
         // The overwhelmingly likely cause on a laptop, and the one worth ruling
         // in or out first: check `pmset -g log` for a Sleep spanning the gap.

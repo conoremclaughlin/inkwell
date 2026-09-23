@@ -16,7 +16,9 @@
 -- Measured before writing, over 689 rows:
 --   priority: medium 319, high 309, low 49, critical 10, normal 2
 --   status:   pending 398, completed 252, in_progress 24, blocked 15
--- So status is already clean and only the two priority rows need moving.
+-- So status is already clean and only the two priority rows need moving. Note
+-- that a census of ROWS is not a census of the vocabulary — see the status
+-- constraint below.
 
 BEGIN;
 
@@ -34,9 +36,18 @@ ALTER TABLE tasks
   ADD CONSTRAINT tasks_priority_check
   CHECK (priority IS NULL OR priority IN ('low', 'medium', 'high', 'critical'));
 
+-- 'archived' is NOT in the census above, and constraining to what the data
+-- happens to hold today would have broken a live code path. It is a real task
+-- status with no rows yet:
+--   * project-tasks.repository.ts:344 — archive() writes status = 'archived'
+--   * _graph_evaluate_group (plpgsql) — treats status IN ('completed',
+--     'archived') as terminal when deciding what is still open
+-- Census the writers, not just the rows: the first archive() call after this
+-- migration would have thrown, and the census would still have looked clean.
+-- (Caught by Lumen in review of #665.)
 ALTER TABLE tasks
   ADD CONSTRAINT tasks_status_check
-  CHECK (status IN ('pending', 'in_progress', 'completed', 'blocked'));
+  CHECK (status IN ('pending', 'in_progress', 'completed', 'blocked', 'archived'));
 
 COMMIT;
 
