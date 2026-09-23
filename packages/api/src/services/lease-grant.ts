@@ -90,6 +90,17 @@ export async function grantStudioLease(client: unknown, args: GrantArgs): Promis
         conflictHolder: (payload.conflictHolder as StudioLease | null) ?? null,
       };
     }
+    // The RPC's own `lost` verdict lands here, and so does a payload we could
+    // not parse. This used to return silently, which made a deliberate refusal
+    // by the database indistinguishable from one this boundary invented — the
+    // two sinks above both log, and studioPathConflict logs its analogous
+    // branch below. `rpcOutcome` is what separates them: a string is the
+    // database's answer (granted | path-conflict | lost, and only `lost`
+    // reaches here), null means the payload did not carry one.
+    logger.warn('[LeaseGrant] Grant not acquired — reporting lost, never granted', {
+      studioId,
+      rpcOutcome: typeof payload?.outcome === 'string' ? payload.outcome : null,
+    });
     return { outcome: 'lost' };
   } catch (err) {
     logger.warn('[LeaseGrant] RPC threw — reporting lost, never granted', {
