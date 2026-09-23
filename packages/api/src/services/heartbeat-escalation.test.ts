@@ -184,11 +184,20 @@ function makeClient(
     insertResult?: { error: { message: string } | null };
     /**
      * sb_id -> slug. The double RESOLVES THE FILTER rather than answering every
-     * lookup the same way: a fake that returns one slug for every `sb_id` cannot
-     * tell two owners apart, so a test asserting that two same-titled beats
-     * produce distinguishable alerts would pass against code that never looked
-     * at the owner at all. Defaults preserve the previous single-identity
-     * behaviour for the tests that do not care.
+     * lookup the same way, so a test can model two owners at once.
+     *
+     * What this fidelity fix does NOT do — measured, because the intuitive
+     * story is the wrong way round. The previous fake answered every lookup
+     * with one slug; run these same tests against it and the three owner
+     * assertions still turn red against the pre-fix source (46/3). It does not
+     * make them incapable of failing. What it does is fail the CORRECT
+     * implementation: 2 of the 3 report a failure at this head (47/2), because
+     * code that asks about two owners gets one slug back for both. The third
+     * ('drops an unresolvable owner') passes under the old fake, but vacuously
+     * — an owner that cannot be resolved does not exist in a fake that resolves
+     * everything.
+     *
+     * Defaults preserve the single-identity behaviour for tests that do not care.
      */
     identities?: Record<string, string>;
   } = {}
