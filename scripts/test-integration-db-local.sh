@@ -12,6 +12,7 @@ SUPABASE_WORKDIR="${INTEGRATION_MANAGED_WORKDIR:?Use the managed harness entry p
 API_PORT="${INTEGRATION_MANAGED_API_PORT:?Missing managed API port}"
 DB_PORT="${INTEGRATION_MANAGED_DB_PORT:?Missing managed DB port}"
 PROJECT_ID="${INTEGRATION_SUPABASE_PROJECT_ID:-ink-integration}"
+DIAGNOSTICS_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "[integration-db] Exporting local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
@@ -81,14 +82,9 @@ if [[ "${STEADY}" -lt 3 ]]; then
   echo "[integration-db] REST gateway did not answer three times in a row within 20s (last HTTP ${CODE}); continuing anyway." >&2
 fi
 
-# When a suite fails, the vitest output shows the symptom — a repository call
-# answered "An invalid response was received from the upstream server" — and
-# nothing about the cause, because that sentence is Kong's, standing in for
-# whatever PostgREST or Postgres did. Two CI failures on 2026-09-11 were
-# exactly this (one advance_agent_inbox_read_pointer RPC, one task_groups
-# update), both green on rerun and neither reproducible locally. Dump the
-# stack's own logs before the trap tears it down, so the next blip can be
-# read off the job log instead of guessed at.
+# Capture the entire invocation, not the last N lines: later successes pushed
+# the #662 failing request outside the old 150-line gateway tail. Only emit
+# allowlisted diagnostic metadata; raw URLs, query tokens and SQL stay private.
 dump_stack_diagnostics() {
   echo "[integration-db] ❌ Suite failed — dumping isolated stack diagnostics (project ${PROJECT_ID})."
   echo "[integration-db] --- containers ---"
@@ -96,9 +92,17 @@ dump_stack_diagnostics() {
   echo "[integration-db] --- resource snapshot ---"
   docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' 2>/dev/null | grep "${PROJECT_ID}" || true
   if command -v free >/dev/null 2>&1; then free -m || true; fi
-  for name in $(docker ps -a --filter "name=${PROJECT_ID}" --format '{{.Names}}' 2>/dev/null | grep -E '_(rest|kong|db)_' || true); do
-    echo "[integration-db] --- docker logs --tail 150 ${name} ---"
-    docker logs --tail 150 "${name}" 2>&1 || true
+  for service in db rest kong; do
+    name="supabase_${service}_${PROJECT_ID}"
+    # Use the exact managed project's names, not a substring that also picks
+    # up another project's similarly-named containers. Metadata only, no env.
+    id="$(docker inspect --format '{{.Id}}' "${name}" 2>/dev/null)" || continue
+    echo "[integration-db] --- ${service} invocation diagnostics ---"
+    docker inspect --format 'status={{.State.Status}} restarts={{.RestartCount}} oomKilled={{.State.OOMKilled}}' "${id}" 2>/dev/null || true
+    if ! python3 "${ROOT_DIR}/scripts/lib/integration-log-summary.py" \
+      "${service}" "${id}" "${DIAGNOSTICS_SINCE}"; then
+      echo "[integration-db] ${service} log summary incomplete (capture or parser failed)." >&2
+    fi
   done
   echo "[integration-db] --- end of diagnostics ---"
 }
