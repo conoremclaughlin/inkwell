@@ -27,7 +27,31 @@ import { logger } from '../../utils/logger.js';
 import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { resolveInkCli, inkCliSpawn } from '../ink-cli.js';
-import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
+import {
+  injectSessionHeaders,
+  buildSessionEnv,
+  writeRuntimeSessionHint,
+  describeExitResult,
+  type ErrorClassification,
+} from '@inklabs/shared';
+
+/**
+ * A non-zero exit, carrying the verdict computed on the full output.
+ *
+ * The text this error's message holds is bounded, so it cannot be relied on to
+ * classify — that is the whole finding behind PR #662. The classification
+ * travels with it instead of being re-derived from it, and `run` puts it on
+ * the `RunnerResult` for consumers that would otherwise re-read the excerpt.
+ */
+class BackendExitError extends Error {
+  constructor(
+    message: string,
+    readonly classification: ErrorClassification
+  ) {
+    super(message);
+    this.name = 'BackendExitError';
+  }
+}
 
 // Absolute wall-clock backstop for a single ink turn — a final safety net for a
 // truly wedged process (dead loop, unkillable I/O), NOT a working limit. It
@@ -278,6 +302,10 @@ export class InkRunner implements IRunner {
         backendSessionId: sessionId,
         responses: [],
         error: error instanceof Error ? error.message : 'Unknown error',
+        // Present only for a non-zero exit, where we saw the full output.
+        // A spawn failure or an internal throw carries no classification and
+        // consumers fall back to classifying the message, as they always have.
+        ...(error instanceof BackendExitError ? { classification: error.classification } : {}),
       };
     }
   }
@@ -584,8 +612,36 @@ export class InkRunner implements IRunner {
             return;
           }
 
-          const errorText = stderr.trim() || stdout.trim() || `exit code ${code}`;
-          reject(new Error(`ink chat exited with code ${code}: ${errorText.slice(0, 1000)}`));
+          // Bounded text, unbounded verdict, and the split is the point.
+          //
+          // The text is both ends of the output, sanitised, at the diagnostic
+          // budget: it reaches a log field, a DB column and — excerpted again
+          // — the outage alert a human reads. What it replaced was
+          // `.slice(0, 1000)` of the head, and with stderr empty (common; ink
+          // reports fatal errors on stdout) that head was the profile line,
+          // the identity-context line, a session_meta blob and several hundred
+          // bytes of banner escape codes. Both escalations in the log on
+          // 2026-09-22 classified `unknown` for want of any diagnostic in it.
+          // The idle-timeout path 70 lines up already took a tail
+          // (`stderr.slice(-500)`); this one had not followed it.
+          //
+          // The verdict does not come from that text, and this is round two's
+          // correction. Widening the budget only moves where a display policy
+          // breaks the classifier: a 3527-character failure puts `Error: fetch
+          // failed` in the elided middle of a 2000-character excerpt, and the
+          // category falls to `unknown`/non-retryable with the run never
+          // retried (Lumen, second review of PR #662 — measured through this
+          // runner). So the category is decided here, on everything the
+          // process said, and travels on the result. Downstream prefers it
+          // over re-reading the excerpt.
+          const described = describeExitResult({
+            command: 'ink chat',
+            exitCode: code,
+            stdout,
+            stderr,
+            backend: 'ink',
+          });
+          reject(new BackendExitError(described.text, described.classification));
           return;
         }
 

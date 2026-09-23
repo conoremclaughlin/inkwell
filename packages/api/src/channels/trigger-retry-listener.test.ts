@@ -113,6 +113,8 @@ beforeAll(() => {
 
 interface RigOptions {
   planRefusal?: Error;
+  /** A failed (non-refusal) SessionResult from handleMessage, verbatim. */
+  resultFailure?: Record<string, unknown>;
   /** Make the terminal hold-clear throw, the way a network dip does. */
   cleanupThrows?: boolean;
   /** Refuse from handleMessage's own admission, as a structured result. */
@@ -247,6 +249,7 @@ function rig(options: RigOptions = {}) {
           };
         }
         sessionTurns += 1;
+        if (options.resultFailure) return options.resultFailure;
         return { success: true };
       },
       async getSession() {
@@ -615,5 +618,113 @@ describe('fan-out cancellation is per recipient', () => {
     for (const t of r.timers) if (!t.cancelled) t.fn();
     expect(r.redispatched).toHaveLength(1);
     expect(r.redispatched[0].toSlug).toBe('other-recipient');
+  });
+});
+
+/**
+ * The retry decision reads the verdict, not the excerpt (Lumen, r3).
+ *
+ * The default handler turns a failed SessionResult into a throw, and the
+ * throw used to carry only `result.error` — a bounded excerpt. So the
+ * listener re-derived a category from whatever survived the cut, and the
+ * excerpt is cut for a human reading an alert.
+ *
+ * Both directions are here, because one of them alone would pass against a
+ * guard that had simply stopped retrying, or one that retried everything.
+ * Each builds its text through the real `describeExitResult` and asserts the
+ * excerpt genuinely disagrees with the verdict first, so neither can be
+ * satisfied by the text happening to contain the answer. The assertion is the
+ * scheduled timer — the actual retry outcome — not a category.
+ */
+describe('a carried verdict decides the retry, not the excerpt', () => {
+  const STACK_FRAMES = Array.from(
+    { length: 40 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+
+  /** Run one failed turn through the real handler and hand the throw to the listener. */
+  async function failThroughHandler(resultFailure: Record<string, unknown>) {
+    const r = rig({ resultFailure });
+    let thrown: unknown;
+    try {
+      await r.gateway.handler!(r.threadPayload);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(
+      thrown,
+      'the handler must still throw — the failure has to reach the listener'
+    ).toBeTruthy();
+    await r.fail(r.threadPayload, thrown);
+    return r;
+  }
+
+  it('schedules a retry when the verdict is transient and its excerpt is not', async () => {
+    const { describeExitResult, classifyError } = await import('@inklabs/shared');
+    const raw = [
+      'startup one',
+      'startup two',
+      'startup three',
+      'Error: fetch failed',
+      ...STACK_FRAMES,
+    ].join('\n');
+    const failure = describeExitResult({ command: 'ink chat', exitCode: 1, stderr: raw });
+
+    expect(failure.classification.category).toBe('network');
+    expect(failure.classification.retryable).toBe(true);
+    expect(classifyError({ errorText: failure.text }).category).toBe('unknown');
+
+    const r = await failThroughHandler({
+      success: false,
+      admitted: true,
+      error: failure.text,
+      classification: failure.classification,
+    });
+
+    expect(r.timers).toHaveLength(1);
+  });
+
+  it('schedules nothing when the verdict is permanent and its excerpt looks transient', async () => {
+    // The opposite direction, and the expensive one: the excerpt's tail reads
+    // `fetch failed` (network, retryable) while the run actually hit a quota
+    // whose line fell into the elided middle. Retrying that re-dispatches a
+    // message into a backend that will refuse it again, twice, on a ten
+    // minute horizon.
+    const { describeExitResult, classifyError } = await import('@inklabs/shared');
+    const raw = [
+      'startup one',
+      'startup two',
+      'startup three',
+      'Error: quota exceeded',
+      ...STACK_FRAMES,
+      'caused by: fetch failed',
+    ].join('\n');
+    const failure = describeExitResult({ command: 'ink chat', exitCode: 1, stderr: raw });
+
+    expect(failure.classification.category).toBe('quota');
+    expect(failure.classification.retryable).toBe(false);
+    expect(classifyError({ errorText: failure.text }).retryable).toBe(true);
+
+    const r = await failThroughHandler({
+      success: false,
+      admitted: true,
+      error: failure.text,
+      classification: failure.classification,
+    });
+
+    expect(r.timers).toHaveLength(0);
+  });
+
+  it('still classifies the text when the failure carries no verdict', async () => {
+    // A spawn failure or an internal throw has no verdict to carry, and the
+    // fallback is the behaviour that shipped before any of this.
+    const r = await failThroughHandler({
+      success: false,
+      admitted: true,
+      error: 'Error: fetch failed',
+    });
+
+    expect(r.timers).toHaveLength(1);
   });
 });

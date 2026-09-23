@@ -286,6 +286,200 @@ describe('heartbeat escalation', () => {
     });
   });
 
+  /**
+   * Myra, on `debug:myra-heartbeat-failures`, 2026-09-22: the alerting
+   * worked — a beat failed, it was caught, Conor was told — and what landed on
+   * his phone was the ink startup banner as raw escape sequences, a
+   * `session_meta` blob, and no cause, under a heading telling him his monitor
+   * had stopped.
+   *
+   * The root cause is fixed upstream in ink-runner (it now sends a sanitised
+   * tail). These cover the seam instead: every backend funnels through here and
+   * they compose failure text differently — Claude and Gemini still reject with
+   * their whole raw stderr — so an alert must be readable regardless of which
+   * one produced the string.
+   *
+   * The fixture is invented; only its shape is copied from the real payload.
+   */
+  describe('the alert is readable by the human who receives it', () => {
+    const BANNER_CELL = '\u001b[38;2;10;10;26m\u001b[48;2;10;10;26m▄\u001b[49m\u001b[39m';
+    const NOISY_FAILURE =
+      '\u001b[32mApplied "Safe" profile (All tools allowed except comms and file writes.)\u001b[39m\n' +
+      '\u001b[2mIdentity context loaded: ~21,793 tokens injected into prompt\u001b[22m\n' +
+      '{"type":"session_meta","transcriptPath":"/tmp/example.test/repl/session.jsonl"}\n' +
+      BANNER_CELL.repeat(60) +
+      '\nError: backend refused the turn (no credentials)';
+
+    async function alertContentFor(error: string): Promise<string> {
+      const { client } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+      await onFailure(makeReminder(), error, 1, FIRST_FOR_DESTINATION);
+      return sendToChannel.mock.calls[0][0].content as string;
+    }
+
+    it('strips the terminal escape sequences before they reach the channel', async () => {
+      // Control: the fixture really does carry what we are claiming to remove.
+      // Without this the assertion below would pass on an empty string.
+      expect(NOISY_FAILURE).toMatch(/\u001b/);
+
+      const content = await alertContentFor(NOISY_FAILURE);
+      expect(content).not.toMatch(/\u001b/);
+    });
+
+    it('leads with the cause rather than the startup preamble', async () => {
+      const content = await alertContentFor(NOISY_FAILURE);
+
+      expect(content).toContain('backend refused the turn');
+      expect(content).not.toContain('Applied "Safe" profile');
+      expect(content).not.toContain('session_meta');
+    });
+
+    it('keeps the alert short enough to read on a phone', async () => {
+      const content = await alertContentFor(NOISY_FAILURE);
+
+      // The real one ran to a screenful. The heading and closing sentence are
+      // ~200 chars, so this bounds the quoted excerpt, not the message.
+      expect(content.length).toBeLessThan(600);
+      expect(NOISY_FAILURE.length).toBeGreaterThan(600);
+    });
+
+    it('says so explicitly when the backend gave no diagnostic at all', async () => {
+      const content = await alertContentFor('');
+      expect(content).toContain('(no diagnostic output)');
+    });
+
+    // The durable copy is read by a human too, and on the dashboard.
+    it('sanitises the inbox copy as well as the channel alert', async () => {
+      const { client, insert } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      await onFailure(makeReminder(), NOISY_FAILURE, 1, FIRST_FOR_DESTINATION);
+
+      const row = insert.mock.calls[0][0] as { content: string };
+      expect(row.content).not.toMatch(/\u001b/);
+      expect(row.content).toContain('backend refused the turn');
+    });
+
+    // Classification reads the FULL text, deliberately not the trimmed excerpt.
+    // `owner_conflict` needs the refusal sentence AND the thread-store context,
+    // and those arrive at the head of a long Codex stderr dump — the excerpt
+    // keeps the tail, so classifying off it would silently stop matching.
+    it('still classifies on the full text, not on the trimmed excerpt', async () => {
+      const codexRefusal =
+        'failed to initialize thread persistence: thread-store conflict\n' +
+        'thread thr_01 already has an active writer\n' +
+        `${'filler line\n'.repeat(200)}` +
+        'stream closed';
+
+      const content = await alertContentFor(codexRefusal);
+      expect(content).toContain('owner_conflict');
+    });
+  });
+
+  /**
+   * Classifying before OUR trim is necessary and is not sufficient, which is
+   * the correction Lumen's second review of PR #662 made.
+   *
+   * By the time a failure reaches this hook it has already been bounded: a
+   * runner composed it for a log field and a DB column several layers up. The
+   * text below is what a 2000-character diagnostic excerpt leaves of a 3.5KB
+   * Node failure — warnings at the head, frames at the tail, `Error: fetch
+   * failed` gone with the elided middle. No ordering at this seam can recover
+   * it, because it is not in the string. Only a verdict formed before the trim
+   * can, and that is what the escalation context now carries.
+   */
+  describe('a category the excerpt can no longer support', () => {
+    const TRIMMED_TO_DEATH = [
+      'ink chat exited with code 1: (node:123) Warning: Example optional feature is experimental',
+      '(Use node --trace-warnings to show where the warning was created)',
+      '…',
+      '    at step29 (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)',
+    ].join('\n');
+
+    const NETWORK_VERDICT = {
+      category: 'network' as const,
+      summary: 'Error: fetch failed',
+      retryable: true,
+    };
+
+    async function alertFor(
+      error: string,
+      context: typeof FIRST_FOR_DESTINATION & { classification?: typeof NETWORK_VERDICT }
+    ): Promise<string> {
+      const { client } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+      await onFailure(makeReminder(), error, 1, context);
+      return sendToChannel.mock.calls[0][0].content as string;
+    }
+
+    /**
+     * The control, and the whole reason the carried value is needed: this seam
+     * cannot do better than `unknown` on this text, however early it classifies.
+     */
+    it('reads unknown off the excerpt, because there is nothing left to match', async () => {
+      const content = await alertFor(TRIMMED_TO_DEATH, FIRST_FOR_DESTINATION);
+
+      expect(content).toContain('unknown:');
+      expect(content).not.toContain('retryable');
+    });
+
+    it('reports the carried verdict instead of re-reading the excerpt', async () => {
+      const content = await alertFor(TRIMMED_TO_DEATH, {
+        ...FIRST_FOR_DESTINATION,
+        classification: NETWORK_VERDICT,
+      });
+
+      expect(content).toContain('network (retryable):');
+    });
+
+    // The durable copy is the one the dashboard reads, and it must not carry a
+    // different category from the message that went to a phone.
+    it('uses the carried verdict for the inbox copy too', async () => {
+      const { client, insert } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      await onFailure(makeReminder(), TRIMMED_TO_DEATH, 1, {
+        ...FIRST_FOR_DESTINATION,
+        classification: NETWORK_VERDICT,
+      });
+
+      const row = insert.mock.calls[0][0] as { content: string };
+      expect(row.content).toContain('Category: network (retryable: true)');
+    });
+
+    /**
+     * Bounded claim: the carried value decides the CATEGORY, never the text.
+     * A human still reads the excerpt, elision and all — what was dropped is
+     * dropped, and this is not a claim to have recovered it.
+     */
+    it('changes the verdict without changing a byte of what a human reads', async () => {
+      const carried = await alertFor(TRIMMED_TO_DEATH, {
+        ...FIRST_FOR_DESTINATION,
+        classification: NETWORK_VERDICT,
+      });
+      sendToChannel.mockClear();
+      const derived = await alertFor(TRIMMED_TO_DEATH, FIRST_FOR_DESTINATION);
+
+      expect(carried.replace('network (retryable):', 'unknown:')).toBe(derived);
+    });
+  });
+
   describe('one outage is two messages, not two per beat', () => {
     it('alerts on the first failure only', async () => {
       const { client } = makeClient();
@@ -953,5 +1147,33 @@ describe('heartbeat escalation', () => {
       expect(insert).toHaveBeenCalledTimes(1);
       expect(insert.mock.calls[0][0].recipient_agent_id).toBe('unrelated-sb');
     });
+  });
+
+  it('keeps the error line in the alert when the stack under it is longer than the budget', async () => {
+    const { client } = makeClient();
+    const { onFailure } = createHeartbeatEscalation({ client, sendToChannel, defaultSlug: 'myra' });
+
+    // Lumen's fixture, review of PR #662: an ordinary Node failure names its
+    // cause on the FIRST line. An unconditional tail sent Conor ten stack
+    // frames and no sentence — the mirror of the head-slice bug this PR
+    // replaced. Asserted on the real channel payload, not on the excerpt.
+    const frames = Array.from(
+      { length: 10 },
+      (_, i) =>
+        `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+    );
+
+    await onFailure(
+      makeReminder(),
+      `Error: fetch failed\n${frames.join('\n')}`,
+      1,
+      FIRST_FOR_DESTINATION
+    );
+
+    const content = sendToChannel.mock.calls[0][0].content;
+    expect(content).toContain('fetch failed');
+    // The tail is still there — this keeps both ends, it does not swap which
+    // end gets lost.
+    expect(content).toContain('at step9');
   });
 });

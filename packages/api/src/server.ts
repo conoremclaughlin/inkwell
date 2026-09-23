@@ -56,6 +56,8 @@ import {
   TriggerRetryScheduler,
   TRIGGER_MAX_ATTEMPTS,
   getTriggerAttempt,
+  BackendFailureError,
+  carriedClassification,
 } from './channels/trigger-retry';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteSlug } from './services/routing/resolve-route';
@@ -721,6 +723,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       return {
         status: 'failed',
         error: result.error || 'session reported failure',
+        // Carried, not re-derived. `result.error` is an excerpt by the time it
+        // reaches here; the escalation prints a category to a human and would
+        // otherwise read it off that excerpt and disagree with the verdict the
+        // server acted on (Lumen, review of PR #662).
+        ...(result.classification ? { classification: result.classification } : {}),
       };
     } catch (error) {
       logger.error(`Failed to deliver reminder ${reminder.id}:`, error);
@@ -1576,7 +1583,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       }
 
       logger.error(`[Trigger] SessionService failed for ${targetSlug}: ${result.error}`);
-      throw new Error(result.error || 'SessionService processing failed');
+      // A BackendFailureError when the runner reached a verdict, so the retry
+      // decision is made on what the process actually said rather than on the
+      // excerpt that survived the cut (Lumen, r3). Without the carried value
+      // this throw is the point the verdict dies: `result.error` is bounded
+      // text, and the listener below is the only thing left to read it.
+      const failureText = result.error || 'SessionService processing failed';
+      throw result.classification
+        ? new BackendFailureError(failureText, result.classification)
+        : new Error(failureText);
     }
 
     // Mark the payload: the session turn completed. If anything below throws
@@ -1679,7 +1694,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       error: unknown;
     }) => {
       const errorText = error instanceof Error ? error.message : String(error);
-      const classification = classifyError({ errorText });
+      // Prefer the verdict the error is carrying. `errorText` here is whatever
+      // the throw site had — for a runner failure that is a bounded excerpt,
+      // and classifying it re-decides retryability from a display-shaped cut
+      // of the output. A throw with nothing carried (spawn failure, internal
+      // error, routing refusal) still classifies its text, as it always has.
+      const classification = carriedClassification(error) ?? classifyError({ errorText });
       const attempt = getTriggerAttempt(payload);
 
       // Log full error text — truncateSummary only keeps the first line,

@@ -4,6 +4,8 @@
  * Core types for the stateless SessionService architecture.
  */
 
+import type { ErrorClassification } from '@inklabs/shared';
+
 // ─── Channel Types ───
 
 // Keep aligned with src/agent/types.ts ChannelType
@@ -313,6 +315,14 @@ export interface SessionResult {
 
   // Error info if failed
   error?: string;
+  /**
+   * The classification this turn was actually judged by — carried from the
+   * runner when it measured one, otherwise session-service's own reading of
+   * `error`. Passed on so a downstream consumer (the heartbeat outage alert)
+   * reports the same category the server acted on, rather than re-classifying
+   * an excerpt and disagreeing with it.
+   */
+  classification?: ErrorClassification;
   errorCode?: string;
   /**
    * Admission evidence (v18 S3): true when routing completed — session
@@ -738,6 +748,20 @@ export interface RunnerResult {
    */
   servedModel?: string;
   error?: string;
+  /**
+   * The runner's own verdict on `error`, computed BEFORE that text was bounded.
+   *
+   * `error` is an excerpt. A consumer that classifies it is classifying
+   * whatever survived a text budget — which is how `Error: fetch failed`
+   * under a long stack became `unknown`/non-retryable (Lumen, review of
+   * PR #662). A runner that saw the full output says so here, and consumers
+   * prefer this over re-reading the excerpt.
+   *
+   * Optional because only runners with a classification seam populate it —
+   * InkRunner today. Absent means "not measured", so consumers fall back to
+   * classifying `error` exactly as they did before.
+   */
+  classification?: ErrorClassification;
   /** The final text response from the backend (for auto-routing if no explicit send_response) */
   finalTextResponse?: string;
   /** Tool calls captured during this run (for activity stream logging) */
