@@ -179,20 +179,46 @@ function makeReminder(overrides: Partial<DueReminder> = {}): DueReminder {
  * RESOLVES with — PostgREST reports failures this way rather than throwing,
  * which is the entire point of one of these tests.
  */
-function makeClient(opts: { insertResult?: { error: { message: string } | null } } = {}) {
+function makeClient(
+  opts: {
+    insertResult?: { error: { message: string } | null };
+    /**
+     * sb_id -> slug. The double RESOLVES THE FILTER rather than answering every
+     * lookup the same way: a fake that returns one slug for every `sb_id` cannot
+     * tell two owners apart, so a test asserting that two same-titled beats
+     * produce distinguishable alerts would pass against code that never looked
+     * at the owner at all. Defaults preserve the previous single-identity
+     * behaviour for the tests that do not care.
+     */
+    identities?: Record<string, string>;
+  } = {}
+) {
   const insert = vi.fn().mockResolvedValue(opts.insertResult ?? { error: null });
-  const identitySingle = vi.fn().mockResolvedValue({ data: { agent_id: 'myra' }, error: null });
+  const identities = opts.identities ?? { 'sb-myra-uuid': 'myra' };
+  const identitySingle = vi.fn();
 
   const from = vi.fn().mockImplementation((table: string) => {
     if (table === 'agent_identities') {
       return {
-        select: () => ({ eq: () => ({ single: identitySingle }) }),
+        select: () => ({
+          eq: (_column: string, value: string) => ({
+            single: () => {
+              identitySingle(value);
+              const slug = identities[value];
+              return Promise.resolve(
+                slug
+                  ? { data: { agent_id: slug }, error: null }
+                  : { data: null, error: { message: `no identity for ${value}` } }
+              );
+            },
+          }),
+        }),
       };
     }
     return { insert };
   });
 
-  return { client: { from } as never, insert, from };
+  return { client: { from } as never, insert, from, identitySingle };
 }
 
 describe('heartbeat escalation', () => {
@@ -637,6 +663,134 @@ describe('heartbeat escalation', () => {
       expect(insert).toHaveBeenCalledWith(
         expect.objectContaining({ recipient_agent_id: 'fallback-agent' })
       );
+    });
+
+    /**
+     * The regression for 2026-09-23. Three `scheduled_reminders` rows were
+     * titled "Daily check-in" — two active, owned by different SBs, on
+     * different slots. The alert quoted the title alone, so the SB who received
+     * one read it as her own beat and published a timeline explaining why a
+     * reminder she owned had run at a time it never ran at. It was not her beat.
+     *
+     * The discriminating input is two reminders that differ ONLY in the fields
+     * the alert used to drop. A fixture varying the title as well would pass
+     * against the old code.
+     */
+    it('distinguishes two same-titled beats owned by different SBs', async () => {
+      const { client } = makeClient({
+        identities: { 'sb-myra-uuid': 'myra', 'sb-wren-uuid': 'wren' },
+      });
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      const hers = makeReminder({
+        id: 'rem-hers',
+        title: 'Daily check-in',
+        sb_id: 'sb-myra-uuid',
+        cron_expression: '0 9 * * *',
+      });
+      const mine = makeReminder({
+        id: 'rem-mine',
+        title: 'Daily check-in',
+        sb_id: 'sb-wren-uuid',
+        cron_expression: '45 8 * * *',
+      });
+
+      await onFailure(hers, AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+      await onFailure(mine, AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+      const [first, second] = sendToChannel.mock.calls.map((call) => call[0].content as string);
+
+      // Each alert names its own owner and slot...
+      expect(first).toContain('myra');
+      expect(first).toContain('0 9 * * *');
+      expect(second).toContain('wren');
+      expect(second).toContain('45 8 * * *');
+
+      // ...and does not claim the other's. This is the half that fails against
+      // a title-only alert: both messages were byte-identical, so a reader had
+      // no way to tell which beat had stopped.
+      expect(first).not.toContain('wren');
+      expect(second).not.toContain('myra');
+      expect(first).not.toBe(second);
+    });
+
+    // The all-clear has to name the same beat the alarm did, or the ambiguity
+    // just moves to the message telling someone they are covered again.
+    it('names the owner and slot on the recovery notice too', async () => {
+      const { client } = makeClient({ identities: { 'sb-wren-uuid': 'wren' } });
+      const { onRecovery } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      await onRecovery(
+        makeReminder({
+          title: 'Daily check-in',
+          sb_id: 'sb-wren-uuid',
+          cron_expression: '45 8 * * *',
+        }),
+        3,
+        FIRST_FOR_DESTINATION
+      );
+
+      const content = sendToChannel.mock.calls[0][0].content as string;
+      expect(content).toContain('Daily check-in');
+      expect(content).toContain('wren');
+      expect(content).toContain('45 8 * * *');
+    });
+
+    /**
+     * Control for the degrade path. An owner we cannot look up must not render
+     * as `(null)` on someone's phone, and must not cost the notice — the slot
+     * still qualifies it, and a beat with no cron at all falls back to the bare
+     * title rather than an empty bracket.
+     */
+    it('drops an unresolvable owner from the label instead of printing a hole', async () => {
+      const { client } = makeClient({ identities: {} });
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      await onFailure(
+        makeReminder({ title: 'Daily check-in', sb_id: 'sb-unknown' }),
+        AUTH_ERROR,
+        1,
+        FIRST_FOR_DESTINATION
+      );
+
+      const content = sendToChannel.mock.calls[0][0].content as string;
+      expect(content).toContain('Daily check-in');
+      expect(content).toContain('0 * * * *');
+      expect(content).not.toContain('null');
+      expect(content).not.toContain('undefined');
+      expect(content).not.toContain('()');
+    });
+
+    it('falls back to the bare title when a beat has neither owner nor slot', async () => {
+      const { client } = makeClient({ identities: {} });
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultSlug: 'myra',
+      });
+
+      await onFailure(
+        makeReminder({ title: 'Daily check-in', sb_id: 'sb-unknown', cron_expression: null }),
+        AUTH_ERROR,
+        1,
+        FIRST_FOR_DESTINATION
+      );
+
+      const content = sendToChannel.mock.calls[0][0].content as string;
+      expect(content).toContain('"Daily check-in"');
+      expect(content).not.toContain('()');
     });
 
     it('escalates priority once an outage is established', async () => {

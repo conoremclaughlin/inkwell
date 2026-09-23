@@ -168,7 +168,13 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
   });
 
   /**
-   * Resolve the agent whose beat this was, so the notice lands in their inbox.
+   * Resolve the agent whose beat this is.
+   *
+   * Two callers with different stakes, which is why the log lines below name
+   * only what the lookup did and leave the consequence to each caller: on the
+   * failure path a null routes the inbox copy nowhere (recorded as
+   * `inboxError`), while on the recovery path it merely drops the owner from
+   * the alert label. Neither can block the channel send.
    *
    * Returns null when the beat names an owner we could not resolve. That is not
    * the same as having no owner: `defaultSlug` is the answer for a beat that
@@ -186,7 +192,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
    * coupling the two-destination split exists to prevent. The channel alert
    * below does not depend on this resolving at all.
    */
-  const resolveFailedSlug = async (reminder: DueReminder): Promise<string | null> => {
+  const resolveOwnerSlug = async (reminder: DueReminder): Promise<string | null> => {
     if (!reminder.sb_id) return defaultSlug;
     try {
       const { data: identity, error } = await client
@@ -195,7 +201,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
         .eq('id', reminder.sb_id)
         .single();
       if (error) {
-        logger.warn('[Heartbeat] Could not resolve the failed beat’s agent — skipping inbox copy', {
+        logger.warn('[Heartbeat] Could not resolve the beat’s owner', {
           reminderId: reminder.id,
           sbId: reminder.sb_id,
           error: error.message,
@@ -204,7 +210,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       }
       const resolved = (identity as { agent_id?: string } | null)?.agent_id;
       if (!resolved) {
-        logger.warn('[Heartbeat] Failed beat’s agent resolved to nothing — skipping inbox copy', {
+        logger.warn('[Heartbeat] Beat’s owner resolved to nothing', {
           reminderId: reminder.id,
           sbId: reminder.sb_id,
         });
@@ -212,13 +218,41 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       }
       return resolved;
     } catch (err) {
-      logger.warn('[Heartbeat] Agent identity lookup threw — skipping inbox copy', {
+      logger.warn('[Heartbeat] Beat’s owner lookup threw', {
         reminderId: reminder.id,
         sbId: reminder.sb_id,
         error: err instanceof Error ? err.message : String(err),
       });
       return null;
     }
+  };
+
+  /**
+   * Which beat this is — because the title alone does not say.
+   *
+   * A reminder title is free text with no uniqueness constraint, and in practice
+   * it is not unique. On 2026-09-23 three `scheduled_reminders` rows were titled
+   * "Daily check-in": two active, owned by different SBs, on different slots and
+   * different backends. The alert quoted the title and nothing else, so the SB
+   * who received it read it as her own and spent an entire investigation
+   * explaining why a beat she owned had run at a time it never ran at. The
+   * answer was that it was somebody else's beat.
+   *
+   * Legibility and unambiguity are different properties, and #662 only bought
+   * the first. An alert can be perfectly readable and still name the wrong beat.
+   *
+   * The owner is what actually disambiguates; the slot is what answers "which
+   * occurrence" once you know whose it is. Both are already on the row — this
+   * costs no extra lookup on the failure path, where the slug is resolved for
+   * the inbox copy regardless. Qualifiers are dropped individually when absent
+   * rather than rendering an empty bracket, because an unresolved owner is a
+   * case this path already handles and must not turn into `(null)` on a phone.
+   */
+  const beatLabel = (reminder: DueReminder, slug: string | null): string => {
+    const qualifiers = [slug, reminder.cron_expression].filter((value): value is string => !!value);
+    return qualifiers.length > 0
+      ? `"${reminder.title}" (${qualifiers.join(' · ')})`
+      : `"${reminder.title}"`;
   };
 
   /**
@@ -269,7 +303,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     consecutive: number,
     context: HeartbeatEscalationContext
   ): Promise<{ alerted: boolean }> => {
-    const failedSlug = await resolveFailedSlug(reminder);
+    const failedSlug = await resolveOwnerSlug(reminder);
 
     // The producer's verdict when it reached one, our own reading of the text
     // otherwise.
@@ -319,9 +353,9 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
           sender_agent_id: null,
           message_type: 'notification',
           priority: consecutive >= 3 ? 'urgent' : 'high',
-          subject: `Heartbeat FAILED (${consecutive}x): ${reminder.title}`,
+          subject: `Heartbeat FAILED (${consecutive}x): ${beatLabel(reminder, failedSlug)}`,
           content:
-            `Your scheduled heartbeat "${reminder.title}" did not run.\n\n` +
+            `Your scheduled heartbeat ${beatLabel(reminder, failedSlug)} did not run.\n\n` +
             `Consecutive failures: ${consecutive}\n` +
             `Category: ${classification.category} (retryable: ${classification.retryable})\n` +
             `Error: ${readableError}\n\n` +
@@ -398,7 +432,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
 
     const alert = await alertOwnerDirectly(
       reminder,
-      `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
+      `⚠️ Heartbeat FAILED: ${beatLabel(reminder, failedSlug)}\n\n` +
         `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
         `Whatever this beat monitors is NOT being checked. ` +
         `I will send one more message when it runs again.`
@@ -437,6 +471,12 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
+    // Resolved after the reachability gate, so a beat with nowhere to send
+    // still costs no lookup. An unresolved owner degrades to a cron-only label
+    // rather than failing the all-clear — losing a qualifier is not a reason to
+    // withhold the message telling someone their monitor is back.
+    const recoveredSlug = await resolveOwnerSlug(reminder);
+
     const key = noticeKeyFor(reminder, 'recovery', context, failedBeats);
 
     // Same collapse on the way out. One "back up" per destination per run —
@@ -465,7 +505,11 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
 
     const alert = await alertOwnerDirectly(
       reminder,
-      `✅ Heartbeat recovered: "${reminder.title}"\n\n` +
+      // The all-clear has to name the same beat the alarm did. Labelling only
+      // the alarm would leave a reader holding "FAILED: X (wren · 45 8 * * *)"
+      // and a bare "recovered: X" that could be any of the rows sharing that
+      // title — the ambiguity moves rather than closing.
+      `✅ Heartbeat recovered: ${beatLabel(reminder, recoveredSlug)}\n\n` +
         `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`
     );
 
