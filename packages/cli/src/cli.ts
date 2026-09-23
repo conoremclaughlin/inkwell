@@ -207,7 +207,12 @@ program
   .allowUnknownOption(true)
   .allowExcessArguments(true)
   .option('-a, --agent <id>', 'Agent identity to use')
-  .option('-b, --backend <name>', 'AI backend (claude, codex, gemini, ink)', 'claude')
+  // No Commander default: extractArgs does the real parsing, and an absent
+  // -b now means "ask the agent's identity record", not "claude".
+  .option(
+    '-b, --backend <name>',
+    "AI backend (claude, codex, gemini, ink). Defaults to the -a agent's own backend."
+  )
   .option('-m, --model <model>', 'Model to use (defaults to backend-specific)')
   .option('--no-session', 'Disable session tracking')
   .option(
@@ -231,7 +236,11 @@ program
     const { sbOptions, passthroughArgs, promptParts, prompt } = extractArgs(process.argv.slice(2));
 
     // Resolve backend from identity.json if not explicitly set
-    const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
+    const backendResolution = await resolveBackend({
+      cliBackend: sbOptions.backend,
+      agentSlug: sbOptions.agent,
+    });
+    const resolvedOptions = { ...sbOptions, backend: backendResolution.backend };
     // Machine-readable output mode: everything printed between here and the
     // payload (debug path, dangerous banner, server-update notice, hook
     // health, Inkwell availability) belongs on stderr.
@@ -263,6 +272,9 @@ program
           chalk.dim('           --dangerous is now --yolo (the old spelling still works)')
         );
       }
+    }
+    if (backendResolution.note) {
+      console.log(chalk.yellow(`⚠ ${backendResolution.note}`));
     }
     await maybeWarnServerUpdate();
     sbDebugLog('sb', 'parsed_args', {

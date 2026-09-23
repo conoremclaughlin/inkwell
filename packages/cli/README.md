@@ -179,17 +179,37 @@ echo "explain this" | sb        # Pipe input as prompt
 
 ### SB Options
 
-| Flag                        | Description                                                | Default                                |
-| --------------------------- | ---------------------------------------------------------- | -------------------------------------- |
-| `-a, --agent <id>`          | Agent identity                                             | from `.ink/identity.json`              |
-| `-b, --backend <name>`      | AI backend                                                 | from `.ink/identity.json`, or `claude` |
-| `--no-session`              | Disable session tracking                                   | enabled                                |
-| `--sb-verbose`              | Show SB verbose output                                     | off                                    |
-| `--session-candidates`      | Print picker candidates and exit                           | off                                    |
-| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                    |
-| `--yolo`                    | Skip all permission prompts (maps to backend auto-approve) | off                                    |
+| Flag                        | Description                                                | Default                                                                |
+| --------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `-a, --agent <id>`          | Agent identity                                             | from `.ink/identity.json`                                              |
+| `-b, --backend <name>`      | AI backend                                                 | the `-a` agent's own backend, else `.ink/identity.json`, else `claude` |
+| `--no-session`              | Disable session tracking                                   | enabled                                                                |
+| `--sb-verbose`              | Show SB verbose output                                     | off                                                                    |
+| `--session-candidates`      | Print picker candidates and exit                           | off                                                                    |
+| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                                                    |
+| `--yolo`                    | Skip all permission prompts (maps to backend auto-approve) | off                                                                    |
 
 Any flag not listed above is forwarded to the backend.
+
+#### How the backend is chosen
+
+Most explicit wins:
+
+1. `-b/--backend`
+2. **The `-a` agent's own backend**, read from their identity record (`agent_identities.backend`) and cached at `~/.ink/agent-backends.json` for a day
+3. `.ink/identity.json` → `backend`, i.e. whatever this studio was made for
+4. `claude`
+
+The agent sits above `.ink/identity.json` on purpose. `-a lumen` is an explicit
+request for Lumen; the directory's recorded backend describes whichever SB the
+studio was created for, so letting it win would mean `ink -a lumen` inside a
+wren studio still starting claude.
+
+The cache means the usual path costs nothing and keeps working offline. When
+the server is unreachable a stale entry is still used — an SB's runtime changes
+about once a year, and the alternative is silently launching them on the wrong
+one. If a record names a backend this CLI has no adapter for, it says so and
+falls through rather than quietly substituting another.
 
 Testing and regression workflows for session-candidate resolution live in [`packages/cli/TESTS.md`](./TESTS.md).
 

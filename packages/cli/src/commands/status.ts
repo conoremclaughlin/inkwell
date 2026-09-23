@@ -187,7 +187,9 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
   const cwd = process.cwd();
   const identity = readIdentityJson(cwd);
   const sbSlug = resolveSlug() || 'unresolved';
-  const backend = normalizeBackend(resolveBackend(options.backend));
+  // No agentSlug: `ink status` reports on THIS directory's setup, and the
+  // command takes no -a. The identity.json layer is the right source here.
+  const backend = normalizeBackend((await resolveBackend({ cliBackend: options.backend })).backend);
   const hookConfig = getHookConfigPath(backend);
 
   const auth = loadAuth();
