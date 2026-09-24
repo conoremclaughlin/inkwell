@@ -71,6 +71,14 @@ import {
   missingThreadKeys,
 } from '../services/thread-key/thread-spines';
 import { groupNodeEvents, type GateEventInput } from '../services/thread-key/graph-evidence';
+import {
+  LAST_MESSAGE_EMBED,
+  lastMessageUserIds,
+  MESSAGES_PAGE_SIZE,
+  olderThan,
+  toLastMessage,
+  withLastMessage,
+} from '../services/thread-key/thread-conversation';
 import { openVerifiedMedia } from '../utils/media-path';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
@@ -7234,13 +7242,13 @@ router.get('/threads', async (req: Request, res: Response) => {
     // same-key session from another workspace is another conversation.
     const carrierScope = carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId);
 
+    // One list for both thread reads below (the newest window and the
+    // hydration of older carrier keys), so neither can drop a column alone.
+    // The embed carries each thread's newest message for the list preview.
+    const THREAD_COLUMNS = `id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at, ${LAST_MESSAGE_EMBED}`;
+
     const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
-      supabase
-        .from('inbox_threads')
-        .select(
-          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at',
-          { count: 'exact' }
-        )
+      withLastMessage(supabase.from('inbox_threads').select(THREAD_COLUMNS, { count: 'exact' }))
         .eq('workspace_id', workspaceId)
         .order('updated_at', { ascending: false })
         .limit(THREADS_CAP),
@@ -7327,11 +7335,9 @@ router.get('/threads', async (req: Request, res: Response) => {
       groupRows
     );
     for (let i = 0; i < missing.length; i += 50) {
-      const { data: extraRows, error: extraError } = await supabase
-        .from('inbox_threads')
-        .select(
-          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at'
-        )
+      const { data: extraRows, error: extraError } = await withLastMessage(
+        supabase.from('inbox_threads').select(THREAD_COLUMNS)
+      )
         .eq('workspace_id', workspaceId)
         .in('thread_key', missing.slice(i, i + 50));
       if (extraError) {
@@ -7385,10 +7391,11 @@ router.get('/threads', async (req: Request, res: Response) => {
     const slugBySbId = new Map(
       (await resolveSbsByIds(supabase, [...participantSbIds])).map((sb) => [sb.sbId, sb.sbSlug])
     );
-    const personNames = await resolvePersonNames(
-      supabase,
-      participantRows.flatMap((row) => (row.user_id ? [row.user_id] : []))
-    );
+    const personNames = await resolvePersonNames(supabase, [
+      ...participantRows.flatMap((row) => (row.user_id ? [row.user_id] : [])),
+      // A person who wrote a thread's newest message is named in its preview.
+      ...threadRows.flatMap((t) => lastMessageUserIds(t.last_message)),
+    ]);
     for (const row of participantRows) {
       if (row.sb_id) {
         const list = participantsByThreadId.get(row.thread_id) ?? [];
@@ -7438,6 +7445,10 @@ router.get('/threads', async (req: Request, res: Response) => {
         participants: participantsByThreadId.get(t.id) ?? [],
         // Named for THIS viewer: a person's own row says so (spec §3).
         people: describePeople(peopleByThreadId.get(t.id) ?? [], personNames, authReq.inkUserId),
+        lastMessage: toLastMessage(
+          t.last_message,
+          (senderUserId) => describePeople([senderUserId], personNames, authReq.inkUserId)[0]
+        ),
       })),
       sessions: sessionRows,
       studios: studioRows,
@@ -7550,20 +7561,34 @@ async function loadThreadStudioHistory(
   });
 }
 
+const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
- * GET /api/admin/threads/messages?key=<threadKey>
+ * GET /api/admin/threads/messages?key=<threadKey>[&before=<messageId>]
  *
  * Conversation for one threadKey. The key rides a query param, not a path
  * segment — keys contain colons and slashes. A key with no thread row is a
  * valid answer ({ thread: null }), not a 404: the browse page shows those
  * keys as "no thread yet". Studio history rides along in both cases — a
  * key nobody ever messaged about can still have been worked somewhere.
+ *
+ * `before` pages backwards: the page of messages strictly older than that
+ * message, in the same shape. `meta.total` counts every message the page
+ * was drawn from (the whole thread, or everything older than the cursor),
+ * so `meta.truncated` always means "there is more, further back".
  */
 router.get('/threads/messages', async (req: Request, res: Response) => {
   try {
     const key = typeof req.query.key === 'string' ? req.query.key : '';
     if (!key) {
       res.status(400).json({ error: 'key query parameter is required' });
+      return;
+    }
+    const before = typeof req.query.before === 'string' ? req.query.before : '';
+    // The cursor is interpolated into a PostgREST filter, so only an id
+    // shape is ever let near it.
+    if (before && !MESSAGE_ID_RE.test(before)) {
+      res.status(400).json({ error: 'before must be a message id' });
       return;
     }
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -7596,23 +7621,49 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       return;
     }
 
-    // Newest MESSAGES_CAP fetched descending, served ascending for display.
-    // The cap is reported, not silent: production already holds a
-    // 669-message thread, and a viewer must know they are seeing a window.
-    const MESSAGES_CAP = 100;
-    const {
-      data: messageRows,
-      error: messagesError,
-      count: messagesCount,
-    } = await supabase
+    // An older page starts from the cursor message's own position. The
+    // cursor must belong to THIS thread: an id from another thread would
+    // otherwise page by a timestamp that means nothing here.
+    let cursor: { id: string; createdAt: string } | null = null;
+    if (before) {
+      const { data: cursorRow, error: cursorError } = await supabase
+        .from('inbox_thread_messages')
+        .select('id, created_at')
+        .eq('thread_id', thread.id)
+        .eq('id', before)
+        .maybeSingle();
+      if (cursorError) {
+        logger.error('Failed to load thread message cursor:', cursorError);
+        res.status(500).json(errorJson('Failed to load thread messages', cursorError));
+        return;
+      }
+      if (!cursorRow) {
+        res.status(400).json({ error: 'before is not a message in this thread' });
+        return;
+      }
+      cursor = { id: cursorRow.id, createdAt: cursorRow.created_at };
+    }
+
+    // Newest page fetched descending, served ascending for display. The cap
+    // is reported, not silent: production already holds a 669-message
+    // thread, and a viewer must know they are seeing a window. `id` breaks
+    // created_at ties so pages never skip or repeat a message.
+    let messagesQuery = supabase
       .from('inbox_thread_messages')
       .select(
         'id, sender_kind, sender_sb_id, sender_user_id, sender_agent_id, content, message_type, priority, metadata, created_at',
         { count: 'exact' }
       )
-      .eq('thread_id', thread.id)
+      .eq('thread_id', thread.id);
+    if (cursor) messagesQuery = olderThan(messagesQuery, cursor);
+    const {
+      data: messageRows,
+      error: messagesError,
+      count: messagesCount,
+    } = await messagesQuery
       .order('created_at', { ascending: false })
-      .limit(MESSAGES_CAP);
+      .order('id', { ascending: false })
+      .limit(MESSAGES_PAGE_SIZE);
     if (messagesError) {
       logger.error('Failed to load thread messages:', messagesError);
       res.status(500).json(errorJson('Failed to load thread messages', messagesError));
@@ -7684,7 +7735,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           createdAt: m.created_at,
         }))
         .reverse(),
-      meta: { fetched, total, truncated: total > MESSAGES_CAP },
+      meta: { fetched, total, truncated: total > fetched },
     });
   } catch (error) {
     logger.error('Failed to load thread messages:', error);

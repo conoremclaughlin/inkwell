@@ -361,7 +361,7 @@ export function Sidebar() {
   };
 
   return (
-    <div className="flex h-full w-64 flex-col border-r border-white/[0.06] bg-[#0f1117]">
+    <div className="flex h-full w-52 flex-col border-r border-white/[0.06] bg-[#0f1117]">
       {/* Workspace switcher */}
       <div className="relative px-3 pb-2 pt-4" ref={accountMenuRef}>
         <button
