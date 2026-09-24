@@ -17,8 +17,20 @@ import type { Database } from '../data/supabase/types';
 // Types
 // ============================================================================
 
+/**
+ * The token types this module mints and verifies.
+ *
+ * `browser_client` is deliberately NOT here — it is a separate credential with
+ * mandatory grant bindings, signed and verified in `browser-client-tokens.ts`.
+ * Widening this union to include it would make
+ * `verifyInkAccessToken(t, 'browser_client')` type-legal and hand back an
+ * `InkTokenPayload` with no `grantId`, which is exactly the unbound-token
+ * downgrade that file exists to prevent.
+ */
+const INK_TOKEN_TYPES = ['mcp_access', 'pcp_admin'] as const;
+
 export interface InkTokenPayload {
-  type: 'mcp_access' | 'pcp_admin';
+  type: (typeof INK_TOKEN_TYPES)[number];
   sub: string; // Inkwell user ID
   email: string;
   scope: string;
@@ -114,6 +126,15 @@ export function verifyInkAccessToken(
 
     const payload = decoded as InkTokenPayload & { agentId?: string };
     if (!payload.type || !payload.sub) return null;
+
+    // Reject any type this module does not mint, whether or not the caller
+    // named an expected one. Every call site today passes `expectedType`, so
+    // this changes nothing for them — it closes the case where a later one
+    // does not. Other credentials (browser_client) are signed with the same
+    // JWT_SECRET and so verify cryptographically here; without this line the
+    // no-expectedType call would accept one and hand back a payload whose
+    // bindings it never checked.
+    if (!(INK_TOKEN_TYPES as readonly string[]).includes(payload.type)) return null;
 
     if (expectedType && payload.type !== expectedType) return null;
 

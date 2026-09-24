@@ -53,6 +53,10 @@ import {
   exchangeRefreshToken,
 } from '../auth/ink-tokens';
 import type { Database } from '../data/supabase/types';
+import {
+  BrowserCompanionGrantService,
+  isInstallationCommitment,
+} from '../services/browser-companion-grant.service';
 import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { ThreadKeyService } from '../services/thread-key/thread-key.service';
@@ -1828,6 +1832,74 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Mobile pairing code error:', error);
     res.status(500).json(errorJson('Failed to create pairing code', error));
+  }
+});
+
+/**
+ * POST /api/admin/browser-companion/pairing-code
+ * Body: { installationId, installationCommitment } → { grantId, pairingCode, … }
+ *
+ * Mints the code the browser extension claims. It lives on the admin router
+ * because the human doing the granting is signed into the dashboard — this is
+ * the authenticated act of consent, and the extension holds no credential yet.
+ * The workspace is `authReq.inkWorkspaceId`, resolved by the admin middleware
+ * from the caller's membership; a client-supplied workspace is never honoured
+ * here, so a code can only ever be minted into a workspace its minter belongs
+ * to.
+ *
+ * `installationCommitment` is sha256 hex of a secret the extension generated
+ * locally and has not sent anywhere. Without it, the claim would be gated on a
+ * code read off a screen plus an installation id handed to this endpoint —
+ * neither secret, so any installation observing both could claim a pairing it
+ * did not start. Getting the commitment from the extension to the dashboard is
+ * browser-side transport and is NOT in this PR: what ships here is the
+ * server's half of pairing, unexposed, not a complete pairing flow.
+ *
+ * Unlike the mobile pairing code above, the row goes into
+ * `browser_companion_grants`, never `mcp_tokens`. A row in `mcp_tokens` is
+ * exchangeable for a general 30-day `mcp_access` JWT at `POST /token` by
+ * anyone holding its `refresh_token` value and naming its `client_id` — the
+ * client_id check there compares the row against a caller-supplied string, so
+ * it namespaces nothing. Storing a browser grant there would have made the
+ * companion route allowlist bypassable in one request.
+ */
+router.post('/browser-companion/pairing-code', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const installationId =
+      typeof req.body?.installationId === 'string' ? req.body.installationId.trim() : '';
+    if (!installationId) {
+      res.status(400).json({ error: 'installationId is required' });
+      return;
+    }
+
+    const installationCommitment =
+      typeof req.body?.installationCommitment === 'string'
+        ? req.body.installationCommitment.trim().toLowerCase()
+        : '';
+    if (!isInstallationCommitment(installationCommitment)) {
+      res.status(400).json({ error: 'installationCommitment must be a sha256 hex digest' });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const grants = new BrowserCompanionGrantService(dataComposer.getClient());
+    const created = await grants.createPairingCode({
+      userId: authReq.inkUserId,
+      workspaceId: authReq.inkWorkspaceId,
+      installationId,
+      installationCommitment,
+    });
+
+    res.json({
+      grantId: created.grantId,
+      pairingCode: formatPairingCode(created.pairingCode),
+      pairingCodeExpiresAt: created.pairingCodeExpiresAt,
+      installationId,
+    });
+  } catch (error) {
+    logger.error('Browser companion pairing code error:', error);
+    res.status(500).json(errorJson('Failed to create browser pairing code', error));
   }
 });
 
