@@ -141,14 +141,21 @@ function resolveTarget(args) {
 function parseMigrationTable(raw) {
   const lines = String(raw).split(/\r?\n/);
   const header = lines.findIndex((line) => /^\s*Local\s*\|\s*Remote\s*\|/.test(line));
-  if (header < 0) return null;
+  if (header < 0) return { error: 'no Local | Remote header' };
   const rows = [];
   for (const line of lines.slice(header + 1)) {
-    const match = line.match(/^\s*(\d{14})?\s*\|\s*(\d{14})?\s*\|/);
-    if (!match || (!match[1] && !match[2])) continue;
+    if (/^\s*$/.test(line)) continue; // the blank line the CLI ends with
+    if (/^\s*-+\s*\|\s*-+\s*\|/.test(line)) continue; // the rule under the header
+    // Every other line must be a row: at least one 14-digit version, then
+    // the time column. Anything else means the listing is not what this
+    // parser knows, and the answer is unknown, never clean.
+    const match = line.match(/^\s*(\d{14})?\s*\|\s*(\d{14})?\s*\|\s*\S/);
+    if (!match || (!match[1] && !match[2])) {
+      return { error: `malformed row: ${line.trim().slice(0, 60)}` };
+    }
     rows.push({ local: match[1] || null, remote: match[2] || null });
   }
-  return rows;
+  return { rows };
 }
 
 // The apply hint follows the target. `yarn db:migrate` only ever writes to
@@ -226,12 +233,12 @@ function main() {
     return;
   }
 
-  const rows = parseMigrationTable(raw);
-  if (rows === null) {
+  const parsed = parseMigrationTable(raw);
+  if (parsed.error) {
     const result = {
       target,
       state: 'unknown',
-      reason: 'unrecognized `supabase migration list` output (no Local | Remote header)',
+      reason: `unrecognized \`supabase migration list\` output (${parsed.error})`,
       pendingCount: 0,
       pending: [],
       elsewhereCount: 0,
@@ -242,6 +249,7 @@ function main() {
     process.exit(args.warnOnly ? 0 : 2);
     return;
   }
+  const rows = parsed.rows;
   const pending = rows.filter((row) => row.local && !row.remote).map((row) => row.local);
   const elsewhere = rows.filter((row) => row.remote && !row.local).map((row) => row.remote);
   const result = {

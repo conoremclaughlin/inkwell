@@ -33,13 +33,22 @@
 #     output without the table header is unknown (exit 2), and the apply
 #     hint follows the target
 #
+#   - transaction control is judged SQL-aware: every spelling at the top
+#     level is refused, and comments, strings and dollar-quoted bodies are
+#     not; psql meta-commands and BEGIN ATOMIC are refused
+#   - no message ever prints the connection string's password
+#
 # Usage:  sh scripts/db-migrate.test.sh
+#
+# SCRIPT_UNDER_TEST and STATUS_UNDER_TEST point the suite at other copies of
+# the two scripts, so a check can be shown red against an older head.
 
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd) || exit 1
-script="$root/scripts/db-migrate.sh"
-status_mjs="$root/scripts/migration-status.mjs"
+script="${SCRIPT_UNDER_TEST:-$root/scripts/db-migrate.sh}"
+status_mjs="${STATUS_UNDER_TEST:-$root/scripts/migration-status.mjs}"
+guard="$root/scripts/lib/sql-transaction-control.awk"
 
 git_isolate() {
   unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_OBJECT_DIRECTORY \
@@ -117,11 +126,20 @@ case "$cmd $sub" in
       echo "unrecognized CLI output"
       exit 0
     }
+    [ -n "${STUB_LIST_MALFORMED:-}" ] && {
+      printf '\n  \n   Local          | Remote         | Time (UTC)          \n  ----------------|----------------|---------------------\n   this is not a row\n'
+      exit 0
+    }
     printf '\n  \n   Local          | Remote         | Time (UTC)          \n  ----------------|----------------|---------------------\n'
     : > "$STUB_TMP/local"
     for f in "$workdir"/supabase/migrations/*.sql; do
       [ -e "$f" ] || continue
       b=$(basename "$f")
+      # like the CLI: a name without the 14-digit version is skipped
+      case "$b" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_*.sql) ;;
+        *) continue ;;
+      esac
       echo "${b%%_*}" >> "$STUB_TMP/local"
     done
     sort -u "$STUB_TMP/local" -o "$STUB_TMP/local"
@@ -145,7 +163,8 @@ exit 99
 STUB
 cat > "$work/stubs/psql" <<'STUB'
 #!/bin/sh
-printf 'psql %s\n' "$*" >> "$STUB_LOG"
+# one log line per call: the file text passed as -v content= has newlines
+printf 'psql %s\n' "$(printf '%s ' "$@" | tr '\n' ' ')" >> "$STUB_LOG"
 version=''
 query=''
 prev=''
@@ -188,7 +207,8 @@ export PATH
 STUB_LOG="$work/calls.log"
 STUB_LEDGER="$work/ledger.txt"
 STUB_TMP="$work"
-STUB_DB_URL='postgresql://stub@127.0.0.1:1/stub'
+# A synthetic password, so the redaction checks have something to look for.
+STUB_DB_URL='postgresql://stub:s3cretpw@127.0.0.1:1/stub'
 export STUB_LOG STUB_LEDGER STUB_TMP STUB_DB_URL
 : > "$STUB_LOG"
 : > "$STUB_LEDGER"
@@ -260,11 +280,65 @@ rc=$?
 reset_log
 out=$(cd "$repo" && sh "$script" apply supabase/migrations/20260105000000_five.sql 2>&1)
 rc=$?
-if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'BEGIN/COMMIT' && echo "$out" | grep -q 'single-transaction'; then
-  ok "a file carrying its own BEGIN/COMMIT is refused before psql, and told why"
+if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'transaction control: BEGIN' && echo "$out" | grep -q 'single-transaction'; then
+  ok "a file carrying its own BEGIN/COMMIT is refused before psql, naming the statement and why"
 else
-  bad "a file carrying its own BEGIN/COMMIT is refused before psql, and told why" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  bad "a file carrying its own BEGIN/COMMIT is refused before psql, naming the statement and why" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
 fi
+
+# --- transaction control is judged SQL-aware ---------------------------------
+# Its own fixture checkout, so the counts in the status checks stay put.
+tc="$work/tc"
+mkdir -p "$tc/supabase/migrations"
+(cd "$tc" && git init -q -b main && git -c user.name=fixture -c user.email=fixture@example.com commit -q --allow-empty -F "$work/msg") || bad "tc fixture" "git init failed"
+tcm="$tc/supabase/migrations"
+: > "$work/ledger-tc.txt"
+printf 'SELECT 1;\nCOMMIT WORK;\n' > "$tcm/20260201000000_commit_work.sql"
+printf 'SELECT 1; COMMIT;\n' > "$tcm/20260202000000_two_on_a_line.sql"
+printf 'SELECT 1;\nEND;\n' > "$tcm/20260203000000_end.sql"
+printf 'SELECT 1;\nROLLBACK WORK;\n' > "$tcm/20260204000000_rollback_work.sql"
+printf 'START TRANSACTION;\nSELECT 1;\n' > "$tcm/20260205000000_start.sql"
+printf 'SAVEPOINT a;\nSELECT 1;\nRELEASE a;\n' > "$tcm/20260206000000_savepoint.sql"
+printf 'SELECT 1;\n\\connect other\nSELECT 2;\n' > "$tcm/20260207000000_meta.sql"
+printf 'CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;\n' > "$tcm/20260208000000_atomic.sql"
+printf 'COMMIT AND CHAIN;\n' > "$tcm/20260209000000_chain.sql"
+printf 'SELECT 1 \\gset\n' > "$tcm/20260210000000_gset.sql"
+for f in 20260201000000_commit_work 20260202000000_two_on_a_line 20260203000000_end 20260204000000_rollback_work \
+  20260205000000_start 20260206000000_savepoint 20260207000000_meta 20260208000000_atomic 20260209000000_chain 20260210000000_gset; do
+  reset_log
+  out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql'; then
+    ok "refused before psql: $f"
+  else
+    bad "refused before psql: $f" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  fi
+done
+printf '/* COMMIT; */\nSELECT 1;\n' > "$tcm/20260211000000_block_comment.sql"
+printf -- '-- COMMIT;\nSELECT 1; -- END;\n' > "$tcm/20260212000000_line_comment.sql"
+printf "SELECT 'COMMIT;';\nSELECT \"END\" FROM (SELECT 1 AS \"END\") s;\n" > "$tcm/20260213000000_quoted.sql"
+printf 'CREATE OR REPLACE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n  PERFORM 1;\n  COMMIT;\nEND;\n$$;\n' > "$tcm/20260214000000_dollar_body.sql"
+printf 'CREATE OR REPLACE FUNCTION g() RETURNS int LANGUAGE plpgsql AS $fn$\nDECLARE x int;\nBEGIN\n  x := 1;\n  RETURN x;\nEND;\n$fn$;\nSELECT g();\n' > "$tcm/20260215000000_tagged_body.sql"
+printf 'SELECT CASE WHEN true THEN 1 END;\n' > "$tcm/20260216000000_case_end.sql"
+printf "DO \$\$ BEGIN RAISE NOTICE 'it''s fine'; END \$\$;\n" > "$tcm/20260217000000_do_block.sql"
+for f in 20260211000000_block_comment 20260212000000_line_comment 20260213000000_quoted 20260214000000_dollar_body \
+  20260215000000_tagged_body 20260216000000_case_end 20260217000000_do_block; do
+  reset_log
+  out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(apply_calls)" -eq 1 ]; then
+    ok "accepted and applied: $f"
+  else
+    bad "accepted and applied: $f" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  fi
+done
+out=$(awk -f "$guard" "$tcm/20260201000000_commit_work.sql" 2>&1)
+rc=$?
+[ "$rc" -eq 1 ] && [ "$out" = "transaction control: COMMIT WORK" ] && ok "the scanner names the offending statement and exits 1" ||
+  bad "the scanner names the offending statement and exits 1" "exit $rc: $out"
+out=$(awk -f "$guard" "$tcm/20260214000000_dollar_body.sql" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && ok "the scanner is silent and exits 0 on a clean file" || bad "the scanner is silent and exits 0 on a clean file" "exit $rc: $out"
 
 reset_log
 out=$(cd "$repo" && STUB_NO_STACK=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
@@ -293,6 +367,11 @@ if [ "$rc" -eq 2 ] && [ "$(apply_calls)" -eq 0 ] && [ "$(calls | grep -c '^psql'
   ok "a recorded-count read that fails is a refusal: one psql call, no apply, no row"
 else
   bad "a recorded-count read that fails is a refusal: one psql call, no apply, no row" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+if ! echo "$out" | grep -q 's3cretpw' && echo "$out" | grep -q 'stub:\*\*\*@127.0.0.1' && calls | grep -q 's3cretpw'; then
+  ok "the failure names the endpoint with the password replaced, while psql received the real one"
+else
+  bad "the failure names the endpoint with the password replaced, while psql received the real one" "$out"
 fi
 
 # --- the happy path ---------------------------------------------------------
@@ -408,7 +487,8 @@ fi
 reset_log
 out=$(cd "$repo" && STUB_LIST_FAIL=1 sh "$script" status 2>&1)
 rc=$?
-[ "$rc" -eq 2 ] && echo "$out" | grep -q 'migration list failed' && ok "status refuses when the listing fails" || bad "status refuses when the listing fails" "exit $rc: $out"
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'migration list failed' && ! echo "$out" | grep -q 's3cretpw' && echo "$out" | grep -q '\*\*\*@' &&
+  ok "status refuses when the listing fails, without printing the password" || bad "status refuses when the listing fails, without printing the password" "exit $rc: $out"
 
 # --- migration-status.mjs reads the same table ------------------------------
 
@@ -472,6 +552,14 @@ out=$(STUB_LIST_GARBAGE=1 node "$status_mjs" --local --workdir "$repo" --warn-on
 rc=$?
 [ "$rc" -eq 0 ] && echo "$out" | grep -q 'Unable to determine' && ok "migration-status.mjs: unknown output under --warn-only still warns, exits 0" ||
   bad "migration-status.mjs: unknown output under --warn-only still warns, exits 0" "exit $rc: $out"
+
+out=$(STUB_LIST_MALFORMED=1 node "$status_mjs" --local --workdir "$repo" 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && echo "$out" | grep -q 'malformed row' && ! echo "$out" | grep -q 'No pending'; then
+  ok "migration-status.mjs: a good header followed by a malformed row is unknown, never clean"
+else
+  bad "migration-status.mjs: a good header followed by a malformed row is unknown, never clean" "exit $rc: $out"
+fi
 
 out=$(STUB_LIST_FAIL=1 node "$status_mjs" --local --workdir "$repo" 2>&1)
 rc=$?

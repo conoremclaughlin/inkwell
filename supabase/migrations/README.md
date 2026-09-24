@@ -34,13 +34,29 @@ worktree cannot read one ledger and write another. It works from any worktree,
 in any order, and skips a version the ledger already has. Several files can be
 given at once; each is its own transaction.
 
-A file must not carry its own `BEGIN`, `COMMIT`, `ROLLBACK` or
-`START TRANSACTION`; the wrapper refuses it. psql's single-transaction mode
-does not cover transaction-control statements: an inner `COMMIT` would commit
-the ledger row and everything before it, and a failure later in the file would
-not roll that back, which is precisely the recorded-but-partially-applied state
-the wrapper exists to prevent. Older files in this directory do carry them;
-they are already applied and do not go through the wrapper.
+A file must not carry its own transaction control at the top level, in any
+spelling (`BEGIN`, `START TRANSACTION`, `COMMIT`, `COMMIT WORK`, `END`,
+`ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ABORT`, `PREPARE TRANSACTION`), nor a
+psql meta-command (`\connect`, `\i`, ...); the wrapper refuses it and names
+the statement. psql's single-transaction mode does not cover
+transaction-control statements: an inner `COMMIT` would commit the ledger row
+and everything before it, and a failure later in the file would not roll that
+back, which is precisely the recorded-but-partially-applied state the wrapper
+exists to prevent. The judgement is SQL-aware
+(`scripts/lib/sql-transaction-control.awk`): comments, string literals and
+dollar-quoted bodies are invisible to it, so the `BEGIN`/`END` of a plpgsql
+function is not transaction control and a `COMMIT;` inside a comment is not
+either. `BEGIN ATOMIC` bodies are refused outright; use a dollar-quoted body.
+Two older files in this directory do carry a top-level `BEGIN`/`COMMIT`; they
+are already applied and do not go through the wrapper.
+
+`DB_MIGRATE_URL` overrides the connection string (the wrapper then does not ask
+`supabase status`). It exists for `scripts/db-migrate.integration.test.sh`,
+which builds a disposable database on a throwaway Postgres and proves the
+contract for real: one transaction, one effect under concurrency, nothing left
+behind by a failure. That test is opt-in and must never be pointed at the
+shared stack; the file's header shows the `docker run` it expects. Messages
+never print the connection string; the password is shown as `***`.
 
 If the stack is not running, start it from the root checkout with
 `supabase start`. Do not reach for `yarn supabase:local:setup` for that: it

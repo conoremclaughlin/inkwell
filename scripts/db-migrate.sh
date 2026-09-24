@@ -22,14 +22,23 @@
 # The apply is one psql transaction: an advisory lock on the version, the
 # ledger row (its primary key is the version, so a second run of the same
 # file blocks on the lock and then fails the insert), then the file. Either
-# all of it commits or none of it does. A file that carries its own BEGIN or
-# COMMIT is refused: psql's single-transaction mode does not cover
-# transaction-control statements, so an inner COMMIT would commit the row and
-# the partial file and leave a later failure un-rolled-back.
+# all of it commits or none of it does. A file that carries its own
+# transaction control (any spelling of BEGIN/COMMIT/END/ROLLBACK/SAVEPOINT at
+# the top level) or a psql meta-command is refused: psql's single-transaction
+# mode does not cover transaction-control statements, so an inner COMMIT
+# would commit the row and the partial file and leave a later failure
+# un-rolled-back. The judgement is SQL-aware (lib/sql-transaction-control.awk):
+# comments, strings and dollar-quoted bodies are invisible to it, so a
+# function body's BEGIN and END do not count.
 #
 # Usage:
 #   sh scripts/db-migrate.sh apply supabase/migrations/<version>_<name>.sql [...]
 #   sh scripts/db-migrate.sh status
+#
+# DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
+# exists for the integration test (a disposable database) and for a stack
+# the CLI cannot describe. The connection string is never printed; messages
+# show it with the password replaced.
 #
 # Exit codes: 0 applied and recorded (or already recorded); 1 the transaction
 # failed and rolled back; 2 usage or environment, before anything ran.
@@ -53,13 +62,24 @@ mode=${1:-}
 [ -n "$mode" ] || usage
 shift
 
-command -v supabase >/dev/null 2>&1 ||
-  die "Supabase CLI not found on PATH (https://supabase.com/docs/guides/cli/getting-started)"
+here=$(cd "$(dirname "$0")" && pwd -P) || die "cannot locate the scripts directory"
+guard="$here/lib/sql-transaction-control.awk"
+[ -f "$guard" ] || die "missing $guard"
 command -v psql >/dev/null 2>&1 ||
   die "psql not found on PATH; install it (brew install libpq && brew link --force libpq)"
 common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not inside a git checkout"
 root=$(cd "$common/.." && pwd -P) || die "could not resolve the repository root from $common"
 checkout=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git work tree"
+
+need_cli() {
+  command -v supabase >/dev/null 2>&1 ||
+    die "Supabase CLI not found on PATH (https://supabase.com/docs/guides/cli/getting-started)"
+}
+
+# The connection string with its password replaced, for every message.
+redact() {
+  printf '%s' "$1" | sed -E 's#(://[^/@:]*):[^@]*@#\1:***@#'
+}
 
 # Paths are compared physically (pwd -P): git reports the real path of the
 # work tree, and on macOS a temp directory has two spellings.
@@ -72,9 +92,14 @@ db_url() {
     sed -n 's/^DB_URL="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1
 }
 
-url=$(db_url)
-[ -n "$url" ] ||
-  die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
+url=${DB_MIGRATE_URL:-}
+if [ -z "$url" ]; then
+  need_cli
+  url=$(db_url)
+  [ -n "$url" ] ||
+    die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
+fi
+shown=$(redact "$url")
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/db-migrate.XXXXXX") || die "could not create a temp directory"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
@@ -105,11 +130,17 @@ apply_one() {
   dir=$(cd "$(dirname "$file")" && pwd -P) || die "cannot enter $(dirname "$file")"
   [ "$dir" = "$checkout/supabase/migrations" ] ||
     die "$base must live in $checkout/supabase/migrations (found it in $dir)"
-  if sed 's/--.*$//' "$file" | grep -qiE '^[[:space:]]*(BEGIN|COMMIT|ROLLBACK|START TRANSACTION)[[:space:]]*;'; then
-    die "$base contains its own BEGIN/COMMIT; remove it. The wrapper runs the file inside one transaction with its ledger row, and psql's single-transaction mode does not cover transaction-control statements, so an inner COMMIT would record the row and commit a partial file."
-  fi
+  findings=$(awk -f "$guard" "$file" 2>&1)
+  case $? in
+    0) ;;
+    1)
+      printf 'db-migrate: %s carries its own transaction control or a psql meta-command; remove it:\n%s\n' "$base" "$findings" >&2
+      die "the wrapper runs the file inside one transaction with its ledger row, and psql's single-transaction mode does not cover transaction-control statements, so an inner COMMIT would record the row and commit a partial file (a BEGIN/COMMIT pair is also redundant here)"
+      ;;
+    *) die "could not scan $base for transaction control: $findings" ;;
+  esac
 
-  count=$(recorded_count "$version") || die "could not read the ledger over $url (refusing to apply without it)"
+  count=$(recorded_count "$version") || die "could not read the ledger over $shown (refusing to apply without it)"
   case "$count" in
     0) ;;
     [1-9]*)
@@ -151,10 +182,11 @@ case "$mode" in
     ;;
   status)
     [ "$#" -eq 0 ] || usage
+    need_cli
     # The CLI prints a table: local version | remote version | time. Bound to
     # the same endpoint as apply; the files come from this checkout.
     table=$(supabase migration list --db-url "$url" --workdir "$checkout" 2>/dev/null) ||
-      die "supabase migration list failed over $url"
+      die "supabase migration list failed over $shown"
     printf '%s\n' "$table"
     printf '%s\n' "$table" | awk -F'|' '
       NF >= 2 {
