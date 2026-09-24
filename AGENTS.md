@@ -532,7 +532,7 @@ The global link stays where it was. Your studio's build is for you to exercise, 
 
 ## Supabase Project ID
 
-When using MCP Supabase tools (`execute_sql`, `apply_migration`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:
+When using MCP Supabase tools (`execute_sql`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:
 
 ```
 SUPABASE_URL=https://<project_id>.supabase.co
@@ -560,9 +560,7 @@ supabase/migrations/YYYYMMDDHHmmss_short_description.sql
 
    Never use manual numeric prefixes (`001_`, `002_`). Timestamps prevent branch conflicts — two agents can create migrations independently and they merge cleanly as long as the SQL doesn't conflict.
 
-3. **Apply migrations via:**
-   - MCP tool: `mcp__supabase__apply_migration`
-   - Supabase CLI (if installed): `supabase db push` (remote) / `supabase migration up` (local)
+3. **Apply with `yarn db:migrate supabase/migrations/<file>`** from the checkout that holds the file: any worktree, any order, before or after other branches merge. It runs the file and its ledger row in one transaction against the local stack, under the file's own version; `yarn db:migrate:status` shows what is pending. Do not apply through the MCP `apply_migration` tool (it records the apply time as the version, and the ledger drifts) or `supabase migration up` / `db push` from a branch (they refuse while another branch's applied migration has no file in your checkout). Never `supabase db reset` on the shared local stack. The ledger, the from-scratch order check, and the incident this came from are in `supabase/migrations/README.md`.
 
 4. **After applying, regenerate types:**
    - MCP tool: `mcp__supabase__generate_typescript_types`
