@@ -1440,9 +1440,12 @@ describe('StudioLeaseService release paths', () => {
   });
 
   it('releaseByStudio releases NOW when the caller session is the live holder (task e7752d29)', async () => {
-    // The holder is live in every sense the deferral rule checks — an
-    // in-process run is registered, the row is not terminal — and still the
-    // release completes in one call, because the holder is the one asking.
+    // The holder is live in every sense the deferral rule checks: an
+    // in-process run is registered AND the row is made non-terminal here
+    // (the shared fixture seeds ended_at; either signal alone would defer a
+    // stranger's close). Still the release completes in one call, because
+    // the holder is the one asking.
+    tables.sessions[0].ended_at = null;
     registerActiveRun({
       sessionId: 'session-a',
       userId: 'user-1',
