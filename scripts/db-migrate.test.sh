@@ -322,9 +322,16 @@ printf 'SELECT 1 AS foo$tag$; COMMIT; SELECT 1 AS foo$tag$;\n' > "$tcm/202602180
 printf 'SELECT 1 AS foo$$; COMMIT; SELECT 1 AS bar$$;\n' > "$tcm/20260219000000_ident_dollardollar_bypass.sql"
 # caf\303\251 is "café": a non-ASCII identifier character before the $
 printf 'SELECT 1 AS caf\303\251$tag$; COMMIT; SELECT 1 AS caf\303\251$tag$;\n' > "$tcm/20260222000000_ident_nonascii_bypass.sql"
+# no semicolon, no newline, the file ends inside a line comment
+printf 'CREATE TABLE t (id int);\nROLLBACK -- final comment' > "$tcm/20260224000000_eof_in_line_comment.sql"
+# \015 is a bare CR: PostgreSQL ends a line comment there too
+printf -- '-- comment\015COMMIT;\nSELECT 1;\n' > "$tcm/20260225000000_cr_ends_comment.sql"
+printf 'SELECT 1;\015\nCOMMIT;\015\n' > "$tcm/20260226000000_crlf_commit.sql"
+printf 'ROLLBACK' > "$tcm/20260227000000_eof_no_semicolon.sql"
 for f in 20260201000000_commit_work 20260202000000_two_on_a_line 20260203000000_end 20260204000000_rollback_work \
   20260205000000_start 20260206000000_savepoint 20260207000000_meta 20260208000000_atomic 20260209000000_chain 20260210000000_gset \
-  20260218000000_ident_dollar_bypass 20260219000000_ident_dollardollar_bypass 20260222000000_ident_nonascii_bypass; do
+  20260218000000_ident_dollar_bypass 20260219000000_ident_dollardollar_bypass 20260222000000_ident_nonascii_bypass \
+  20260224000000_eof_in_line_comment 20260225000000_cr_ends_comment 20260226000000_crlf_commit 20260227000000_eof_no_semicolon; do
   reset_log
   out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
   rc=$?
@@ -344,8 +351,13 @@ printf "DO \$\$ BEGIN RAISE NOTICE 'it''s fine'; END \$\$;\n" > "$tcm/2026021700
 printf 'SELECT 1 AS foo$tag$;\nSELECT 2 AS x$$;\n' > "$tcm/20260220000000_ident_with_dollar.sql"
 printf 'SELECT $$COMMIT;$$;\nSELECT 1;\n' > "$tcm/20260221000000_dollar_string_at_boundary.sql"
 printf 'SELECT 1 AS caf\303\251$tag$;\nSELECT $caf\303\251$ BEGIN; COMMIT; $caf\303\251$;\n' > "$tcm/20260223000000_nonascii_ident_and_tag.sql"
+printf 'SELECT 1 -- trailing comment, no newline' > "$tcm/20260228000000_eof_benign_comment.sql"
+printf -- '-- comment\015SELECT 1;\n' > "$tcm/20260229000000_cr_benign.sql"
+printf 'SELECT 1;\015\nSELECT 2; -- COMMIT;\015\n' > "$tcm/20260230000000_crlf_benign.sql"
+printf 'SELECT 1 -- COMMIT;' > "$tcm/20260231000000_eof_comment_mentions_commit.sql"
 for f in 20260211000000_block_comment 20260212000000_line_comment 20260213000000_quoted 20260214000000_dollar_body \
-  20260215000000_tagged_body 20260216000000_case_end 20260217000000_do_block 20260220000000_ident_with_dollar 20260221000000_dollar_string_at_boundary 20260223000000_nonascii_ident_and_tag; do
+  20260215000000_tagged_body 20260216000000_case_end 20260217000000_do_block 20260220000000_ident_with_dollar 20260221000000_dollar_string_at_boundary 20260223000000_nonascii_ident_and_tag \
+  20260228000000_eof_benign_comment 20260229000000_cr_benign 20260230000000_crlf_benign 20260231000000_eof_comment_mentions_commit; do
   reset_log
   out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
   rc=$?

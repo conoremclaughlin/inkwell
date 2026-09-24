@@ -21,6 +21,10 @@
 # sets: the same file then lexes the same way on every machine, and awk
 # never fails on multibyte input.
 #
+# A line comment ends at LF or CR, as in PostgreSQL's scanner, and a file
+# that ends inside a line comment, or without a final semicolon or newline,
+# still has its last statement judged.
+#
 # Refused at the top level: BEGIN, START TRANSACTION, COMMIT, END, ROLLBACK,
 # ABORT, SAVEPOINT, RELEASE, PREPARE TRANSACTION, any spelling (COMMIT WORK,
 # ROLLBACK TO SAVEPOINT x, COMMIT AND CHAIN, ...); any psql meta-command
@@ -108,7 +112,7 @@ END {
       }
       if (c == "\\") {
         rest = substr(src, i)
-        sub(/\n.*/, "", rest)
+        sub(/[\n\r].*/, "", rest)
         report("psql meta-command", rest)
         i += length(rest) - 1
         continue
@@ -117,7 +121,7 @@ END {
       stmt = stmt c
       continue
     }
-    if (mode == "lc") { if (c == "\n") mode = "sql"; continue }
+    if (mode == "lc") { if (c == "\n" || c == "\r") mode = "sql"; continue }
     if (mode == "bc") {
       if (c == "/" && nxt == "*") { depth++; i++; continue }
       if (c == "*" && nxt == "/") { depth--; i++; if (depth == 0) mode = "sql"; continue }
@@ -139,7 +143,9 @@ END {
       continue
     }
   }
-  if (mode == "sql") judge(stmt)
-  else if (mode != "lc") report("unterminated " (mode == "bc" ? "block comment" : mode == "sq" ? "string" : mode == "dq" ? "quoted identifier" : "dollar-quoted body " tag), "")
+  # End of input inside a line comment is the end of that comment; the
+  # statement before it is still a statement.
+  if (mode == "sql" || mode == "lc") judge(stmt)
+  else report("unterminated " (mode == "bc" ? "block comment" : mode == "sq" ? "string" : mode == "dq" ? "quoted identifier" : "dollar-quoted body " tag), "")
   exit found ? 1 : 0
 }
