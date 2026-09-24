@@ -26,6 +26,7 @@ import {
   loadAuthorizedAmbientSession,
   type CallerIdentity,
 } from './caller-identity';
+import { resolveCallerSb } from './caller-principal';
 import { findOrCreateThread } from './inbox-handlers';
 import { assignThreadParticipant } from '../../services/sessions/thread-assignment';
 import type { Session } from '../../data/models/memory';
@@ -412,27 +413,33 @@ async function bindThreadHome(
   opts: { userId: string; sbSlug: string; threadKey: string; sessionId: string; via: string }
 ): Promise<HomeSummary> {
   const supabase = dataComposer.getClient();
+  // The agent is a principal in exactly one workspace; the thread lives there.
+  const sb = await resolveCallerSb(supabase, opts.userId, opts.sbSlug);
   const thread = await findOrCreateThread(supabase, {
-    userId: opts.userId,
+    workspaceId: sb.workspaceId,
     threadKey: opts.threadKey,
-    creatorSlug: opts.sbSlug,
+    creator: sb,
     title: null,
-    participants: [opts.sbSlug],
+    participants: [sb],
   });
   if (!thread.isNew) {
     // An existing thread this agent is not yet on: join it first.
     const { data: row } = await participantTable(supabase)
-      .select('agent_id')
+      .select('sb_id')
       .eq('thread_id', thread.id)
-      .eq('agent_id', opts.sbSlug)
+      .eq('sb_id', sb.sbId)
       .maybeSingle();
     if (!row) {
-      await participantTable(supabase).insert({ thread_id: thread.id, agent_id: opts.sbSlug });
+      await participantTable(supabase).insert({
+        thread_id: thread.id,
+        workspace_id: sb.workspaceId,
+        sb_id: sb.sbId,
+      });
     }
   }
   const assignment = await assignThreadParticipant(supabase, {
     threadId: thread.id,
-    sbSlug: opts.sbSlug,
+    sbId: sb.sbId,
     candidateSessionId: opts.sessionId,
     explicitAnchor: true,
     source: opts.via,

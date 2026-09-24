@@ -7,9 +7,9 @@ import { BaseRepository } from './base.repository';
  *
  * The registry is DATA, not a code constant (Conor, 2026-08-20): general
  * rules like "pr:* creates a studio" are user-adjustable without a deploy,
- * and system template rows (user_id IS NULL) ship working defaults.
+ * and system template rows (workspace_id IS NULL) ship working defaults.
  *
- * Resolution: a user override row beats the template row for the same type;
+ * Resolution: a workspace override row beats the template row for the same type;
  * no row at all resolves to the unknown-type default. Behavior lives HERE,
  * never in call sites (grammar invariant 5) — no consumer hardcodes
  * "spec means presence".
@@ -22,7 +22,7 @@ export type StudioPolicy = 'provision' | 'reuse-only';
 
 export interface ThreadKeyType {
   id: string;
-  userId: string | null;
+  workspaceId: string | null;
   type: string;
   writeIntent: WriteIntent;
   studioPolicy: StudioPolicy;
@@ -72,7 +72,7 @@ export class ThreadKeyTypesRepository extends BaseRepository {
   private mapRow(row: ThreadKeyTypeRow): ThreadKeyType {
     return {
       id: row.id,
-      userId: row.user_id ?? null,
+      workspaceId: row.workspace_id ?? null,
       type: row.type,
       writeIntent: row.write_intent as WriteIntent,
       studioPolicy: row.studio_policy as StudioPolicy,
@@ -82,27 +82,27 @@ export class ThreadKeyTypesRepository extends BaseRepository {
     };
   }
 
-  /** All rows visible to this user: system templates + their overrides. */
-  async listForUser(userId: string): Promise<ThreadKeyType[]> {
+  /** All rows visible in this workspace: system templates + the workspace's overrides (§1b). */
+  async listForWorkspace(workspaceId: string): Promise<ThreadKeyType[]> {
     try {
       const { data, error } = await this.db
         .from('thread_key_types')
         .select('*')
-        .or(`user_id.is.null,user_id.eq.${userId}`)
+        .or(`workspace_id.is.null,workspace_id.eq.${workspaceId}`)
         .order('type');
       if (error) throw error;
       return (data ?? []).map((r) => this.mapRow(r));
     } catch (error) {
-      this.handleError(error, 'listForUser');
+      this.handleError(error, 'listForWorkspace');
     }
   }
 
   /** Effective view: overrides shadow templates, keyed by type. */
-  async listEffective(userId: string): Promise<EffectiveThreadKeyType[]> {
-    const rows = await this.listForUser(userId);
+  async listEffective(workspaceId: string): Promise<EffectiveThreadKeyType[]> {
+    const rows = await this.listForWorkspace(workspaceId);
     const byType = new Map<string, EffectiveThreadKeyType>();
     // Templates first, then overrides shadow them.
-    for (const row of rows.filter((r) => r.userId === null)) {
+    for (const row of rows.filter((r) => r.workspaceId === null)) {
       byType.set(row.type, {
         type: row.type,
         writeIntent: row.writeIntent,
@@ -111,7 +111,7 @@ export class ThreadKeyTypesRepository extends BaseRepository {
         source: 'template',
       });
     }
-    for (const row of rows.filter((r) => r.userId !== null)) {
+    for (const row of rows.filter((r) => r.workspaceId !== null)) {
       byType.set(row.type, {
         type: row.type,
         writeIntent: row.writeIntent,
@@ -129,10 +129,10 @@ export class ThreadKeyTypesRepository extends BaseRepository {
    * unknown-type default (write), because failing toward presence would let
    * a session mutate an unleased tree.
    */
-  async getEffective(userId: string, type: string): Promise<EffectiveThreadKeyType> {
+  async getEffective(workspaceId: string, type: string): Promise<EffectiveThreadKeyType> {
     try {
-      const rows = await this.listForUser(userId);
-      const override = rows.find((r) => r.userId !== null && r.type === type);
+      const rows = await this.listForWorkspace(workspaceId);
+      const override = rows.find((r) => r.workspaceId !== null && r.type === type);
       if (override) {
         return {
           type: override.type,
@@ -142,7 +142,7 @@ export class ThreadKeyTypesRepository extends BaseRepository {
           source: 'override',
         };
       }
-      const template = rows.find((r) => r.userId === null && r.type === type);
+      const template = rows.find((r) => r.workspaceId === null && r.type === type);
       if (template) {
         return {
           type: template.type,
@@ -158,9 +158,9 @@ export class ThreadKeyTypesRepository extends BaseRepository {
     }
   }
 
-  /** Upsert a user override. */
+  /** Upsert a workspace override. */
   async setOverride(
-    userId: string,
+    workspaceId: string,
     type: string,
     values: { writeIntent: WriteIntent; studioPolicy: StudioPolicy; description?: string | null }
   ): Promise<ThreadKeyType> {
@@ -168,7 +168,7 @@ export class ThreadKeyTypesRepository extends BaseRepository {
       const { data: existing, error: findErr } = await this.db
         .from('thread_key_types')
         .select('id')
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .eq('type', type)
         .maybeSingle();
       if (findErr) throw findErr;
@@ -191,7 +191,7 @@ export class ThreadKeyTypesRepository extends BaseRepository {
       }
 
       const insert: Database['public']['Tables']['thread_key_types']['Insert'] = {
-        user_id: userId,
+        workspace_id: workspaceId,
         type,
         write_intent: values.writeIntent,
         studio_policy: values.studioPolicy,
@@ -209,13 +209,13 @@ export class ThreadKeyTypesRepository extends BaseRepository {
     }
   }
 
-  /** Delete a user override; the shipped template (or default) resumes. */
-  async clearOverride(userId: string, type: string): Promise<boolean> {
+  /** Delete a workspace override; the shipped template (or default) resumes. */
+  async clearOverride(workspaceId: string, type: string): Promise<boolean> {
     try {
       const { data, error } = await this.db
         .from('thread_key_types')
         .delete()
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .eq('type', type)
         .select('id');
       if (error) throw error;

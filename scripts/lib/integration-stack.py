@@ -179,9 +179,12 @@ def configuration(root, project, ports):
     return text
 
 
-def fingerprint(root, config, exclude, version):
+def fingerprint(root, config, exclude, version, until=""):
     digest = hashlib.sha256()
-    for value in (config, exclude, version, POLICY):
+    # `until` is the rehearsal cut (INTEGRATION_MIGRATIONS_UNTIL): a stack built
+    # at the older schema must never be reused for a full-schema run, or the
+    # reverse, so the cut is part of what makes two stacks the same.
+    for value in (config, exclude, version, POLICY, until):
         digest.update(value.encode() + b"\0")
     # Include file names as well as contents: rename/removal is schema drift.
     for path in sorted((root / "supabase").rglob("*.sql")):
@@ -191,12 +194,25 @@ def fingerprint(root, config, exclude, version):
     return digest.hexdigest()
 
 
-def prepare(root, workdir, config):
+def prepare(root, workdir, config, until=None):
     target = workdir / "supabase"
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(root / "supabase", target, ignore=shutil.ignore_patterns(".temp", ".branches"))
     (target / "config.toml").write_text(config)
+    # Rehearsal mode (spec inkmail-thread-scope §4): withhold every migration at
+    # or after a timestamp so the stack comes up at the OLDER schema, and a test
+    # can execute a withheld migration file itself — inside a transaction it
+    # rolls back — against fixtures it seeded. The withheld files are read from
+    # the real repository (INTEGRATION_MIGRATIONS_DIR), never from this copy.
+    if until:
+        withheld = 0
+        for migration in sorted((target / "migrations").glob("*.sql")):
+            stamp = migration.name.split("_", 1)[0]
+            if stamp >= until:
+                migration.unlink()
+                withheld += 1
+        say("Rehearsal: applying migrations before " + until + " (" + str(withheld) + " withheld)")
 
 
 def read_state(path):
@@ -324,7 +340,8 @@ def manage(root, harness, args, env):
             return 0
         config = configuration(root, project, ports)
         version = capture(["supabase", "--version"])
-        signature = fingerprint(root, config, exclude, version)
+        until = env.get("INTEGRATION_MIGRATIONS_UNTIL") or ""
+        signature = fingerprint(root, config, exclude, version, until)
         if existing and (state.get("config") != config or state.get("exclude") != exclude or state.get("version") != version):
             raise Refusal("Retained stack ports/config/CLI differ. Use --stop, then retry.")
         if existing and state.get("fingerprint") != signature and not reset:
@@ -351,7 +368,7 @@ def manage(root, harness, args, env):
         keep = not fresh or env.get("INTEGRATION_KEEP_SUPABASE") == "1"
         try:
             if not existing:
-                prepare(root, workdir, config)
+                prepare(root, workdir, config, until)
                 say("Starting test stack " + project)
                 started = True
                 subprocess.check_call(["supabase", "start", "--workdir", str(workdir), "--exclude", exclude],
@@ -370,7 +387,7 @@ def manage(root, harness, args, env):
                 write_state(state_path, state)
             if fresh or reset or not existing:
                 if existing:
-                    prepare(root, workdir, config)
+                    prepare(root, workdir, config, until)
                 say("Resetting test DB (migrations + seed)")
                 try:
                     subprocess.check_call(["supabase", "db", "reset", "--workdir", str(workdir), "--local"],
@@ -384,13 +401,13 @@ def manage(root, harness, args, env):
                         write_state(state_path, state)
                 db_id = containers(project).get(db_name)
                 baseline_state = capture_baseline(workdir, project, db_id, ports[1], lock_fds,
-                                                  signature, marker["runId"])
+                                                  signature, marker["runId"], until)
             else:
                 marker["phase"] = "cleaning"
                 write_state(marker_path, marker)
                 say("Cleaning allowlisted fixture tables (not resetting the database or containers)")
                 clean_fixtures(workdir, project, db_id, ports[1], baseline_state, lock_fds,
-                               signature, marker["runId"])
+                               signature, marker["runId"], until)
             if containers(project).get(db_name) != db_id:
                 raise Refusal("Database container changed during fixture preparation; suite not started.")
             if not fresh:
@@ -398,6 +415,7 @@ def manage(root, harness, args, env):
                              baseline=baseline_state)
                 write_state(state_path, state)
             suite_env = dict(env, INTEGRATION_MANAGED_WORKDIR=str(workdir),
+                             INTEGRATION_MIGRATIONS_DIR=str(root / "supabase" / "migrations"),
                              INTEGRATION_MANAGED_API_PORT=str(ports[0]),
                              INTEGRATION_MANAGED_DB_PORT=str(ports[1]))
             marker["phase"] = "testing"

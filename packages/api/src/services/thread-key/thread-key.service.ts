@@ -40,16 +40,21 @@ export class ThreadKeyService {
    * identity that callers might then act on. No caller may treat "could not
    * read the registry" as "there are no projects".
    *
-   * An alias can never equal a canonical slug of the same user (namespace
-   * triggers), so the two loops cannot collide on a map key.
+   * An alias can never equal a canonical slug in the same workspace
+   * (namespace triggers), so the two loops cannot collide on a map key.
+   * The namespace is the workspace (spec inkmail-thread-scope §1b).
    */
-  async projectSlugLookup(userId: string): Promise<Map<string, string>> {
+  async projectSlugLookup(workspaceId: string): Promise<Map<string, string>> {
     const [slugs, aliases] = await Promise.all([
-      this.supabase.from('projects').select('slug').eq('user_id', userId).not('slug', 'is', null),
+      this.supabase
+        .from('projects')
+        .select('slug')
+        .eq('workspace_id', workspaceId)
+        .not('slug', 'is', null),
       this.supabase
         .from('project_slug_aliases')
         .select('alias, projects!inner(slug)')
-        .eq('user_id', userId),
+        .eq('workspace_id', workspaceId),
     ]);
     if (slugs.error) {
       throw new Error(`Project slug lookup failed: ${slugs.error.message}`);
@@ -69,12 +74,12 @@ export class ThreadKeyService {
   }
 
   /**
-   * The thread-key types this user actually has, as a set of names. Used to
-   * tell an unregistered project prefix apart from an ordinary typed key whose
-   * id contains a colon.
+   * The thread-key types this workspace actually has, as a set of names. Used
+   * to tell an unregistered project prefix apart from an ordinary typed key
+   * whose id contains a colon.
    */
-  async knownTypeNames(userId: string): Promise<Set<string>> {
-    const effective = await this.registry.listEffective(userId);
+  async knownTypeNames(workspaceId: string): Promise<Set<string>> {
+    const effective = await this.registry.listEffective(workspaceId);
     return new Set(effective.map((t) => t.type));
   }
 
@@ -84,12 +89,12 @@ export class ThreadKeyService {
    * gets the conservative unknown default — write.
    */
   async typeBehavior(
-    userId: string,
+    workspaceId: string,
     storedKeyType: string | null
   ): Promise<EffectiveThreadKeyType> {
     if (!storedKeyType) {
       return { ...UNKNOWN_TYPE_DEFAULT, type: '' };
     }
-    return this.registry.getEffective(userId, storedKeyType);
+    return this.registry.getEffective(workspaceId, storedKeyType);
   }
 }

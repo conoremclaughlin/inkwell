@@ -249,18 +249,21 @@ export type Database = {
           {
             foreignKeyName: 'agent_identities_default_session_id_fkey';
             columns: ['default_session_id'];
+            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_identities_user_id_fkey';
             columns: ['user_id'];
+            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_identities_workspace_id_fkey';
             columns: ['workspace_id'];
+            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -1618,7 +1621,10 @@ export type Database = {
           message_type: string;
           metadata: Json | null;
           priority: string;
-          sender_agent_id: string;
+          sender_agent_id: string | null;
+          sender_kind: string;
+          sender_sb_id: string | null;
+          sender_user_id: string | null;
           thread_id: string;
         };
         Insert: {
@@ -1628,7 +1634,10 @@ export type Database = {
           message_type?: string;
           metadata?: Json | null;
           priority?: string;
-          sender_agent_id: string;
+          sender_agent_id?: string | null;
+          sender_kind: string;
+          sender_sb_id?: string | null;
+          sender_user_id?: string | null;
           thread_id: string;
         };
         Update: {
@@ -1638,13 +1647,17 @@ export type Database = {
           message_type?: string;
           metadata?: Json | null;
           priority?: string;
-          sender_agent_id?: string;
+          sender_agent_id?: string | null;
+          sender_kind?: string;
+          sender_sb_id?: string | null;
+          sender_user_id?: string | null;
           thread_id?: string;
         };
         Relationships: [
           {
             foreignKeyName: 'inbox_thread_messages_thread_id_fkey';
             columns: ['thread_id'];
+            isOneToOne: false;
             referencedRelation: 'inbox_threads';
             referencedColumns: ['id'];
           },
@@ -1652,59 +1665,112 @@ export type Database = {
       };
       inbox_thread_participants: {
         Row: {
-          agent_id: string;
           joined_at: string | null;
+          principal_key: string;
+          sb_id: string | null;
           session_id: string | null;
           thread_id: string;
+          user_id: string | null;
+          workspace_id: string;
         };
         Insert: {
-          agent_id: string;
           joined_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           session_id?: string | null;
           thread_id: string;
+          user_id?: string | null;
+          workspace_id: string;
         };
         Update: {
-          agent_id?: string;
           joined_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           session_id?: string | null;
           thread_id?: string;
+          user_id?: string | null;
+          workspace_id?: string;
         };
         Relationships: [
           {
+            foreignKeyName: 'inbox_thread_participants_sb_workspace_fkey';
+            columns: ['sb_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+          {
             foreignKeyName: 'inbox_thread_participants_session_id_fkey';
             columns: ['session_id'];
+            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'inbox_thread_participants_thread_id_fkey';
             columns: ['thread_id'];
+            isOneToOne: false;
             referencedRelation: 'inbox_threads';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'inbox_thread_participants_thread_workspace_fkey';
+            columns: ['thread_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_threads';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+          {
+            foreignKeyName: 'inbox_thread_participants_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
             referencedColumns: ['id'];
           },
         ];
       };
       inbox_thread_read_status: {
         Row: {
-          agent_id: string;
           last_read_at: string | null;
+          principal_key: string;
+          sb_id: string | null;
           thread_id: string;
+          user_id: string | null;
         };
         Insert: {
-          agent_id: string;
           last_read_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           thread_id: string;
+          user_id?: string | null;
         };
         Update: {
-          agent_id?: string;
           last_read_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           thread_id?: string;
+          user_id?: string | null;
         };
         Relationships: [
           {
+            foreignKeyName: 'inbox_thread_read_status_sb_id_fkey';
+            columns: ['sb_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
             foreignKeyName: 'inbox_thread_read_status_thread_id_fkey';
             columns: ['thread_id'];
+            isOneToOne: false;
             referencedRelation: 'inbox_threads';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'inbox_thread_read_status_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
             referencedColumns: ['id'];
           },
         ];
@@ -1712,9 +1778,13 @@ export type Database = {
       inbox_threads: {
         Row: {
           closed_at: string | null;
-          closed_by_agent_id: string | null;
+          closed_by_kind: string | null;
+          closed_by_sb_id: string | null;
+          closed_by_user_id: string | null;
           created_at: string | null;
-          created_by_agent_id: string;
+          created_by_kind: string;
+          created_by_sb_id: string | null;
+          created_by_user_id: string | null;
           id: string;
           key_id: string | null;
           key_project: string | null;
@@ -1729,13 +1799,17 @@ export type Database = {
           title_updated_at: string | null;
           title_updated_by_sb_id: string | null;
           updated_at: string | null;
-          user_id: string;
+          workspace_id: string;
         };
         Insert: {
           closed_at?: string | null;
-          closed_by_agent_id?: string | null;
+          closed_by_kind?: string | null;
+          closed_by_sb_id?: string | null;
+          closed_by_user_id?: string | null;
           created_at?: string | null;
-          created_by_agent_id: string;
+          created_by_kind: string;
+          created_by_sb_id?: string | null;
+          created_by_user_id?: string | null;
           id?: string;
           key_id?: string | null;
           key_project?: string | null;
@@ -1750,13 +1824,17 @@ export type Database = {
           title_updated_at?: string | null;
           title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
-          user_id: string;
+          workspace_id: string;
         };
         Update: {
           closed_at?: string | null;
-          closed_by_agent_id?: string | null;
+          closed_by_kind?: string | null;
+          closed_by_sb_id?: string | null;
+          closed_by_user_id?: string | null;
           created_at?: string | null;
-          created_by_agent_id?: string;
+          created_by_kind?: string;
+          created_by_sb_id?: string | null;
+          created_by_user_id?: string | null;
           id?: string;
           key_id?: string | null;
           key_project?: string | null;
@@ -1771,7 +1849,7 @@ export type Database = {
           title_updated_at?: string | null;
           title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
-          user_id?: string;
+          workspace_id?: string;
         };
         Relationships: [
           {
@@ -1787,9 +1865,10 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'inbox_threads_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
+            foreignKeyName: 'inbox_threads_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2680,6 +2759,7 @@ export type Database = {
           id: string;
           project_id: string;
           user_id: string;
+          workspace_id: string;
         };
         Insert: {
           alias: string;
@@ -2687,6 +2767,7 @@ export type Database = {
           id?: string;
           project_id: string;
           user_id: string;
+          workspace_id: string;
         };
         Update: {
           alias?: string;
@@ -2694,18 +2775,28 @@ export type Database = {
           id?: string;
           project_id?: string;
           user_id?: string;
+          workspace_id?: string;
         };
         Relationships: [
           {
             foreignKeyName: 'project_slug_aliases_project_id_fkey';
             columns: ['project_id'];
+            isOneToOne: false;
             referencedRelation: 'projects';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'project_slug_aliases_user_id_fkey';
             columns: ['user_id'];
+            isOneToOne: false;
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'project_slug_aliases_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2725,6 +2816,7 @@ export type Database = {
           tech_stack: string[] | null;
           updated_at: string | null;
           user_id: string;
+          workspace_id: string;
         };
         Insert: {
           created_at?: string | null;
@@ -2740,6 +2832,7 @@ export type Database = {
           tech_stack?: string[] | null;
           updated_at?: string | null;
           user_id: string;
+          workspace_id: string;
         };
         Update: {
           created_at?: string | null;
@@ -2755,12 +2848,21 @@ export type Database = {
           tech_stack?: string[] | null;
           updated_at?: string | null;
           user_id?: string;
+          workspace_id?: string;
         };
         Relationships: [
           {
             foreignKeyName: 'projects_user_id_fkey';
             columns: ['user_id'];
+            isOneToOne: false;
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'projects_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -4351,7 +4453,7 @@ export type Database = {
           studio_policy: string;
           type: string;
           updated_at: string;
-          user_id: string | null;
+          workspace_id: string | null;
           write_intent: string;
         };
         Insert: {
@@ -4361,7 +4463,7 @@ export type Database = {
           studio_policy: string;
           type: string;
           updated_at?: string;
-          user_id?: string | null;
+          workspace_id?: string | null;
           write_intent: string;
         };
         Update: {
@@ -4371,14 +4473,15 @@ export type Database = {
           studio_policy?: string;
           type?: string;
           updated_at?: string;
-          user_id?: string | null;
+          workspace_id?: string | null;
           write_intent?: string;
         };
         Relationships: [
           {
-            foreignKeyName: 'thread_key_types_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
+            foreignKeyName: 'thread_key_types_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -4778,9 +4881,10 @@ export type Database = {
       };
       advance_thread_read_pointer: {
         Args: {
-          p_agent_id: string;
+          p_sb_id: string;
           p_thread_id: string;
           p_through_message_id: string;
+          p_user_id: string;
         };
         Returns: string;
       };
@@ -4800,11 +4904,30 @@ export type Database = {
       };
       reopen_inbox_thread: {
         Args: {
+          p_actor_sb_id: string;
+          p_actor_user_id: string;
           p_thread_id: string;
-          p_actor_kind: string;
-          p_actor_agent_id?: string | null;
         };
         Returns: boolean;
+      };
+      clear_routing_hold: {
+        Args: {
+          p_agent_id: string;
+          p_routed_since: string;
+          p_thread_id: string;
+          p_workspace_id: string;
+        };
+        Returns: number;
+      };
+      stamp_routing_hold: {
+        Args: {
+          p_agent_id: string;
+          p_attempt_started: string;
+          p_hold: Json;
+          p_thread_id: string;
+          p_workspace_id: string;
+        };
+        Returns: number;
       };
       update_inbox_thread_metadata: {
         Args: {
@@ -4902,15 +5025,8 @@ export type Database = {
         Returns: Json;
       };
       compute_thread_key_pin: {
-        Args: {
-          p_user_id: string;
-          p_key: string;
-        };
-        Returns: {
-          o_project: string | null;
-          o_type: string | null;
-          o_id: string | null;
-        };
+        Args: { p_key: string; p_workspace_id: string };
+        Returns: Record<string, unknown>;
       };
       convert_task_group_to_graph: {
         Args: {
@@ -4924,12 +5040,7 @@ export type Database = {
         Returns: Json;
       };
       get_unread_thread_candidates: {
-        Args: {
-          p_agent_id: string;
-          p_limit?: number;
-          p_session_id?: string;
-          p_user_id: string;
-        };
+        Args: { p_limit?: number; p_sb_id: string; p_session_id?: string };
         Returns: {
           latest_message_at: string;
           thread_id: string;

@@ -46,8 +46,8 @@ vi.mock('../../services/studio-settings', () => ({
 // Defaults let the pre-existing bootstrap tests run unchanged: a caller with
 // no identifiable session, and a lease that grants. The provenance suite
 // below overrides per test.
-const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMock } = vi.hoisted(
-  () => ({
+const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMock, callerSbMock } =
+  vi.hoisted(() => ({
     acquireMock: vi.fn(async () => ({ acquired: true, lease: {} })),
     implicitMock: vi.fn(async () => ({ session: null, reason: 'no-session' })),
     callerMock: vi.fn(async () => ({ sbSlug: 'wren', sbId: undefined })),
@@ -58,9 +58,18 @@ const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMoc
       boundVia: 'explicit-anchor',
       stampPersisted: true,
     })),
-  })
-);
+    // The thread home is bound by PRINCIPAL (spec inkmail-thread-scope §3):
+    // the agent's identity in its one workspace, resolved at the boundary.
+    callerSbMock: vi.fn(async () => ({
+      kind: 'sb',
+      sbId: 'sb-1',
+      sbSlug: 'wren',
+      userId: '00000000-0000-0000-0000-000000000001',
+      workspaceId: 'ws-1',
+    })),
+  }));
 vi.mock('./inbox-handlers', () => ({ findOrCreateThread: findOrCreateThreadMock }));
+vi.mock('./caller-principal', () => ({ resolveCallerSb: callerSbMock }));
 vi.mock('../../services/sessions/thread-assignment', () => ({
   assignThreadParticipant: assignMock,
 }));
@@ -411,16 +420,17 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(findOrCreateThreadMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
+        workspaceId: 'ws-1',
         threadKey: 'pr:600',
-        creatorSlug: 'wren',
-        participants: ['wren'],
+        creator: expect.objectContaining({ kind: 'sb', sbId: 'sb-1', sbSlug: 'wren' }),
+        participants: [expect.objectContaining({ sbId: 'sb-1' })],
       })
     );
     expect(assignMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         threadId: 'thread-1',
-        sbSlug: 'wren',
+        sbId: 'sb-1',
         candidateSessionId: 'sess-1',
         explicitAnchor: true,
         source: 'create_studio',

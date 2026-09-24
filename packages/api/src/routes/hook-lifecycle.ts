@@ -15,6 +15,7 @@ import { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
 import { StudioLeaseService } from '../services/studio-lease.service';
 import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { logger } from '../utils/logger';
+import { workspaceOfSb } from '../services/principals';
 
 const VALID_LIFECYCLES = ['running', 'idle', 'compacting', 'completed', 'failed'] as const;
 
@@ -254,6 +255,13 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // closed (revocation-aware), no sibling row holding the same
         // checkout — and only AFTER the tombstone CAS passes, so a stopped
         // reclaim grants nothing.
+        // The thread a regrant is for is one row, (workspace_id, thread_key)
+        // — and the workspace is resolved HERE, from the session's canonical
+        // identity, never read from the caller (spec inkmail-thread-scope
+        // §1; Lumen, #616). Without one the RPC refuses the regrant.
+        const regrantWorkspaceId = session.sbId
+          ? await workspaceOfSb(dataComposer.getClient(), session.sbId)
+          : null;
         const regrant = claimStudioId
           ? {
               sessionId,
@@ -263,6 +271,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
               // Round 15: the canonical identity UUID, from the SESSION row
               // (server-trusted) — never just the ambiguous slug.
               ...(session.sbId ? { sbId: session.sbId } : {}),
+              ...(regrantWorkspaceId ? { workspaceId: regrantWorkspaceId } : {}),
               reason: 'cli-prompt-regrant',
             }
           : undefined;

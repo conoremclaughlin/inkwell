@@ -19,7 +19,15 @@ import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { getParticipants, reopenThreadRow } from '../mcp/tools/thread-handlers';
+import {
+  getParticipants,
+  isParticipant,
+  participantSlugs,
+  reopenThreadRow,
+} from '../mcp/tools/thread-handlers';
+import { resolveSbsByIds, userPrincipal } from '../services/principals';
+import { describePeople, resolvePersonNames } from '../services/person-display';
+import { carrierScopeFilter, workspaceSbIds } from '../services/carrier-scope';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
@@ -1173,14 +1181,19 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       });
     };
 
+    // The role is the membership row's, read once here and carried on the
+    // request; every write guard downstream decides on it. A direct member
+    // used to be stamped 'member' regardless of the row, which let a viewer
+    // write and stopped an owner recovering a thread (Lumen, #619).
     let activeWorkspaceId = '';
     let activeWorkspaceRole: WorkspaceMemberRole | 'trusted' = 'trusted';
     let hasDirectMembership = false;
 
     if (requestedWorkspaceId) {
-      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, inkUserId!);
-      if (requestedWorkspace) {
-        activeWorkspaceId = requestedWorkspace.id;
+      const direct = await workspaceRepo.findByIdWithRole(requestedWorkspaceId, inkUserId!);
+      if (direct) {
+        activeWorkspaceId = direct.workspace.id;
+        activeWorkspaceRole = direct.role;
         hasDirectMembership = true;
       } else {
         const requestedWorkspaceExists = await workspaceRepo.findRawById(requestedWorkspaceId);
@@ -1200,7 +1213,16 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       }
     } else {
       const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(inkUserId!);
+      // Provisioned with an 'owner' row (repository and DB trigger alike), but
+      // the row is what says so; a personal workspace with no membership row
+      // is refused rather than assumed.
+      const personalRole = await workspaceRepo.getMemberRole(personalWorkspace.id, inkUserId!);
+      if (!personalRole) {
+        res.status(403).json({ error: 'Insufficient permissions' });
+        return;
+      }
       activeWorkspaceId = personalWorkspace.id;
+      activeWorkspaceRole = personalRole;
       hasDirectMembership = true;
     }
 
@@ -1210,10 +1232,6 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         res.status(403).json({ error: 'Insufficient permissions' });
         return;
       }
-    }
-
-    if (hasDirectMembership) {
-      activeWorkspaceRole = 'member';
     }
 
     // --- Issue cookies (Tier 3 success) ---
@@ -4250,6 +4268,11 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
       senderSlug: string | null;
       senderSbId: string | null;
       senderIdentityId: string | null;
+      /** Thread messages only (spec inkmail-thread-scope §3). */
+      senderKind?: string;
+      senderUserId?: string | null;
+      senderName?: string;
+      isOwn?: boolean;
       recipientSlug: string;
       recipientSbId: string | null;
       recipientIdentityId: string | null;
@@ -4262,6 +4285,8 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
       acknowledgedAt: string | null;
       expiresAt: string | null;
     }
+
+    type ThreadMessageRow = Database['public']['Tables']['inbox_thread_messages']['Row'];
 
     const mapMessage = (m: (typeof allMessages)[0]): MappedMessage => ({
       id: m.id,
@@ -4350,6 +4375,8 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
       title: string | null;
       status: string;
       participants: string[];
+      /** People on the thread, named for this viewer — never in `participants`. */
+      people: Array<{ userId: string; name: string; isOwn: boolean }>;
       messageCount: number;
       unreadCount: number;
       lastMessage: MappedMessage | null;
@@ -4360,84 +4387,138 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
     const groupThreads: GroupThread[] = [];
     let threadTableUnreadCount = 0;
 
+    let groupThreadsUnavailable = false;
     try {
-      // Find threads this agent participates in (from thread tables)
-      const { data: threadParticipantRows } = await (supabase as any)
+      // Threads this agent's identities are on. Since the cutover a
+      // participant row names an SB by identity (spec inkmail-thread-scope
+      // §3); slugs and people are resolved once, for this viewer. Every read
+      // is checked: this section used to swallow its errors at debug level,
+      // which is how a dropped column would have emptied the page silently
+      // (Lumen, #621).
+      const { data: threadParticipantRows, error: participantErr } = await supabase
         .from('inbox_thread_participants')
         .select('thread_id')
-        .eq('agent_id', sbSlug);
-
-      const threadIds = (threadParticipantRows || []).map(
-        (p: { thread_id: string }) => p.thread_id
-      );
+        .in('sb_id', scopedIdentityIds);
+      if (participantErr) throw participantErr;
+      const threadIds = [...new Set((threadParticipantRows || []).map((p) => p.thread_id))];
 
       if (threadIds.length > 0) {
-        // Get thread metadata
-        let threadQuery = (supabase as any)
+        const { data: threadRows, error: threadErr } = await supabase
           .from('inbox_threads')
           .select('*')
-          .eq('user_id', authReq.inkUserId)
+          .eq('workspace_id', authReq.inkWorkspaceId)
           .in('id', threadIds)
           .order('updated_at', { ascending: false });
-
-        const { data: threadRows } = await threadQuery;
+        if (threadErr) throw threadErr;
 
         if (threadRows?.length) {
-          // Get read status for all threads
-          const { data: readStatusRows } = await (supabase as any)
+          const visibleIds = threadRows.map((t) => t.id);
+
+          const { data: readStatusRows, error: readErr } = await supabase
             .from('inbox_thread_read_status')
             .select('thread_id, last_read_at')
-            .eq('agent_id', sbSlug)
-            .in('thread_id', threadIds);
-
+            .in('sb_id', scopedIdentityIds)
+            .in('thread_id', visibleIds);
+          if (readErr) throw readErr;
+          // Should one slug resolve to several identities, the furthest
+          // pointer counts.
           const readStatusMap = new Map<string, string>();
           for (const rs of readStatusRows || []) {
-            readStatusMap.set(rs.thread_id, rs.last_read_at);
+            if (!rs.last_read_at) continue;
+            const prev = readStatusMap.get(rs.thread_id);
+            if (!prev || new Date(rs.last_read_at) > new Date(prev)) {
+              readStatusMap.set(rs.thread_id, rs.last_read_at);
+            }
           }
 
-          for (const t of threadRows) {
-            // Get participants
-            const { data: parts } = await (supabase as any)
-              .from('inbox_thread_participants')
-              .select('agent_id')
-              .eq('thread_id', t.id);
-            const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
+          const { data: partRows, error: partsErr } = await supabase
+            .from('inbox_thread_participants')
+            .select('thread_id, sb_id, user_id')
+            .in('thread_id', visibleIds)
+            .order('principal_key', { ascending: true });
+          if (partsErr) throw partsErr;
+          const participantSbIds = [
+            ...new Set((partRows || []).flatMap((p) => (p.sb_id ? [p.sb_id] : []))),
+          ];
+          const slugBySbId = new Map(
+            (await resolveSbsByIds(supabase, participantSbIds)).map((sb) => [sb.sbId, sb.sbSlug])
+          );
+          const sbSlugsByThread = new Map<string, string[]>();
+          const peopleByThread = new Map<string, string[]>();
+          for (const p of partRows || []) {
+            if (p.sb_id) {
+              const list = sbSlugsByThread.get(p.thread_id) ?? [];
+              list.push(slugBySbId.get(p.sb_id) ?? p.sb_id);
+              sbSlugsByThread.set(p.thread_id, list);
+            } else if (p.user_id) {
+              const list = peopleByThread.get(p.thread_id) ?? [];
+              list.push(p.user_id);
+              peopleByThread.set(p.thread_id, list);
+            }
+          }
 
-            // Get messages
-            let msgQuery = (supabase as any)
+          // Messages per thread (capped as before), then one name lookup
+          // for every person who wrote or is on any of them.
+          const messagesByThread = new Map<string, ThreadMessageRow[]>();
+          for (const t of threadRows) {
+            let msgQuery = supabase
               .from('inbox_thread_messages')
               .select('*')
               .eq('thread_id', t.id)
               .order('created_at', { ascending: true })
               .limit(200);
-
-            if (status !== 'all') {
-              // Thread messages don't have a status field — filter by read status instead
-              // For 'unread' filter, only include messages after last_read_at
+            if (messageType) msgQuery = msgQuery.eq('message_type', messageType);
+            const { data: msgRows, error: msgErr } = await msgQuery;
+            if (msgErr) throw msgErr;
+            messagesByThread.set(t.id, (msgRows || []) as ThreadMessageRow[]);
+          }
+          const personNames = await resolvePersonNames(supabase, [
+            ...[...peopleByThread.values()].flat(),
+            ...[...messagesByThread.values()]
+              .flat()
+              .flatMap((m) => (m.sender_user_id ? [m.sender_user_id] : [])),
+          ]);
+          const viewerUserId = authReq.inkUserId;
+          const nameOf = (m: ThreadMessageRow): string => {
+            if (m.sender_kind === 'user' && m.sender_user_id) {
+              return describePeople([m.sender_user_id], personNames, viewerUserId)[0].name;
             }
-            if (messageType) {
-              msgQuery = msgQuery.eq('message_type', messageType);
-            }
+            if (m.sender_kind === 'sb') return m.sender_agent_id ?? 'an SB';
+            return 'system';
+          };
 
-            const { data: msgRows } = await msgQuery;
-            const threadMsgs: MappedMessage[] = (msgRows || []).map((m: Record<string, any>) => ({
+          for (const t of threadRows) {
+            const participants = sbSlugsByThread.get(t.id) ?? [];
+            const people = describePeople(
+              peopleByThread.get(t.id) ?? [],
+              personNames,
+              viewerUserId
+            );
+            const threadMsgs: MappedMessage[] = (messagesByThread.get(t.id) ?? []).map((m) => ({
               id: m.id,
               subject: null,
               content: m.content,
               messageType: m.message_type,
               priority: m.priority,
               status: 'unread', // computed below
-              senderSlug: m.sender_agent_id,
-              senderSbId: null,
-              senderIdentityId: null,
+              // The author is a principal (spec §3): the SB's slug for
+              // display, else the kind; named for this viewer alongside.
+              senderKind: m.sender_kind,
+              senderSlug: m.sender_agent_id ?? m.sender_kind,
+              senderSbId: m.sender_sb_id,
+              senderIdentityId: m.sender_sb_id,
+              senderUserId: m.sender_user_id,
+              senderName: nameOf(m),
+              isOwn:
+                m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
               recipientSlug: sbSlug, // thread messages don't have a single recipient
               recipientSbId: null,
               recipientIdentityId: null,
               threadKey: t.thread_key,
               recipientSessionId: null,
               relatedArtifactUri: null,
-              metadata: m.metadata as Record<string, unknown> | null,
-              createdAt: m.created_at,
+              metadata: (m.metadata as Record<string, unknown> | null) ?? null,
+              createdAt: m.created_at ?? '',
               readAt: null,
               acknowledgedAt: null,
               expiresAt: null,
@@ -4464,6 +4545,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
                 title: t.title,
                 status: t.status,
                 participants,
+                people,
                 messageCount: threadMsgs.length,
                 unreadCount: unread,
                 lastMessage: threadMsgs[threadMsgs.length - 1],
@@ -4476,8 +4558,21 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
         }
       }
     } catch (err) {
-      // Thread tables may not exist yet — graceful fallback
-      logger.debug('Failed to fetch group threads (tables may not exist)', { err });
+      // Checked reads above: a failure here means the page is missing its
+      // group threads. That is said in the log and in the response — never
+      // a debug line and a quietly shorter page.
+      groupThreadsUnavailable = true;
+      // PostgREST errors are plain objects, not Errors: read their message.
+      const message =
+        err instanceof Error
+          ? err.message
+          : err && typeof err === 'object' && 'message' in err
+            ? String((err as { message: unknown }).message)
+            : String(err);
+      logger.warn('[AdminInbox] Group threads unavailable for this page', {
+        sbSlug,
+        error: message,
+      });
     }
 
     // Sort group threads by latest message
@@ -4509,6 +4604,7 @@ router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => 
         totalUnreadCount,
         threadCount: threads.length,
         groupThreadCount: groupThreads.length,
+        groupThreadsUnavailable,
         flatCount: flatMessages.length,
       },
       threads: paginatedThreads,
@@ -7103,6 +7199,20 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
  * announced — is a first-class row with `thread: null`, not an absence.
  * Merge semantics live in services/thread-key/thread-spines.ts.
  */
+// ── Thread ACL (spec inkmail-thread-scope §1) ──
+// read: every role, trusted included; reply / start / reopen: member, admin,
+// owner; recover a thread you are not on: admin, owner. A trusted non-member
+// gets the explicit rule the spec asks for — read-only — not an implicit hole.
+const THREAD_WRITE_ROLES: ReadonlySet<string> = new Set(['owner', 'admin', 'member']);
+const THREAD_RECOVER_ROLES: ReadonlySet<string> = new Set(['owner', 'admin']);
+
+function refuseThreadWrite(res: Response, role: string, action: string): void {
+  res.status(403).json({
+    error: `Your role in this workspace (${role}) cannot ${action}`,
+    role,
+  });
+}
+
 router.get('/threads', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -7110,6 +7220,9 @@ router.get('/threads', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
     const userId = authReq.inkUserId;
+    // Threads are workspace rows (spec inkmail-thread-scope §1): the page is
+    // the person's active workspace, resolved by the auth middleware.
+    const workspaceId = authReq.inkWorkspaceId;
 
     // Reported caps, same contract as /tasks and /task-groups: the response
     // says what was dropped instead of silently truncating.
@@ -7117,14 +7230,18 @@ router.get('/threads', async (req: Request, res: Response) => {
     const SESSIONS_CAP = 500;
     const GROUPS_CAP = 500;
 
+    // Carriers by the workspace's identities, not the viewer's user id: a
+    // same-key session from another workspace is another conversation.
+    const carrierScope = carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId);
+
     const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
       supabase
         .from('inbox_threads')
         .select(
-          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_agent_id, updated_at, closed_at',
+          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at',
           { count: 'exact' }
         )
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .order('updated_at', { ascending: false })
         .limit(THREADS_CAP),
       supabase
@@ -7133,21 +7250,21 @@ router.get('/threads', async (req: Request, res: Response) => {
           'id, agent_id, lifecycle, status, current_phase, thread_key, active_thread_key, updated_at, studio_id',
           { count: 'exact' }
         )
-        .eq('user_id', userId)
+        .or(carrierScope)
         .or('thread_key.not.is.null,active_thread_key.not.is.null')
         .order('updated_at', { ascending: false })
         .limit(SESSIONS_CAP),
       supabase
         .from('studios')
         .select('id, slug, branch, agent_id, thread_key, lease, updated_at')
-        .eq('user_id', userId)
+        .or(carrierScope)
         .neq('status', 'cleaned'),
       supabase
         .from('task_groups')
         .select('id, title, status, thread_key, execution_model, execution_phase, updated_at', {
           count: 'exact',
         })
-        .eq('user_id', userId)
+        .or(carrierScope)
         .not('thread_key', 'is', null)
         .order('updated_at', { ascending: false })
         .limit(GROUPS_CAP),
@@ -7213,9 +7330,9 @@ router.get('/threads', async (req: Request, res: Response) => {
       const { data: extraRows, error: extraError } = await supabase
         .from('inbox_threads')
         .select(
-          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_agent_id, updated_at, closed_at'
+          'id, thread_key, key_project, key_type, key_id, title, summary, status, created_by_kind, created_by_sb_id, updated_at, closed_at'
         )
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .in('thread_key', missing.slice(i, i + 50));
       if (extraError) {
         logger.error('Failed to hydrate thread rows for carrier keys:', extraError);
@@ -7230,17 +7347,29 @@ router.get('/threads', async (req: Request, res: Response) => {
     // ~20KB GET URL — rejected live with "URI too long"), and paginated
     // past the PostgREST page ceiling: production already returns 992
     // participant rows, one row-capped page away from silently dropping
-    // participants. The (thread_id, agent_id) PK gives a total order, so
-    // pages never skip or duplicate.
+    // participants. (thread_id, principal_key) is unique, so ordering by it
+    // gives a total order and pages never skip or duplicate. SB rows carry
+    // an identity id; the slug for display comes from one identity lookup.
     const participantsByThreadId = new Map<string, string[]>();
+    const peopleByThreadId = new Map<string, string[]>();
+    const participantSbIds = new Set<string>();
+    const participantRows: Array<{
+      thread_id: string;
+      sb_id: string | null;
+      user_id: string | null;
+    }> = [];
     const PARTICIPANT_PAGE = 1000;
     for (let from = 0; ; from += PARTICIPANT_PAGE) {
       const { data: pageRows, error: participantsError } = await supabase
         .from('inbox_thread_participants')
-        .select('thread_id, agent_id, inbox_threads!inner(user_id)')
-        .eq('inbox_threads.user_id', userId)
+        // The FK is named: two relationships exist between the tables since
+        // the cutover, and an unqualified embed is PGRST201-ambiguous.
+        .select(
+          'thread_id, sb_id, user_id, inbox_threads!inbox_thread_participants_thread_id_fkey!inner(workspace_id)'
+        )
+        .eq('inbox_threads.workspace_id', workspaceId)
         .order('thread_id', { ascending: true })
-        .order('agent_id', { ascending: true })
+        .order('principal_key', { ascending: true })
         .range(from, from + PARTICIPANT_PAGE - 1);
       if (participantsError) {
         logger.error('Failed to list thread participants:', participantsError);
@@ -7248,11 +7377,28 @@ router.get('/threads', async (req: Request, res: Response) => {
         return;
       }
       for (const row of pageRows || []) {
-        const list = participantsByThreadId.get(row.thread_id) ?? [];
-        list.push(row.agent_id);
-        participantsByThreadId.set(row.thread_id, list);
+        participantRows.push(row);
+        if (row.sb_id) participantSbIds.add(row.sb_id);
       }
       if (!pageRows || pageRows.length < PARTICIPANT_PAGE) break;
+    }
+    const slugBySbId = new Map(
+      (await resolveSbsByIds(supabase, [...participantSbIds])).map((sb) => [sb.sbId, sb.sbSlug])
+    );
+    const personNames = await resolvePersonNames(
+      supabase,
+      participantRows.flatMap((row) => (row.user_id ? [row.user_id] : []))
+    );
+    for (const row of participantRows) {
+      if (row.sb_id) {
+        const list = participantsByThreadId.get(row.thread_id) ?? [];
+        list.push(slugBySbId.get(row.sb_id) ?? row.sb_id);
+        participantsByThreadId.set(row.thread_id, list);
+      } else if (row.user_id) {
+        const list = peopleByThreadId.get(row.thread_id) ?? [];
+        list.push(row.user_id);
+        peopleByThreadId.set(row.thread_id, list);
+      }
     }
 
     // Provisional identity for keys with no pinned thread row. Fail-closed
@@ -7264,7 +7410,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     try {
       const slugLookup = await new ThreadKeyService(
         supabase as SupabaseClient<Database>
-      ).projectSlugLookup(userId);
+      ).projectSlugLookup(workspaceId);
       parse = (key) => parseThreadKey(key, slugLookup);
     } catch (error) {
       logger.warn('Thread spine slug lookup failed; provisional identities disabled:', error);
@@ -7283,10 +7429,15 @@ router.get('/threads', async (req: Request, res: Response) => {
         title: t.title ?? null,
         summary: t.summary ?? null,
         status: t.status,
-        createdBySlug: t.created_by_agent_id,
+        createdBySlug:
+          t.created_by_kind === 'sb' && t.created_by_sb_id
+            ? (slugBySbId.get(t.created_by_sb_id) ?? t.created_by_sb_id)
+            : t.created_by_kind,
         updatedAt: t.updated_at,
         closedAt: t.closed_at ?? null,
         participants: participantsByThreadId.get(t.id) ?? [],
+        // Named for THIS viewer: a person's own row says so (spec §3).
+        people: describePeople(peopleByThreadId.get(t.id) ?? [], personNames, authReq.inkUserId),
       })),
       sessions: sessionRows,
       studios: studioRows,
@@ -7326,6 +7477,7 @@ router.get('/threads', async (req: Request, res: Response) => {
 async function loadThreadStudioHistory(
   supabase: SupabaseClient<Database>,
   userId: string,
+  workspaceId: string,
   threadKey: string
 ): Promise<
   Array<{
@@ -7346,7 +7498,10 @@ async function loadThreadStudioHistory(
   const { data: leaseEvents, error: leaseEventsError } = await supabase
     .from('studio_lease_events')
     .select('studio_id, agent_id, event, created_at')
-    .eq('user_id', userId)
+    // The thread's workspace, through each event's identity — not the
+    // viewer's user id, which showed a same-owner namesake's history from
+    // elsewhere and hid another owner's on this thread (Lumen, #624).
+    .or(carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId))
     .eq('thread_key', threadKey)
     .in('event', ['acquired', 'released', 'expired', 'reclaimed'])
     .order('created_at', { ascending: false })
@@ -7418,8 +7573,10 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, title, status, created_by_agent_id, created_at, closed_at')
-      .eq('user_id', authReq.inkUserId)
+      .select(
+        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at'
+      )
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7430,6 +7587,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const studioHistory = await loadThreadStudioHistory(
       supabase as SupabaseClient<Database>,
       authReq.inkUserId,
+      authReq.inkWorkspaceId,
       key
     );
 
@@ -7448,9 +7606,10 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       count: messagesCount,
     } = await supabase
       .from('inbox_thread_messages')
-      .select('id, sender_agent_id, content, message_type, priority, metadata, created_at', {
-        count: 'exact',
-      })
+      .select(
+        'id, sender_kind, sender_sb_id, sender_user_id, sender_agent_id, content, message_type, priority, metadata, created_at',
+        { count: 'exact' }
+      )
       .eq('thread_id', thread.id)
       .order('created_at', { ascending: false })
       .limit(MESSAGES_CAP);
@@ -7462,26 +7621,65 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 
     const fetched = (messageRows || []).length;
     const total = messagesCount ?? fetched;
+
+    // Every author is named here, for this viewer. A person is named from
+    // their profile and is "own" only when they are the Inkwell user this
+    // request resolved to — a client comparing against its auth provider's
+    // id would compare the wrong id (Lumen, #620).
+    const viewerUserId = authReq.inkUserId;
+    const personNames = await resolvePersonNames(
+      supabase,
+      (messageRows || []).flatMap((m) => (m.sender_user_id ? [m.sender_user_id] : []))
+    );
+    const senderName = (m: {
+      sender_kind: string;
+      sender_agent_id: string | null;
+      sender_user_id: string | null;
+    }) => {
+      if (m.sender_kind === 'user' && m.sender_user_id) {
+        return describePeople([m.sender_user_id], personNames, viewerUserId)[0].name;
+      }
+      if (m.sender_kind === 'sb') return m.sender_agent_id ?? 'an SB';
+      return 'system';
+    };
+
     res.json({
       studioHistory,
+      viewerUserId,
       thread: {
         threadKey: thread.thread_key,
         title: thread.title ?? null,
         status: thread.status,
-        createdBySlug: thread.created_by_agent_id,
+        createdByKind: thread.created_by_kind,
+        createdBySlug:
+          thread.created_by_kind === 'sb' && thread.created_by_sb_id
+            ? ((await resolveSbsByIds(supabase, [thread.created_by_sb_id]))[0]?.sbSlug ??
+              thread.created_by_sb_id)
+            : thread.created_by_kind,
+        createdByUserId: thread.created_by_user_id ?? null,
         createdAt: thread.created_at,
         closedAt: thread.closed_at ?? null,
       },
       messages: (messageRows || [])
         .map((m) => ({
           id: m.id,
-          senderSlug: m.sender_agent_id,
+          // The author is a principal (spec inkmail-thread-scope §3): an SB
+          // by identity with its display slug, a person by user id, or the
+          // system with neither. The 'unknown' sentinel is gone.
+          senderKind: m.sender_kind,
+          // Display label: the SB's slug, else the kind ('user' | 'system'),
+          // so a client that renders one name still renders one.
+          senderSlug: m.sender_agent_id ?? m.sender_kind,
+          senderSbId: m.sender_sb_id,
+          senderUserId: m.sender_user_id,
+          // Resolved on the server: SB slug, the person's profile name, or
+          // 'system'. Never "You" — that is `isOwn`, the reader's call.
+          senderName: senderName(m),
+          isOwn:
+            m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
           content: m.content,
           messageType: m.message_type,
           priority: m.priority,
-          // Human replies land with sender_agent_id 'unknown' (no agent in the
-          // request context); metadata.sentBy = 'user' is how clients tell a
-          // person's message from a genuinely unattributed one.
           metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
         }))
@@ -7558,12 +7756,17 @@ router.post('/threads', async (req: Request, res: Response) => {
       return;
     }
 
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'start a thread');
+      return;
+    }
+
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
     const { data: existing } = await supabase
       .from('inbox_threads')
       .select('id')
-      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
 
@@ -7581,7 +7784,15 @@ router.post('/threads', async (req: Request, res: Response) => {
         ...(priority ? { priority } : {}),
         metadata: { sentBy: 'user', channel: 'admin-api' },
       },
-      dataComposer
+      dataComposer,
+      // The person is the sender, in the workspace the middleware resolved —
+      // server-side context the public tool schema never carries (§3, §6).
+      {
+        sender: {
+          principal: userPrincipal(authReq.inkUserId),
+          workspaceId: authReq.inkWorkspaceId,
+        },
+      }
     );
 
     const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
@@ -7655,11 +7866,15 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'reply');
+      return;
+    }
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select('id, thread_key')
-      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7673,9 +7888,13 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     }
 
     const dataComposer = await getDataComposer();
-    const participants = await getParticipants(dataComposer.getClient(), thread.id);
+    // Dispatch operates on the SB participants (§7): a person's reply wakes
+    // every SB in the thread; the people reading it are never spawned.
+    const participants = participantSlugs(
+      await getParticipants(dataComposer.getClient(), thread.id)
+    );
     if (participants.length === 0) {
-      // A thread without participants has nobody to wake; refuse loudly
+      // A thread without SB participants has nobody to wake; refuse loudly
       // rather than storing a message no agent will ever see.
       res.status(409).json({ error: 'Thread has no participants to notify' });
       return;
@@ -7692,7 +7911,13 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
         ...(priority ? { priority } : {}),
         metadata: { sentBy: 'user', channel: 'admin-api' },
       },
-      dataComposer
+      dataComposer,
+      {
+        sender: {
+          principal: userPrincipal(authReq.inkUserId),
+          workspaceId: authReq.inkWorkspaceId,
+        },
+      }
     );
 
     const parsed = JSON.parse((result.content[0] as { text: string }).text) as Record<
@@ -7756,7 +7981,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select('id, thread_key, status')
-      .eq('user_id', authReq.inkUserId)
+      .eq('workspace_id', authReq.inkWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7768,14 +7993,30 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
       res.status(404).json({ error: `No thread with key "${key}"` });
       return;
     }
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'reopen a thread');
+      return;
+    }
+    // A participant reopens their own thread; anyone else needs the
+    // recovery role (§2, §6: owner/admin may recover any thread).
+    const dataComposer = await getDataComposer();
+    const onThread = await isParticipant(
+      dataComposer.getClient(),
+      thread.id,
+      userPrincipal(authReq.inkUserId)
+    );
+    if (!onThread && !THREAD_RECOVER_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'reopen a thread you are not on');
+      return;
+    }
     if (thread.status !== 'closed') {
       res.json({ success: true, threadKey: key, reopened: false, alreadyOpen: true });
       return;
     }
 
-    const dataComposer = await getDataComposer();
     const { reopened } = await reopenThreadRow(dataComposer.getClient(), thread.id, {
       kind: 'user',
+      userId: authReq.inkUserId,
     });
     res.json({ success: true, threadKey: key, reopened, alreadyOpen: !reopened });
   } catch (error) {
@@ -7816,6 +8057,14 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
     // current run survives the cap; reversed below for oldest-first
     // display within the window.
     const GROUPS_CAP = 10;
+    // Evidence follows the thread's workspace (spec inkmail-thread-scope §1):
+    // groups by the workspace's identities, their tasks and gate events by
+    // the groups — not by the viewer's user id, which hid another owner's
+    // graph on this thread and showed a namesake from elsewhere.
+    const evidenceScope = carrierScopeFilter(
+      await workspaceSbIds(supabase, authReq.inkWorkspaceId),
+      userId
+    );
     const {
       data: cappedGroupRows,
       error: groupsError,
@@ -7825,7 +8074,7 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
       .select('id, title, status, execution_model, execution_phase, created_at', {
         count: 'exact',
       })
-      .eq('user_id', userId)
+      .or(evidenceScope)
       .eq('thread_key', key)
       .eq('execution_model', 'graph')
       .order('created_at', { ascending: false })
@@ -7850,7 +8099,6 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
       .select(
         'id, task_group_id, title, node_slug, task_type, status, outcome, gate_state, gate_attempt, assignee_identity_id, assignee_user_id, created_at'
       )
-      .eq('user_id', userId)
       .in('task_group_id', groupIds)
       .order('created_at', { ascending: true });
     if (tasksError) {
@@ -7887,7 +8135,6 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
           'task_id, event, attempt, gate_version, session_id, actor_identity_id, actor_user_id, evidence, reason, created_at',
           { count: 'exact' }
         )
-        .eq('user_id', userId)
         .in(
           'task_id',
           nodes.map((node) => node.id)

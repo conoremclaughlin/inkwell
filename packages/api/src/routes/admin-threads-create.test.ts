@@ -69,8 +69,16 @@ function getCreateHandler(): Handler {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
-function createReq(body: Record<string, unknown>): Request {
-  return { body, headers: {}, cookies: {}, params: {}, inkUserId: 'user-1' } as unknown as Request;
+function createReq(body: Record<string, unknown>, role = 'owner'): Request {
+  return {
+    body,
+    headers: {},
+    cookies: {},
+    params: {},
+    inkUserId: 'user-1',
+    inkWorkspaceId: 'ws-1',
+    inkWorkspaceRole: role,
+  } as unknown as Request;
 }
 
 interface MockResponse extends Response {
@@ -134,6 +142,17 @@ describe('POST /threads', () => {
     expect(mockHandleSendToInbox).not.toHaveBeenCalled();
   });
 
+  it('a viewer or a trusted non-member cannot start a thread — read is every role, write is member and up (§1)', async () => {
+    mockThreadLookup(null);
+    for (const role of ['viewer', 'trusted']) {
+      const res = createRes();
+      await create(createReq({ key: 'pr:545', recipients: ['wren'], content: 'hi' }, role), res);
+      expect(res._status).toBe(403);
+      expect(res._json).toMatchObject({ role });
+    }
+    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
+  });
+
   it('starts a new thread: human sender, title as subject, every recipient woken', async () => {
     mockThreadLookup(null);
     mockHandleSendToInbox.mockResolvedValue(
@@ -173,6 +192,11 @@ describe('POST /threads', () => {
     });
     expect(args.senderSlug).toBeUndefined();
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
+    // The person and the workspace they act in are server-side context, not
+    // tool args (spec inkmail-thread-scope §3, §6).
+    expect(mockHandleSendToInbox.mock.calls[0][2]).toEqual({
+      sender: { principal: { kind: 'user', userId: 'user-1' }, workspaceId: 'ws-1' },
+    });
   });
 
   it("pins a single-recipient send to a studio by slug, in the handler's single form", async () => {

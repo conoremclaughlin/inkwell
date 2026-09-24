@@ -34,7 +34,8 @@ export interface RoutingHoldDetail {
 
 export interface StampHoldArgs {
   threadId: string;
-  userId: string;
+  /** The thread's workspace — the row is (id, workspace_id) now (spec inkmail-thread-scope §1). */
+  workspaceId: string;
   sbSlug: string;
   /** When this delivery attempt began — its generation. */
   attemptStartedAt: string;
@@ -44,7 +45,7 @@ export interface StampHoldArgs {
 
 export interface ClearHoldArgs {
   threadId: string;
-  userId: string;
+  workspaceId: string;
   sbSlug: string;
   /** When the successful route began; older holds only. */
   routedSince: string;
@@ -56,11 +57,11 @@ export interface ClearHoldArgs {
  * attempt cannot resurrect a hold a later success already disproved.
  */
 export async function stampRoutingHold(client: any, args: StampHoldArgs): Promise<boolean> {
-  const { threadId, userId, sbSlug, attemptStartedAt, detail } = args;
+  const { threadId, workspaceId, sbSlug, attemptStartedAt, detail } = args;
   try {
     const { data, error } = await client.rpc('stamp_routing_hold', {
       p_thread_id: threadId,
-      p_user_id: userId,
+      p_workspace_id: workspaceId,
       p_agent_id: sbSlug,
       p_attempt_started: attemptStartedAt,
       p_hold: {
@@ -120,11 +121,11 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
  * from stamping afterwards, so it must be written even when no hold existed.
  */
 export async function clearRoutingHold(client: any, args: ClearHoldArgs): Promise<boolean> {
-  const { threadId, userId, sbSlug, routedSince } = args;
+  const { threadId, workspaceId, sbSlug, routedSince } = args;
   try {
     const { data, error } = await client.rpc('clear_routing_hold', {
       p_thread_id: threadId,
-      p_user_id: userId,
+      p_workspace_id: workspaceId,
       p_agent_id: sbSlug,
       p_routed_since: routedSince,
     });

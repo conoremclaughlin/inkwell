@@ -67,6 +67,7 @@ import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
 import { resolveSbId } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
+import { resolveSbsByIds, workspaceOfSb } from './principals';
 import { grantStudioLease, studioPathConflict, type GrantOutcome } from './lease-grant';
 
 const execFileAsync = promisify(execFile);
@@ -494,10 +495,12 @@ export class StudioLeaseService {
     worktreePath?: string;
     ephemeral?: boolean;
     status?: string;
+    /** The row's identity, for callers deciding scope from fresh state. */
+    sbId?: string | null;
   } | null> {
     let query = this.supabase
       .from('studios')
-      .select('lease, worktree_path, ephemeral, status')
+      .select('lease, worktree_path, ephemeral, status, sb_id')
       .eq('id', studioId);
     if (userId) query = query.eq('user_id', userId);
     const { data, error } = await query.maybeSingle();
@@ -508,6 +511,7 @@ export class StudioLeaseService {
     if (!data) return null;
     return {
       lease: parseStudioLease(data.lease),
+      sbId: (data as { sb_id?: string | null }).sb_id ?? null,
       worktreePath: data.worktree_path,
       ephemeral: data.ephemeral,
       status: data.status,
@@ -1431,6 +1435,7 @@ export class StudioLeaseService {
     Array<{
       id: string;
       user_id: string;
+      sb_id: string | null;
       lease: StudioLease;
       worktree_path: string | null;
       ephemeral: boolean;
@@ -1439,7 +1444,7 @@ export class StudioLeaseService {
   > {
     let query = this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
+      .select('id, user_id, sb_id, lease, worktree_path, ephemeral, expires_at')
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data } = await query;
@@ -1452,6 +1457,7 @@ export class StudioLeaseService {
       held.push({
         id: row.id,
         user_id: row.user_id,
+        sb_id: (row.sb_id as string | null) ?? null,
         lease,
         worktree_path: row.worktree_path ?? null,
         ephemeral: row.ephemeral === true,
@@ -1768,20 +1774,39 @@ export class StudioLeaseService {
    * worktree to another thread while the process is still cd'd into it).
    */
   async releaseByThread(
-    userId: string,
-    threadKey: string,
-    opts: { reason?: string } = {}
+    thread: { workspaceId: string; threadKey: string },
+    opts: { reason?: string; legacyOwnerUserId?: string } = {}
   ): Promise<{ released: number; deferred: number; removed: number; studioIds: string[] }> {
+    const { threadKey } = thread;
     // Membership is against the LIVE SET, not the scalar (v18 S2): a
     // multiplexed key never appears in `lease->>threadKey`, and a scalar
     // whose key was already removed from the set must not match again.
-    // Leased studios per user are few — read them all and filter parsed.
+    // Leased studios are few — read them all and filter parsed.
+    //
+    // A thread is a workspace row (spec inkmail-thread-scope §1), so the
+    // leases it releases are the ones riding THIS thread: any owner in the
+    // workspace, attributed through the lease's identity, and never a
+    // same-key thread of the same owner in another workspace. Keyed by
+    // owner, this released the wrong namesake and missed another owner's
+    // lease on the very thread being closed (Lumen, #621 P1). A legacy
+    // lease with no identity at all is matched by owner, as before.
     const { data } = await this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path')
-      .eq('user_id', userId)
+      .select('id, user_id, sb_id, lease, worktree_path')
       .not('lease', 'is', null);
     if (!data?.length) return { released: 0, deferred: 0, removed: 0, studioIds: [] };
+
+    const riding = data
+      .map((row) => ({ row, lease: parseStudioLease(row.lease) }))
+      .filter(
+        ({ lease }) => lease && !lease.quarantined && leaseThreadKeys(lease).includes(threadKey)
+      ) as Array<{ row: (typeof data)[number]; lease: StudioLease }>;
+    const identityIds = [
+      ...new Set(riding.map(({ row, lease }) => lease.sbId ?? row.sb_id).filter(Boolean)),
+    ] as string[];
+    const workspaceBySbId = new Map(
+      (await resolveSbsByIds(this.supabase, identityIds)).map((sb) => [sb.sbId, sb.workspaceId])
+    );
 
     let released = 0;
     let deferred = 0;
@@ -1792,10 +1817,12 @@ export class StudioLeaseService {
     // (`studios.thread_key` is the CREATED-FOR thread, and the last live key
     // need not be it — Lumen r1 P1-2).
     const studioIds: string[] = [];
-    for (const row of data) {
-      const initial = parseStudioLease(row.lease);
-      if (!initial || initial.quarantined) continue;
-      if (!leaseThreadKeys(initial).includes(threadKey)) continue;
+    for (const { row, lease: initial } of riding) {
+      const identityId = initial.sbId ?? row.sb_id;
+      const inWorkspace = identityId
+        ? workspaceBySbId.get(identityId) === thread.workspaceId
+        : !!opts.legacyOwnerUserId && row.user_id === opts.legacyOwnerUserId;
+      if (!inWorkspace) continue;
       studioIds.push(row.id);
       const outcome = await this.releaseThreadFromLease(
         row.id,
@@ -1972,7 +1999,7 @@ export class StudioLeaseService {
     // A thread-close release stamps the CLOSING thread's record — under
     // multiplexing the last live key need not be the scalar first-acquirer.
     await this.stampThreadFinalState(
-      userId,
+      lease.sbId ?? null,
       opts.closingThreadKey ?? lease.threadKey,
       studioId,
       finalState
@@ -1985,17 +2012,23 @@ export class StudioLeaseService {
    * thread's metadata so the thread records where its work ended up.
    */
   private async stampThreadFinalState(
-    userId: string,
+    sbId: string | null,
     threadKey: string,
     studioId: string,
     finalState?: WorktreeFinalState
   ): Promise<void> {
     if (!finalState || finalState.error) return;
+    // The thread is one row per (workspace, key); the workspace is the
+    // holding identity's. A lease with no canonical identity names no
+    // workspace, so it stamps nothing rather than guessing among namesakes.
+    if (!sbId) return;
     try {
+      const workspaceId = await workspaceOfSb(this.supabase, sbId);
+      if (!workspaceId) return;
       const { data: thread } = await this.supabase
         .from('inbox_threads')
         .select('id, metadata')
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .eq('thread_key', threadKey)
         .maybeSingle();
       if (!thread) return;
@@ -2047,7 +2080,7 @@ export class StudioLeaseService {
   }> {
     const { data, error } = await this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
+      .select('id, user_id, sb_id, lease, worktree_path, ephemeral, expires_at')
       .not('lease', 'is', null);
     if (error || !data?.length) return { expired: 0, renewed: 0, quarantined: 0, released: 0 };
 
@@ -2223,7 +2256,7 @@ export class StudioLeaseService {
         },
       });
       if (claim.heldThreadKey) {
-        await this.stampThreadFinalState(row.user_id, claim.heldThreadKey, row.id, rescue);
+        await this.stampThreadFinalState(row.sb_id ?? null, claim.heldThreadKey, row.id, rescue);
       }
       expired += 1;
     }
@@ -2291,11 +2324,33 @@ export class StudioLeaseService {
   async claimForTeardown(
     studioId: string,
     userId: string,
-    opts: { expectedThreadKey?: string; reason: string }
+    opts: { expectedThreadKey?: string; expectedWorkspaceId?: string; reason: string }
   ): Promise<StudioLease | null> {
     const current = await this.getLease(studioId, userId);
     if (!current) return null;
     const holder = current.lease;
+
+    // Scope from FRESH state, lease first: a studio selected for a close in
+    // workspace A whose live lease belongs to an identity in workspace B is
+    // B's, whatever the row or the owner says. A canonical foreign lease is
+    // never overridden by row or legacy-owner attribution; a studio with no
+    // identity at all keeps the owner boundary this claim already enforces
+    // (Lumen, #624).
+    if (opts.expectedWorkspaceId) {
+      const identityId = holder?.sbId ?? current.sbId ?? null;
+      if (identityId) {
+        const leaseWorkspace = await workspaceOfSb(this.supabase, identityId);
+        if (leaseWorkspace !== opts.expectedWorkspaceId) {
+          logger.info('[StudioLease] Teardown claim refused — lease belongs to another workspace', {
+            studioId,
+            identityId,
+            leaseWorkspace,
+            expectedWorkspaceId: opts.expectedWorkspaceId,
+          });
+          return null;
+        }
+      }
+    }
 
     const claim = this.claimRecord(holder, 'teardown', opts.reason, opts.expectedThreadKey);
 

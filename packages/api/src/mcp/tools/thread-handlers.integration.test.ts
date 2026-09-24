@@ -18,7 +18,11 @@
 
 import { describe, it, expect, beforeAll, afterEach, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
-import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
+import {
+  ensureEchoIntegrationFixture,
+  ensureSuiteIdentity,
+  type EchoIntegrationFixture,
+} from '../../test/integration-fixtures';
 import { handleGetThreadMessages } from './thread-handlers';
 
 type ThreadRow = { id: string; status: string };
@@ -38,13 +42,21 @@ async function parseResult(raw: {
 
 describe('Thread Handlers Integration — read cursor + monotonic markRead', () => {
   let dataComposer: DataComposer;
+  let fixture: EchoIntegrationFixture;
   let userId: string;
+  // Since the cutover a thread principal is an identity in the thread's
+  // workspace (spec inkmail-thread-scope §3): the two SBs this suite talks
+  // as are suite-owned identities in the fixture workspace.
+  const sbIdBySlug = new Map<string, string>();
   const testThreadKeys: string[] = [];
 
   beforeAll(async () => {
     dataComposer = await getDataComposer();
-    const fixture = await ensureEchoIntegrationFixture(dataComposer);
+    fixture = await ensureEchoIntegrationFixture(dataComposer);
     userId = fixture.userId;
+    for (const slug of ['lumen', 'wren']) {
+      sbIdBySlug.set(slug, await ensureSuiteIdentity(dataComposer, fixture, slug));
+    }
   });
 
   afterEach(async () => {
@@ -56,7 +68,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
       const { data: thread } = await raw
         .from('inbox_threads')
         .select('id')
-        .eq('user_id', userId)
+        .eq('workspace_id', fixture.workspaceId)
         .eq('thread_key', key)
         .maybeSingle();
       if (thread?.id) {
@@ -77,8 +89,12 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     await raw
       .from('inbox_threads')
       .delete()
-      .eq('user_id', userId)
+      .eq('workspace_id', fixture.workspaceId)
       .like('thread_key', 'thread:test-cursor-%');
+    // Suite identities last: their participant rows are gone with the threads.
+    for (const sbId of sbIdBySlug.values()) {
+      await raw.from('agent_identities').delete().eq('id', sbId);
+    }
   });
 
   async function createThreadWithMessages(
@@ -93,12 +109,18 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = supabase as any;
 
+    const sb = (slug: string): string => {
+      const id = sbIdBySlug.get(slug);
+      if (!id) throw new Error(`no suite identity for ${slug}`);
+      return id;
+    };
     const { data: thread, error: threadError } = await raw
       .from('inbox_threads')
       .insert({
         thread_key: threadKey,
-        user_id: userId,
-        created_by_agent_id: senderSlug,
+        workspace_id: fixture.workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: sb(senderSlug),
         status: 'open',
       })
       .select('id')
@@ -106,10 +128,10 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     if (threadError || !thread) throw new Error(`thread insert: ${threadError?.message}`);
     const threadId = (thread as ThreadRow).id;
 
-    // Participants — sender + receiver
+    // Participants — sender + receiver, by identity
     await raw.from('inbox_thread_participants').insert([
-      { thread_id: threadId, agent_id: senderSlug },
-      { thread_id: threadId, agent_id: sbSlug },
+      { thread_id: threadId, workspace_id: fixture.workspaceId, sb_id: sb(senderSlug) },
+      { thread_id: threadId, workspace_id: fixture.workspaceId, sb_id: sb(sbSlug) },
     ]);
 
     // Insert messages serially so created_at is monotonic
@@ -119,6 +141,8 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
         .from('inbox_thread_messages')
         .insert({
           thread_id: threadId,
+          sender_kind: 'sb',
+          sender_sb_id: sb(m.sender),
           sender_agent_id: m.sender,
           content: m.content,
           message_type: 'message',
@@ -141,7 +165,7 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
       .from('inbox_thread_read_status')
       .select('last_read_at')
       .eq('thread_id', threadId)
-      .eq('agent_id', sbSlug)
+      .eq('sb_id', sbIdBySlug.get(sbSlug))
       .maybeSingle();
     return (data as ReadStatusRow | null)?.last_read_at ?? null;
   }
