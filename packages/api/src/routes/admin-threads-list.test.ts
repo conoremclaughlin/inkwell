@@ -111,12 +111,30 @@ function createRes(): MockResponse {
  * without it, both mutants survived.
  */
 function projector(columns: string): (row: Record<string, unknown>) => Record<string, unknown> {
-  const names = columns
-    .split(',')
-    .map((c) => c.trim())
-    // Embedded resources ("inbox_threads!inner(user_id)") are a join spec, not
-    // a column of this row; the route never reads them off the row itself.
-    .filter((c) => c.length > 0 && !c.includes('(') && !c.includes('!'));
+  // Split on top-level commas only: an embed's own column list
+  // ("alias:table(a, b)") is one entry, not several.
+  const entries: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of columns) {
+    if (ch === '(') depth += 1;
+    if (ch === ')') depth -= 1;
+    if (ch === ',' && depth === 0) {
+      entries.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  entries.push(current.trim());
+  const names = entries
+    .filter((c) => c.length > 0 && !c.includes('!'))
+    // An aliased embed ("last_message:inbox_thread_messages(...)") projects
+    // under its alias, which is where fixtures put the embedded rows. An
+    // unaliased join spec ("inbox_threads!inner(user_id)") is filtered above:
+    // the route never reads it off the row.
+    .map((c) => (c.includes('(') ? c.slice(0, c.indexOf(':')) : c))
+    .filter((c) => !c.includes('('));
   return (row) => Object.fromEntries(names.filter((n) => n in row).map((n) => [n, row[n]]));
 }
 
@@ -143,15 +161,42 @@ function table(rows: Array<Record<string, unknown>>) {
   // outside it — so the hydration query goes unexercised and its SELECT list
   // can lose a column with every test still green. (It did: removing `summary`
   // from the hydration SELECT survived until this was implemented.)
-  chain.order = vi.fn((column: string, opts?: { ascending?: boolean }) => {
-    const dir = opts?.ascending === false ? -1 : 1;
-    working = [...working].sort((a, b) =>
-      String(a[column] ?? '') < String(b[column] ?? '') ? -dir : dir
+  // With `referencedTable`, PostgREST orders, limits and filters the EMBED
+  // under that alias, per parent row — never the parents. A fake that
+  // applied them to the parents would cut the thread window to one row.
+  const eachEmbed = (
+    alias: string,
+    fn: (rows: Array<Record<string, unknown>>) => Array<Record<string, unknown>>
+  ) => {
+    working = working.map((row) =>
+      Array.isArray(row[alias])
+        ? { ...row, [alias]: fn(row[alias] as Array<Record<string, unknown>>) }
+        : row
     );
+  };
+  const sortBy = (column: string, ascending: boolean | undefined) => {
+    const dir = ascending === false ? -1 : 1;
+    return (rows: Array<Record<string, unknown>>) =>
+      [...rows].sort((a, b) => (String(a[column] ?? '') < String(b[column] ?? '') ? -dir : dir));
+  };
+  chain.order = vi.fn(
+    (column: string, opts?: { ascending?: boolean; referencedTable?: string }) => {
+      if (opts?.referencedTable) eachEmbed(opts.referencedTable, sortBy(column, opts.ascending));
+      else working = sortBy(column, opts?.ascending)(working);
+      return chain;
+    }
+  );
+  chain.limit = vi.fn((n: number, opts?: { referencedTable?: string }) => {
+    if (opts?.referencedTable) eachEmbed(opts.referencedTable, (rows) => rows.slice(0, n));
+    else working = working.slice(0, n);
     return chain;
   });
-  chain.limit = vi.fn((n: number) => {
-    working = working.slice(0, n);
+  chain.neq = vi.fn((column: string, value: unknown) => {
+    const dot = column.indexOf('.');
+    if (dot > 0) {
+      const field = column.slice(dot + 1);
+      eachEmbed(column.slice(0, dot), (rows) => rows.filter((r) => r[field] !== value));
+    }
     return chain;
   });
   chain.in = vi.fn((column: string, values: unknown[]) => {
@@ -159,7 +204,7 @@ function table(rows: Array<Record<string, unknown>>) {
     working = working.filter((row) => wanted.has(row[column]));
     return chain;
   });
-  for (const method of ['eq', 'or', 'not', 'neq', 'range']) {
+  for (const method of ['eq', 'or', 'not', 'range']) {
     chain[method] = vi.fn(() => chain);
   }
   return chain;
@@ -170,7 +215,18 @@ const ago = (minutes: number) => new Date(Date.now() - minutes * MINUTE).toISOSt
 
 interface Spine {
   key: string;
-  thread: { title: string | null; summary: string | null } | null;
+  thread: {
+    title: string | null;
+    summary: string | null;
+    lastMessage: {
+      id: string;
+      senderSlug: string;
+      sentByUser: boolean;
+      messageType: string;
+      preview: string;
+      createdAt: string;
+    } | null;
+  } | null;
   sessions: Array<{ id: string; sbSlug: string | null; live: boolean }>;
 }
 
@@ -310,5 +366,104 @@ describe('GET /threads', () => {
     expect(spine!.thread, 'hydration must find the real thread, not thread: null').not.toBeNull();
     expect(spine!.thread?.summary).toBe('Carried by a session, outside the newest-500 window.');
     expect(spine!.sessions[0].live).toBe(true);
+  });
+
+  describe('last message preview', () => {
+    const message = (over: Record<string, unknown> = {}) => ({
+      id: 'msg-1',
+      sender_agent_id: 'lumen',
+      content: 'Reviewed.',
+      message_type: 'message',
+      metadata: {},
+      created_at: ago(10),
+      ...over,
+    });
+
+    it('carries the newest deliverable message, collapsed to one line', async () => {
+      const newestAt = ago(5);
+      const [spine] = await listSpines({
+        inbox_threads: [
+          threadRow({
+            last_message: [
+              message({ id: 'older', content: 'first pass', created_at: ago(30) }),
+              message({
+                id: 'newest',
+                sender_agent_id: 'lumen',
+                content: 'Round 2:\n\n  **approve** — ship it',
+                created_at: newestAt,
+              }),
+              // Newer still, but a system event: not a preview, not unread.
+              message({
+                id: 'closed-event',
+                sender_agent_id: 'system',
+                content: 'Thread closed',
+                message_type: 'system',
+                created_at: ago(1),
+              }),
+            ],
+          }),
+        ],
+      });
+      expect(spine.thread?.lastMessage).toEqual({
+        id: 'newest',
+        senderSlug: 'lumen',
+        sentByUser: false,
+        messageType: 'message',
+        preview: 'Round 2: **approve** — ship it',
+        createdAt: newestAt,
+      });
+    });
+
+    it("marks a person's reply as sent by a person", async () => {
+      const [spine] = await listSpines({
+        inbox_threads: [
+          threadRow({
+            last_message: [message({ sender_agent_id: 'unknown', metadata: { sentBy: 'user' } })],
+          }),
+        ],
+      });
+      expect(spine.thread?.lastMessage?.sentByUser).toBe(true);
+      expect(spine.thread?.lastMessage?.senderSlug).toBe('unknown');
+    });
+
+    it('answers null for a thread with only system events, and keeps the thread', async () => {
+      const [spine] = await listSpines({
+        inbox_threads: [
+          threadRow({ last_message: [message({ message_type: 'system', content: 'Reopened' })] }),
+        ],
+      });
+      expect(spine.thread).not.toBeNull();
+      expect(spine.thread?.lastMessage).toBeNull();
+    });
+
+    it('carries the preview on a thread hydrated from outside the window', async () => {
+      const OLD_KEY = 'inkwell:pr:1';
+      const filler = Array.from({ length: 500 }, (_, i) =>
+        threadRow({
+          id: `filler-${i}`,
+          thread_key: `inkwell:pr:9${String(i).padStart(3, '0')}`,
+          updated_at: new Date(Date.now() - i * MINUTE).toISOString(),
+        })
+      );
+      const target = threadRow({
+        id: 'old-thread',
+        thread_key: OLD_KEY,
+        updated_at: new Date(Date.now() - 400 * 24 * 60 * MINUTE).toISOString(),
+        // Unordered, with a newer system event: only the embed's own order,
+        // filter and limit — applied on THIS query too — pick 'old-last'.
+        last_message: [
+          message({ id: 'old-first', content: 'kickoff', created_at: ago(90) }),
+          message({ id: 'old-last', content: 'still going', created_at: ago(20) }),
+          message({ id: 'old-event', message_type: 'system', created_at: ago(10) }),
+        ],
+      });
+      const spines = await listSpines({
+        inbox_threads: [...filler, target],
+        sessions: [sessionRow({ thread_key: OLD_KEY, updated_at: ago(2) })],
+      });
+      const spine = spines.find((s) => s.key === OLD_KEY);
+      expect(spine?.thread?.lastMessage?.id).toBe('old-last');
+      expect(spine?.thread?.lastMessage?.preview).toBe('still going');
+    });
   });
 });

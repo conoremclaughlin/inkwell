@@ -19,6 +19,7 @@
  */
 
 import { isTerminalPhaseMarker } from '../sessions/phase-markers';
+import type { ThreadLastMessage } from './thread-conversation';
 
 export interface SpineThreadRow {
   threadKey: string;
@@ -32,6 +33,8 @@ export interface SpineThreadRow {
   updatedAt: string;
   closedAt: string | null;
   participants: string[];
+  /** Newest deliverable message, when the route fetched one. */
+  lastMessage?: ThreadLastMessage | null;
 }
 
 export interface SpineSessionRow {
@@ -92,6 +95,8 @@ export interface ThreadSpine {
     createdBySlug: string;
     participants: string[];
     closedAt: string | null;
+    /** Newest deliverable (non-system) message; null when there is none. */
+    lastMessage: ThreadLastMessage | null;
   } | null;
   sessions: Array<{
     id: string;
@@ -376,6 +381,7 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
       createdBySlug: t.createdBySlug,
       participants: t.participants,
       closedAt: t.closedAt,
+      lastMessage: t.lastMessage ?? null,
     };
     // Pinned identity is authoritative even when all three components are
     // null (a pre-pinning thread awaiting reconciliation stays "unknown",
