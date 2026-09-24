@@ -26,12 +26,21 @@ yarn db:migrate:status
 lock on the version, the ledger row (version, name, and the file text as its
 one statement), then the file. Either all of it commits or none of it does, and
 two runs of the same file cannot both succeed: the second waits on the lock and
-then fails the row's primary key before its copy of the file runs. It works from
-any worktree (the CLI reaches the stack by the port in `supabase/config.toml`),
+then fails the row's primary key before its copy of the file runs. Every
+database operation, the recorded check, the transaction and `status`, goes over
+the running root stack's connection string (`supabase status` asked through the
+root), never an endpoint resolved from the current checkout's config, so a
+worktree cannot read one ledger and write another. It works from any worktree,
 in any order, and skips a version the ledger already has. Several files can be
-given at once; each is its own transaction. Do not write `BEGIN`/`COMMIT` into a
-migration file: the wrapper, like the CLI, already wraps the file, and an inner
-pair only produces "there is already a transaction in progress" warnings.
+given at once; each is its own transaction.
+
+A file must not carry its own `BEGIN`, `COMMIT`, `ROLLBACK` or
+`START TRANSACTION`; the wrapper refuses it. psql's single-transaction mode
+does not cover transaction-control statements: an inner `COMMIT` would commit
+the ledger row and everything before it, and a failure later in the file would
+not roll that back, which is precisely the recorded-but-partially-applied state
+the wrapper exists to prevent. Older files in this directory do carry them;
+they are already applied and do not go through the wrapper.
 
 If the stack is not running, start it from the root checkout with
 `supabase start`. Do not reach for `yarn supabase:local:setup` for that: it

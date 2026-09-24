@@ -14,10 +14,18 @@
 #     ledger holds a version whose file is not in the current checkout, which
 #     is the normal state whenever another branch applied its migration first.
 #
-# This script runs ONE psql transaction: an advisory lock on the version, the
+# Every database operation here goes over ONE connection string, the running
+# root stack's DB_URL: the recorded check, the transaction, and `status`.
+# Nothing is resolved from the current checkout's config, so a worktree with
+# a divergent supabase/config.toml cannot read one ledger and write another.
+#
+# The apply is one psql transaction: an advisory lock on the version, the
 # ledger row (its primary key is the version, so a second run of the same
 # file blocks on the lock and then fails the insert), then the file. Either
-# all of it commits or none of it does. Any checkout, any order.
+# all of it commits or none of it does. A file that carries its own BEGIN or
+# COMMIT is refused: psql's single-transaction mode does not cover
+# transaction-control statements, so an inner COMMIT would commit the row and
+# the partial file and leave a later failure un-rolled-back.
 #
 # Usage:
 #   sh scripts/db-migrate.sh apply supabase/migrations/<version>_<name>.sql [...]
@@ -47,6 +55,8 @@ shift
 
 command -v supabase >/dev/null 2>&1 ||
   die "Supabase CLI not found on PATH (https://supabase.com/docs/guides/cli/getting-started)"
+command -v psql >/dev/null 2>&1 ||
+  die "psql not found on PATH; install it (brew install libpq && brew link --force libpq)"
 common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not inside a git checkout"
 root=$(cd "$common/.." && pwd -P) || die "could not resolve the repository root from $common"
 checkout=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git work tree"
@@ -54,27 +64,29 @@ checkout=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git w
 # Paths are compared physically (pwd -P): git reports the real path of the
 # work tree, and on macOS a temp directory has two spellings.
 
-# The running local stack's connection string. `supabase status` names its
-# Docker containers after the directory, so a worktree cannot ask directly;
-# it asks through the root. Everything else goes over this one connection.
+# The running root stack's connection string. `supabase status` names its
+# Docker containers after the directory, so it is asked through the root; a
+# worktree has no stack of its own.
 db_url() {
   supabase status --workdir "$root" -o env 2>/dev/null |
     sed -n 's/^DB_URL="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1
 }
 
-# The CLI prints a table: local version | remote version | time. A row with a
-# remote version is recorded; the header and rule lines carry no 14-digit
-# number and drop out. A failed listing is a refusal, never an empty ledger.
-list_table() {
-  supabase migration list --local --workdir "$checkout" 2>/dev/null
-}
-
-recorded_versions() {
-  awk -F'|' 'NF >= 2 { gsub(/[[:space:]]/, "", $2); if (length($2) == 14 && $2 ~ /^[0-9]+$/) print $2 }'
-}
+url=$(db_url)
+[ -n "$url" ] ||
+  die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/db-migrate.XXXXXX") || die "could not create a temp directory"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+# How many ledger rows carry this version, read over the same connection the
+# apply will use. A read that fails is a refusal, never "not recorded".
+# $1 is exactly 14 digits by the time this runs (see apply_one), so it can
+# sit inside the SQL text; psql does not interpolate variables into -c.
+recorded_count() {
+  psql "$url" -X -q -t -A -v ON_ERROR_STOP=1 \
+    -c "SELECT count(*) FROM supabase_migrations.schema_migrations WHERE version = '$1'"
+}
 
 apply_one() {
   file=$1
@@ -93,16 +105,19 @@ apply_one() {
   dir=$(cd "$(dirname "$file")" && pwd -P) || die "cannot enter $(dirname "$file")"
   [ "$dir" = "$checkout/supabase/migrations" ] ||
     die "$base must live in $checkout/supabase/migrations (found it in $dir)"
-
-  table=$(list_table) || die "supabase migration list failed; is the local stack running? (refusing to apply without reading the ledger)"
-  if printf '%s\n' "$table" | recorded_versions | grep -qx "$version"; then
-    printf 'db-migrate: %s is already recorded; nothing to do\n' "$base"
-    return 0
+  if sed 's/--.*$//' "$file" | grep -qiE '^[[:space:]]*(BEGIN|COMMIT|ROLLBACK|START TRANSACTION)[[:space:]]*;'; then
+    die "$base contains its own BEGIN/COMMIT; remove it. The wrapper runs the file inside one transaction with its ledger row, and psql's single-transaction mode does not cover transaction-control statements, so an inner COMMIT would record the row and commit a partial file."
   fi
 
-  url=$(db_url)
-  [ -n "$url" ] ||
-    die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
+  count=$(recorded_count "$version") || die "could not read the ledger over $url (refusing to apply without it)"
+  case "$count" in
+    0) ;;
+    [1-9]*)
+      printf 'db-migrate: %s is already recorded; nothing to do\n' "$base"
+      return 0
+      ;;
+    *) die "unexpected ledger answer for $version: '$count'" ;;
+  esac
 
   # Lock, then row, then file, in one transaction. The lock serialises two
   # runs of the same version; the loser then fails the insert on the primary
@@ -128,8 +143,6 @@ SQL
 case "$mode" in
   apply)
     [ "$#" -ge 1 ] || usage
-    command -v psql >/dev/null 2>&1 ||
-      die "psql not found on PATH; install it (brew install libpq && brew link --force libpq)"
     status=0
     for f in "$@"; do
       apply_one "$f" || status=1
@@ -138,7 +151,10 @@ case "$mode" in
     ;;
   status)
     [ "$#" -eq 0 ] || usage
-    table=$(list_table) || die "supabase migration list failed; is the local stack running?"
+    # The CLI prints a table: local version | remote version | time. Bound to
+    # the same endpoint as apply; the files come from this checkout.
+    table=$(supabase migration list --db-url "$url" --workdir "$checkout" 2>/dev/null) ||
+      die "supabase migration list failed over $url"
     printf '%s\n' "$table"
     printf '%s\n' "$table" | awk -F'|' '
       NF >= 2 {

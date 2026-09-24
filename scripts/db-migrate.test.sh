@@ -3,27 +3,35 @@
 # local stack and record it in the ledger under the file's own version) and
 # for the table parsing in scripts/migration-status.mjs.
 #
-# Both run against stub `supabase` and `psql` commands placed first on PATH:
-# no Docker, no database. The stub answers `status` with a synthetic DB_URL,
-# `migration list` with the same table the real CLI prints (local files of
-# the --workdir checkout against a ledger file). The psql stub records its
-# argv, keeps a copy of the SQL it was handed, and appends the version it was
-# given to that ledger file on success, standing in for the INSERT.
+# Hermetic: PATH is a directory of stub `supabase` and `psql` commands plus a
+# directory of symlinks to the few utilities the scripts need. No Docker, no
+# database, and nothing from the host's system directories, so a psql that
+# happens to be installed on a CI runner cannot leak in.
+#
+# The supabase stub answers `status` with a synthetic DB_URL and `migration
+# list` with the same table the real CLI prints (local files of the --workdir
+# checkout against a ledger file). The psql stub records its argv, keeps a
+# copy of the SQL it was handed, answers the recorded-count query from the
+# ledger file, and appends the version it was given on a successful apply,
+# standing in for the INSERT.
 #
 # What is pinned:
 #   - the ledger row and the file run in ONE psql transaction, behind an
 #     advisory lock on the version, with values passed as psql variables
 #   - a failed transaction writes no row
-#   - an already-recorded version is skipped without touching the database
-#   - a listing that fails is a refusal, not an empty ledger
-#   - a file outside supabase/migrations, or misnamed, is refused before psql
+#   - an already-recorded version is skipped without an apply
+#   - a recorded-count read that fails is a refusal, never "not recorded"
+#   - every database call uses the root stack's DB_URL; a worktree's own
+#     supabase/config.toml is never consulted, however divergent
+#   - a file outside supabase/migrations, misnamed, or carrying its own
+#     BEGIN/COMMIT is refused before psql
 #   - a stopped stack, or a missing psql, is refused before psql; the hint
 #     names `supabase start`, never the setup script that resets the database
-#   - from a worktree, the stack is asked through the root and the ledger is
-#     read from the worktree that holds the file
 #   - `status` counts pending files and rows applied from other checkouts
 #   - migration-status.mjs reads the CLI table: a local-only row is pending
-#     and exits 10, a remote-only row is not, and a clean ledger exits 0
+#     (exit 10), a remote-only row is not, a valid empty table is clean,
+#     output without the table header is unknown (exit 2), and the apply
+#     hint follows the target
 #
 # Usage:  sh scripts/db-migrate.test.sh
 
@@ -69,7 +77,18 @@ bad() {
   printf 'FAIL %s: %s\n' "$1" "$2"
 }
 
-# --- stubs -----------------------------------------------------------------
+# --- a hermetic PATH ------------------------------------------------------
+
+# Only what the scripts and this suite call. Resolved from the host once,
+# here, so nothing else on the host PATH is reachable during the checks.
+mkdir -p "$work/tools"
+for tool in sh git node awk sed grep basename dirname cat mktemp head rm sort cut tr wc cp mkdir chmod ln; do
+  bin=$(command -v "$tool") || {
+    echo "cannot find $tool on the host PATH" >&2
+    exit 1
+  }
+  ln -s "$bin" "$work/tools/$tool"
+done
 
 mkdir -p "$work/stubs"
 cat > "$work/stubs/supabase" <<'STUB'
@@ -93,6 +112,10 @@ case "$cmd $sub" in
     [ -n "${STUB_LIST_FAIL:-}" ] && {
       echo "connection refused" >&2
       exit 1
+    }
+    [ -n "${STUB_LIST_GARBAGE:-}" ] && {
+      echo "unrecognized CLI output"
+      exit 0
     }
     printf '\n  \n   Local          | Remote         | Time (UTC)          \n  ----------------|----------------|---------------------\n'
     : > "$STUB_TMP/local"
@@ -124,15 +147,32 @@ cat > "$work/stubs/psql" <<'STUB'
 #!/bin/sh
 printf 'psql %s\n' "$*" >> "$STUB_LOG"
 version=''
+query=''
 prev=''
-: > "$STUB_TMP/handed.sql"
+files=''
 for a in "$@"; do
   case "$a" in version=*) version=${a#version=} ;; esac
-  if [ "$prev" = "-f" ] && [ -f "$a" ]; then
-    printf -- '-- file: %s\n' "$(basename "$a")" >> "$STUB_TMP/handed.sql"
-    cat "$a" >> "$STUB_TMP/handed.sql"
-  fi
+  [ "$prev" = "-c" ] && query=$a
+  [ "$prev" = "-f" ] && files="$files $a"
   prev=$a
+done
+case "$query" in
+  *"SELECT count(*) FROM supabase_migrations.schema_migrations WHERE version = '"*)
+    [ -n "${STUB_PRECHECK_RC:-}" ] && {
+      echo "connection refused" >&2
+      exit "$STUB_PRECHECK_RC"
+    }
+    v=${query##*version = \'}
+    v=${v%\'*}
+    grep -cx "$v" "$STUB_LEDGER"
+    exit 0
+    ;;
+esac
+: > "$STUB_TMP/handed.sql"
+for f in $files; do
+  [ -f "$f" ] || continue
+  printf -- '-- file: %s\n' "$(basename "$f")" >> "$STUB_TMP/handed.sql"
+  cat "$f" >> "$STUB_TMP/handed.sql"
 done
 rc=${STUB_PSQL_RC:-0}
 [ "$rc" -eq 0 ] && [ -n "$version" ] && echo "$version" >> "$STUB_LEDGER"
@@ -140,7 +180,10 @@ exit "$rc"
 STUB
 chmod +x "$work/stubs/supabase" "$work/stubs/psql"
 
-PATH="$work/stubs:$PATH"
+mkdir -p "$work/stubs-nopsql"
+cp "$work/stubs/supabase" "$work/stubs-nopsql/supabase"
+
+PATH="$work/stubs:$work/tools"
 export PATH
 STUB_LOG="$work/calls.log"
 STUB_LEDGER="$work/ledger.txt"
@@ -167,11 +210,13 @@ printf 'select 1;\n' > "$mig/20260101000000_one.sql"
 printf 'select 2;\n' > "$mig/20260102000000_two.sql"
 printf 'select 3;\n' > "$mig/20260103000000_three.sql"
 printf 'select 4;\n' > "$mig/20260104000000_four.sql"
+printf -- '-- a comment mentioning BEGIN; is fine\nBEGIN;\nselect 5;\nCOMMIT;\n' > "$mig/20260105000000_five.sql"
 printf 'select 0;\n' > "$mig/001_bad.sql"
 printf 'select 9;\n' > "$repo/20260109000000_stray.sql"
 
 calls() { cat "$STUB_LOG"; }
 reset_log() { : > "$STUB_LOG"; }
+apply_calls() { calls | grep -c '^psql.* -f '; }
 
 # --- usage -----------------------------------------------------------------
 
@@ -187,30 +232,39 @@ out=$(cd "$repo" && sh "$script" frobnicate 2>&1)
 rc=$?
 [ "$rc" -eq 2 ] && ok "an unknown mode is a usage error" || bad "an unknown mode is a usage error" "exit $rc: $out"
 
-# --- refusals before psql ---------------------------------------------------
+# --- refusals before any apply ---------------------------------------------
 
 reset_log
 out=$(cd "$repo" && sh "$script" apply supabase/migrations/001_bad.sql 2>&1)
 rc=$?
-if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'date -u'; then
-  ok "a file without the 14-digit version is refused before psql"
+if [ "$rc" -eq 2 ] && [ "$(apply_calls)" -eq 0 ] && echo "$out" | grep -q 'date -u'; then
+  ok "a file without the 14-digit version is refused before any apply"
 else
-  bad "a file without the 14-digit version is refused before psql" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  bad "a file without the 14-digit version is refused before any apply" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
 fi
 
 reset_log
 out=$(cd "$repo" && sh "$script" apply 20260109000000_stray.sql 2>&1)
 rc=$?
-if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'supabase/migrations'; then
-  ok "a file outside supabase/migrations is refused before psql"
+if [ "$rc" -eq 2 ] && [ "$(apply_calls)" -eq 0 ] && echo "$out" | grep -q 'supabase/migrations'; then
+  ok "a file outside supabase/migrations is refused before any apply"
 else
-  bad "a file outside supabase/migrations is refused before psql" "exit $rc: $out"
+  bad "a file outside supabase/migrations is refused before any apply" "exit $rc: $out"
 fi
 
 reset_log
 out=$(cd "$repo" && sh "$script" apply supabase/migrations/20260199000000_missing.sql 2>&1)
 rc=$?
-[ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && ok "a missing file is refused" || bad "a missing file is refused" "exit $rc: $out"
+[ "$rc" -eq 2 ] && [ "$(apply_calls)" -eq 0 ] && ok "a missing file is refused" || bad "a missing file is refused" "exit $rc: $out"
+
+reset_log
+out=$(cd "$repo" && sh "$script" apply supabase/migrations/20260105000000_five.sql 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'BEGIN/COMMIT' && echo "$out" | grep -q 'single-transaction'; then
+  ok "a file carrying its own BEGIN/COMMIT is refused before psql, and told why"
+else
+  bad "a file carrying its own BEGIN/COMMIT is refused before psql, and told why" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
 
 reset_log
 out=$(cd "$repo" && STUB_NO_STACK=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
@@ -223,24 +277,22 @@ else
 fi
 
 reset_log
-out=$(cd "$repo" && STUB_LIST_FAIL=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
+out=$(cd "$repo" && PATH="$work/stubs-nopsql:$work/tools" sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
 rc=$?
-if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'migration list failed'; then
-  ok "a failed ledger listing is a refusal before psql, not an empty ledger"
+if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'psql not found'; then
+  ok "a missing psql is refused with an install hint (hermetic PATH)"
 else
-  bad "a failed ledger listing is a refusal before psql, not an empty ledger" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  bad "a missing psql is refused with an install hint (hermetic PATH)" "exit $rc: $out"
 fi
 
 reset_log
-gitdir=$(dirname "$(command -v git)")
-mkdir -p "$work/stubs-nopsql"
-cp "$work/stubs/supabase" "$work/stubs-nopsql/supabase"
-out=$(cd "$repo" && PATH="$work/stubs-nopsql:$gitdir:/usr/bin:/bin" sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
+out=$(cd "$repo" && STUB_PRECHECK_RC=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
 rc=$?
-if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'psql not found'; then
-  ok "a missing psql is refused with an install hint"
+if [ "$rc" -eq 2 ] && [ "$(apply_calls)" -eq 0 ] && [ "$(calls | grep -c '^psql')" -eq 1 ] &&
+  ! grep -qx 20260101000000 "$STUB_LEDGER" && echo "$out" | grep -q 'could not read the ledger'; then
+  ok "a recorded-count read that fails is a refusal: one psql call, no apply, no row"
 else
-  bad "a missing psql is refused with an install hint" "exit $rc: $out"
+  bad "a recorded-count read that fails is a refusal: one psql call, no apply, no row" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
 fi
 
 # --- the happy path ---------------------------------------------------------
@@ -248,13 +300,12 @@ fi
 reset_log
 out=$(cd "$repo" && sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
 rc=$?
-psql_line=$(calls | grep '^psql')
-n_psql=$(calls | grep -c '^psql')
-if [ "$rc" -eq 0 ] && [ "$n_psql" -eq 1 ] && ! calls | grep -q 'migration repair' &&
+psql_line=$(calls | grep '^psql.* -f ')
+if [ "$rc" -eq 0 ] && [ "$(apply_calls)" -eq 1 ] && ! calls | grep -q '^supabase migration' &&
   echo "$out" | grep -q 'recorded 20260101000000_one.sql as 20260101000000'; then
-  ok "one psql call does it all; the CLI's repair is never invoked"
+  ok "one apply call does it all; the CLI's migration commands are never invoked"
 else
-  bad "one psql call does it all; the CLI's repair is never invoked" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  bad "one apply call does it all; the CLI's migration commands are never invoked" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
 fi
 if echo "$psql_line" | grep -q -- ' -1 ' && echo "$psql_line" | grep -q 'ON_ERROR_STOP=1' &&
   echo "$psql_line" | grep -q -- '-f supabase/migrations/20260101000000_one.sql' && echo "$psql_line" | grep -q "$STUB_DB_URL"; then
@@ -289,10 +340,10 @@ grep -qx 20260101000000 "$STUB_LEDGER" && ok "the row lands under the file's own
 reset_log
 out=$(cd "$repo" && sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
 rc=$?
-if [ "$rc" -eq 0 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'already recorded'; then
-  ok "an already-recorded version is skipped without touching the database"
+if [ "$rc" -eq 0 ] && [ "$(apply_calls)" -eq 0 ] && echo "$out" | grep -q 'already recorded'; then
+  ok "an already-recorded version is skipped without an apply"
 else
-  bad "an already-recorded version is skipped without touching the database" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  bad "an already-recorded version is skipped without an apply" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
 fi
 
 # --- failures ---------------------------------------------------------------
@@ -310,25 +361,36 @@ fi
 reset_log
 out=$(cd "$repo" && STUB_PSQL_RC=1 sh "$script" apply supabase/migrations/20260102000000_two.sql supabase/migrations/20260103000000_three.sql 2>&1)
 rc=$?
-n=$(calls | grep -c '^psql')
+n=$(apply_calls)
 [ "$rc" -eq 1 ] && [ "$n" -eq 2 ] && ok "several files: every file is attempted and any failure fails the run" ||
-  bad "several files: every file is attempted and any failure fails the run" "exit $rc, psql calls $n: $out"
+  bad "several files: every file is attempted and any failure fails the run" "exit $rc, apply calls $n: $out"
 
-# --- from a worktree --------------------------------------------------------
+# --- from a worktree with a divergent config -------------------------------
 
 (cd "$repo" && git worktree add -q "$work/wt" -b feature) || bad "fixture worktree" "git worktree add failed"
 mkdir -p "$work/wt/supabase/migrations"
 cp "$mig/20260104000000_four.sql" "$work/wt/supabase/migrations/"
+printf '[db]\nport = 55422\n' > "$work/wt/supabase/config.toml"
 reset_log
 out=$(cd "$work/wt" && sh "$script" apply supabase/migrations/20260104000000_four.sql 2>&1)
 rc=$?
 status_line=$(calls | grep '^supabase status')
-list_line=$(calls | grep '^supabase migration list')
-if [ "$rc" -eq 0 ] && echo "$status_line" | grep -q -- "--workdir $repo" && echo "$list_line" | grep -q -- "--workdir $work/wt" &&
-  grep -qx 20260104000000 "$STUB_LEDGER"; then
-  ok "from a worktree: the stack is asked through the root, the ledger is read from the worktree, the row lands"
+psql_off_root=$(calls | grep '^psql' | grep -vc "$STUB_DB_URL")
+if [ "$rc" -eq 0 ] && echo "$status_line" | grep -q -- "--workdir $repo" && [ "$psql_off_root" -eq 0 ] &&
+  ! calls | grep -q '55422' && grep -qx 20260104000000 "$STUB_LEDGER"; then
+  ok "from a worktree: the stack is asked through the root and every psql call uses that DB_URL; the worktree's config.toml is never consulted"
 else
-  bad "from a worktree: the stack is asked through the root, the ledger is read from the worktree, the row lands" "exit $rc: $out; status: $status_line; list: $list_line"
+  bad "from a worktree: the stack is asked through the root and every psql call uses that DB_URL; the worktree's config.toml is never consulted" "exit $rc: $out; status: $status_line; off-root psql: $psql_off_root; calls: $(calls | tr '\n' ' ')"
+fi
+
+reset_log
+out=$(cd "$work/wt" && sh "$script" status 2>&1)
+rc=$?
+list_line=$(calls | grep '^supabase migration list')
+if [ "$rc" -eq 0 ] && echo "$list_line" | grep -q -- "--db-url $STUB_DB_URL" && echo "$list_line" | grep -q -- "--workdir $work/wt"; then
+  ok "status from a worktree lists that worktree's files against the root stack's DB_URL"
+else
+  bad "status from a worktree lists that worktree's files against the root stack's DB_URL" "exit $rc: $out; list: $list_line"
 fi
 
 # --- status -----------------------------------------------------------------
@@ -336,27 +398,32 @@ fi
 echo 20260999000000 >> "$STUB_LEDGER"
 out=$(cd "$repo" && sh "$script" status 2>&1)
 rc=$?
-if [ "$rc" -eq 0 ] && echo "$out" | grep -q '2 recorded, 2 pending in this checkout, 1 applied from another checkout' &&
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q '2 recorded, 3 pending in this checkout, 1 applied from another checkout' &&
   echo "$out" | grep -q 'yarn db:migrate supabase/migrations/<file>'; then
   ok "status counts recorded, pending, and rows applied from another checkout"
 else
   bad "status counts recorded, pending, and rows applied from another checkout" "exit $rc: $out"
 fi
 
+reset_log
+out=$(cd "$repo" && STUB_LIST_FAIL=1 sh "$script" status 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'migration list failed' && ok "status refuses when the listing fails" || bad "status refuses when the listing fails" "exit $rc: $out"
+
 # --- migration-status.mjs reads the same table ------------------------------
 
 out=$(node "$status_mjs" --local --workdir "$repo" 2>&1)
 rc=$?
-if [ "$rc" -eq 10 ] && echo "$out" | grep -q '2 pending local migrations' && echo "$out" | grep -q '20260102000000' &&
+if [ "$rc" -eq 10 ] && echo "$out" | grep -q '3 pending local migrations' && echo "$out" | grep -q '20260102000000' &&
   echo "$out" | grep -q 'yarn db:migrate'; then
-  ok "migration-status.mjs: local-only rows are pending, exit 10, with the apply hint"
+  ok "migration-status.mjs: local-only rows are pending, exit 10, with the local apply hint"
 else
-  bad "migration-status.mjs: local-only rows are pending, exit 10, with the apply hint" "exit $rc: $out"
+  bad "migration-status.mjs: local-only rows are pending, exit 10, with the local apply hint" "exit $rc: $out"
 fi
 
 out=$(node "$status_mjs" --local --workdir "$repo" --json 2>&1)
 rc=$?
-if [ "$rc" -eq 10 ] && echo "$out" | grep -q '"pendingCount":2' && echo "$out" | grep -q '"elsewhereCount":1'; then
+if [ "$rc" -eq 10 ] && echo "$out" | grep -q '"pendingCount":3' && echo "$out" | grep -q '"elsewhereCount":1'; then
   ok "migration-status.mjs --json carries pendingCount and elsewhereCount"
 else
   bad "migration-status.mjs --json carries pendingCount and elsewhereCount" "exit $rc: $out"
@@ -366,8 +433,17 @@ out=$(node "$status_mjs" --local --workdir "$repo" --warn-only 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && ok "migration-status.mjs --warn-only exits 0 with pending rows" || bad "migration-status.mjs --warn-only exits 0 with pending rows" "exit $rc: $out"
 
+out=$(node "$status_mjs" --linked --workdir "$repo" 2>&1)
+rc=$?
+if [ "$rc" -eq 10 ] && echo "$out" | grep -q 'yarn linked:migrate' && ! echo "$out" | grep -q 'db:migrate'; then
+  ok "migration-status.mjs: a linked target gets the linked apply hint, never the local-only command"
+else
+  bad "migration-status.mjs: a linked target gets the linked apply hint, never the local-only command" "exit $rc: $out"
+fi
+
 echo 20260102000000 >> "$STUB_LEDGER"
 echo 20260103000000 >> "$STUB_LEDGER"
+echo 20260105000000 >> "$STUB_LEDGER"
 out=$(node "$status_mjs" --local --workdir "$repo" 2>&1)
 rc=$?
 if [ "$rc" -eq 0 ] && echo "$out" | grep -q 'No pending local migrations' && echo "$out" | grep -q '1 applied from another checkout'; then
@@ -376,12 +452,28 @@ else
   bad "migration-status.mjs: a remote-only row is reported but is not pending" "exit $rc: $out"
 fi
 
-# The unknown state needs the CLI itself to fail, so swap in a stub that does.
-nodedir=$(dirname "$(command -v node)")
-rm -f "$work/stubs-nopsql/supabase"
-printf '#!/bin/sh\necho "connection refused" >&2\nexit 1\n' > "$work/stubs-nopsql/supabase"
-chmod +x "$work/stubs-nopsql/supabase"
-out=$(cd "$repo" && PATH="$work/stubs-nopsql:$nodedir:$gitdir:/usr/bin:/bin" node "$status_mjs" --local --workdir "$repo" 2>&1)
+empty="$work/empty"
+mkdir -p "$empty/supabase/migrations"
+: > "$STUB_LEDGER"
+out=$(node "$status_mjs" --local --workdir "$empty" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'No pending local migrations' && ok "migration-status.mjs: a valid empty table is clean" ||
+  bad "migration-status.mjs: a valid empty table is clean" "exit $rc: $out"
+
+out=$(STUB_LIST_GARBAGE=1 node "$status_mjs" --local --workdir "$repo" 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && echo "$out" | grep -q 'Unable to determine' && ! echo "$out" | grep -q 'No pending'; then
+  ok "migration-status.mjs: output without the table header is unknown, exit 2, never clean"
+else
+  bad "migration-status.mjs: output without the table header is unknown, exit 2, never clean" "exit $rc: $out"
+fi
+
+out=$(STUB_LIST_GARBAGE=1 node "$status_mjs" --local --workdir "$repo" --warn-only 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'Unable to determine' && ok "migration-status.mjs: unknown output under --warn-only still warns, exits 0" ||
+  bad "migration-status.mjs: unknown output under --warn-only still warns, exits 0" "exit $rc: $out"
+
+out=$(STUB_LIST_FAIL=1 node "$status_mjs" --local --workdir "$repo" 2>&1)
 rc=$?
 if [ "$rc" -eq 2 ] && echo "$out" | grep -q 'Unable to determine'; then
   ok "migration-status.mjs: a failing CLI is reported as unknown, exit 2"

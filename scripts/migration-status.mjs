@@ -133,14 +133,30 @@ function resolveTarget(args) {
 // A row with a remote version and no local one was applied from a checkout
 // that has a file this one lacks, normally a branch that has not merged; it
 // is reported, but it is not ours to apply and it does not make the run red.
+//
+// The header line is the proof that this is the listing at all. Output with
+// no header (an error the CLI printed to stdout, a future format) is reported
+// as unknown, never as clean: a clean answer is only ever "the table was
+// there and no row was local-only".
 function parseMigrationTable(raw) {
+  const lines = String(raw).split(/\r?\n/);
+  const header = lines.findIndex((line) => /^\s*Local\s*\|\s*Remote\s*\|/.test(line));
+  if (header < 0) return null;
   const rows = [];
-  for (const line of String(raw).split(/\r?\n/)) {
+  for (const line of lines.slice(header + 1)) {
     const match = line.match(/^\s*(\d{14})?\s*\|\s*(\d{14})?\s*\|/);
     if (!match || (!match[1] && !match[2])) continue;
     rows.push({ local: match[1] || null, remote: match[2] || null });
   }
   return rows;
+}
+
+// The apply hint follows the target. `yarn db:migrate` only ever writes to
+// the local stack; a pending linked listing keeps the linked apply path.
+function applyHint(target) {
+  return target === 'local'
+    ? 'Run: yarn db:migrate supabase/migrations/<file> (one per pending version)'
+    : 'Run: yarn linked:migrate';
 }
 
 function printHuman(result) {
@@ -171,9 +187,7 @@ function printHuman(result) {
   for (const item of result.pending.slice(0, 10)) {
     console.log(`[migrations]   - ${item}`);
   }
-  console.log(
-    '[migrations] Run: yarn db:migrate supabase/migrations/<file> (one per pending version)'
-  );
+  console.log(`[migrations] ${applyHint(result.target)}`);
 }
 
 function main() {
@@ -213,6 +227,21 @@ function main() {
   }
 
   const rows = parseMigrationTable(raw);
+  if (rows === null) {
+    const result = {
+      target,
+      state: 'unknown',
+      reason: 'unrecognized `supabase migration list` output (no Local | Remote header)',
+      pendingCount: 0,
+      pending: [],
+      elsewhereCount: 0,
+      elsewhere: [],
+    };
+    if (args.json) console.log(JSON.stringify(result));
+    else if (!args.quiet) printHuman(result);
+    process.exit(args.warnOnly ? 0 : 2);
+    return;
+  }
   const pending = rows.filter((row) => row.local && !row.remote).map((row) => row.local);
   const elsewhere = rows.filter((row) => row.remote && !row.local).map((row) => row.remote);
   const result = {
