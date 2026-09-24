@@ -375,6 +375,8 @@ yarn local:status          # Show local migration status
 yarn linked:status         # Show linked (remote) migration status
 yarn local:migrate         # Apply local migrations
 yarn linked:migrate        # Apply linked (remote) migrations
+yarn db:migrate <file>     # Apply one migration file to the local stack, recorded under the file's version (any worktree)
+yarn db:migrate:status     # Local ledger vs the files in this checkout
 yarn test:integration:db:local   # DB integration suite against isolated local Supabase
 yarn test:integration:runtime    # Runtime/CLI integration suite
 yarn logs:ink              # View Inkwell server logs (structured JSON)

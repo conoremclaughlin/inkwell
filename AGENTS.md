@@ -532,7 +532,7 @@ The global link stays where it was. Your studio's build is for you to exercise, 
 
 ## Supabase Project ID
 
-When using MCP Supabase tools (`execute_sql`, `apply_migration`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:
+When using MCP Supabase tools (`execute_sql`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:
 
 ```
 SUPABASE_URL=https://<project_id>.supabase.co
@@ -560,9 +560,7 @@ supabase/migrations/YYYYMMDDHHmmss_short_description.sql
 
    Never use manual numeric prefixes (`001_`, `002_`). Timestamps prevent branch conflicts — two agents can create migrations independently and they merge cleanly as long as the SQL doesn't conflict.
 
-3. **Apply migrations via:**
-   - MCP tool: `mcp__supabase__apply_migration`
-   - Supabase CLI (if installed): `supabase db push` (remote) / `supabase migration up` (local)
+3. **Apply with `yarn db:migrate supabase/migrations/<file>`**, from the checkout that holds the file: any worktree, any order, before or after other branches merge. It runs the file in one transaction against the local stack and writes the ledger row under the file's own version; `yarn db:migrate:status` shows what is pending. Two things that look equivalent are not. The MCP `apply_migration` tool records the moment of application as the version, so its row never matches the file name; by 2026-09-23, 63 of 129 rows had drifted that way, one data migration had never run at all, and the `yarn dev` startup warning meant to catch both was itself broken. And `supabase migration up` / `db push` refuse to run while the ledger holds a version whose file is not in your checkout, which is the normal state whenever another branch applied first. The ledger, the from-scratch order check, and repairs are in `supabase/migrations/README.md`.
 
 4. **After applying, regenerate types:**
    - MCP tool: `mcp__supabase__generate_typescript_types`
