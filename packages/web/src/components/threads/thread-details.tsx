@@ -8,6 +8,7 @@ import {
   Hash,
   History,
   ShieldCheck,
+  User,
   Users,
   Workflow,
   X,
@@ -17,7 +18,7 @@ import { useApiQuery } from '@/lib/api';
 import { AuthorAvatar } from '@/components/conversation/author-avatar';
 import { formatRelativeTime } from '@/components/conversation/format';
 import { EvidenceNodeCard, type GraphEvidenceResponse } from './evidence';
-import { sbAuthor, type NameFor } from './to-conversation';
+import { creatorLabel, sbAuthor, type NameFor } from './to-conversation';
 import { displayTitle, isSessionLive, TypeChip } from './thread-list';
 import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
 
@@ -116,7 +117,7 @@ export function ThreadDetails({
             {spine.thread && (
               <>
                 <dt className="text-muted-foreground">Started by</dt>
-                <dd>{nameFor(spine.thread.createdBySlug)}</dd>
+                <dd>{creatorLabel(spine.thread.createdBySlug, nameFor)}</dd>
               </>
             )}
             <dt className="text-muted-foreground">Last activity</dt>
@@ -135,6 +136,23 @@ export function ThreadDetails({
                   {nameFor(slug) !== slug && (
                     <span className="text-xs text-muted-foreground">@{slug}</span>
                   )}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {(spine.thread?.people?.length ?? 0) > 0 && (
+          <section>
+            <SectionLabel icon={User} label={`People (${spine.thread!.people!.length})`} />
+            <div className="flex flex-col gap-1">
+              {spine.thread!.people!.map((person) => (
+                <div key={person.userId} className="flex items-center gap-2 text-sm">
+                  <AuthorAvatar
+                    author={{ kind: 'user', id: person.userId, name: person.name }}
+                    size="sm"
+                  />
+                  <span className="font-medium">{person.isOwn ? 'You' : person.name}</span>
                 </div>
               ))}
             </div>

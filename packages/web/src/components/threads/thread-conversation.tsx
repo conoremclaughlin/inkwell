@@ -11,7 +11,7 @@ import type { ConversationMessage } from '@/components/conversation/types';
 import type { ReadCursorStore } from './read-cursors';
 import { ReopenThreadButton } from './reopen-button';
 import { ReplyComposer } from './reply-composer';
-import { sbAuthor, toConversationMessage, type NameFor } from './to-conversation';
+import { creatorLabel, sbAuthor, toConversationMessage, type NameFor } from './to-conversation';
 import {
   displayTitle,
   liveAgentsOf,
@@ -258,7 +258,7 @@ export function ThreadConversation({
             <div className="mt-3 text-lg font-semibold tracking-tight">{title}</div>
             <p className="mt-1 max-w-prose text-sm text-muted-foreground">
               This is the start of <span className="font-mono text-[13px]">{key}</span>
-              {creator && <>, opened by {nameFor(creator)}</>}
+              {creator && <>, opened by {creatorLabel(creator, nameFor)}</>}
               {data?.thread?.createdAt && <> · {formatDayLabel(data.thread.createdAt)}</>}
             </p>
             {spine.thread?.summary && (

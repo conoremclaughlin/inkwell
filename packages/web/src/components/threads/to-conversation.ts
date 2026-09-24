@@ -4,7 +4,7 @@
  */
 
 import type { ConversationAuthor, ConversationMessage } from '@/components/conversation/types';
-import type { ThreadMessage } from './thread-types';
+import type { ThreadLastMessage, ThreadMessage } from './thread-types';
 
 /** Slug → display name ("wren" → "Wren"), falling back to the slug. */
 export type NameFor = (sbSlug: string) => string;
@@ -25,26 +25,23 @@ export function sbAuthor(sbSlug: string, nameFor: NameFor): ConversationAuthor {
 }
 
 export function authorOf(message: ThreadMessage, nameFor: NameFor): ConversationAuthor {
-  // A server that names principals (spec inkmail-thread-scope §3) has
-  // already decided who wrote it and whether that is the viewer.
-  if (message.senderKind === 'system') return SYSTEM;
-  if (message.senderKind === 'user') {
-    return message.isOwn
-      ? YOU
-      : {
-          kind: 'user',
-          id: 'user',
-          name: message.senderName || 'a workspace member',
-          isOwn: false,
-        };
+  // The server names every author and decides which person is the viewer
+  // (spec inkmail-thread-scope §3); the page only maps it.
+  switch (message.senderKind) {
+    case 'system':
+      return SYSTEM;
+    case 'user':
+      return message.isOwn
+        ? YOU
+        : {
+            kind: 'user',
+            id: message.senderUserId ?? 'user',
+            name: message.senderName || 'a workspace member',
+            isOwn: false,
+          };
+    default:
+      return sbAuthor(message.senderSlug, nameFor);
   }
-  if (message.senderKind === 'sb') return sbAuthor(message.senderSlug, nameFor);
-
-  // Until then: a person's reply is marked in metadata, and events are
-  // written by 'system' with message type 'system'.
-  if (message.metadata && (message.metadata as { sentBy?: unknown }).sentBy === 'user') return YOU;
-  if (message.messageType === 'system' || message.senderSlug === 'system') return SYSTEM;
-  return sbAuthor(message.senderSlug, nameFor);
 }
 
 export function toConversationMessage(
@@ -101,11 +98,26 @@ export function plainPreview(markdown: string): string {
 
 /** "Lumen: Round 2 — approve" for a list row. */
 export function previewLine(
-  lastMessage: { senderSlug: string; sentByUser: boolean; preview: string },
+  lastMessage: Pick<
+    ThreadLastMessage,
+    'senderKind' | 'senderSlug' | 'senderName' | 'isOwn' | 'preview'
+  >,
   nameFor: NameFor
 ): { sender: string; text: string } {
-  return {
-    sender: lastMessage.sentByUser ? 'You' : nameFor(lastMessage.senderSlug),
-    text: plainPreview(lastMessage.preview),
-  };
+  const sender = lastMessage.isOwn
+    ? 'You'
+    : lastMessage.senderKind === 'sb'
+      ? nameFor(lastMessage.senderSlug)
+      : lastMessage.senderName;
+  return { sender, text: plainPreview(lastMessage.preview) };
+}
+
+/**
+ * Who started a thread, for display. The server reports an SB by slug and
+ * a person or the system by kind alone (spec inkmail-thread-scope §3).
+ */
+export function creatorLabel(createdBySlug: string, nameFor: NameFor): string {
+  if (createdBySlug === 'user') return 'a person';
+  if (createdBySlug === 'system') return 'the system';
+  return nameFor(createdBySlug);
 }

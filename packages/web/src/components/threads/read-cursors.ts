@@ -186,11 +186,15 @@ export function useReadCursors(): ReadCursorStore {
   return store;
 }
 
-/** A thread has news for the viewer: its newest message is someone else's, after their cursor. */
+/**
+ * A thread has news for the viewer: its newest message is someone else's —
+ * an SB's or another person's — after their cursor. System events are not
+ * news, as in the conversation's own divider.
+ */
 export function hasUnread(
-  lastMessage: { createdAt: string; sentByUser: boolean } | null | undefined,
+  lastMessage: { createdAt: string; isOwn: boolean; senderKind: string } | null | undefined,
   cursor: string
 ): boolean {
-  if (!lastMessage || lastMessage.sentByUser) return false;
+  if (!lastMessage || lastMessage.isOwn || lastMessage.senderKind === 'system') return false;
   return compareInstants(lastMessage.createdAt, cursor) > 0;
 }

@@ -18,8 +18,12 @@ describe('read cursor store', () => {
   it('treats every thread as read up to the first visit, so history is not all "new"', () => {
     const store = createReadCursorStore(memoryStorage(), () => new Date(T1));
     expect(store.cursorFor('pr:1')).toBe(T1);
-    expect(hasUnread({ createdAt: T0, sentByUser: false }, store.cursorFor('pr:1'))).toBe(false);
-    expect(hasUnread({ createdAt: T2, sentByUser: false }, store.cursorFor('pr:1'))).toBe(true);
+    expect(
+      hasUnread({ createdAt: T0, isOwn: false, senderKind: 'sb' }, store.cursorFor('pr:1'))
+    ).toBe(false);
+    expect(
+      hasUnread({ createdAt: T2, isOwn: false, senderKind: 'sb' }, store.cursorFor('pr:1'))
+    ).toBe(true);
   });
 
   it('keeps its baseline across visits instead of resetting it', () => {
@@ -54,7 +58,7 @@ describe('read cursor store', () => {
     expect(store.cursorFor('pr:1')).toBe('2026-09-23T11:00:00.123900+00:00');
     expect(
       hasUnread(
-        { createdAt: '2026-09-23T11:00:00.123950+00:00', sentByUser: false },
+        { createdAt: '2026-09-23T11:00:00.123950+00:00', isOwn: false, senderKind: 'sb' },
         store.cursorFor('pr:1')
       )
     ).toBe(true);
@@ -146,8 +150,13 @@ describe('read cursor store', () => {
 });
 
 describe('hasUnread', () => {
+  it('counts another person’s message, and never a system event', () => {
+    expect(hasUnread({ createdAt: T2, isOwn: false, senderKind: 'user' }, T0)).toBe(true);
+    expect(hasUnread({ createdAt: T2, isOwn: false, senderKind: 'system' }, T0)).toBe(false);
+  });
+
   it('never counts the viewer’s own message, or a thread with no messages', () => {
-    expect(hasUnread({ createdAt: T2, sentByUser: true }, T0)).toBe(false);
+    expect(hasUnread({ createdAt: T2, isOwn: true, senderKind: 'sb' }, T0)).toBe(false);
     expect(hasUnread(null, T0)).toBe(false);
     expect(hasUnread(undefined, T0)).toBe(false);
   });

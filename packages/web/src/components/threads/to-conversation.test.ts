@@ -9,6 +9,7 @@ const names = nameLookup([
 
 const message = (over: Partial<ThreadMessage> = {}): ThreadMessage => ({
   id: 'm1',
+  senderKind: 'sb',
   senderSlug: 'wren',
   content: 'hello',
   messageType: 'message',
@@ -31,9 +32,9 @@ describe('toConversationMessage', () => {
     );
   });
 
-  it('reads a person’s reply as the viewer’s own, whatever the sender slot says', () => {
+  it('reads the viewer’s own reply as theirs', () => {
     const author = toConversationMessage(
-      message({ senderSlug: 'unknown', metadata: { sentBy: 'user' } }),
+      message({ senderKind: 'user', senderSlug: 'user', senderUserId: 'u1', isOwn: true }),
       names
     ).author;
     expect(author).toMatchObject({ kind: 'user', name: 'You', isOwn: true });
@@ -41,7 +42,12 @@ describe('toConversationMessage', () => {
 
   it('turns system events into event rows without a label', () => {
     const event = toConversationMessage(
-      message({ senderSlug: 'system', messageType: 'system', content: 'Thread closed by wren' }),
+      message({
+        senderKind: 'system',
+        senderSlug: 'system',
+        messageType: 'system',
+        content: 'Thread closed by wren',
+      }),
       names
     );
     expect(event.author.kind).toBe('system');
@@ -55,18 +61,18 @@ describe('toConversationMessage', () => {
     expect(toConversationMessage(message(), names).label).toBeUndefined();
   });
 
-  it('prefers a server that names principals over the metadata marker', () => {
-    // Another person's message, as spec inkmail-thread-scope §3 payloads say it.
-    const other = toConversationMessage(
-      message({
-        senderKind: 'user',
-        senderName: 'Sam',
-        isOwn: false,
-        metadata: { sentBy: 'user' },
-      }),
+  it('names another person as the server does, as a different author per person', () => {
+    const sam = toConversationMessage(
+      message({ senderKind: 'user', senderSlug: 'user', senderUserId: 'u2', senderName: 'Sam' }),
       names
-    );
-    expect(other.author).toMatchObject({ kind: 'user', name: 'Sam', isOwn: false });
+    ).author;
+    const kim = toConversationMessage(
+      message({ senderKind: 'user', senderSlug: 'user', senderUserId: 'u3', senderName: 'Kim' }),
+      names
+    ).author;
+    expect(sam).toMatchObject({ kind: 'user', name: 'Sam', isOwn: false });
+    // Distinct ids, so the timeline never groups two people under one header.
+    expect(sam.id).not.toBe(kim.id);
   });
 
   it('drops a priority it does not recognise instead of passing it through', () => {

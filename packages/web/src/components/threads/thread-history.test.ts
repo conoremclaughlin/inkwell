@@ -19,6 +19,7 @@ const PAGE = 100;
 const at = (i: number) => new Date(Date.UTC(2026, 8, 22, 0, 0, i)).toISOString();
 const message = (i: number): ThreadMessage => ({
   id: `m${String(i).padStart(4, '0')}`,
+  senderKind: 'sb',
   senderSlug: 'wren',
   content: `Message ${i}`,
   messageType: 'message',

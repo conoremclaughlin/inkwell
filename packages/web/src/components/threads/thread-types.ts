@@ -44,12 +44,25 @@ export interface SpineGroup {
 
 export interface ThreadLastMessage {
   id: string;
+  /** The author's principal kind (spec inkmail-thread-scope §3). */
+  senderKind: 'sb' | 'user' | 'system';
+  /** The SB's slug; for a person or the system, the kind. */
   senderSlug: string;
-  sentByUser: boolean;
+  /** Named for this viewer on the server: SB slug, person's name, or 'system'. */
+  senderName: string;
+  /** The viewer wrote it. */
+  isOwn: boolean;
   messageType: string;
   /** One line, capped on the server. */
   preview: string;
   createdAt: string;
+}
+
+/** A person on a thread, named for the viewer. */
+export interface ThreadPerson {
+  userId: string;
+  name: string;
+  isOwn: boolean;
 }
 
 export interface ThreadSpine {
@@ -61,6 +74,8 @@ export interface ThreadSpine {
     status: string;
     createdBySlug: string;
     participants: string[];
+    /** People on the thread, named for the viewer — never woken, never in `participants`. */
+    people?: ThreadPerson[];
     closedAt: string | null;
     /** Newest deliverable message; absent from servers that predate it. */
     lastMessage?: ThreadLastMessage | null;
@@ -102,22 +117,21 @@ export interface StudioHistoryItem {
 
 export interface ThreadMessage {
   id: string;
+  /** The author is a principal (spec inkmail-thread-scope §3). */
+  senderKind: 'sb' | 'user' | 'system';
+  /** The SB's slug; for a person or the system, the kind. */
   senderSlug: string;
+  senderSbId?: string | null;
+  senderUserId?: string | null;
+  /** Named on the server for this viewer: SB slug, person's name, or 'system'. */
+  senderName?: string;
+  /** The viewer's own message — decided on the server against the Inkwell user. */
+  isOwn?: boolean;
   content: string;
   messageType: string;
   priority: string;
-  /**
-   * A person's reply carries { sentBy: 'user' } here while its sender slot
-   * says 'unknown' (see POST /threads/reply). Until the principal columns
-   * of spec inkmail-thread-scope §3 land, this marker is how the page tells
-   * a person from a genuinely unattributed sender.
-   */
   metadata?: Record<string, unknown> | null;
   createdAt: string;
-  /** Principal fields from spec inkmail-thread-scope §3, once the server sends them. */
-  senderKind?: 'sb' | 'user' | 'system';
-  senderName?: string;
-  isOwn?: boolean;
 }
 
 export interface ThreadMessagesResponse {
@@ -127,10 +141,13 @@ export interface ThreadMessagesResponse {
     title: string | null;
     status: string;
     createdBySlug: string;
+    createdByKind?: 'sb' | 'user' | 'system';
     createdAt: string;
     closedAt: string | null;
   } | null;
   messages: ThreadMessage[];
+  /** The Inkwell user this response was rendered for. */
+  viewerUserId?: string;
   /** `truncated`: there are older messages than this page. */
   meta?: FeedMeta;
 }

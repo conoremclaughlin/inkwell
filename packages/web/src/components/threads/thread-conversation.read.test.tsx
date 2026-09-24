@@ -37,6 +37,7 @@ function page(lo: number, hi: number): ThreadMessagesResponse {
     thread: null,
     messages: Array.from({ length: hi - lo + 1 }, (_, j) => ({
       id: `m${lo + j}`,
+      senderKind: 'sb' as const,
       senderSlug: 'wren',
       content: `Message ${lo + j}`,
       messageType: 'message',

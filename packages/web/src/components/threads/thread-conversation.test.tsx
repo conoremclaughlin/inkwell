@@ -70,6 +70,7 @@ function pageOf(from: number, to: number): ThreadMessagesResponse {
     thread: null,
     messages: Array.from({ length: Math.max(0, to - start + 1) }, (_, j) => ({
       id: `m${start + j}`,
+      senderKind: 'sb' as const,
       senderSlug: 'wren',
       content: `Message ${start + j}`,
       createdAt: at(start + j),
