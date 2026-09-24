@@ -27,16 +27,36 @@ fi
 case "$admin" in
   *54322*) echo "db-migrate.integration.test: refusing: that looks like the shared local stack's port" >&2; exit 2 ;;
 esac
+# Only a URL form is accepted, and its database is replaced outright: the
+# path becomes the disposable database and any query string is dropped, so a
+# ?dbname= or ?options= on the admin URL cannot redirect the run elsewhere.
+case "$admin" in
+  postgresql://*/* | postgres://*/*) ;;
+  *) echo "db-migrate.integration.test: DB_MIGRATE_TEST_ADMIN_URL must be a postgresql://user:pw@host:port/db URL" >&2; exit 2 ;;
+esac
+case "$admin" in
+  *dbname=*) echo "db-migrate.integration.test: refusing a dbname= parameter on the admin URL" >&2; exit 2 ;;
+esac
 command -v psql >/dev/null 2>&1 || { echo "psql is required" >&2; exit 2; }
+# libpq reads the environment too. Nothing inherited may redirect a connection
+# or add options: every connection here is exactly the URL it is given.
+unset PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE PGSERVICE PGSERVICEFILE \
+  PGOPTIONS PGAPPNAME PGSSLMODE PGREQUIRESSL PGSSLKEY PGSSLCERT PGSSLROOTCERT PGCONNECT_TIMEOUT \
+  PGTARGETSESSIONATTRS PGCLIENTENCODING PGDATESTYLE PGTZ PGGEQO PGSYSCONFDIR PGLOCALEDIR 2>/dev/null
 
 root=$(cd "$(dirname "$0")/.." && pwd) || exit 1
 script="$root/scripts/db-migrate.sh"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/db-migrate-itest.XXXXXX") || exit 1
 work=$(cd "$work" && pwd -P) || exit 1
-dbname="db_migrate_test_$$"
+# pid, wall clock and random bytes: a recycled pid or another host cannot
+# collide with it, and a collision would only fail the CREATE anyway.
+dbname="db_migrate_test_$$_$(date +%s)_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+created=0
 cleanup() {
-  psql "$admin" -X -q -c "DROP DATABASE IF EXISTS \"$dbname\" WITH (FORCE)" >/dev/null 2>&1
+  # Only a database this run created is dropped. A failed CREATE (a name
+  # collision, say) must never lead to dropping what was already there.
+  [ "$created" -eq 1 ] && psql "$admin" -X -q -c "DROP DATABASE IF EXISTS \"$dbname\" WITH (FORCE)" >/dev/null 2>&1
   rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
@@ -50,8 +70,20 @@ psql "$admin" -X -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$dbname\"" >/dev/nu
   echo "could not create the disposable database" >&2
   exit 1
 }
-# The disposable database's URL: the admin URL with its database path swapped.
-url=$(printf '%s' "$admin" | sed -E "s#/[^/?]*(\\?.*)?\$#/$dbname\\1#")
+created=1
+# The disposable database's URL: scheme, userinfo, host and port from the
+# admin URL; the path is the new database; the query string is gone.
+base=$(printf '%s' "$admin" | sed -E 's#^([a-z]+://[^/]*)/.*$#\1#')
+url="$base/$dbname"
+# Before any DDL, the connection must report the database this run owns.
+actual=$(psql "$url" -X -q -t -A -v ON_ERROR_STOP=1 -c "SELECT current_database()") || {
+  echo "could not connect to the disposable database" >&2
+  exit 1
+}
+[ "$actual" = "$dbname" ] || {
+  echo "refusing: the connection reports database '$actual', not the one this run created" >&2
+  exit 1
+}
 psql "$url" -X -q -v ON_ERROR_STOP=1 -c "CREATE SCHEMA supabase_migrations; CREATE TABLE supabase_migrations.schema_migrations (version text PRIMARY KEY, statements text[], name text);" >/dev/null || {
   echo "could not build the ledger table" >&2
   exit 1
@@ -121,9 +153,10 @@ pw=$(printf '%s' "$admin" | sed -nE 's#^[a-z]+://[^:/@]*:([^@]*)@.*$#\1#p')
 if [ -n "$pw" ]; then
   out=$(cd "$repo" && DB_MIGRATE_URL="$(printf '%s' "$url" | sed 's#/db_migrate_test#/nope_db_migrate_test#')" sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
   rc=$?
-  [ "$rc" -eq 2 ] && ! echo "$out" | grep -qF "$pw" && echo "$out" | grep -q '\*\*\*@' &&
-    ok "a failed ledger read names the endpoint with its password replaced" ||
-    bad "a failed ledger read names the endpoint with its password replaced" "exit $rc: $out"
+  hostport=$(printf '%s' "$admin" | sed -nE 's#^[a-z]+://[^@]*@([^/]*)/.*$#\1#p')
+  [ "$rc" -eq 2 ] && ! echo "$out" | grep -qF "$pw" && ! echo "$out" | grep -qF "$hostport" &&
+    ok "a failed ledger read prints neither the password nor the endpoint" ||
+    bad "a failed ledger read prints neither the password nor the endpoint" "exit $rc: $out"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

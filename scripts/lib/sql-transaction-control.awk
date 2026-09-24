@@ -12,6 +12,10 @@
 # of each statement. Anything inside a function body is invisible to it,
 # which is the point: the body's BEGIN and END are not ours.
 #
+# A dollar quote needs a token boundary before it: PostgreSQL lexes foo$tag$
+# as one identifier (identifiers may contain $ after their first character),
+# so a $ that follows an identifier character never opens a quote here.
+#
 # Refused at the top level: BEGIN, START TRANSACTION, COMMIT, END, ROLLBACK,
 # ABORT, SAVEPOINT, RELEASE, PREPARE TRANSACTION, any spelling (COMMIT WORK,
 # ROLLBACK TO SAVEPOINT x, COMMIT AND CHAIN, ...); any psql meta-command
@@ -66,7 +70,7 @@ END {
         mode = "sq"; stmt = stmt " "; continue
       }
       if (c == "\"") { mode = "dq"; stmt = stmt " "; continue }
-      if (c == "$") {
+      if (c == "$" && (i == 1 || substr(src, i - 1, 1) !~ /[A-Za-z0-9_$]/)) {
         if (match(substr(src, i), /^\$[A-Za-z_][A-Za-z0-9_]*\$/) || match(substr(src, i), /^\$\$/)) {
           tag = substr(src, i, RLENGTH)
           mode = "dollar"; i += RLENGTH - 1; stmt = stmt " "; continue

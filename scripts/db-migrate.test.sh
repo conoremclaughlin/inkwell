@@ -36,7 +36,9 @@
 #   - transaction control is judged SQL-aware: every spelling at the top
 #     level is refused, and comments, strings and dollar-quoted bodies are
 #     not; psql meta-commands and BEGIN ATOMIC are refused
-#   - no message ever prints the connection string's password
+#   - no message ever prints the connection string, in any of its forms
+#   - the integration harness's own refusals: a failed CREATE DATABASE issues
+#     no DROP, and a connection that reports another database stops before DDL
 #
 # Usage:  sh scripts/db-migrate.test.sh
 #
@@ -48,6 +50,7 @@ set -u
 root=$(cd "$(dirname "$0")/.." && pwd) || exit 1
 script="${SCRIPT_UNDER_TEST:-$root/scripts/db-migrate.sh}"
 status_mjs="${STATUS_UNDER_TEST:-$root/scripts/migration-status.mjs}"
+itest="$root/scripts/db-migrate.integration.test.sh"
 guard="$root/scripts/lib/sql-transaction-control.awk"
 
 git_isolate() {
@@ -91,7 +94,7 @@ bad() {
 # Only what the scripts and this suite call. Resolved from the host once,
 # here, so nothing else on the host PATH is reachable during the checks.
 mkdir -p "$work/tools"
-for tool in sh git node awk sed grep basename dirname cat mktemp head rm sort cut tr wc cp mkdir chmod ln; do
+for tool in sh git node awk sed grep basename dirname cat mktemp head rm sort cut tr wc cp mkdir chmod ln date od; do
   bin=$(command -v "$tool") || {
     echo "cannot find $tool on the host PATH" >&2
     exit 1
@@ -176,6 +179,18 @@ for a in "$@"; do
   prev=$a
 done
 case "$query" in
+  *"CREATE DATABASE"*)
+    [ -n "${STUB_CREATE_FAIL:-}" ] && {
+      echo "ERROR: database already exists" >&2
+      exit 1
+    }
+    exit 0
+    ;;
+  *"DROP DATABASE"*) exit 0 ;;
+  *"SELECT current_database()"*)
+    if [ -n "${STUB_CURRENT_DB:-}" ]; then echo "$STUB_CURRENT_DB"; else printf '%s\n' "$1" | sed -E 's#^.*/([^/?]*)(\?.*)?$#\1#'; fi
+    exit 0
+    ;;
   *"SELECT count(*) FROM supabase_migrations.schema_migrations WHERE version = '"*)
     [ -n "${STUB_PRECHECK_RC:-}" ] && {
       echo "connection refused" >&2
@@ -303,8 +318,11 @@ printf 'SELECT 1;\n\\connect other\nSELECT 2;\n' > "$tcm/20260207000000_meta.sql
 printf 'CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;\n' > "$tcm/20260208000000_atomic.sql"
 printf 'COMMIT AND CHAIN;\n' > "$tcm/20260209000000_chain.sql"
 printf 'SELECT 1 \\gset\n' > "$tcm/20260210000000_gset.sql"
+printf 'SELECT 1 AS foo$tag$; COMMIT; SELECT 1 AS foo$tag$;\n' > "$tcm/20260218000000_ident_dollar_bypass.sql"
+printf 'SELECT 1 AS foo$$; COMMIT; SELECT 1 AS bar$$;\n' > "$tcm/20260219000000_ident_dollardollar_bypass.sql"
 for f in 20260201000000_commit_work 20260202000000_two_on_a_line 20260203000000_end 20260204000000_rollback_work \
-  20260205000000_start 20260206000000_savepoint 20260207000000_meta 20260208000000_atomic 20260209000000_chain 20260210000000_gset; do
+  20260205000000_start 20260206000000_savepoint 20260207000000_meta 20260208000000_atomic 20260209000000_chain 20260210000000_gset \
+  20260218000000_ident_dollar_bypass 20260219000000_ident_dollardollar_bypass; do
   reset_log
   out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
   rc=$?
@@ -321,8 +339,10 @@ printf 'CREATE OR REPLACE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGI
 printf 'CREATE OR REPLACE FUNCTION g() RETURNS int LANGUAGE plpgsql AS $fn$\nDECLARE x int;\nBEGIN\n  x := 1;\n  RETURN x;\nEND;\n$fn$;\nSELECT g();\n' > "$tcm/20260215000000_tagged_body.sql"
 printf 'SELECT CASE WHEN true THEN 1 END;\n' > "$tcm/20260216000000_case_end.sql"
 printf "DO \$\$ BEGIN RAISE NOTICE 'it''s fine'; END \$\$;\n" > "$tcm/20260217000000_do_block.sql"
+printf 'SELECT 1 AS foo$tag$;\nSELECT 2 AS x$$;\n' > "$tcm/20260220000000_ident_with_dollar.sql"
+printf 'SELECT $$COMMIT;$$;\nSELECT 1;\n' > "$tcm/20260221000000_dollar_string_at_boundary.sql"
 for f in 20260211000000_block_comment 20260212000000_line_comment 20260213000000_quoted 20260214000000_dollar_body \
-  20260215000000_tagged_body 20260216000000_case_end 20260217000000_do_block; do
+  20260215000000_tagged_body 20260216000000_case_end 20260217000000_do_block 20260220000000_ident_with_dollar 20260221000000_dollar_string_at_boundary; do
   reset_log
   out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
   rc=$?
@@ -368,11 +388,27 @@ if [ "$rc" -eq 2 ] && [ "$(apply_calls)" -eq 0 ] && [ "$(calls | grep -c '^psql'
 else
   bad "a recorded-count read that fails is a refusal: one psql call, no apply, no row" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
 fi
-if ! echo "$out" | grep -q 's3cretpw' && echo "$out" | grep -q 'stub:\*\*\*@127.0.0.1' && calls | grep -q 's3cretpw'; then
-  ok "the failure names the endpoint with the password replaced, while psql received the real one"
+if ! echo "$out" | grep -q 's3cretpw' && ! echo "$out" | grep -q '127.0.0.1:1' && calls | grep -q 's3cretpw'; then
+  ok "the failure never prints the endpoint, while psql received the real one"
 else
-  bad "the failure names the endpoint with the password replaced, while psql received the real one" "$out"
+  bad "the failure never prints the endpoint, while psql received the real one" "$out"
 fi
+
+reset_log
+out=$(cd "$repo" && DB_MIGRATE_URL='postgresql://stub@127.0.0.1:1/stub?password=qsSECRET' STUB_PRECHECK_RC=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! echo "$out" | grep -q 'qsSECRET' && calls | grep -q 'qsSECRET' && ! calls | grep -q '^supabase status'; then
+  ok "DB_MIGRATE_URL with a ?password= parameter: used by psql, never printed, and supabase status is not asked"
+else
+  bad "DB_MIGRATE_URL with a ?password= parameter: used by psql, never printed, and supabase status is not asked" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+reset_log
+out=$(cd "$repo" && DB_MIGRATE_URL='host=127.0.0.1 port=1 dbname=stub user=stub password=kvSECRET' STUB_PRECHECK_RC=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ! echo "$out" | grep -q 'kvSECRET' && calls | grep -q 'kvSECRET' &&
+  ok "DB_MIGRATE_URL in keyword/value form: used by psql, never printed" ||
+  bad "DB_MIGRATE_URL in keyword/value form: used by psql, never printed" "exit $rc: $out"
 
 # --- the happy path ---------------------------------------------------------
 
@@ -487,8 +523,8 @@ fi
 reset_log
 out=$(cd "$repo" && STUB_LIST_FAIL=1 sh "$script" status 2>&1)
 rc=$?
-[ "$rc" -eq 2 ] && echo "$out" | grep -q 'migration list failed' && ! echo "$out" | grep -q 's3cretpw' && echo "$out" | grep -q '\*\*\*@' &&
-  ok "status refuses when the listing fails, without printing the password" || bad "status refuses when the listing fails, without printing the password" "exit $rc: $out"
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'migration list failed' && ! echo "$out" | grep -q 's3cretpw' && ! echo "$out" | grep -q '127.0.0.1:1' &&
+  ok "status refuses when the listing fails, without printing the endpoint" || bad "status refuses when the listing fails, without printing the endpoint" "exit $rc: $out"
 
 # --- migration-status.mjs reads the same table ------------------------------
 
@@ -568,6 +604,41 @@ if [ "$rc" -eq 2 ] && echo "$out" | grep -q 'Unable to determine'; then
 else
   bad "migration-status.mjs: a failing CLI is reported as unknown, exit 2" "exit $rc: $out"
 fi
+
+# --- the integration harness's own refusals (stubs; no database) ------------
+
+reset_log
+out=$(STUB_CREATE_FAIL=1 DB_MIGRATE_TEST_ADMIN_URL='postgresql://stub:pw@127.0.0.1:1/postgres' sh "$itest" 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ] && ! calls | grep -q 'DROP DATABASE' && calls | grep -q 'CREATE DATABASE'; then
+  ok "integration harness: a failed CREATE DATABASE issues no DROP"
+else
+  bad "integration harness: a failed CREATE DATABASE issues no DROP" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+reset_log
+out=$(STUB_CURRENT_DB=fixture_existing DB_MIGRATE_TEST_ADMIN_URL='postgresql://stub:pw@127.0.0.1:1/postgres' sh "$itest" 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q 'fixture_existing' && ! calls | grep -q 'CREATE SCHEMA' && calls | grep -q 'DROP DATABASE'; then
+  ok "integration harness: a connection reporting another database stops before DDL, and drops only what it created"
+else
+  bad "integration harness: a connection reporting another database stops before DDL, and drops only what it created" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+out=$(DB_MIGRATE_TEST_ADMIN_URL='postgresql://stub:pw@127.0.0.1:1/postgres?dbname=elsewhere' sh "$itest" 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'dbname=' && ok "integration harness: a dbname= override on the admin URL is refused" ||
+  bad "integration harness: a dbname= override on the admin URL is refused" "exit $rc: $out"
+
+out=$(DB_MIGRATE_TEST_ADMIN_URL='host=127.0.0.1 port=1 user=stub password=pw' sh "$itest" 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ok "integration harness: a keyword/value admin string is refused (only a URL is parsed)" ||
+  bad "integration harness: a keyword/value admin string is refused (only a URL is parsed)" "exit $rc: $out"
+
+out=$(DB_MIGRATE_TEST_ADMIN_URL='postgresql://stub:pw@127.0.0.1:54322/postgres' sh "$itest" 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'shared local stack' && ok "integration harness: the shared stack's port is refused" ||
+  bad "integration harness: the shared stack's port is refused" "exit $rc: $out"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

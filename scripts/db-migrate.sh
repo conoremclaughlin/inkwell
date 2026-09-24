@@ -37,8 +37,9 @@
 #
 # DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
 # exists for the integration test (a disposable database) and for a stack
-# the CLI cannot describe. The connection string is never printed; messages
-# show it with the password replaced.
+# the CLI cannot describe. The connection string is never printed, in any
+# part: a password can sit in the userinfo, in a ?password= parameter, or in
+# keyword/value form, so no message names the endpoint at all.
 #
 # Exit codes: 0 applied and recorded (or already recorded); 1 the transaction
 # failed and rolled back; 2 usage or environment, before anything ran.
@@ -76,11 +77,6 @@ need_cli() {
     die "Supabase CLI not found on PATH (https://supabase.com/docs/guides/cli/getting-started)"
 }
 
-# The connection string with its password replaced, for every message.
-redact() {
-  printf '%s' "$1" | sed -E 's#(://[^/@:]*):[^@]*@#\1:***@#'
-}
-
 # Paths are compared physically (pwd -P): git reports the real path of the
 # work tree, and on macOS a temp directory has two spellings.
 
@@ -99,7 +95,6 @@ if [ -z "$url" ]; then
   [ -n "$url" ] ||
     die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
 fi
-shown=$(redact "$url")
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/db-migrate.XXXXXX") || die "could not create a temp directory"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
@@ -140,7 +135,7 @@ apply_one() {
     *) die "could not scan $base for transaction control: $findings" ;;
   esac
 
-  count=$(recorded_count "$version") || die "could not read the ledger over $shown (refusing to apply without it)"
+  count=$(recorded_count "$version") || die "could not read the ledger (refusing to apply without it; the endpoint is not shown because it can carry a password)"
   case "$count" in
     0) ;;
     [1-9]*)
@@ -186,7 +181,7 @@ case "$mode" in
     # The CLI prints a table: local version | remote version | time. Bound to
     # the same endpoint as apply; the files come from this checkout.
     table=$(supabase migration list --db-url "$url" --workdir "$checkout" 2>/dev/null) ||
-      die "supabase migration list failed over $shown"
+      die "supabase migration list failed (the endpoint is not shown because it can carry a password)"
     printf '%s\n' "$table"
     printf '%s\n' "$table" | awk -F'|' '
       NF >= 2 {

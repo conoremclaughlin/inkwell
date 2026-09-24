@@ -55,8 +55,9 @@ are already applied and do not go through the wrapper.
 which builds a disposable database on a throwaway Postgres and proves the
 contract for real: one transaction, one effect under concurrency, nothing left
 behind by a failure. That test is opt-in and must never be pointed at the
-shared stack; the file's header shows the `docker run` it expects. Messages
-never print the connection string; the password is shown as `***`.
+shared stack; the file's header shows the `docker run` it expects. No message
+ever names the endpoint: a password can sit in the userinfo, in a `?password=`
+parameter, or in keyword/value form, so the connection string is never printed.
 
 If the stack is not running, start it from the root checkout with
 `supabase start`. Do not reach for `yarn supabase:local:setup` for that: it
