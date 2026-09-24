@@ -27,6 +27,12 @@
  *   boundary. Accepted residual: an idle holder with an open terminal keeps
  *   its pendingRelease deferred (bounded delay: next stop, or staleness
  *   after the terminal closes) — delayed, never premature.
+ *   ONE deliberate exception (PR #673, task e7752d29): close_studio from the
+ *   HOLDER'S OWN session releases at once. The caller session is the request
+ *   context's session, loaded and authorized as the calling identity's own
+ *   by the handler — an authorization check, not cryptographic process
+ *   proof — and the deferral above protects a holder that did not ask;
+ *   this one did. Every other requester still waits for the boundary.
  *
  * Safety invariants (PR #492 review rounds 1–3, Lumen):
  *   - Every read and CAS is scoped to the owning user.
