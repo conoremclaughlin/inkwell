@@ -62,6 +62,33 @@ function parse(raw: string | null): Stored | null {
   }
 }
 
+const has = (record: Record<string, string>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(record, key);
+
+/**
+ * Two copies of the cursors — this tab's and storage's — combined so neither
+ * can move one backwards: per thread the later cursor, and the later baseline.
+ *
+ * Storage alone is not the truth. When a write fails (a full quota lets
+ * getItem succeed while setItem throws) this tab's progress exists only in
+ * memory, and taking storage's copy over it would silently un-read threads
+ * (Lumen, #670 review).
+ */
+function mergeStored(local: Stored, persisted: Stored | null): Stored {
+  if (!persisted) return local;
+  const cursors = Object.create(null) as Record<string, string>;
+  for (const source of [local.cursors, persisted.cursors]) {
+    for (const [key, at] of Object.entries(source)) {
+      if (!has(cursors, key) || Date.parse(at) > Date.parse(cursors[key])) cursors[key] = at;
+    }
+  }
+  const baselineAt =
+    Date.parse(persisted.baselineAt) > Date.parse(local.baselineAt)
+      ? persisted.baselineAt
+      : local.baselineAt;
+  return { baselineAt, cursors };
+}
+
 export function createReadCursorStore(
   storage: StorageLike | null,
   now: () => Date = () => new Date()
@@ -96,9 +123,7 @@ export function createReadCursorStore(
   };
 
   const cursorFor = (threadKey: string): string =>
-    Object.prototype.hasOwnProperty.call(state.cursors, threadKey)
-      ? state.cursors[threadKey]
-      : state.baselineAt;
+    has(state.cursors, threadKey) ? state.cursors[threadKey] : state.baselineAt;
 
   return {
     cursorFor,
@@ -106,7 +131,7 @@ export function createReadCursorStore(
       const through = Date.parse(throughIso);
       if (Number.isNaN(through)) return;
       // Another tab may have moved it further since this one last looked.
-      state = read() ?? state;
+      state = mergeStored(state, read());
       if (through <= Date.parse(cursorFor(threadKey))) return;
       const cursors = { ...state.cursors, [threadKey]: throughIso };
       const keys = Object.keys(cursors);
@@ -121,11 +146,8 @@ export function createReadCursorStore(
       notify();
     },
     reload: () => {
-      const fresh = read();
-      if (fresh) {
-        state = fresh;
-        notify();
-      }
+      state = mergeStored(state, read());
+      notify();
     },
     subscribe: (listener) => {
       listeners.add(listener);

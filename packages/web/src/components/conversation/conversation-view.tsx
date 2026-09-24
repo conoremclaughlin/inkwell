@@ -32,6 +32,11 @@ export interface ConversationViewProps {
    * reader would pull the divider out from under them.
    */
   unreadAfter?: string | null;
+  /**
+   * Not ready to show: the view renders a skeleton and holds its opening
+   * position until this clears, so it positions exactly once, on the
+   * messages it was meant to open on.
+   */
   loading?: boolean;
   /** There is history before the first message. */
   hasOlder?: boolean;
@@ -110,7 +115,7 @@ export function ConversationView({
   // themselves runs before paint, so the reader never sees a jump.
   useLayoutEffect(() => {
     const el = scrollerRef.current;
-    if (!el || !first || !last) return;
+    if (!el || !first || !last || loading) return;
 
     if (!positioned.current) {
       positioned.current = true;
@@ -143,7 +148,7 @@ export function ConversationView({
     }
     seen.current = { firstId: first.id, lastId: last.id, height: el.scrollHeight };
     measure();
-  }, [first, last, ordered, measure, scrollToEnd]);
+  }, [first, last, ordered, loading, measure, scrollToEnd]);
 
   // Growth that is not a new message — an image loading, a code block
   // laying out, a streaming body getting longer — keeps a pinned view pinned.
@@ -192,7 +197,7 @@ export function ConversationView({
         aria-relevant="additions"
       >
         <div ref={contentRef} className="flex min-h-full flex-col justify-end pb-4">
-          {loading && ordered.length === 0 ? (
+          {loading ? (
             <ConversationSkeleton />
           ) : ordered.length === 0 ? (
             <div className="flex flex-1 items-center justify-center p-8">{empty}</div>
@@ -253,7 +258,7 @@ export function ConversationView({
         </div>
       </div>
 
-      {!atBottom && ordered.length > 0 && (
+      {!atBottom && !loading && ordered.length > 0 && (
         <button
           type="button"
           onClick={() => scrollToEnd('smooth')}

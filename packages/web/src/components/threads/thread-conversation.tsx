@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronLeft, Info, MessageSquareDashed } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { apiGet, useApiQuery } from '@/lib/api';
@@ -19,10 +19,20 @@ import {
   spineStatus,
   TypeChip,
 } from './thread-list';
-import type { ThreadMessage, ThreadMessagesResponse, ThreadSpine } from './thread-types';
+import {
+  absorbNewest,
+  absorbOlder,
+  dropGap,
+  EMPTY_HISTORY,
+  type ThreadHistory,
+} from './thread-history';
+import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
 
 /** How often an open conversation looks for new messages while the tab is visible. */
 const POLL_MS = 5_000;
+
+const pagePath = (key: string, beforeId?: string) =>
+  `/api/admin/threads/messages?key=${encodeURIComponent(key)}${beforeId ? `&before=${beforeId}` : ''}`;
 
 /**
  * One thread as a conversation: header, timeline, composer. Mount it keyed
@@ -49,49 +59,72 @@ export function ThreadConversation({
 
   const { data, isLoading } = useApiQuery<ThreadMessagesResponse>(
     ['thread-messages', key],
-    `/api/admin/threads/messages?key=${encodeURIComponent(key)}`,
+    pagePath(key),
     { refetchInterval: hasThread ? POLL_MS : false }
   );
 
   // Where the reader was when they opened the thread. Held for the whole
-  // visit so the divider stays put while they read past it.
+  // visit so the divider stays put while they read past it; a send clears it.
   const [unreadAfter, setUnreadAfter] = useState<string | null>(() => cursors.cursorFor(key));
+  // The same cursor, kept for the history to catch up to on open whatever
+  // happens to the divider meanwhile.
+  const [openingCursor] = useState(() => cursors.cursorFor(key));
 
-  const [older, setOlder] = useState<ThreadMessage[]>([]);
-  const [olderHasMore, setOlderHasMore] = useState<boolean | null>(null);
+  // Every newest page is merged into the history in the render it arrives,
+  // so no poll ever shows the conversation without rows it had a moment ago.
+  const [history, setHistory] = useState<ThreadHistory>(EMPTY_HISTORY);
+  const [absorbed, setAbsorbed] = useState<ThreadMessagesResponse | undefined>(undefined);
+  if (data && data !== absorbed) {
+    setAbsorbed(data);
+    setHistory((current) => absorbNewest(current, data, openingCursor));
+  }
+
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
 
-  const merged = useMemo(() => {
-    const byId = new Map<string, ThreadMessage>();
-    for (const message of [...older, ...(data?.messages ?? [])]) byId.set(message.id, message);
-    return [...byId.values()];
-  }, [older, data]);
+  // Work the history's gaps one at a time: the catch-up to the read cursor
+  // on open, and any stretch a poll skipped.
+  const gap = history.gaps[0] ?? null;
+  useEffect(() => {
+    if (!gap) return;
+    let cancelled = false;
+    apiGet<ThreadMessagesResponse>(pagePath(key, gap.beforeId))
+      .then((page) => {
+        if (!cancelled) setHistory((current) => absorbOlder(current, page, gap));
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setOlderError(error instanceof Error ? error.message : 'Failed to load messages');
+        setHistory((current) => dropGap(current, gap));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [gap, key]);
 
   const messages = useMemo<ConversationMessage[]>(
-    () => merged.map((m) => toConversationMessage(m, nameFor)),
-    [merged, nameFor]
+    () => history.messages.map((m) => toConversationMessage(m, nameFor)),
+    [history.messages, nameFor]
   );
 
-  const hasOlder = olderHasMore ?? data?.meta?.truncated ?? false;
-
   const loadOlder = useCallback(async () => {
-    if (loadingOlder || messages.length === 0) return;
-    const oldest = [...merged].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))[0];
+    const oldest = history.messages[0];
+    if (loadingOlder || !oldest) return;
     setLoadingOlder(true);
     setOlderError(null);
     try {
-      const page = await apiGet<ThreadMessagesResponse>(
-        `/api/admin/threads/messages?key=${encodeURIComponent(key)}&before=${oldest.id}`
-      );
-      setOlder((current) => [...page.messages, ...current]);
-      setOlderHasMore(page.meta?.truncated ?? false);
+      const page = await apiGet<ThreadMessagesResponse>(pagePath(key, oldest.id));
+      setHistory((current) => absorbOlder(current, page, null));
     } catch (error) {
       setOlderError(error instanceof Error ? error.message : 'Failed to load earlier messages');
     } finally {
       setLoadingOlder(false);
     }
-  }, [loadingOlder, messages.length, merged, key]);
+  }, [loadingOlder, history.messages, key]);
+
+  // Not ready to show until the history reaches the read cursor: the view
+  // positions once, on the real first unread message.
+  const opening = history.started ? !history.ready : isLoading;
 
   const onReadThrough = useCallback(
     (message: ConversationMessage) => cursors.advance(key, message.createdAt),
@@ -178,8 +211,8 @@ export function ThreadConversation({
         key={key}
         messages={messages}
         unreadAfter={unreadAfter}
-        loading={isLoading}
-        hasOlder={hasOlder}
+        loading={opening}
+        hasOlder={history.started && !history.oldestReached}
         loadingOlder={loadingOlder}
         onLoadOlder={() => void loadOlder()}
         onReadThrough={onReadThrough}

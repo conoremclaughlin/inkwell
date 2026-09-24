@@ -74,6 +74,57 @@ describe('read cursor store', () => {
     expect(store.cursorFor('pr:1')).toBe(T1);
   });
 
+  /**
+   * A full quota lets getItem succeed while setItem throws, so storage holds
+   * a stale copy and this tab's progress lives only in memory. Taking the
+   * stale copy on the next read un-reads threads (Lumen, #670 review). The
+   * all-throwing test above cannot see this: its reads fail too.
+   */
+  describe('when storage reads but will not write', () => {
+    const readOnly = () => {
+      const saved = JSON.stringify({ baselineAt: T0, cursors: {} });
+      return {
+        getItem: () => saved,
+        setItem: () => {
+          throw new Error('QuotaExceededError');
+        },
+      };
+    };
+
+    it('keeps one thread’s progress when another thread advances', () => {
+      const store = createReadCursorStore(readOnly());
+      store.advance('pr:a', T1);
+      store.advance('pr:b', T2);
+      expect(store.cursorFor('pr:a')).toBe(T1);
+      expect(store.cursorFor('pr:b')).toBe(T2);
+    });
+
+    it('does not move a thread back when it is advanced to an older point', () => {
+      const store = createReadCursorStore(readOnly());
+      store.advance('pr:a', T2);
+      store.advance('pr:a', T1);
+      expect(store.cursorFor('pr:a')).toBe(T2);
+    });
+
+    it('keeps unsaved progress through a reload from another tab', () => {
+      const store = createReadCursorStore(readOnly());
+      store.advance('pr:a', T2);
+      store.reload();
+      expect(store.cursorFor('pr:a')).toBe(T2);
+    });
+  });
+
+  it('takes another tab’s newer cursor on reload without losing its own', () => {
+    const storage = memoryStorage();
+    const tabA = createReadCursorStore(storage, () => new Date(T0));
+    const tabB = createReadCursorStore(storage, () => new Date(T0));
+    tabA.advance('pr:1', T1);
+    tabB.advance('pr:2', T2);
+    tabA.reload();
+    expect(tabA.cursorFor('pr:1')).toBe(T1);
+    expect(tabA.cursorFor('pr:2')).toBe(T2);
+  });
+
   it('reads a thread key named like an Object prototype member as a thread, not a builtin', () => {
     const store = createReadCursorStore(memoryStorage(), () => new Date(T0));
     expect(store.cursorFor('constructor')).toBe(T0);
