@@ -1439,6 +1439,74 @@ describe('StudioLeaseService release paths', () => {
     expect((tables.studios[0].lease as StudioLease).pendingRelease?.reason).toBe('studio-closed');
   });
 
+  it('releaseByStudio releases NOW when the caller session is the live holder (task e7752d29)', async () => {
+    // The holder is live in every sense the deferral rule checks — an
+    // in-process run is registered, the row is not terminal — and still the
+    // release completes in one call, because the holder is the one asking.
+    registerActiveRun({
+      sessionId: 'session-a',
+      userId: 'user-1',
+      sbSlug: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+    expect(
+      await service.releaseByStudio('studio-1', {
+        userId: 'user-1',
+        reason: 'studio-closed',
+        callerSessionId: 'session-a',
+      })
+    ).toBe('released');
+    expect(tables.studios[0].lease).toBeNull();
+    const event = tables.studio_lease_events.find(
+      (e) => e.event === 'released' && e.studio_id === 'studio-1'
+    );
+    expect(event?.reason).toBe('studio-closed');
+    expect(event?.session_id).toBe('session-a');
+  });
+
+  it('releaseByStudio still DEFERS a live holder when the caller is a different session', async () => {
+    registerActiveRun({
+      sessionId: 'session-a',
+      userId: 'user-1',
+      sbSlug: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+    expect(
+      await service.releaseByStudio('studio-1', {
+        userId: 'user-1',
+        reason: 'studio-closed',
+        callerSessionId: 'session-z',
+      })
+    ).toBe('deferred');
+    const marked = tables.studios[0].lease as StudioLease;
+    expect(marked.sessionId).toBe('session-a');
+    expect(marked.pendingRelease?.reason).toBe('studio-closed');
+  });
+
+  it('releaseByStudio with a caller session still clears a dead holder and refuses a quarantined claim', async () => {
+    // session-b (studio-2) is terminal: a caller that is NOT the holder releases it.
+    expect(
+      await service.releaseByStudio('studio-2', {
+        userId: 'user-1',
+        reason: 'studio-closed',
+        callerSessionId: 'session-z',
+      })
+    ).toBe('released');
+    expect(tables.studios[1].lease).toBeNull();
+    // A quarantined claim is never releasable this way, holder or not.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-a', quarantined: true });
+    expect(
+      await service.releaseByStudio('studio-1', {
+        userId: 'user-1',
+        reason: 'studio-closed',
+        callerSessionId: 'session-a',
+      })
+    ).toBe('none');
+    expect((tables.studios[0].lease as StudioLease).quarantined).toBe(true);
+  });
+
   it('renewBySession bumps heartbeatAt without logging an event', async () => {
     const before = (tables.studios[0].lease as StudioLease).heartbeatAt;
     await new Promise((resolve) => setTimeout(resolve, 5));
