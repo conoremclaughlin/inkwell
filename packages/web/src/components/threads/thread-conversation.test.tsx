@@ -15,7 +15,12 @@ import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
 const fake = vi.hoisted(() => ({
   newest: undefined as unknown,
   apiGet: vi.fn(),
-  viewProps: [] as Array<{ loading: boolean; ids: string[]; hasOlder: boolean }>,
+  viewProps: [] as Array<{
+    loading: boolean;
+    ids: string[];
+    hasOlder: boolean;
+    unreadBeyond: boolean;
+  }>,
 }));
 
 vi.mock('@/lib/api', () => ({
@@ -29,12 +34,14 @@ vi.mock('@/components/conversation/conversation-view', () => ({
     messages: Array<{ id: string }>;
     loading: boolean;
     hasOlder: boolean;
+    unreadBeyond: boolean;
     onLoadOlder: () => void;
   }) => {
     fake.viewProps.push({
       loading: props.loading,
       ids: props.messages.map((m) => m.id),
       hasOlder: props.hasOlder,
+      unreadBeyond: props.unreadBeyond,
     });
     return (
       <div>
@@ -43,6 +50,7 @@ vi.mock('@/components/conversation/conversation-view', () => ({
         </button>
         <span data-testid="loading">{String(props.loading)}</span>
         <span data-testid="hasOlder">{String(props.hasOlder)}</span>
+        <span data-testid="unreadBeyond">{String(props.unreadBeyond)}</span>
         {props.messages.map((m) => (
           <div key={m.id} data-testid={m.id} />
         ))}
@@ -169,6 +177,28 @@ describe('ThreadConversation', () => {
     const readyRenders = fake.viewProps.filter((p) => !p.loading);
     expect(readyRenders.length).toBeGreaterThan(0);
     expect(readyRenders.every((p) => p.ids.includes('m51'))).toBe(true);
+  });
+
+  /**
+   * Lumen's round-2 shape: 669 messages, cursor at 50. The catch-up stops at
+   * its page limit and the view opens — but is told unread messages remain
+   * above, and nothing loads further until the reader asks.
+   */
+  it('opens a paused catch-up as incomplete, and continues it on request', async () => {
+    fake.newest = pageOf(1, 669);
+    fake.apiGet.mockImplementation((path: string) => Promise.resolve(pageOf(1, olderThan(path))));
+    mount(at(50));
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'));
+    expect(screen.getByTestId('unreadBeyond').textContent).toBe('true');
+    expect(screen.queryByTestId('m51')).toBeNull();
+    const fetchedOnOpen = fake.apiGet.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fake.apiGet.mock.calls.length, 'nothing more loads unasked').toBe(fetchedOnOpen);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load' }));
+    await waitFor(() => expect(screen.getByTestId('unreadBeyond').textContent).toBe('false'));
+    expect(screen.getByTestId('m51')).toBeTruthy();
   });
 
   it('is ready at once when the newest page covers the cursor', () => {

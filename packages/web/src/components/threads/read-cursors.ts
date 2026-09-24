@@ -11,6 +11,7 @@
  */
 
 import { useSyncExternalStore } from 'react';
+import { compareInstants } from '@/components/conversation/instant';
 
 export const READ_CURSORS_STORAGE_KEY = 'ink.threads.read-cursors.v1';
 
@@ -79,11 +80,11 @@ function mergeStored(local: Stored, persisted: Stored | null): Stored {
   const cursors = Object.create(null) as Record<string, string>;
   for (const source of [local.cursors, persisted.cursors]) {
     for (const [key, at] of Object.entries(source)) {
-      if (!has(cursors, key) || Date.parse(at) > Date.parse(cursors[key])) cursors[key] = at;
+      if (!has(cursors, key) || compareInstants(at, cursors[key]) > 0) cursors[key] = at;
     }
   }
   const baselineAt =
-    Date.parse(persisted.baselineAt) > Date.parse(local.baselineAt)
+    compareInstants(persisted.baselineAt, local.baselineAt) > 0
       ? persisted.baselineAt
       : local.baselineAt;
   return { baselineAt, cursors };
@@ -128,16 +129,15 @@ export function createReadCursorStore(
   return {
     cursorFor,
     advance: (threadKey, throughIso) => {
-      const through = Date.parse(throughIso);
-      if (Number.isNaN(through)) return;
+      if (Number.isNaN(Date.parse(throughIso))) return;
       // Another tab may have moved it further since this one last looked.
       state = mergeStored(state, read());
-      if (through <= Date.parse(cursorFor(threadKey))) return;
+      if (compareInstants(throughIso, cursorFor(threadKey)) <= 0) return;
       const cursors = { ...state.cursors, [threadKey]: throughIso };
       const keys = Object.keys(cursors);
       if (keys.length > MAX_CURSORS) {
         keys
-          .sort((a, b) => Date.parse(cursors[a]) - Date.parse(cursors[b]))
+          .sort((a, b) => compareInstants(cursors[a], cursors[b]))
           .slice(0, keys.length - MAX_CURSORS)
           .forEach((key) => delete cursors[key]);
       }
@@ -192,5 +192,5 @@ export function hasUnread(
   cursor: string
 ): boolean {
   if (!lastMessage || lastMessage.sentByUser) return false;
-  return Date.parse(lastMessage.createdAt) > Date.parse(cursor);
+  return compareInstants(lastMessage.createdAt, cursor) > 0;
 }

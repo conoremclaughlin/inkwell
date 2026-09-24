@@ -13,12 +13,21 @@
  * view positions itself — so it opens on the real first unread message, not
  * on the first unread message that happened to fit in the newest page.
  *
+ * A gap is never forgotten while messages are missing. The catch-up to the
+ * read cursor stops after a few pages so the thread opens promptly, and the
+ * gap stays, paused, as the explicit record that unread messages remain
+ * above; the reader's next request for older history continues it. A failed
+ * fetch blocks a gap until the next successful poll shows the server
+ * answering again. Dropping either would leave a hole nothing could find later
+ * (Lumen, #670 round 2).
+ *
  * Pure: the component runs the fetches and feeds the pages back in.
  */
 
+import { compareInstants } from '@/components/conversation/instant';
 import type { ThreadMessage, ThreadMessagesResponse } from './thread-types';
 
-/** Older pages fetched to reach the read cursor before a thread opens. */
+/** Older pages fetched on open, toward the read cursor, before the thread shows. */
 export const MAX_CATCH_UP_PAGES = 5;
 
 /** A point in the (created_at, id) order the server pages in. */
@@ -36,16 +45,24 @@ export interface HistoryGap {
   initial: boolean;
   /** Older pages fetched for this gap so far. */
   pages: number;
+  /**
+   * The catch-up reached its page limit: the thread opened, and unread
+   * messages remain above what is loaded. Continued by the reader, not
+   * automatically.
+   */
+  paused: boolean;
+  /** A fetch for this gap failed. Retried once a newest page arrives. */
+  blocked: boolean;
 }
 
 export interface ThreadHistory {
-  /** Ascending, one entry per id. */
+  /** Ascending in the server's order, one entry per id. */
   messages: ThreadMessage[];
   /** Nothing exists before the first message. */
   oldestReached: boolean;
-  /** Stretches still to fetch, oldest-first processing order. */
+  /** Stretches still missing. */
   gaps: HistoryGap[];
-  /** The history reaches the read cursor (or gave up trying): safe to position. */
+  /** Safe to position: the history reaches the read cursor, or says it doesn't. */
   ready: boolean;
   /** The first newest page has arrived. */
   started: boolean;
@@ -59,9 +76,9 @@ export const EMPTY_HISTORY: ThreadHistory = {
   started: false,
 };
 
-/** The server's order: created_at, then id. */
+/** The server's order: created_at at full precision, then id. */
 export function comparePosition(a: HistoryPosition, b: HistoryPosition): number {
-  const byTime = Date.parse(a.createdAt) - Date.parse(b.createdAt);
+  const byTime = compareInstants(a.createdAt, b.createdAt);
   if (byTime !== 0) return byTime;
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
@@ -82,10 +99,33 @@ function oldestOf(messages: ThreadMessage[]): ThreadMessage | undefined {
   return [...messages].sort(comparePosition)[0];
 }
 
+/** The gap to fetch next without being asked: not paused, not blocked. */
+export function nextGap(history: ThreadHistory): HistoryGap | null {
+  return history.gaps.find((gap) => !gap.paused && !gap.blocked) ?? null;
+}
+
+/**
+ * The catch-up to the read cursor stopped short — paused at its page limit,
+ * or blocked by a failed fetch — so unread messages exist above the first
+ * loaded one.
+ */
+export function unreadBeyondLoaded(history: ThreadHistory): boolean {
+  return history.gaps.some((gap) => gap.initial);
+}
+
+/**
+ * The gap a request for older history should continue: the paused or
+ * blocked catch-up, which starts at the oldest loaded message. Null when
+ * older history is an ordinary page back.
+ */
+export function olderGap(history: ThreadHistory): HistoryGap | null {
+  return history.gaps.find((gap) => gap.initial) ?? null;
+}
+
 /**
  * Merge a newest page (the poll). The first one starts the history, and —
  * when the viewer's read cursor is older than anything on it — opens an
- * initial gap back to the cursor, holding `ready` until it closes.
+ * initial gap back to the cursor, holding `ready` until it closes or pauses.
  */
 export function absorbNewest(
   history: ThreadHistory,
@@ -104,14 +144,16 @@ export function absorbNewest(
       ready: true,
       started: true,
     };
-    if (
-      truncated &&
-      oldest &&
-      unreadAfter &&
-      Date.parse(oldest.createdAt) > Date.parse(unreadAfter)
-    ) {
+    if (truncated && oldest && unreadAfter && compareInstants(oldest.createdAt, unreadAfter) > 0) {
       start.gaps = [
-        { beforeId: oldest.id, floor: { createdAt: unreadAfter, id: '' }, initial: true, pages: 0 },
+        {
+          beforeId: oldest.id,
+          floor: { createdAt: unreadAfter, id: '' },
+          initial: true,
+          pages: 0,
+          paused: false,
+          blocked: false,
+        },
       ];
       start.ready = false;
     }
@@ -127,8 +169,15 @@ export function absorbNewest(
   // The page stops short of what was loaded: fill the stretch between.
   if (truncated && oldest && knownNewest && comparePosition(oldest, knownNewest) > 0) {
     next.gaps = [
-      ...history.gaps,
-      { beforeId: oldest.id, floor: knownNewest, initial: false, pages: 0 },
+      ...next.gaps,
+      {
+        beforeId: oldest.id,
+        floor: knownNewest,
+        initial: false,
+        pages: 0,
+        paused: false,
+        blocked: false,
+      },
     ];
   }
   return next;
@@ -137,9 +186,10 @@ export function absorbNewest(
 /**
  * Merge a page of older messages. With `gap`, the page was fetched for it:
  * the gap closes once the page reaches its floor (or the thread's start),
- * and otherwise moves down to continue from the page's oldest message. An
- * initial catch-up gives up after MAX_CATCH_UP_PAGES and opens anyway.
- * Without `gap`, the reader asked for older history.
+ * and otherwise moves down to continue from the page's oldest message. The
+ * catch-up to the read cursor pauses at MAX_CATCH_UP_PAGES — the thread
+ * opens, and the gap stays to say what is still missing. Without `gap`, the
+ * reader asked for an ordinary page of older history.
  */
 export function absorbOlder(
   history: ThreadHistory,
@@ -164,21 +214,42 @@ export function absorbOlder(
     if (gap.initial) next.ready = true;
     return next;
   }
-  const continued: HistoryGap = { ...gap, beforeId: oldest.id, pages: gap.pages + 1 };
+  const continued: HistoryGap = {
+    ...gap,
+    beforeId: oldest.id,
+    pages: gap.pages + 1,
+    blocked: false,
+  };
   if (gap.initial && continued.pages >= MAX_CATCH_UP_PAGES) {
-    next.gaps = others;
+    continued.paused = true;
     next.ready = true;
-    return next;
   }
   next.gaps = [continued, ...others];
   return next;
 }
 
-/** Abandon a gap whose fetch failed, so the thread still opens. */
-export function dropGap(history: ThreadHistory, gap: HistoryGap): ThreadHistory {
+/**
+ * A fetch for `gap` failed. The gap stays — the messages are still missing —
+ * but waits for unblockGaps before it is tried again. A catch-up that fails
+ * still lets the thread open.
+ */
+export function failGap(history: ThreadHistory, gap: HistoryGap): ThreadHistory {
   return {
     ...history,
-    gaps: history.gaps.filter((g) => g.beforeId !== gap.beforeId),
+    gaps: history.gaps.map((g) => (g.beforeId === gap.beforeId ? { ...g, blocked: true } : g)),
     ready: gap.initial ? true : history.ready,
+  };
+}
+
+/**
+ * The server answered a fetch: try blocked gaps again. Called on every
+ * successful poll, including one that brought nothing new — a quiet thread
+ * must still recover what it failed to load.
+ */
+export function unblockGaps(history: ThreadHistory): ThreadHistory {
+  if (!history.gaps.some((gap) => gap.blocked)) return history;
+  return {
+    ...history,
+    gaps: history.gaps.map((gap) => (gap.blocked ? { ...gap, blocked: false } : gap)),
   };
 }

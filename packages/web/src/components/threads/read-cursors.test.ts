@@ -47,6 +47,19 @@ describe('read cursor store', () => {
     expect(createReadCursorStore(storage).cursorFor('pr:2')).toBe(T0);
   });
 
+  it('moves forward by microseconds, which Date.parse cannot see', () => {
+    const store = createReadCursorStore(memoryStorage(), () => new Date(T0));
+    store.advance('pr:1', '2026-09-23T11:00:00.123100+00:00');
+    store.advance('pr:1', '2026-09-23T11:00:00.123900+00:00');
+    expect(store.cursorFor('pr:1')).toBe('2026-09-23T11:00:00.123900+00:00');
+    expect(
+      hasUnread(
+        { createdAt: '2026-09-23T11:00:00.123950+00:00', sentByUser: false },
+        store.cursorFor('pr:1')
+      )
+    ).toBe(true);
+  });
+
   it('notifies subscribers when a cursor moves, and not when it does not', () => {
     const store = createReadCursorStore(memoryStorage(), () => new Date(T0));
     let calls = 0;

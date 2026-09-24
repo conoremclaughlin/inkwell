@@ -6,6 +6,7 @@
  */
 
 import { formatDayLabel, isSameDay } from './format';
+import { compareInstants } from './instant';
 import type { ConversationMessage } from './types';
 
 /** Consecutive messages from one author within this window share a header. */
@@ -21,11 +22,11 @@ export type TimelineItem =
  * neither their own nor a system event. Nobody leaves their own message
  * unread, and "thread closed" is not news anyone has to catch up on.
  */
-export function isUnread(message: ConversationMessage, unreadAfterMs: number): boolean {
+export function isUnread(message: ConversationMessage, unreadAfter: string): boolean {
   return (
     !message.author.isOwn &&
     message.author.kind !== 'system' &&
-    Date.parse(message.createdAt) > unreadAfterMs
+    compareInstants(message.createdAt, unreadAfter) > 0
   );
 }
 
@@ -42,12 +43,13 @@ export function buildTimeline(
   } = {}
 ): TimelineItem[] {
   const now = options.now ?? new Date();
-  const sorted = [...messages].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  const sorted = [...messages].sort((a, b) => compareInstants(a.createdAt, b.createdAt));
 
-  const unreadAfterMs = options.unreadAfter ? Date.parse(options.unreadAfter) : NaN;
-  const unread = Number.isNaN(unreadAfterMs)
-    ? []
-    : sorted.filter((message) => isUnread(message, unreadAfterMs));
+  const unreadAfter = options.unreadAfter;
+  const unread =
+    unreadAfter && !Number.isNaN(Date.parse(unreadAfter))
+      ? sorted.filter((message) => isUnread(message, unreadAfter))
+      : [];
   const firstUnread = unread[0];
 
   const items: TimelineItem[] = [];

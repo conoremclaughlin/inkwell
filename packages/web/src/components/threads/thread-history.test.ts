@@ -2,9 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   absorbNewest,
   absorbOlder,
-  dropGap,
   EMPTY_HISTORY,
+  failGap,
   MAX_CATCH_UP_PAGES,
+  nextGap,
+  olderGap,
+  unblockGaps,
+  unreadBeyondLoaded,
   type ThreadHistory,
 } from './thread-history';
 import type { ThreadMessage, ThreadMessagesResponse } from './thread-types';
@@ -42,14 +46,21 @@ function server(latest: number) {
   };
 }
 
-/** Work every outstanding gap, as the component's effect does. */
+/** Work the gaps the component's effect would, without being asked. */
 function fillGaps(history: ThreadHistory, api: ReturnType<typeof server>): ThreadHistory {
   let current = history;
-  for (let guard = 0; current.gaps.length > 0 && guard < 50; guard++) {
-    const gap = current.gaps[0];
+  for (let guard = 0; guard < 50; guard++) {
+    const gap = nextGap(current);
+    if (!gap) break;
     current = absorbOlder(current, api.before(gap.beforeId), gap);
   }
   return current;
+}
+
+/** The reader asking for older history, as loadOlder does. */
+function readUpwards(history: ThreadHistory, api: ReturnType<typeof server>): ThreadHistory {
+  const catchUp = olderGap(history);
+  return absorbOlder(history, api.before(catchUp?.beforeId ?? history.messages[0].id), catchUp);
 }
 
 const numbers = (history: ThreadHistory) => history.messages.map((m) => Number(m.id.slice(1)));
@@ -90,6 +101,55 @@ describe('thread history', () => {
     expect(contiguous(history)).toBe(true);
   });
 
+  /**
+   * Lumen's round-2 counterexample: 1–100 loaded, a poll jumps to 251–350,
+   * and the fetch for 101–250 fails once. Dropping the gap forgot the hole;
+   * the next poll (252–351) overlapped what was known and never recreated
+   * it, and with the oldest page exhausted there was no older button either.
+   */
+  it('keeps a failed gap, and fills it once the server answers again', () => {
+    let history = absorbNewest(EMPTY_HISTORY, server(100).newest(), at(100));
+    history = absorbNewest(history, server(350).newest(), at(100));
+    history = failGap(history, history.gaps[0]);
+    history = absorbNewest(history, server(351).newest(), at(100));
+    expect(history.gaps).toHaveLength(1);
+    expect(nextGap(history), 'a blocked gap waits for the next successful poll').toBeNull();
+
+    history = fillGaps(unblockGaps(history), server(351));
+    expect(history.gaps).toEqual([]);
+    expect(numbers(history)).toHaveLength(351);
+    expect(contiguous(history)).toBe(true);
+  });
+
+  /**
+   * Lumen's round-2 counterexample: Postgres keeps microseconds. Two
+   * hundred messages inside one millisecond, with UUIDs in the opposite
+   * order to time: compared by Date.parse they tie, the UUID decides, the
+   * "oldest" loaded message is really the newest, and every older page is
+   * requested from the same cursor.
+   */
+  it('pages by the server’s microsecond order, not Date.parse', () => {
+    const all: ThreadMessage[] = Array.from({ length: 200 }, (_, i) => ({
+      ...message(i + 1),
+      id: `00000000-0000-4000-8000-${String(1000 - i).padStart(12, '0')}`,
+      createdAt: `2026-09-22T00:00:00.${String(123001 + i)}+00:00`,
+    }));
+    const slice = (end: number): ThreadMessagesResponse => ({
+      thread: null,
+      messages: all.slice(Math.max(0, end - PAGE), end),
+      meta: { fetched: Math.min(PAGE, end), total: end, truncated: end > PAGE },
+    });
+
+    let history = absorbNewest(EMPTY_HISTORY, slice(200), '2026-09-23T00:00:00Z');
+    expect(history.messages[0].id).toBe(all[100].id);
+    for (let i = 0; i < 3 && !history.oldestReached; i++) {
+      const end = all.findIndex((m) => m.id === history.messages[0].id);
+      history = absorbOlder(history, slice(end), null);
+    }
+    expect(history.messages).toHaveLength(200);
+    expect(history.messages.map((m) => m.id)).toEqual(all.map((m) => m.id));
+  });
+
   describe('opening behind the read cursor', () => {
     it('is ready at once when the newest page already covers the cursor', () => {
       const history = absorbNewest(EMPTY_HISTORY, server(200).newest(), at(150));
@@ -116,21 +176,43 @@ describe('thread history', () => {
       expect(contiguous(history)).toBe(true);
     });
 
-    it('gives up after a bounded number of pages and opens anyway', () => {
-      const api = server(2_000);
-      let history = absorbNewest(EMPTY_HISTORY, api.newest(), at(5));
+    /**
+     * Lumen's round-2 counterexample: 669 messages, cursor at 50. The
+     * catch-up stops at its page limit with 70–669 loaded. Opening there is
+     * fine; calling it complete was not — 51–69 were unread, unloaded, and
+     * nothing said so.
+     */
+    it('pauses at its page limit and says unread messages remain above', () => {
+      const api = server(669);
+      let history = absorbNewest(EMPTY_HISTORY, api.newest(), at(50));
       history = fillGaps(history, api);
       expect(history.ready).toBe(true);
-      expect(history.oldestReached).toBe(false);
-      expect(numbers(history)).toHaveLength(PAGE * (1 + MAX_CATCH_UP_PAGES));
+      expect(numbers(history)[0]).toBe(669 - PAGE * (1 + MAX_CATCH_UP_PAGES) + 1);
+      expect(numbers(history)).not.toContain(51);
+      expect(unreadBeyondLoaded(history)).toBe(true);
+      expect(olderGap(history)?.paused).toBe(true);
+
+      // Reading upwards continues the catch-up until it reaches the cursor.
+      for (let guard = 0; unreadBeyondLoaded(history) && guard < 10; guard++) {
+        history = readUpwards(history, api);
+      }
+      expect(unreadBeyondLoaded(history)).toBe(false);
+      expect(numbers(history)).toContain(50);
+      expect(numbers(history)).toContain(51);
       expect(contiguous(history)).toBe(true);
     });
 
-    it('opens when a catch-up fetch fails', () => {
-      const history = absorbNewest(EMPTY_HISTORY, server(200).newest(), at(50));
-      const dropped = dropGap(history, history.gaps[0]);
-      expect(dropped.ready).toBe(true);
-      expect(dropped.gaps).toEqual([]);
+    it('opens when a catch-up fetch fails, and still knows what it is missing', () => {
+      const api = server(200);
+      let history = absorbNewest(EMPTY_HISTORY, api.newest(), at(50));
+      history = failGap(history, history.gaps[0]);
+      expect(history.ready).toBe(true);
+      expect(unreadBeyondLoaded(history)).toBe(true);
+      expect(nextGap(history)).toBeNull();
+
+      history = fillGaps(unblockGaps(history), api);
+      expect(unreadBeyondLoaded(history)).toBe(false);
+      expect(numbers(history)).toContain(51);
     });
 
     it('never waits on a thread that fits in one page', () => {

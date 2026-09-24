@@ -40,6 +40,12 @@ export interface ConversationViewProps {
   loading?: boolean;
   /** There is history before the first message. */
   hasOlder?: boolean;
+  /**
+   * Unread messages exist before the first loaded one: the source stopped
+   * short of the reader's cursor. The older-history control and the divider
+   * say so instead of presenting what loaded as the whole of it.
+   */
+  unreadBeyond?: boolean;
   loadingOlder?: boolean;
   onLoadOlder?: () => void;
   /** The viewer has seen through this message: at the end, with the page visible. */
@@ -67,6 +73,7 @@ export function ConversationView({
   unreadAfter,
   loading = false,
   hasOlder = false,
+  unreadBeyond = false,
   loadingOlder = false,
   onLoadOlder,
   onReadThrough,
@@ -120,7 +127,11 @@ export function ConversationView({
     if (!positioned.current) {
       positioned.current = true;
       const divider = unreadRef.current;
-      if (divider) {
+      if (unreadBeyond) {
+        // The unread run starts above what loaded: open at the very top, on
+        // the control that loads the rest.
+        el.scrollTop = 0;
+      } else if (divider) {
         el.scrollTop +=
           divider.getBoundingClientRect().top - el.getBoundingClientRect().top - UNREAD_OFFSET_PX;
       } else {
@@ -148,7 +159,7 @@ export function ConversationView({
     }
     seen.current = { firstId: first.id, lastId: last.id, height: el.scrollHeight };
     measure();
-  }, [first, last, ordered, loading, measure, scrollToEnd]);
+  }, [first, last, ordered, loading, unreadBeyond, measure, scrollToEnd]);
 
   // Growth that is not a new message — an image loading, a code block
   // laying out, a streaming body getting longer — keeps a pinned view pinned.
@@ -167,10 +178,21 @@ export function ConversationView({
   const onScroll = useCallback(() => {
     measure();
     const el = scrollerRef.current;
-    if (el && el.scrollTop < TOP_LOAD_PX && hasOlder && !loadingOlder && positioned.current) {
+    // Not while unread messages remain above: opening on the first loaded
+    // one lands inside this zone, and loading on arrival would slide the
+    // real boundary in above the reader, out of view. The explicit control
+    // continues it instead.
+    if (
+      el &&
+      el.scrollTop < TOP_LOAD_PX &&
+      hasOlder &&
+      !unreadBeyond &&
+      !loadingOlder &&
+      positioned.current
+    ) {
       onLoadOlder?.();
     }
-  }, [measure, hasOlder, loadingOlder, onLoadOlder]);
+  }, [measure, hasOlder, unreadBeyond, loadingOlder, onLoadOlder]);
 
   // Seen means at the end with the page in front of the reader. A hidden
   // tab polling in new messages must not mark them read.
@@ -209,10 +231,19 @@ export function ConversationView({
                     type="button"
                     onClick={onLoadOlder}
                     disabled={loadingOlder}
-                    className="inline-flex items-center gap-1.5 rounded-full border bg-background px-3 py-1 text-xs text-muted-foreground shadow-sm transition-colors hover:text-foreground disabled:opacity-70"
+                    className={cn(
+                      'inline-flex items-center gap-1.5 rounded-full border bg-background px-3 py-1 text-xs shadow-sm transition-colors disabled:opacity-70',
+                      unreadBeyond
+                        ? 'border-rose-500/40 text-rose-600 hover:bg-rose-500/5 dark:text-rose-400'
+                        : 'text-muted-foreground hover:text-foreground'
+                    )}
                   >
                     {loadingOlder && <Loader2 className="h-3 w-3 animate-spin" />}
-                    {loadingOlder ? 'Loading earlier messages…' : 'Load earlier messages'}
+                    {loadingOlder
+                      ? 'Loading earlier messages…'
+                      : unreadBeyond
+                        ? 'Load earlier unread messages'
+                        : 'Load earlier messages'}
                   </button>
                 </div>
               ) : (
@@ -240,7 +271,11 @@ export function ConversationView({
                     >
                       <div className="h-px flex-1 bg-rose-500/70" />
                       <span className="text-[11px] font-semibold uppercase tracking-wide text-rose-600 dark:text-rose-400">
-                        {item.count === 1 ? '1 new message' : `${item.count} new messages`}
+                        {unreadBeyond
+                          ? `${item.count}+ new messages`
+                          : item.count === 1
+                            ? '1 new message'
+                            : `${item.count} new messages`}
                       </span>
                     </div>
                   );

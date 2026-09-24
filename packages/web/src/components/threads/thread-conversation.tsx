@@ -22,8 +22,12 @@ import {
 import {
   absorbNewest,
   absorbOlder,
-  dropGap,
   EMPTY_HISTORY,
+  failGap,
+  nextGap,
+  olderGap,
+  unblockGaps,
+  unreadBeyondLoaded,
   type ThreadHistory,
 } from './thread-history';
 import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
@@ -57,7 +61,7 @@ export function ThreadConversation({
   const key = spine.key;
   const hasThread = spine.sources.includes('thread');
 
-  const { data, isLoading } = useApiQuery<ThreadMessagesResponse>(
+  const { data, dataUpdatedAt, isLoading } = useApiQuery<ThreadMessagesResponse>(
     ['thread-messages', key],
     pagePath(key),
     { refetchInterval: hasThread ? POLL_MS : false }
@@ -82,9 +86,15 @@ export function ThreadConversation({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
 
+  // Every successful poll — even one that brought nothing new, which hands
+  // back the same data object — is the server answering: retry what failed.
+  useEffect(() => {
+    if (dataUpdatedAt) setHistory((current) => unblockGaps(current));
+  }, [dataUpdatedAt]);
+
   // Work the history's gaps one at a time: the catch-up to the read cursor
-  // on open, and any stretch a poll skipped.
-  const gap = history.gaps[0] ?? null;
+  // on open, and any stretch a poll skipped. Paused and blocked gaps wait.
+  const gap = nextGap(history);
   useEffect(() => {
     if (!gap) return;
     let cancelled = false;
@@ -95,7 +105,7 @@ export function ThreadConversation({
       .catch((error: unknown) => {
         if (cancelled) return;
         setOlderError(error instanceof Error ? error.message : 'Failed to load messages');
-        setHistory((current) => dropGap(current, gap));
+        setHistory((current) => failGap(current, gap));
       });
     return () => {
       cancelled = true;
@@ -107,20 +117,26 @@ export function ThreadConversation({
     [history.messages, nameFor]
   );
 
+  // Older history continues the catch-up when one stopped short — so reading
+  // upwards closes it and the divider lands on the real boundary — and is
+  // otherwise an ordinary page back from the oldest loaded message.
   const loadOlder = useCallback(async () => {
     const oldest = history.messages[0];
     if (loadingOlder || !oldest) return;
+    const catchUp = olderGap(history);
     setLoadingOlder(true);
     setOlderError(null);
     try {
-      const page = await apiGet<ThreadMessagesResponse>(pagePath(key, oldest.id));
-      setHistory((current) => absorbOlder(current, page, null));
+      const page = await apiGet<ThreadMessagesResponse>(
+        pagePath(key, catchUp?.beforeId ?? oldest.id)
+      );
+      setHistory((current) => absorbOlder(current, page, catchUp));
     } catch (error) {
       setOlderError(error instanceof Error ? error.message : 'Failed to load earlier messages');
     } finally {
       setLoadingOlder(false);
     }
-  }, [loadingOlder, history.messages, key]);
+  }, [loadingOlder, history, key]);
 
   // Not ready to show until the history reaches the read cursor: the view
   // positions once, on the real first unread message.
@@ -213,6 +229,7 @@ export function ThreadConversation({
         unreadAfter={unreadAfter}
         loading={opening}
         hasOlder={history.started && !history.oldestReached}
+        unreadBeyond={history.ready && unreadBeyondLoaded(history)}
         loadingOlder={loadingOlder}
         onLoadOlder={() => void loadOlder()}
         onReadThrough={onReadThrough}

@@ -127,6 +127,16 @@ describe('buildTimeline', () => {
       expect(buildTimeline(messages, { now: NOW }).some((i) => i.type === 'unread')).toBe(false);
     });
 
+    it('counts a message microseconds after the cursor as new', () => {
+      // Same millisecond: Date.parse calls these equal and the message read.
+      const reply = { ...msg(lumen, '2026-09-22T00:00:00.123900+00:00'), body: 'later' };
+      const items = buildTimeline([reply], {
+        unreadAfter: '2026-09-22T00:00:00.123100+00:00',
+        now: NOW,
+      });
+      expect(items.some((i) => i.type === 'unread')).toBe(true);
+    });
+
     it('opens the whole window when the cursor predates every loaded message', () => {
       const items = buildTimeline([msg(lumen, at(23, 9)), msg(wren, at(23, 10))], {
         unreadAfter: at(20, 9),
