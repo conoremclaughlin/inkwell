@@ -22,14 +22,20 @@ yarn db:migrate supabase/migrations/20260916024540_memory_embedding_atomic_swap.
 yarn db:migrate:status
 ```
 
-`db:migrate` (`scripts/db-migrate.sh`) runs the file with psql in one
-transaction, then `supabase migration repair --local --status applied <version>`,
-which writes the row with the file's version, name and statements. It works from
+`db:migrate` (`scripts/db-migrate.sh`) runs one psql transaction: an advisory
+lock on the version, the ledger row (version, name, and the file text as its
+one statement), then the file. Either all of it commits or none of it does, and
+two runs of the same file cannot both succeed: the second waits on the lock and
+then fails the row's primary key before its copy of the file runs. It works from
 any worktree (the CLI reaches the stack by the port in `supabase/config.toml`),
 in any order, and skips a version the ledger already has. Several files can be
 given at once; each is its own transaction. Do not write `BEGIN`/`COMMIT` into a
 migration file: the wrapper, like the CLI, already wraps the file, and an inner
 pair only produces "there is already a transaction in progress" warnings.
+
+If the stack is not running, start it from the root checkout with
+`supabase start`. Do not reach for `yarn supabase:local:setup` for that: it
+runs `supabase db reset` and discards every row of live data.
 
 Two other ways of applying exist, and both leave the ledger wrong:
 
