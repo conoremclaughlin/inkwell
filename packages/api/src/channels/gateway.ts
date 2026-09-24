@@ -93,6 +93,18 @@ const TYPING_MAX_DURATION_MS = 10 * 60 * 1000; // 10 min max before auto-clear
 // Message buffering configuration
 const DEFAULT_BUFFER_DELAY_MS = 2000; // Wait 2 seconds for additional messages
 
+/**
+ * Slug recorded on an outgoing Telegram row when the author could not be
+ * resolved. It identifies the SB that OWNS the channel, not the one that wrote
+ * the message — the two coincide only when Myra is the sender.
+ *
+ * Rows carrying this slug are marked `authorship: 'unattributed'` in the
+ * payload and are never eligible to route a reply. Keeping the owner as the
+ * display slug preserves existing timeline behaviour; the payload flag is what
+ * stops it being mistaken for a real attribution.
+ */
+const TELEGRAM_CHANNEL_OWNER_SLUG = 'myra';
+
 interface BufferedMessage {
   content: string;
   timestamp: Date;
@@ -625,8 +637,8 @@ export class ChannelGateway extends EventEmitter {
 
     // NOTE: inbound messages are NOT logged to the activity stream here.
     // SessionService.handleMessage logs them first thing with the RESOLVED
-    // agentId and full payload (media, threadKey, sender) — this site used
-    // to log a second copy with a hardcoded agentId of 'myra', producing
+    // sbSlug and full payload (media, threadKey, sender) — this site used
+    // to log a second copy with a hardcoded sbSlug of 'myra', producing
     // duplicate message_in rows (double-rendered in attached CLI views).
 
     // Pass resolved userId to message handler so SessionService can persist messages
@@ -808,7 +820,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'myra',
+                sbSlug: 'myra',
                 direction: 'out',
                 content: logContent,
                 sessionId,
@@ -871,7 +883,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'benson',
+                sbSlug: 'benson',
                 direction: 'out',
                 content: logContent,
                 sessionId,
@@ -930,7 +942,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'slack',
+                sbSlug: 'slack',
                 direction: 'out',
                 content: logContent,
                 sessionId,
@@ -1080,19 +1092,65 @@ export class ChannelGateway extends EventEmitter {
       }
     }
 
-    await this.telegramListener.sendMessage(conversationId, processedContent, {
-      replyToMessageId: options?.replyToMessageId,
-      parseMode,
-    });
+    const platformMessageId = await this.telegramListener.sendMessage(
+      conversationId,
+      processedContent,
+      {
+        replyToMessageId: options?.replyToMessageId,
+        parseMode,
+      }
+    );
 
-    await this.logOutgoingTelegram(conversationId, content, undefined, options?.sessionId);
+    await this.logOutgoingTelegram(
+      conversationId,
+      content,
+      undefined,
+      options?.sessionId,
+      platformMessageId
+    );
+  }
+
+  /**
+   * Resolve who actually authored an outgoing message, from the session that
+   * produced it.
+   *
+   * The channel owner is NOT the author. Every SB reaches Conor through the one
+   * Telegram bot, so stamping the owner's slug on every outgoing row erases the
+   * only fact a reply needs. Returns null when the session is absent or
+   * unresolvable — callers must record that as unattributed rather than
+   * substituting the owner, because a confident wrong author is what makes the
+   * misroute invisible.
+   */
+  private async resolveOutgoingAuthor(
+    sessionId?: string
+  ): Promise<{ sbSlug: string; sbId?: string } | null> {
+    if (!sessionId || !this.dataComposer) return null;
+
+    try {
+      const { data, error } = await this.dataComposer
+        .getClient()
+        .from('sessions')
+        .select('agent_id, sb_id')
+        .eq('id', sessionId)
+        .maybeSingle();
+
+      if (error || !data?.agent_id) return null;
+      return { sbSlug: data.agent_id, sbId: data.sb_id ?? undefined };
+    } catch (err) {
+      logger.warn('Failed to resolve outgoing message author from session', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
   }
 
   private async logOutgoingTelegram(
     conversationId: string,
     content: string,
     media?: OutboundMedia[],
-    sessionId?: string
+    sessionId?: string,
+    platformMessageId?: string
   ): Promise<void> {
     // Log outgoing message to activity stream
     const userId = await this.resolveUserIdForConversation('telegram', conversationId);
@@ -1109,16 +1167,26 @@ export class ChannelGateway extends EventEmitter {
             contentType: m.contentType || null,
           }));
         }
+
+        // Authorship is recorded explicitly so a reply can distinguish "written
+        // by this SB" from "we do not know who wrote this". Only rows marked
+        // `session` are eligible to route a reply; `unattributed` rows fall
+        // through to the normal cascade with a visible reason.
+        const author = await this.resolveOutgoingAuthor(sessionId);
+        payload.authorship = author ? 'session' : 'unattributed';
+
         await this.dataComposer.repositories.activityStream.logMessage({
           userId,
-          agentId: 'myra',
+          sbSlug: author?.sbSlug ?? TELEGRAM_CHANNEL_OWNER_SLUG,
+          sbId: author?.sbId,
           direction: 'out',
           content,
           sessionId,
           platform: 'telegram',
+          platformMessageId,
           platformChatId: conversationId,
           isDm: true, // Will be corrected by context
-          payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
+          payload: payload as Json,
         });
       } catch (activityError) {
         logger.warn('Failed to log outgoing message to activity stream:', activityError);
@@ -1170,7 +1238,7 @@ export class ChannelGateway extends EventEmitter {
     // attachment.filename collided when two attachments shared a name
     // (e.g. an album of two photo.jpg items) — the later download
     // overwrote the earlier and the album uploaded duplicate bytes.
-    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media', randomUUID());
+    const tmpDir = pathMod.join(os.tmpdir(), 'ink-media', randomUUID());
     await fs.mkdir(tmpDir, { recursive: true });
 
     const safeName = (filename || 'media').replace(/[^a-zA-Z0-9._-]/g, '_') || 'media';

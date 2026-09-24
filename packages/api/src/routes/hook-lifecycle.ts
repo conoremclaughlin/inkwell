@@ -11,7 +11,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import type { DataComposer } from '../data/composer';
-import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
+import { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
 import { StudioLeaseService } from '../services/studio-lease.service';
 import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { logger } from '../utils/logger';
@@ -24,7 +24,7 @@ type Lifecycle = (typeof VALID_LIFECYCLES)[number];
 
 export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
   const router = Router();
-  const authProvider = new PcpAuthProvider();
+  const authProvider = new InkAuthProvider();
   const leaseService = new StudioLeaseService(dataComposer.getClient());
 
   /**
@@ -36,7 +36,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
    *   pre-compact → lifecycle: 'compacting'
    *   post-compact → lifecycle: 'idle'
    *
-   * Body: { sessionId, lifecycle, agentId?, workingDir? }
+   * Body: { sessionId, lifecycle, sbSlug?, workingDir? }
    * Auth: Bearer token (same as MCP)
    */
   router.post('/lifecycle', async (req: Request, res: Response) => {
@@ -52,7 +52,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         sessionId,
         lifecycle,
         event,
-        agentId,
+        sbSlug,
         workingDir,
         cliAttached,
         cliPollAt,
@@ -75,7 +75,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
          * field get renewals but never boundary releases.
          */
         event?: string;
-        agentId?: string;
+        sbSlug?: string;
         workingDir?: string;
         cliAttached?: boolean;
         cliPollAt?: string;
@@ -267,7 +267,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
               sessionId,
               threadKey: session.threadKey ?? `session:${sessionId}`,
               threadKeys: [session.threadKey ?? `session:${sessionId}`],
-              agentId: agentId ?? session.agentId ?? 'unknown',
+              sbSlug: sbSlug ?? session.sbSlug ?? 'unknown',
               // Round 15: the canonical identity UUID, from the SESSION row
               // (server-trusted) — never just the ambiguous slug.
               ...(session.sbId ? { sbId: session.sbId } : {}),
@@ -642,7 +642,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         }
       }
 
-      logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
+      logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, sbSlug });
       res.json({
         success: true,
         sessionId,

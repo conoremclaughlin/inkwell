@@ -16,7 +16,7 @@ describe('renderSessionsByAgent', () => {
     const sessions: Session[] = [
       {
         id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         status: 'active',
         currentPhase: 'implementing',
         threadKey: 'pr:61',
@@ -26,12 +26,12 @@ describe('renderSessionsByAgent', () => {
           id: '2b086159-3bad-4cee-ad85-30fbc5d3206f',
           worktreePath: '/Users/conormclaughlin/ws/pcp/personal-context-protocol--lumen',
           worktreeFolder: 'personal-context-protocol--lumen',
-          branch: 'lumen/feat/pcp-first-class-repl-remote',
+          branch: 'lumen/feat/ink-first-class-repl-remote',
         },
       },
       {
         id: 'ffffffff-1111-2222-3333-444444444444',
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'completed',
         startedAt: new Date('2026-02-17T18:00:00.000Z').toISOString(),
         endedAt: new Date('2026-02-17T19:00:00.000Z').toISOString(),
@@ -48,7 +48,7 @@ describe('renderSessionsByAgent', () => {
     expect(output).toContain(
       'Path:    /Users/conormclaughlin/ws/pcp/personal-context-protocol--lumen'
     );
-    expect(output).toContain('Branch:  lumen/feat/pcp-first-class-repl-remote');
+    expect(output).toContain('Branch:  lumen/feat/ink-first-class-repl-remote');
   });
 
   it('renders empty state and flat mode', () => {
@@ -59,7 +59,7 @@ describe('renderSessionsByAgent', () => {
         [
           {
             id: '11111111-2222-3333-4444-555555555555',
-            agentId: 'aster',
+            sbSlug: 'aster',
             status: 'active',
             startedAt: new Date('2026-02-18T19:00:00.000Z').toISOString(),
           },
@@ -90,7 +90,7 @@ describe('renderSyncedTranscriptArchives', () => {
           syncedAt: new Date('2026-03-11T20:00:00.000Z').toISOString(),
           session: {
             id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-            agentId: 'lumen',
+            sbSlug: 'lumen',
             agentName: 'Lumen',
             threadKey: 'pr:219',
             startedAt: new Date('2026-03-11T19:00:00.000Z').toISOString(),
@@ -176,6 +176,41 @@ describe('buildTranscriptInstallPlan', () => {
         content: '/Users/conormclaughlin/ws/pcp/personal-context-protocol\n',
       },
     ]);
+  });
+
+  // This branch was unreachable until #659: it matched only the pre-rename
+  // 'pcp' spelling while sessions store 'ink', so `ink session sync` on an ink
+  // session fell past every branch and threw "Cannot infer a backend-native
+  // install target". Nothing covered it, which is how it stayed that way.
+  it('installs ink-backend transcripts under the studio .ink/runtime/repl', () => {
+    const plan = buildTranscriptInstallPlan({
+      sessionId: 'session-3',
+      backend: 'ink',
+      backendSessionId: 'backend-3',
+      format: 'jsonl',
+      targetCwd: '/tmp/studio',
+      resolvedBy: 'cwd',
+    });
+
+    expect(plan.destinationPath).toBe(
+      '/tmp/studio/.ink/runtime/repl/session-3-synced-backend-3.jsonl'
+    );
+    expect(plan.sidecarFiles).toEqual([]);
+  });
+
+  it('still resolves rows written with the pre-rename backend value', () => {
+    const plan = buildTranscriptInstallPlan({
+      sessionId: 'session-4',
+      backend: 'pcp',
+      backendSessionId: 'backend-4',
+      format: 'json',
+      targetCwd: '/tmp/studio',
+      resolvedBy: 'cwd',
+    });
+
+    expect(plan.destinationPath).toBe(
+      '/tmp/studio/.ink/runtime/repl/session-4-synced-backend-4.json'
+    );
   });
 
   it('supports explicit path installs', () => {

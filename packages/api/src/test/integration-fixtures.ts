@@ -180,14 +180,14 @@ export async function ensureEchoIntegrationFixture(
 export async function ensureSuiteIdentity(
   dataComposer: DataComposer,
   fixture: EchoIntegrationFixture,
-  agentId: string
+  sbSlug: string
 ): Promise<string> {
   const supabase = dataComposer.getClient();
   const { data: existing } = await supabase
     .from('agent_identities')
     .select('id')
     .eq('user_id', fixture.userId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .eq('workspace_id', fixture.workspaceId)
     .maybeSingle();
   if (existing?.id) return existing.id as string;
@@ -196,8 +196,8 @@ export async function ensureSuiteIdentity(
     .insert({
       user_id: fixture.userId,
       workspace_id: fixture.workspaceId,
-      agent_id: agentId,
-      name: agentId,
+      agent_id: sbSlug,
+      name: sbSlug,
       role: 'Integration suite identity',
       metadata: { fixture: true, suite: true },
       backend: 'claude',
@@ -205,7 +205,7 @@ export async function ensureSuiteIdentity(
     .select('id')
     .single();
   if (error || !data) {
-    throw new Error(`Failed to create suite identity ${agentId}: ${error?.message}`);
+    throw new Error(`Failed to create suite identity ${sbSlug}: ${error?.message}`);
   }
   return data.id as string;
 }

@@ -2,11 +2,11 @@
  * ink chat Runtime Integration Tests
  *
  * Tests the real runtime wiring:
- * 1. PcpClient.callTool('recall') returns the shape our hooks expect
+ * 1. InkClient.callTool('recall') returns the shape our hooks expect
  * 2. turn_end is fire-and-forget — injections appear in NEXT turn's prompt
  * 3. Inbox messages enter the ledger and inform passive recall topic signal
  *
- * Requires PCP server on localhost:3001 (or INK_SERVER_URL).
+ * Requires Inkwell server on localhost:3001 (or INK_SERVER_URL).
  *
  * Run with:
  *   INK_SERVER_URL=http://localhost:3001 npx vitest run -c vitest.integration.config.ts \
@@ -23,40 +23,40 @@ import { isClientLocalTool, handleClientLocalTool } from './context-tools.js';
 
 // ─── Server check ───────────────────────────────────────────────
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 let serverAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
 }
 
-// ─── PcpClient (real instance) ──────────────────────────────────
+// ─── InkClient (real instance) ──────────────────────────────────
 
 // Dynamic import to avoid breaking when not running integration tests
-async function createPcpClient() {
-  const { PcpClient } = await import('../lib/pcp-client.js');
+async function createInkClient() {
+  const { InkClient } = await import('../lib/ink-client.js');
   const authPath = join(process.env.HOME || '', '.ink', 'auth.json');
-  return new PcpClient(PCP_URL, authPath);
+  return new InkClient(INK_URL, authPath);
 }
 
 // ─── Test 1: callTool('recall') shape validation ────────────────
 
-describe('PcpClient.callTool recall shape', () => {
+describe('InkClient.callTool recall shape', () => {
   it.skipIf(!serverAvailable)(
     'returns { success, memories } directly (not MCP wrapper)',
     async () => {
-      const pcp = await createPcpClient();
-      const result = await pcp.callTool('recall', {
+      const inkClient = await createInkClient();
+      const result = await inkClient.callTool('recall', {
         query: 'session routing',
-        agentId: 'wren',
+        sbSlug: 'wren',
         includeShared: true,
         limit: 3,
         recallMode: 'hybrid',
       });
 
-      // PcpClient.parseJsonRpcToolPayload extracts content[0].text and JSON-parses it.
+      // InkClient.parseJsonRpcToolPayload extracts content[0].text and JSON-parses it.
       // So we should get the inner object directly.
       expect(result.success).toBe(true);
       expect(Array.isArray(result.memories)).toBe(true);
@@ -76,14 +76,14 @@ describe('PcpClient.callTool recall shape', () => {
   it.skipIf(!serverAvailable)(
     'the callRecall wrapper produces the right shape for hooks',
     async () => {
-      const pcp = await createPcpClient();
+      const inkClient = await createInkClient();
 
       // This mirrors exactly what chat.ts does
       const callRecall = async (query: string, limit: number) => {
         try {
-          const result = await pcp.callTool('recall', {
+          const result = await inkClient.callTool('recall', {
             query,
-            agentId: 'wren',
+            sbSlug: 'wren',
             includeShared: true,
             limit,
             recallMode: 'hybrid',
@@ -114,14 +114,14 @@ describe('PcpClient.callTool recall shape', () => {
   );
 
   it.skipIf(!serverAvailable)('callRecall feeds correctly into passive recall hook', async () => {
-    const pcp = await createPcpClient();
+    const inkClient = await createInkClient();
     const ledger = new ContextLedger();
     const registry = new SbHookRegistry();
 
     const callRecall = async (query: string, limit: number) => {
-      const result = await pcp.callTool('recall', {
+      const result = await inkClient.callTool('recall', {
         query,
-        agentId: 'wren',
+        sbSlug: 'wren',
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -147,7 +147,7 @@ describe('PcpClient.callTool recall shape', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'How does session routing work for triggered agents?',
         assistantResponse: 'The server resolves the studio and spawns a backend session.',
@@ -201,7 +201,7 @@ describe('turn_end fire-and-forget semantics', () => {
     // 4. Fire turn_end (fire-and-forget in real code, but we await here for testing)
     const hookResult = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'Tell me about routing',
         assistantResponse: 'Routing works by resolving the studio...',
@@ -251,7 +251,7 @@ describe('turn_end fire-and-forget semantics', () => {
 
     await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: { userInput: 'test', assistantResponse: 'test', turnIndex: 1 },
     });
 
@@ -276,7 +276,7 @@ describe('turn_end fire-and-forget semantics', () => {
     await registry
       .fire('turn_end', {
         ledger,
-        runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+        runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
         lastTurn: { userInput: 'test', assistantResponse: 'test', turnIndex: 1 },
       })
       .catch(() => {
@@ -337,7 +337,7 @@ describe('Inbox polling + passive recall interaction', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'Let me look at that PR review request from Lumen',
         assistantResponse: 'Looking at PR #242 for context eviction changes...',
@@ -380,14 +380,14 @@ describe('Inbox polling + passive recall interaction', () => {
   it.skipIf(!serverAvailable)(
     'real recall after inbox-informed turn returns relevant memories',
     async () => {
-      const pcp = await createPcpClient();
+      const inkClient = await createInkClient();
       const ledger = new ContextLedger();
       const registry = new SbHookRegistry();
 
       const callRecall = async (query: string, limit: number) => {
-        const result = await pcp.callTool('recall', {
+        const result = await inkClient.callTool('recall', {
           query,
-          agentId: 'wren',
+          sbSlug: 'wren',
           includeShared: true,
           limit,
           recallMode: 'hybrid',
@@ -422,7 +422,7 @@ describe('Inbox polling + passive recall interaction', () => {
 
       const result = await registry.fire('turn_end', {
         ledger,
-        runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+        runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
         lastTurn: {
           userInput: 'Let me address Lumen review feedback on the hook system',
           assistantResponse:
@@ -480,14 +480,14 @@ describe('Budget utilization with bootstrap reservation', () => {
     // At 75% effective budget — no warning
     const r1 = await registry.fire('prompt_build', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.75 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.75 },
     });
     expect(r1.injected).toBe(0);
 
     // At 82% effective budget — warning fires
     const r2 = await registry.fire('prompt_build', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.82 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.82 },
     });
     expect(r2.injected).toBe(1);
     expect(ledger.listEntries()[0].content).toContain('82%');
@@ -508,7 +508,7 @@ describe('Budget utilization with bootstrap reservation', () => {
     // At 79% — recall fires
     const r1 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.79 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.79 },
       lastTurn: {
         userInput: 'How does session routing work for triggered agents?',
         assistantResponse: 'The server resolves the studio and spawns a session.',
@@ -520,7 +520,7 @@ describe('Budget utilization with bootstrap reservation', () => {
     // At 81% — recall suppressed
     const r2 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.81 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.81 },
       lastTurn: {
         userInput: 'What about the authentication flow?',
         assistantResponse: 'MCP uses self-issued JWTs.',

@@ -33,7 +33,7 @@ describe('resolveSbInWorkspace', () => {
     expect(await resolveSbInWorkspace(client as never, 'ws-2', 'wren')).toEqual({
       kind: 'sb',
       sbId: 'sb-wren-2',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'user-1',
       workspaceId: 'ws-2',
     });
@@ -82,7 +82,7 @@ describe('column shapes', () => {
     const sb = {
       kind: 'sb',
       sbId: 'sb-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       userId: 'u',
       workspaceId: 'w',
     } as const;

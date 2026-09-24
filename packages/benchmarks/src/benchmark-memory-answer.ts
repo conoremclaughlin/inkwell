@@ -132,7 +132,7 @@ async function main() {
         mode,
         variant,
         limit: TOP_K,
-        agentId: BENCHMARK_AGENT_ID,
+        sbSlug: BENCHMARK_AGENT_ID,
         topics: [seeded.topic],
       })
     );

@@ -6,7 +6,7 @@ import { mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
-  pcpCalls: [] as Array<{ tool: string; args: Record<string, unknown> }>,
+  inkCalls: [] as Array<{ tool: string; args: Record<string, unknown> }>,
   identity: { studioId: 'studio-test' } as { studioId?: string },
   callToolImpl: vi.fn(),
   runBackendImpl: vi.fn(),
@@ -18,15 +18,15 @@ vi.mock('../backends/identity.js', async (importOriginal) => {
   const original = await importOriginal<typeof import('../backends/identity.js')>();
   return {
     ...original,
-    resolveAgentId: (agent?: string) => agent || 'lumen',
+    resolveSlug: (agent?: string) => agent || 'lumen',
     readIdentityJson: () => testState.identity,
   };
 });
 
-vi.mock('../lib/pcp-client.js', () => ({
-  PcpClient: class MockPcpClient {
+vi.mock('../lib/ink-client.js', () => ({
+  InkClient: class MockInkClient {
     public async callTool(tool: string, args: Record<string, unknown> = {}): Promise<unknown> {
-      testState.pcpCalls.push({ tool, args });
+      testState.inkCalls.push({ tool, args });
       return testState.callToolImpl(tool, args);
     }
   },
@@ -93,7 +93,7 @@ describe('runChat integration', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-02-27T00:00:00.000Z'));
     testState.inputs = [];
-    testState.pcpCalls = [];
+    testState.inkCalls = [];
     testState.identity = { studioId: 'studio-test' };
     testState.callToolImpl.mockReset();
     testState.runBackendImpl.mockReset();
@@ -131,10 +131,10 @@ describe('runChat integration', () => {
       content: 'skill content',
     }));
 
-    testCwd = mkdtempSync(join(tmpdir(), 'pcp-chat-int-'));
+    testCwd = mkdtempSync(join(tmpdir(), 'ink-chat-int-'));
     process.chdir(testCwd);
     process.env.INK_TOOL_POLICY_PATH = join(testCwd, '.ink', 'security', 'tool-policy.json');
-    process.env.INK_DELEGATION_SECRET = 'pcp-delegation-test-secret';
+    process.env.INK_DELEGATION_SECRET = 'ink-delegation-test-secret';
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
   });
 
@@ -163,9 +163,9 @@ describe('runChat integration', () => {
     const backendRequest = testState.runBackendImpl.mock.calls[0][0] as { prompt: string };
     expect(backendRequest.prompt).toContain('Latest user message:\nhello from test');
 
-    const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+    const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
     expect(startCall?.args).toMatchObject({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       threadKey: 'heartbeat:myra',
       studioId: 'studio-test',
     });
@@ -196,7 +196,7 @@ describe('runChat integration', () => {
     expect(backendRequest.backend).toBe('gemini');
     expect(backendRequest.prompt).toContain('Latest user message:\nheartbeat pulse');
     // Non-interactive sessions are left resumable (update_session_state, not end_session).
-    expect(testState.pcpCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
+    expect(testState.inkCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
 
   /**
@@ -587,9 +587,9 @@ describe('runChat integration', () => {
     });
 
     // Attached mode skips start_session.
-    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'start_session')).toBe(false);
     // Attached mode should not end the existing session.
-    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'end_session')).toBe(false);
 
     const transcriptDir = join(testCwd, '.ink', 'runtime', 'repl');
     const transcriptFiles = readdirSync(transcriptDir).filter((entry) =>
@@ -638,8 +638,8 @@ describe('runChat integration', () => {
     expect(logText).toContain('history: 2 prior message(s) loaded');
   });
 
-  it('hydrates ledger context from PCP session context when no local transcript exists', async () => {
-    const sessionId = 'sess-pcp-history-1';
+  it('hydrates ledger context from Inkwell session context when no local transcript exists', async () => {
+    const sessionId = 'sess-ink-history-1';
     testState.callToolImpl.mockImplementation(async (tool: string) => {
       switch (tool) {
         case 'bootstrap':
@@ -690,7 +690,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-a111',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'implementing',
                 threadKey: 'pr:61',
@@ -700,7 +700,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-b222',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'reviewing',
                 threadKey: 'spec:cli-session-hooks',
@@ -726,8 +726,8 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
-    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'end_session')).toBe(false);
 
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).toContain('sess-b222');
@@ -744,7 +744,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-a111',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'implementing',
                 threadKey: 'pr:61',
@@ -754,7 +754,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-b222',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'reviewing',
                 threadKey: 'spec:cli-session-hooks',
@@ -821,14 +821,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:1',
                 startedAt: '2026-02-18T18:00:00.000Z',
               },
               {
                 id: 'sess-new',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:2',
                 startedAt: '2026-02-18T19:00:00.000Z',
@@ -900,14 +900,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:9',
                 startedAt: '2026-02-18T18:00:00.000Z',
               },
               {
                 id: 'sess-latest',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:10',
                 startedAt: '2026-02-18T19:00:00.000Z',
@@ -928,7 +928,7 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'start_session')).toBe(false);
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).toContain('auto-attached to latest session');
     expect(sessionStatusLine).toContain('sess-latest');
@@ -945,14 +945,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-wren-latest',
-                agentId: 'wren',
+                sbSlug: 'wren',
                 status: 'active',
                 threadKey: 'pr:99',
                 startedAt: '2026-02-18T20:00:00.000Z',
               },
               {
                 id: 'sess-lumen-older',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:12',
                 startedAt: '2026-02-18T18:00:00.000Z',
@@ -988,7 +988,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-wren-new',
-                agentId: 'wren',
+                sbSlug: 'wren',
                 studioId: 'studio-test',
                 status: 'active',
                 threadKey: 'pr:900',
@@ -996,7 +996,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-lumen-mid',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 studioId: 'studio-2',
                 status: 'active',
                 threadKey: 'pr:901',
@@ -1004,7 +1004,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-lumen-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 studioId: 'studio-3',
                 status: 'active',
                 threadKey: 'pr:902',
@@ -1069,8 +1069,8 @@ describe('runChat integration', () => {
     }
   });
 
-  it('supports gated /pcp tool execution with inline approval', async () => {
-    testState.inputs = ['/pcp send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
+  it('supports gated /ink tool execution with inline approval', async () => {
+    testState.inputs = ['/ink send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
       agent: 'lumen',
@@ -1078,8 +1078,8 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
-    expect(sendCall?.args).toEqual({ recipientAgentId: 'wren' });
+    const sendCall = testState.inkCalls.find((call) => call.tool === 'send_to_inbox');
+    expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(0);
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
@@ -1102,7 +1102,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-1',
                   content: 'please re-review',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'PR #50',
                   threadKey: 'pr:50',
                   createdAt: '2026-02-26T04:03:04.000Z',
@@ -1149,13 +1149,13 @@ describe('runChat integration', () => {
                 {
                   id: 'm-2',
                   content: 'second',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   createdAt: '2026-02-26T04:10:05.000Z',
                 },
                 {
                   id: 'm-1',
                   content: 'first',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   createdAt: '2026-02-26T04:10:01.000Z',
                 },
               ],
@@ -1200,7 +1200,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-auto-1',
                   content: 'Please handle PR 77 now.',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'Task request',
                   messageType: 'task_request',
                   threadKey: 'pr:77',
@@ -1257,7 +1257,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-existing',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 startedAt: '2026-02-26T04:16:00.000Z',
               },
@@ -1271,7 +1271,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-hydrated-1',
                   content: 'already hydrated',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'PR #77',
                   createdAt: '2026-02-26T04:15:00.000Z',
                 },
@@ -1318,20 +1318,20 @@ describe('runChat integration', () => {
                 {
                   id: 'm-skip-thread',
                   content: 'Wrong thread',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   threadKey: 'pr:999',
                   messageType: 'task_request',
                 },
                 {
                   id: 'm-skip-unscoped',
                   content: 'Missing thread/session metadata',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   messageType: 'task_request',
                 },
                 {
                   id: 'm-run',
                   content: 'Right thread',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   threadKey: 'pr:123',
                   messageType: 'task_request',
                 },
@@ -1617,7 +1617,7 @@ describe('runChat integration', () => {
   });
 
   it('applies policy gate to /mcp call with inline approval', async () => {
-    testState.inputs = ['/mcp call send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
+    testState.inputs = ['/mcp call send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
       agent: 'lumen',
@@ -1625,8 +1625,8 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
-    expect(sendCall?.args).toEqual({ recipientAgentId: 'wren' });
+    const sendCall = testState.inkCalls.find((call) => call.tool === 'send_to_inbox');
+    expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Granted once.');
   });
@@ -1635,7 +1635,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        'Running local tool.\n```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":1}}\n```\nDone.',
+        'Running local tool.\n```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":1}}\n```\nDone.',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1674,7 +1674,7 @@ describe('runChat integration', () => {
     expect(backendRequest.passthroughArgs).toEqual(['--allowedTools', '']);
     expect(backendRequest.prompt).toContain('Tool routing: local.');
 
-    const localToolCall = testState.pcpCalls.find(
+    const localToolCall = testState.inkCalls.find(
       (call) => call.tool === 'get_inbox' && call.args.limit === 1
     );
     expect(localToolCall).toBeTruthy();
@@ -1684,7 +1684,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":2}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":2}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1720,7 +1720,7 @@ describe('runChat integration', () => {
       passthroughArgs: string[];
     };
     expect(backendRequest.passthroughArgs).toEqual(['--allowed-tools', '']);
-    const localToolCall = testState.pcpCalls.find(
+    const localToolCall = testState.inkCalls.find(
       (call) => call.tool === 'get_inbox' && call.args.limit === 2
     );
     expect(localToolCall).toBeTruthy();
@@ -1730,7 +1730,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":3}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":3}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1766,7 +1766,7 @@ describe('runChat integration', () => {
       passthroughArgs: string[];
     };
     expect(backendRequest.passthroughArgs).toEqual([]);
-    const localToolCall = testState.pcpCalls.find(
+    const localToolCall = testState.inkCalls.find(
       (call) => call.tool === 'get_inbox' && call.args.limit === 3
     );
     expect(localToolCall).toBeTruthy();
@@ -1836,7 +1836,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"wren","status":"unread","limit":2}}\n```',
+            '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"wren","status":"unread","limit":2}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -1889,7 +1889,7 @@ describe('runChat integration', () => {
     expect(secondCall.prompt).toContain('get_inbox');
 
     // The tool should have been executed locally
-    const inboxCall = testState.pcpCalls.find((call) => call.tool === 'get_inbox');
+    const inboxCall = testState.inkCalls.find((call) => call.tool === 'get_inbox');
     expect(inboxCall).toBeTruthy();
 
     // Final output should be the summary (no tool blocks)
@@ -1902,7 +1902,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"wren","status":"unread","limit":1}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"wren","status":"unread","limit":1}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1947,7 +1947,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"wren","content":"ping"}}\n```',
+        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"wren","content":"ping"}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1967,7 +1967,7 @@ describe('runChat integration', () => {
 
     // In non-interactive mode there is no readline prompt, so this tool call must be denied
     // instead of crashing from an uninitialized readline reference.
-    expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Local tool denied (send_to_inbox)');
   });
@@ -1982,7 +1982,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":1}}\n```',
+            '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":1}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -2031,7 +2031,7 @@ describe('runChat integration', () => {
     });
 
     // get_inbox should have been executed after auto-approval
-    const inboxCall = testState.pcpCalls.find((call) => call.tool === 'get_inbox');
+    const inboxCall = testState.inkCalls.find((call) => call.tool === 'get_inbox');
     expect(inboxCall).toBeTruthy();
   });
 
@@ -2040,7 +2040,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"myra","content":"hello"}}\n```',
+        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"myra","content":"hello"}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -2057,7 +2057,7 @@ describe('runChat integration', () => {
     });
 
     // send_to_inbox should have been denied (non-interactive auto-denies promptable tools)
-    expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
+    expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('send_to_inbox');
   });
@@ -2072,7 +2072,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"myra","content":"hi"}}\n```',
+            '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"myra","content":"hi"}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -2157,7 +2157,7 @@ describe('runChat integration', () => {
     expect(request.id).toBeTruthy();
 
     // send_to_inbox should have been executed after approval response was piped to stdin
-    expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
+    expect(testState.inkCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
   }, 10_000);
 
   it('leaves the hard timeout unset and applies the idle timeout for non-interactive turns', async () => {
@@ -2352,15 +2352,15 @@ describe('runChat integration', () => {
       pollSeconds: '999',
     });
 
-    const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
+    const sendCall = testState.inkCalls.find((call) => call.tool === 'send_to_inbox');
     expect(sendCall).toBeTruthy();
     const metadata = sendCall?.args?.metadata as Record<string, unknown> | undefined;
     const token = metadata?.delegationToken;
     expect(typeof token).toBe('string');
 
     const verified = verifyDelegationToken(String(token), process.env.INK_DELEGATION_SECRET || '', {
-      expectedIssuerAgentId: 'lumen',
-      expectedDelegateeAgentId: 'wren',
+      expectedIssuerSlug: 'lumen',
+      expectedDelegateeSlug: 'wren',
       expectedThreadKey: 'pr:123',
       requiredScopes: ['send_to_inbox', 'trigger_agent'],
     });
@@ -2370,8 +2370,8 @@ describe('runChat integration', () => {
   it('renders delegation metadata label for inbox messages', async () => {
     const delegationToken = mintDelegationToken(
       {
-        issuerAgentId: 'wren',
-        delegateeAgentId: 'lumen',
+        issuerSlug: 'wren',
+        delegateeSlug: 'lumen',
         scopes: ['send_to_inbox'],
         threadKey: 'pr:50',
       },
@@ -2393,7 +2393,7 @@ describe('runChat integration', () => {
                 {
                   id: 'delegated-1',
                   content: 'please take this action',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'Delegated task',
                   threadKey: 'pr:50',
                   metadata: { delegationToken },
@@ -2432,7 +2432,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall).toBeDefined();
       expect(startCall!.args.contactId).toBe('contact-alice-uuid');
     });
@@ -2460,11 +2460,11 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const aliceStart = testState.pcpCalls.find((c) => c.tool === 'start_session');
+      const aliceStart = testState.inkCalls.find((c) => c.tool === 'start_session');
       expect(aliceStart!.args.contactId).toBe('contact-alice');
 
       // Reset for Sender B
-      testState.pcpCalls = [];
+      testState.inkCalls = [];
       testState.callToolImpl.mockImplementation(async (tool: string) => {
         switch (tool) {
           case 'bootstrap':
@@ -2486,7 +2486,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const bobStart = testState.pcpCalls.find((c) => c.tool === 'start_session');
+      const bobStart = testState.inkCalls.find((c) => c.tool === 'start_session');
       expect(bobStart!.args.contactId).toBe('contact-bob');
 
       // Different contacts → different session IDs requested
@@ -2502,7 +2502,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall).toBeDefined();
       expect(startCall!.args.contactId).toBeUndefined();
     });
@@ -2537,7 +2537,7 @@ describe('runChat integration', () => {
         pollSeconds: '999',
       });
 
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall).toBeDefined();
       expect(startCall!.args.contactId).toBe('resolved-contact-123');
 
@@ -2575,7 +2575,7 @@ describe('runChat integration', () => {
       expect(backendRequest.prompt).toContain('what is my balance?');
 
       // Session should have been started with contactId
-      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      const startCall = testState.inkCalls.find((call) => call.tool === 'start_session');
       expect(startCall!.args.contactId).toBe('contact-alice');
     });
   });

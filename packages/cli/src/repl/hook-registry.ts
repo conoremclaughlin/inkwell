@@ -43,7 +43,7 @@ export interface HookContext {
 
 export interface HookRuntimeState {
   sessionId?: string;
-  agentId?: string;
+  sbSlug?: string;
   backend?: string;
   budgetUtilization?: number; // 0-1
   turnCount: number;
@@ -55,7 +55,7 @@ export interface InjectedLedgerEntry {
   source: string;
   /** Hook that produced this injection */
   hookName?: string;
-  /** PCP memory ID if this came from recall */
+  /** Inkwell memory ID if this came from recall */
   memoryId?: string;
   /** Relevance score if available */
   score?: number;

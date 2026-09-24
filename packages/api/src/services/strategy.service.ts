@@ -26,7 +26,7 @@ import type {
 } from '../data/repositories/task-groups.repository';
 import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { resolveAgentSlug } from '../auth/resolve-identity';
+import { resolveSbSlug } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
 import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
@@ -51,6 +51,19 @@ export interface StartStrategyInput {
   planUri?: string;
   executionMode?: ExecutionMode;
 }
+
+/**
+ * What a watchdog tick did.
+ *
+ * `skipped` is the one that matters: a watchdog that cancels itself because
+ * its group completed has done its job, and must not be reported as a failed
+ * beat. Collapsing it into `false` made a finished strategy look identical to
+ * a monitor that stopped running.
+ */
+export type WatchdogOutcome =
+  | { outcome: 'fired' }
+  | { outcome: 'skipped'; reason: string }
+  | { outcome: 'failed'; error: string };
 
 export interface StrategyAdvanceResult {
   /** What happened after completing the task */
@@ -196,7 +209,7 @@ export class StrategyService {
 
   private async resolveOwnerSlug(group: TaskGroup): Promise<string | null> {
     if (!group.sb_id) return null;
-    return resolveAgentSlug(this.dataComposer.getClient(), group.sb_id);
+    return resolveSbSlug(this.dataComposer.getClient(), group.sb_id);
   }
 
   /**
@@ -265,7 +278,7 @@ export class StrategyService {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       if (!metadata.studioId) {
         const ownerSlug = input.sbId
-          ? await resolveAgentSlug(this.dataComposer.getClient(), input.sbId)
+          ? await resolveSbSlug(this.dataComposer.getClient(), input.sbId)
           : null;
         if (!ownerSlug) {
           throw new Error('Could not resolve agent slug for persistent studio branch naming');
@@ -491,7 +504,7 @@ export class StrategyService {
 
         // Notify supervisor too if configured
         if (config.supervisorId) {
-          const supervisorSlug = await resolveAgentSlug(
+          const supervisorSlug = await resolveSbSlug(
             this.dataComposer.getClient(),
             config.supervisorId
           );
@@ -626,7 +639,7 @@ export class StrategyService {
 
       // Notify supervisor at check-in points too
       if (config.supervisorId) {
-        const supervisorSlug = await resolveAgentSlug(
+        const supervisorSlug = await resolveSbSlug(
           this.dataComposer.getClient(),
           config.supervisorId
         );
@@ -1011,11 +1024,11 @@ export class StrategyService {
    */
   private async notifyDispatcher(
     group: TaskGroup,
-    notifyAgentId: string | undefined,
+    notifySlug: string | undefined,
     message: string,
     userId: string
   ): Promise<boolean> {
-    if (!notifyAgentId) return false;
+    if (!notifySlug) return false;
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
@@ -1028,8 +1041,8 @@ export class StrategyService {
       await handleSendToInbox(
         {
           userId,
-          recipientAgentId: notifyAgentId,
-          ...(ownerSlug ? { senderAgentId: ownerSlug } : {}),
+          recipientSlug: notifySlug,
+          ...(ownerSlug ? { senderSlug: ownerSlug } : {}),
           recipientStudioSlug: 'main',
           content: message,
           messageType: 'notification',
@@ -1052,7 +1065,7 @@ export class StrategyService {
           : [{ sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } } as const])
       );
 
-      logger.info(`Strategy notification sent to ${notifyAgentId} for group ${group.id}`);
+      logger.info(`Strategy notification sent to ${notifySlug} for group ${group.id}`);
       return true;
     } catch (err) {
       logger.warn('Strategy notification failed:', err);
@@ -1109,8 +1122,8 @@ export class StrategyService {
       await handleSendToInbox(
         {
           userId: group.user_id,
-          recipientAgentId: ownerSlug,
-          senderAgentId: ownerSlug,
+          recipientSlug: ownerSlug,
+          senderSlug: ownerSlug,
           // Prefer studioId (UUID); fall back to slug only when UUID is absent.
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
@@ -1209,7 +1222,7 @@ export class StrategyService {
     // siblings (spec:studio-materialization v8; studio-paths.ts). Persistent
     // strategy studios below keep the legacy sibling location — durable.
     const worktreePath = ephemeralWorktreePath({
-      agentId: ownerSlug,
+      sbSlug: ownerSlug,
       repoRoot: mainRoot,
       leaf: slug,
     });
@@ -1252,7 +1265,7 @@ export class StrategyService {
     try {
       const studio = await this.dataComposer.repositories.studios.create({
         userId: group.user_id,
-        agentId: ownerSlug,
+        sbSlug: ownerSlug,
         repoRoot: mainRoot,
         worktreePath,
         branch,
@@ -1304,7 +1317,7 @@ export class StrategyService {
   private async createPersistentStudio(
     group: TaskGroup,
     slug: string,
-    ownerAgentId: string
+    ownerSlug: string
   ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
     const metadata = (group.metadata || {}) as Record<string, unknown>;
     const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
@@ -1315,8 +1328,8 @@ export class StrategyService {
       return null;
     }
 
-    const agentId = ownerAgentId;
-    const branch = `${agentId}/${slug}`;
+    const sbSlug = ownerSlug;
+    const branch = `${sbSlug}/${slug}`;
 
     let mainRoot = repoRoot;
     try {
@@ -1369,7 +1382,7 @@ export class StrategyService {
     try {
       const studio = await this.dataComposer.repositories.studios.create({
         userId: group.user_id,
-        agentId,
+        sbSlug,
         repoRoot: mainRoot,
         worktreePath,
         branch,
@@ -1535,10 +1548,10 @@ export class StrategyService {
       return { containerName: '', success: false, error: msg };
     }
 
-    const ownerSlug = (await this.resolveOwnerSlug(group)) || studio.agentId || 'unknown';
+    const ownerSlug = (await this.resolveOwnerSlug(group)) || studio.sbSlug || 'unknown';
     const result = await this.sandboxOrchestrator.spinUp({
       userId: group.user_id,
-      agentId: ownerSlug,
+      sbSlug: ownerSlug,
       studioId: studio.id,
       studioSlug: studio.slug || undefined,
       worktreePath: studio.worktreePath,
@@ -1583,18 +1596,25 @@ export class StrategyService {
    * strategy is no longer active or there is no pending work, then routes a
    * task-aware prompt to the owner agent in the assigned studio.
    *
-   * Returns true on successful trigger (reminder should be marked delivered).
-   * Returns false when the watchdog decides no action is needed — the heartbeat
-   * treats this as a failed delivery today, which re-runs the cron next tick.
-   * That's acceptable for now; the strategy will either become active again
-   * (next tick triggers) or be cancelled (watchdog reminder is cancelled).
+   * Three outcomes, and the distinction is load-bearing:
+   *
+   * - `fired`    — the owner agent was triggered. A delivered beat.
+   * - `skipped`  — the watchdog decided no action was needed and cancelled
+   *                itself: the group is gone, finished, paused, or has no
+   *                remaining task. This is the watchdog working correctly.
+   * - `failed`   — the trigger was attempted and did not happen.
+   *
+   * This used to be a bare boolean, so all three collapsed into true/false and
+   * a strategy completing normally was indistinguishable from a monitor going
+   * down. Once failed beats started raising outage alerts (2026-09-11) that
+   * conflation would have paged a human every time a task group finished.
    */
-  async triggerWatchdog(groupId: string): Promise<boolean> {
+  async triggerWatchdog(groupId: string): Promise<WatchdogOutcome> {
     const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
     if (!group) {
       logger.warn(`Strategy watchdog: group ${groupId} not found, cancelling orphaned watchdog`);
       await this.cancelWatchdogReminder(groupId);
-      return false;
+      return { outcome: 'skipped', reason: `group ${groupId} no longer exists` };
     }
 
     // Log every cron wakeup so we can trace heartbeat frequency in the activity stream.
@@ -1617,7 +1637,10 @@ export class StrategyService {
         `Watchdog skipped and self-cancelled: group is ${group.status}`,
         { reason: 'inactive_group' }
       );
-      return false;
+      return {
+        outcome: 'skipped',
+        reason: `group is ${group.status} (strategy=${group.strategy ?? 'null'})`,
+      };
     }
 
     // Find the current in-progress task. If none, fall back to the next
@@ -1641,7 +1664,7 @@ export class StrategyService {
           currentTaskIndex: group.current_task_index,
         }
       );
-      return false;
+      return { outcome: 'skipped', reason: 'no pending or in-progress task remaining' };
     }
 
     // If the strategy uses a sandbox, spin up (or reuse) the container before
@@ -1665,7 +1688,12 @@ export class StrategyService {
           status: 'paused',
           strategy_paused_at: new Date().toISOString(),
         });
-        return false;
+        // A genuine failure, not a no-op: the strategy wanted to run and the
+        // sandbox it requires would not come up.
+        return {
+          outcome: 'failed',
+          error: `sandbox required but spin-up failed: ${sandboxResult.error}`,
+        };
       }
 
       if (sandboxResult?.success) {
@@ -1673,7 +1701,18 @@ export class StrategyService {
       }
     }
 
-    return this.triggerOwnerAgent(group, currentTask, 'watchdog', sandboxContainerName);
+    const fired = await this.triggerOwnerAgent(
+      group,
+      currentTask,
+      'watchdog',
+      sandboxContainerName
+    );
+    return fired
+      ? { outcome: 'fired' }
+      : {
+          outcome: 'failed',
+          error: `could not trigger owner agent for group ${groupId} (task ${currentTask.id})`,
+        };
   }
 
   /**
@@ -1795,7 +1834,7 @@ export class StrategyService {
     );
 
     if (config.supervisorId) {
-      const supervisorSlug = await resolveAgentSlug(
+      const supervisorSlug = await resolveSbSlug(
         this.dataComposer.getClient(),
         config.supervisorId
       );
@@ -1868,7 +1907,7 @@ export class StrategyService {
       const agentSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
       await this.dataComposer.repositories.activityStream.logActivity({
         userId: group.user_id,
-        agentId: agentSlug,
+        sbSlug: agentSlug,
         type: 'state_change',
         subtype,
         content,

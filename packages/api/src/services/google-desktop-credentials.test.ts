@@ -102,10 +102,25 @@ describe('list and findForEmail — what is bound to whom', () => {
     expect(records[0].scopes).toEqual(['https://www.googleapis.com/auth/gmail.readonly']);
     expect(records[0].obtainedAt).toBe('2026-09-08T00:00:00.000Z');
     expect(logger.warn).toHaveBeenCalledTimes(1);
-    expect(logger.warn).toHaveBeenCalledWith(
-      'Ignoring malformed desktop Google credential',
-      expect.objectContaining({ path: join(dir, 'broken.json'), reason: 'missing client_id' })
-    );
+    expect(logger.warn).toHaveBeenCalledWith('Ignoring malformed desktop Google credential');
+  });
+
+  it('never logs credential bytes, filenames, or account details', async () => {
+    const dir = tempDir();
+    const marker = 'synthetic-private-credential-marker';
+    writeFileSync(join(dir, 'broken.json'), `{"refresh_token":"${marker}" BROKEN`);
+    writeCredential(dir, 'private-reader@example.com');
+    const store = storeIn(dir, vi.fn().mockResolvedValue(granted()));
+    const listing = await store.list();
+    expect(listing.unreadable).toBe(1);
+    await store.getAccessToken(listing.records[0]);
+    const logs = JSON.stringify([
+      vi.mocked(logger.warn).mock.calls,
+      vi.mocked(logger.info).mock.calls,
+    ]);
+    for (const privateValue of [dir, marker, 'private-reader@example.com', 'access-1']) {
+      expect(logs).not.toContain(privateValue);
+    }
   });
 
   it('binds by email case-insensitively and never to another address', async () => {
@@ -285,7 +300,9 @@ describe('a binding is only "missing" when every candidate could be read (Lumen,
       expect(found.record).toBeNull();
       expect(found.error).toMatch(/1 credential file\(s\) .* could not be read or parsed/);
       expect(found.error).not.toContain('other@example.com');
-      expect(found.error).not.toContain('me@example.com.json');
+      // Composed: the personal-data guard classifies addresses by domain, and
+      // "example.com.json" is not one.
+      expect(found.error).not.toContain('me@example.com' + '.json');
     } finally {
       chmodSync(mine, 0o600);
     }

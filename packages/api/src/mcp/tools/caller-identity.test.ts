@@ -30,23 +30,23 @@ const contactSession = '55555555-5555-4555-8555-555555555555';
 const sbId = '33333333-3333-4333-8333-333333333333';
 
 const rows: Record<string, object> = {
-  [ownSession]: { id: ownSession, userId: 'owner', agentId: 'myra', sbId },
+  [ownSession]: { id: ownSession, userId: 'owner', sbSlug: 'myra', sbId },
   [foreignUserSession]: {
     id: foreignUserSession,
     userId: 'someone-else',
-    agentId: 'wren',
+    sbSlug: 'wren',
     sbId: 'sb-wren',
   },
   [peerIdentitySession]: {
     id: peerIdentitySession,
     userId: 'owner',
-    agentId: 'wren',
+    sbSlug: 'wren',
     sbId: 'sb-wren',
   },
   [contactSession]: {
     id: contactSession,
     userId: 'owner',
-    agentId: 'myra',
+    sbSlug: 'myra',
     sbId,
     contactId: 'contact-b',
   },
@@ -66,10 +66,10 @@ function composer(opts: { throws?: boolean } = {}) {
 /** An SB's own token: signed identity, no signed session claim. */
 const boundMyra = {
   userId: 'owner',
-  agentId: 'myra',
+  sbSlug: 'myra',
   sbId,
   agentTokenBound: true,
-  tokenAgentId: 'myra',
+  tokenSlug: 'myra',
   tokenSbId: sbId,
 };
 
@@ -111,10 +111,10 @@ describe('resolveAttributedSession', () => {
 
   it('stamps a header-asserted session for a user token when it belongs to the same user', async () => {
     const { composer: c } = composer();
-    // The normal local shape: user bearer, ctx.agentId enriched from the
+    // The normal local shape: user bearer, ctx.sbSlug enriched from the
     // ambient session, no signed session claim.
     const result = await runWithRequestContext(
-      { userId: 'owner', agentId: 'myra', sbId, sessionId: ownSession },
+      { userId: 'owner', sbSlug: 'myra', sbId, sessionId: ownSession },
       () => resolveAttributedSession(c)
     );
     expect(result).toEqual({ sessionId: ownSession, via: 'header' });
@@ -209,8 +209,8 @@ describe('loadAuthorizedAmbientSession', () => {
     expect(result.reason).toBeUndefined();
   });
 
-  it('applies the same-user floor to user tokens even with an explicit agentId', async () => {
-    // An explicit agentId on a user token is attribution, never authority: it
+  it('applies the same-user floor to user tokens even with an explicit sbSlug', async () => {
+    // An explicit sbSlug on a user token is attribution, never authority: it
     // does not turn the caller into an agent-bound one, and it does not lift
     // the cross-user floor.
     const { composer: c } = composer();
@@ -227,7 +227,7 @@ describe('resolveCallerIdentity', () => {
     const caller = runWithRequestContext(
       {
         ...boundMyra,
-        agentId: 'enriched-slug',
+        sbSlug: 'enriched-slug',
         sbId: 'enriched-sb',
         contactId: 'header-contact',
         tokenContactId: 'signed-contact',
@@ -236,16 +236,16 @@ describe('resolveCallerIdentity', () => {
     );
     expect(caller).toEqual({
       sbId,
-      agentId: 'myra',
+      sbSlug: 'myra',
       contactId: 'signed-contact',
       agentBound: true,
     });
   });
 
   it('keeps a user token unbound when handed an explicit identity', () => {
-    const caller = runWithRequestContext({ userId: 'owner', agentId: 'myra' }, () =>
+    const caller = runWithRequestContext({ userId: 'owner', sbSlug: 'myra' }, () =>
       resolveCallerIdentity('myra')
     );
-    expect(caller).toEqual({ agentId: 'myra', agentBound: false });
+    expect(caller).toEqual({ sbSlug: 'myra', agentBound: false });
   });
 });

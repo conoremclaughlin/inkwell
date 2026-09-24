@@ -50,8 +50,8 @@ function builder(table: string) {
 vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({ from: (table: string) => builder(table) })),
 }));
-vi.mock('../config/env.js', () => ({
-  env: { SUPABASE_URL: 'http://localhost:54321', SUPABASE_SECRET_KEY: 'mock' },
+vi.mock('../config/env.js', async () => ({
+  env: { ...(await import('../test/fake-env')).fakeEnv },
 }));
 vi.mock('../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -63,7 +63,7 @@ import { logger } from '../utils/logger';
 const params = {
   userId: 'user-1',
   sbId: 'sb-new',
-  agentId: 'myra',
+  sbSlug: 'myra',
   deliveryChannel: 'telegram',
   deliveryTarget: '123',
 };
@@ -81,7 +81,7 @@ describe('ensureDefaultReminders — candidate lookup failure (PR #595, Lumen)',
     expect(state.inserts).toHaveLength(0);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('identity lookup failed'),
-      expect.objectContaining({ agentId: 'myra', sbId: 'sb-new' })
+      expect.objectContaining({ sbSlug: 'myra', sbId: 'sb-new' })
     );
   });
 

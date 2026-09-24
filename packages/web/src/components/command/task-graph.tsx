@@ -109,7 +109,7 @@ function TaskNodeComponent({ data }: { data: Record<string, unknown> }) {
       </div>
       <div className="text-[10px] mt-1" style={{ color: skin.colors.textMuted }}>
         {isGate ? 'verification' : status}
-        {data.agentId ? ` · ${data.agentId}` : ''}
+        {data.sbSlug ? ` · ${data.sbSlug}` : ''}
         {!isGate && data.blocked ? ' · gated' : ''}
       </div>
       {execution ? (
@@ -417,7 +417,7 @@ export function buildGroupFlow(
         label: task.title,
         status: task.status,
         priority: task.priority,
-        agentId: task.agentId,
+        sbSlug: task.sbSlug,
         blocked: dependenciesFetched(task.id).length > 0,
         cyclic: cyclic.has(task.id),
         taskType: task.taskType,
@@ -705,12 +705,12 @@ export function TaskGraph() {
                   >
                     {t.status}
                   </span>
-                  {t.agentId && (
+                  {t.sbSlug && (
                     <span
                       className="shrink-0 text-[10px]"
                       style={{ color: skin.colors.textMuted, fontFamily: skin.fonts.mono }}
                     >
-                      {t.agentId}
+                      {t.sbSlug}
                     </span>
                   )}
                 </div>

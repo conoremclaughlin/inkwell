@@ -1,7 +1,7 @@
 /**
  * Who is calling a thread tool, as a principal (spec inkmail-thread-scope §3).
  *
- * An MCP caller names itself by slug (`agentId`), pinned to the token when
+ * An MCP caller names itself by slug (`sbSlug`), pinned to the token when
  * the connection is bound to an identity. The canonical identity comes from
  * the request context's `sbId` when the token carries one; otherwise the
  * slug must resolve to exactly one workspace-scoped identity the user owns.
@@ -60,7 +60,7 @@ export async function roleOfUserIn(
 }
 
 async function withOwnerMembership(client: Client, sb: SbPrincipal): Promise<CallerSb> {
-  const ownerRole = await roleOfUserIn(client, sb.workspaceId, sb.userId, `${sb.agentId}'s owner`);
+  const ownerRole = await roleOfUserIn(client, sb.workspaceId, sb.userId, `${sb.sbSlug}'s owner`);
   return { ...sb, ownerRole };
 }
 
@@ -77,43 +77,43 @@ interface IdentityRow {
 export async function resolveCallerSb(
   client: Client,
   userId: string,
-  agentId: string
+  sbSlug: string
 ): Promise<CallerSb> {
   const reqCtx = getRequestContext() || getSessionContext();
   const ctxSbId = reqCtx?.sbId;
   if (ctxSbId) {
     const sb = await resolveSbById(client, ctxSbId);
-    if (sb && sb.agentId === agentId) return withOwnerMembership(client, sb);
+    if (sb && sb.sbSlug === sbSlug) return withOwnerMembership(client, sb);
     // A token bound to one identity naming another slug is the mismatch
     // enforce-identity guards against; fall through to the owned-slug rule
     // only when the bound identity is gone.
     if (sb) {
-      throw new Error(`Agent identity mismatch: token is ${sb.agentId}, call names ${agentId}`);
+      throw new Error(`Agent identity mismatch: token is ${sb.sbSlug}, call names ${sbSlug}`);
     }
   }
   const { data, error } = await client
     .from('agent_identities')
     .select('id, agent_id, user_id, workspace_id')
     .eq('user_id', userId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .not('workspace_id', 'is', null);
   if (error) {
-    throw new Error(`Failed to resolve caller ${agentId}: ${error.message}`);
+    throw new Error(`Failed to resolve caller ${sbSlug}: ${error.message}`);
   }
   const rows = (data || []) as IdentityRow[];
   if (rows.length === 0) {
-    throw new Error(`Unknown agent for user: ${agentId}. Register in agent_identities first.`);
+    throw new Error(`Unknown agent for user: ${sbSlug}. Register in agent_identities first.`);
   }
   if (rows.length > 1) {
     throw new Error(
-      `Agent ${agentId} exists in ${rows.length} of your workspaces; the connection must be bound to one identity`
+      `Agent ${sbSlug} exists in ${rows.length} of your workspaces; the connection must be bound to one identity`
     );
   }
   const row = rows[0];
   return withOwnerMembership(client, {
     kind: 'sb',
     sbId: row.id,
-    agentId: row.agent_id,
+    sbSlug: row.agent_id,
     userId: row.user_id,
     workspaceId: row.workspace_id as string,
   });
@@ -121,17 +121,17 @@ export async function resolveCallerSb(
 
 /**
  * The workspace a tool call acts in when the caller may be anonymous
- * (add_thread_participant's `addedByAgentId` is optional): the named SB's
+ * (add_thread_participant's `addedBySlug` is optional): the named SB's
  * workspace, else the token-bound identity's, else the user's personal one
  * (§6: personal is the no-selection fallback).
  */
 export async function resolveCallerWorkspace(
   client: Client,
   userId: string,
-  agentId?: string | null
+  sbSlug?: string | null
 ): Promise<{ workspaceId: string; sb: CallerSb | null; role: WorkspaceMemberRole }> {
-  if (agentId) {
-    const sb = await resolveCallerSb(client, userId, agentId);
+  if (sbSlug) {
+    const sb = await resolveCallerSb(client, userId, sbSlug);
     return { workspaceId: sb.workspaceId, sb, role: sb.ownerRole };
   }
   const reqCtx = getRequestContext() || getSessionContext();

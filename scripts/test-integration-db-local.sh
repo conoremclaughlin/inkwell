@@ -2,110 +2,22 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKDIR_BASE="${INTEGRATION_SUPABASE_WORKDIR_BASE:-${TMPDIR:-/tmp}}"
-TEMP_DIR="$(mktemp -d "${WORKDIR_BASE%/}/pcp-supabase-it-XXXXXX")"
-SUPABASE_WORKDIR="${TEMP_DIR}"
-SUPABASE_DIR="${SUPABASE_WORKDIR}/supabase"
-CONFIG_PATH="${SUPABASE_DIR}/config.toml"
-
-# Keep this stack isolated from any existing local/remote setup.
-API_PORT="${INTEGRATION_SUPABASE_API_PORT:-55421}"
-DB_PORT="${INTEGRATION_SUPABASE_DB_PORT:-55422}"
-STUDIO_PORT="${INTEGRATION_SUPABASE_STUDIO_PORT:-55423}"
-INBUCKET_PORT="${INTEGRATION_SUPABASE_INBUCKET_PORT:-55424}"
-INBUCKET_SMTP_PORT="${INTEGRATION_SUPABASE_INBUCKET_SMTP_PORT:-55425}"
-INBUCKET_POP3_PORT="${INTEGRATION_SUPABASE_INBUCKET_POP3_PORT:-55426}"
-PROJECT_ID="${INTEGRATION_SUPABASE_PROJECT_ID:-pcp-integration}"
-EXCLUDED_CONTAINERS="${INTEGRATION_SUPABASE_EXCLUDE:-studio,mailpit,logflare,vector,supavisor}"
-
-cleanup() {
-  if [[ "${INTEGRATION_KEEP_SUPABASE:-0}" == "1" ]]; then
-    echo "[integration-db] Leaving local Supabase running for inspection (INTEGRATION_KEEP_SUPABASE=1)."
-    echo "[integration-db] workdir=${SUPABASE_WORKDIR}"
-    return
-  fi
-
-  if command -v supabase >/dev/null 2>&1; then
-    supabase stop --workdir "${SUPABASE_WORKDIR}" --no-backup >/dev/null 2>&1 || true
-  fi
-
-  rm -rf "${TEMP_DIR}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT INT TERM
-
-if ! command -v supabase >/dev/null 2>&1; then
-  echo "Supabase CLI is required. Install via: brew install supabase/tap/supabase" >&2
-  exit 1
+# Executed normally, the Python parent owns locks and stack lifecycle. When
+# sourced by that parent, run only env derivation and the suite. Keeping these
+# together preserves the endpoint safety checks for both cold and warm runs.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  exec python3 "${ROOT_DIR}/scripts/lib/integration-stack.py" "${BASH_SOURCE[0]}" "$@"
 fi
-
-if ! command -v docker >/dev/null 2>&1; then
-  echo "Docker is required to run local Supabase integration tests." >&2
-  exit 1
-fi
-
-if ! docker info >/dev/null 2>&1; then
-  echo "Docker is installed but the daemon is not running." >&2
-  echo "Start Docker Desktop (or your docker daemon) and retry." >&2
-  exit 1
-fi
-
-echo "[integration-db] Preparing isolated Supabase workdir: ${SUPABASE_WORKDIR}"
-cp -R "${ROOT_DIR}/supabase" "${SUPABASE_DIR}"
-
-# Rehearsal mode (spec inkmail-thread-scope §4): withhold every migration at or
-# after a timestamp so the stack comes up at the OLDER schema, and a test can
-# execute a withheld migration file itself — inside a transaction it rolls
-# back — against fixtures it seeded. The withheld files are read from the
-# real repository (INTEGRATION_MIGRATIONS_DIR), never from this copy.
-if [[ -n "${INTEGRATION_MIGRATIONS_UNTIL:-}" ]]; then
-  withheld=0
-  for migration in "${SUPABASE_DIR}/migrations/"*.sql; do
-    stamp="$(basename "${migration}")"
-    stamp="${stamp%%_*}"
-    if [[ "${stamp}" > "${INTEGRATION_MIGRATIONS_UNTIL}" || "${stamp}" == "${INTEGRATION_MIGRATIONS_UNTIL}" ]]; then
-      rm "${migration}"
-      withheld=$((withheld + 1))
-    fi
-  done
-  echo "[integration-db] Rehearsal: applying migrations before ${INTEGRATION_MIGRATIONS_UNTIL} (${withheld} withheld)"
-fi
-export INTEGRATION_MIGRATIONS_DIR="${ROOT_DIR}/supabase/migrations"
-
-python3 - "$CONFIG_PATH" "$API_PORT" "$DB_PORT" "$STUDIO_PORT" "$INBUCKET_PORT" "$INBUCKET_SMTP_PORT" "$INBUCKET_POP3_PORT" "$PROJECT_ID" <<'PY'
-import pathlib
-import re
-import sys
-
-config_path = pathlib.Path(sys.argv[1])
-api_port = sys.argv[2]
-db_port = sys.argv[3]
-studio_port = sys.argv[4]
-inbucket_port = sys.argv[5]
-smtp_port = sys.argv[6]
-pop3_port = sys.argv[7]
-project_id = sys.argv[8]
-
-text = config_path.read_text()
-text = re.sub(r'(?m)^(port\s*=\s*)54321$', rf'\g<1>{api_port}', text)
-text = re.sub(r'(?m)^(port\s*=\s*)54322$', rf'\g<1>{db_port}', text)
-text = re.sub(r'(?m)^(port\s*=\s*)54323$', rf'\g<1>{studio_port}', text)
-text = re.sub(r'(?m)^(port\s*=\s*)54324$', rf'\g<1>{inbucket_port}', text)
-text = re.sub(r'(?m)^(smtp_port\s*=\s*)54325$', rf'\g<1>{smtp_port}', text)
-text = re.sub(r'(?m)^(pop3_port\s*=\s*)54326$', rf'\g<1>{pop3_port}', text)
-
-if re.search(r'(?m)^project_id\s*=', text):
-  text = re.sub(r'(?m)^project_id\s*=.*$', f'project_id = "{project_id}"', text)
-else:
-  text = f'project_id = "{project_id}"\n\n{text}'
-
-config_path.write_text(text)
-PY
-
-echo "[integration-db] Starting isolated Supabase stack..."
-supabase start --workdir "${SUPABASE_WORKDIR}" --exclude "${EXCLUDED_CONTAINERS}" >/dev/null
-
-echo "[integration-db] Resetting DB (migrations + seed)..."
-supabase db reset --workdir "${SUPABASE_WORKDIR}" --local >/dev/null
+SUPABASE_WORKDIR="${INTEGRATION_MANAGED_WORKDIR:?Use the managed harness entry point}"
+API_PORT="${INTEGRATION_MANAGED_API_PORT:?Missing managed API port}"
+DB_PORT="${INTEGRATION_MANAGED_DB_PORT:?Missing managed DB port}"
+PROJECT_ID="${INTEGRATION_SUPABASE_PROJECT_ID:-ink-integration}"
+# Include a five-minute prelude: low-volume REST reset/reconnect events can
+# predate this sourced suite (especially on warm runs). This is a bounded
+# lookback, not the complete retained stack history. Python is portable across
+# GNU/BSD date implementations and is already required by the parent harness.
+DIAGNOSTICS_INVOKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DIAGNOSTICS_SINCE="$(python3 -c 'import sys; from datetime import datetime, timedelta; print((datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ") - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))' "${DIAGNOSTICS_INVOKED_AT}")"
 
 echo "[integration-db] Exporting local Supabase env..."
 # The isolated stack's values, and ONLY those. These used to be
@@ -120,26 +32,24 @@ echo "[integration-db] Exporting local Supabase env..."
 unset SUPABASE_URL SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY JWT_SECRET DB_URL \
   API_URL ANON_KEY PUBLISHABLE_KEY SERVICE_ROLE_KEY SECRET_KEY AUTH_JWT_SECRET
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
-eval "${STATUS_ENV}"
 
-export SUPABASE_URL="${API_URL:-}"
-export SUPABASE_PUBLISHABLE_KEY="${PUBLISHABLE_KEY:-${ANON_KEY:-}}"
-export SUPABASE_SECRET_KEY="${SECRET_KEY:-${SERVICE_ROLE_KEY:-}}"
-export JWT_SECRET="${JWT_SECRET:-${AUTH_JWT_SECRET:-}}"
+# Both endpoints come from the stack this script started, and from nothing the
+# calling shell already had. See the library for why inheriting them is unsafe.
+# shellcheck source=lib/derive-isolated-supabase-env.sh
+source "${ROOT_DIR}/scripts/lib/derive-isolated-supabase-env.sh"
+derive_isolated_supabase_env "${STATUS_ENV}" "${API_PORT}" "${DB_PORT}" || exit 1
+
 export NODE_ENV="test"
 export INK_ALLOW_REMOTE_INTEGRATION_DB="0"
 export INTEGRATION_SUPABASE_WORKDIR="${SUPABASE_WORKDIR}"
-# Direct Postgres URL, for the few tests that need a SECOND connection and so
-# cannot go through PostgREST — concurrency regressions where one transaction
-# must hold a row lock while another statement waits on it. PostgREST gives one
-# transaction per request and cannot express that. Same rule: the stack's port.
-export INTEGRATION_DB_URL="postgresql://postgres:postgres@127.0.0.1:${DB_PORT}/postgres"
 
-if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SECRET_KEY}" || -z "${JWT_SECRET}" ]]; then
-  echo "[integration-db] Failed to derive required env vars from supabase status output." >&2
-  echo "${STATUS_ENV}" >&2
-  exit 1
-fi
+# Prove the target before a single test runs: the API URL must be exactly the
+# loopback endpoint on the port this script reserved — not merely contain the
+# port (Lumen, #623: a substring test passed foreign hosts and fragments). The
+# check lives in scripts/lib so it can be tested alone.
+# shellcheck source=lib/assert-isolated-supabase-url.sh
+source "${ROOT_DIR}/scripts/lib/assert-isolated-supabase-url.sh"
+assert_isolated_supabase_url "${SUPABASE_URL}" "${API_PORT}" || exit 1
 
 # Prove the target before a single test runs: the API URL must be exactly
 # the loopback endpoint on the port this script reserved — not merely
@@ -150,7 +60,7 @@ source "${ROOT_DIR}/scripts/lib/assert-isolated-supabase-url.sh"
 assert_isolated_supabase_url "${SUPABASE_URL}" "${API_PORT}" || exit 1
 
 # Non-empty is not the same as service-role. A key that parses but resolves to
-# `anon` sails past the check above and then fails every single test with
+# `anon` sails past the non-empty check and then fails every single test with
 # "permission denied for table users" — 100+ confusing failures for one bad
 # variable. That is exactly how this job stayed red from June to August 2026
 # without anyone being able to read the cause off the log. Probe once, here.
@@ -168,7 +78,7 @@ if [[ "${PROBE_STATUS}" != "200" ]]; then
   echo "[integration-db] CLI version in use:" >&2
   supabase --version >&2 || true
   echo "[integration-db] Keys emitted by status (values redacted):" >&2
-  echo "${STATUS_ENV}" | sed -E 's/=.*/=<redacted>/' >&2
+  printf '%s\n' "${STATUS_ENV}" | redact_env_assignments >&2
   exit 1
 fi
 
@@ -196,24 +106,29 @@ if [[ "${STEADY}" -lt 3 ]]; then
   echo "[integration-db] REST gateway did not answer three times in a row within 20s (last HTTP ${CODE}); continuing anyway." >&2
 fi
 
-# When a suite fails, the vitest output shows the symptom — a repository call
-# answered "An invalid response was received from the upstream server" — and
-# nothing about the cause, because that sentence is Kong's, standing in for
-# whatever PostgREST or Postgres did. Two CI failures on 2026-09-11 were
-# exactly this (one advance_agent_inbox_read_pointer RPC, one task_groups
-# update), both green on rerun and neither reproducible locally. Dump the
-# stack's own logs before the trap tears it down, so the next blip can be
-# read off the job log instead of guessed at.
+# Capture the invocation plus its prelude, not the last N lines: later successes pushed
+# the #662 failing request outside the old 150-line gateway tail. Only emit
+# allowlisted diagnostic metadata; raw URLs, query tokens and SQL stay private.
 dump_stack_diagnostics() {
   echo "[integration-db] ❌ Suite failed — dumping isolated stack diagnostics (project ${PROJECT_ID})."
+  echo "[integration-db] window_start=${DIAGNOSTICS_SINCE} invocation_start=${DIAGNOSTICS_INVOKED_AT} (UTC; through capture)."
+  echo "[integration-db] Prelude may include events from an earlier run; timestamps are not causal attribution."
   echo "[integration-db] --- containers ---"
   docker ps -a --filter "name=${PROJECT_ID}" --format '{{.Names}}\t{{.Status}}' 2>/dev/null || true
   echo "[integration-db] --- resource snapshot ---"
   docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' 2>/dev/null | grep "${PROJECT_ID}" || true
   if command -v free >/dev/null 2>&1; then free -m || true; fi
-  for name in $(docker ps -a --filter "name=${PROJECT_ID}" --format '{{.Names}}' 2>/dev/null | grep -E '_(rest|kong|db)_' || true); do
-    echo "[integration-db] --- docker logs --tail 150 ${name} ---"
-    docker logs --tail 150 "${name}" 2>&1 || true
+  for service in db rest kong; do
+    name="supabase_${service}_${PROJECT_ID}"
+    # Use the exact managed project's names, not a substring that also picks
+    # up another project's similarly-named containers. Metadata only, no env.
+    id="$(docker inspect --format '{{.Id}}' "${name}" 2>/dev/null)" || continue
+    echo "[integration-db] --- ${service} invocation diagnostics ---"
+    docker inspect --format 'status={{.State.Status}} restarts={{.RestartCount}} oomKilled={{.State.OOMKilled}}' "${id}" 2>/dev/null || true
+    if ! python3 "${ROOT_DIR}/scripts/lib/integration-log-summary.py" \
+      "${service}" "${id}" "${DIAGNOSTICS_SINCE}"; then
+      echo "[integration-db] ${service} log summary incomplete (capture or parser failed)." >&2
+    fi
   done
   echo "[integration-db] --- end of diagnostics ---"
 }
@@ -221,8 +136,9 @@ dump_stack_diagnostics() {
 echo "[integration-db] Running API DB integration suite against ${SUPABASE_URL}"
 # INTEGRATION_VITEST_ARGS narrows the run (a path filter, a -t pattern); the
 # rehearsal job uses it to run only the cutover suite at the older schema.
+# Arguments passed through the managed entry point narrow it the same way.
 # shellcheck disable=SC2086
-if ! yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db ${INTEGRATION_VITEST_ARGS:-}; then
+if ! yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db ${INTEGRATION_VITEST_ARGS:-} "$@"; then
   dump_stack_diagnostics
   exit 1
 fi

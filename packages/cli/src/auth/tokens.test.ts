@@ -87,20 +87,20 @@ describe('decodeJwtPayload', () => {
     expect(decodeJwtPayload('two.parts')).toBeNull();
   });
 
-  it('extracts optional agentId and identityId', () => {
+  it('extracts optional sbSlug and identityId', () => {
     const token = makeJwt({
       type: 'mcp_access',
       sub: 'user-123',
       email: 'test@example.com',
       scope: 'mcp:tools',
-      agentId: 'wren',
+      sbSlug: 'wren',
       identityId: 'id-456',
       exp: 9999999999,
       iat: 1000000000,
     });
 
     const payload = decodeJwtPayload(token);
-    expect(payload!.agentId).toBe('wren');
+    expect(payload!.sbSlug).toBe('wren');
     expect(payload!.identityId).toBe('id-456');
   });
 });
@@ -217,7 +217,7 @@ describe('delegated auth storage', () => {
 
   beforeEach(() => {
     origHome = process.env.HOME;
-    tempHome = join(tmpdir(), `pcp-delegated-auth-test-${Date.now()}`);
+    tempHome = join(tmpdir(), `ink-delegated-auth-test-${Date.now()}`);
     mkdirSync(tempHome, { recursive: true });
     process.env.HOME = tempHome;
   });

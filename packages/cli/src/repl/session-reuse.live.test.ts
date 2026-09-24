@@ -2,7 +2,7 @@
  * Provider session reuse — live cross-process E2E.
  *
  * This is the real Myra codepath: two SEPARATE `ink chat --non-interactive`
- * processes (like two heartbeats) sharing one PCP session id must resume the
+ * processes (like two heartbeats) sharing one Inkwell session id must resume the
  * SAME native Claude session, so the conversation is one coherent jsonl instead
  * of fragmenting into a new file per message. Unit tests cover the decision and
  * recovery logic in isolation; this asserts the actual wiring end-to-end —
@@ -87,7 +87,7 @@ function buildFixtureDir(serverUrl: string): string {
   );
   writeFileSync(
     join(root, '.ink', 'identity.json'),
-    JSON.stringify({ agentId: 'wren', studioId: 'main', context: 'main' })
+    JSON.stringify({ sbSlug: 'wren', studioId: 'main', context: 'main' })
   );
   return root;
 }
@@ -121,12 +121,12 @@ function runInkTurn(cwd: string, sessionId: string, message: string) {
   );
 }
 
-/** The provider session id ink persisted for this pcp session (transcript marker). */
-function backendSessionMarkerId(cwd: string, pcpSessionId: string): string | undefined {
+/** The provider session id ink persisted for this Inkwell session (transcript marker). */
+function backendSessionMarkerId(cwd: string, inkSessionId: string): string | undefined {
   const replDir = join(cwd, '.ink', 'runtime', 'repl');
   if (!existsSync(replDir)) return undefined;
   const files = readdirSync(replDir).filter(
-    (f) => f.startsWith(`${pcpSessionId}-`) && f.endsWith('.jsonl')
+    (f) => f.startsWith(`${inkSessionId}-`) && f.endsWith('.jsonl')
   );
   let last: string | undefined;
   for (const f of files) {
@@ -174,7 +174,7 @@ describe.sequential('provider session reuse (live, cross-process)', () => {
     async () => {
       if (!reachable || !fixtureDir) return;
 
-      const pcpSessionId = randomUUID();
+      const inkSessionId = randomUUID();
       const codeword = `WREN-LIVE-${randomUUID().slice(0, 8).toUpperCase()}`;
       const projDir = claudeProjectDir(fixtureDir);
       const before = listJsonls(projDir);
@@ -182,7 +182,7 @@ describe.sequential('provider session reuse (live, cross-process)', () => {
       // ── Process 1: plant the codeword (seeds a fresh native session) ──
       const plant = runInkTurn(
         fixtureDir,
-        pcpSessionId,
+        inkSessionId,
         `Do not use any tools. Remember this codeword: ${codeword}. Reply with just OK.`
       );
       expect(plant.status, `inv1 failed:\n${plant.stderr}\n${plant.stdout}`).toBe(0);
@@ -194,15 +194,15 @@ describe.sequential('provider session reuse (live, cross-process)', () => {
       const seededJsonl = seeded[0]!;
 
       // The transcript marker ink persisted must match the seeded jsonl id.
-      const markerId = backendSessionMarkerId(fixtureDir, pcpSessionId);
+      const markerId = backendSessionMarkerId(fixtureDir, inkSessionId);
       expect(markerId, 'backend_session marker should be persisted on seed').toBe(
         seededJsonl.replace(/\.jsonl$/, '')
       );
 
-      // ── Process 2: recall the codeword (a SEPARATE process, same pcp session) ──
+      // ── Process 2: recall the codeword (a SEPARATE process, same Inkwell session) ──
       const recall = runInkTurn(
         fixtureDir,
-        pcpSessionId,
+        inkSessionId,
         `Do not use any tools. What codeword did I give you earlier? Reply with ONLY the codeword.`
       );
       expect(recall.status, `inv2 failed:\n${recall.stderr}\n${recall.stdout}`).toBe(0);

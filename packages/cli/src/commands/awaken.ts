@@ -2,7 +2,7 @@
  * Awaken Command
  *
  * Brings a new SB to life on a given backend. Fetches shared values
- * and sibling identities from PCP cloud (falling back to local files),
+ * and sibling identities from Inkwell cloud (falling back to local files),
  * builds an awakening prompt, and drops into an interactive session
  * with the chosen backend.
  *
@@ -25,7 +25,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import { getBackend, BACKEND_NAMES } from '../backends/index.js';
-import { callPcpTool } from '../lib/pcp-mcp.js';
+import { callInkTool } from '../lib/ink-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { ensureBackendAuthReady, isBackendAuthBackend } from '../lib/backend-auth.js';
@@ -54,7 +54,7 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // ============================================================================
 
 export interface BootstrapIdentity {
-  agentId: string;
+  sbSlug: string;
   name?: string;
   role?: string;
   description?: string;
@@ -75,16 +75,16 @@ interface BootstrapResponse {
  * Fetch the shared values document from the Inkwell server.
  *
  * Values only. Siblings used to be read from this same response, but bootstrap
- * is called here as the synthetic agentId 'awakening' — which has no identity
+ * is called here as the synthetic sbSlug 'awakening' — which has no identity
  * row — so its sibling list is always empty. See fetchSiblings().
  */
 async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: string } | null> {
   try {
-    const result = await callPcpTool<BootstrapResponse>(
+    const result = await callInkTool<BootstrapResponse>(
       'bootstrap',
       {
         email: config.email,
-        agentId: 'awakening', // temporary identity for bootstrap
+        sbSlug: 'awakening', // temporary identity for bootstrap
       },
       {
         timeoutMs: 5000,
@@ -101,7 +101,7 @@ async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: strin
  * Fetch siblings from agent_identities — the authoritative list.
  *
  * bootstrap() is the wrong question to ask here. We call it as the synthetic
- * agentId 'awakening', which has no identity row, so identityCore.siblings
+ * sbSlug 'awakening', which has no identity row, so identityCore.siblings
  * comes back empty and the prompt confidently told a new SB "No other SBs yet
  * — you may be the first" while five of them were already in the database.
  * (The SB who caught this called meet_family and found all of them.)
@@ -110,7 +110,7 @@ async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: strin
  */
 async function fetchSiblings(config: UserConfig): Promise<BootstrapIdentity[] | null> {
   try {
-    const result = await callPcpTool<{ identities?: BootstrapIdentity[] }>(
+    const result = await callInkTool<{ identities?: BootstrapIdentity[] }>(
       'list_identities',
       { email: config.email },
       { timeoutMs: 5000 }
@@ -165,7 +165,7 @@ export function buildAwakeningPrompt(
   } else if (siblings.length > 0) {
     siblingsSection = siblings
       .map((s) => {
-        const parts = [`**${s.name || s.agentId}** (\`${s.agentId}\`)`];
+        const parts = [`**${s.name || s.sbSlug}** (\`${s.sbSlug}\`)`];
         if (s.role) parts.push(` — ${s.role}`);
         return `- ${parts.join('')}`;
       })
@@ -389,7 +389,7 @@ async function awakenCommand(options: {
       )
     );
   } else if (siblings.length > 0) {
-    console.log(chalk.dim(`  Siblings: ${siblings.map((s) => s.name || s.agentId).join(', ')}`));
+    console.log(chalk.dim(`  Siblings: ${siblings.map((s) => s.name || s.sbSlug).join(', ')}`));
   }
 
   // 2. Build the awakening prompt
@@ -441,7 +441,7 @@ async function awakenCommand(options: {
 
   // 4b. Prepare and spawn an external backend CLI
   const prepared = adapter!.prepare({
-    agentId: 'nascent',
+    sbSlug: 'nascent',
     promptParts: [],
     passthroughArgs: [],
     // Undefined is meaningful: adapters skip --model entirely, so the backend
@@ -486,7 +486,7 @@ async function awakenCommand(options: {
     )
   );
 
-  // 5. Resolve PCP auth token (same as ink chat) so MCP tools work
+  // 5. Resolve Inkwell auth token (same as ink chat) so MCP tools work
   const authEnv: Record<string, string> = {};
   try {
     const token = await getValidAccessToken(process.env.INK_SERVER_URL || 'http://localhost:3001');
@@ -502,6 +502,7 @@ async function awakenCommand(options: {
       ...process.env,
       ...authEnv,
       ...prepared.env,
+      SB_SLUG: 'nascent',
       AGENT_ID: 'nascent',
     },
   });

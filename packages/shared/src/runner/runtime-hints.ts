@@ -2,7 +2,7 @@
  * Runtime Session Hints
  *
  * Writes session state to .ink/runtime/sessions.json so the on-session-start
- * hook can find the correct PCP session ID for server-spawned runs.
+ * hook can find the correct Inkwell session ID for server-spawned runs.
  *
  * Without these hints, the hook picks up the last sb-launched session (wrong)
  * instead of the server-triggered one.
@@ -22,14 +22,14 @@ interface RuntimeSessionState {
 
 /**
  * Write a runtime session hint so the on-session-start hook can resolve
- * the correct PCP session ID for a spawned backend process.
+ * the correct Inkwell session ID for a spawned backend process.
  *
  * Best-effort: silently catches errors since the hook has fallbacks.
  */
 export function writeRuntimeSessionHint(
   workingDirectory: string,
-  pcpSessionId: string,
-  agentId: string,
+  inkSessionId: string,
+  sbSlug: string,
   backend: string,
   runtimeLinkId: string,
   studioId?: string
@@ -45,7 +45,45 @@ export function writeRuntimeSessionHint(
       try {
         const raw = JSON.parse(readFileSync(sessionsPath, 'utf-8')) as RuntimeSessionState;
         if (raw.version === 1 && Array.isArray(raw.sessions)) {
-          state = raw;
+          // Independent raw reader of the same file as the CLI's
+          // readRuntimeState, with the same defect: records written before the
+          // rename carry `agentId`, the match below keys on sbSlug, and an
+          // un-normalized record is duplicated rather than merged
+          // (Lumen, PR #635).
+          //
+          // #659 renamed pcpSessionId -> inkSessionId and reproduced that
+          // defect one field over: rows on disk key the session id under the
+          // old name, so the match below misses them and the reader's type
+          // guard drops them outright — losing backend lineage on the next
+          // upsert. Both migrations live in one table now, so the next rename
+          // adds a row here rather than a third copy of this shape.
+          const LEGACY_KEYS: ReadonlyArray<readonly [string, string]> = [
+            ['agentId', 'sbSlug'],
+            ['pcpSessionId', 'inkSessionId'],
+          ];
+          const withSlug = (row: Record<string, unknown>): Record<string, unknown> => {
+            if (!row || typeof row !== 'object') return row;
+            let out = row;
+            for (const [legacy, current] of LEGACY_KEYS) {
+              if (out[current] === undefined && typeof out[legacy] === 'string') {
+                out = { ...out, [current]: out[legacy] };
+              }
+            }
+            return out;
+          };
+          state = {
+            ...raw,
+            sessions: raw.sessions.map((s) =>
+              withSlug(s as Record<string, unknown>)
+            ) as typeof raw.sessions,
+            ...(raw.current
+              ? {
+                  current: withSlug(
+                    raw.current as unknown as Record<string, unknown>
+                  ) as typeof raw.current,
+                }
+              : {}),
+          };
         }
       } catch {
         // Corrupt file — start fresh.
@@ -54,9 +92,9 @@ export function writeRuntimeSessionHint(
 
     const now = new Date().toISOString();
     const record: Record<string, unknown> = {
-      pcpSessionId,
+      inkSessionId,
       backend,
-      agentId,
+      sbSlug,
       runtimeLinkId,
       ...(studioId ? { studioId } : {}),
       updatedAt: now,
@@ -65,7 +103,7 @@ export function writeRuntimeSessionHint(
 
     const idx = state.sessions.findIndex(
       (s) =>
-        s['pcpSessionId'] === pcpSessionId && s['backend'] === backend && s['agentId'] === agentId
+        s['inkSessionId'] === inkSessionId && s['backend'] === backend && s['sbSlug'] === sbSlug
     );
     if (idx >= 0) {
       state.sessions[idx] = { ...state.sessions[idx], ...record };
@@ -74,13 +112,27 @@ export function writeRuntimeSessionHint(
     }
 
     state.current = {
-      pcpSessionId,
+      inkSessionId,
       backend,
-      agentId,
+      sbSlug,
       ...(studioId ? { studioId } : {}),
       updatedAt: now,
     };
-    writeFileSync(sessionsPath, JSON.stringify(state, null, 2));
+    // Same dual-write as the CLI's writeRuntimeState: an older `ink` on PATH
+    // drops rows it cannot parse and then writes the file back without them,
+    // so the legacy key has to keep being emitted, not just read.
+    const withLegacyKeys = (row: Record<string, unknown>): Record<string, unknown> =>
+      row && typeof row.inkSessionId === 'string'
+        ? { ...row, pcpSessionId: row.inkSessionId }
+        : row;
+    const onDisk = {
+      ...state,
+      sessions: state.sessions.map((s) => withLegacyKeys(s as Record<string, unknown>)),
+      ...(state.current
+        ? { current: withLegacyKeys(state.current as unknown as Record<string, unknown>) }
+        : {}),
+    };
+    writeFileSync(sessionsPath, JSON.stringify(onDisk, null, 2));
   } catch {
     // Best-effort only — hook will fall back to sessions.json current pointer.
   }

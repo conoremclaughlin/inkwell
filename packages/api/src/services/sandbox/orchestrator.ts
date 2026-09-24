@@ -40,7 +40,7 @@ export interface SandboxMount {
 
 export interface SandboxSpinUpRequest {
   userId: string;
-  agentId: string;
+  sbSlug: string;
   studioId: string;
   studioSlug?: string;
   worktreePath: string;
@@ -84,7 +84,7 @@ export function getRunnerFilesDir(containerName: string): string {
 
 export function buildContainerName(request: SandboxSpinUpRequest): string {
   if (request.containerName) return request.containerName;
-  const label = sanitizeSlug(request.studioSlug || request.agentId || 'studio');
+  const label = sanitizeSlug(request.studioSlug || request.sbSlug || 'studio');
   const parts = [request.worktreePath];
   if (request.taskGroupId) parts.push(request.taskGroupId);
   const digest = createHash('sha256').update(parts.join(':')).digest('hex').slice(0, 8);
@@ -110,7 +110,7 @@ export function buildEnvVars(request: SandboxSpinUpRequest): Record<string, stri
 
   const env: Record<string, string> = {
     HOME: CONTAINER_HOME,
-    AGENT_ID: request.agentId,
+    AGENT_ID: request.sbSlug,
     INK_SERVER_URL: rewriteLoopbackUrl(serverUrl),
     INK_STUDIO_ID: request.studioId,
     INK_SANDBOX: 'docker',
@@ -516,7 +516,7 @@ export async function buildDockerRunArgs(request: SandboxSpinUpRequest): Promise
 
   // Labels for discovery and lifecycle management
   args.push('--label', CONTAINER_LABEL);
-  args.push('--label', `ink.agent-id=${request.agentId}`);
+  args.push('--label', `ink.agent-id=${request.sbSlug}`);
   args.push('--label', `ink.studio-id=${request.studioId}`);
   if (request.taskGroupId) {
     args.push('--label', `ink.task-group-id=${request.taskGroupId}`);
@@ -580,7 +580,7 @@ export class SandboxOrchestrator {
 
       logger.info('Sandbox container started', {
         containerName,
-        agentId: request.agentId,
+        sbSlug: request.sbSlug,
         studioId: request.studioId,
         taskGroupId: request.taskGroupId,
       });

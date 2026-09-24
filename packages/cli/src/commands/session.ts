@@ -1,7 +1,7 @@
 /**
  * Session Commands
  *
- * Manage PCP sessions.
+ * Manage Inkwell sessions.
  *
  * Commands:
  *   session list         List recent sessions
@@ -16,13 +16,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline/promises';
-import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 
 export interface Session {
   id: string;
-  agentId?: string;
+  sbSlug?: string;
   lifecycle?: string;
   status: string;
   currentPhase?: string;
@@ -72,7 +72,7 @@ interface SyncedTranscriptArchiveSummary {
   syncedAt: string;
   session: {
     id: string;
-    agentId?: string | null;
+    sbSlug?: string | null;
     agentName?: string | null;
     agentRole?: string | null;
     backend?: string | null;
@@ -251,7 +251,10 @@ export function buildTranscriptInstallPlan(options: {
     };
   }
 
-  if (backend.includes('pcp')) {
+  // 'ink' is the stored backend value; 'pcp' is the pre-rename spelling kept
+  // for rows written before 01b9047b. Matching only 'pcp' made this branch
+  // unreachable, so the ink REPL transcript destination was never chosen (#659).
+  if (backend.includes('ink') || backend.includes('pcp')) {
     return {
       destinationPath: join(
         targetCwd,
@@ -279,7 +282,7 @@ export function renderSyncedTranscriptArchives(
   return archives.flatMap((archive) => {
     const header = `  ${chalk.cyan(archive.sessionId.substring(0, 8))} ${chalk.dim(`(${archive.backend || 'unknown'})`)}`;
     const thread = archive.session.threadKey || '-';
-    const agent = archive.session.agentName || archive.session.agentId || 'Unknown';
+    const agent = archive.session.agentName || archive.session.sbSlug || 'Unknown';
     const lines = [
       header,
       chalk.dim(`      Agent:   ${agent}`),
@@ -304,7 +307,7 @@ async function fetchAdminJson<T>(options: {
   body?: Record<string, unknown>;
   workspaceId?: string;
 }): Promise<T> {
-  const serverUrl = getPcpServerUrl().replace(/\/+$/, '');
+  const serverUrl = getInkServerUrl().replace(/\/+$/, '');
   const token = await getValidAccessToken(serverUrl);
   if (!token) {
     throw new Error('Not authenticated. Run: ink auth login');
@@ -383,7 +386,7 @@ async function resolvePullTarget(options: {
     if (!options.config?.email) {
       throw new Error(NOT_SIGNED_IN_MESSAGE);
     }
-    const studio = await callPcpTool<StudioLookupResult>('get_studio', {
+    const studio = await callInkTool<StudioLookupResult>('get_studio', {
       email: options.config.email,
       studioId: options.studio,
     });
@@ -425,7 +428,7 @@ function formatSessionLine(session: Session): string[] {
     `  ${statusIcon} ${chalk.cyan(session.id.substring(0, 8))} ${chalk.dim(`(${phase})`)}`,
     chalk.dim(`      Started: ${formatDate(startedAt)}  Duration: ${duration}`),
     chalk.dim(`      Thread:  ${thread}`),
-    chalk.dim(`      Attach:  ink chat -a ${session.agentId || 'wren'} --attach ${session.id}`),
+    chalk.dim(`      Attach:  ink chat -a ${session.sbSlug || 'wren'} --attach ${session.id}`),
   ];
 
   if (session.summary) {
@@ -469,7 +472,7 @@ export function renderSessionsByAgent(sessions: Session[], flat = false): string
 
   const grouped = new Map<string, Session[]>();
   for (const session of sessions) {
-    const key = session.agentId || 'unknown';
+    const key = session.sbSlug || 'unknown';
     const list = grouped.get(key) || [];
     list.push(session);
     grouped.set(key, list);
@@ -504,9 +507,9 @@ async function listCommand(options: {
   }
 
   try {
-    const result = await callPcpTool<SessionListResult>('list_sessions', {
+    const result = await callInkTool<SessionListResult>('list_sessions', {
       email: config.email,
-      agentId: options.agent,
+      sbSlug: options.agent,
       limit: parseInt(options.limit || '10', 10),
     });
 
@@ -528,13 +531,13 @@ async function showCommand(sessionId: string): Promise<void> {
   }
 
   try {
-    const session = await callPcpTool<Session>('get_session', {
+    const session = await callInkTool<Session>('get_session', {
       email: config.email,
       sessionId,
     });
 
     console.log(chalk.bold(`\nSession: ${session.id}\n`));
-    console.log(chalk.dim('  Agent:    ') + (session.agentId || 'unknown'));
+    console.log(chalk.dim('  Agent:    ') + (session.sbSlug || 'unknown'));
     console.log(chalk.dim('  Status:   ') + session.status);
     console.log(chalk.dim('  Started:  ') + formatDate(new Date(session.startedAt)));
 
@@ -591,7 +594,7 @@ async function resumeCommand(sessionId: string): Promise<void> {
 
   // Get session to find Claude session ID
   try {
-    const session = await callPcpTool<Session>('get_session', {
+    const session = await callInkTool<Session>('get_session', {
       email: config.email,
       sessionId,
     });
@@ -626,7 +629,7 @@ async function endCommand(sessionId?: string): Promise<void> {
   }
 
   try {
-    await callPcpTool(
+    await callInkTool(
       'end_session',
       {
         email: config.email,
@@ -913,7 +916,7 @@ function formatDuration(ms: number): string {
 // ============================================================================
 
 export function registerSessionCommands(program: Command): void {
-  const session = program.command('session').description('Manage PCP sessions');
+  const session = program.command('session').description('Manage Inkwell sessions');
 
   session
     .command('list')
@@ -933,7 +936,7 @@ export function registerSessionCommands(program: Command): void {
   session
     .command('sync [target] [value]')
     .description('Push, list, and pull synced session transcripts')
-    .option('--backend <backend>', 'Override backend resolver (claude|codex|gemini|pcp)')
+    .option('--backend <backend>', 'Override backend resolver (claude|codex|gemini|ink)')
     .option('--backend-session-id <id>', 'Override backend session id used for transcript lookup')
     .option('--limit <n>', 'Number of synced archives to list', '20')
     .option('--path <path>', 'Write pulled transcript to an explicit file path')

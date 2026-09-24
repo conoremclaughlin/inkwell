@@ -14,8 +14,8 @@ export interface DelegationTokenPayload {
 }
 
 export interface MintDelegationTokenInput {
-  issuerAgentId: string;
-  delegateeAgentId: string;
+  issuerSlug: string;
+  delegateeSlug: string;
   scopes: string[];
   ttlSeconds?: number;
   sessionId?: string;
@@ -26,8 +26,8 @@ export interface MintDelegationTokenInput {
 
 export interface VerifyDelegationTokenOptions {
   nowSeconds?: number;
-  expectedIssuerAgentId?: string;
-  expectedDelegateeAgentId?: string;
+  expectedIssuerSlug?: string;
+  expectedDelegateeSlug?: string;
   expectedThreadKey?: string;
   requiredScopes?: string[];
 }
@@ -38,7 +38,13 @@ export interface VerifyDelegationTokenResult {
   error?: string;
 }
 
-const TOKEN_TYPE = 'PCP-DELEGATION';
+const TOKEN_TYPE = 'Inkwell-DELEGATION';
+// `typ` sits inside the signed header, so a token minted before #659 carries
+// 'PCP-DELEGATION' under a signature that covers that exact string — it cannot
+// be re-spelled on the way in. Rejecting it invalidates every unexpired
+// delegation at deploy time (TTL is 15m by default, 24h at most). Accepted on
+// verify, never minted; removable once a deploy is more than MAX_TTL old.
+const LEGACY_TOKEN_TYPE = 'PCP-DELEGATION';
 const DEFAULT_TTL_SECONDS = 15 * 60;
 const MAX_TTL_SECONDS = 24 * 60 * 60;
 
@@ -69,19 +75,15 @@ function safeEqual(a: string, b: string): boolean {
 
 function normalizeScopes(scopes: string[]): string[] {
   return Array.from(
-    new Set(
-      scopes
-        .map((scope) => scope.trim().toLowerCase())
-        .filter(Boolean)
-    )
+    new Set(scopes.map((scope) => scope.trim().toLowerCase()).filter(Boolean))
   ).sort((a, b) => a.localeCompare(b));
 }
 
 export function mintDelegationToken(input: MintDelegationTokenInput, secret: string): string {
-  const issuerAgentId = input.issuerAgentId.trim().toLowerCase();
-  const delegateeAgentId = input.delegateeAgentId.trim().toLowerCase();
-  if (!issuerAgentId || !delegateeAgentId) {
-    throw new Error('issuerAgentId and delegateeAgentId are required');
+  const issuerSlug = input.issuerSlug.trim().toLowerCase();
+  const delegateeSlug = input.delegateeSlug.trim().toLowerCase();
+  if (!issuerSlug || !delegateeSlug) {
+    throw new Error('issuerSlug and delegateeSlug are required');
   }
 
   const scopes = normalizeScopes(input.scopes || []);
@@ -99,8 +101,8 @@ export function mintDelegationToken(input: MintDelegationTokenInput, secret: str
 
   const payload: DelegationTokenPayload = {
     v: 1,
-    iss: issuerAgentId,
-    sub: delegateeAgentId,
+    iss: issuerSlug,
+    sub: delegateeSlug,
     scopes,
     iat: now,
     exp: now + ttl,
@@ -127,7 +129,7 @@ export function decodeDelegationToken(token: string): DelegationTokenPayload {
     typ?: string;
     alg?: string;
   };
-  if (header.typ !== TOKEN_TYPE || header.alg !== 'HS256') {
+  if ((header.typ !== TOKEN_TYPE && header.typ !== LEGACY_TOKEN_TYPE) || header.alg !== 'HS256') {
     throw new Error('Unsupported token header');
   }
 
@@ -162,11 +164,14 @@ export function verifyDelegationToken(
       return { valid: false, error: 'Token issued in the future' };
     }
 
-    if (options.expectedIssuerAgentId && payload.iss !== options.expectedIssuerAgentId.toLowerCase()) {
+    if (options.expectedIssuerSlug && payload.iss !== options.expectedIssuerSlug.toLowerCase()) {
       return { valid: false, error: 'Unexpected issuer' };
     }
 
-    if (options.expectedDelegateeAgentId && payload.sub !== options.expectedDelegateeAgentId.toLowerCase()) {
+    if (
+      options.expectedDelegateeSlug &&
+      payload.sub !== options.expectedDelegateeSlug.toLowerCase()
+    ) {
       return { valid: false, error: 'Unexpected delegatee' };
     }
 

@@ -1,7 +1,7 @@
 /**
  * 2FA Approval API Client
  *
- * Shared client for creating and polling approval requests via the PCP
+ * Shared client for creating and polling approval requests via the Inkwell
  * server's HTTP API. The server handles all notification routing (Telegram,
  * WhatsApp) and response interception — the CLI only needs to create the
  * request and poll for status.
@@ -12,7 +12,7 @@
  */
 
 import { getValidAccessToken } from '../auth/tokens.js';
-import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
+import { resolveSlug, readIdentityJson } from '../backends/identity.js';
 
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const POLL_INTERVAL_MS = 3000;
@@ -25,12 +25,12 @@ function getContextHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
   let contextToken = process.env.INK_CONTEXT?.trim();
   if (!contextToken) {
-    const agentId = resolveAgentId();
-    if (agentId) {
+    const sbSlug = resolveSlug();
+    if (sbSlug) {
       const identity = readIdentityJson(process.cwd());
       contextToken = Buffer.from(
         JSON.stringify({
-          agentId,
+          sbSlug,
           studioId: identity?.studioId || 'main',
           cliAttached: true,
         })
@@ -67,7 +67,7 @@ function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Create an approval request on the PCP server and poll until resolved.
+ * Create an approval request on the Inkwell server and poll until resolved.
  *
  * The server handles notification routing:
  * - Looks up user's connected platforms (Telegram, WhatsApp) from trusted_users

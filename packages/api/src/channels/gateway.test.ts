@@ -711,7 +711,7 @@ describe('Activity Stream Integration', () => {
   describe('Incoming Messages', () => {
     it('does not log inbound messages itself — SessionService is the canonical logger', async () => {
       // Regression: the gateway used to log message_in with a hardcoded
-      // agentId of 'myra' AND SessionService logged the same message again,
+      // sbSlug of 'myra' AND SessionService logged the same message again,
       // producing duplicate rows that double-rendered in attached CLI views.
       const handler = vi.fn().mockResolvedValue(undefined);
       gateway.setMessageHandler(handler);
@@ -827,10 +827,17 @@ describe('Activity Stream Integration', () => {
       expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith({
         userId: 'user-uuid-123',
-        agentId: 'myra',
+        // No session was threaded through this send, so the author is unknown.
+        // The channel owner's slug is kept for display, but `authorship` marks
+        // the row as unattributed so a reply will never route on it.
+        sbSlug: 'myra',
+        sbId: undefined,
+        payload: { authorship: 'unattributed' },
         direction: 'out',
         content: 'Reply message',
+        sessionId: undefined,
         platform: 'telegram',
+        platformMessageId: undefined,
         platformChatId: 'chat123',
         isDm: true,
       });

@@ -45,14 +45,25 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   type DueReminder,
+  type HeartbeatDeliveryOutcome,
 } from './services/heartbeat';
+import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
+import {
+  TriggerRetryScheduler,
+  getTriggerAttempt,
+  BackendFailureError,
+} from './channels/trigger-retry';
 import { storedTriggerMedia } from './channels/agent-media';
-import { resolveRouteAgentId } from './services/routing/resolve-route';
-import { resolveAgentFromMention } from './services/routing/resolve-mention';
+import { resolveRouteSlug } from './services/routing/resolve-route';
+import { resolveInboundAgent } from './services/routing/resolve-inbound-agent';
+import {
+  loadThreadDescriptor,
+  formatThreadDescriptorLines,
+} from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { logger } from './utils/logger';
 import { resolveThreadTriggerScope } from './services/trigger-scope';
@@ -80,6 +91,7 @@ import type { ActivityType } from './data/repositories/activity-stream.repositor
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { StudioLeaseService } from './services/studio-lease.service';
 import { StudioOverflowService } from './services/studio-overflow.service';
+import { resolveServerSbSlug } from './config/server-identity';
 
 // Server configuration
 interface ServerConfig {
@@ -132,7 +144,7 @@ async function routeResponses(responses: ChannelResponse[], sessionId?: string):
 }
 
 /**
- * Start the PCP server
+ * Start the Inkwell server
  */
 async function startServer(config: ServerConfig = {}): Promise<void> {
   logger.info('Starting Inkwell Server...');
@@ -140,12 +152,12 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // Resolve configuration
   const workingDirectory = config.workingDirectory || path.resolve(__dirname, '../../..');
   const mcpConfigPath = config.mcpConfigPath || path.resolve(workingDirectory, '.mcp.json');
-  const agentId = process.env.AGENT_ID || 'myra';
+  const sbSlug = resolveServerSbSlug();
 
   logger.info('Configuration:', {
     workingDirectory,
     mcpConfigPath,
-    agentId,
+    sbSlug,
     telegramPollingInterval: config.telegramPollingInterval || 1000,
   });
 
@@ -169,7 +181,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       ? { defaultAntigravityModel: env.DEFAULT_ANTIGRAVITY_MODEL }
       : {}),
     // The port this process actually bound, not whatever a checked-in config
-    // file claims — an isolated server started with PCP_PORT_BASE must not hand
+    // file claims — an isolated server started with INK_PORT_BASE must not hand
     // its credentials to the main server on 3001.
     inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
   };
@@ -202,62 +214,31 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       return;
     }
 
-    // Resolve agent: mention → channel_routes → AGENT_ID env fallback
-    let routedAgentId = agentId;
-    let routedIdentityId: string | undefined;
+    // Resolve agent: mention → reply authorship → channel_routes → AGENT_ID env
+    // fallback. The cascade lives in its own module so each tier knows whether
+    // an earlier one MATCHED, rather than inferring it from the selected slug —
+    // a mention of, or a reply to, the default SB is a match, and treating it
+    // as "nothing matched" handed the message to the next tier.
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
-    // For group chats, try mention-based routing first
-    // Always call for group chats — text matching works even without platform mentions
-    // (e.g., WhatsApp has no native @mentions, Slack bot mention excluded from users array)
-    if (isGroupChat) {
-      const mentionMatch = await resolveAgentFromMention(
-        dataComposer!.getClient(),
-        userId,
-        content,
-        metadata?.mentions?.users ?? []
-      );
-      if (mentionMatch) {
-        routedAgentId = mentionMatch.agentId;
-        routedIdentityId = mentionMatch.sbId;
-        logger.debug(`[Route] Resolved agent from @mention`, {
-          platform: channel,
-          agentId: mentionMatch.agentId,
-          sbId: mentionMatch.sbId,
-        });
-      }
-    }
+    const resolution = await resolveInboundAgent({
+      supabase: dataComposer!.getClient(),
+      userId,
+      defaultSlug: sbSlug,
+      platform: channel,
+      conversationId,
+      content,
+      isGroupChat,
+      mentionedUserIds: metadata?.mentions?.users ?? [],
+      platformAccountId: metadata?.platformAccountId,
+      replyToMessageId: metadata?.replyToMessageId,
+    });
 
-    // If mention didn't match, try channel_routes specificity cascade
-    let routeStudioHint: string | null = null;
-    let resolvedRouteId: string | null = null;
-    if (routedAgentId === agentId) {
-      const route = await resolveRouteAgentId(
-        dataComposer!.getClient(),
-        userId,
-        channel,
-        metadata?.platformAccountId,
-        conversationId
-      );
-      if (route) {
-        routedAgentId = route.agentId;
-        routedIdentityId = route.sbId;
-        routeStudioHint = route.studioHint;
-        resolvedRouteId = route.routeId;
-        logger.debug(`[Route] Resolved agent from channel_routes`, {
-          platform: channel,
-          agentId: route.agentId,
-          sbId: route.sbId,
-          routeId: route.routeId,
-          studioHint: route.studioHint,
-        });
-      } else {
-        logger.warn(
-          `[Route] No channel_route found for ${channel}, falling back to AGENT_ID=${agentId}`,
-          { userId, platform: channel, conversationId }
-        );
-      }
-    }
+    const routedSlug = resolution.sbSlug;
+    const routedIdentityId = resolution.sbId;
+    const routeStudioHint = resolution.studioHint;
+    const resolvedRouteId = resolution.routeId;
+    const replyRouting = resolution.replyRouting;
 
     // Resolve contact for per-sender session isolation (only when agent has session_scope: 'per_sender')
     let contactId: string | undefined;
@@ -273,7 +254,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         if (routedIdentityId) {
           scopeQuery = scopeQuery.eq('id', routedIdentityId);
         } else {
-          scopeQuery = scopeQuery.eq('user_id', userId).eq('agent_id', routedAgentId);
+          scopeQuery = scopeQuery.eq('user_id', userId).eq('agent_id', routedSlug);
         }
         const { data: identity } = await scopeQuery.single();
         agentSessionScope = identity?.session_scope || 'global';
@@ -322,7 +303,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // Build SessionRequest
     const request: SessionRequest = {
       userId,
-      agentId: routedAgentId,
+      sbSlug: routedSlug,
       channel: channel as ChannelType,
       conversationId,
       sender: {
@@ -338,6 +319,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         triggerType: 'message',
         ...(routeStudioHint ? { studioHint: routeStudioHint } : {}),
         ...(contactId ? { contactId } : {}),
+        // Carried so a misroute is diagnosable after the fact. Without it, a
+        // reply that fell through to the channel owner is indistinguishable
+        // from one that was never a reply at all. The cascade withholds this
+        // for a message that was never a reply, so its presence means one was.
+        ...(replyRouting ? { replyRouting } : {}),
       },
     };
 
@@ -467,7 +453,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
   }
 
-  // Force HTTP mode for the PCP server
+  // Force HTTP mode for the Inkwell server
   const originalTransport = env.MCP_TRANSPORT;
   (env as { MCP_TRANSPORT: string }).MCP_TRANSPORT = 'http';
   await mcpServer.start();
@@ -532,8 +518,15 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.
+   *
+   * The consecutive-failure count that separates a blip from an outage is not
+   * tracked here. It is derived from `reminder_history` inside processHeartbeat,
+   * because a process-local counter resets on restart — and a server restart is
+   * exactly when a monitor is most likely to be broken.
    */
-  const deliverReminderViaSession = async (reminder: DueReminder): Promise<boolean> => {
+  const deliverReminderViaSession = async (
+    reminder: DueReminder
+  ): Promise<HeartbeatDeliveryOutcome> => {
     const userId = reminder.user_id;
 
     // Strategy watchdog branch: reminders created by StrategyService carry
@@ -549,28 +542,41 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         logger.warn(
           `[Heartbeat] strategyWatchdog reminder ${reminder.id} has no groupId in metadata, skipping`
         );
-        return false;
+        return { status: 'failed', error: 'strategyWatchdog reminder has no groupId in metadata' };
       }
       try {
         const strategyService = new StrategyService(dataComposer, getOrchestrator());
-        const fired = await strategyService.triggerWatchdog(groupId);
-        if (fired) {
+        const result = await strategyService.triggerWatchdog(groupId);
+        if (result.outcome === 'fired') {
           logger.info(
             `[Heartbeat] Strategy watchdog fired for group ${groupId} (reminder ${reminder.id})`
           );
+          return { status: 'delivered' };
         }
-        return fired;
+        if (result.outcome === 'skipped') {
+          // The watchdog cancelled itself because there is nothing left to
+          // watch. That is the watchdog working, not a monitor going down —
+          // escalating it would page a human every time a strategy finished.
+          return {
+            status: 'skipped',
+            reason: `strategy watchdog stood down for group ${groupId}: ${result.reason}`,
+          };
+        }
+        return { status: 'failed', error: result.error };
       } catch (err) {
         logger.error(
           `[Heartbeat] Strategy watchdog failed for group ${groupId} (reminder ${reminder.id}):`,
           err
         );
-        return false;
+        return {
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        };
       }
     }
 
     // Resolve agent from reminder's sb_id, fall back to server default
-    let reminderAgentId = agentId;
+    let reminderSlug = sbSlug;
     if (reminder.sb_id && dataComposer) {
       const { data: identity } = await dataComposer
         .getClient()
@@ -579,8 +585,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         .eq('id', reminder.sb_id)
         .single();
       if (identity?.agent_id) {
-        reminderAgentId = identity.agent_id;
-        logger.debug(`[Heartbeat] Resolved agent from sb_id: ${reminderAgentId}`);
+        reminderSlug = identity.agent_id;
+        logger.debug(`[Heartbeat] Resolved agent from sb_id: ${reminderSlug}`);
       }
     }
 
@@ -603,7 +609,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Resolve channel_routes for both studioHint and activeSessionId
     if (dataComposer && reminder.delivery_channel) {
-      const route = await resolveRouteAgentId(
+      const route = await resolveRouteSlug(
         dataComposer.getClient(),
         userId,
         reminder.delivery_channel,
@@ -619,19 +625,19 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             deliveryTarget: reminder.delivery_target,
           });
         }
-        if (route.activeSessionId && route.agentId === reminderAgentId) {
+        if (route.activeSessionId && route.sbSlug === reminderSlug) {
           routeActiveSessionId = route.activeSessionId;
           logger.info(`[Heartbeat] Using active_session_id from channel_route`, {
             activeSessionId: routeActiveSessionId,
             deliveryChannel: reminder.delivery_channel,
             reminderId: reminder.id,
           });
-        } else if (route.activeSessionId && route.agentId !== reminderAgentId) {
+        } else if (route.activeSessionId && route.sbSlug !== reminderSlug) {
           logger.debug(
-            `[Heartbeat] Ignoring active_session_id — route agent ${route.agentId} ≠ reminder agent ${reminderAgentId}`,
+            `[Heartbeat] Ignoring active_session_id — route agent ${route.sbSlug} ≠ reminder agent ${reminderSlug}`,
             {
-              routeAgentId: route.agentId,
-              reminderAgentId,
+              routeSlug: route.sbSlug,
+              reminderSlug,
               activeSessionId: route.activeSessionId,
             }
           );
@@ -676,7 +682,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
     const request: SessionRequest = {
       userId,
-      agentId: reminderAgentId,
+      sbSlug: reminderSlug,
       channel: 'heartbeat',
       conversationId: `heartbeat:${reminder.id}`,
       sender: { id: 'system', name: 'heartbeat' },
@@ -694,7 +700,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       logger.info('[Heartbeat] Delivery result', {
         reminderId: reminder.id,
-        agentId: reminderAgentId,
+        sbSlug: reminderSlug,
         success: result.success,
         responseCount: result.responses?.length || 0,
         ...(result.error ? { error: result.error } : {}),
@@ -709,12 +715,57 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         await routeResponses(result.responses, result.sessionId);
       }
 
-      return result.success;
+      // The error is the point. Returning a bare `result.success` here is what
+      // reduced "Backend claude is not authenticated (not logged in)" to the
+      // recorded reason "Delivery callback returned false".
+      if (result.success) {
+        return { status: 'delivered' };
+      }
+      return {
+        status: 'failed',
+        error: result.error || 'session reported failure',
+        // Carried, not re-derived. `result.error` is an excerpt by the time it
+        // reaches here; the escalation prints a category to a human and would
+        // otherwise read it off that excerpt and disagree with the verdict the
+        // server acted on (Lumen, review of PR #662).
+        ...(result.classification ? { classification: result.classification } : {}),
+      };
     } catch (error) {
       logger.error(`Failed to deliver reminder ${reminder.id}:`, error);
-      return false;
+      return {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   };
+
+  /**
+   * Escalation for a failed beat, and the all-clear when it comes back.
+   *
+   * Heartbeats bypass the agent gateway entirely, so `trigger:error` — and
+   * with it the whole `[TriggerFailure]` path that restores the message and
+   * notifies the sender — never fires for a beat. And even if it did, it
+   * would return at `if (!payload.fromSlug)`: a heartbeat's sender is
+   * `system`, so there is nobody to notify. Unreportable twice over.
+   *
+   * The implementation lives in `heartbeat-escalation.ts` rather than in this
+   * closure, so it can be tested as the thing that actually reports an outage.
+   * A suite built against a mocked hook proves the hook gets called; it cannot
+   * prove a notice reached anyone.
+   */
+  const heartbeatEscalation = dataComposer
+    ? createHeartbeatEscalation({
+        client: dataComposer.getClient(),
+        // The direct path: straight out over the channel, no session and no
+        // LLM turn anywhere in it. A notice that needs an SB to wake up cannot
+        // be the one that reports an SB failing to wake up.
+        sendToChannel: async (response) => {
+          if (!channelGateway) throw new Error('ChannelGateway not initialized');
+          return channelGateway.sendResponse(response);
+        },
+        defaultSlug: sbSlug,
+      })
+    : null;
 
   if (heartbeatServiceEnabled) {
     const sweepLeaseService = new StudioLeaseService(dataComposer!.getClient());
@@ -727,7 +778,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       enableLocalCron,
       onHeartbeat: async () => {
         logger.info('Heartbeat tick — processing due reminders');
-        const stats = await processHeartbeat(deliverReminderViaSession);
+        const stats = await processHeartbeat(
+          deliverReminderViaSession,
+          heartbeatEscalation?.onFailure,
+          heartbeatEscalation?.onRecovery
+        );
         logger.info('Heartbeat complete', stats);
 
         // Lease sweep: expire leases whose heartbeat went stale (rescuing the
@@ -794,16 +849,16 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       await dataComposer!.repositories.activityStream.logActivity({
         userId,
-        agentId: payload.toAgentId,
+        sbSlug: payload.toSlug,
         type,
         subtype: payload.triggerType,
-        content: payload.summary || `Inkmail from ${payload.fromAgentId}`,
+        content: payload.summary || `Inkmail from ${payload.fromSlug}`,
         sessionId: extra?.sessionId,
         taskGroupId,
         correlationId: payload.threadMessageId || payload.inboxMessageId,
         payload: {
-          fromAgentId: payload.fromAgentId,
-          toAgentId: payload.toAgentId,
+          fromSlug: payload.fromSlug,
+          toSlug: payload.toSlug,
           threadKey: payload.threadKey || null,
           messageId: payload.threadMessageId || payload.inboxMessageId || null,
           priority: payload.priority || 'normal',
@@ -827,9 +882,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   }
 
   agentGateway.setDefaultHandler(async (payload: AgentTriggerPayload) => {
-    const targetAgentId = payload.toAgentId;
+    const targetSlug = payload.toSlug;
 
-    logger.info(`[Trigger] Received trigger for ${targetAgentId} from ${payload.fromAgentId}`, {
+    logger.info(`[Trigger] Received trigger for ${targetSlug} from ${payload.fromSlug}`, {
       type: payload.triggerType,
       priority: payload.priority,
       summary: payload.summary,
@@ -879,8 +934,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
             inboxMessageId: payload.inboxMessageId,
             inboxRecipientUserId: inboxMsg.recipient_user_id,
             authUserId,
-            targetAgentId,
-            fromAgentId: payload.fromAgentId,
+            targetSlug,
+            fromSlug: payload.fromSlug,
           }
         );
         throw new Error('Trigger denied: inbox message does not belong to authenticated user');
@@ -902,9 +957,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         threadId: payload.threadId,
         threadMessageId: payload.threadMessageId,
         toSbId: payload.toSbId,
-        targetAgentId,
+        targetSlug,
         authUserId,
-        fromAgentId: payload.fromAgentId,
+        fromSlug: payload.fromSlug,
       });
       threadWorkspaceId = scope.threadWorkspaceId;
       if (scope.userId) userId = scope.userId;
@@ -915,12 +970,12 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     if (!userId) {
       userId = authUserId;
       if (userId) {
-        logger.info(`[Trigger] Resolved userId from auth context for ${targetAgentId}`);
+        logger.info(`[Trigger] Resolved userId from auth context for ${targetSlug}`);
       }
     }
 
     if (!userId) {
-      logger.error(`[Trigger] Cannot process - no userId found for agent ${targetAgentId}`);
+      logger.error(`[Trigger] Cannot process - no userId found for agent ${targetSlug}`);
       throw new Error(
         'Cannot process trigger without userId (no inbox message and no auth context)'
       );
@@ -950,13 +1005,13 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       if (!identityRow) {
         throw new Error(
-          `Inbox recipient_sb_id is invalid for this user (${targetAgentId}). Re-send inbox message.`
+          `Inbox recipient_sb_id is invalid for this user (${targetSlug}). Re-send inbox message.`
         );
       }
 
-      if (identityRow.agent_id !== targetAgentId) {
+      if (identityRow.agent_id !== targetSlug) {
         throw new Error(
-          `Inbox recipient_sb_id targets "${identityRow.agent_id}", not "${targetAgentId}".`
+          `Inbox recipient_sb_id targets "${identityRow.agent_id}", not "${targetSlug}".`
         );
       }
 
@@ -967,7 +1022,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         .from('agent_identities')
         .select('id, workspace_id')
         .eq('user_id', userId)
-        .eq('agent_id', targetAgentId);
+        .eq('agent_id', targetSlug);
 
       if (metadataWorkspaceId) {
         identityQuery = identityQuery.eq('workspace_id', metadataWorkspaceId);
@@ -976,17 +1031,17 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       const { data: identityRows, error: identityError } = await identityQuery;
       if (identityError) {
         throw new Error(
-          `Failed to resolve target identity for ${targetAgentId}: ${identityError.message}`
+          `Failed to resolve target identity for ${targetSlug}: ${identityError.message}`
         );
       }
 
       if (!identityRows || identityRows.length === 0) {
-        logger.error(`[Trigger] Unknown agent for user: ${targetAgentId}`, {
+        logger.error(`[Trigger] Unknown agent for user: ${targetSlug}`, {
           userId,
           workspaceId: metadataWorkspaceId || null,
         });
         throw new Error(
-          `Unknown agent for user: ${targetAgentId}. Register in agent_identities first.`
+          `Unknown agent for user: ${targetSlug}. Register in agent_identities first.`
         );
       }
 
@@ -999,11 +1054,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
           resolvedIdentityId = workspaceScoped[0].id;
           resolvedWorkspaceId = workspaceScoped[0].workspace_id || undefined;
           logger.info(
-            `[Trigger] Disambiguated ${targetAgentId}: preferred workspace-scoped identity ${resolvedIdentityId}`
+            `[Trigger] Disambiguated ${targetSlug}: preferred workspace-scoped identity ${resolvedIdentityId}`
           );
         } else {
           throw new Error(
-            `Ambiguous identity for agent "${targetAgentId}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_sb_id or pass metadata.workspaceId.`
+            `Ambiguous identity for agent "${targetSlug}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_sb_id or pass metadata.workspaceId.`
           );
         }
       } else {
@@ -1013,7 +1068,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     }
 
     // 3. Build trigger message
-    let triggerMessage = `[TRIGGER from ${payload.fromAgentId}]
+    let triggerMessage = `[TRIGGER from ${payload.fromSlug}]
 Type: ${payload.triggerType}`;
     if (payload.summary) {
       triggerMessage += `\nSummary: ${payload.summary}`;
@@ -1023,6 +1078,28 @@ Type: ${payload.triggerType}`;
     }
     if (payload.threadKey) {
       triggerMessage += `\n\nThread: ${payload.threadKey}`;
+
+      // The thread's own description, on the surface an SB reads BEFORE
+      // deciding whether to act. A key alone ("inkwell:thread:legibility-commission")
+      // says nothing about what the thread became, and one thread routinely
+      // spans several PRs and specs. Each line carries its age, so a
+      // description nobody has touched since the thread opened cannot be read
+      // as a current statement of what it is about.
+      //
+      // targetSlug is passed because this text is about to be written into that
+      // SB's prompt, and a trigger may name any threadKey: the loader delivers
+      // nothing unless the recipient is a participant.
+      if (dataComposer) {
+        const descriptor = await loadThreadDescriptor(
+          dataComposer.getClient(),
+          userId,
+          payload.threadKey,
+          targetSlug
+        );
+        for (const line of formatThreadDescriptorLines(descriptor)) {
+          triggerMessage += `\n${line}`;
+        }
+      }
     }
     triggerMessage += `
 
@@ -1035,12 +1112,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // 4. Process via SessionService (stateless - looks up session from DB)
     const request: SessionRequest = {
       userId,
-      agentId: targetAgentId,
+      sbSlug: targetSlug,
       channel: 'agent',
       conversationId: payload.threadKey
-        ? `trigger:${targetAgentId}:${payload.threadKey}`
-        : `trigger:${targetAgentId}`,
-      sender: { id: payload.fromAgentId, name: payload.fromAgentId },
+        ? `trigger:${targetSlug}:${payload.threadKey}`
+        : `trigger:${targetSlug}`,
+      sender: { id: payload.fromSlug, name: payload.fromSlug },
       content: triggerMessage,
       metadata: {
         triggerType: 'agent',
@@ -1068,7 +1145,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
     logger.info('[Trigger] Resolved target identity', {
       userId,
-      agentId: targetAgentId,
+      sbSlug: targetSlug,
       sbId: resolvedIdentityId,
       workspaceId: resolvedWorkspaceId || null,
     });
@@ -1099,7 +1176,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       await clearRoutingHold(dataComposer!.getClient(), {
         threadId: payload.threadId,
         workspaceId: threadWorkspaceId,
-        agentId: targetAgentId,
+        sbSlug: targetSlug,
         routedSince: routeStartedAt,
       });
     };
@@ -1125,7 +1202,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // sees it — ~/.ink/logs/error.log is the one place an operator looks.
       logger.error('[Trigger] HELD — routing refused, no session created', {
         threadKey: refusal.threadKey,
-        targetAgentId,
+        targetSlug,
         reason: refusal.detail.reason ?? 'no-route',
         triedCallerRepo: refusal.detail.triedCallerRepo,
         callerRepoRoot: refusal.detail.callerRepoRoot || null,
@@ -1150,7 +1227,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         await stampRoutingHold(dataComposer!.getClient(), {
           threadId: payload.threadId,
           workspaceId: threadWorkspaceId,
-          agentId: targetAgentId,
+          sbSlug: targetSlug,
           attemptStartedAt: routeStartedAt,
           detail: {
             triedCallerRepo: refusal.detail.triedCallerRepo,
@@ -1172,7 +1249,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // Only a delivery that actually admits a spawn provisions, inside
     // handleMessage's own full resolution below.
     try {
-      const routedSession = await sessionService!.getOrCreateSession(userId, targetAgentId, {
+      const routedSession = await sessionService!.getOrCreateSession(userId, targetSlug, {
         planOnly: true,
         threadKey: payload.threadKey,
         alias: payload.sessionAlias,
@@ -1243,7 +1320,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           assignmentFailure = err instanceof Error ? err.message : String(err);
           logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,
-            agentId: targetAgentId,
+            sbSlug: targetSlug,
             sessionId: routedSession.id,
             error: assignmentFailure,
           });
@@ -1268,18 +1345,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       if (payload.routeOnly) {
         if (assignmentFailure) {
           logger.error('[Trigger] routeOnly assignment failed — surfacing to sender', {
-            targetAgentId,
+            targetSlug,
             sessionId: deliverySession.id,
             threadKey: payload.threadKey,
             threadId: payload.threadId,
             error: assignmentFailure,
           });
-          throw new Error(`routeOnly assignment failed for ${targetAgentId}: ${assignmentFailure}`);
+          throw new Error(`routeOnly assignment failed for ${targetSlug}: ${assignmentFailure}`);
         }
         // Terminal for routeOnly: assignment is the whole job and it landed.
         await clearHoldAtTerminal();
         logger.info('[Trigger] routeOnly — assignment complete, no wake', {
-          targetAgentId,
+          targetSlug,
           sessionId: deliverySession.id,
           threadKey: payload.threadKey,
           threadId: payload.threadId,
@@ -1347,7 +1424,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         logger.info(
           `[Trigger] CLI-attached (${delivery.source}) — skipping spawn, channel plugin will deliver`,
           {
-            targetAgentId,
+            targetSlug,
             attachedSessionId: delivery.sessionId || deliverySession.id,
             routedSessionId: deliverySession.id,
             studioId: deliverySession.studioId,
@@ -1363,7 +1440,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
       if (delivery.forced) {
         logger.info('[Trigger] Force-spawn — bypassing CLI-attached check', {
-          targetAgentId,
+          targetSlug,
           reason: payload.metadata?.reason,
           groupId: payload.metadata?.groupId,
         });
@@ -1417,7 +1494,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       request.metadata!.media = triggerMedia;
       logger.info('[Trigger] delivering media attachments', {
         count: triggerMedia.length,
-        to: targetAgentId,
+        to: targetSlug,
       });
     }
 
@@ -1447,7 +1524,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           detail: result.refusal.detail,
           message: result.error || 'routing refused at spawn admission',
         });
-        throw new Error(result.error || 'routing refused at spawn admission');
+        // A RoutingRefusedError, not a bare Error (Lumen, r2). The two throw
+        // sites above rethrow the real one and carry `code` with them; this
+        // one used to flatten a refusal into prose, and prose is exactly what
+        // the retry scheduler cannot read a refusal from — a message naming
+        // thread "pr:503" classifies as capacity and gets re-dispatched.
+        throw new RoutingRefusedError(result.refusal.threadKey, targetSlug, result.refusal.detail);
       }
 
       // Post-admission failure (Lumen, PR #565 r2): routing completed —
@@ -1460,9 +1542,37 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         await clearHoldAtTerminal();
       }
 
-      logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);
-      throw new Error(result.error || 'SessionService processing failed');
+      logger.error(`[Trigger] SessionService failed for ${targetSlug}: ${result.error}`);
+      // A BackendFailureError when the runner reached a verdict, so the retry
+      // decision is made on what the process actually said rather than on the
+      // excerpt that survived the cut (Lumen, r3). Without the carried value
+      // this throw is the point the verdict dies: `result.error` is bounded
+      // text, and the listener below is the only thing left to read it.
+      const failureText = result.error || 'SessionService processing failed';
+      throw result.classification
+        ? new BackendFailureError(failureText, result.classification)
+        : new Error(failureText);
     }
+
+    // Mark the payload: the session turn completed. If anything below throws
+    // and lands in trigger:error, the retry scheduler must NOT re-dispatch —
+    // the spawn already produced a successful turn (double-execution guard).
+    payload.metadata = { ...(payload.metadata ?? {}), triggerTurnCompleted: true };
+
+    // And kill any retry still waiting on this message (Lumen, r2). The marker
+    // above only protects THIS payload; a delivery that arrives by another
+    // route — a heartbeat scan, a manual re-send — is a different payload
+    // object, and the pending timer holds a copy made before it existed. The
+    // timer would fire into an already-answered message and run a second
+    // session turn. cancelFor keys off the source message, which both payloads
+    // agree on.
+    //
+    // triggerRetryScheduler is declared further down this function on purpose:
+    // hoisting it above the handler re-indented 666 lines and, on the way,
+    // swallowed this registration into the scheduler's own callback. The
+    // binding is initialised long before any trigger arrives, so the closure
+    // is the cheaper half of that trade.
+    triggerRetryScheduler.cancelFor(payload);
 
     // Terminal for spawn: admission actually succeeded — occupancy was
     // rechecked, provisioning and acquisition landed, a process ran. Only now
@@ -1502,21 +1612,44 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       }
     } catch (routeErr) {
       logger.error(
-        `[Trigger] Response routing failed for ${targetAgentId} (session succeeded):`,
+        `[Trigger] Response routing failed for ${targetSlug} (session succeeded):`,
         routeErr
       );
     }
 
     await logInkmail('inkmail_deliver', payload, userId, { deliveryMethod: 'spawn' });
-    logger.info(`[Trigger] Successfully processed trigger for ${targetAgentId}`);
+    logger.info(`[Trigger] Successfully processed trigger for ${targetSlug}`);
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
 
-  // 7b. Listen for trigger failures — restore inbox message + notify sender
+  // 7b. Delayed re-queue for transiently failed triggers (network dips,
+  // connect timeouts, stream disconnects). Attempt 2 after ~2min, attempt 3
+  // after ~10min; then the final failure notification fires, annotated with the
+  // attempt count. State is in-memory — a process restart drops pending
+  // retries (v1 tradeoff), which is why nothing depends on the timer: the
+  // inbox row is restored to unread before the retry decision, and a threaded
+  // failure is announced on its first failure rather than held silently.
+  const triggerRetryScheduler = new TriggerRetryScheduler((retryPayload) => {
+    logger.info('[TriggerRetry] Re-dispatching trigger', {
+      to: retryPayload.toSlug,
+      from: retryPayload.fromSlug,
+      attempt: getTriggerAttempt(retryPayload),
+      threadKey: retryPayload.threadKey || null,
+      inboxMessageId: retryPayload.inboxMessageId || null,
+    });
+    agentGateway.dispatchTrigger(retryPayload);
+  });
+
+  // 7c. Listen for trigger failures — transient errors get a delayed retry;
+  // otherwise restore inbox message + notify sender. The decision lives in
+  // services/trigger-failure-listener.ts so it can run over a table-backed
+  // client (Lumen, #618); the scheduler and the activity stream are handed in.
   agentGateway.on('trigger:error', (event: TriggerFailureEvent) =>
     handleTriggerFailure(dataComposer?.getClient(), event, {
       logInkmailFailure: (payload, userId, extra) =>
         logInkmail('inkmail_fail', payload, userId, extra),
+      retryScheduler: triggerRetryScheduler,
+      logRetryActivity: (entry) => dataComposer!.repositories.activityStream.logActivity(entry),
     })
   );
 
@@ -1630,7 +1763,7 @@ function printStatus(): void {
   logger.info('Server Status');
   logger.info('='.repeat(60));
   logger.info(`  Architecture: SessionService (stateless)`);
-  logger.info(`  Agent ID: ${process.env.AGENT_ID || 'myra'}`);
+  logger.info(`  SB slug: ${resolveServerSbSlug()}`);
   logger.info(`  MCP Port: ${env.MCP_HTTP_PORT}`);
 
   const status = channelGateway?.getStatus();
@@ -1691,7 +1824,7 @@ async function shutdown(): Promise<void> {
         logActivity: (entry) =>
           composer.repositories.activityStream.logActivity({
             userId: entry.userId,
-            agentId: entry.agentId,
+            sbSlug: entry.sbSlug,
             type: entry.type as ActivityType,
             subtype: entry.subtype,
             content: entry.content,

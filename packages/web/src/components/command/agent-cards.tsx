@@ -73,7 +73,7 @@ function computeTaskStats(agent: AgentState, tasks: TaskNode[]): TaskStats {
   const agentTasks = tasks.filter(
     (t) =>
       (agent.sbId && t.assigneeIdentityId === agent.sbId) ||
-      (!t.assigneeIdentityId && t.agentId === agent.agentId)
+      (!t.assigneeIdentityId && t.sbSlug === agent.sbSlug)
   );
   const inProgress = agentTasks.filter((t) => t.status === 'in_progress').length;
   const pending = agentTasks.filter((t) => t.status === 'pending').length;
@@ -113,7 +113,7 @@ function AgentCard({
   skin: SkinConfig;
   onSelect: () => void;
 }) {
-  const color = AGENT_COLORS[agent.agentId] ?? '#888';
+  const color = AGENT_COLORS[agent.sbSlug] ?? '#888';
   const statusColor = lifecycleColor(agent.lifecycle, agent.phase, skin);
   const statusLabel = lifecycleLabel(agent.lifecycle, agent.phase);
   const isActive = agent.lifecycle === 'running';
@@ -275,12 +275,12 @@ export function AgentCards() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {activeAgents.map((agent) => (
               <AgentCard
-                key={agent.agentId}
+                key={agent.sbSlug}
                 agent={agent}
-                studios={studios.filter((s) => s.agentId === agent.agentId)}
+                studios={studios.filter((s) => s.sbSlug === agent.sbSlug)}
                 taskStats={computeTaskStats(agent, tasks)}
                 skin={skin}
-                onSelect={() => selectAgent(agent.agentId)}
+                onSelect={() => selectAgent(agent.sbSlug)}
               />
             ))}
           </div>
@@ -299,12 +299,12 @@ export function AgentCards() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {idleAgents.map((agent) => (
               <AgentCard
-                key={agent.agentId}
+                key={agent.sbSlug}
                 agent={agent}
-                studios={studios.filter((s) => s.agentId === agent.agentId)}
+                studios={studios.filter((s) => s.sbSlug === agent.sbSlug)}
                 taskStats={computeTaskStats(agent, tasks)}
                 skin={skin}
-                onSelect={() => selectAgent(agent.agentId)}
+                onSelect={() => selectAgent(agent.sbSlug)}
               />
             ))}
           </div>

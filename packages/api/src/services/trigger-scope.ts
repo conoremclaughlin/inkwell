@@ -25,10 +25,10 @@ export interface ThreadTriggerScopeInput {
   /** The canonical target, set by thread dispatch. */
   toSbId?: string;
   /** The slug the payload names; must match the identity. */
-  targetAgentId: string;
+  targetSlug: string;
   /** The authenticated caller, when there is one (internal dispatch may run without). */
   authUserId?: string;
-  fromAgentId?: string;
+  fromSlug?: string;
 }
 
 export interface ThreadTriggerScope {
@@ -43,7 +43,7 @@ export async function resolveThreadTriggerScope(
   client: Client,
   input: ThreadTriggerScopeInput
 ): Promise<ThreadTriggerScope> {
-  const { targetAgentId, authUserId, fromAgentId } = input;
+  const { targetSlug, authUserId, fromSlug } = input;
 
   // 1. The thread, from the id or from the message. Unreadable is refused.
   let threadId = input.threadId;
@@ -85,8 +85,8 @@ export async function resolveThreadTriggerScope(
       threadId,
       threadWorkspaceId,
       authUserId,
-      targetAgentId,
-      fromAgentId,
+      targetSlug,
+      fromSlug,
     });
     throw new Error('Trigger denied: sender is not a member of the thread workspace');
   }
@@ -103,11 +103,11 @@ export async function resolveThreadTriggerScope(
     .eq('id', input.toSbId)
     .maybeSingle();
   if (identityError || !identity) {
-    throw new Error(`Trigger denied: unknown target identity for ${targetAgentId}`);
+    throw new Error(`Trigger denied: unknown target identity for ${targetSlug}`);
   }
-  if (identity.agent_id !== targetAgentId) {
+  if (identity.agent_id !== targetSlug) {
     throw new Error(
-      `Trigger denied: target identity is "${identity.agent_id}", not "${targetAgentId}"`
+      `Trigger denied: target identity is "${identity.agent_id}", not "${targetSlug}"`
     );
   }
   if (identity.workspace_id !== threadWorkspaceId) {
@@ -115,8 +115,8 @@ export async function resolveThreadTriggerScope(
       threadId,
       threadWorkspaceId,
       identityWorkspaceId: identity.workspace_id,
-      targetAgentId,
-      fromAgentId,
+      targetSlug,
+      fromSlug,
     });
     throw new Error('Trigger denied: target identity is not in the thread workspace');
   }
@@ -156,7 +156,7 @@ export async function resolveFailureNoticeAddress(
     threadMessageId?: string;
     toSbId?: string;
     fromSbId?: string;
-    fromAgentId?: string;
+    fromSlug?: string;
   }
 ): Promise<FailureNoticeAddress> {
   const out: FailureNoticeAddress = {};

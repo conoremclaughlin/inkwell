@@ -1,7 +1,7 @@
 /**
  * Backend Permission Adapter Types
  *
- * Defines the interface for translating PCP permissions to backend-specific formats.
+ * Defines the interface for translating Inkwell permissions to backend-specific formats.
  * Each backend (Claude Code, Direct API, future models) implements this interface.
  */
 
@@ -27,19 +27,19 @@ export interface BackendPermissionConfig {
 
 /**
  * Permission adapter interface
- * Implement this for each backend to translate PCP permissions
+ * Implement this for each backend to translate Inkwell permissions
  */
 export interface PermissionAdapter {
   /** Backend identifier (e.g., 'claude-code', 'ink') */
   readonly backendId: string;
 
   /**
-   * Translate PCP permissions to backend-specific configuration
+   * Translate Inkwell permissions to backend-specific configuration
    */
   translate(permissions: EffectivePermissions): BackendPermissionConfig;
 
   /**
-   * Get the list of PCP permissions this adapter supports
+   * Get the list of Inkwell permissions this adapter supports
    */
   getSupportedPermissions(): PermissionId[];
 

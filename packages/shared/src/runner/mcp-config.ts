@@ -32,8 +32,8 @@ interface McpJsonConfig {
 export interface InjectSessionHeadersOptions {
   /** Path to the .mcp.json file to read as base config */
   mcpConfigPath: string;
-  /** PCP session ID to inject. Optional — other headers still get injected without it. */
-  pcpSessionId?: string;
+  /** Inkwell session ID to inject. Optional — other headers still get injected without it. */
+  inkSessionId?: string;
   /** Optional studio ID to inject */
   studioId?: string;
   /** Optional access token — injected as Authorization header for triggered sessions */
@@ -69,11 +69,11 @@ export interface InjectSessionHeadersResult {
 export function injectSessionHeaders(
   options: InjectSessionHeadersOptions
 ): InjectSessionHeadersResult {
-  const { mcpConfigPath, pcpSessionId, studioId, accessToken } = options;
+  const { mcpConfigPath, inkSessionId, studioId, accessToken } = options;
 
   // Missing config file — nothing to inject into. Note: we still inject the
-  // other headers (studio, context, authorization) when pcpSessionId is
-  // absent — x-ink-context carries agentId/studioId/runtime which are useful
+  // other headers (studio, context, authorization) when inkSessionId is
+  // absent — x-ink-context carries sbSlug/studioId/runtime which are useful
   // independently of session identity.
   if (!mcpConfigPath || !existsSync(mcpConfigPath)) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
@@ -99,7 +99,7 @@ export function injectSessionHeaders(
   // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime).
   // Only when we actually have a session — otherwise the rendered header
   // would be an empty string which muddies server-side logs.
-  if (pcpSessionId && !config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
+  if (inkSessionId && !config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
     config.mcpServers[serverKey].headers = {
       ...config.mcpServers[serverKey].headers,
       'x-ink-session-id': '${INK_SESSION_ID}',
@@ -166,10 +166,10 @@ export function injectSessionHeaders(
  * Carried in the `x-ink-context` header as base64url-encoded JSON.
  * See spec: ink://specs/mcp-context-token
  */
-export interface PcpContextToken {
+export interface InkContextToken {
   sessionId: string;
   studioId: string;
-  agentId: string;
+  sbSlug: string;
   cliAttached: boolean;
   runtime: string; // 'claude' | 'codex' | 'gemini'
   repoRoot?: string; // root repo path for cross-project 'main' resolution
@@ -178,9 +178,9 @@ export interface PcpContextToken {
 /**
  * Encode a context token for the `x-ink-context` header.
  */
-export function encodeContextToken(token: PcpContextToken): string {
+export function encodeContextToken(token: InkContextToken): string {
   // token.runtime values in the wild: 'claude' | 'codex' | 'gemini' for
-  // provider-backed spawns, plus 'ink' for the ink chat loop's own PcpClient
+  // provider-backed spawns, plus 'ink' for the ink chat loop's own InkClient
   // (PR #468). The server treats it as an opaque string.
   return Buffer.from(JSON.stringify(token)).toString('base64url');
 }
@@ -189,14 +189,25 @@ export function encodeContextToken(token: PcpContextToken): string {
  * Decode a context token from the `x-ink-context` header.
  * Returns null if the header is missing or malformed.
  */
-export function decodeContextToken(header: string | undefined | null): PcpContextToken | null {
+export function decodeContextToken(header: string | undefined | null): InkContextToken | null {
   if (!header) return null;
   try {
     const parsed = JSON.parse(Buffer.from(header, 'base64url').toString());
-    if (typeof parsed.sessionId !== 'string' || typeof parsed.agentId !== 'string') {
+    // Tokens minted before the agentId -> sbSlug rename carry `agentId`, and they
+    // live in running processes and already-generated MCP configs that nothing
+    // rewrites. Such a token is otherwise valid: refusing it would discard its
+    // session, studio, runtime and cliAttached together, and take the server's
+    // context-session auth fallback with them (Lumen, PR #635).
+    const sbSlug =
+      typeof parsed.sbSlug === 'string'
+        ? parsed.sbSlug
+        : typeof parsed.agentId === 'string'
+          ? parsed.agentId
+          : undefined;
+    if (typeof parsed.sessionId !== 'string' || sbSlug === undefined) {
       return null;
     }
-    return parsed as PcpContextToken;
+    return { ...parsed, sbSlug } as InkContextToken;
   } catch {
     return null;
   }
@@ -213,11 +224,11 @@ export function decodeContextToken(header: string | undefined | null): PcpContex
  *   for backward compat during Phase 1 migration
  */
 export function buildSessionEnv(options: {
-  pcpSessionId?: string;
+  inkSessionId?: string;
   runtimeLinkId?: string;
   studioId?: string;
   accessToken?: string;
-  agentId?: string;
+  sbSlug?: string;
   cliAttached?: boolean;
   runtime?: string;
   repoRoot?: string;
@@ -225,8 +236,8 @@ export function buildSessionEnv(options: {
   const env: Record<string, string> = {};
 
   // Legacy individual env vars (Phase 1 backward compat)
-  if (options.pcpSessionId) {
-    env.INK_SESSION_ID = options.pcpSessionId;
+  if (options.inkSessionId) {
+    env.INK_SESSION_ID = options.inkSessionId;
   }
   if (options.runtimeLinkId) {
     env.INK_RUNTIME_LINK_ID = options.runtimeLinkId;
@@ -239,11 +250,11 @@ export function buildSessionEnv(options: {
   }
 
   // Consolidated context token (new — Phase 1)
-  if (options.pcpSessionId && options.agentId) {
+  if (options.inkSessionId && options.sbSlug) {
     env.INK_CONTEXT = encodeContextToken({
-      sessionId: options.pcpSessionId,
+      sessionId: options.inkSessionId,
       studioId: options.studioId || '',
-      agentId: options.agentId,
+      sbSlug: options.sbSlug,
       cliAttached: options.cliAttached || false,
       runtime: options.runtime || 'claude',
       ...(options.repoRoot ? { repoRoot: options.repoRoot } : {}),

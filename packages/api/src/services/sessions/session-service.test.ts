@@ -88,7 +88,7 @@ describe('SessionService', () => {
   const createMockSession = (overrides: Partial<Session> = {}): Session => ({
     id: 'session-123',
     userId: 'user-456',
-    agentId: 'myra',
+    sbSlug: 'myra',
     backendSessionId: 'claude-abc',
     type: 'primary',
     status: 'active',
@@ -112,7 +112,7 @@ describe('SessionService', () => {
 
   const createMockRequest = (overrides = {}) => ({
     userId: 'user-456',
-    agentId: 'myra',
+    sbSlug: 'myra',
     channel: 'telegram' as const,
     conversationId: 'chat-123',
     sender: { id: '123456789', name: 'TestUser' },
@@ -123,7 +123,7 @@ describe('SessionService', () => {
 
   const createMockInjectedContext = (): InjectedContext => ({
     agent: {
-      agentId: 'myra',
+      sbSlug: 'myra',
       name: 'Myra',
       role: 'assistant',
       values: [],
@@ -1013,7 +1013,7 @@ describe('SessionService', () => {
 
   describe('MCP endpoint propagation', () => {
     it('hands the runner the endpoint the server bound, not a config file', async () => {
-      // The standard isolation recipe (`PCP_PORT_BASE=4001 yarn dev`) does not
+      // The standard isolation recipe (`INK_PORT_BASE=4001 yarn dev`) does not
       // rewrite the committed .mcp.json, so a runner that trusts that file
       // sends an isolated server's bearer token to the MAIN server on 3001.
       // server.ts derives this from env.MCP_HTTP_PORT — the port the listener
@@ -1096,8 +1096,8 @@ describe('SessionService', () => {
 
     it('should allow parallel processing for different agents', async () => {
       // Two different agents = two different sessions
-      const session1 = createMockSession({ id: 'session-1', agentId: 'myra' });
-      const session2 = createMockSession({ id: 'session-2', agentId: 'wren' });
+      const session1 = createMockSession({ id: 'session-1', sbSlug: 'myra' });
+      const session2 = createMockSession({ id: 'session-2', sbSlug: 'wren' });
 
       vi.mocked(mockRepository.findByUserAndAgent)
         .mockResolvedValueOnce(session1)
@@ -1111,8 +1111,8 @@ describe('SessionService', () => {
         return createMockClaudeResult();
       });
 
-      const request1 = createMockRequest({ agentId: 'myra' });
-      const request2 = createMockRequest({ agentId: 'wren' });
+      const request1 = createMockRequest({ sbSlug: 'myra' });
+      const request2 = createMockRequest({ sbSlug: 'wren' });
 
       await Promise.all([
         sessionService.handleMessage(request1),
@@ -1314,7 +1314,7 @@ describe('SessionService', () => {
       expect(mockRepository.create).toHaveBeenCalledWith(
         expect.objectContaining({
           userId: 'user-456',
-          agentId: 'myra',
+          sbSlug: 'myra',
           type: 'primary',
           status: 'active',
         })
@@ -1546,7 +1546,7 @@ describe('SessionService', () => {
       expect(mockActivityStream.logMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           userId: 'user-456',
-          agentId: 'myra',
+          sbSlug: 'myra',
           direction: 'in',
           content: 'Test message',
           platform: 'telegram',
@@ -2055,12 +2055,12 @@ describe('SessionService', () => {
   });
 
   describe('Lock Key Format', () => {
-    it('should use agentId:sessionId as lock key for debuggability', async () => {
+    it('should use sbSlug:sessionId as lock key for debuggability', async () => {
       // This test verifies the lock key format by checking that messages
       // to the same agent+session are queued, but different agents are parallel
 
-      const sessionMyra = createMockSession({ id: 'session-myra', agentId: 'myra' });
-      const sessionWren = createMockSession({ id: 'session-wren', agentId: 'wren' });
+      const sessionMyra = createMockSession({ id: 'session-myra', sbSlug: 'myra' });
+      const sessionWren = createMockSession({ id: 'session-wren', sbSlug: 'wren' });
 
       vi.mocked(mockRepository.findByUserAndAgent)
         .mockResolvedValueOnce(sessionMyra) // First myra request
@@ -2079,9 +2079,9 @@ describe('SessionService', () => {
       // Send: myra, wren, myra
       // Expected: myra-1 and wren start in parallel, myra-2 waits for myra-1
       const results = await Promise.all([
-        sessionService.handleMessage(createMockRequest({ agentId: 'myra', content: 'M1' })),
-        sessionService.handleMessage(createMockRequest({ agentId: 'wren', content: 'W1' })),
-        sessionService.handleMessage(createMockRequest({ agentId: 'myra', content: 'M2' })),
+        sessionService.handleMessage(createMockRequest({ sbSlug: 'myra', content: 'M1' })),
+        sessionService.handleMessage(createMockRequest({ sbSlug: 'wren', content: 'W1' })),
+        sessionService.handleMessage(createMockRequest({ sbSlug: 'myra', content: 'M2' })),
       ]);
 
       expect(results.every((r) => r.success)).toBe(true);
@@ -2273,7 +2273,7 @@ describe('SessionService', () => {
     it('should route to recipientSession when it exists and is active', async () => {
       const recipientSession = createMockSession({
         id: 'recipient-session-abc',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:210',
         studioId: 'studio-wren',
         endedAt: null,
@@ -2281,7 +2281,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findById).mockResolvedValue(recipientSession);
 
       const request = createMockRequest({
-        agentId: 'wren',
+        sbSlug: 'wren',
         metadata: {
           threadKey: 'pr:210',
           recipientSessionId: 'recipient-session-abc',
@@ -2301,7 +2301,7 @@ describe('SessionService', () => {
     it('should skip recipientSession when it has ended and fall through to threadKey', async () => {
       const endedSession = createMockSession({
         id: 'ended-session',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:210',
         endedAt: new Date(),
       });
@@ -2332,7 +2332,7 @@ describe('SessionService', () => {
       );
 
       const request = createMockRequest({
-        agentId: 'wren',
+        sbSlug: 'wren',
         metadata: {
           threadKey: 'pr:210',
           recipientSessionId: 'ended-session',
@@ -2352,14 +2352,14 @@ describe('SessionService', () => {
     it('should prioritize recipientSession over threadKey match', async () => {
       const recipientSession = createMockSession({
         id: 'recipient-session',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:210',
         studioId: 'studio-wren',
         endedAt: null,
       });
       const differentThreadSession = createMockSession({
         id: 'thread-match-session',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:213',
       });
 
@@ -2383,7 +2383,7 @@ describe('SessionService', () => {
       );
 
       const request = createMockRequest({
-        agentId: 'wren',
+        sbSlug: 'wren',
         metadata: {
           threadKey: 'pr:213',
           recipientSessionId: 'recipient-session',
@@ -5161,7 +5161,7 @@ describe('SessionService', () => {
       const foreign = createMockSession({
         id: 'foreign-session',
         userId: 'SOMEONE-ELSE',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       vi.mocked(mockRepository.findById).mockResolvedValue(foreign);
 
@@ -5211,7 +5211,7 @@ describe('SessionService', () => {
       // all run BEFORE it. A matching fallback therefore satisfied a request
       // whose explicit anchor had just been rejected (Lumen, #514 r8).
       const fallback = repoWithFallback(
-        createMockSession({ id: 'tempting-fallback', userId: 'user-456', agentId: 'wren' })
+        createMockSession({ id: 'tempting-fallback', userId: 'user-456', sbSlug: 'wren' })
       );
 
       const mockSupabase = {
@@ -5253,7 +5253,7 @@ describe('SessionService', () => {
 
     it('ambiguity refuses even though alias/thread reuse would have matched', async () => {
       repoWithFallback(
-        createMockSession({ id: 'sibling-session', userId: 'user-456', agentId: 'wren' })
+        createMockSession({ id: 'sibling-session', userId: 'user-456', sbSlug: 'wren' })
       );
 
       const mockSupabase = {
@@ -5337,7 +5337,7 @@ describe('SessionService', () => {
       const foreign = createMockSession({
         id: 'foreign-identity-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (foreign as unknown as { sbId?: string }).sbId = 'sb-OTHER';
       vi.mocked(mockRepository.findById).mockResolvedValue(foreign);
@@ -5367,7 +5367,7 @@ describe('SessionService', () => {
       const sibling = createMockSession({
         id: 'sibling-general',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(sibling);
 
@@ -5400,7 +5400,7 @@ describe('SessionService', () => {
       const sibling = createMockSession({
         id: 'sibling-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (sibling as unknown as { sbId?: string }).sbId = 'sb-OTHER';
       vi.mocked(mockRepository.findById).mockResolvedValue(sibling);
@@ -5428,7 +5428,7 @@ describe('SessionService', () => {
       const legacy = createMockSession({
         id: 'legacy-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (legacy as unknown as { sbId?: string | null }).sbId = null;
       vi.mocked(mockRepository.findById).mockResolvedValue(legacy);
@@ -5458,7 +5458,7 @@ describe('SessionService', () => {
       const legacy = createMockSession({
         id: 'legacy-session',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
       });
       (legacy as unknown as { sbId?: string | null }).sbId = null;
       vi.mocked(mockRepository.findById).mockResolvedValue(legacy);
@@ -5639,7 +5639,7 @@ describe('SessionService', () => {
     });
 
     // Myra tested the escape hatch the message recommended and it doesn't
-    // exist: server.ts resolves `recipientAgentId` with .eq('agent_id', …),
+    // exist: server.ts resolves `recipientSlug` with .eq('agent_id', …),
     // the SLUG column, so a UUID matches zero rows and comes back "Unknown
     // agent for user: <uuid>. Register in agent_identities first." — which
     // flatly contradicts the row she'd just read out of that table. A remedy
@@ -5835,7 +5835,7 @@ describe('SessionService', () => {
       sessionId: string;
       threadKey: string;
       threadKeys?: string[];
-      agentId: string;
+      sbSlug: string;
       sbId?: string | null;
       acquiredAt: string;
       heartbeatAt: string;
@@ -5847,7 +5847,7 @@ describe('SessionService', () => {
         sessionId: 'holder-session',
         threadKey: 'pr:other',
         threadKeys: ['pr:other'],
-        agentId: 'wren',
+        sbSlug: 'wren',
         sbId: 'sb-wren',
         acquiredAt: now,
         heartbeatAt: now,
@@ -5918,7 +5918,7 @@ describe('SessionService', () => {
     const holderSession = {
       id: 'holder-session',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'sb-wren',
       studioId: 'studio-A',
       threadKey: 'pr:other',
@@ -5978,7 +5978,7 @@ describe('SessionService', () => {
         lease: holderLease({
           sessionId: 'foreign-session',
           sbId: 'sb-else',
-          agentId: 'else',
+          sbSlug: 'else',
           threadKeys: ['pr:other', 'pr:3200'],
         }),
         participantSessionId: null,
@@ -6074,7 +6074,7 @@ describe('SessionService', () => {
       sessionId: string;
       threadKey: string;
       threadKeys?: string[];
-      agentId: string;
+      sbSlug: string;
       sbId?: string | null;
       acquiredAt: string;
       heartbeatAt: string;
@@ -6086,7 +6086,7 @@ describe('SessionService', () => {
         sessionId: 'foreign-session',
         threadKey: 'pr:other',
         threadKeys: ['pr:other'],
-        agentId: 'else',
+        sbSlug: 'else',
         sbId: 'sb-else',
         acquiredAt: now,
         heartbeatAt: now,
@@ -6174,7 +6174,7 @@ describe('SessionService', () => {
       const overflowStudio = {
         id: 'studio-B',
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
         ephemeral: true,
         parentStudioId: 'studio-A',
         threadKey: 'pr:3200',
@@ -6185,7 +6185,7 @@ describe('SessionService', () => {
       const ensureSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
       const threadSession = createMockSession({
         id: 'thread-session',
-        agentId: 'wren',
+        sbSlug: 'wren',
         studioId: 'studio-B',
       });
       const findByThreadKey = vi.fn().mockResolvedValue(threadSession);
@@ -6244,7 +6244,7 @@ describe('SessionService', () => {
           sessionId: 'holder-session',
           threadKey: 'pr:other',
           threadKeys: ['pr:other'],
-          agentId: 'wren',
+          sbSlug: 'wren',
           sbId: 'sb-wren',
           acquiredAt: now,
           heartbeatAt: now,
@@ -6253,7 +6253,7 @@ describe('SessionService', () => {
       mockRepository.findById = vi.fn().mockResolvedValue(
         createMockSession({
           id: 'holder-session',
-          agentId: 'wren',
+          sbSlug: 'wren',
           sbId: 'sb-wren',
           studioId: 'studio-A',
         })
@@ -6284,7 +6284,7 @@ describe('SessionService', () => {
 
       const result = await service.handleMessage({
         userId: 'user-456',
-        agentId: 'wren',
+        sbSlug: 'wren',
         channel: 'agent',
         conversationId: 'trigger:wren:pr:3200',
         sender: { id: 'lumen', name: 'lumen' },

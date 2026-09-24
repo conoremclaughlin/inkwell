@@ -22,7 +22,7 @@
  * Requires:
  * - INK_LIVE_TESTS=1
  * - claude CLI installed with valid credentials
- * - Inkwell server running (default localhost:3001, override via PCP_SERVER_URL)
+ * - Inkwell server running (default localhost:3001, override via INK_SERVER_URL)
  * - Valid access token in ~/.ink/auth.json
  * - LOCAL Supabase credentials (.env.local) — mutates DB rows; a remote
  *   SUPABASE_URL is refused unless INK_ALLOW_REMOTE_INTEGRATION_DB=1.
@@ -71,7 +71,7 @@ const accessToken: string | null = existsSync(authPath)
   ? JSON.parse(readFileSync(authPath, 'utf-8')).access_token
   : null;
 
-const INKWELL_URL = process.env.PCP_SERVER_URL || 'http://localhost:3001';
+const INKWELL_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 
 /** Live tests run on Opus, never the session's own frontier model. */
 const LIVE_TEST_MODEL = 'claude-opus-5';

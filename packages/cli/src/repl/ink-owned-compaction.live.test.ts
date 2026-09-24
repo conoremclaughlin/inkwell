@@ -96,7 +96,7 @@ function buildFixtureDir(serverUrl: string): string {
   );
   writeFileSync(
     join(root, '.ink', 'identity.json'),
-    JSON.stringify({ agentId: 'wren', studioId: 'main', context: 'main' })
+    JSON.stringify({ sbSlug: 'wren', studioId: 'main', context: 'main' })
   );
   return root;
 }
@@ -139,7 +139,7 @@ function listJsonls(dir: string): Set<string> {
   return new Set(readdirSync(dir).filter((f) => f.endsWith('.jsonl')));
 }
 
-/** Every transcript event for this pcp session, across all its jsonl files, in order. */
+/** Every transcript event for this Inkwell session, across all its jsonl files, in order. */
 function readSessionEvents(cwd: string, sessionId: string): Array<Record<string, unknown>> {
   const replDir = join(cwd, '.ink', 'runtime', 'repl');
   if (!existsSync(replDir)) return [];

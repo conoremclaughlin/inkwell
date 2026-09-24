@@ -36,7 +36,7 @@ interface SpineIdentity {
 
 interface SpineSession {
   id: string;
-  agentId: string | null;
+  sbSlug: string | null;
   lifecycle: string | null;
   status: string | null;
   phase: string | null;
@@ -49,9 +49,9 @@ interface SpineStudio {
   id: string;
   slug: string | null;
   branch: string;
-  agentId: string;
+  sbSlug: string;
   relation: 'affinity' | 'lease' | 'both';
-  leaseAgentId: string | null;
+  leaseSlug: string | null;
   updatedAt: string;
 }
 
@@ -70,7 +70,7 @@ interface ThreadSpine {
   thread: {
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     participants: string[];
     /** People on the thread, named for the viewer — never woken, never in `participants`. */
     people?: Array<{ userId: string; name: string; isOwn: boolean }>;
@@ -117,14 +117,14 @@ interface ThreadMessagesResponse {
     threadKey: string;
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     createdAt: string;
     closedAt: string | null;
   } | null;
   messages: Array<{
     id: string;
     senderKind: 'sb' | 'user' | 'system';
-    senderAgentId: string | null;
+    senderSlug: string | null;
     senderSbId: string | null;
     senderUserId: string | null;
     /** Named on the server: the SB's slug, the person's profile name, or 'system'. */
@@ -701,7 +701,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                       : 'bg-muted-foreground/40'
                   )}
                 />
-                <span className="font-medium">{s.agentId ?? 'unknown'}</span>
+                <span className="font-medium">{s.sbSlug ?? 'unknown'}</span>
                 {s.phase && <span className="truncate text-muted-foreground">{s.phase}</span>}
                 <span className="rounded bg-muted px-1 py-0.5 text-[10px]" title={RELATION_TOOLTIP}>
                   {RELATION_LABELS[s.relation]}
@@ -729,7 +729,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                 <span className="ml-auto shrink-0 rounded bg-muted px-1 py-0.5 text-[10px]">
                   {st.relation === 'affinity'
                     ? 'dedicated'
-                    : `leased by ${st.leaseAgentId ?? st.agentId}`}
+                    : `leased by ${st.leaseSlug ?? st.sbSlug}`}
                 </span>
               </div>
             ))}

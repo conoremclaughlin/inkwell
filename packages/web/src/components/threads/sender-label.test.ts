@@ -4,8 +4,8 @@ import { senderLabel } from './sender-label';
 describe('senderLabel', () => {
   // Two people on one thread, as each of them sees it: "You" is the
   // viewer's own message only, and the other person keeps their name.
-  const fromA = { senderKind: 'user', senderAgentId: null, senderName: 'Conor', isOwn: true };
-  const fromB = { senderKind: 'user', senderAgentId: null, senderName: 'second', isOwn: false };
+  const fromA = { senderKind: 'user', senderSlug: null, senderName: 'Conor', isOwn: true };
+  const fromB = { senderKind: 'user', senderSlug: null, senderName: 'second', isOwn: false };
 
   it('the viewer reads their own message as "You" and the other person by name', () => {
     expect(senderLabel(fromA)).toBe('You');
@@ -19,10 +19,10 @@ describe('senderLabel', () => {
 
   it('names an SB by its slug and the system as system', () => {
     expect(
-      senderLabel({ senderKind: 'sb', senderAgentId: 'wren', senderName: 'wren', isOwn: false })
+      senderLabel({ senderKind: 'sb', senderSlug: 'wren', senderName: 'wren', isOwn: false })
     ).toBe('wren');
     expect(
-      senderLabel({ senderKind: 'system', senderAgentId: null, senderName: 'system', isOwn: false })
+      senderLabel({ senderKind: 'system', senderSlug: null, senderName: 'system', isOwn: false })
     ).toBe('system');
   });
 
@@ -30,21 +30,21 @@ describe('senderLabel', () => {
     expect(
       senderLabel({
         senderKind: 'user',
-        senderAgentId: null,
+        senderSlug: null,
         senderName: 'a workspace member',
         isOwn: false,
       })
     ).toBe('a workspace member');
     // An unnamed payload (no senderName at all) falls back to the kind.
-    expect(senderLabel({ senderKind: 'user', senderAgentId: null })).toBe('a workspace member');
+    expect(senderLabel({ senderKind: 'user', senderSlug: null })).toBe('a workspace member');
     // An SB row without its display slug still shows something, never "null".
-    expect(senderLabel({ senderKind: 'sb', senderAgentId: null })).toBe('system');
+    expect(senderLabel({ senderKind: 'sb', senderSlug: null })).toBe('system');
   });
 
   it('ignores the retired metadata hint even when it is supplied', () => {
     const withHint = {
       senderKind: 'sb',
-      senderAgentId: 'wren',
+      senderSlug: 'wren',
       senderName: 'wren',
       isOwn: false,
       metadata: { sentBy: 'user' },

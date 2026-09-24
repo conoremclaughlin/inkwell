@@ -7,10 +7,10 @@ import {
   extractClaudeHistorySessionsForProject,
   extractBackendSessionOverrideId,
   extractLatestPreviewFromClaudeSessionJsonl,
-  extractLatestPreviewFromPcpTranscriptJsonl,
+  extractLatestPreviewFromInkTranscriptJsonl,
   extractSessionFromStartSessionResponse,
   filterUntrackedLocalBackendSessions,
-  filterPcpSessionsForContext,
+  filterInkSessionsForContext,
   filterUntrackedLocalClaudeSessions,
   buildSessionPickerLabel,
   getBackendLocalSessionsForProject,
@@ -118,8 +118,8 @@ describe('renderSessionCandidatesTable', () => {
         preview: 'Start new session',
       },
       {
-        type: 'pcp',
-        choice: 'pcp:12345678',
+        type: 'ink',
+        choice: 'ink:12345678',
         updated: '3/7/2026, 1:23:45 PM',
         phase: 'runtime:idle',
         thread: 'pr:182',
@@ -133,7 +133,7 @@ describe('renderSessionCandidatesTable', () => {
     expect(lines[0]).toContain('CHOICE');
     expect(lines[0]).toContain('PREVIEW');
     expect(lines[2]).toContain('new');
-    expect(lines[3]).toContain('pcp:12345678');
+    expect(lines[3]).toContain('ink:12345678');
     expect(lines[3].length).toBe(lines[2].length);
   });
 });
@@ -141,13 +141,13 @@ describe('renderSessionCandidatesTable', () => {
 describe('buildSessionPickerLabel', () => {
   it('renders two lines when preview is present', () => {
     const label = buildSessionPickerLabel({
-      metaLine: 'PCP        c4ec2f5e   runtime:idle         main         2m ago',
+      metaLine: 'Inkwell        c4ec2f5e   runtime:idle         main         2m ago',
       preview: 'lumen: latest assistant message preview here',
     });
 
     expect(label).toContain('\n');
     expect(label).toContain('↳');
-    expect(label).toContain('PCP');
+    expect(label).toContain('Inkwell');
     expect(label).toContain('c4ec2f5e');
   });
 });
@@ -167,28 +167,28 @@ describe('withSessionFileSize', () => {
 describe('sortSessionEntriesByRecency', () => {
   it('sorts newest-first regardless of source type', () => {
     const sorted = sortSessionEntriesByRecency([
-      { key: 'pcp:old', sortMs: 10 },
+      { key: 'ink:old', sortMs: 10 },
       { key: 'local:new', sortMs: 30 },
-      { key: 'pcp:mid', sortMs: 20 },
+      { key: 'ink:mid', sortMs: 20 },
     ]);
 
-    expect(sorted.map((entry) => entry.key)).toEqual(['local:new', 'pcp:mid', 'pcp:old']);
+    expect(sorted.map((entry) => entry.key)).toEqual(['local:new', 'ink:mid', 'ink:old']);
   });
 
   it('uses key as stable tiebreaker for deterministic ordering', () => {
     const sorted = sortSessionEntriesByRecency([
       { key: 'local:b', sortMs: 10 },
-      { key: 'pcp:a', sortMs: 10 },
-      { key: 'pcp:c', sortMs: 10 },
+      { key: 'ink:a', sortMs: 10 },
+      { key: 'ink:c', sortMs: 10 },
     ]);
 
-    expect(sorted.map((entry) => entry.key)).toEqual(['local:b', 'pcp:a', 'pcp:c'].sort());
+    expect(sorted.map((entry) => entry.key)).toEqual(['local:b', 'ink:a', 'ink:c'].sort());
   });
 });
 
-describe('filterPcpSessionsForContext', () => {
+describe('filterInkSessionsForContext', () => {
   it('filters claude sessions by workingDir when present', () => {
-    const filtered = filterPcpSessionsForContext(
+    const filtered = filterInkSessionsForContext(
       [
         {
           id: 'a',
@@ -211,10 +211,10 @@ describe('filterPcpSessionsForContext', () => {
   });
 
   it('retains claude sessions without workingDir when local claude session id matches', () => {
-    const filtered = filterPcpSessionsForContext(
+    const filtered = filterInkSessionsForContext(
       [
         {
-          id: 'pcp-1',
+          id: 'ink-1',
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'claude',
           backendSessionId: 'claude-local-123',
@@ -225,14 +225,14 @@ describe('filterPcpSessionsForContext', () => {
       new Set(['claude-local-123'])
     );
 
-    expect(filtered.map((session) => session.id)).toEqual(['pcp-1']);
+    expect(filtered.map((session) => session.id)).toEqual(['ink-1']);
   });
 
   it('strictly excludes claude sessions outside current project when no local match exists', () => {
-    const filtered = filterPcpSessionsForContext(
+    const filtered = filterInkSessionsForContext(
       [
         {
-          id: 'pcp-1',
+          id: 'ink-1',
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'claude',
           backendSessionId: 'remote-session-id',
@@ -248,7 +248,7 @@ describe('filterPcpSessionsForContext', () => {
   });
 
   it('path-scopes non-claude sessions and excludes other repos', () => {
-    const filtered = filterPcpSessionsForContext(
+    const filtered = filterInkSessionsForContext(
       [
         {
           id: 'codex-1',
@@ -271,7 +271,7 @@ describe('filterPcpSessionsForContext', () => {
   });
 
   it('treats codex backend aliases as equivalent during filtering', () => {
-    const filtered = filterPcpSessionsForContext(
+    const filtered = filterInkSessionsForContext(
       [
         {
           id: 'codex-legacy-label',
@@ -288,7 +288,7 @@ describe('filterPcpSessionsForContext', () => {
   });
 
   it('path-scopes codex sessions when workingDir data is available', () => {
-    const filtered = filterPcpSessionsForContext(
+    const filtered = filterInkSessionsForContext(
       [
         {
           id: 'codex-a',
@@ -312,7 +312,7 @@ describe('filterPcpSessionsForContext', () => {
 
   it('keeps path-ambiguous codex sessions visible alongside path-scoped matches', () => {
     const nowIso = new Date().toISOString();
-    const filtered = filterPcpSessionsForContext(
+    const filtered = filterInkSessionsForContext(
       [
         {
           id: 'codex-a',
@@ -335,7 +335,7 @@ describe('filterPcpSessionsForContext', () => {
 });
 
 describe('filterUntrackedLocalClaudeSessions', () => {
-  it('excludes local claude sessions already represented by PCP sessions', () => {
+  it('excludes local claude sessions already represented by Inkwell sessions', () => {
     const local = [
       {
         sessionId: 'claude-1',
@@ -351,7 +351,7 @@ describe('filterUntrackedLocalClaudeSessions', () => {
 
     const filtered = filterUntrackedLocalClaudeSessions(local, [
       {
-        id: 'pcp-1',
+        id: 'ink-1',
         startedAt: '2026-02-28T00:00:00.000Z',
         backend: 'claude',
         backendSessionId: 'claude-1',
@@ -457,7 +457,7 @@ describe('getKnownClaudeSessionIds', () => {
 });
 
 describe('filterUntrackedLocalBackendSessions', () => {
-  it('excludes local codex sessions already represented by PCP sessions', () => {
+  it('excludes local codex sessions already represented by Inkwell sessions', () => {
     const local = [
       {
         sessionId: 'codex-1',
@@ -473,7 +473,7 @@ describe('filterUntrackedLocalBackendSessions', () => {
 
     const filtered = filterUntrackedLocalBackendSessions(local, [
       {
-        id: 'pcp-1',
+        id: 'ink-1',
         startedAt: '2026-02-28T00:00:00.000Z',
         backend: 'codex',
         backendSessionId: 'codex-1',
@@ -533,9 +533,9 @@ describe('sanitizeBackendExecutionArgs', () => {
 });
 
 describe('shouldAutoResumeRuntimeSession', () => {
-  it('auto-resumes only for non-tty execution when runtime has a PCP session', () => {
-    expect(shouldAutoResumeRuntimeSession({ pcpSessionId: 'pcp-1' }, false)).toBe(true);
-    expect(shouldAutoResumeRuntimeSession({ pcpSessionId: 'pcp-1' }, true)).toBe(false);
+  it('auto-resumes only for non-tty execution when runtime has a Inkwell session', () => {
+    expect(shouldAutoResumeRuntimeSession({ inkSessionId: 'ink-1' }, false)).toBe(true);
+    expect(shouldAutoResumeRuntimeSession({ inkSessionId: 'ink-1' }, true)).toBe(false);
     expect(shouldAutoResumeRuntimeSession(undefined, false)).toBe(false);
     expect(shouldAutoResumeRuntimeSession({ backendSessionId: 'b-1' }, false)).toBe(false);
   });
@@ -578,7 +578,7 @@ describe('resolveBackendSessionIdForResume', () => {
       resolveBackendSessionIdForResume({
         backend: 'claude',
         chosen: {
-          id: 'pcp-1',
+          id: 'ink-1',
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'claude',
           backendSessionId: 'stale-id',
@@ -594,7 +594,7 @@ describe('resolveBackendSessionIdForResume', () => {
       resolveBackendSessionIdForResume({
         backend: 'claude',
         chosen: {
-          id: 'pcp-1',
+          id: 'ink-1',
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'claude',
           backendSessionId: 'stale-id',
@@ -602,9 +602,9 @@ describe('resolveBackendSessionIdForResume', () => {
         localBackendSessionIds: new Set(['local-a', 'local-b']),
       })
     ).toEqual({
-      backendSessionId: 'pcp-1',
+      backendSessionId: 'ink-1',
       staleTrackedBackendSessionId: 'stale-id',
-      fallbackMode: 'resume_pcp_session_id',
+      fallbackMode: 'resume_ink_session_id',
     });
   });
 
@@ -613,7 +613,7 @@ describe('resolveBackendSessionIdForResume', () => {
       resolveBackendSessionIdForResume({
         backend: 'claude',
         chosen: {
-          id: 'pcp-1',
+          id: 'ink-1',
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'claude',
           backendSessionId: 'known-global-id',
@@ -629,7 +629,7 @@ describe('resolveBackendSessionIdForResume', () => {
       resolveBackendSessionIdForResume({
         backend: 'claude',
         chosen: {
-          id: 'pcp-1',
+          id: 'ink-1',
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'claude',
           backendSessionId: 'local-a',
@@ -644,7 +644,7 @@ describe('resolveBackendSessionIdForResume', () => {
       resolveBackendSessionIdForResume({
         backend: 'codex',
         chosen: {
-          id: 'pcp-codex',
+          id: 'ink-codex',
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'codex-cli',
           backendSessionId: 'codex-local-a',
@@ -660,7 +660,7 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
     expect(
       resolveAdoptableLocalBackendSessionId({
         backend: 'claude',
-        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        chosen: { id: 'ink-1', startedAt: '2026-03-02T21:30:14.354Z' },
         localSessions: [
           {
             backend: 'claude',
@@ -677,8 +677,8 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
     expect(
       resolveAdoptableLocalBackendSessionId({
         backend: 'codex',
-        createdNewPcpSession: false,
-        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        createdNewInkSession: false,
+        chosen: { id: 'ink-1', startedAt: '2026-03-02T21:30:14.354Z' },
         localSessions: [
           {
             backend: 'codex',
@@ -691,12 +691,12 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
     ).toBe('019cb076-af49-7471-bd8e-12315a616dca');
   });
 
-  it('does not auto-adopt local codex sessions for newly created PCP sessions', () => {
+  it('does not auto-adopt local codex sessions for newly created Inkwell sessions', () => {
     expect(
       resolveAdoptableLocalBackendSessionId({
         backend: 'codex',
-        createdNewPcpSession: true,
-        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        createdNewInkSession: true,
+        chosen: { id: 'ink-1', startedAt: '2026-03-02T21:30:14.354Z' },
         localSessions: [
           {
             backend: 'codex',
@@ -713,7 +713,7 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
     expect(
       resolveAdoptableLocalBackendSessionId({
         backend: 'gemini',
-        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        chosen: { id: 'ink-1', startedAt: '2026-03-02T21:30:14.354Z' },
         localSessions: [
           {
             backend: 'gemini',
@@ -736,7 +736,7 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
     expect(
       resolveAdoptableLocalBackendSessionId({
         backend: 'codex',
-        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        chosen: { id: 'ink-1', startedAt: '2026-03-02T21:30:14.354Z' },
         localSessions: [
           {
             backend: 'codex',
@@ -757,22 +757,22 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
 });
 
 describe('resolveBackendSessionSeedId', () => {
-  it('seeds claude on first run when pcp session is newly created', () => {
+  it('seeds claude on first run when the Inkwell session is newly created', () => {
     expect(
       resolveBackendSessionSeedId({
         backend: 'claude',
-        chosenSessionId: 'pcp-new-1',
-        createdNewPcpSession: true,
+        chosenSessionId: 'ink-new-1',
+        createdNewInkSession: true,
       })
-    ).toBe('pcp-new-1');
+    ).toBe('ink-new-1');
   });
 
   it('does not seed claude for stale existing sessions (uses resume fallback instead)', () => {
     expect(
       resolveBackendSessionSeedId({
         backend: 'claude',
-        chosenSessionId: 'pcp-existing-1',
-        createdNewPcpSession: false,
+        chosenSessionId: 'ink-existing-1',
+        createdNewInkSession: false,
       })
     ).toBeUndefined();
   });
@@ -781,16 +781,16 @@ describe('resolveBackendSessionSeedId', () => {
     expect(
       resolveBackendSessionSeedId({
         backend: 'claude',
-        chosenSessionId: 'pcp-existing-1',
+        chosenSessionId: 'ink-existing-1',
         backendSessionId: 'claude-123',
-        createdNewPcpSession: false,
+        createdNewInkSession: false,
       })
     ).toBeUndefined();
   });
 });
 
 describe('resolveCapturedBackendSessionIdFromRuntime', () => {
-  it('returns fallback when no pcp session id is present', () => {
+  it('returns fallback when no Inkwell session id is present', () => {
     expect(
       resolveCapturedBackendSessionIdFromRuntime({
         backend: 'claude',
@@ -827,7 +827,7 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
       const resolved = resolveCapturedBackendSessionIdFromRuntime({
         cwd: tempRepo,
         backend: 'claude',
-        pcpSessionId: 'pcp-session-empty-snapshot',
+        inkSessionId: 'ink-session-empty-snapshot',
         knownLocalSessionSnapshot: new Map(),
       });
 
@@ -872,7 +872,7 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
       const resolved = await resolveCapturedBackendSessionIdWithRetry({
         cwd: tempRepo,
         backend: 'claude',
-        pcpSessionId: 'pcp-session-retry',
+        inkSessionId: 'ink-session-retry',
         knownLocalSessionSnapshot: new Map(),
         attempts: 10,
         intervalMs: 40,
@@ -927,7 +927,7 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
       const resolved = resolveCapturedBackendSessionIdFromRuntime({
         cwd: tempRepo,
         backend: 'claude',
-        pcpSessionId: 'pcp-session-1',
+        inkSessionId: 'ink-session-1',
         knownLocalSessionSnapshot: new Map([[oldSessionId, '2026-03-04T00:00:00.000Z']]),
       });
 
@@ -981,7 +981,7 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
       const resolved = resolveCapturedBackendSessionIdFromRuntime({
         cwd: tempRepo,
         backend: 'claude',
-        pcpSessionId: 'pcp-session-1',
+        inkSessionId: 'ink-session-1',
         knownLocalSessionSnapshot: new Map([[existingSessionId, beforeModified]]),
       });
 
@@ -1214,9 +1214,9 @@ describe('extractLatestPreviewFromClaudeSessionJsonl', () => {
   });
 });
 
-describe('extractLatestPreviewFromPcpTranscriptJsonl', () => {
+describe('extractLatestPreviewFromInkTranscriptJsonl', () => {
   it('ignores local-command wrapper chatter and keeps last meaningful conversational text', () => {
-    const preview = extractLatestPreviewFromPcpTranscriptJsonl(
+    const preview = extractLatestPreviewFromInkTranscriptJsonl(
       [
         JSON.stringify({
           type: 'assistant',
@@ -1490,22 +1490,22 @@ describe('extractSessionFromStartSessionResponse', () => {
     expect(
       extractSessionFromStartSessionResponse({
         session: {
-          id: 'pcp-1',
+          id: 'ink-1',
           startedAt: '2026-03-03T00:00:00.000Z',
           backend: 'codex',
         },
       })
-    ).toMatchObject({ id: 'pcp-1', backend: 'codex' });
+    ).toMatchObject({ id: 'ink-1', backend: 'codex' });
   });
 
   it('extracts top-level session payload', () => {
     expect(
       extractSessionFromStartSessionResponse({
-        id: 'pcp-2',
+        id: 'ink-2',
         startedAt: '2026-03-03T00:00:00.000Z',
         backend: 'codex',
       })
-    ).toMatchObject({ id: 'pcp-2', backend: 'codex' });
+    ).toMatchObject({ id: 'ink-2', backend: 'codex' });
   });
 
   it('returns undefined for payloads without session objects', () => {
@@ -1518,56 +1518,56 @@ describe('extractSessionFromStartSessionResponse', () => {
 describe('resolveStartedSessionFromList', () => {
   it('prefers requested session id when present', () => {
     const resolved = resolveStartedSessionFromList({
-      beforeSessionIds: new Set(['pcp-old']),
-      requestedSessionId: 'pcp-new',
+      beforeSessionIds: new Set(['ink-old']),
+      requestedSessionId: 'ink-new',
       listedSessions: [
         {
-          id: 'pcp-old',
+          id: 'ink-old',
           startedAt: '2026-03-03T00:00:00.000Z',
           backend: 'codex',
         },
         {
-          id: 'pcp-new',
+          id: 'ink-new',
           startedAt: '2026-03-03T00:01:00.000Z',
           backend: 'codex',
         },
       ],
     });
 
-    expect(resolved?.id).toBe('pcp-new');
+    expect(resolved?.id).toBe('ink-new');
   });
 
   it('falls back to the newest newly created session', () => {
     const resolved = resolveStartedSessionFromList({
-      beforeSessionIds: new Set(['pcp-old']),
+      beforeSessionIds: new Set(['ink-old']),
       listedSessions: [
         {
-          id: 'pcp-old',
+          id: 'ink-old',
           startedAt: '2026-03-03T00:00:00.000Z',
           backend: 'codex',
         },
         {
-          id: 'pcp-new-a',
+          id: 'ink-new-a',
           startedAt: '2026-03-03T00:01:00.000Z',
           backend: 'codex',
         },
         {
-          id: 'pcp-new-b',
+          id: 'ink-new-b',
           startedAt: '2026-03-03T00:02:00.000Z',
           backend: 'codex',
         },
       ],
     });
 
-    expect(resolved?.id).toBe('pcp-new-b');
+    expect(resolved?.id).toBe('ink-new-b');
   });
 
   it('returns undefined when no new session can be inferred', () => {
     const resolved = resolveStartedSessionFromList({
-      beforeSessionIds: new Set(['pcp-old']),
+      beforeSessionIds: new Set(['ink-old']),
       listedSessions: [
         {
-          id: 'pcp-old',
+          id: 'ink-old',
           startedAt: '2026-03-03T00:00:00.000Z',
           backend: 'codex',
         },
@@ -1581,12 +1581,12 @@ describe('resolveStartedSessionFromList', () => {
 describe('buildBackendSessionOwnerIndex', () => {
   const session = (
     id: string,
-    agentId: string | null,
+    sbSlug: string | null,
     backendSessionId: string | null,
     claudeSessionId: string | null = null
   ) => ({
     id,
-    agentId,
+    sbSlug,
     backendSessionId,
     claudeSessionId,
     startedAt: '2026-08-01T00:00:00Z',
@@ -1627,9 +1627,9 @@ describe('buildBackendSessionOwnerIndex', () => {
       [session('p1', 'wren', 'b-known')],
       [
         {
-          pcpSessionId: 'p2',
+          inkSessionId: 'p2',
           backend: 'claude',
-          agentId: 'myra',
+          sbSlug: 'myra',
           backendSessionId: 'b-runtime-only',
           backendSessionIds: ['b-known', 'b-extra'],
           updatedAt: '2026-08-01T00:00:00Z',
@@ -1646,7 +1646,7 @@ describe('buildBackendSessionOwnerIndex', () => {
       [],
       [
         {
-          pcpSessionId: 'p1',
+          inkSessionId: 'p1',
           backend: 'claude',
           backendSessionId: 'b-555',
           updatedAt: '2026-08-01T00:00:00Z',

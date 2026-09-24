@@ -76,7 +76,7 @@ describe('advanceThreadReadPointer', () => {
 
 const INBOX_PARAMS = {
   userId: 'user-1',
-  agentId: 'myra',
+  sbSlug: 'myra',
   throughMessageId: 'msg-9',
   source: 'test',
 };

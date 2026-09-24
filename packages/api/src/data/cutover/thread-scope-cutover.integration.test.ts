@@ -182,7 +182,7 @@ describe.skipIf(!REHEARSAL)(
     }
     interface Principal {
       kind: 'sb' | 'user' | 'system';
-      sbAgentId?: string;
+      sbSlug?: string;
       sbId?: string;
       userId?: string;
     }
@@ -204,7 +204,7 @@ describe.skipIf(!REHEARSAL)(
           rowId,
           principal.kind,
           principal.sbId ?? null,
-          principal.sbAgentId ?? null,
+          principal.sbSlug ?? null,
           principal.userId ?? null,
         ]
       );
@@ -217,25 +217,25 @@ describe.skipIf(!REHEARSAL)(
       );
       await attest('creator', threadId, t.created_by_agent_id, {
         kind: 'sb',
-        sbAgentId: t.created_by_agent_id,
+        sbSlug: t.created_by_agent_id,
       });
       if (opts.closer !== false && t.closed_by_agent_id) {
         await attest('closer', threadId, t.closed_by_agent_id, {
           kind: 'sb',
-          sbAgentId: t.closed_by_agent_id,
+          sbSlug: t.closed_by_agent_id,
         });
       }
       for (const p of await many<{ agent_id: string }>(
         `SELECT agent_id FROM public.inbox_thread_participants WHERE thread_id = $1`,
         [threadId]
       )) {
-        await attest('participant', threadId, p.agent_id, { kind: 'sb', sbAgentId: p.agent_id });
+        await attest('participant', threadId, p.agent_id, { kind: 'sb', sbSlug: p.agent_id });
       }
       for (const rs of await many<{ agent_id: string }>(
         `SELECT agent_id FROM public.inbox_thread_read_status WHERE thread_id = $1`,
         [threadId]
       )) {
-        await attest('read_status', threadId, rs.agent_id, { kind: 'sb', sbAgentId: rs.agent_id });
+        await attest('read_status', threadId, rs.agent_id, { kind: 'sb', sbSlug: rs.agent_id });
       }
       for (const m of await many<{ sender_agent_id: string }>(
         `SELECT DISTINCT sender_agent_id FROM public.inbox_thread_messages WHERE thread_id = $1
@@ -244,7 +244,7 @@ describe.skipIf(!REHEARSAL)(
       )) {
         await attest('message', threadId, m.sender_agent_id, {
           kind: 'sb',
-          sbAgentId: m.sender_agent_id,
+          sbSlug: m.sender_agent_id,
         });
       }
     }
@@ -573,16 +573,16 @@ describe.skipIf(!REHEARSAL)(
           type: 'notification',
           priority: 'high',
           content: 'Trigger failed for lumen: spawn error',
-          metadata: { type: 'trigger_failure', targetAgentId: 'lumen' },
+          metadata: { type: 'trigger_failure', targetSlug: 'lumen' },
         });
         const stamped = await message(t, 'wren', {
-          metadata: { pcp: { sender: { agentId: 'wren' } } },
+          metadata: { pcp: { sender: { sbSlug: 'wren' } } },
         });
         await attestThread(t, w.w1);
         // Everything but the three messages is attested.
-        await attest('creator', t, 'wren', { kind: 'sb', sbAgentId: 'wren' });
-        await attest('participant', t, 'wren', { kind: 'sb', sbAgentId: 'wren' });
-        await attest('participant', t, 'lumen', { kind: 'sb', sbAgentId: 'lumen' });
+        await attest('creator', t, 'wren', { kind: 'sb', sbSlug: 'wren' });
+        await attest('participant', t, 'wren', { kind: 'sb', sbSlug: 'wren' });
+        await attest('participant', t, 'lumen', { kind: 'sb', sbSlug: 'lumen' });
 
         const result = await runCutover();
         expectAbort(result, 'principal_unattested', human, notice, stamped);
@@ -610,7 +610,7 @@ describe.skipIf(!REHEARSAL)(
         const t2 = await thread(w.owner, { key: 'pr:13' });
         await attestThread(t2, w.w1);
         await attestAllAsSlugs(t2);
-        await attest('closer', t2, 'lumen', { kind: 'sb', sbAgentId: 'lumen' });
+        await attest('closer', t2, 'lumen', { kind: 'sb', sbSlug: 'lumen' });
 
         expectAbort(await runCutover(), 'closer_attested_on_open_thread', t2);
         await rollback();
@@ -656,10 +656,10 @@ describe.skipIf(!REHEARSAL)(
         const counterfeit = await message(t, 'lumen', { content: 'looks like lumen' });
         await message(t, 'wren');
         await attestThread(t, w.w1);
-        await attest('creator', t, 'wren', { kind: 'sb', sbAgentId: 'wren' });
-        await attest('participant', t, 'wren', { kind: 'sb', sbAgentId: 'wren' });
-        await attest('participant', t, 'lumen', { kind: 'sb', sbAgentId: 'lumen' });
-        await attest('message', t, 'wren', { kind: 'sb', sbAgentId: 'wren' });
+        await attest('creator', t, 'wren', { kind: 'sb', sbSlug: 'wren' });
+        await attest('participant', t, 'wren', { kind: 'sb', sbSlug: 'wren' });
+        await attest('participant', t, 'lumen', { kind: 'sb', sbSlug: 'lumen' });
+        await attest('message', t, 'wren', { kind: 'sb', sbSlug: 'wren' });
         // No attestation for the lumen message: the session stamp proves
         // participation, not authorship of that row.
         const result = await runCutover();
@@ -761,7 +761,7 @@ describe.skipIf(!REHEARSAL)(
             [
               session.id,
               studio.id,
-              JSON.stringify({ sessionId: session.id, agentId: 'wren', ...regrant }),
+              JSON.stringify({ sessionId: session.id, sbSlug: 'wren', ...regrant }),
             ]
           );
 

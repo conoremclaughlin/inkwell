@@ -1,5 +1,5 @@
 /**
- * PCP Auth Tokens
+ * Inkwell Auth Tokens
  *
  * PKCE generation, token storage (~/.ink/auth.json), refresh,
  * and JWT payload decoding for CLI OAuth flow.
@@ -41,7 +41,7 @@ export interface JwtPayload {
   sub: string; // userId
   email: string;
   scope: string;
-  agentId?: string;
+  sbSlug?: string;
   identityId?: string;
   exp: number;
   iat: number;
@@ -65,15 +65,15 @@ function delegatedAuthDirPath(): string {
   return join(homedir(), '.ink', 'auth', 'agents');
 }
 
-function sanitizeAgentId(agentId: string): string {
-  return agentId
+function sanitizeSlug(sbSlug: string): string {
+  return sbSlug
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, '_');
 }
 
-function delegatedAuthFilePath(agentId: string): string {
-  return join(delegatedAuthDirPath(), `${sanitizeAgentId(agentId)}.json`);
+function delegatedAuthFilePath(sbSlug: string): string {
+  return join(delegatedAuthDirPath(), `${sanitizeSlug(sbSlug)}.json`);
 }
 
 // ============================================================================
@@ -115,8 +115,8 @@ export function clearAuth(): void {
   }
 }
 
-export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
-  const path = delegatedAuthFilePath(agentId);
+export function loadDelegatedAuth(sbSlug: string): StoredDelegatedAuth | null {
+  const path = delegatedAuthFilePath(sbSlug);
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(readFileSync(path, 'utf-8'));
@@ -125,7 +125,7 @@ export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
   }
 }
 
-export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): void {
+export function saveDelegatedAuth(sbSlug: string, auth: StoredDelegatedAuth): void {
   const dir = delegatedAuthDirPath();
   mkdirSync(dir, { recursive: true });
   try {
@@ -134,13 +134,13 @@ export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): v
     // Best-effort only; some environments may not support chmod.
   }
 
-  const path = delegatedAuthFilePath(agentId);
+  const path = delegatedAuthFilePath(sbSlug);
   writeFileSync(path, JSON.stringify(auth, null, 2) + '\n');
   chmodSync(path, 0o600);
 }
 
-export function clearDelegatedAuth(agentId: string): void {
-  const path = delegatedAuthFilePath(agentId);
+export function clearDelegatedAuth(sbSlug: string): void {
+  const path = delegatedAuthFilePath(sbSlug);
   if (existsSync(path)) {
     unlinkSync(path);
   }
@@ -228,10 +228,28 @@ export function isJwtProvablyExpired(token: string, bufferSeconds = 60): boolean
   return payload.exp * 1000 <= Date.now() + bufferSeconds * 1000;
 }
 
-export async function getValidAccessToken(
-  serverUrl: string,
-  options?: { allowEnvToken?: boolean }
-): Promise<string | null> {
+/** Which credential this process would present, and where it came from. */
+export interface SelectedCredential {
+  source: 'env' | 'stored';
+  token: string;
+}
+
+/**
+ * The credential-selection half of `getValidAccessToken`, without the network.
+ *
+ * Callers that need to know WHO this process is — not to make a request, but
+ * to scope something to the account — must not restate this precedence. The
+ * env token is skipped when provably expired, and restating that rule without
+ * the expiry check picks a different account than the request will actually
+ * use. `agent-backend.ts` did exactly that: an expired env token for one
+ * account and valid stored auth for another meant the HTTP call went out as
+ * the second while the cache was keyed to the first. (Lumen, #665 r3.)
+ *
+ * Synchronous on purpose: it never refreshes, so it is safe on a launch path.
+ * A refresh rotates the token but not the account, so the identity it reports
+ * is the identity the eventual request carries.
+ */
+export function selectCredential(options?: { allowEnvToken?: boolean }): SelectedCredential | null {
   const allowEnvToken = options?.allowEnvToken !== false;
   if (allowEnvToken) {
     const envToken = process.env.INK_ACCESS_TOKEN?.trim();
@@ -241,9 +259,20 @@ export async function getValidAccessToken(
     // even after a fresh `ink login` — because the env token short-circuits
     // the auth.json path below.
     if (envToken && !isJwtProvablyExpired(envToken)) {
-      return envToken;
+      return { source: 'env', token: envToken };
     }
   }
+  const auth = loadAuth();
+  return auth ? { source: 'stored', token: auth.access_token } : null;
+}
+
+export async function getValidAccessToken(
+  serverUrl: string,
+  options?: { allowEnvToken?: boolean }
+): Promise<string | null> {
+  const selected = selectCredential(options);
+  if (!selected) return null;
+  if (selected.source === 'env') return selected.token;
 
   const auth = loadAuth();
   if (!auth) return null;
@@ -265,10 +294,10 @@ export async function getValidAccessToken(
 }
 
 export function getValidDelegatedAccessToken(
-  agentId: string,
+  sbSlug: string,
   options?: { bufferSeconds?: number }
 ): string | null {
-  const auth = loadDelegatedAuth(agentId);
+  const auth = loadDelegatedAuth(sbSlug);
   if (!auth) return null;
   if (isTokenExpired(auth, options?.bufferSeconds ?? 300)) return null;
   return auth.access_token;

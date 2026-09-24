@@ -42,7 +42,7 @@ import {
 type Move = InitResult['moves'][number];
 
 // Create a temporary test directory
-const TEST_DIR = join(tmpdir(), 'pcp-cli-test-' + Date.now());
+const TEST_DIR = join(tmpdir(), 'ink-cli-test-' + Date.now());
 const TEST_REPO = join(TEST_DIR, 'test-repo');
 
 function git(args: string, cwd: string): string {
@@ -190,11 +190,11 @@ describe('Studio Commands', () => {
       git(`worktree add -b wren/studio/test "${worktreePath}"`, TEST_REPO);
 
       // Create .ink identity like the CLI would
-      const pcpDir = join(worktreePath, '.ink');
-      mkdirSync(pcpDir, { recursive: true });
+      const inkDir = join(worktreePath, '.ink');
+      mkdirSync(inkDir, { recursive: true });
 
       const identity = {
-        agentId: 'wren',
+        sbSlug: 'wren',
         context: 'studio-test',
         description: 'Test studio',
         studio: 'test',
@@ -202,26 +202,26 @@ describe('Studio Commands', () => {
         createdAt: new Date().toISOString(),
       };
 
-      writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+      writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
       // Verify identity was created
-      expect(existsSync(join(pcpDir, 'identity.json'))).toBe(true);
+      expect(existsSync(join(inkDir, 'identity.json'))).toBe(true);
 
-      const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
-      expect(savedIdentity.agentId).toBe('wren');
+      const savedIdentity = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
+      expect(savedIdentity.sbSlug).toBe('wren');
       expect(savedIdentity.studio).toBe('test');
       expect(savedIdentity.branch).toBe('wren/studio/test');
     });
 
-    it('should support custom agent ID', () => {
+    it('should support custom SB slug', () => {
       const worktreePath = join(TEST_DIR, 'test-repo--myra');
       git(`worktree add -b myra/studio/myra "${worktreePath}"`, TEST_REPO);
 
-      const pcpDir = join(worktreePath, '.ink');
-      mkdirSync(pcpDir, { recursive: true });
+      const inkDir = join(worktreePath, '.ink');
+      mkdirSync(inkDir, { recursive: true });
 
       const identity = {
-        agentId: 'myra',
+        sbSlug: 'myra',
         context: 'studio-myra',
         description: 'Myra studio',
         studio: 'myra',
@@ -229,22 +229,22 @@ describe('Studio Commands', () => {
         createdAt: new Date().toISOString(),
       };
 
-      writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+      writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
-      const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
-      expect(savedIdentity.agentId).toBe('myra');
+      const savedIdentity = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
+      expect(savedIdentity.sbSlug).toBe('myra');
     });
 
     it('should read legacy identity.json with workspace field', () => {
       const worktreePath = join(TEST_DIR, 'test-repo--legacy');
       git(`worktree add -b wren/workspace/legacy "${worktreePath}"`, TEST_REPO);
 
-      const pcpDir = join(worktreePath, '.ink');
-      mkdirSync(pcpDir, { recursive: true });
+      const inkDir = join(worktreePath, '.ink');
+      mkdirSync(inkDir, { recursive: true });
 
       // Old format with workspace field
       const identity = {
-        agentId: 'wren',
+        sbSlug: 'wren',
         context: 'workspace-legacy',
         description: 'Legacy workspace',
         workspace: 'legacy',
@@ -252,10 +252,10 @@ describe('Studio Commands', () => {
         createdAt: new Date().toISOString(),
       };
 
-      writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+      writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
-      const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
-      expect(savedIdentity.agentId).toBe('wren');
+      const savedIdentity = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
+      expect(savedIdentity.sbSlug).toBe('wren');
       expect(savedIdentity.workspace).toBe('legacy');
     });
   });
@@ -270,7 +270,7 @@ describe('Studio Commands', () => {
       expect(existsSync(expectedPath)).toBe(true);
     });
 
-    it('should use agentId/studio/ prefix for branches', () => {
+    it('should use sbSlug/studio/ prefix for branches', () => {
       const studioName = 'bugfix-y';
       const branchName = `wren/studio/${studioName}`;
       const worktreePath = join(TEST_DIR, `test-repo--${studioName}`);
@@ -319,7 +319,7 @@ describe('CLI link path helpers', () => {
     ).toBe(false);
   });
 
-  it('should warn when PATH includes neither PCP nor compatibility bin dirs', () => {
+  it('should warn when PATH includes neither Inkwell nor compatibility bin dirs', () => {
     const targets = getCliLinkTargets('/tmp/home', 'ink-lumen');
     expect(shouldWarnMissingCliBinPath(['/usr/bin', '/bin'].join(pathDelimiter), targets)).toBe(
       true
@@ -380,12 +380,12 @@ describe('Studio init', () => {
       const wtPath = join(realTestDir, 'test-repo--myra');
       git(`worktree add -b myra/studio/myra "${wtPath}"`, realTestRepo);
 
-      const result = planInit(realTestRepo, 'pcp');
+      const result = planInit(realTestRepo, 'inkwell');
 
       expect(result.moves).toHaveLength(2);
       expect(result.moves[0].from).toBe(realTestRepo);
       expect(result.moves[1].from).toBe(wtPath);
-      expect(result.moves[1].to).toBe(join(realTestDir, 'pcp', 'test-repo--myra'));
+      expect(result.moves[1].to).toBe(join(realTestDir, 'inkwell', 'test-repo--myra'));
     });
 
     it('should ignore worktrees that do not follow naming convention', () => {
@@ -393,7 +393,7 @@ describe('Studio init', () => {
       const wtPath = join(realTestDir, 'unrelated-worktree');
       git(`worktree add -b feature/unrelated "${wtPath}"`, realTestRepo);
 
-      const result = planInit(realTestRepo, 'pcp');
+      const result = planInit(realTestRepo, 'inkwell');
 
       // Should only have the main repo move, not the unrelated worktree
       expect(result.moves).toHaveLength(1);
@@ -427,7 +427,7 @@ describe('Studio init', () => {
       git(`worktree add -b wren/studio/wren "${wtPath}"`, realTestRepo);
 
       // Plan the init
-      const { parentDir, moves } = planInit(realTestRepo, 'pcp');
+      const { parentDir, moves } = planInit(realTestRepo, 'inkwell');
 
       // Execute the moves (same logic as initStudio but without spinner/process.exit)
       mkdirSync(parentDir, { recursive: true });
@@ -586,7 +586,7 @@ describe('updateIdentityForStudioRename', () => {
       join(wsPath, '.ink', 'identity.json'),
       JSON.stringify(
         {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           studio: 'old',
           context: 'studio-old',
           description: 'Studio: old',
@@ -614,7 +614,7 @@ describe('updateIdentityForStudioRename', () => {
 describe('planStudioHomeBranchRename', () => {
   it('plans a rename when current branch is old per-studio default', () => {
     const plan = planStudioHomeBranchRename(
-      { agentId: 'lumen', branch: 'lumen/studio/main-old-name' },
+      { sbSlug: 'lumen', branch: 'lumen/studio/main-old-name' },
       'old-name',
       'new-name'
     );
@@ -626,7 +626,7 @@ describe('planStudioHomeBranchRename', () => {
 
   it('plans a rename when current branch is legacy default', () => {
     const plan = planStudioHomeBranchRename(
-      { agentId: 'lumen', branch: 'lumen/studio/main' },
+      { sbSlug: 'lumen', branch: 'lumen/studio/main' },
       'old-name',
       'new-name'
     );
@@ -638,7 +638,7 @@ describe('planStudioHomeBranchRename', () => {
 
   it('does not plan rename for custom feature branches', () => {
     const plan = planStudioHomeBranchRename(
-      { agentId: 'lumen', branch: 'lumen/feat/my-work' },
+      { sbSlug: 'lumen', branch: 'lumen/feat/my-work' },
       'old-name',
       'new-name'
     );

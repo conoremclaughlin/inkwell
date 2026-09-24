@@ -21,7 +21,7 @@ vi.mock('../../utils/logger', () => ({
 
 const baseRequest: SandboxSpinUpRequest = {
   userId: 'user-123',
-  agentId: 'wren',
+  sbSlug: 'wren',
   studioId: 'studio-abc',
   studioSlug: 'wren',
   worktreePath: '/tmp/test-studio',
@@ -44,7 +44,7 @@ describe('buildContainerName', () => {
     expect(name).toMatch(/^ink-sandbox-wren-auth-refactor-[a-f0-9]{8}$/);
   });
 
-  it('falls back to agentId when no studioSlug', () => {
+  it('falls back to sbSlug when no studioSlug', () => {
     const name = buildContainerName({ ...baseRequest, studioSlug: undefined });
     expect(name).toMatch(/^ink-sandbox-wren-[a-f0-9]{8}$/);
   });

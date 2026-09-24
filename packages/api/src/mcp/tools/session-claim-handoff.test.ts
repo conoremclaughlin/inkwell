@@ -22,14 +22,12 @@
 
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 
-vi.mock('../../config/env', () => ({
+vi.mock('../../config/env', async () => ({
   env: {
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../../test/fake-env')).fakeEnv,
     MCP_TRANSPORT: 'http',
     MCP_HTTP_PORT: 0,
     MCP_REQUIRE_OAUTH: false,
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-key',
     SUPABASE_ANON_KEY: 'test-anon-key',
   },
 }));
@@ -72,10 +70,11 @@ vi.mock('../../services/user-resolver', async (importOriginal) => {
   };
 });
 
-// Deliberately NOT mocked: ./tools (real handlers), ../auth/pcp-auth-provider
+// Deliberately NOT mocked: ./tools (real handlers), ../auth/ink-auth-provider
 // (real verification), ../../utils/request-context (real AsyncLocalStorage),
-// ../../auth/pcp-tokens (real signing), and SessionService's token minter.
+// ../../auth/ink-tokens (real signing), and SessionService's token minter.
 import { MCPServer } from '../server';
+import { fakeProcessEnv } from '../../test/fake-env';
 import { SessionService } from '../../services/sessions/session-service';
 
 const USER_ID = 'user-123';
@@ -84,7 +83,7 @@ const TARGET_UUID = '95f7f160-6599-449d-9f63-e31ca20a43ce';
 const ownerSession = {
   id: 'session-owner',
   userId: USER_ID,
-  agentId: 'myra',
+  sbSlug: 'myra',
   sbId: 'sb-myra',
   startedAt: new Date('2026-08-20T10:00:00Z'),
   metadata: {},
@@ -136,11 +135,11 @@ const dataComposer = {
  * under test, not the service's lifecycle.
  */
 function runnerBearer(session: { id: string; sbId?: string; contactId?: string }): string {
-  process.env.JWT_SECRET = 'test-jwt-secret-that-is-at-least-32-characters-long';
+  process.env.JWT_SECRET = fakeProcessEnv.JWT_SECRET;
   const minter = Object.create(SessionService.prototype) as {
     createRunnerAccessToken(
       userId: string,
-      agentId: string,
+      sbSlug: string,
       email: string,
       session: { id: string; sbId?: string; contactId?: string }
     ): string | undefined;
@@ -271,7 +270,7 @@ describe('contact isolation, end to end through the real MCP HTTP path', () => {
 
   it('refuses a peer identity even with a valid bearer', async (ctx) => {
     requireServer(ctx);
-    getSession.mockResolvedValue({ ...ownerSession, agentId: 'lumen', sbId: 'sb-lumen' });
+    getSession.mockResolvedValue({ ...ownerSession, sbSlug: 'lumen', sbId: 'sb-lumen' });
 
     const result = await callTool(runnerBearer(ownerSession), {
       sessionId: TARGET_UUID,
@@ -290,7 +289,7 @@ describe('contact isolation, end to end through the real MCP HTTP path', () => {
       JSON.stringify({
         sessionId: 'session-contact-b',
         studioId: 'main',
-        agentId: 'myra',
+        sbSlug: 'myra',
         cliAttached: false,
         runtime: 'claude',
       })

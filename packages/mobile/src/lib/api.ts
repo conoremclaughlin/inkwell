@@ -34,13 +34,13 @@ import type { LoginResponse, RefreshResponse, SignupResponse } from './types';
  * Port the Inkwell API listens on, for the tiers that supply only a host.
  *
  * app.config.js reads INK_PORT_BASE — falling back to the legacy
- * PCP_PORT_BASE, matching the server's own resolution in
+ * INK_PORT_BASE, matching the server's own resolution in
  * packages/api/src/config/env.ts — on the machine that started Metro, and
  * publishes it here. So an isolated server (4001, 4801, …) is reached without
  * anyone editing a constant or typing a URL on a phone keyboard. The literal
  * is only the floor for a config that predates the field.
  */
-const PCP_API_PORT = Number(Constants.expoConfig?.extra?.apiPort) || 3001;
+const INK_API_PORT = Number(Constants.expoConfig?.extra?.apiPort) || 3001;
 
 // Which of these Expo populates depends on the runtime, so try them all rather
 // than trusting one and silently landing on loopback.
@@ -59,7 +59,7 @@ const resolved: ResolvedApiUrl = resolveApiUrl({
   lanHost: Constants.expoConfig?.extra?.lanHost as string | null | undefined,
   productionApiUrl: Constants.expoConfig?.extra?.productionApiUrl as string | undefined,
   isDev: __DEV__,
-  port: PCP_API_PORT,
+  port: INK_API_PORT,
 });
 
 export const AUTO_API_BASE_URL = resolved.url;
@@ -202,7 +202,7 @@ export async function signup(email: string, password: string): Promise<SignupRes
   return body;
 }
 
-/** Does a PCP server answer at this base URL? Bounded so a dead LAN address fails fast. */
+/** Does a Inkwell server answer at this base URL? Bounded so a dead LAN address fails fast. */
 export async function probeServer(url: string, timeoutMs = 2500): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

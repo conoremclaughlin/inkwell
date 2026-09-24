@@ -33,7 +33,7 @@ interface SessionWorkspace {
 interface Session {
   id: string;
   backendSessionId: string | null;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   lifecycle: string | null;
@@ -205,7 +205,7 @@ function SessionCard({ session }: { session: Session }) {
           <div className="flex items-center gap-2 flex-wrap">
             <h3 className="font-semibold text-foreground">{session.agentName}</h3>
             <Badge variant="outline" className="text-xs font-mono">
-              {session.agentId}
+              {session.sbSlug}
             </Badge>
             <Badge className={clsx('text-xs', state.badgeClass)}>{state.label}</Badge>
           </div>
@@ -333,7 +333,7 @@ function SessionCard({ session }: { session: Session }) {
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-muted-foreground">
                 <div>
-                  <span className="text-muted-foreground/70">PCP Session ID: </span>
+                  <span className="text-muted-foreground/70">Inkwell Session ID: </span>
                   <code className="font-mono select-all">{session.id}</code>
                 </div>
                 {session.backendSessionId && (

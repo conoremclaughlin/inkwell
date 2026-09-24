@@ -40,7 +40,7 @@ export interface ToolPolicyScopeRef {
 }
 
 export interface ToolPolicyContext {
-  agentId?: string;
+  sbSlug?: string;
   workspaceId?: string;
   studioId?: string;
 }
@@ -52,9 +52,9 @@ export interface ToolPolicyDecision {
   /**
    * True when the `allowed` verdict was bought with a one-use grant.
    *
-   * Set only by the inspecting (non-consuming) path — `canCallPcpTool` has
+   * Set only by the inspecting (non-consuming) path — `canCallInkTool` has
    * already spent the grant by the time it returns, so there is nothing left to
-   * warn a caller about. `inspectPcpTool` DID NOT spend it, so a caller that
+   * warn a caller about. `inspectInkTool` DID NOT spend it, so a caller that
    * acts on an `allowed: true` carrying this flag must understand that the same
    * verdict will not repeat for free.
    */
@@ -67,14 +67,14 @@ export interface SessionAccessQuery {
     threadKey?: string;
     studioId?: string;
     workspaceId?: string;
-    agentId?: string;
+    sbSlug?: string;
   };
   target: {
     sessionId?: string;
     threadKey?: string;
     studioId?: string;
     workspaceId?: string;
-    agentId?: string;
+    sbSlug?: string;
   };
   action?: 'list' | 'attach' | 'events' | 'inbox';
 }
@@ -160,7 +160,7 @@ interface ToolPolicyRulesState {
 
 const DEFAULT_POLICY_PATH = join(homedir(), '.ink', 'security', 'tool-policy.json');
 
-export const DEFAULT_SAFE_PCP_TOOLS = new Set<string>([
+export const DEFAULT_SAFE_INK_TOOLS = new Set<string>([
   'bootstrap',
   // Asking what exists. Read-only, and the one call an agent makes precisely
   // when it is unsure — gating it means learning the surface by being refused,
@@ -185,7 +185,7 @@ export const DEFAULT_SAFE_PCP_TOOLS = new Set<string>([
 ]);
 
 export const TOOL_GROUPS: ToolGroupMap = {
-  'group:ink-safe': Array.from(DEFAULT_SAFE_PCP_TOOLS),
+  'group:ink-safe': Array.from(DEFAULT_SAFE_INK_TOOLS),
   'group:ink-comms': ['send_to_inbox', 'trigger_agent', 'send_response'],
   'group:ink-memory': ['remember', 'recall', 'forget', 'update_memory', 'restore_memory'],
   'group:ink-session': [
@@ -232,7 +232,7 @@ function createRules(options?: {
 }): ToolPolicyRulesState {
   const safeTools = new Set<string>();
   if (options?.includeDefaultSafeTools) {
-    for (const tool of DEFAULT_SAFE_PCP_TOOLS) safeTools.add(tool);
+    for (const tool of DEFAULT_SAFE_INK_TOOLS) safeTools.add(tool);
   }
 
   return {
@@ -266,7 +266,7 @@ function normalizeStringArray(values: string[] | undefined): string[] {
 
 function cloneContext(context: ToolPolicyContext): ToolPolicyContext {
   return {
-    agentId: context.agentId,
+    sbSlug: context.sbSlug,
     workspaceId: context.workspaceId,
     studioId: context.studioId,
   };
@@ -383,7 +383,7 @@ export class ToolPolicyState {
       scope === 'workspace'
         ? this.context.workspaceId
         : scope === 'agent'
-          ? this.context.agentId
+          ? this.context.sbSlug
           : this.context.studioId;
     if (!raw) return undefined;
     const normalized = normalizeScopeId(raw);
@@ -423,8 +423,8 @@ export class ToolPolicyState {
     const workspaceId = this.resolveContextScopeId('workspace');
     if (workspaceId) refs.push({ scope: 'workspace', id: workspaceId });
 
-    const agentId = this.resolveContextScopeId('agent');
-    if (agentId) refs.push({ scope: 'agent', id: agentId });
+    const sbSlug = this.resolveContextScopeId('agent');
+    if (sbSlug) refs.push({ scope: 'agent', id: sbSlug });
 
     const studioId = this.resolveContextScopeId('studio');
     if (studioId) refs.push({ scope: 'studio', id: studioId });
@@ -628,7 +628,7 @@ export class ToolPolicyState {
   private findAllowFilterBlockingScope(tool: string): string | undefined {
     for (const { ref, rules } of this.getActiveScopeRules()) {
       // Only explicit allow-list entries create a narrowing filter.
-      // safeTools (DEFAULT_SAFE_PCP_TOOLS) are auto-allowed but must not
+      // safeTools (DEFAULT_SAFE_INK_TOOLS) are auto-allowed but must not
       // block tools that happen to not be in the safe list — e.g., MCP
       // tools like list_emails, get_integration_health.
       if (rules.allowTools.size === 0) continue;
@@ -757,7 +757,7 @@ export class ToolPolicyState {
     const target = query.target;
     if (visibility === 'all') return true;
     if (visibility === 'agent') {
-      return Boolean(requester.agentId && target.agentId && requester.agentId === target.agentId);
+      return Boolean(requester.sbSlug && target.sbSlug && requester.sbSlug === target.sbSlug);
     }
     if (visibility === 'workspace') {
       // Workspace = parent-level container. Studio = worktree child scope.
@@ -789,7 +789,7 @@ export class ToolPolicyState {
   public setContext(context: ToolPolicyContext): void {
     const studioNorm = context.studioId ? normalizeScopeId(context.studioId) : undefined;
     this.context = {
-      agentId: context.agentId ? normalizeScopeId(context.agentId) : undefined,
+      sbSlug: context.sbSlug ? normalizeScopeId(context.sbSlug) : undefined,
       // Workspace and studio are separate scopes — never derive one from the other.
       workspaceId: context.workspaceId ? normalizeScopeId(context.workspaceId) : undefined,
       studioId: studioNorm,
@@ -1251,29 +1251,29 @@ export class ToolPolicyState {
   }
 
   /**
-   * Decide whether a PCP tool call may proceed, SPENDING any one-use grant that
+   * Decide whether a Inkwell tool call may proceed, SPENDING any one-use grant that
    * makes it possible. Call this exactly once per actual call — it is the
    * authorization, not a query about one.
    */
-  public canCallPcpTool(tool: string, sessionId?: string): ToolPolicyDecision {
-    return this.evaluatePcpTool(tool, sessionId, true);
+  public canCallInkTool(tool: string, sessionId?: string): ToolPolicyDecision {
+    return this.evaluateInkTool(tool, sessionId, true);
   }
 
   /**
    * The same decision, without spending anything.
    *
-   * `canCallPcpTool` reads like a query but mutates: it decrements session
+   * `canCallInkTool` reads like a query but mutates: it decrements session
    * grants and scoped one-use grants, and persists the latter to disk. Anything
    * that wants to *look* — an approval coordinator re-checking a queued request
    * after a sibling's decision changed policy, a clone envelope computing what
    * it may pass through, a status display — must use this instead, or it will
    * silently burn the user's grants on calls that never happen.
    */
-  public inspectPcpTool(tool: string, sessionId?: string): ToolPolicyDecision {
-    return this.evaluatePcpTool(tool, sessionId, false);
+  public inspectInkTool(tool: string, sessionId?: string): ToolPolicyDecision {
+    return this.evaluateInkTool(tool, sessionId, false);
   }
 
-  private evaluatePcpTool(
+  private evaluateInkTool(
     tool: string,
     sessionId: string | undefined,
     consume: boolean
@@ -1295,7 +1295,7 @@ export class ToolPolicyState {
     if (sessionGrant !== 'none') {
       return {
         allowed: true,
-        reason: 'Tool is granted for this PCP session.',
+        reason: 'Tool is granted for this Inkwell session.',
         // A session-wide grant is standing permission and costs nothing to use;
         // only a finite one is spent, and only the inspecting path still owes
         // the caller that warning.

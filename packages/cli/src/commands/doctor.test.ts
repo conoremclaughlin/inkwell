@@ -1,5 +1,38 @@
-import { describe, expect, it } from 'vitest';
-import { analyzeCliLink } from './doctor.js';
+import { describe, expect, it, vi } from 'vitest';
+import { execFile } from 'child_process';
+import { analyzeCliLink, applyCliLinkFix, buildFixArgs } from './doctor.js';
+
+vi.mock('child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('child_process')>()),
+  execFile: vi.fn((_binary, _args, callback) => callback(null, '', '')),
+}));
+
+describe('doctor repair execution', () => {
+  it.each([
+    '../demo',
+    '/tmp/demo',
+    'ink demo',
+    'ink;echo',
+    'ink$(echo marker)',
+    '--demo',
+    'ink\n',
+    'ink\r',
+    '',
+  ])('rejects unsafe aliases before execution: %s', (name) =>
+    expect(() => buildFixArgs(name)).toThrow('CLI alias')
+  );
+
+  it('keeps the alias as a validated argument, not shell text', async () => {
+    expect(buildFixArgs('ink')).toEqual(['studio', 'cli']);
+    expect(buildFixArgs('ink-demo')).toEqual(['studio', 'cli', '--name', 'ink-demo']);
+    await applyCliLinkFix('ink-demo');
+    expect(execFile).toHaveBeenCalledWith(
+      'ink',
+      ['studio', 'cli', '--name', 'ink-demo'],
+      expect.any(Function)
+    );
+  });
+});
 
 function makeFs(overrides?: {
   files?: Record<string, string>;
@@ -39,7 +72,7 @@ function makeFs(overrides?: {
 
 describe('analyzeCliLink', () => {
   it('defaults to ink binary name when no identity hint is available', () => {
-    const originalAgentId = process.env.AGENT_ID;
+    const originalSlug = process.env.AGENT_ID;
     delete process.env.AGENT_ID;
     try {
       const fsOps = makeFs();
@@ -48,13 +81,13 @@ describe('analyzeCliLink', () => {
       const linkedBinaryCheck = result.checks.find((check) => check.name === 'Linked binary');
       expect(linkedBinaryCheck?.detail).toContain('run: ink studio cli');
     } finally {
-      if (originalAgentId === undefined) delete process.env.AGENT_ID;
-      else process.env.AGENT_ID = originalAgentId;
+      if (originalSlug === undefined) delete process.env.AGENT_ID;
+      else process.env.AGENT_ID = originalSlug;
     }
   });
 
   it('uses AGENT_ID as fallback binary hint when present', () => {
-    const originalAgentId = process.env.AGENT_ID;
+    const originalSlug = process.env.AGENT_ID;
     process.env.AGENT_ID = 'lumen';
     try {
       const fsOps = makeFs();
@@ -67,8 +100,8 @@ describe('analyzeCliLink', () => {
         expect(linkedBinaryCheck?.detail).toContain('run: ink studio cli');
       }
     } finally {
-      if (originalAgentId === undefined) delete process.env.AGENT_ID;
-      else process.env.AGENT_ID = originalAgentId;
+      if (originalSlug === undefined) delete process.env.AGENT_ID;
+      else process.env.AGENT_ID = originalSlug;
     }
   });
 

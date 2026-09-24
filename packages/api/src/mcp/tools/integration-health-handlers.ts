@@ -77,7 +77,7 @@ export const updateIntegrationHealthSchema = userIdentifierBaseSchema.extend({
     .optional()
     .describe('Structured error code (e.g., "oauth_expired", "rate_limited")'),
   errorMessage: z.string().optional().describe('Human-readable error description'),
-  agentId: z.string().optional().describe('Which SB is reporting this'),
+  sbSlug: z.string().optional().describe('Which SB is reporting this'),
   metadata: z.record(z.string(), z.unknown()).optional().describe('Additional context'),
 });
 
@@ -107,7 +107,7 @@ export async function handleUpdateIntegrationHealth(args: unknown, dataComposer:
     // healthy report lands between the two, and an erasure whenever the read
     // fails.
     last_healthy_at: isHealthy ? now : null,
-    reported_by_agent_id: params.agentId ?? null,
+    reported_by_agent_id: params.sbSlug ?? null,
     metadata: (params.metadata ?? {}) as Json,
     updated_at: now,
   };
@@ -144,7 +144,7 @@ export async function handleUpdateIntegrationHealth(args: unknown, dataComposer:
               errorMessage: data.error_message,
               lastCheckAt: data.last_check_at,
               lastHealthyAt: data.last_healthy_at,
-              reportedByAgentId: data.reported_by_agent_id,
+              reportedBySlug: data.reported_by_agent_id,
             },
           },
           null,
@@ -226,7 +226,7 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
       id: row?.id ?? null,
       service,
       lastHealthyAt: row?.last_healthy_at ?? null,
-      reportedByAgentId: row?.reported_by_agent_id ?? null,
+      reportedBySlug: row?.reported_by_agent_id ?? null,
       metadata: row?.metadata ?? {},
       updatedAt: row?.updated_at ?? null,
       lastCheckAt: row?.last_check_at ?? null,

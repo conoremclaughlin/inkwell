@@ -8,7 +8,7 @@
  */
 export interface SenderLike {
   senderKind?: 'sb' | 'user' | 'system' | string | null;
-  senderAgentId?: string | null;
+  senderSlug?: string | null;
   senderName?: string | null;
   isOwn?: boolean | null;
 }
@@ -19,5 +19,5 @@ export function senderLabel(m: SenderLike): string {
   // Older payloads name nobody: fall back to what the kind says.
   if (m.senderKind === 'user') return 'a workspace member';
   if (m.senderKind === 'system') return 'system';
-  return m.senderAgentId ?? 'system';
+  return m.senderSlug ?? 'system';
 }

@@ -28,7 +28,7 @@ if (existsSync(envLocalPath)) {
   }
 }
 
-if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9997';
+if (!process.env.INK_PORT_BASE) process.env.INK_PORT_BASE = '9997';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
@@ -48,12 +48,12 @@ const canRun = !!SUPABASE_URL && !!SUPABASE_KEY;
 
 // Bypass auth helpers that require request context in a server
 vi.mock('../../auth/enforce-identity', () => ({
-  getEffectiveAgentId: vi.fn().mockReturnValue('wren'),
+  getEffectiveSlug: vi.fn().mockReturnValue('wren'),
 }));
 vi.mock('../../utils/request-context', () => ({
   setSessionContext: vi.fn(),
   pinSessionAgent: vi.fn(),
-  getPinnedAgentId: vi.fn().mockReturnValue(null),
+  getPinnedSlug: vi.fn().mockReturnValue(null),
   getRequestContext: vi.fn().mockReturnValue(undefined),
 }));
 // resolveUser is normally called via OAuth context; short-circuit it.

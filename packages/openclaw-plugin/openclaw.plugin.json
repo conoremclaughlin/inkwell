@@ -3,28 +3,28 @@
   "skills": ["skills"],
   "uiHints": {
     "serverUrl": {
-      "label": "PCP Server URL",
+      "label": "Inkwell Server URL",
       "placeholder": "http://localhost:3001",
-      "help": "URL of the running PCP server"
+      "help": "URL of the running Inkwell server"
     },
     "accessToken": {
       "label": "Access Token",
       "sensitive": true,
       "placeholder": "eyJhbGciOi...",
-      "help": "PCP access token (from ~/.ink/auth.json or 'sb login')"
+      "help": "Inkwell access token (from ~/.ink/auth.json or 'sb login')"
     },
-    "agentId": {
-      "label": "Agent ID",
+    "sbSlug": {
+      "label": "SB Slug",
       "placeholder": "wren",
-      "help": "Your PCP agent identity. If omitted, reads from ~/.ink/config.json agentMapping."
+      "help": "Your SB's slug. If omitted, reads from ~/.ink/config.json sbMapping."
     },
     "autoBootstrap": {
       "label": "Auto-Bootstrap",
-      "help": "Inject PCP identity context at the start of each agent turn"
+      "help": "Inject Inkwell identity context at the start of each agent turn"
     },
     "autoSessionEnd": {
       "label": "Auto Session End",
-      "help": "Automatically end the PCP session when the agent turn completes"
+      "help": "Automatically end the Inkwell session when the agent turn completes"
     }
   },
   "configSchema": {
@@ -38,8 +38,12 @@
       "accessToken": {
         "type": "string"
       },
-      "agentId": {
+      "sbSlug": {
         "type": "string"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Pre-rename name for sbSlug. Still accepted: nothing rewrites a user's OpenClaw config, and additionalProperties is false."
       },
       "autoBootstrap": {
         "type": "boolean",

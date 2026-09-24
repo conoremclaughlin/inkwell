@@ -7,13 +7,29 @@
  */
 
 export type ErrorCategory =
+  | 'owner_conflict'
   | 'capacity'
   | 'quota'
   | 'timeout'
+  | 'network'
   | 'config'
   | 'auth'
   | 'crash'
   | 'unknown';
+
+/**
+ * Categories where the backend refused the run BEFORE accepting it — no turn
+ * began, so the run observed nothing about the target session's own state.
+ *
+ * Callers use this to decide whether a failure may be written onto the target
+ * session as an outcome. It must not be read as "the owner is alive": the
+ * refusal proves a writer/lock exists on the backend thread, which is not a
+ * heartbeat, not an authenticated endpoint, and not authority to refresh
+ * owner registration or extend a lease (Lumen, spec:live-agent-surfaces).
+ */
+export function isPreAcceptanceRefusal(category: ErrorCategory): boolean {
+  return category === 'owner_conflict';
+}
 
 export interface ErrorClassification {
   category: ErrorCategory;
@@ -27,12 +43,65 @@ interface ClassifyInput {
   exitCode?: number | null;
 }
 
+/**
+ * The refusal sentence itself, with the thread it names. Requiring the thread
+ * reference is what separates the backend's own refusal from any text that
+ * happens to contain the words — an agent quoting this incident, a log line
+ * about a `writer` role, a diff touching `thread-store.ts` (Lumen's review of
+ * PR #660: two unqualified substrings were not the signature the comment
+ * claimed).
+ */
+const WRITER_CONFLICT_SENTENCE = /thread\s+\S+\s+already has an active writer/i;
+
+/**
+ * Where that sentence came from. Codex emits the refusal twice for one event —
+ * once on stderr while initializing thread persistence, once on stdout as the
+ * JSON-RPC reply to `thread/resume` — and the captured text carries both. One
+ * of these must accompany the sentence: the pair together is the signature,
+ * and either alone is just a string.
+ */
+const REFUSAL_CONTEXT =
+  /thread-store conflict|thread\/resume|failed to initialize thread persistence/i;
+
 /** Pattern rules checked in priority order. First match wins. */
 const RULES: Array<{
   category: ErrorCategory;
   retryable: boolean;
   test: (input: ClassifyInput) => boolean;
 }> = [
+  {
+    // FIRST, deliberately: the backend refused to start because another writer
+    // already holds the thread. It is the most specific signature we receive
+    // and the only one that says something about a session OTHER than the
+    // spawn's own health, so a looser rule must never claim it first.
+    //
+    // Measured on spec:live-agent-surfaces, 2026-09-21: four resumes into one
+    // Codex thread were refused this way while its owner was working, and each
+    // one landed `lifecycle='failed', cli_attached=false` on the live owner's
+    // row. Classified `unknown` at the time — the `crash` rule's exit-code test
+    // is the one that would otherwise have caught it, and session-service calls
+    // classifyError without an exitCode.
+    //
+    // The test is an AND of the two halves defined above, not a substring
+    // search: the refusal sentence naming a thread, plus the Codex context it
+    // arrived in. Both are signatures we have actually observed. Other backends
+    // get added when a real refusal from them has been seen, not guessed at —
+    // and a text that fails this test falls through to the categories it
+    // already had, which is the behaviour that shipped before this rule.
+    category: 'owner_conflict',
+    // Not retryable, matching what this text already classified as: an
+    // immediate re-dispatch would re-resume the same held thread and be
+    // refused again. Recovery belongs to reconciliation, not to the runner.
+    //
+    // Naming it does change one downstream behaviour, deliberately.
+    // session-service's flushQueueOnNonRetryableError acts on classifications
+    // that are non-retryable AND not `unknown`, so this text used to fall
+    // through it and every queued message took its own turn at resuming the
+    // held thread. Now the queue is flushed with a named reason instead.
+    retryable: false,
+    test: ({ errorText }) =>
+      WRITER_CONFLICT_SENTENCE.test(errorText) && REFUSAL_CONTEXT.test(errorText),
+  },
   {
     category: 'capacity',
     retryable: true,
@@ -65,6 +134,33 @@ const RULES: Array<{
       /\btimeout\b/i.test(errorText) ||
       (/\bidle\b/i.test(errorText) && /\bkill/i.test(errorText)) ||
       exitCode === 124,
+  },
+  {
+    // Transient network / connectivity failures — the request never completed.
+    // Seen when the host's network dips mid-spawn: undici connect timeouts
+    // ("fetch failed" + UND_ERR_CONNECT_TIMEOUT), codex stream disconnects
+    // ("stream disconnected before completion: error sending request"), and
+    // codex startup model-list refresh failures. Note: signatures containing
+    // the literal word "timeout" (e.g. "failed to refresh available models:
+    // timeout waiting for child process") match the timeout rule above —
+    // both categories are retryable, so either classification triggers retry.
+    category: 'network',
+    retryable: true,
+    test: ({ errorText }) =>
+      /stream disconnected/i.test(errorText) ||
+      /error sending request/i.test(errorText) ||
+      /fetch failed/i.test(errorText) ||
+      /UND_ERR_CONNECT/i.test(errorText) ||
+      /UND_ERR_SOCKET/i.test(errorText) ||
+      /failed to refresh available models/i.test(errorText) ||
+      /\bECONNRESET\b/.test(errorText) ||
+      /\bECONNREFUSED\b/.test(errorText) ||
+      /\bETIMEDOUT\b/.test(errorText) ||
+      /\bENETUNREACH\b/.test(errorText) ||
+      /\bEHOSTUNREACH\b/.test(errorText) ||
+      /\bEAI_AGAIN\b/.test(errorText) ||
+      /socket hang ?up/i.test(errorText) ||
+      /\bnetwork error\b/i.test(errorText),
   },
   {
     category: 'auth',

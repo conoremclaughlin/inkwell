@@ -16,8 +16,8 @@ function isLegacyMessageForThisStudio(
   if (!myStudioId) return true;
 
   const metadata = msg.metadata as Record<string, unknown> | undefined;
-  const pcp = metadata?.pcp as Record<string, unknown> | undefined;
-  const recipient = pcp?.recipient as Record<string, unknown> | undefined;
+  const inkMeta = metadata?.pcp as Record<string, unknown> | undefined;
+  const recipient = inkMeta?.recipient as Record<string, unknown> | undefined;
   const recipientStudioId = recipient?.studioId as string | undefined;
 
   if (!recipientStudioId) return true; // no studio scoping — broadcast
@@ -31,9 +31,9 @@ describe('isLegacyMessageForThisStudio', () => {
   it('accepts messages addressed to this studio', () => {
     const msg = {
       id: 'msg-1',
-      senderAgentId: 'lumen',
+      senderSlug: 'lumen',
       content: 'hello',
-      metadata: { pcp: { recipient: { studioId: MY_STUDIO }, sender: { agentId: 'lumen' } } },
+      metadata: { pcp: { recipient: { studioId: MY_STUDIO }, sender: { sbSlug: 'lumen' } } },
     };
     expect(isLegacyMessageForThisStudio(msg, MY_STUDIO)).toBe(true);
   });
@@ -41,9 +41,9 @@ describe('isLegacyMessageForThisStudio', () => {
   it('rejects messages addressed to a different studio', () => {
     const msg = {
       id: 'msg-2',
-      senderAgentId: 'lumen',
+      senderSlug: 'lumen',
       content: 'hello',
-      metadata: { pcp: { recipient: { studioId: OTHER_STUDIO }, sender: { agentId: 'lumen' } } },
+      metadata: { pcp: { recipient: { studioId: OTHER_STUDIO }, sender: { sbSlug: 'lumen' } } },
     };
     expect(isLegacyMessageForThisStudio(msg, MY_STUDIO)).toBe(false);
   });
@@ -51,22 +51,22 @@ describe('isLegacyMessageForThisStudio', () => {
   it('accepts broadcast messages (no recipient studio)', () => {
     const msg = {
       id: 'msg-3',
-      senderAgentId: 'lumen',
+      senderSlug: 'lumen',
       content: 'hello',
-      metadata: { pcp: { sender: { agentId: 'lumen' } } },
+      metadata: { pcp: { sender: { sbSlug: 'lumen' } } },
     };
     expect(isLegacyMessageForThisStudio(msg, MY_STUDIO)).toBe(true);
   });
 
   it('accepts messages with no metadata at all', () => {
-    const msg = { id: 'msg-4', senderAgentId: 'lumen', content: 'hello' };
+    const msg = { id: 'msg-4', senderSlug: 'lumen', content: 'hello' };
     expect(isLegacyMessageForThisStudio(msg, MY_STUDIO)).toBe(true);
   });
 
   it('accepts all messages when studioId is undefined', () => {
     const msg = {
       id: 'msg-6',
-      senderAgentId: 'lumen',
+      senderSlug: 'lumen',
       content: 'hello',
       metadata: { pcp: { recipient: { studioId: 'any-studio' } } },
     };
@@ -99,12 +99,12 @@ describe('message dedup logic', () => {
   });
 
   it('own message filter works', () => {
-    const agentId = 'wren';
-    const ownMsg = { senderAgentId: 'wren', content: 'hello' };
-    const otherMsg = { senderAgentId: 'lumen', content: 'hello' };
+    const sbSlug = 'wren';
+    const ownMsg = { senderSlug: 'wren', content: 'hello' };
+    const otherMsg = { senderSlug: 'lumen', content: 'hello' };
 
-    expect(ownMsg.senderAgentId === agentId).toBe(true);
-    expect(otherMsg.senderAgentId === agentId).toBe(false);
+    expect(ownMsg.senderSlug === sbSlug).toBe(true);
+    expect(otherMsg.senderSlug === sbSlug).toBe(false);
   });
 
   it('timestamp comparison for thread messages', () => {

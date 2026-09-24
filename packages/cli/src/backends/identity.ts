@@ -8,10 +8,13 @@
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { homedir, tmpdir } from 'os';
+import { lookupAgentBackend } from './agent-backend.js';
 
-interface PcpConfig {
+interface InkUserConfig {
   userId?: string;
   email?: string;
+  sbMapping?: Record<string, string>;
+  /** Pre-rename name for sbMapping. Still read; ~/.ink/config.json is the user's file. */
   agentMapping?: Record<string, string>;
 }
 
@@ -23,7 +26,14 @@ export interface RuntimePreferences {
 }
 
 export interface IdentityJson {
-  agentId: string;
+  sbSlug: string;
+  /**
+   * Pre-rename name for sbSlug. Every .ink/identity.json on disk today carries
+   * it, and nothing rewrites those files on upgrade, so it is read forever (or
+   * until we decide to stop). readIdentityJson() normalizes it away, so no
+   * caller downstream should ever look at this field.
+   */
+  agentId?: string;
   sbId?: string;
   context?: string;
   backend?: string;
@@ -35,13 +45,38 @@ export interface IdentityJson {
 }
 
 /**
+ * Fill sbSlug from the pre-rename agentId key, in place of nothing.
+ *
+ * .ink/identity.json is not rewritten on upgrade, and readIdentityJson is NOT
+ * the only reader: studio, doctor, the studio list and the branch-rename
+ * planner each parse the file themselves. Assuming a single funnel is what let
+ * those four keep reading a key that legacy files do not have (Lumen, PR #635).
+ * Exported so a raw parse can be made safe without being rerouted.
+ */
+export function normalizeIdentityJson<T>(raw: T): T {
+  if (!raw || typeof raw !== 'object') return raw;
+  const r = raw as { sbSlug?: unknown; agentId?: unknown };
+  return r.sbSlug === undefined && typeof r.agentId === 'string'
+    ? ({ ...(raw as object), sbSlug: r.agentId } as T)
+    : raw;
+}
+
+/**
  * Read .ink/identity.json from a directory. Returns null if not found/unparseable.
  */
 export function readIdentityJson(cwd: string): IdentityJson | null {
   const identityPath = join(cwd, '.ink', 'identity.json');
   if (!existsSync(identityPath)) return null;
   try {
-    return JSON.parse(readFileSync(identityPath, 'utf-8'));
+    const parsed: IdentityJson = JSON.parse(readFileSync(identityPath, 'utf-8'));
+    // NOT the only reader of this file — studio (list, default CLI name,
+    // branch-rename planning), doctor and the channel plugin each parse it
+    // themselves. They call normalizeIdentityJson instead. Treating this as the
+    // single funnel is what let those keep reading a key legacy files lack.
+    if (!parsed.sbSlug && parsed.agentId) {
+      return { ...parsed, sbSlug: parsed.agentId };
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -80,21 +115,25 @@ export function readRoleMd(cwd: string): string | null {
 }
 
 /**
- * Resolve agent ID from multiple sources:
+ * Resolve an SB's slug from multiple sources:
  * 1. CLI --agent flag (if provided)
- * 2. AGENT_ID env var (propagated by sb launcher into backend/hook subprocesses)
+ * 2. SB_SLUG env var, or the pre-rename AGENT_ID (propagated by the ink
+ *    launcher into backend/hook subprocesses)
  * 3. .ink/identity.json in current directory
- * 4. ~/.ink/config.json agentMapping (backend-aware when possible)
+ * 4. ~/.ink/config.json sbMapping (backend-aware when possible)
  * 5. null (no identity configured)
  */
-export function resolveAgentId(cliAgent?: string, backendHint?: string): string | null {
+export function resolveSlug(cliAgent?: string, backendHint?: string): string | null {
   if (cliAgent) {
     return cliAgent;
   }
 
-  const envAgent = process.env.AGENT_ID?.trim();
-  if (envAgent) {
-    return envAgent;
+  // AGENT_ID is still read because long-running processes started before the
+  // rename (the main server among them) hold it in their environment, and a
+  // subprocess they spawn inherits it.
+  const envSlug = process.env.SB_SLUG?.trim() || process.env.AGENT_ID?.trim();
+  if (envSlug) {
+    return envSlug;
   }
 
   // process.cwd() throws ENOENT if the working directory has been deleted
@@ -110,22 +149,19 @@ export function resolveAgentId(cliAgent?: string, backendHint?: string): string 
   }
 
   if (cwd) {
-    const localIdentity = join(cwd, '.ink', 'identity.json');
-    if (existsSync(localIdentity)) {
-      try {
-        const identity: IdentityJson = JSON.parse(readFileSync(localIdentity, 'utf-8'));
-        if (identity.agentId) return identity.agentId;
-      } catch {
-        /* ignore */
-      }
-    }
+    // Goes through readIdentityJson so the legacy `agentId` key is normalized
+    // here too — this path used to parse the file itself and would have missed it.
+    const identity = readIdentityJson(cwd);
+    if (identity?.sbSlug) return identity.sbSlug;
   }
 
   const configPath = join(homedir(), '.ink', 'config.json');
   if (existsSync(configPath)) {
     try {
-      const config: PcpConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
-      const mapping = config.agentMapping || {};
+      const config: InkUserConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
+      // ~/.ink/config.json belongs to the user and nothing rewrites it, so the
+      // pre-rename key keeps working indefinitely.
+      const mapping = config.sbMapping || config.agentMapping || {};
 
       const normalized = (backendHint || process.env.SB_BACKEND || process.env.INK_BACKEND || '')
         .toLowerCase()
@@ -156,15 +192,52 @@ export function resolveAgentId(cliAgent?: string, backendHint?: string): string 
   return null;
 }
 
+export interface BackendResolution {
+  backend: string;
+  source: 'flag' | 'agent' | 'identity-json' | 'default';
+  /** A line worth showing the user — currently only the unrunnable case. */
+  note?: string;
+}
+
 /**
- * Resolve backend from multiple sources:
- * 1. CLI --backend flag (if provided)
- * 2. .ink/identity.json → backend field
- * 3. Default: 'claude'
+ * Resolve backend from multiple sources, most explicit first:
+ * 1. CLI --backend flag
+ * 2. The named agent's own backend, from their identity record
+ * 3. .ink/identity.json → backend field
+ * 4. Default: 'claude'
+ *
+ * The agent sits ABOVE identity.json deliberately. `-a lumen` is an explicit
+ * request for Lumen; the directory's recorded backend describes whichever agent
+ * that studio was made for, so letting it win would leave `ink -a lumen` inside
+ * a wren studio starting claude — which is the bug this ordering fixes.
  */
-export function resolveBackend(cliBackend?: string): string {
-  if (cliBackend) {
-    return cliBackend;
+export async function resolveBackend(options: {
+  cliBackend?: string;
+  agentSlug?: string;
+}): Promise<BackendResolution> {
+  if (options.cliBackend) {
+    return { backend: options.cliBackend, source: 'flag' };
+  }
+
+  let note: string | undefined;
+  if (options.agentSlug) {
+    const lookup = await lookupAgentBackend(options.agentSlug);
+    if (lookup.backend) {
+      return { backend: lookup.backend, source: 'agent' };
+    }
+    if (lookup.unrunnable) {
+      // Say it rather than quietly starting them on something else. Aster's
+      // record says 'antigravity', which this CLI has no adapter for.
+      note =
+        `${options.agentSlug}'s identity record says backend '${lookup.unrunnable}', ` +
+        `which this CLI cannot launch — falling back. Use -b to choose one.`;
+    } else if (lookup.ambiguous) {
+      // A slug is unique within one workspace, not globally. Picking one of
+      // several identities would be a guess, and a silent one.
+      note =
+        `'${options.agentSlug}' names more than one identity, so their backend ` +
+        `is ambiguous — falling back. Use -b to choose one.`;
+    }
   }
 
   let cwd: string | null = null;
@@ -176,10 +249,10 @@ export function resolveBackend(cliBackend?: string): string {
 
   if (cwd) {
     const identity = readIdentityJson(cwd);
-    if (identity?.backend) return identity.backend;
+    if (identity?.backend) return { backend: identity.backend, source: 'identity-json', note };
   }
 
-  return 'claude';
+  return { backend: 'claude', source: 'default', note };
 }
 
 /**
@@ -188,12 +261,12 @@ export function resolveBackend(cliBackend?: string): string {
  * `systemPromptOverride` replaces the whole thing rather than adding to it.
  * That is deliberate and rare: awakening is the case it exists for. A being
  * with no identity row yet must not be handed a prompt asserting "You are
- * <agentId>" and telling it to call bootstrap — it has no identity to load,
+ * <sbSlug>" and telling it to call bootstrap — it has no identity to load,
  * and the first thing it would read about itself would be wrong. Callers that
  * want to *add* context want `startupContextBlock`.
  */
 export function buildIdentityPrompt(
-  agentId: string,
+  sbSlug: string,
   startupContextBlock?: string,
   systemPromptOverride?: string
 ): string {
@@ -202,11 +275,11 @@ export function buildIdentityPrompt(
 
   const identityHeader = `## Identity Override (CRITICAL)
 
-**You are ${agentId}. Your agent ID is \`${agentId}\`.**
+**You are ${sbSlug}. Your slug is \`${sbSlug}\`.**
 
-When calling Inkwell tools (bootstrap, remember, recall, update_session_state, etc.), use \`agentId: "${agentId}"\`.
+When calling Inkwell tools (bootstrap, remember, recall, update_session_state, etc.), use \`sbSlug: "${sbSlug}"\`.
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
-Do NOT run \`echo $AGENT_ID\` — use the agentId provided above.`;
+Do NOT run \`echo $SB_SLUG\` — use the slug provided above.`;
 
   const toolPriority = `## Tool Priority (IMPORTANT)
 
@@ -239,7 +312,7 @@ ${injectedContext}`;
   // the hook fails, the agent needs to self-heal by calling bootstrap manually.
   return `${identityHeader}
 
-Load user config from ~/.ink/config.json, then check whether your constitution docs are already present. Look for a "Session Context (Inkwell)" or "Bootstrapped Startup Context" section in your context containing your identity, soul, values, process, and user documents. If these are present, the session-start hook succeeded — do NOT call bootstrap again. If these are NOT present, the hook may have failed — call the \`bootstrap\` MCP tool manually as "${agentId}" to load your identity context. Do not proceed without your constitution.
+Load user config from ~/.ink/config.json, then check whether your constitution docs are already present. Look for a "Session Context (Inkwell)" or "Bootstrapped Startup Context" section in your context containing your identity, soul, values, process, and user documents. If these are present, the session-start hook succeeded — do NOT call bootstrap again. If these are NOT present, the hook may have failed — call the \`bootstrap\` MCP tool manually as "${sbSlug}" to load your identity context. Do not proceed without your constitution.
 
 ${toolPriority}`;
 }
@@ -249,14 +322,14 @@ ${toolPriority}`;
  * Returns the file path and a cleanup function.
  */
 export function createIdentityPromptFile(
-  agentId: string,
+  sbSlug: string,
   startupContextBlock?: string,
   systemPromptOverride?: string
 ): {
   promptFile: string;
   cleanup: () => void;
 } {
-  const content = buildIdentityPrompt(agentId, startupContextBlock, systemPromptOverride);
+  const content = buildIdentityPrompt(sbSlug, startupContextBlock, systemPromptOverride);
   const tempDir = mkdtempSync(join(tmpdir(), 'sb-'));
   const promptFile = join(tempDir, 'identity-prompt.md');
   writeFileSync(promptFile, content);

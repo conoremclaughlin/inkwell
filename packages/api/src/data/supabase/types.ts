@@ -546,6 +546,192 @@ export type Database = {
           },
         ];
       };
+      alert_events: {
+        Row: {
+          created_at: string;
+          dedupe_key: string;
+          delivery: Json;
+          detail: string | null;
+          first_seen_at: string;
+          id: string;
+          last_delivered_severity: string | null;
+          last_notified_at: string | null;
+          last_seen_at: string;
+          metrics: Json;
+          notify_claim_severity: string | null;
+          notify_claim_token: string | null;
+          notify_claimed_at: string | null;
+          occurrence_count: number;
+          resolved_at: string | null;
+          severity: string;
+          source: string;
+          title: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          dedupe_key: string;
+          delivery?: Json;
+          detail?: string | null;
+          first_seen_at?: string;
+          id?: string;
+          last_delivered_severity?: string | null;
+          last_notified_at?: string | null;
+          last_seen_at?: string;
+          metrics?: Json;
+          notify_claim_severity?: string | null;
+          notify_claim_token?: string | null;
+          notify_claimed_at?: string | null;
+          occurrence_count?: number;
+          resolved_at?: string | null;
+          severity: string;
+          source: string;
+          title: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          dedupe_key?: string;
+          delivery?: Json;
+          detail?: string | null;
+          first_seen_at?: string;
+          id?: string;
+          last_delivered_severity?: string | null;
+          last_notified_at?: string | null;
+          last_seen_at?: string;
+          metrics?: Json;
+          notify_claim_severity?: string | null;
+          notify_claim_token?: string | null;
+          notify_claimed_at?: string | null;
+          occurrence_count?: number;
+          resolved_at?: string | null;
+          severity?: string;
+          source?: string;
+          title?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_events_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      alert_sources: {
+        Row: {
+          created_at: string;
+          description: string | null;
+          expected_interval_seconds: number | null;
+          id: string;
+          last_detail: string | null;
+          last_seen_at: string | null;
+          last_status: string | null;
+          source: string;
+          stale_alerted_at: string | null;
+          staleness_grace_factor: number;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          description?: string | null;
+          expected_interval_seconds?: number | null;
+          id?: string;
+          last_detail?: string | null;
+          last_seen_at?: string | null;
+          last_status?: string | null;
+          source: string;
+          stale_alerted_at?: string | null;
+          staleness_grace_factor?: number;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          description?: string | null;
+          expected_interval_seconds?: number | null;
+          id?: string;
+          last_detail?: string | null;
+          last_seen_at?: string | null;
+          last_status?: string | null;
+          source?: string;
+          stale_alerted_at?: string | null;
+          staleness_grace_factor?: number;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_sources_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      alert_webhooks: {
+        Row: {
+          consecutive_failures: number;
+          created_at: string;
+          enabled: boolean;
+          id: string;
+          last_delivery_at: string | null;
+          last_delivery_error: string | null;
+          last_delivery_status: number | null;
+          name: string;
+          secret: string;
+          severities: string[];
+          sources: string[];
+          updated_at: string;
+          url: string;
+          user_id: string;
+        };
+        Insert: {
+          consecutive_failures?: number;
+          created_at?: string;
+          enabled?: boolean;
+          id?: string;
+          last_delivery_at?: string | null;
+          last_delivery_error?: string | null;
+          last_delivery_status?: number | null;
+          name: string;
+          secret: string;
+          severities?: string[];
+          sources?: string[];
+          updated_at?: string;
+          url: string;
+          user_id: string;
+        };
+        Update: {
+          consecutive_failures?: number;
+          created_at?: string;
+          enabled?: boolean;
+          id?: string;
+          last_delivery_at?: string | null;
+          last_delivery_error?: string | null;
+          last_delivery_status?: number | null;
+          name?: string;
+          secret?: string;
+          severities?: string[];
+          sources?: string[];
+          updated_at?: string;
+          url?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_webhooks_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       approval_requests: {
         Row: {
           action: string | null;
@@ -1329,6 +1515,70 @@ export type Database = {
           },
         ];
       };
+      heartbeat_notifications: {
+        Row: {
+          attempts: number;
+          created_at: string;
+          delivered_at: string | null;
+          destination: string | null;
+          episode_closed_at: string | null;
+          episode_key: string;
+          failed_beats: number;
+          id: string;
+          kind: string;
+          last_attempt_at: string | null;
+          last_error: string | null;
+          next_attempt_at: string | null;
+          reminder_id: string;
+          status: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key: string;
+          failed_beats?: number;
+          id?: string;
+          kind: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id: string;
+          status?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key?: string;
+          failed_beats?: number;
+          id?: string;
+          kind?: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id?: string;
+          status?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'heartbeat_notifications_reminder_id_fkey';
+            columns: ['reminder_id'];
+            referencedRelation: 'scheduled_reminders';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       heartbeat_state: {
         Row: {
           last_checks: Json | null;
@@ -1541,8 +1791,13 @@ export type Database = {
           key_type: string | null;
           metadata: Json | null;
           status: string;
+          summary: string | null;
+          summary_updated_at: string | null;
+          summary_updated_by_sb_id: string | null;
           thread_key: string;
           title: string | null;
+          title_updated_at: string | null;
+          title_updated_by_sb_id: string | null;
           updated_at: string | null;
           workspace_id: string;
         };
@@ -1561,8 +1816,13 @@ export type Database = {
           key_type?: string | null;
           metadata?: Json | null;
           status?: string;
+          summary?: string | null;
+          summary_updated_at?: string | null;
+          summary_updated_by_sb_id?: string | null;
           thread_key: string;
           title?: string | null;
+          title_updated_at?: string | null;
+          title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
           workspace_id: string;
         };
@@ -1581,12 +1841,29 @@ export type Database = {
           key_type?: string | null;
           metadata?: Json | null;
           status?: string;
+          summary?: string | null;
+          summary_updated_at?: string | null;
+          summary_updated_by_sb_id?: string | null;
           thread_key?: string;
           title?: string | null;
+          title_updated_at?: string | null;
+          title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
           workspace_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'inbox_threads_summary_updated_by_sb_id_fkey';
+            columns: ['summary_updated_by_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'inbox_threads_title_updated_by_sb_id_fkey';
+            columns: ['title_updated_by_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'inbox_threads_workspace_id_fkey';
             columns: ['workspace_id'];
@@ -4568,6 +4845,29 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      swap_memory_embedding: {
+        Args: {
+          p_memory_id: string;
+          p_user_id: string;
+          p_expected_version: number;
+          p_chunks: Json;
+          p_embedding: string;
+          p_chunks_version: number;
+          p_chunk_count: number;
+          p_metadata_patch: Json;
+          p_metadata_remove?: string[];
+        };
+        Returns: string;
+      };
+      clear_memory_embedding: {
+        Args: {
+          p_memory_id: string;
+          p_user_id: string;
+          p_expected_version: number;
+          p_metadata_remove?: string[];
+        };
+        Returns: string;
+      };
       advance_agent_inbox_read_pointer: {
         Args: {
           p_agent_id: string;
@@ -4587,6 +4887,20 @@ export type Database = {
           p_user_id: string;
         };
         Returns: string;
+      };
+      alert_severity_rank: { Args: { p_severity: string }; Returns: number };
+      alert_should_claim: {
+        Args: {
+          p_claim_ttl_seconds: number;
+          p_claimed_at: string | null;
+          p_cooldown_seconds: number;
+          p_delivered_severity: string | null;
+          p_last_notified_at: string | null;
+          p_new_severity: string;
+          p_now: string;
+          p_row_severity: string;
+        };
+        Returns: boolean;
       };
       reopen_inbox_thread: {
         Args: {
@@ -4614,6 +4928,19 @@ export type Database = {
           p_workspace_id: string;
         };
         Returns: number;
+      };
+      update_inbox_thread_metadata: {
+        Args: {
+          p_thread_id: string;
+          p_set_title: boolean;
+          p_title: string | null;
+          p_set_summary: boolean;
+          p_summary: string | null;
+          p_editor_sb_id: string | null;
+          p_editor_slug: string;
+          p_attributed_by: string;
+        };
+        Returns: string;
       };
       add_graph_nodes: {
         Args: {
@@ -4794,6 +5121,27 @@ export type Database = {
           isSetofReturn: false;
         };
       };
+      ingest_alert_event: {
+        Args: {
+          p_claim_ttl_seconds?: number;
+          p_cooldown_seconds?: number;
+          p_dedupe_key: string;
+          p_detail?: string;
+          p_metrics?: Json;
+          p_severity: string;
+          p_source: string;
+          p_title: string;
+          p_user_id: string;
+        };
+        Returns: {
+          claim_token: string | null;
+          event_id: string;
+          first_seen_at: string;
+          is_new: boolean;
+          occurrence_count: number;
+          should_notify: boolean;
+        }[];
+      };
       match_artifacts: {
         Args: {
           match_count?: number;
@@ -4944,6 +5292,18 @@ export type Database = {
         Args: { p: string | null };
         Returns: string | null;
       };
+      mark_alert_notified: {
+        Args: { p_claim_token?: string | null; p_event_id: string; p_severity?: string };
+        Returns: undefined;
+      };
+      release_alert_claim: {
+        Args: { p_claim_token?: string | null; p_event_id: string };
+        Returns: undefined;
+      };
+      record_alert_webhook_failure: {
+        Args: { p_error?: string; p_status?: number; p_webhook_id: string };
+        Returns: number;
+      };
       record_gate_verdict: {
         Args: {
           p_user_id: string;
@@ -4970,6 +5330,17 @@ export type Database = {
           p_reason?: string | null;
         };
         Returns: Json;
+      };
+      resolve_alert_event: {
+        Args: { p_dedupe_key: string; p_user_id: string };
+        Returns: {
+          event_id: string;
+          first_seen_at: string;
+          occurrence_count: number;
+          severity: string;
+          title: string;
+          was_notified: boolean;
+        }[];
       };
       retry_gate: {
         Args: {

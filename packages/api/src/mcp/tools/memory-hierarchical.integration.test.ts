@@ -67,7 +67,7 @@ describe('Hierarchical Memory Integration', () => {
         source: 'session',
         salience: 'high',
         topics: ['auth', 'mcp'],
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
 
       createdMemoryIds.push(memory.id);
@@ -87,7 +87,7 @@ describe('Hierarchical Memory Integration', () => {
         content: 'A plain memory without the new fields',
         source: 'observation',
         salience: 'medium',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
 
       createdMemoryIds.push(memory.id);
@@ -104,7 +104,7 @@ describe('Hierarchical Memory Integration', () => {
         topicKey: 'convention:git',
         source: 'user_stated',
         salience: 'critical',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
 
       createdMemoryIds.push(memory.id);
@@ -140,7 +140,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Core identity',
         topicKey: 'identity:test',
         salience: 'critical',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       criticalMemId = critical.id;
       createdMemoryIds.push(critical.id);
@@ -151,7 +151,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Important decision',
         topicKey: 'decision:test',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       highMemId = high.id;
       createdMemoryIds.push(high.id);
@@ -160,7 +160,7 @@ describe('Hierarchical Memory Integration', () => {
         userId: testUserId,
         content: 'Medium: routine observation',
         salience: 'medium',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       mediumMemId = medium.id;
       createdMemoryIds.push(medium.id);
@@ -280,7 +280,7 @@ describe('Hierarchical Memory Integration', () => {
         userId: testUserId,
         content: 'New memory that invalidates cache',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(newMem.id);
 
@@ -332,7 +332,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Original summary',
         topicKey: 'test:history',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
@@ -365,7 +365,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Delete test summary',
         topicKey: 'test:delete-history',
         salience: 'medium',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
@@ -389,6 +389,94 @@ describe('Hierarchical Memory Integration', () => {
     });
   });
 
+  describe('content editing with versioning', () => {
+    it('should archive the prior version on content edit and bump version', async () => {
+      const memory = await dataComposer.repositories.memory.remember({
+        userId: testUserId,
+        content: 'Original content before correction',
+        summary: 'Original edit-test summary',
+        topicKey: 'test:content-edit',
+        salience: 'high',
+        sbSlug: 'integration-test',
+      });
+      createdMemoryIds.push(memory.id);
+      expect(memory.version).toBe(1);
+
+      // Edit content + summary via updateMemory (the update_memory tool path)
+      const updated = await dataComposer.repositories.memory.updateMemory(memory.id, testUserId, {
+        content: 'Corrected content after revision',
+        summary: 'Corrected edit-test summary',
+      });
+
+      expect(updated).not.toBeNull();
+      expect(updated!.content).toBe('Corrected content after revision');
+      expect(updated!.summary).toBe('Corrected edit-test summary');
+      expect(updated!.version).toBe(2);
+
+      // get_memory_history must show the pre-edit version
+      const history = await dataComposer.repositories.memory.getMemoryHistory(
+        memory.id,
+        testUserId
+      );
+      expect(history.length).toBeGreaterThan(0);
+      const archived = history[0];
+      expect(archived.content).toBe('Original content before correction');
+      expect(archived.summary).toBe('Original edit-test summary');
+      expect(archived.version).toBe(1);
+      expect(archived.changeType).toBe('update');
+    });
+
+    it('should support restore_memory rollback after a content edit', async () => {
+      const memory = await dataComposer.repositories.memory.remember({
+        userId: testUserId,
+        content: 'Rollback test original content',
+        summary: 'Rollback original summary',
+        salience: 'medium',
+        sbSlug: 'integration-test',
+      });
+      createdMemoryIds.push(memory.id);
+
+      await dataComposer.repositories.memory.updateMemory(memory.id, testUserId, {
+        content: 'Rollback test edited content',
+      });
+
+      const history = await dataComposer.repositories.memory.getMemoryHistory(
+        memory.id,
+        testUserId
+      );
+      const priorVersion = history.find((h) => h.content === 'Rollback test original content');
+      expect(priorVersion).toBeDefined();
+
+      const restored = await dataComposer.repositories.memory.restoreMemory(
+        priorVersion!.id,
+        testUserId
+      );
+      expect(restored).not.toBeNull();
+      expect(restored!.content).toBe('Rollback test original content');
+    });
+
+    it('should not create a history entry when only metadata changes', async () => {
+      const memory = await dataComposer.repositories.memory.remember({
+        userId: testUserId,
+        content: 'Metadata-only update test',
+        salience: 'low',
+        sbSlug: 'integration-test',
+      });
+      createdMemoryIds.push(memory.id);
+
+      const updated = await dataComposer.repositories.memory.updateMemory(memory.id, testUserId, {
+        metadata: { note: 'metadata only' },
+      });
+      expect(updated!.version).toBe(1);
+
+      const history = await dataComposer.repositories.memory.getMemoryHistory(
+        memory.id,
+        testUserId
+      );
+      expect(history.length).toBe(0);
+    });
+  });
+
   // =========================================================================
   // 6. restoreMemory propagates summary/topicKey
   // =========================================================================
@@ -402,7 +490,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Original restore summary',
         topicKey: 'test:restore',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       createdMemoryIds.push(memory.id);
 
@@ -452,7 +540,7 @@ describe('Hierarchical Memory Integration', () => {
         summary: 'Restore from deleted',
         topicKey: 'test:restore-deleted',
         salience: 'high',
-        agentId: 'integration-test',
+        sbSlug: 'integration-test',
       });
       // Don't track in createdMemoryIds yet — it will be deleted
 

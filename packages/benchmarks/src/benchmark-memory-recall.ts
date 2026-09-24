@@ -214,7 +214,7 @@ async function persistRun(
     summary,
     metadata: {
       benchmarkTopic: BENCHMARK_TOPIC,
-      benchmarkAgentId: BENCHMARK_AGENT_ID,
+      benchmarkSlug: BENCHMARK_AGENT_ID,
       datasetSource,
       benchmarkFamily,
       variant: variantName,
@@ -418,7 +418,7 @@ async function main() {
           () =>
             repo.remember({
               userId,
-              agentId: BENCHMARK_AGENT_ID,
+              sbSlug: BENCHMARK_AGENT_ID,
               content: targetDocuments[i],
               summary:
                 targetDocuments.length > 1
@@ -440,7 +440,7 @@ async function main() {
         const distractor = await withRetries(`remember distractor ${benchCase.id} #${i + 1}`, () =>
           repo.remember({
             userId,
-            agentId: BENCHMARK_AGENT_ID,
+            sbSlug: BENCHMARK_AGENT_ID,
             content: benchCase.distractors[i],
             summary: `benchmark distractor ${benchCase.id} #${i + 1}`,
             source: 'observation',
@@ -536,7 +536,7 @@ async function main() {
               mode,
               variant,
               limit: TOP_K,
-              agentId: BENCHMARK_AGENT_ID,
+              sbSlug: BENCHMARK_AGENT_ID,
               topics: caseTopics[benchCase.id],
             })
           )

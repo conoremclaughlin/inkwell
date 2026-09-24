@@ -1,7 +1,7 @@
 /**
  * Auth Command
  *
- * OAuth 2.0 PKCE login against the PCP MCP server.
+ * OAuth 2.0 PKCE login against the Inkwell MCP server.
  *
  * Commands:
  *   auth login    Authenticate via browser
@@ -14,7 +14,8 @@ import chalk from 'chalk';
 import ora from 'ora';
 import http from 'http';
 import crypto from 'crypto';
-import { exec } from 'child_process';
+import { openBrowser } from '../lib/open-browser.js';
+export { openBrowser } from '../lib/open-browser.js';
 import {
   generatePkce,
   loadAuth,
@@ -37,13 +38,8 @@ import {
 // Helpers
 // ============================================================================
 
-function getPcpServerUrl(): string {
+function getInkServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
-}
-
-function openBrowser(url: string): void {
-  // macOS — extend for Linux/Windows later
-  exec(`open "${url}"`);
 }
 
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -69,7 +65,7 @@ interface CallbackResult {
   state: string;
 }
 
-function startCallbackServer(
+export function startCallbackServer(
   expectedState: string
 ): Promise<{ result: Promise<CallbackResult>; port: number; close: () => void }> {
   return new Promise((resolveServer) => {
@@ -94,10 +90,26 @@ function startCallbackServer(
       const state = url.searchParams.get('state');
       const error = url.searchParams.get('error');
 
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
+
+      if (state !== expectedState) {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(ERROR_HTML('State mismatch — possible CSRF. Try again.'));
+        clearTimeout(timeout);
+        rejectResult(new Error('State mismatch'));
+        return;
+      }
+
       if (error) {
         const desc = url.searchParams.get('error_description') || error;
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(ERROR_HTML(desc));
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        // Provider-supplied descriptions are not HTML. Keep the browser page
+        // static; the terminal receives the diagnostic through the result.
+        res.end(
+          ERROR_HTML('The authorization server rejected login. Return to the terminal for details.')
+        );
         clearTimeout(timeout);
         rejectResult(new Error(desc));
         return;
@@ -108,14 +120,6 @@ function startCallbackServer(
         res.end(ERROR_HTML('Missing code or state parameter'));
         clearTimeout(timeout);
         rejectResult(new Error('Missing code or state in callback'));
-        return;
-      }
-
-      if (state !== expectedState) {
-        res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(ERROR_HTML('State mismatch — possible CSRF. Try again.'));
-        clearTimeout(timeout);
-        rejectResult(new Error('State mismatch'));
         return;
       }
 
@@ -183,7 +187,7 @@ async function exchangeCode(
 }
 
 async function loginCommand(options: { browser: boolean }): Promise<void> {
-  const serverUrl = getPcpServerUrl();
+  const serverUrl = getInkServerUrl();
 
   // Check if already logged in
   const existing = loadAuth();
@@ -304,10 +308,10 @@ async function logoutCommand(): Promise<void> {
 }
 
 async function delegateCommand(options: { agent: string }): Promise<void> {
-  const serverUrl = getPcpServerUrl();
-  const agentId = options.agent?.trim().toLowerCase();
-  if (!agentId) {
-    console.log(chalk.red('Missing --agent <agentId>'));
+  const serverUrl = getInkServerUrl();
+  const sbSlug = options.agent?.trim().toLowerCase();
+  if (!sbSlug) {
+    console.log(chalk.red('Missing --agent <sbSlug>'));
     process.exitCode = 1;
     return;
   }
@@ -325,7 +329,7 @@ async function delegateCommand(options: { agent: string }): Promise<void> {
       Authorization: `Bearer ${baseToken}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ agentId }),
+    body: JSON.stringify({ sbSlug }),
   });
 
   if (!response.ok) {
@@ -349,19 +353,19 @@ async function delegateCommand(options: { agent: string }): Promise<void> {
     return;
   }
 
-  saveDelegatedAuth(agentId, {
+  saveDelegatedAuth(sbSlug, {
     access_token: payload.access_token,
     expires_in: payload.expires_in,
     issued_at: Date.now(),
     scope: payload.scope,
-    agent_id: payload.delegated_agent_id || agentId,
+    agent_id: payload.delegated_agent_id || sbSlug,
     sb_id: payload.sb_id,
   });
 
   const expiresAt = new Date(Date.now() + payload.expires_in * 1000);
   console.log(
     chalk.green(
-      `Delegated token saved for ${agentId} (expires ${expiresAt.toLocaleString('en-US')}).`
+      `Delegated token saved for ${sbSlug} (expires ${expiresAt.toLocaleString('en-US')}).`
     )
   );
 }
@@ -456,11 +460,11 @@ async function backendLoginCommand(options: { backend: string }): Promise<void> 
 // ============================================================================
 
 export function registerAuthCommands(program: Command): void {
-  const auth = program.command('auth').description('Manage PCP authentication');
+  const auth = program.command('auth').description('Manage Inkwell authentication');
 
   auth
     .command('login')
-    .description('Log in to PCP via browser')
+    .description('Log in to Inkwell via browser')
     .option('--no-browser', 'Print login URL instead of opening browser')
     .action(loginCommand);
 
@@ -471,7 +475,7 @@ export function registerAuthCommands(program: Command): void {
   auth
     .command('delegate')
     .description('Mint and store an SB-scoped delegated MCP token')
-    .requiredOption('-a, --agent <agentId>', 'SB agentId (e.g. wren, lumen, aster)')
+    .requiredOption('-a, --agent <sbSlug>', 'SB sbSlug (e.g. wren, lumen, aster)')
     .action(delegateCommand);
 
   const backend = auth

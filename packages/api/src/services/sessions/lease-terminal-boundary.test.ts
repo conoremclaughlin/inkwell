@@ -29,7 +29,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: 'session-1',
     userId: 'user-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     studioId: 'studio-1',
     backendSessionId: null,
     type: 'primary',
@@ -95,7 +95,7 @@ describe('fail-closed routing at the lease boundary', () => {
     const foreignHolder: StudioLease = {
       sessionId: 'session-foreign',
       threadKey: 'pr:999',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       acquiredAt: new Date().toISOString(),
       heartbeatAt: new Date().toISOString(),
     };
@@ -194,7 +194,7 @@ describe('terminal-boundary release', () => {
           lease: {
             sessionId,
             threadKey: 'pr:200',
-            agentId: 'wren',
+            sbSlug: 'wren',
             acquiredAt: staleIso(),
             heartbeatAt: new Date().toISOString(),
           } as unknown as Row,
@@ -224,7 +224,7 @@ describe('terminal-boundary release', () => {
     registerActiveRun({
       sessionId: 'session-1',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });
@@ -262,7 +262,7 @@ describe('terminal-boundary release', () => {
     registerActiveRun({
       sessionId: 'session-1',
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backend: 'claude-code',
       startedAt: Date.now(),
     });

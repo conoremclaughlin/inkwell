@@ -45,7 +45,7 @@ export function messageTime(iso: string, nowMs: number = Date.now()): string {
  */
 export function senderName(message: {
   senderKind?: 'sb' | 'user' | 'system' | string | null;
-  senderAgentId?: string | null;
+  senderSlug?: string | null;
   senderName?: string | null;
   isOwn?: boolean | null;
 }): { name: string; isOwn: boolean } {
@@ -54,7 +54,7 @@ export function senderName(message: {
   // Older payloads name nobody: fall back to what the kind says.
   if (message.senderKind === 'user') return { name: 'a workspace member', isOwn: false };
   if (message.senderKind === 'system') return { name: 'system', isOwn: false };
-  return { name: message.senderAgentId ?? 'system', isOwn: false };
+  return { name: message.senderSlug ?? 'system', isOwn: false };
 }
 
 /** "runtime:idle" → "idle"; "active:implementing" → "implementing". */

@@ -9,11 +9,18 @@
 
 export interface SpineSession {
   id: string;
-  agentId: string | null;
+  sbSlug: string | null;
   lifecycle: string | null;
   status: string | null;
   phase: string | null;
   relation: 'anchor' | 'active' | 'both';
+  /**
+   * Whether this session is working right now. Computed by the server
+   * (isSessionLive in thread-spines.ts) because `lifecycle` alone is not
+   * evidence: nothing reaps abandoned sessions, so rows sit at `running` for
+   * months. Do not re-derive presence here — there is one owner for the rule.
+   */
+  live: boolean;
   updatedAt: string;
   studioId: string | null;
 }
@@ -22,9 +29,9 @@ export interface SpineStudio {
   id: string;
   slug: string | null;
   branch: string;
-  agentId: string;
+  sbSlug: string;
   relation: 'affinity' | 'lease' | 'both';
-  leaseAgentId: string | null;
+  leaseSlug: string | null;
   updatedAt: string;
 }
 
@@ -41,8 +48,10 @@ export interface ThreadSpine {
   key: string;
   thread: {
     title: string | null;
+    /** One-line "what is this about" (DB-capped at 280 chars); often absent. */
+    summary: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     participants: string[];
     closedAt: string | null;
   } | null;
@@ -65,7 +74,7 @@ export interface ThreadMessage {
   /** Who wrote it (spec inkmail-thread-scope §3): an SB, a person, or the system. */
   senderKind: 'sb' | 'user' | 'system';
   /** The SB's display slug; the kind for a person or the system. */
-  senderAgentId: string | null;
+  senderSlug: string | null;
   senderSbId: string | null;
   senderUserId: string | null;
   /** Named on the server: the SB's slug, the person's profile name, or 'system'. */
@@ -84,7 +93,7 @@ export interface ThreadMessagesResponse {
     threadKey: string;
     title: string | null;
     status: string;
-    createdByAgentId: string;
+    createdBySlug: string;
     createdAt: string;
     closedAt: string | null;
   } | null;
@@ -116,7 +125,7 @@ export interface ReplyResponse {
 
 export interface FleetSession {
   id: string;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string;
   lifecycle: string;
   status: string | null;
@@ -191,7 +200,7 @@ export interface WorkspacesResponse {
 
 export interface SessionInfo {
   id: string;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   backend: string | null;
   backendSessionId: string | null;
@@ -225,7 +234,7 @@ export interface SessionLogItem {
 export interface SessionLogsResponse {
   session: {
     id: string;
-    agentId: string | null;
+    sbSlug: string | null;
     status: string | null;
     currentPhase: string | null;
     backend: string | null;
@@ -242,7 +251,7 @@ export interface SessionLogsResponse {
 
 export interface Individual {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string | null;
   backend: string | null;

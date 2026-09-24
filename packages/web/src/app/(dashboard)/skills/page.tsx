@@ -161,7 +161,7 @@ function CopyButton({ text }: { text: string }) {
 
 function CodeBlock({ children }: { children: string }) {
   return (
-    <div className="relative bg-gray-900 rounded-lg p-3 font-mono text-sm text-gray-100 overflow-x-auto">
+    <div className="relative min-w-0 max-w-full overflow-x-auto rounded-lg bg-gray-900 p-3 font-mono text-sm text-gray-100">
       <div className="absolute top-2 right-2">
         <CopyButton text={children} />
       </div>
@@ -209,14 +209,14 @@ export default function SkillsPage() {
 
   return (
     <div>
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
           <h1 className="text-3xl font-bold text-gray-900">Skills & Mini Apps</h1>
           <p className="mt-2 text-gray-600">
             Extend your assistant's capabilities with skills, tools, and guides
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
           <Link href="/skills/registry">
             <Button variant="default">
               <Download className="mr-2 h-4 w-4" />
@@ -248,9 +248,13 @@ export default function SkillsPage() {
             </div>
 
             {/* Type Filter */}
-            <div className="flex items-center gap-2">
-              <Filter className="h-4 w-4 text-gray-400" />
-              <div className="flex gap-1">
+            {/* items-start, not items-center: once the buttons wrap to a second
+                row the icon would otherwise float in the vertical middle,
+                detached from the row it labels. mt-2.5 aligns it with the
+                first button's text. */}
+            <div className="flex items-start gap-2">
+              <Filter className="mt-2.5 h-4 w-4 shrink-0 text-gray-400" />
+              <div className="flex min-w-0 flex-wrap gap-1">
                 <Button
                   variant={typeFilter === 'all' ? 'default' : 'outline'}
                   size="sm"
@@ -280,10 +284,10 @@ export default function SkillsPage() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6">
         <Card>
           <CardContent className="p-4 flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-purple-100 text-purple-600">
+            <div className="shrink-0 p-2 rounded-lg bg-purple-100 text-purple-600">
               <Puzzle className="h-5 w-5" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-2xl font-bold">{totalCount}</p>
               <p className="text-sm text-gray-500">Total Skills</p>
             </div>
@@ -291,10 +295,10 @@ export default function SkillsPage() {
         </Card>
         <Card>
           <CardContent className="p-4 flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-green-100 text-green-600">
+            <div className="shrink-0 p-2 rounded-lg bg-green-100 text-green-600">
               <CheckCircle className="h-5 w-5" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-2xl font-bold">
                 {skills.filter((s) => s.eligibility.eligible).length}
               </p>
@@ -304,10 +308,10 @@ export default function SkillsPage() {
         </Card>
         <Card>
           <CardContent className="p-4 flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-yellow-100 text-yellow-600">
+            <div className="shrink-0 p-2 rounded-lg bg-yellow-100 text-yellow-600">
               <Wrench className="h-5 w-5" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-2xl font-bold">
                 {skills.filter((s) => !s.eligibility.eligible).length}
               </p>
@@ -317,10 +321,10 @@ export default function SkillsPage() {
         </Card>
         <Card>
           <CardContent className="p-4 flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-blue-100 text-blue-600">
+            <div className="shrink-0 p-2 rounded-lg bg-blue-100 text-blue-600">
               <Folder className="h-5 w-5" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-2xl font-bold">{categories.length}</p>
               <p className="text-sm text-gray-500">Categories</p>
             </div>
@@ -380,17 +384,23 @@ export default function SkillsPage() {
                             : 'border-yellow-200 bg-yellow-50/30'
                         )}
                       >
-                        <div className="flex items-start justify-between">
-                          <div className="flex items-start gap-3">
-                            <div className={clsx('p-2 rounded-lg', typeCfg.bgColor, typeCfg.color)}>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex min-w-0 flex-1 items-start gap-3">
+                            <div
+                              className={clsx(
+                                'shrink-0 p-2 rounded-lg',
+                                typeCfg.bgColor,
+                                typeCfg.color
+                              )}
+                            >
                               {skill.emoji ? (
                                 <span className="text-lg">{skill.emoji}</span>
                               ) : (
                                 typeCfg.icon
                               )}
                             </div>
-                            <div>
-                              <div className="flex items-center gap-2">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
                                 <h3 className="font-medium text-gray-900">{skill.displayName}</h3>
                                 <Badge className={clsx('text-xs', typeCfg.bgColor, typeCfg.color)}>
                                   {typeCfg.icon}
@@ -467,7 +477,7 @@ export default function SkillsPage() {
                               )}
                             </div>
                           </div>
-                          <div className="text-right">
+                          <div className="shrink-0 text-right">
                             <span className="text-xs text-gray-400">v{skill.version}</span>
                           </div>
                         </div>
@@ -520,7 +530,7 @@ export default function SkillsPage() {
                   <div>
                     <code className="text-sm font-mono text-gray-800">Built-in skills</code>
                     <p className="text-xs text-gray-500 mt-1">
-                      Ships with PCP, updated via releases
+                      Ships with Inkwell, updated via releases
                     </p>
                   </div>
                 </div>
@@ -532,7 +542,7 @@ export default function SkillsPage() {
               <h4 className="font-medium text-gray-900 mb-2">Installation Methods</h4>
               <div className="grid md:grid-cols-2 gap-4">
                 {/* From GitHub */}
-                <div className="border rounded-lg p-4">
+                <div className="min-w-0 border rounded-lg p-4">
                   <div className="flex items-center gap-2 mb-3">
                     <Github className="h-5 w-5" />
                     <span className="font-medium">From GitHub</span>
@@ -543,7 +553,7 @@ git clone https://github.com/user/skill-name`}</CodeBlock>
                 </div>
 
                 {/* Single File */}
-                <div className="border rounded-lg p-4">
+                <div className="min-w-0 border rounded-lg p-4">
                   <div className="flex items-center gap-2 mb-3">
                     <Download className="h-5 w-5" />
                     <span className="font-medium">Single File</span>

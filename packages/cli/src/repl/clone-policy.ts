@@ -13,7 +13,7 @@
  * whatever the parent itself may do.
  *
  * The other half of the design is that a clone never shares the parent's
- * `ToolPolicyState`. That object mutates on read — `canCallPcpTool` consumes
+ * `ToolPolicyState`. That object mutates on read — `canCallInkTool` consumes
  * one-use grants — so concurrent clones sharing one would consume the parent's
  * grants nondeterministically, and a clone's session/always/deny answer would
  * rewrite policy for its siblings mid-run. Authorization would depend on promise
@@ -33,7 +33,7 @@ import { ToolPolicyState, type ToolMode } from './tool-policy.js';
  * by the allowlist and escalates to the parent's approval coordinator, labelled
  * with the clone that asked.
  *
- * `DEFAULT_SAFE_PCP_TOOLS` bypass allowlist narrowing inside `ToolPolicyState`,
+ * `DEFAULT_SAFE_INK_TOOLS` bypass allowlist narrowing inside `ToolPolicyState`,
  * so the clone's effective read surface is this list UNION that one. Every
  * member of both is read-only, and a parent denial still overrides either.
  */
@@ -47,7 +47,7 @@ export const CLONE_BASELINE_TOOLS: readonly string[] = [
   // surface by being refused, which is the failure mode this whole area exists
   // to remove — and unattended, a promptable tool is denied outright.
   'describe_tool',
-  // PCP introspection. Reading the workspace is the point of a clone.
+  // Inkwell introspection. Reading the workspace is the point of a clone.
   'bootstrap',
   'recall',
   'get_artifact',
@@ -164,8 +164,8 @@ export interface DeriveClonePolicyOptions {
 /**
  * Build a clone's policy from an immutable read of the parent's.
  *
- * "Immutable read" is load-bearing and is why this uses `inspectPcpTool`:
- * `canCallPcpTool` would consume the parent's one-use grants merely by being
+ * "Immutable read" is load-bearing and is why this uses `inspectInkTool`:
+ * `canCallInkTool` would consume the parent's one-use grants merely by being
  * asked what a clone is allowed to do, billing the parent for calls that may
  * never happen.
  */
@@ -181,7 +181,7 @@ export function deriveClonePolicy(
 
   for (const tool of candidates) {
     if (CLONE_DENIED_TOOLS.includes(tool)) continue;
-    const decision = parent.inspectPcpTool(tool, options.sessionId);
+    const decision = parent.inspectInkTool(tool, options.sessionId);
     if (!decision.allowed) {
       narrowedByParent.push(tool);
       continue;

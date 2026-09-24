@@ -25,15 +25,15 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
 vi.mock('../mcp/tools/thread-handlers', () => ({
   getParticipants: (...args: unknown[]) => mockGetParticipants(...args),
   // The real helper: the SB participants' slugs, people excluded.
-  participantSlugs: (ps: Array<{ sbId: string | null; agentId: string | null }>) =>
-    ps.filter((p) => p.sbId).map((p) => p.agentId as string),
+  participantSlugs: (ps: Array<{ sbId: string | null; sbSlug: string | null }>) =>
+    ps.filter((p) => p.sbId).map((p) => p.sbSlug as string),
 }));
 
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 const mockSupabaseFrom = vi.fn();
@@ -48,12 +48,9 @@ vi.mock('../data/composer', () => ({
 vi.mock('../services/authorization', () => ({ getAuthorizationService: vi.fn(() => ({})) }));
 vi.mock('../services/oauth', () => ({ getOAuthService: vi.fn(() => ({})) }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    SUPABASE_PUBLISHABLE_KEY: 'test-publishable',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -82,16 +79,16 @@ function getReplyHandler(): Handler {
 }
 
 function createReq(body: Record<string, unknown>, role = 'owner'): Request {
-  // pcpUserId / pcpWorkspaceId / pcpWorkspaceRole are what adminAuthMiddleware
+  // inkUserId / inkWorkspaceId / inkWorkspaceRole are what adminAuthMiddleware
   // attaches; the handler is driven directly here, so they are injected.
   return {
     body,
     headers: {},
     cookies: {},
     params: {},
-    pcpUserId: 'user-1',
-    pcpWorkspaceId: 'ws-1',
-    pcpWorkspaceRole: role,
+    inkUserId: 'user-1',
+    inkWorkspaceId: 'ws-1',
+    inkWorkspaceRole: role,
   } as unknown as Request;
 }
 
@@ -117,11 +114,11 @@ function createRes(): MockResponse {
 }
 
 /** A participant row as getParticipants returns it. */
-function sb(agentId: string) {
-  return { sbId: `sb-${agentId}`, agentId, userId: null, sessionId: null, joinedAt: null };
+function sb(sbSlug: string) {
+  return { sbId: `sb-${sbSlug}`, sbSlug, userId: null, sessionId: null, joinedAt: null };
 }
 function person(userId: string) {
-  return { sbId: null, agentId: null, userId, sessionId: null, joinedAt: null };
+  return { sbId: null, sbSlug: null, userId, sessionId: null, joinedAt: null };
 }
 
 /** inbox_threads chain: select().eq().eq().maybeSingle() → thread row. */
@@ -203,9 +200,9 @@ describe('POST /threads/reply', () => {
       triggerAll: true,
       priority: 'high',
     });
-    // No senderAgentId: the human IS the sender; the handler's non-agent
+    // No senderSlug: the human IS the sender; the handler's non-agent
     // path depends on this being absent.
-    expect(args.senderAgentId).toBeUndefined();
+    expect(args.senderSlug).toBeUndefined();
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
     // The person and their workspace ride as server-side context — the
     // public tool schema never carries who a person is (spec §3, §6).

@@ -17,7 +17,7 @@ describe('JsonlApprovalChannel', () => {
 
     const promise = channel.requestApproval({
       tool: 'get_inbox',
-      args: { agentId: 'wren' },
+      args: { sbSlug: 'wren' },
       reason: 'Tool requires approval.',
       sessionId: 'sess-1',
     });
@@ -27,7 +27,7 @@ describe('JsonlApprovalChannel', () => {
     const request = JSON.parse(requestLine) as ApprovalRequestEvent;
     expect(request.type).toBe('approval_request');
     expect(request.tool).toBe('get_inbox');
-    expect(request.args).toEqual({ agentId: 'wren' });
+    expect(request.args).toEqual({ sbSlug: 'wren' });
     expect(request.reason).toBe('Tool requires approval.');
     expect(request.sessionId).toBe('sess-1');
     expect(request.ts).toBeTruthy();

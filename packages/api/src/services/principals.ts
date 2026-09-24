@@ -17,7 +17,7 @@ export interface SbPrincipal {
   /** agent_identities.id — the canonical identity. */
   sbId: string;
   /** agent_identities.agent_id — the workspace-local slug, for display and routing. */
-  agentId: string;
+  sbSlug: string;
   /** agent_identities.user_id — the runtime owner (§1a: who the SB is spawned for). */
   userId: string;
   /** agent_identities.workspace_id — the one workspace this identity lives in. */
@@ -59,7 +59,7 @@ export function senderColumns(p: Principal): {
         sender_kind: 'sb',
         sender_sb_id: p.sbId,
         sender_user_id: null,
-        sender_agent_id: p.agentId,
+        sender_agent_id: p.sbSlug,
       };
     case 'user':
       return {
@@ -88,7 +88,7 @@ export function principalColumns(p: SbPrincipal | UserPrincipal): {
 
 /** A display label: the slug for an SB, 'user' for a person, 'system' otherwise. */
 export function principalLabel(p: Principal): string {
-  return p.kind === 'sb' ? p.agentId : p.kind;
+  return p.kind === 'sb' ? p.sbSlug : p.kind;
 }
 
 export function isSb(p: Principal | null | undefined): p is SbPrincipal {
@@ -115,7 +115,7 @@ function toSb(row: IdentityRow): SbPrincipal {
   return {
     kind: 'sb',
     sbId: row.id,
-    agentId: row.agent_id,
+    sbSlug: row.agent_id,
     userId: row.user_id,
     workspaceId: row.workspace_id,
   };
@@ -130,23 +130,23 @@ function toSb(row: IdentityRow): SbPrincipal {
 export async function resolveSbInWorkspace(
   client: Client,
   workspaceId: string,
-  agentId: string
+  sbSlug: string
 ): Promise<SbPrincipal> {
   const { data, error } = await client
     .from('agent_identities')
     .select('id, agent_id, user_id, workspace_id')
     .eq('workspace_id', workspaceId)
-    .eq('agent_id', agentId);
+    .eq('agent_id', sbSlug);
   if (error) {
-    throw new Error(`Failed to resolve ${agentId} in workspace ${workspaceId}: ${error.message}`);
+    throw new Error(`Failed to resolve ${sbSlug} in workspace ${workspaceId}: ${error.message}`);
   }
   const rows = (data || []) as IdentityRow[];
   if (rows.length === 0) {
-    throw new Error(`Unknown recipient: ${agentId} (no identity in this workspace)`);
+    throw new Error(`Unknown recipient: ${sbSlug} (no identity in this workspace)`);
   }
   if (rows.length > 1) {
-    logger.error('Ambiguous identity slug inside a workspace', { workspaceId, agentId });
-    throw new Error(`Ambiguous recipient: ${agentId} names ${rows.length} identities here`);
+    logger.error('Ambiguous identity slug inside a workspace', { workspaceId, sbSlug });
+    throw new Error(`Ambiguous recipient: ${sbSlug} names ${rows.length} identities here`);
   }
   return toSb(rows[0]);
 }
@@ -155,10 +155,10 @@ export async function resolveSbInWorkspace(
 export async function resolveSbsInWorkspace(
   client: Client,
   workspaceId: string,
-  agentIds: string[]
+  sbSlugs: string[]
 ): Promise<SbPrincipal[]> {
   const out: SbPrincipal[] = [];
-  for (const slug of agentIds) {
+  for (const slug of sbSlugs) {
     out.push(await resolveSbInWorkspace(client, workspaceId, slug));
   }
   return out;
@@ -234,23 +234,23 @@ export async function personalWorkspaceOf(client: Client, userId: string): Promi
 export async function resolveSbOwnedBy(
   client: Client,
   userId: string,
-  agentId: string
+  sbSlug: string
 ): Promise<SbPrincipal> {
   const { data, error } = await client
     .from('agent_identities')
     .select('id, agent_id, user_id, workspace_id')
     .eq('user_id', userId)
-    .eq('agent_id', agentId)
+    .eq('agent_id', sbSlug)
     .not('workspace_id', 'is', null);
   if (error) {
-    throw new Error(`Failed to resolve ${agentId} for its owner: ${error.message}`);
+    throw new Error(`Failed to resolve ${sbSlug} for its owner: ${error.message}`);
   }
   const rows = (data || []) as IdentityRow[];
   if (rows.length !== 1) {
     throw new Error(
       rows.length === 0
-        ? `Unknown recipient: ${agentId} (no identity owned by this user)`
-        : `Ambiguous recipient: ${agentId} exists in ${rows.length} of this user's workspaces`
+        ? `Unknown recipient: ${sbSlug} (no identity owned by this user)`
+        : `Ambiguous recipient: ${sbSlug} exists in ${rows.length} of this user's workspaces`
     );
   }
   return toSb(rows[0]);

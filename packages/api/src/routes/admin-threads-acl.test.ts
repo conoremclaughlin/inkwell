@@ -1,7 +1,7 @@
 /**
  * Thread-write ACL through the REAL admin auth middleware, the real
  * WorkspacesRepository and the real routes â€” only the DB and the send/reopen
- * side effects are mocked. The route suites inject `pcpWorkspaceRole`; this
+ * side effects are mocked. The route suites inject `inkWorkspaceRole`; this
  * one lets the middleware set it from the membership row, which is the only
  * way to catch a middleware that stamps every direct member 'member' (Lumen,
  * #619 â€” whose probe harness this follows).
@@ -33,9 +33,9 @@ vi.mock('../data/composer', () => ({
     getClient: () => ({ from: state.from }),
   }),
 }));
-vi.mock('../auth/pcp-tokens', () => ({
-  verifyPcpAccessToken: () => ({ sub: 'user-1', email: 'fixture@example.test' }),
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  verifyInkAccessToken: () => ({ sub: 'user-1', email: 'fixture@example.test' }),
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
 }));
@@ -45,7 +45,7 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
 vi.mock('../mcp/tools/thread-handlers', () => ({
   isParticipant: async () => state.participant,
   reopenThreadRow: (...args: unknown[]) => state.reopen(...args),
-  getParticipants: async () => [{ sbId: 'sb-1', agentId: 'wren', userId: null }],
+  getParticipants: async () => [{ sbId: 'sb-1', sbSlug: 'wren', userId: null }],
   participantSlugs: () => ['wren'],
 }));
 vi.mock('../services/authorization', () => ({
@@ -185,7 +185,7 @@ describe('thread writes through the real middleware (spec inkmail-thread-scope Â
     async (role) => {
       withRole(role);
       const { req } = await throughAuth('/threads/reply');
-      expect(req.pcpWorkspaceRole).toBe(role);
+      expect(req.inkWorkspaceRole).toBe(role);
     }
   );
 
@@ -222,8 +222,8 @@ describe('thread writes through the real middleware (spec inkmail-thread-scope Â
     withRole('owner');
     state.participant = false;
     const { req, res } = await throughAuth('/threads/reopen');
-    expect(req.pcpWorkspaceId).toBe('ws-1');
-    expect(req.pcpWorkspaceRole).toBe('owner');
+    expect(req.inkWorkspaceId).toBe('ws-1');
+    expect(req.inkWorkspaceRole).toBe('owner');
     expect(res._status).toBe(200);
   });
 

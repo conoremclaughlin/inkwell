@@ -1,7 +1,30 @@
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
+import { hasSameOrigin } from './cookie-csrf';
 
 export async function updateSession(request: NextRequest) {
+  const path = request.nextUrl.pathname;
+  const isApiMutation =
+    path.startsWith('/api/') && !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
+  const sameOrigin = isApiMutation && hasSameOrigin(request);
+  // Validate browser provenance BEFORE Supabase refresh or cookie-to-bearer
+  // conversion. Neither a supplied bearer nor a forged CSRF header bypasses it.
+  if (
+    isApiMutation &&
+    !sameOrigin &&
+    (request.headers.has('cookie') ||
+      request.headers.has('origin') ||
+      request.headers.has('sec-fetch-site') ||
+      request.headers.has('referer'))
+  ) {
+    return NextResponse.json({ error: 'Cross-origin API mutation rejected' }, { status: 403 });
+  }
+  const forwardHeaders = () => {
+    const headers = new Headers(request.headers);
+    headers.delete('X-Inkwell-CSRF');
+    if (sameOrigin) headers.set('X-Inkwell-CSRF', '1');
+    return headers;
+  };
   let supabaseResponse = NextResponse.next({
     request,
   });
@@ -27,18 +50,17 @@ export async function updateSession(request: NextRequest) {
     }
   );
 
-  const path = request.nextUrl.pathname;
   const isProxiedApiRoute = path.startsWith('/api/') && !path.startsWith('/api/auth/');
 
   // Fast-path for proxied API routes: inject bearer token only.
-  // Prefers PCP admin JWT (local verification, no Supabase dependency).
+  // Prefers Inkwell admin JWT (local verification, no Supabase dependency).
   if (isProxiedApiRoute) {
-    const pcpToken = request.cookies.get('pcp-admin-token')?.value;
+    const inkToken = request.cookies.get('pcp-admin-token')?.value;
 
-    if (pcpToken) {
-      // PCP admin JWT available — use it directly, skip Supabase entirely.
-      const requestHeaders = new Headers(request.headers);
-      requestHeaders.set('Authorization', `Bearer ${pcpToken}`);
+    if (inkToken) {
+      // Inkwell admin JWT available — use it directly, skip Supabase entirely.
+      const requestHeaders = forwardHeaders();
+      requestHeaders.set('Authorization', `Bearer ${inkToken}`);
       const response = NextResponse.next({ request: { headers: requestHeaders } });
       supabaseResponse.cookies.getAll().forEach((cookie) => {
         response.cookies.set(cookie.name, cookie.value, cookie);
@@ -46,12 +68,12 @@ export async function updateSession(request: NextRequest) {
       return response;
     }
 
-    // No PCP JWT — fall back to Supabase session token (first request after login).
+    // No Inkwell JWT — fall back to Supabase session token (first request after login).
     const {
       data: { session },
     } = await supabase.auth.getSession();
     if (session?.access_token) {
-      const requestHeaders = new Headers(request.headers);
+      const requestHeaders = forwardHeaders();
       requestHeaders.set('Authorization', `Bearer ${session.access_token}`);
       const response = NextResponse.next({ request: { headers: requestHeaders } });
       supabaseResponse.cookies.getAll().forEach((cookie) => {
@@ -60,7 +82,11 @@ export async function updateSession(request: NextRequest) {
       return response;
     }
 
-    return supabaseResponse;
+    const response = NextResponse.next({ request: { headers: forwardHeaders() } });
+    supabaseResponse.cookies
+      .getAll()
+      .forEach((cookie) => response.cookies.set(cookie.name, cookie.value, cookie));
+    return response;
   }
 
   // IMPORTANT: Avoid writing any logic between createServerClient and

@@ -2,7 +2,7 @@
  * Codex CLI Backend Adapter
  *
  * Identity injection via --config model_instructions_file=<tmpfile>
- * PCP session headers via --config mcp_servers.inkwell.env_http_headers (env-var-backed)
+ * Inkwell session headers via --config mcp_servers.inkwell.env_http_headers (env-var-backed)
  *
  * Docs: https://developers.openai.com/codex/cli/
  */
@@ -15,7 +15,7 @@ import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 /**
- * PCP headers to inject as env_http_headers on the "inkwell" MCP server.
+ * Inkwell headers to inject as env_http_headers on the "inkwell" MCP server.
  * Each entry maps a header name to the env var that holds its value.
  * Codex resolves env var → value at runtime, so multiple sessions in
  * the same studio each get their own scoped headers.
@@ -27,7 +27,7 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  * `bearer_token_env_var` mechanism instead (see prepare()), which also stops
  * codex from running its own managed OAuth for the server.
  */
-const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
+const INK_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
   { header: 'x-ink-context', envVar: 'INK_CONTEXT' },
   { header: 'x-ink-agent-id', envVar: 'AGENT_ID' },
   { header: 'x-ink-session-id', envVar: 'INK_SESSION_ID' },
@@ -42,7 +42,7 @@ export class CodexAdapter implements BackendAdapter {
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(
-      config.agentId,
+      config.sbSlug,
       config.startupContextBlock,
       config.systemPromptOverride
     );
@@ -74,7 +74,7 @@ export class CodexAdapter implements BackendAdapter {
 
     // Ink session headers — Codex resolves env var names to values at runtime.
     // Server key must match what's in .codex/config.toml (mcp_servers.inkwell).
-    for (const { header, envVar } of PCP_ENV_HEADERS) {
+    for (const { header, envVar } of INK_ENV_HEADERS) {
       args.push('-c', `mcp_servers.inkwell.env_http_headers.${header}="${envVar}"`);
     }
 
@@ -143,9 +143,9 @@ export class CodexAdapter implements BackendAdapter {
 
     // Build consolidated context token for x-ink-context header
     const contextToken = encodeContextToken({
-      sessionId: config.pcpSessionId || '',
+      sessionId: config.inkSessionId || '',
       studioId: config.studioId || '',
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       cliAttached: true,
       runtime: 'codex',
     });
@@ -157,9 +157,10 @@ export class CodexAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
-        AGENT_ID: config.agentId,
+        SB_SLUG: config.sbSlug,
+        AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,
-        ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
+        ...(config.inkSessionId ? { INK_SESSION_ID: config.inkSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },
       cleanup,

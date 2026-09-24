@@ -139,7 +139,7 @@ describe('applyChannelForward', () => {
 
   const ctx = {
     channel: 'telegram',
-    conversationId: '726555973',
+    conversationId: '100200300',
     hadExplicitResponse: false,
     runSucceeded: true,
     finalTextLength: 0,

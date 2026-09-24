@@ -20,7 +20,7 @@
 
 import type { Command } from 'commander';
 import chalk from 'chalk';
-import { PcpClient } from '../lib/pcp-client.js';
+import { InkClient } from '../lib/ink-client.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 
 export interface SseFrame {
@@ -142,8 +142,8 @@ export function registerObserveCommand(program: Command): void {
     .option('--no-follow', 'Replay only, then exit')
     .option('--server <url>', 'Server URL (default: INK_SERVER_URL or http://localhost:3001)')
     .action(async (sessionId: string, options: ObserveOptions) => {
-      const pcp = new PcpClient(options.server);
-      const baseUrl = pcp.getBaseUrl();
+      const inkClient = new InkClient(options.server);
+      const baseUrl = inkClient.getBaseUrl();
       const token = await getValidAccessToken(baseUrl);
       if (!token) {
         console.error(
@@ -169,7 +169,7 @@ export function registerObserveCommand(program: Command): void {
       // Idle notice (Myra): a quiet session must look idle, not broken.
       const idleTimer = setTimeout(() => {
         if (!sawEntry) {
-          void pcp
+          void inkClient
             .callTool('get_session', { sessionId })
             .then((s) => {
               const session = (s as { session?: Record<string, unknown> }).session;

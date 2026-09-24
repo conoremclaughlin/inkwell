@@ -101,7 +101,7 @@ async function main() {
 
       const result = await telegramApi<TelegramMessage>(token, 'sendMessage', {
         chat_id: targetChatId,
-        text: '🎉 *Test message from Personal Context Protocol!*\n\nYour Telegram integration is working.',
+        text: '🎉 *Test message from Inkwell!*\n\nYour Telegram integration is working.',
         parse_mode: 'Markdown',
       });
 

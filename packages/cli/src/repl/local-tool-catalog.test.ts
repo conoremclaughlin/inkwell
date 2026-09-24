@@ -13,21 +13,21 @@ import { ToolPolicyState } from './tool-policy.js';
 import { applyProfile } from './tool-profiles.js';
 import { isClientLocalTool } from './context-tools.js';
 import { isPiTool } from './pi-tools.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
 /**
- * What `PcpClient.callTool` actually hands back: the payload, already unwrapped
+ * What `InkClient.callTool` actually hands back: the payload, already unwrapped
  * from the MCP envelope. Mocking the envelope instead is how the first cut of
  * this merge passed every unit test and did nothing at all in production.
  */
-const serverPayload = (data: object): PcpToolCallResult => ({ ...data });
+const serverPayload = (data: object): InkToolCallResult => ({ ...data });
 
 /** The legacy `/api/mcp/call` path, which returns whatever the endpoint gives. */
-const enveloped = (data: object): PcpToolCallResult => ({
+const enveloped = (data: object): InkToolCallResult => ({
   content: [{ type: 'text', text: JSON.stringify(data) }],
 });
 
-const payloadOf = (result: PcpToolCallResult): any => result;
+const payloadOf = (result: InkToolCallResult): any => result;
 
 const serverList = () =>
   serverPayload({
@@ -125,7 +125,7 @@ describe('the prompt and the catalog describe the same surface', () => {
         'Client-local tools (no server round-trip):',
         '- list_context: Introspect your context window — totals and a per-source breakdown for everything, plus ONE page of entries (IDs, token counts, sources, previews). Filter by source/role/minTokens or sort by "largest" to find what is worth evicting; evicting by source or role needs no listing. Args: limit (number, default 50, max 200), offset (number), source (string), role (string), minTokens (number), sort ("oldest" | "newest" | "largest") — all optional.',
         "- evict_context: Remove specific entries from your context to reclaim tokens. Address entries by ref (the durable content hash list_context shows); ids are this process's ordinals and renumber on reattach. Args: refs (string[]), entryIds (number[]), source (string), or role (string).",
-        '- compact_context: Compact your context window: everything but the most recent entries is replaced by a summary, and the provider session is re-seeded from it. Args: summary (string, optional — your own brief of what matters; omit to have the runtime summarize), keepRecent (number, optional, default 12). Prefer writing the summary yourself: you know which decisions, identifiers and open threads matter. Compaction is lossy — remember anything that must outlive the session first.',
+        '- compact_context: Replace context entries with a summary. By default the oldest entries go and the most recent are kept; pass refs to replace a set you name instead, wherever it sits. Args: summary (string, optional — your own brief of what matters; omit to have the runtime summarize), keepRecent (number, optional, default 12), refs (string[], optional — replace exactly these entries instead of the oldest). Prefer writing the summary yourself: you know which decisions, identifiers and open threads matter. Compaction is lossy — remember anything that must outlive the session first. Use refs to consolidate work that has FINISHED (a merged PR, a closed thread) while leaving live work untouched; the summary takes the place of the first entry it replaces, so surrounding context keeps its order.',
         '- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.',
       ].join('\n')
     );
@@ -253,7 +253,7 @@ describe('describeToolWithLocalSurface', () => {
           audience: 'clone',
           cwd: '/work',
           isHardDenied: (tool) => {
-            const decision = policy.inspectPcpTool(tool);
+            const decision = policy.inspectInkTool(tool);
             return !decision.allowed && !decision.promptable;
           },
           callServer: async () =>
@@ -269,7 +269,7 @@ describe('describeToolWithLocalSurface', () => {
   });
 
   it('never spends a grant to answer what exists', async () => {
-    // The predicate MUST be inspectPcpTool, never canCallPcpTool: the latter
+    // The predicate MUST be inspectInkTool, never canCallInkTool: the latter
     // decrements one-use grants, so merely asking what exists would bill the
     // user for calls that never happen — on the one call an agent makes
     // precisely when it is unsure.
@@ -285,7 +285,7 @@ describe('describeToolWithLocalSurface', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
     applyProfile(policy, 'safe');
     policy.grantTool('send_response', 1);
-    expect(policy.inspectPcpTool('send_response').wouldConsumeGrant).toBe(true);
+    expect(policy.inspectInkTool('send_response').wouldConsumeGrant).toBe(true);
 
     await describeToolWithLocalSurface(
       {},
@@ -293,7 +293,7 @@ describe('describeToolWithLocalSurface', () => {
         audience: 'parent',
         cwd: '/work',
         isHardDenied: (tool) => {
-          const decision = policy.inspectPcpTool(tool);
+          const decision = policy.inspectInkTool(tool);
           return !decision.allowed && !decision.promptable;
         },
         callServer: async () =>
@@ -302,7 +302,7 @@ describe('describeToolWithLocalSurface', () => {
     );
 
     // Still unspent. A consuming predicate leaves this false and allowed:false.
-    const after = policy.inspectPcpTool('send_response');
+    const after = policy.inspectInkTool('send_response');
     expect(after.allowed).toBe(true);
     expect(after.wouldConsumeGrant).toBe(true);
   });
@@ -372,7 +372,7 @@ describe('describeToolWithLocalSurface', () => {
           isHardDenied: (tool) => {
             const decision = deriveClonePolicy(
               new ToolPolicyState('backend', { persist: false })
-            ).policy.inspectPcpTool(tool);
+            ).policy.inspectInkTool(tool);
             return !decision.allowed && !decision.promptable;
           },
           callServer: async () =>
@@ -439,7 +439,7 @@ describe('describeToolWithLocalSurface', () => {
   it('leaves the server response alone when it cannot be parsed', async () => {
     // Discovery degrading to the old, incomplete answer is bad. Discovery
     // throwing where a caller expected a list is worse.
-    const opaque = { content: [{ type: 'text', text: '<html>502</html>' }] } as PcpToolCallResult;
+    const opaque = { content: [{ type: 'text', text: '<html>502</html>' }] } as InkToolCallResult;
     expect(
       await describeToolWithLocalSurface(
         {},

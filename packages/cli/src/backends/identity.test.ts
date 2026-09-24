@@ -2,9 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { resolveAgentId } from './identity.js';
+import { resolveSlug } from './identity.js';
 
-describe('resolveAgentId', () => {
+describe('resolveSlug', () => {
   let originalHome: string | undefined;
   let originalAgentEnv: string | undefined;
   let originalBackendEnv: string | undefined;
@@ -18,7 +18,7 @@ describe('resolveAgentId', () => {
     originalBackendEnv = process.env.SB_BACKEND;
     originalCwd = process.cwd();
 
-    rootDir = mkdtempSync(join(tmpdir(), 'pcp-identity-'));
+    rootDir = mkdtempSync(join(tmpdir(), 'ink-identity-'));
     workDir = join(rootDir, 'work');
     mkdirSync(workDir, { recursive: true });
     process.chdir(workDir);
@@ -41,18 +41,18 @@ describe('resolveAgentId', () => {
 
   it('prefers explicit CLI agent over env/config', () => {
     process.env.AGENT_ID = 'env-agent';
-    expect(resolveAgentId('cli-agent', 'codex')).toBe('cli-agent');
+    expect(resolveSlug('cli-agent', 'codex')).toBe('cli-agent');
   });
 
   it('uses AGENT_ID env when present', () => {
     process.env.AGENT_ID = 'lumen';
-    expect(resolveAgentId(undefined, 'claude')).toBe('lumen');
+    expect(resolveSlug(undefined, 'claude')).toBe('lumen');
   });
 
   it('uses local .ink/identity.json when env is not set', () => {
     mkdirSync(join(workDir, '.ink'), { recursive: true });
-    writeFileSync(join(workDir, '.ink', 'identity.json'), JSON.stringify({ agentId: 'aster' }));
-    expect(resolveAgentId(undefined, 'gemini')).toBe('aster');
+    writeFileSync(join(workDir, '.ink', 'identity.json'), JSON.stringify({ sbSlug: 'aster' }));
+    expect(resolveSlug(undefined, 'gemini')).toBe('aster');
   });
 
   it('uses backend-specific agentMapping fallback', () => {
@@ -68,9 +68,8 @@ describe('resolveAgentId', () => {
       })
     );
 
-    expect(resolveAgentId(undefined, 'codex')).toBe('lumen');
-    expect(resolveAgentId(undefined, 'gemini')).toBe('aster');
-    expect(resolveAgentId(undefined, 'claude')).toBe('wren');
+    expect(resolveSlug(undefined, 'codex')).toBe('lumen');
+    expect(resolveSlug(undefined, 'gemini')).toBe('aster');
+    expect(resolveSlug(undefined, 'claude')).toBe('wren');
   });
 });
-

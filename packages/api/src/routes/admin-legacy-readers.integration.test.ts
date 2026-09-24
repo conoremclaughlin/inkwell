@@ -22,9 +22,9 @@ function getInboxHandler(): Handler {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const layer = (router as any).stack.find(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (entry: any) => entry.route?.path === '/individuals/:agentId/inbox' && entry.route?.methods?.get
+    (entry: any) => entry.route?.path === '/individuals/:sbSlug/inbox' && entry.route?.methods?.get
   );
-  if (!layer) throw new Error('GET /individuals/:agentId/inbox not found in router stack');
+  if (!layer) throw new Error('GET /individuals/:sbSlug/inbox not found in router stack');
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
@@ -121,13 +121,13 @@ describe('§5 legacy readers over the post-cutover schema (integration)', () => 
     res.json = (payload: unknown) => ((res._json = payload), res);
     await getInboxHandler()(
       {
-        params: { agentId: AGENT },
+        params: { sbSlug: AGENT },
         query: {},
         headers: {},
         cookies: {},
-        pcpUserId: userId,
-        pcpWorkspaceId: workspaceId,
-        pcpWorkspaceRole: 'owner',
+        inkUserId: userId,
+        inkWorkspaceId: workspaceId,
+        inkWorkspaceRole: 'owner',
       } as unknown as Request,
       res as unknown as Response
     );

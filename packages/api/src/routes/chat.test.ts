@@ -29,10 +29,9 @@ vi.mock('../utils/logger', () => ({
   },
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret-key',
+    ...(await import('../test/fake-env')).fakeEnv,
   },
 }));
 
@@ -147,7 +146,7 @@ describe('chatAuthMiddleware', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
-  it('should reject authenticated users without PCP account', async () => {
+  it('should reject authenticated users without Inkwell account', async () => {
     mockAuthGetUser.mockResolvedValue({
       data: { user: { id: 'supabase-id', email: 'nobody@example.com' } },
       error: null,
@@ -163,7 +162,7 @@ describe('chatAuthMiddleware', () => {
     await chatAuthMiddleware(req, res, next);
 
     expect(res._status).toBe(403);
-    expect((res._json as Record<string, string>).error).toBe('User not found in PCP system');
+    expect((res._json as Record<string, string>).error).toBe('User not found in Inkwell system');
     expect(next).not.toHaveBeenCalled();
   });
 
@@ -172,7 +171,7 @@ describe('chatAuthMiddleware', () => {
       data: { user: { id: 'supabase-id', email: 'test@example.com' } },
       error: null,
     });
-    mockFrom.mockReturnValue(createChainableQuery({ id: 'pcp-user-123' }));
+    mockFrom.mockReturnValue(createChainableQuery({ id: 'ink-user-123' }));
 
     const req = createMockReq({
       headers: { authorization: 'Bearer valid-token' } as Record<string, string>,
@@ -183,7 +182,7 @@ describe('chatAuthMiddleware', () => {
     await chatAuthMiddleware(req, res, next);
 
     expect(next).toHaveBeenCalled();
-    expect((req as ChatAuthRequest).userId).toBe('pcp-user-123');
+    expect((req as ChatAuthRequest).userId).toBe('ink-user-123');
     expect((req as ChatAuthRequest).userEmail).toBe('test@example.com');
   });
 });
@@ -198,37 +197,64 @@ describe('Chat Route Handlers', () => {
   });
 
   describe('POST /message validation', () => {
-    it('should validate that agentId and content are present', async () => {
+    it('validates identity and text before dispatching a message', async () => {
       // Import and create router to get access to internal handlers
       const { createChatRouter } = await import('./chat');
 
       const mockSessionService = {
-        handleMessage: vi.fn(),
+        handleMessage: vi.fn().mockResolvedValue({ success: true }),
       };
 
       const router = createChatRouter(() => mockSessionService as never);
 
-      // The router's POST handler checks for agentId and content
-      // We can verify this by testing the validation logic
-      // agentId missing → 400
+      const stack = (
+        router as unknown as {
+          stack: Array<{
+            route?: {
+              path: string;
+              stack: Array<{ handle: (req: Request, res: Response) => Promise<void> }>;
+            };
+          }>;
+        }
+      ).stack;
+      const handler = stack.find((layer) => layer.route?.path === '/message')!.route!.stack[0]
+        .handle;
+      for (const body of [
+        null,
+        {},
+        { sbSlug: '../outside', content: 'hello' },
+        { sbSlug: 'agent\n', content: 'hello' },
+        { sbSlug: ['agent'], content: 'hello' },
+        { sbSlug: 'agent', content: { text: 'hello' } },
+      ]) {
+        const res = createMockRes();
+        await handler(createMockReq({ body }), res);
+        expect(res._status).toBe(400);
+      }
       expect(mockSessionService.handleMessage).not.toHaveBeenCalled();
+      const res = createMockRes();
+      await handler(createMockReq({ body: { sbSlug: 'synthetic-agent', content: 'hello' } }), res);
+      expect(res._status).toBe(200);
+      expect(mockSessionService.handleMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ sbSlug: 'synthetic-agent', content: 'hello' })
+      );
     });
   });
 
   describe('SessionRequest construction', () => {
     it('should build correct SessionRequest from chat message', () => {
       // Verify the expected shape of a SessionRequest built from chat input
-      const userId = 'pcp-user-123';
-      const agentId = 'wren';
+      const userId = 'ink-user-123';
+      const sbSlug = 'wren';
       const userEmail = 'test@example.com';
       const content = 'Hello, Wren!';
 
       // This mirrors the logic in chat.ts POST /message
       const sessionRequest = {
         userId,
-        agentId,
+        sbSlug,
         channel: 'web' as const,
-        conversationId: `web:${userId}:${agentId}`,
+        conversationId: `web:${userId}:${sbSlug}`,
         sender: {
           id: userId,
           name: userEmail,
@@ -242,7 +268,7 @@ describe('Chat Route Handlers', () => {
       };
 
       expect(sessionRequest.channel).toBe('web');
-      expect(sessionRequest.conversationId).toBe('web:pcp-user-123:wren');
+      expect(sessionRequest.conversationId).toBe('web:ink-user-123:wren');
       expect(sessionRequest.sender.id).toBe(userId);
       expect(sessionRequest.metadata.chatType).toBe('direct');
     });
@@ -272,7 +298,7 @@ describe('Chat Route Handlers', () => {
         id: m.id,
         direction: m.direction,
         content: m.content,
-        agentId: m.agent_id,
+        sbSlug: m.agent_id,
         createdAt: m.created_at,
       }));
 
@@ -281,7 +307,7 @@ describe('Chat Route Handlers', () => {
       expect(messages[0].id).toBe('msg-1');
       expect(messages[1].id).toBe('msg-2');
       // snake_case → camelCase
-      expect(messages[0].agentId).toBe('wren');
+      expect(messages[0].sbSlug).toBe('wren');
       expect(messages[0].createdAt).toBeDefined();
     });
   });

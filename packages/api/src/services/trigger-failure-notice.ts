@@ -28,9 +28,9 @@ export interface TriggerFailureNotice {
    */
   userId?: string;
   /** Original trigger sender — the agent being notified. */
-  fromAgentId: string;
+  fromSlug: string;
   /** Failed trigger target — named in content; legacy-lane attributed sender. */
-  toAgentId: string;
+  toSlug: string;
   threadId?: string | null;
   threadKey?: string | null;
   /** The thread's workspace, when known — the only way a bare key resolves. */
@@ -56,7 +56,7 @@ export async function sendTriggerFailureNotice(
   client: any,
   notice: TriggerFailureNotice
 ): Promise<NoticeResult> {
-  const { userId, fromAgentId, toAgentId, threadKey, subject, content, metadata } = notice;
+  const { userId, fromSlug, toSlug, threadKey, subject, content, metadata } = notice;
 
   // Resolve the thread: the explicit id, or the one row (workspace, key)
   // names when the caller knows the workspace. A bare key is not enough —
@@ -116,8 +116,8 @@ export async function sendTriggerFailureNotice(
       logger.info('[TriggerFailure] Posted failure notice into thread', {
         threadId,
         threadKey: threadKey || null,
-        to: fromAgentId,
-        failedTarget: toAgentId,
+        to: fromSlug,
+        failedTarget: toSlug,
       });
       return { via: 'thread', ok: true };
     }
@@ -133,15 +133,15 @@ export async function sendTriggerFailureNotice(
     logger.warn('[TriggerFailure] No legacy lane for this sender — notice not delivered', {
       threadId: threadId || null,
       threadKey: threadKey || null,
-      to: fromAgentId,
-      failedTarget: toAgentId,
+      to: fromSlug,
+      failedTarget: toSlug,
     });
     return { via: 'legacy', ok: false };
   }
   const { error: legacyErr } = await client.from('agent_inbox').insert({
     recipient_user_id: userId,
-    recipient_agent_id: fromAgentId,
-    sender_agent_id: toAgentId,
+    recipient_agent_id: fromSlug,
+    sender_agent_id: toSlug,
     subject,
     content,
     message_type: 'notification',
@@ -152,7 +152,7 @@ export async function sendTriggerFailureNotice(
   });
   if (legacyErr) {
     logger.error('[TriggerFailure] Failed to send failure notification to sender', {
-      sender: fromAgentId,
+      sender: fromSlug,
       error: legacyErr.message,
     });
     return { via: 'legacy', ok: false };

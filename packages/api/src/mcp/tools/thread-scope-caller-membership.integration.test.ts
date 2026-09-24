@@ -79,19 +79,19 @@ describe("SB callers act with their owner's membership; carriers follow the work
       .insert({ workspace_id: workspaceId, user_id: viewerUserId, role: 'viewer' });
     if (memberErr) throw new Error(`Failed to add viewer membership: ${memberErr.message}`);
 
-    const identity = async (ws: string, agentId: string) => {
+    const identity = async (ws: string, sbSlug: string) => {
       const { data, error } = await supabase
         .from('agent_identities')
         .insert({
           user_id: viewerUserId,
           workspace_id: ws,
-          agent_id: agentId,
-          name: agentId,
+          agent_id: sbSlug,
+          name: sbSlug,
           role: 'assistant',
         })
         .select('id')
         .single();
-      if (error) throw new Error(`Failed to create identity ${agentId}: ${error.message}`);
+      if (error) throw new Error(`Failed to create identity ${sbSlug}: ${error.message}`);
       return data.id as string;
     };
     viewerSbId = await identity(workspaceId, VIEWER_SB);
@@ -166,21 +166,21 @@ describe("SB callers act with their owner's membership; carriers follow the work
 
   it("a viewer's SB reads the thread and is refused every write — close, send", async () => {
     const read = await handleGetThreadMessages(
-      { userId: viewerUserId, agentId: VIEWER_SB, threadKey },
+      { userId: viewerUserId, sbSlug: VIEWER_SB, threadKey },
       dataComposer
     );
     const readPayload = JSON.parse((read.content[0] as { text: string }).text);
     expect(readPayload.success).not.toBe(false);
 
     await expect(
-      handleCloseThread({ userId: viewerUserId, agentId: VIEWER_SB, threadKey }, dataComposer)
+      handleCloseThread({ userId: viewerUserId, sbSlug: VIEWER_SB, threadKey }, dataComposer)
     ).rejects.toThrow('Your role in this workspace (viewer) cannot close a thread');
     await expect(
       handleSendToInbox(
         {
           userId: viewerUserId,
-          senderAgentId: VIEWER_SB,
-          recipientAgentId: 'echo',
+          senderSlug: VIEWER_SB,
+          recipientSlug: 'echo',
           threadKey,
           content: 'a viewer writing',
           trigger: false,
@@ -197,7 +197,7 @@ describe("SB callers act with their owner's membership; carriers follow the work
         handleSendToInbox(
           {
             userId: viewerUserId,
-            recipientAgentId: VIEWER_SB,
+            recipientSlug: VIEWER_SB,
             threadKey,
             content: 'as myself',
             trigger: false,
@@ -223,9 +223,9 @@ describe("SB callers act with their owner's membership; carriers follow the work
         params: {},
         headers: {},
         cookies: {},
-        pcpUserId: ownerUserId,
-        pcpWorkspaceId: workspaceId,
-        pcpWorkspaceRole: 'owner',
+        inkUserId: ownerUserId,
+        inkWorkspaceId: workspaceId,
+        inkWorkspaceRole: 'owner',
       } as unknown as Request,
       res as unknown as Response
     );
@@ -253,14 +253,14 @@ describe("SB callers act with their owner's membership; carriers follow the work
           userId: ownerUserId,
           workspaceId,
           sbId: echoSbId,
-          agentId: 'echo',
+          sbSlug: 'echo',
           agentTokenBound: true,
         },
         () =>
           handleSendToInbox(
             {
               userId: ownerUserId,
-              recipientAgentId: `dispatcher-${RUN}`,
+              recipientSlug: `dispatcher-${RUN}`,
               threadKey,
               content: 'strategy notice',
               trigger: false,
@@ -290,7 +290,7 @@ describe("SB callers act with their owner's membership; carriers follow the work
       .eq('workspace_id', workspaceId)
       .eq('user_id', viewerUserId);
     await expect(
-      handleGetThreadMessages({ userId: viewerUserId, agentId: VIEWER_SB, threadKey }, dataComposer)
+      handleGetThreadMessages({ userId: viewerUserId, sbSlug: VIEWER_SB, threadKey }, dataComposer)
     ).rejects.toThrow(`${VIEWER_SB}'s owner cannot act in this workspace: not a member`);
   });
 });

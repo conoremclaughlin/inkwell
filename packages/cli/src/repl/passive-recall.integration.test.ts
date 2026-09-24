@@ -1,7 +1,7 @@
 /**
  * Passive Recall Integration Tests
  *
- * Tests the passive recall hook against a LIVE PCP server with real
+ * Tests the passive recall hook against a LIVE Inkwell server with real
  * semantic search. Requires INK_SERVER_URL (defaults to localhost:3001)
  * and valid auth credentials in ~/.ink/auth.json.
  *
@@ -13,14 +13,14 @@
  * 5. End-to-end: conversation → topic extraction → recall → injection → eviction cycle
  *
  * Run with: npx vitest run packages/cli/src/repl/passive-recall.integration.test.ts
- * Requires: PCP server running on localhost:3001 (or INK_SERVER_URL env var)
+ * Requires: Inkwell server running on localhost:3001 (or INK_SERVER_URL env var)
  */
 
 import { describe, expect, it, beforeAll } from 'vitest';
 import { ContextLedger } from './context-ledger.js';
 import { SbHookRegistry, type HookResult, type HookRuntimeState } from './hook-registry.js';
 
-// ─── PCP Client (lightweight, for integration tests) ────────────
+// ─── Inkwell Client (lightweight, for integration tests) ────────────
 
 interface RecallMemory {
   id: string;
@@ -29,7 +29,7 @@ interface RecallMemory {
   source: string;
   salience: string;
   topics: string[];
-  agentId: string | null;
+  sbSlug: string | null;
   createdAt: string;
 }
 
@@ -39,9 +39,9 @@ interface RecallResponse {
   memories: RecallMemory[];
 }
 
-async function pcpRecall(
+async function inkRecall(
   query: string,
-  options?: { limit?: number; agentId?: string; recallMode?: string }
+  options?: { limit?: number; sbSlug?: string; recallMode?: string }
 ): Promise<RecallResponse> {
   const serverUrl = process.env.INK_SERVER_URL || 'http://localhost:3001';
   const authPath = `${process.env.HOME}/.ink/auth.json`;
@@ -53,12 +53,12 @@ async function pcpRecall(
     accessToken = auth.accessToken || auth.access_token;
     if (!accessToken) throw new Error('No access token in auth.json');
   } catch {
-    throw new Error(`Cannot read PCP auth from ${authPath} — is the server running?`);
+    throw new Error(`Cannot read Inkwell auth from ${authPath} — is the server running?`);
   }
 
   const body = {
     query,
-    agentId: options?.agentId || 'wren',
+    sbSlug: options?.sbSlug || 'wren',
     includeShared: true,
     limit: options?.limit || 5,
     recallMode: options?.recallMode || 'hybrid',
@@ -81,7 +81,9 @@ async function pcpRecall(
 
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
-    throw new Error(`PCP recall failed: ${resp.status} ${resp.statusText} — ${body.slice(0, 200)}`);
+    throw new Error(
+      `Inkwell recall failed: ${resp.status} ${resp.statusText} — ${body.slice(0, 200)}`
+    );
   }
 
   // MCP Streamable HTTP returns SSE format: "event: message\ndata: {...}\n\n"
@@ -94,7 +96,7 @@ async function pcpRecall(
     error?: { message: string };
   };
   if (rpc.error) {
-    throw new Error(`PCP recall RPC error: ${rpc.error.message}`);
+    throw new Error(`Inkwell recall RPC error: ${rpc.error.message}`);
   }
 
   const text = rpc.result?.content?.[0]?.text;
@@ -233,12 +235,12 @@ function createPassiveRecallHook(config?: {
       const signal = extractTopicSignal(ctx.lastTurn.userInput, ctx.lastTurn.assistantResponse);
       if (!signal || signal.length < 5) return;
 
-      // Call real PCP recall
+      // Call real Inkwell recall
       let recallResult: RecallResponse;
       try {
-        recallResult = await pcpRecall(signal, {
+        recallResult = await inkRecall(signal, {
           limit: maxInject + 3, // fetch extra for filtering
-          agentId: ctx.runtime.agentId,
+          sbSlug: ctx.runtime.sbSlug,
           recallMode,
         });
       } catch {
@@ -273,15 +275,15 @@ function createPassiveRecallHook(config?: {
 
 // ─── Tests ──────────────────────────────────────────────────────
 
-// Check if PCP server is reachable — must be synchronous for skipIf
+// Check if Inkwell server is reachable — must be synchronous for skipIf
 // We use a module-level check via a synchronous HTTP probe
 import { execSync } from 'child_process';
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 
 let serverAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
@@ -319,9 +321,9 @@ describe('Topic signal extraction', () => {
   });
 });
 
-describe('Passive recall: live PCP integration', () => {
+describe('Passive recall: live Inkwell integration', () => {
   it.skipIf(!serverAvailable)('recalls relevant memories for session routing query', async () => {
-    const result = await pcpRecall('session routing triggered agents studio resolution');
+    const result = await inkRecall('session routing triggered agents studio resolution');
 
     expect(result.success).toBe(true);
     expect(result.count).toBeGreaterThan(0);
@@ -337,7 +339,7 @@ describe('Passive recall: live PCP integration', () => {
   it.skipIf(!serverAvailable)(
     'recalls relevant memories for context management query',
     async () => {
-      const result = await pcpRecall('context window compaction eviction memory management');
+      const result = await inkRecall('context window compaction eviction memory management');
 
       expect(result.success).toBe(true);
       // We know these memories exist from the earlier recall in this session
@@ -353,7 +355,7 @@ describe('Passive recall: live PCP integration', () => {
   );
 
   it.skipIf(!serverAvailable)('returns empty for nonsense query', async () => {
-    const result = await pcpRecall('xyzzy plugh 12345 completely irrelevant gibberish');
+    const result = await inkRecall('xyzzy plugh 12345 completely irrelevant gibberish');
 
     expect(result.success).toBe(true);
     // May still return results via text matching, but they should be low relevance
@@ -361,7 +363,7 @@ describe('Passive recall: live PCP integration', () => {
   });
 
   it.skipIf(!serverAvailable)('respects limit parameter', async () => {
-    const result = await pcpRecall('session routing', { limit: 2 });
+    const result = await inkRecall('session routing', { limit: 2 });
 
     expect(result.success).toBe(true);
     expect(result.memories.length).toBeLessThanOrEqual(2);
@@ -384,7 +386,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'How does session routing work for triggered agents?',
         assistantResponse:
@@ -422,7 +424,7 @@ describe('Passive recall hook: live end-to-end', () => {
     // First turn
     const r1 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: turn,
     });
     const firstInjectionCount = r1.injected;
@@ -430,7 +432,7 @@ describe('Passive recall hook: live end-to-end', () => {
     // Same topic, second turn — should get fewer/no new memories
     const r2 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.3 },
       lastTurn: { ...turn, turnIndex: 2 },
     });
 
@@ -449,7 +451,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.85 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.85 },
       lastTurn: {
         userInput: 'session routing',
         assistantResponse: 'routing explanation',
@@ -475,7 +477,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const r1 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'How does session routing work?',
         assistantResponse: 'Session routing resolves the target studio for triggered agents.',
@@ -502,7 +504,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const r2 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'What about the task comments feature?',
         assistantResponse:
@@ -536,7 +538,7 @@ describe('Passive recall: latency benchmark', () => {
     const times: number[] = [];
     for (const q of queries) {
       const start = performance.now();
-      await pcpRecall(q, { limit: 3 });
+      await inkRecall(q, { limit: 3 });
       times.push(performance.now() - start);
     }
 

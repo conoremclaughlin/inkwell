@@ -3,7 +3,7 @@
  *
  * `--session-candidates-json` promises a stdout that `JSON.parse` accepts,
  * but the path to the payload prints diagnostics from all over the CLI —
- * server-update notices, hook-health warnings, PCP-unavailable warnings,
+ * server-update notices, hook-health warnings, Inkwell-unavailable warnings,
  * profile messages. Silencing each one individually means finding them all
  * and finding them again whenever a new one is added.
  *

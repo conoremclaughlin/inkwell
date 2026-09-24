@@ -22,8 +22,8 @@ describe('relativeTime', () => {
 describe('senderName', () => {
   // Two people on one thread, as each of them sees it: "You" is the
   // viewer's own message only, and the other person keeps their name.
-  const fromA = { senderKind: 'user', senderAgentId: null, senderName: 'Conor', isOwn: true };
-  const fromB = { senderKind: 'user', senderAgentId: null, senderName: 'second', isOwn: false };
+  const fromA = { senderKind: 'user', senderSlug: null, senderName: 'Conor', isOwn: true };
+  const fromB = { senderKind: 'user', senderSlug: null, senderName: 'second', isOwn: false };
 
   it('the viewer reads their own message as "You" and the other person by name', () => {
     expect(senderName(fromA)).toEqual({ name: 'You', isOwn: true });
@@ -37,13 +37,13 @@ describe('senderName', () => {
 
   it('names an SB by its slug and the system as system, neither ever own', () => {
     expect(
-      senderName({ senderKind: 'sb', senderAgentId: 'wren', senderName: 'wren', isOwn: false })
+      senderName({ senderKind: 'sb', senderSlug: 'wren', senderName: 'wren', isOwn: false })
     ).toEqual({
       name: 'wren',
       isOwn: false,
     });
     expect(
-      senderName({ senderKind: 'system', senderAgentId: null, senderName: 'system', isOwn: false })
+      senderName({ senderKind: 'system', senderSlug: null, senderName: 'system', isOwn: false })
     ).toEqual({
       name: 'system',
       isOwn: false,
@@ -54,7 +54,7 @@ describe('senderName', () => {
     expect(
       senderName({
         senderKind: 'user',
-        senderAgentId: null,
+        senderSlug: null,
         senderName: 'a workspace member',
         isOwn: false,
       })
@@ -63,7 +63,7 @@ describe('senderName', () => {
       isOwn: false,
     });
     // An unnamed payload (no senderName at all) falls back to the kind.
-    expect(senderName({ senderKind: 'user', senderAgentId: null })).toEqual({
+    expect(senderName({ senderKind: 'user', senderSlug: null })).toEqual({
       name: 'a workspace member',
       isOwn: false,
     });
@@ -72,7 +72,7 @@ describe('senderName', () => {
   it('ignores the retired metadata hint even when it is supplied', () => {
     const withHint = {
       senderKind: 'sb',
-      senderAgentId: 'wren',
+      senderSlug: 'wren',
       senderName: 'wren',
       isOwn: false,
       metadata: { sentBy: 'user' },

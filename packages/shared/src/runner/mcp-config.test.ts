@@ -7,7 +7,7 @@ import {
   buildSessionEnv,
   encodeContextToken,
   decodeContextToken,
-  type PcpContextToken,
+  type InkContextToken,
 } from './mcp-config.js';
 
 const testDir = join(tmpdir(), 'sb-mcp-test');
@@ -35,7 +35,7 @@ describe('injectSessionHeaders', () => {
 
     const result = injectSessionHeaders({
       mcpConfigPath: configPath,
-      pcpSessionId: 'test-session-id',
+      inkSessionId: 'test-session-id',
       studioId: 'test-studio-id',
     });
 
@@ -54,7 +54,7 @@ describe('injectSessionHeaders', () => {
 
     const result = injectSessionHeaders({
       mcpConfigPath: configPath,
-      pcpSessionId: 'test-session-id',
+      inkSessionId: 'test-session-id',
       accessToken: 'test-token-abc',
     });
 
@@ -78,7 +78,7 @@ describe('injectSessionHeaders', () => {
 
     const result = injectSessionHeaders({
       mcpConfigPath: configPath,
-      pcpSessionId: 'test-session-id',
+      inkSessionId: 'test-session-id',
       accessToken: 'new-token',
     });
 
@@ -95,7 +95,7 @@ describe('injectSessionHeaders', () => {
 
     const result = injectSessionHeaders({
       mcpConfigPath: configPath,
-      pcpSessionId: 'test-session-id',
+      inkSessionId: 'test-session-id',
       accessToken: 'test-token',
     });
 
@@ -114,7 +114,7 @@ describe('injectSessionHeaders', () => {
 
     const result = injectSessionHeaders({
       mcpConfigPath: configPath,
-      pcpSessionId: 'test-session-id',
+      inkSessionId: 'test-session-id',
       studioId: 'test-studio-id',
       outputDir,
     });
@@ -137,7 +137,7 @@ describe('injectSessionHeaders', () => {
 
     const result = injectSessionHeaders({
       mcpConfigPath: configPath,
-      pcpSessionId: 'test-session-id',
+      inkSessionId: 'test-session-id',
     });
 
     expect(result.modified).toBe(true);
@@ -163,7 +163,7 @@ describe('injectSessionHeaders', () => {
 
     const result = injectSessionHeaders({
       mcpConfigPath: configPath,
-      pcpSessionId: 'test-session-id',
+      inkSessionId: 'test-session-id',
       accessToken: 'test-token',
     });
 
@@ -175,10 +175,10 @@ describe('injectSessionHeaders', () => {
 describe('buildSessionEnv', () => {
   it('includes INK_ACCESS_TOKEN (raw) when accessToken provided', () => {
     const env = buildSessionEnv({
-      pcpSessionId: 'sess-123',
+      inkSessionId: 'sess-123',
       studioId: 'studio-456',
       accessToken: 'tok-789',
-      agentId: 'wren',
+      sbSlug: 'wren',
     });
 
     expect(env.INK_SESSION_ID).toBe('sess-123');
@@ -191,7 +191,7 @@ describe('buildSessionEnv', () => {
 
   it('omits INK_ACCESS_TOKEN when not provided', () => {
     const env = buildSessionEnv({
-      pcpSessionId: 'sess-123',
+      inkSessionId: 'sess-123',
     });
 
     expect(env.INK_SESSION_ID).toBe('sess-123');
@@ -199,11 +199,11 @@ describe('buildSessionEnv', () => {
     expect(env).not.toHaveProperty('INK_AUTH_BEARER');
   });
 
-  it('includes INK_CONTEXT when agentId and sessionId provided', () => {
+  it('includes INK_CONTEXT when sbSlug and sessionId provided', () => {
     const env = buildSessionEnv({
-      pcpSessionId: 'sess-123',
+      inkSessionId: 'sess-123',
       studioId: 'studio-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       runtime: 'claude',
       cliAttached: false,
     });
@@ -213,15 +213,15 @@ describe('buildSessionEnv', () => {
     const decoded = JSON.parse(Buffer.from(env.INK_CONTEXT, 'base64url').toString());
     expect(decoded.sessionId).toBe('sess-123');
     expect(decoded.studioId).toBe('studio-456');
-    expect(decoded.agentId).toBe('wren');
+    expect(decoded.sbSlug).toBe('wren');
     expect(decoded.runtime).toBe('claude');
     expect(decoded.cliAttached).toBe(false);
   });
 
   it('sets cliAttached in context token', () => {
     const env = buildSessionEnv({
-      pcpSessionId: 'sess-123',
-      agentId: 'wren',
+      inkSessionId: 'sess-123',
+      sbSlug: 'wren',
       cliAttached: true,
     });
 
@@ -229,9 +229,9 @@ describe('buildSessionEnv', () => {
     expect(decoded.cliAttached).toBe(true);
   });
 
-  it('omits INK_CONTEXT when agentId is missing', () => {
+  it('omits INK_CONTEXT when sbSlug is missing', () => {
     const env = buildSessionEnv({
-      pcpSessionId: 'sess-123',
+      inkSessionId: 'sess-123',
     });
 
     expect(env).not.toHaveProperty('INK_CONTEXT');
@@ -240,10 +240,10 @@ describe('buildSessionEnv', () => {
 
 describe('encodeContextToken / decodeContextToken', () => {
   it('round-trips correctly', () => {
-    const token: PcpContextToken = {
+    const token: InkContextToken = {
       sessionId: 'sess-abc',
       studioId: 'studio-def',
-      agentId: 'myra',
+      sbSlug: 'myra',
       cliAttached: true,
       runtime: 'claude',
     };

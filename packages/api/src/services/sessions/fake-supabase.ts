@@ -278,6 +278,94 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
           return { data: true, error: null };
         }
 
+        if (fn === 'update_inbox_thread_metadata') {
+          // Mirrors migration 20260916020035 as redefined by 20260924071839 for
+          // the post-cutover message columns: the title/summary write and the
+          // timeline event happen together or not at all. The real atomicity —
+          // a rejected audit rolling the edit back — is pinned against Postgres
+          // in thread-metadata.integration.test.ts; this mirror exists so the
+          // handler's own branches are testable, and it must not be laxer than
+          // the function it stands in for.
+          const setTitle = args.p_set_title === true;
+          const setSummary = args.p_set_summary === true;
+          const slug = args.p_editor_slug as string | null | undefined;
+          const attributedBy = args.p_attributed_by as string;
+          if (!setTitle && !setSummary) {
+            return {
+              data: null,
+              error: {
+                message: 'update_inbox_thread_metadata: provide at least one of title or summary',
+              },
+            };
+          }
+          if (!slug) {
+            return {
+              data: null,
+              error: { message: 'update_inbox_thread_metadata: an editor slug is required' },
+            };
+          }
+          if (attributedBy !== 'identity' && attributedBy !== 'slug-only') {
+            return {
+              data: null,
+              error: {
+                message: `update_inbox_thread_metadata: attributed_by must be identity or slug-only, got ${attributedBy}`,
+              },
+            };
+          }
+          const thread = (tables['inbox_threads'] ?? []).find((r) => r.id === args.p_thread_id);
+          if (!thread) {
+            return {
+              data: null,
+              error: {
+                message: `update_inbox_thread_metadata: thread ${args.p_thread_id} not found`,
+              },
+            };
+          }
+          const stamp = new Date().toISOString();
+          const fields: string[] = [];
+          if (setTitle) {
+            Object.assign(thread, {
+              title: args.p_title ?? null,
+              title_updated_by_sb_id: args.p_editor_sb_id ?? null,
+              title_updated_at: stamp,
+            });
+            fields.push('title');
+          }
+          if (setSummary) {
+            Object.assign(thread, {
+              summary: args.p_summary ?? null,
+              summary_updated_by_sb_id: args.p_editor_sb_id ?? null,
+              summary_updated_at: stamp,
+            });
+            fields.push('summary');
+          }
+          thread.updated_at = stamp;
+          const metaMessages =
+            tables['inbox_thread_messages'] ?? (tables['inbox_thread_messages'] = []);
+          metaMessages.push({
+            thread_id: args.p_thread_id,
+            // Post-cutover principal columns (20260924071839): the system
+            // borrows nobody's identity — kind says system, both ids null,
+            // no slug.
+            sender_kind: 'system',
+            sender_sb_id: null,
+            sender_user_id: null,
+            sender_agent_id: null,
+            content: `Thread ${fields.join(' and ')} updated by ${slug}`,
+            message_type: 'system',
+            metadata: {
+              type: 'thread_metadata_updated',
+              updatedBy: slug,
+              updatedBySbId: args.p_editor_sb_id ?? null,
+              attributedBy,
+              updatedFields: fields,
+              ...(setTitle ? { title: args.p_title ?? null } : {}),
+              ...(setSummary ? { summary: args.p_summary ?? null } : {}),
+            },
+          });
+          return { data: stamp, error: null };
+        }
+
         if (fn !== 'grant_studio_lease') {
           return { data: null, error: { message: `no fake for rpc ${fn}` } };
         }

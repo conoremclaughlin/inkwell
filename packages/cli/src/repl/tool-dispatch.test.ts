@@ -1,23 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
 import { bareToolName, createLocalToolDispatcher } from './tool-dispatch.js';
-import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import type { InkToolCallResult } from '../lib/ink-client.js';
 
-const ok = (text: string) => ({ content: [{ type: 'text', text }] }) as PcpToolCallResult;
+const ok = (text: string) => ({ content: [{ type: 'text', text }] }) as InkToolCallResult;
 
-const payloadOf = (result: PcpToolCallResult): any => result;
+const payloadOf = (result: InkToolCallResult): any => result;
 
 function makeDeps(overrides: Partial<Parameters<typeof createLocalToolDispatcher>[0]> = {}) {
   const callPi = vi.fn(async () => ok('pi'));
-  const callPcp = vi.fn(async () => ok('pcp'));
+  const callInk = vi.fn(async () => ok('ink'));
   const resolveCredentials = vi.fn((args: Record<string, unknown>) => ({
     ...args,
     resolved: true,
   }));
   return {
     callPi,
-    callPcp,
+    callInk,
     resolveCredentials,
-    deps: { cwd: '/work', callPi, callPcp, resolveCredentials, ...overrides },
+    deps: { cwd: '/work', callPi, callInk, resolveCredentials, ...overrides },
   };
 }
 
@@ -42,27 +42,27 @@ describe('createLocalToolDispatcher', () => {
     expect(callPi).toHaveBeenCalledWith('read', { path: 'a.ts' }, '/work', undefined);
   });
 
-  it('sends everything else to PCP with credentials resolved and the namespace stripped', async () => {
-    const { callPcp, resolveCredentials, deps } = makeDeps();
+  it('sends everything else to Inkwell with credentials resolved and the namespace stripped', async () => {
+    const { callInk, resolveCredentials, deps } = makeDeps();
     await createLocalToolDispatcher(deps)('mcp__inkwell__recall', { query: '$TOKEN' }, {});
 
     expect(resolveCredentials).toHaveBeenCalledWith({ query: '$TOKEN' });
-    expect(callPcp).toHaveBeenCalledWith('recall', { query: '$TOKEN', resolved: true });
+    expect(callInk).toHaveBeenCalledWith('recall', { query: '$TOKEN', resolved: true });
   });
 
   // The Myra regression (Aug 2026). A long-lived session drifts toward its
-  // priors and starts namespacing every tool it names. Only the PCP
+  // priors and starts namespacing every tool it names. Only the Inkwell
   // fallthrough stripped that namespace, so a namespaced coding tool sailed
   // past isPiTool, was posted to a server that has no `bash`, and came back
   // "tool not found" — which she reasonably read as "you have no shell".
   it.each(['bash', 'read', 'write', 'edit', 'grep', 'find', 'ls'])(
     'routes namespaced %s to the Pi tool, not the server',
     async (piTool) => {
-      const { callPi, callPcp, deps } = makeDeps();
+      const { callPi, callInk, deps } = makeDeps();
       await createLocalToolDispatcher(deps)(`mcp__inkwell__${piTool}`, { path: 'a.ts' }, {});
 
       expect(callPi).toHaveBeenCalledWith(piTool, { path: 'a.ts' }, '/work', undefined);
-      expect(callPcp).not.toHaveBeenCalled();
+      expect(callInk).not.toHaveBeenCalled();
     }
   );
 
@@ -93,14 +93,14 @@ describe('createLocalToolDispatcher', () => {
     // client. Saying that is the difference between "you misspelled it" and
     // "this capability is absent" — the second is actionable, the first sent
     // Myra retrying across two days.
-    const { callPcp, callPi, deps } = makeDeps();
+    const { callInk, callPi, deps } = makeDeps();
     const result = await createLocalToolDispatcher(deps)(
       'mcp__github__list_issues',
       { owner: 'conoremclaughlin', repo: 'inkwell' },
       {}
     );
 
-    expect(callPcp).not.toHaveBeenCalled();
+    expect(callInk).not.toHaveBeenCalled();
     expect(callPi).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
     const text = result.content[0].text as string;
@@ -119,42 +119,42 @@ describe('createLocalToolDispatcher', () => {
     ['Grep', 'grep'],
     ['LS', 'ls'],
   ])('corrects miscased %s to %s instead of relaying "not found"', async (emitted, correct) => {
-    const { callPcp, callPi, deps } = makeDeps();
+    const { callInk, callPi, deps } = makeDeps();
     const result = await createLocalToolDispatcher(deps)(emitted, { command: 'ls' }, {});
 
-    expect(callPcp).not.toHaveBeenCalled();
+    expect(callInk).not.toHaveBeenCalled();
     expect(callPi).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
     expect(result.content[0].text as string).toContain(`"${correct}"`);
   });
 
   it('corrects a name that is both namespaced and miscased', async () => {
-    const { callPcp, deps } = makeDeps();
+    const { callInk, deps } = makeDeps();
     const result = await createLocalToolDispatcher(deps)('mcp__inkwell__Bash', {}, {});
 
-    expect(callPcp).not.toHaveBeenCalled();
+    expect(callInk).not.toHaveBeenCalled();
     expect(result.content[0].text as string).toContain('"bash"');
   });
 
   it('does not "correct" a capitalised name that is not a coding tool', async () => {
     // ToolSearch and WebSearch are Claude Code tools with no lowercase
     // equivalent here. The server stays the authority on those.
-    const { callPcp, deps } = makeDeps();
+    const { callInk, deps } = makeDeps();
     await createLocalToolDispatcher(deps)('ToolSearch', {}, {});
-    expect(callPcp).toHaveBeenCalledWith('ToolSearch', { resolved: true });
+    expect(callInk).toHaveBeenCalledWith('ToolSearch', { resolved: true });
   });
 
   it('still sends a bare unknown tool to the server rather than guessing', async () => {
     // Only an `mcp__<server>__` prefix proves the target is foreign. A bare
     // name we do not recognise may simply be an Inkwell tool this build has
     // not heard of, and the server is the authority on that.
-    const { callPcp, deps } = makeDeps();
+    const { callInk, deps } = makeDeps();
     await createLocalToolDispatcher(deps)('some_new_inkwell_tool', {}, {});
-    expect(callPcp).toHaveBeenCalledWith('some_new_inkwell_tool', { resolved: true });
+    expect(callInk).toHaveBeenCalledWith('some_new_inkwell_tool', { resolved: true });
   });
 
   it('lets the host head answer first and stop there', async () => {
-    const { callPi, callPcp, deps } = makeDeps({
+    const { callPi, callInk, deps } = makeDeps({
       head: (tool) => (tool === 'bash' ? ok('refused') : null),
     });
     const dispatch = createLocalToolDispatcher(deps);
@@ -165,7 +165,7 @@ describe('createLocalToolDispatcher', () => {
 
     // Anything the head declines still falls through to the shared tail.
     await dispatch('recall', {}, {});
-    expect(callPcp).toHaveBeenCalled();
+    expect(callInk).toHaveBeenCalled();
   });
 
   it('gives the head the signal too, for host work that can be cancelled', async () => {
@@ -185,9 +185,9 @@ describe('createLocalToolDispatcher', () => {
   });
 
   it('awaits an async head', async () => {
-    const { callPcp, deps } = makeDeps({ head: async () => ok('async refusal') });
+    const { callInk, deps } = makeDeps({ head: async () => ok('async refusal') });
     expect(await createLocalToolDispatcher(deps)('anything', {}, {})).toEqual(ok('async refusal'));
-    expect(callPcp).not.toHaveBeenCalled();
+    expect(callInk).not.toHaveBeenCalled();
   });
 });
 
@@ -203,11 +203,11 @@ describe('createLocalToolDispatcher — describe_tool', () => {
   /**
    * What the live server returns today: its own namespace, and only that.
    *
-   * Shaped as `PcpClient.callTool` hands it back — the payload, already
+   * Shaped as `InkClient.callTool` hands it back — the payload, already
    * unwrapped from the MCP envelope. Mocking the envelope instead is how the
    * first cut of this merge passed here and did nothing in production.
    */
-  const serverList = (): PcpToolCallResult => ({
+  const serverList = (): InkToolCallResult => ({
     success: true,
     count: 2,
     tools: ['bootstrap', 'recall'],
@@ -215,11 +215,11 @@ describe('createLocalToolDispatcher — describe_tool', () => {
   });
 
   it('lists the in-process tools alongside the server namespace', async () => {
-    const callPcp = vi.fn(async () => serverList());
+    const callInk = vi.fn(async () => serverList());
     const dispatch = createLocalToolDispatcher({
       cwd: '/work',
       callPi: async () => ok('pi'),
-      callPcp,
+      callInk,
       resolveCredentials: (args) => args,
     });
 
@@ -235,11 +235,11 @@ describe('createLocalToolDispatcher — describe_tool', () => {
   });
 
   it('answers for a coding tool without asking the server, which has never heard of it', async () => {
-    const callPcp = vi.fn(async () => serverList());
+    const callInk = vi.fn(async () => serverList());
     const dispatch = createLocalToolDispatcher({
       cwd: process.cwd(),
       callPi: async () => ok('pi'),
-      callPcp,
+      callInk,
       resolveCredentials: (args) => args,
     });
 
@@ -250,14 +250,14 @@ describe('createLocalToolDispatcher — describe_tool', () => {
     expect(parsed.tool.source).toBe('ink-runtime');
     // Pi's own schema, not a hand-copy of it that can drift.
     expect(parsed.tool.parameters.properties).toHaveProperty('command');
-    expect(callPcp).not.toHaveBeenCalled();
+    expect(callInk).not.toHaveBeenCalled();
   });
 
   it('narrows the surface for a clone, which genuinely may not run bash', async () => {
     const dispatch = createLocalToolDispatcher({
       cwd: '/work',
       callPi: async () => ok('pi'),
-      callPcp: async () => serverList(),
+      callInk: async () => serverList(),
       resolveCredentials: (args) => args,
       audience: 'clone',
     });
@@ -274,7 +274,7 @@ describe('createLocalToolDispatcher — describe_tool', () => {
     const dispatch = createLocalToolDispatcher({
       cwd: '/work',
       callPi: async () => ok('pi'),
-      callPcp: async () => opaque,
+      callInk: async () => opaque,
       resolveCredentials: (args) => args,
     });
 

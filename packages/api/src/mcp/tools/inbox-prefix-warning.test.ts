@@ -30,13 +30,13 @@ vi.mock('../../utils/request-context', async (importOriginal) => {
     ...actual,
     getRequestContext: vi.fn().mockReturnValue({ sessionId: 'session-mock-123' }),
     getSessionContext: vi.fn().mockReturnValue(undefined),
-    getPinnedAgentId: vi.fn().mockReturnValue(undefined),
+    getPinnedSlug: vi.fn().mockReturnValue(undefined),
   };
 });
 
 vi.mock('../../auth/resolve-identity', () => ({
-  resolveIdentityId: vi.fn().mockResolvedValue('identity-123'),
-  resolveAgentSlug: vi.fn().mockImplementation(async (_s: unknown, _u: unknown, id: string) => id),
+  resolveSbId: vi.fn().mockResolvedValue('identity-123'),
+  resolveSbSlug: vi.fn().mockImplementation(async (_s: unknown, _u: unknown, id: string) => id),
 }));
 
 // The sender is a principal in one workspace (spec inkmail-thread-scope §3);
@@ -51,7 +51,7 @@ vi.mock('./caller-principal', () => ({
   resolveCallerSb: vi.fn().mockResolvedValue({
     kind: 'sb',
     sbId: 'sb-wren',
-    agentId: 'wren',
+    sbSlug: 'wren',
     userId: '11111111-1111-1111-1111-111111111111',
     workspaceId: 'ws-1',
     ownerRole: 'member',
@@ -188,8 +188,8 @@ async function send(threadKey: string) {
   const result = await handleSendToInbox(
     {
       userId: '11111111-1111-1111-1111-111111111111',
-      recipientAgentId: 'lumen',
-      senderAgentId: 'wren',
+      recipientSlug: 'lumen',
+      senderSlug: 'wren',
       threadKey,
       content: 'hello',
       trigger: false,

@@ -11,12 +11,13 @@ import type { TaskStatus, TaskPriority } from '../../data/repositories/project-t
 import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier, type ResolvedUser } from '../../services/user-resolver';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { getRequestContext, getSessionContext } from '../../utils/request-context';
 import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
 import { isBareDate, resolveDueDate, InvalidDueDateError } from '../../utils/due-date';
 import { logger } from '../../utils/logger';
 import { resolveCallerWorkspace } from './caller-principal';
+import { resolveSbId } from '../../auth/resolve-identity';
 
 export const DUE_DATE_DESCRIPTION =
   'Deadline. Bare YYYY-MM-DD (e.g. "2026-09-14") resolves to the end of that day in the ' +
@@ -385,10 +386,10 @@ export async function handleUpdateTask(
 
     if (args.status && args.status !== existing.status) {
       try {
-        const agentId = getEffectiveAgentId(undefined) || 'system';
+        const sbSlug = getEffectiveSlug(undefined) || 'system';
         await dataComposer.repositories.activityStream.logActivity({
           userId: resolved.user.id,
-          agentId,
+          sbSlug,
           type: 'state_change',
           subtype: 'task_status_change',
           content: `${task.title}: ${existing.status} → ${args.status}`,
@@ -504,10 +505,10 @@ async function completeGraphModeTask(
 
   const taskGroupId = (await dataComposer.repositories.tasks.findById(taskId))?.task_group_id;
   try {
-    const agentId = getEffectiveAgentId(undefined) || 'system';
+    const sbSlug = getEffectiveSlug(undefined) || 'system';
     await dataComposer.repositories.activityStream.logActivity({
       userId,
-      agentId,
+      sbSlug,
       type: 'state_change',
       subtype: outcome === 'completed' ? 'task_completed' : 'task_closed',
       content: summary || `${outcome}: graph node ${taskId}`,
@@ -578,7 +579,7 @@ export async function handleCompleteTask(
 
     // Auto-remember: persist task completion as a memory for session continuity
     try {
-      const agentId = getEffectiveAgentId(undefined);
+      const sbSlug = getEffectiveSlug(undefined);
       const salience = task.priority === 'high' || task.priority === 'critical' ? 'high' : 'medium';
       const topics = [`task:${task.id}`, ...(task.tags || [])];
       if (task.project_id) topics.push(`project:${task.project_id}`);
@@ -591,7 +592,7 @@ export async function handleCompleteTask(
         source: 'session',
         salience: salience as 'medium' | 'high',
         topics,
-        agentId: agentId || undefined,
+        sbSlug: sbSlug || undefined,
         metadata: { taskId: task.id, autoCreated: true },
       });
     } catch (err) {
@@ -601,11 +602,11 @@ export async function handleCompleteTask(
 
     // Log task_completed to activity stream for mission feed visibility
     try {
-      const agentId = getEffectiveAgentId(undefined) || 'system';
+      const sbSlug = getEffectiveSlug(undefined) || 'system';
       const summaryText = args.summary || `Completed: ${task.title}`;
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId,
+        sbSlug,
         type: 'state_change',
         subtype: 'task_completed',
         content: summaryText,
@@ -766,7 +767,7 @@ export async function handleCloseTask(
       args.reason
     );
 
-    const agentId = getEffectiveAgentId(undefined) || 'system';
+    const sbSlug = getEffectiveSlug(undefined) || 'system';
     const outcomeLabel =
       args.outcome === 'completed'
         ? `✓ ${args.summary || task.title}`
@@ -775,7 +776,7 @@ export async function handleCloseTask(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId,
+        sbSlug,
         type: 'state_change',
         subtype: args.outcome === 'completed' ? 'task_completed' : 'task_closed',
         content: outcomeLabel,
@@ -907,27 +908,26 @@ export const addTaskCommentSchema = z.object({
   taskId: z.string().guid().describe('Task ID to comment on'),
   content: z.string().min(1).max(5000).describe('Comment content'),
   parentCommentId: z.string().guid().optional().describe('Parent comment ID for threaded replies'),
-  agentId: z.string().optional().describe('Agent ID for identity attribution'),
+  sbSlug: z.string().optional().describe('SB slug for identity attribution'),
 });
 
-async function resolveIdentityIdForAgent(
+/**
+ * Slug -> canonical identity UUID, via the shared resolver.
+ *
+ * This used to query agent_identities itself with .limit(1).single(), which
+ * differed from the shared resolver in two ways that both lost attribution:
+ * with no workspace it silently took whichever row came back first, and WITH a
+ * workspace it matched workspace_id exactly, so an identity not yet backfilled
+ * (workspace_id IS NULL) resolved to nothing and the comment lost its sbId.
+ */
+async function resolveSbIdForSlug(
   dataComposer: DataComposer,
   userId: string,
-  agentId: string | undefined,
+  sbSlug: string | undefined,
   workspaceId: string | undefined
 ): Promise<string | null> {
-  if (!agentId) return null;
-  let query = dataComposer
-    .getClient()
-    .from('agent_identities')
-    .select('id')
-    .eq('agent_id', agentId)
-    .eq('user_id', userId);
-  if (workspaceId) {
-    query = query.eq('workspace_id', workspaceId);
-  }
-  const { data } = await query.limit(1).single();
-  return (data as { id: string } | null)?.id ?? null;
+  if (!sbSlug) return null;
+  return resolveSbId(dataComposer.getClient(), userId, sbSlug, workspaceId);
 }
 
 export async function handleAddTaskComment(
@@ -949,16 +949,11 @@ export async function handleAddTaskComment(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      agentId,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { data: rawComment, error } = await dataComposer
       .getClient()
@@ -968,7 +963,7 @@ export async function handleAddTaskComment(
         user_id: resolved.user.id,
         content: args.content.trim(),
         parent_comment_id: args.parentCommentId || null,
-        created_by_agent_id: agentId || null,
+        created_by_agent_id: sbSlug || null,
         created_by_sb_id: sbId,
       } as never)
       .select()
@@ -991,7 +986,7 @@ export async function handleAddTaskComment(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId: agentId || 'system',
+        sbSlug: sbSlug || 'system',
         type: 'state_change',
         subtype: 'task_comment',
         content: args.content.trim().slice(0, 200),
@@ -1014,7 +1009,7 @@ export async function handleAddTaskComment(
         id: comment.id,
         taskId: comment.task_id,
         content: comment.content,
-        authorAgentId: agentId || null,
+        authorSlug: sbSlug || null,
         createdAt: comment.created_at,
       },
     });
@@ -1042,7 +1037,7 @@ export const addTaskGroupCommentSchema = z.object({
     .optional()
     .default('comment')
     .describe('Comment type (comment, conclusion, status_change)'),
-  agentId: z.string().optional().describe('Agent ID for identity attribution'),
+  sbSlug: z.string().optional().describe('SB slug for identity attribution'),
 });
 
 export async function handleAddTaskGroupComment(
@@ -1066,16 +1061,11 @@ export async function handleAddTaskGroupComment(
       );
     }
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      agentId,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { data: rawComment, error } = await dataComposer
       .getClient()
@@ -1085,7 +1075,7 @@ export async function handleAddTaskGroupComment(
         user_id: resolved.user.id,
         content: args.content.trim(),
         comment_type: args.commentType || 'comment',
-        agent_id: agentId || null,
+        agent_id: sbSlug || null,
         created_by_sb_id: sbId,
       } as never)
       .select()
@@ -1109,7 +1099,7 @@ export async function handleAddTaskGroupComment(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId: agentId || 'system',
+        sbSlug: sbSlug || 'system',
         type: 'state_change',
         subtype: 'task_group_comment',
         content: args.content.trim().slice(0, 200),
@@ -1133,7 +1123,7 @@ export async function handleAddTaskGroupComment(
         groupId: comment.task_group_id,
         content: comment.content,
         commentType: comment.comment_type,
-        authorAgentId: agentId || null,
+        authorSlug: sbSlug || null,
         createdAt: comment.created_at,
       },
     });
@@ -1208,7 +1198,7 @@ export async function handleListTaskGroupComments(
         groupId: c.task_group_id,
         content: c.content,
         commentType: c.comment_type,
-        authorAgentId: c.agent_id,
+        authorSlug: c.agent_id,
         createdAt: c.created_at,
       })),
     });
@@ -1240,7 +1230,7 @@ export const closeTaskGroupSchema = z.object({
     .max(5000)
     .optional()
     .describe('Conclusion summary. Auto-generated if not provided.'),
-  agentId: z.string().optional().describe('Agent ID for attribution'),
+  sbSlug: z.string().optional().describe('SB slug for attribution'),
 });
 
 export async function handleCloseTaskGroup(
@@ -1309,15 +1299,10 @@ export async function handleCloseTaskGroup(
       conclusion: autoConclusion,
     });
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
-    const sbId = await resolveIdentityIdForAgent(
-      dataComposer,
-      resolved.user.id,
-      agentId,
-      workspaceId
-    );
+    const sbId = await resolveSbIdForSlug(dataComposer, resolved.user.id, sbSlug, workspaceId);
 
     const { error: commentError } = await dataComposer
       .getClient()
@@ -1327,7 +1312,7 @@ export async function handleCloseTaskGroup(
         user_id: resolved.user.id,
         content: autoConclusion,
         comment_type: 'conclusion',
-        agent_id: agentId || null,
+        agent_id: sbSlug || null,
         created_by_sb_id: sbId,
       } as never);
 
@@ -1338,7 +1323,7 @@ export async function handleCloseTaskGroup(
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId: agentId || 'system',
+        sbSlug: sbSlug || 'system',
         type: 'state_change',
         subtype: 'task_group_closed',
         content: `Group closed (${args.outcome}): ${autoConclusion}`,
@@ -1413,7 +1398,7 @@ export const createTaskGroupSchema = z.object({
     .describe('Expected deliverable type (spec, pr, report, proposal)'),
   outputStatus: taskGroupOutputStatusEnum.optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Agent identity to attribute the group to (defaults to caller)'),
@@ -1441,7 +1426,7 @@ export async function handleCreateTaskGroup(
       }
     }
 
-    const agentId = getEffectiveAgentId(args.agentId);
+    const sbSlug = getEffectiveSlug(args.sbSlug);
     const reqCtx = getRequestContext();
 
     if (!effectiveProjectId && reqCtx?.studioId) {
@@ -1455,10 +1440,10 @@ export async function handleCreateTaskGroup(
         }
       }
     }
-    const sbId = await resolveIdentityIdForAgent(
+    const sbId = await resolveSbIdForSlug(
       dataComposer,
       resolved.user.id,
-      agentId,
+      sbSlug,
       reqCtx?.workspaceId
     );
 
@@ -1491,7 +1476,7 @@ export async function handleCreateTaskGroup(
         tags: group.tags,
         projectId: group.project_id,
         sbId: group.sb_id,
-        agentId: agentId || null,
+        sbSlug: sbSlug || null,
         autonomous: group.autonomous,
         maxSessions: group.max_sessions,
         sessionsUsed: group.sessions_used,
@@ -1565,6 +1550,14 @@ export const updateTaskGroupSchema = z.object({
     .nullable()
     .optional()
     .describe('Cap on autonomous sessions spent on this group'),
+  projectId: z
+    .string()
+    .uuid()
+    .nullable()
+    .optional()
+    .describe(
+      'Re-home this group under a different project. Pass a project UUID to move it, or null to detach. The project must belong to the caller. Omit to leave unchanged.'
+    ),
 });
 
 export async function handleUpdateTaskGroup(
@@ -1633,6 +1626,20 @@ export async function handleUpdateTaskGroup(
       nextSbId = args.sbId;
     }
 
+    // Re-home the group under a different project. Service-role DB access
+    // bypasses RLS, so a target project UUID must be validated against the
+    // caller before it's written — mirrors create's check. `undefined` means
+    // "don't touch"; `null` means "detach" and is allowed without a lookup.
+    if (typeof args.projectId === 'string') {
+      const project = await dataComposer.repositories.projects.findById(args.projectId);
+      if (!project) {
+        return mcpResponse({ success: false, error: 'Project not found' }, true);
+      }
+      if (project.user_id !== resolved.user.id) {
+        return mcpResponse({ success: false, error: 'Project does not belong to this user' }, true);
+      }
+    }
+
     const updated = await dataComposer.repositories.taskGroups.update(args.groupId, {
       title: args.title,
       description: args.description,
@@ -1647,6 +1654,7 @@ export async function handleUpdateTaskGroup(
       sb_id: nextSbId,
       autonomous: args.autonomous,
       max_sessions: args.maxSessions,
+      project_id: args.projectId,
     });
 
     return mcpResponse({
@@ -1763,7 +1771,7 @@ export async function handleListTaskGroups(
     const projectMap = new Map(projects.filter(Boolean).map((p) => [p!.id, p!.name]));
 
     const sbIds = [...new Set(groups.map((g) => g.sb_id).filter(Boolean))] as string[];
-    const identityMap = new Map<string, { agentId: string; name: string | null }>();
+    const identityMap = new Map<string, { sbSlug: string; name: string | null }>();
     if (sbIds.length > 0) {
       const { data: identities } = await dataComposer
         .getClient()
@@ -1775,7 +1783,7 @@ export async function handleListTaskGroups(
         agent_id: string;
         name: string | null;
       }>) {
-        identityMap.set(row.id, { agentId: row.agent_id, name: row.name });
+        identityMap.set(row.id, { sbSlug: row.agent_id, name: row.name });
       }
     }
 
@@ -1791,7 +1799,7 @@ export async function handleListTaskGroups(
         projectId: g.project_id,
         projectName: g.project_id ? projectMap.get(g.project_id) || null : null,
         sbId: g.sb_id,
-        agentId: g.sb_id ? identityMap.get(g.sb_id)?.agentId || null : null,
+        sbSlug: g.sb_id ? identityMap.get(g.sb_id)?.sbSlug || null : null,
         agentName: g.sb_id ? identityMap.get(g.sb_id)?.name || null : null,
         autonomous: g.autonomous,
         maxSessions: g.max_sessions,

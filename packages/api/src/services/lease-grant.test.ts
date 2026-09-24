@@ -14,7 +14,7 @@ function rpcClient(result: { data?: unknown; error?: { message: string } }) {
 const LEASE: StudioLease = {
   sessionId: 'sess-1',
   threadKey: 'pr:900',
-  agentId: 'wren',
+  sbSlug: 'wren',
   acquiredAt: '2026-08-20T09:00:00.000Z',
   heartbeatAt: '2026-08-20T09:00:00.000Z',
 };

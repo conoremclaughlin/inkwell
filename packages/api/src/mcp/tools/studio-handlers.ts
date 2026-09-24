@@ -8,9 +8,8 @@
 
 import { z } from 'zod';
 import path from 'path';
-import { execFile, execSync } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { existsSync } from 'fs';
 import { access } from 'fs/promises';
 
 const execFileAsync = promisify(execFile);
@@ -18,7 +17,7 @@ import type { DataComposer } from '../../data/composer';
 import type { Json } from '../../data/supabase/types';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import { bootstrapStudio } from '@inklabs/shared';
+import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { resolveCaller, resolveImplicitSession } from './memory-handlers';
@@ -40,21 +39,17 @@ import {
 /**
  * Resolve the main git worktree root from any path (worktree or main repo).
  * If the given path is a linked worktree, returns the main worktree root.
- * Falls back to the original path if git fails or isn't available.
+ * No inferred root on failure: real creation requires a verified repository.
  */
-function resolveMainWorktree(dir: string): string {
-  try {
-    const output = execSync('git worktree list --porcelain', {
-      cwd: dir,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    // First entry in `git worktree list` is always the main worktree
-    const match = output.match(/^worktree\s+(.+)$/m);
-    return match ? match[1] : dir;
-  } catch {
-    return dir;
+async function resolveMainWorktree(dir: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain', '-z'], {
+    cwd: dir,
+  });
+  const first = stdout.split('\0')[0];
+  if (!first.startsWith('worktree ') || !path.isAbsolute(first.slice(9))) {
+    throw new Error('Could not resolve the main repository root');
   }
+  return first.slice(9);
 }
 
 // ============== Constants ==============
@@ -71,10 +66,14 @@ const WORK_TYPE_ABBREV: Record<string, string> = {
 // ============== Schemas ==============
 
 const createStudioSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID creating the studio (e.g., "wren")'),
+  sbSlug: z
+    .string()
+    .refine(isSafeStudioComponent, 'Invalid SB path component')
+    .describe('SB slug creating the studio (e.g., "wren")'),
   repoRoot: z.string().describe('Absolute path to the main repository root'),
   slug: z
     .string()
+    .refine(isSafeStudioComponent, 'Invalid studio path component')
     .describe('Short slug for the studio (used in branch name and worktree directory)'),
   workType: z
     .enum(['feature', 'bugfix', 'refactor', 'chore', 'experiment', 'other'])
@@ -114,7 +113,7 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
 });
 
 const listStudiosSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().optional().describe('Filter by agent ID'),
+  sbSlug: z.string().optional().describe('Filter by SB slug'),
   status: z
     .enum(['active', 'idle', 'archived', 'cleaned', 'all'])
     .optional()
@@ -131,15 +130,15 @@ const getStudioSchema = userIdentifierBaseSchema.extend({
   studioId: z.string().guid().optional().describe('Studio UUID'),
   branch: z.string().optional().describe('Branch name to look up'),
   path: z.string().optional().describe('Worktree path to look up'),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
-    .describe('Agent ID to disambiguate when multiple agents share the same branch or path'),
+    .describe('SB slug to disambiguate when multiple SBs share the same branch or path'),
 });
 
 const updateStudioSchema = userIdentifierBaseSchema.extend({
   studioId: z.string().guid().describe('Studio UUID to update'),
-  agentId: z.string().describe('Agent ID making the update'),
+  sbSlug: z.string().describe('SB slug making the update'),
   status: z.enum(['active', 'idle', 'archived']).optional().describe('New studio status'),
   purpose: z.string().optional().describe('Updated purpose description'),
   roleTemplate: z.string().optional().describe('Role template name to set'),
@@ -169,7 +168,7 @@ const updateStudioSchema = userIdentifierBaseSchema.extend({
 
 const closeStudioSchema = userIdentifierBaseSchema.extend({
   studioId: z.string().guid().describe('Studio UUID to close'),
-  agentId: z.string().describe('Agent ID closing the studio'),
+  sbSlug: z.string().describe('SB slug closing the studio'),
   removeWorktree: z
     .boolean()
     .optional()
@@ -183,7 +182,7 @@ const closeStudioSchema = userIdentifierBaseSchema.extend({
 });
 
 const adoptStudioSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID adopting the studio'),
+  sbSlug: z.string().describe('SB slug adopting the studio'),
   sessionId: z.string().guid().describe('Session ID to link to the studio'),
   studioId: z.string().guid().optional().describe('Studio UUID to adopt'),
   branch: z.string().optional().describe('Branch name to look up the studio'),
@@ -297,7 +296,7 @@ async function authorizeExplicitSession(
  * the thread home and the log line all carry.
  */
 interface ActingIdentity {
-  agentId: string;
+  sbSlug: string;
   /** Canonical identity UUID from the credential; absent on a user/admin token. */
   sbId?: string;
   /** True when the identity comes from an agent credential, not a user/admin token acting as a named agent. */
@@ -310,7 +309,7 @@ const CREATOR_SESSION_RULE =
 
 /**
  * Who this call acts as. For an agent-bound caller that is the credential's
- * identity and nothing else: the typed `agentId` is a claim, and a claim that
+ * identity and nothing else: the typed `sbSlug` is a claim, and a claim that
  * disagrees with the credential is refused rather than reconciled. Authorizing
  * the session proved the caller may act on it, not that the typed name is who
  * acted — a Lumen request typed as wren, naming Lumen's own valid session,
@@ -321,14 +320,14 @@ const CREATOR_SESSION_RULE =
  */
 function resolveActingIdentity(
   caller: CallerIdentity,
-  requestedAgentId: string,
+  requestedSlug: string,
   toolName: string
 ): { ok: true; actor: ActingIdentity } | { ok: false; error: string } {
-  if (caller.agentBound && caller.agentId && caller.agentId !== requestedAgentId) {
+  if (caller.agentBound && caller.sbSlug && caller.sbSlug !== requestedSlug) {
     return {
       ok: false,
       error:
-        `${toolName}: agentId ${requestedAgentId} is not the authenticated identity (${caller.agentId}). ` +
+        `${toolName}: sbSlug ${requestedSlug} is not the authenticated identity (${caller.sbSlug}). ` +
         'An agent creates or adopts a studio as itself; provisioning ground for another ' +
         'agent is a user/admin operation.',
     };
@@ -336,7 +335,7 @@ function resolveActingIdentity(
   return {
     ok: true,
     actor: {
-      agentId: caller.agentId ?? requestedAgentId,
+      sbSlug: caller.sbSlug ?? requestedSlug,
       sbId: caller.sbId,
       agentBound: caller.agentBound,
     },
@@ -353,10 +352,10 @@ function resolveActingIdentity(
  */
 function sessionIdentityMismatch(session: Session, actor: ActingIdentity): string | null {
   if (actor.sbId && session.sbId && session.sbId !== actor.sbId) {
-    return `session ${session.id} belongs to another identity (${session.sbId}), not ${actor.agentId}`;
+    return `session ${session.id} belongs to another identity (${session.sbId}), not ${actor.sbSlug}`;
   }
-  if (session.agentId !== actor.agentId) {
-    return `session ${session.id} belongs to agent ${session.agentId ?? '(none)'}, not ${actor.agentId}`;
+  if (session.sbSlug !== actor.sbSlug) {
+    return `session ${session.id} belongs to agent ${session.sbSlug ?? '(none)'}, not ${actor.sbSlug}`;
   }
   return null;
 }
@@ -373,19 +372,19 @@ function sessionIdentityMismatch(session: Session, actor: ActingIdentity): strin
  * unowned and stays adoptable.
  */
 function studioOwnershipMismatch(
-  studio: { id: string; agentId: string | null; sbId: string | null },
+  studio: { id: string; sbSlug: string | null; sbId: string | null },
   actor: ActingIdentity
 ): string | null {
   if (studio.sbId && actor.agentBound) {
     if (actor.sbId === studio.sbId) return null;
-    const owner = studio.agentId ?? 'another agent';
+    const owner = studio.sbSlug ?? 'another agent';
     const caller = actor.sbId
-      ? `${actor.agentId} (${actor.sbId})`
-      : `${actor.agentId} (no canonical identity on this credential)`;
+      ? `${actor.sbSlug} (${actor.sbId})`
+      : `${actor.sbSlug} (no canonical identity on this credential)`;
     return `Studio ${studio.id} belongs to identity ${studio.sbId} (${owner}), not to ${caller}`;
   }
-  if (studio.agentId && studio.agentId !== actor.agentId) {
-    return `Studio ${studio.id} belongs to ${studio.agentId}, not ${actor.agentId}`;
+  if (studio.sbSlug && studio.sbSlug !== actor.sbSlug) {
+    return `Studio ${studio.id} belongs to ${studio.sbSlug}, not ${actor.sbSlug}`;
   }
   return null;
 }
@@ -407,11 +406,11 @@ const participantTable = (supabase: ReturnType<DataComposer['getClient']>) =>
  */
 async function bindThreadHome(
   dataComposer: DataComposer,
-  opts: { userId: string; agentId: string; threadKey: string; sessionId: string; via: string }
+  opts: { userId: string; sbSlug: string; threadKey: string; sessionId: string; via: string }
 ): Promise<HomeSummary> {
   const supabase = dataComposer.getClient();
   // The agent is a principal in exactly one workspace; the thread lives there.
-  const sb = await resolveCallerSb(supabase, opts.userId, opts.agentId);
+  const sb = await resolveCallerSb(supabase, opts.userId, opts.sbSlug);
   const thread = await findOrCreateThread(supabase, {
     workspaceId: sb.workspaceId,
     threadKey: opts.threadKey,
@@ -481,7 +480,7 @@ async function recordStudioProvenance(
       expiresAt?: string | null;
     };
     userId: string;
-    agentId: string;
+    sbSlug: string;
     sbId?: string;
     sessionId?: string;
     sessionReason?: string;
@@ -490,7 +489,7 @@ async function recordStudioProvenance(
     via: StudioProvenanceVia;
   }
 ): Promise<{ lease: LeaseSummary | null; routing: RoutingOutcome; logged: boolean }> {
-  const { studio, userId, agentId, sessionId, threadKey, via } = opts;
+  const { studio, userId, sbSlug, sessionId, threadKey, via } = opts;
   const routing: RoutingOutcome = {
     threadKey: threadKey ?? null,
     patternInstalled: false,
@@ -517,7 +516,7 @@ async function recordStudioProvenance(
       try {
         routing.home = await bindThreadHome(dataComposer, {
           userId,
-          agentId,
+          sbSlug,
           threadKey,
           sessionId,
           via,
@@ -543,7 +542,7 @@ async function recordStudioProvenance(
         studioId: studio.id,
         sessionId,
         threadKey: leaseKey,
-        agentId,
+        sbSlug,
         sbId: opts.sbId,
         userId,
         reason: via,
@@ -576,7 +575,7 @@ async function recordStudioProvenance(
   try {
     await dataComposer.repositories.activityStream.logActivity({
       userId,
-      agentId,
+      sbSlug,
       sbId: opts.sbId,
       sessionId,
       type: 'state_change',
@@ -642,7 +641,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const {
-    agentId,
+    sbSlug,
     repoRoot,
     slug,
     workType = 'feature',
@@ -657,13 +656,13 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   } = parsed;
 
   // Who is creating this, from the signed request context — never from what
-  // the caller typed: the typed agentId must be the authenticated identity.
+  // the caller typed: the typed sbSlug must be the authenticated identity.
   // An explicit sessionId still wins (a human linking a studio to a known
   // session); otherwise the session the caller runs in, if it can be
   // identified unambiguously. Never guessed (Lumen, #596). Either way the
   // session must be the acting identity's own before it becomes the creator.
-  const caller = await resolveCaller(dataComposer, resolved.user.id, agentId);
-  const acting = resolveActingIdentity(caller, agentId, 'create_studio');
+  const caller = await resolveCaller(dataComposer, resolved.user.id, sbSlug);
+  const acting = resolveActingIdentity(caller, sbSlug, 'create_studio');
   if (!acting.ok) return errorResponse(acting.error);
   const { actor } = acting;
   let creatorSessionId: string | undefined;
@@ -711,28 +710,41 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   }
 
   // Resolve to the main worktree root (handles case where repoRoot is a linked worktree)
-  const mainRoot = resolveMainWorktree(repoRoot);
+  let mainRoot: string;
+  try {
+    mainRoot = await resolveMainWorktree(repoRoot);
+  } catch {
+    if (!skipGitOperations) return errorResponse('Could not resolve the main repository root');
+    // Explicit metadata-only creation also supports directories without git.
+    mainRoot = path.resolve(repoRoot);
+  }
 
   // Derive branch name and worktree path (sibling of the main repo root)
   const abbrev = WORK_TYPE_ABBREV[workType] || 'other';
-  const branch = `${actor.agentId}/${abbrev}/${slug}`;
-  const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+  const branch = `${actor.sbSlug}/${abbrev}/${slug}`;
+  const worktreePath = studioSiblingPath(mainRoot, slug);
 
   // Perform git operations if not skipped
   if (!skipGitOperations) {
     try {
       logger.info('Creating git worktree', { branch, worktreePath, baseBranch, repoRoot });
-      execSync(`git worktree add -b ${branch} ${worktreePath} ${baseBranch}`, {
-        cwd: repoRoot,
-        stdio: 'pipe',
-      });
+      await execFileAsync(
+        'git',
+        ['worktree', 'add', '-b', branch, '--', worktreePath, baseBranch],
+        { cwd: mainRoot }
+      );
 
       // Install dependencies if package.json exists
-      if (existsSync(path.join(worktreePath, 'package.json'))) {
+      if (
+        await access(path.join(worktreePath, 'package.json')).then(
+          () => true,
+          () => false
+        )
+      ) {
         logger.info('Installing dependencies in worktree', { worktreePath });
-        execSync('yarn install', {
+        await execFileAsync('yarn', ['install'], {
           cwd: worktreePath,
-          stdio: 'pipe',
+          maxBuffer: 20 * 1024 * 1024,
         });
       }
 
@@ -782,7 +794,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   try {
     studio = await dataComposer.repositories.studios.create({
       userId: resolved.user.id,
-      agentId: actor.agentId,
+      sbSlug: actor.sbSlug,
       sbId: actor.sbId,
       sessionId: creatorSessionId,
       repoRoot: mainRoot,
@@ -803,10 +815,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     if (!skipGitOperations) {
       try {
         logger.warn('DB insert failed, cleaning up worktree', { worktreePath });
-        execSync(`git worktree remove ${worktreePath}`, {
-          cwd: repoRoot,
-          stdio: 'pipe',
-        });
+        await execFileAsync('git', ['worktree', 'remove', '--', worktreePath], { cwd: mainRoot });
       } catch (cleanupError) {
         logger.error('Failed to clean up worktree after DB error', {
           worktreePath,
@@ -821,7 +830,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   const provenance = await recordStudioProvenance(dataComposer, {
     studio,
     userId: resolved.user.id,
-    agentId: actor.agentId,
+    sbSlug: actor.sbSlug,
     sbId: actor.sbId,
     sessionId: creatorSessionId,
     sessionReason: creatorSessionReason,
@@ -833,7 +842,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studioId: studio.id,
     branch,
     worktreePath,
-    agentId: actor.agentId,
+    sbSlug: actor.sbSlug,
     sessionId: creatorSessionId ?? null,
     threadKey: threadKey ?? null,
     ephemeral,
@@ -856,7 +865,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studio: {
       id: studio.id,
       studioId: studio.id,
-      agentId: studio.agentId,
+      sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
       worktreePath: studio.worktreePath,
@@ -877,23 +886,23 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
   const parsed = listStudiosSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { agentId, status = 'all', includeAll = false } = parsed;
+  const { sbSlug, status = 'all', includeAll = false } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
   let studios;
   if (status !== 'all') {
     studios = await studiosRepo.listByUser(resolved.user.id, {
       status: status as 'active' | 'idle' | 'archived' | 'cleaned',
-      agentId: agentId || undefined,
+      sbSlug: sbSlug || undefined,
     });
   } else if (includeAll) {
     studios = await studiosRepo.listByUser(resolved.user.id, {
-      agentId: agentId || undefined,
+      sbSlug: sbSlug || undefined,
     });
   } else {
     // Default: get all but exclude 'cleaned'
     const all = await studiosRepo.listByUser(resolved.user.id, {
-      agentId: agentId || undefined,
+      sbSlug: sbSlug || undefined,
     });
     studios = all.filter((w) => w.status !== 'cleaned');
   }
@@ -903,7 +912,7 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
     studios: studios.map((w) => ({
       id: w.id,
       studioId: w.id,
-      agentId: w.agentId,
+      sbSlug: w.sbSlug,
       branch: w.branch,
       worktreePath: w.worktreePath,
       worktreeFolder: path.basename(w.worktreePath),
@@ -930,7 +939,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
   const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
   const studiosRepo = dataComposer.repositories.studios;
-  const scope = { userId: user.id, agentId: parsed.agentId };
+  const scope = { userId: user.id, sbSlug: parsed.sbSlug };
   let studio = null;
 
   // Try identifiers in order: studioId, branch, path
@@ -952,7 +961,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
     studio: {
       id: studio.id,
       studioId: studio.id,
-      agentId: studio.agentId,
+      sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
       worktreePath: studio.worktreePath,
@@ -983,7 +992,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
 
   const {
     studioId,
-    agentId,
+    sbSlug,
     status,
     purpose,
     roleTemplate,
@@ -1044,14 +1053,14 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     updated = await studiosRepo.update(studioId, updateObj);
   }
 
-  logger.info('Studio updated', { studioId, agentId, status: updated.status });
+  logger.info('Studio updated', { studioId, sbSlug, status: updated.status });
 
   return successResponse({
     message: 'Studio updated',
     studio: {
       id: updated.id,
       studioId: updated.id,
-      agentId: updated.agentId,
+      sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),
       worktreePath: updated.worktreePath,
@@ -1069,7 +1078,7 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
   const parsed = closeStudioSchema.parse(args);
   const { user: closingUser } = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { studioId, agentId, removeWorktree = true, deleteBranch = false } = parsed;
+  const { studioId, sbSlug, removeWorktree = true, deleteBranch = false } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
   // Verify studio exists AND belongs to the closing user — repository lookups
@@ -1266,7 +1275,7 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
 
   logger.info('Studio closed', {
     studioId,
-    agentId,
+    sbSlug,
     worktreeRemoved: cleanupResults.worktreeRemoved,
     branchDeleted: cleanupResults.branchDeleted,
   });
@@ -1283,13 +1292,13 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   const parsed = adoptStudioSchema.parse(args);
   const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { agentId, sessionId, routePatterns, threadKey } = parsed;
+  const { sbSlug, sessionId, routePatterns, threadKey } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
-  const caller = await resolveCaller(dataComposer, user.id, agentId);
-  const acting = resolveActingIdentity(caller, agentId, 'adopt_studio');
+  const caller = await resolveCaller(dataComposer, user.id, sbSlug);
+  const acting = resolveActingIdentity(caller, sbSlug, 'adopt_studio');
   if (!acting.ok) return errorResponse(acting.error);
   const { actor } = acting;
-  const scope = { userId: user.id, agentId: actor.agentId };
+  const scope = { userId: user.id, sbSlug: actor.sbSlug };
   const authorized = await authorizeExplicitSession(
     dataComposer,
     user.id,
@@ -1355,7 +1364,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   const provenance = await recordStudioProvenance(dataComposer, {
     studio: updated,
     userId: user.id,
-    agentId: actor.agentId,
+    sbSlug: actor.sbSlug,
     sbId: actor.sbId,
     sessionId,
     threadKey,
@@ -1364,14 +1373,14 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   });
   logger.info('Studio adopted', {
     studioId: updated.id,
-    agentId: actor.agentId,
+    sbSlug: actor.sbSlug,
     sessionId,
     threadKey: threadKey ?? null,
     lease: provenance.lease,
   });
 
   return successResponse({
-    message: `Studio adopted by ${actor.agentId} and linked to session ${sessionId}`,
+    message: `Studio adopted by ${actor.sbSlug} and linked to session ${sessionId}`,
     provenance: { sessionId, logged: provenance.logged },
     lease: provenance.lease,
     routing: provenance.routing,
@@ -1380,7 +1389,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     studio: {
       id: updated.id,
       studioId: updated.id,
-      agentId: updated.agentId,
+      sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),
       worktreePath: updated.worktreePath,
@@ -1395,7 +1404,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
 }
 
 const registerStudioSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID to own the studio'),
+  sbSlug: z.string().describe('SB slug to own the studio'),
   repoRoot: z.string().describe('Absolute path to the repository root'),
 });
 
@@ -1408,12 +1417,12 @@ export async function handleRegisterStudio(args: unknown, dataComposer: DataComp
     dataComposer.getClient(),
     user.id,
     parsed.repoRoot,
-    parsed.agentId
+    parsed.sbSlug
   );
 
   const studioId =
     existingId ??
-    (await resolveMainStudio(dataComposer.getClient(), user.id, parsed.repoRoot, parsed.agentId, {
+    (await resolveMainStudio(dataComposer.getClient(), user.id, parsed.repoRoot, parsed.sbSlug, {
       autoCreate: true,
     }));
 
@@ -1433,7 +1442,7 @@ export async function handleRegisterStudio(args: unknown, dataComposer: DataComp
       repoRoot: studio.repoRoot,
       worktreePath: studio.worktreePath,
       branch: studio.branch,
-      agentId: studio.agentId,
+      sbSlug: studio.sbSlug,
       status: studio.status,
     },
     created: !existingId,

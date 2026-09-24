@@ -1,7 +1,7 @@
 /**
  * Studio Commands
  *
- * Manage git worktrees for parallel development with PCP identity.
+ * Manage git worktrees for parallel development with Inkwell identity.
  *
  * Commands:
  *   studio init [name]     Initialize parent directory structure
@@ -40,9 +40,9 @@ import {
 } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
-import { installHooks, callPcpTool } from './hooks.js';
+import { installHooks, callInkTool } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
-import { resolveAgentId } from '../backends/identity.js';
+import { resolveSlug, normalizeIdentityJson } from '../backends/identity.js';
 import { registerStudioSandboxCommands } from './studio-sandbox.js';
 import { copyBootstrapFiles, syncMcpConfig } from '@inklabs/shared';
 
@@ -50,7 +50,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 interface StudioIdentity {
-  agentId: string;
+  sbSlug: string;
   sbId?: string;
   context: string;
   backend?: string;
@@ -71,7 +71,7 @@ interface StudioInfo {
 }
 
 interface RenameIdentity {
-  agentId?: string;
+  sbSlug?: string;
   branch?: string;
   studioId?: string;
   studio?: string;
@@ -154,10 +154,10 @@ function branchExists(branch: string, cwd?: string): boolean {
 }
 
 function getCurrentUser(): string | undefined {
-  const pcpConfigPath = join(homedir(), '.ink', 'config.json');
-  if (existsSync(pcpConfigPath)) {
+  const inkConfigPath = join(homedir(), '.ink', 'config.json');
+  if (existsSync(inkConfigPath)) {
     try {
-      const config = JSON.parse(readFileSync(pcpConfigPath, 'utf-8'));
+      const config = JSON.parse(readFileSync(inkConfigPath, 'utf-8'));
       return config.email || config.userId;
     } catch {
       // Fall through
@@ -192,7 +192,7 @@ function listStudios(gitRoot: string): StudioInfo[] {
         const identityPath = join(wsPath, '.ink', 'identity.json');
         if (existsSync(identityPath)) {
           try {
-            identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
+            identity = normalizeIdentityJson(JSON.parse(readFileSync(identityPath, 'utf-8')));
           } catch {
             // Ignore
           }
@@ -297,12 +297,12 @@ function slugifyStudioNameForBranch(name: string): string {
   return normalized || 'studio';
 }
 
-function getDefaultStudioMainBranch(agentId: string, studioName: string): string {
-  return `${agentId}/studio/main-${slugifyStudioNameForBranch(studioName)}`;
+function getDefaultStudioMainBranch(sbSlug: string, studioName: string): string {
+  return `${sbSlug}/studio/main-${slugifyStudioNameForBranch(studioName)}`;
 }
 
-function getLegacyDefaultStudioMainBranch(agentId: string): string {
-  return `${agentId}/studio/main`;
+function getLegacyDefaultStudioMainBranch(sbSlug: string): string {
+  return `${sbSlug}/studio/main`;
 }
 
 function isPromptCancelError(err: unknown): boolean {
@@ -322,7 +322,7 @@ function isPromptCancelError(err: unknown): boolean {
  * Run the full interactive studio creation flow when name is omitted and stdin is a TTY.
  * Returns the resolved name, branch, and config dirs to copy.
  */
-async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<InteractiveResult> {
+async function runInteractiveFlow(sbSlug: string, gitRoot: string): Promise<InteractiveResult> {
   const { input, checkbox, confirm } = await import('@inquirer/prompts');
 
   // Step 1: Studio name
@@ -332,7 +332,7 @@ async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<Int
   });
 
   // Step 2: Branch name (derived, editable)
-  const defaultBranch = getDefaultStudioMainBranch(agentId, name);
+  const defaultBranch = getDefaultStudioMainBranch(sbSlug, name);
   const branch = await input({
     message: 'Branch name',
     default: defaultBranch,
@@ -535,21 +535,21 @@ interface StudioBranchRenamePlan {
 }
 
 function planStudioHomeBranchRename(
-  identity: Pick<RenameIdentity, 'agentId' | 'branch'> | null | undefined,
+  identity: Pick<RenameIdentity, 'sbSlug' | 'branch'> | null | undefined,
   from: string,
   to: string
 ): StudioBranchRenamePlan | null {
   if (!identity) return null;
-  if (!identity.agentId || !identity.branch) return null;
+  if (!identity.sbSlug || !identity.branch) return null;
 
-  const oldDefault = getDefaultStudioMainBranch(identity.agentId, from);
-  const oldLegacyDefault = getLegacyDefaultStudioMainBranch(identity.agentId);
+  const oldDefault = getDefaultStudioMainBranch(identity.sbSlug, from);
+  const oldLegacyDefault = getLegacyDefaultStudioMainBranch(identity.sbSlug);
 
   if (identity.branch !== oldDefault && identity.branch !== oldLegacyDefault) {
     return null;
   }
 
-  const nextDefault = getDefaultStudioMainBranch(identity.agentId, to);
+  const nextDefault = getDefaultStudioMainBranch(identity.sbSlug, to);
   if (identity.branch === nextDefault) return null;
 
   return { fromBranch: identity.branch, toBranch: nextDefault };
@@ -653,7 +653,7 @@ async function initStudio(
   if (!parentName) {
     console.error(chalk.red('Error: Parent directory name is required.'));
     console.error(chalk.dim('Usage: ink studio init <parent-name>'));
-    console.error(chalk.dim('Example: ink studio init pcp'));
+    console.error(chalk.dim('Example: ink studio init inkwell'));
     process.exit(1);
   }
 
@@ -726,7 +726,7 @@ async function initStudio(
     console.log(chalk.dim(`  cd ${mainMove.to}`));
     console.log('');
     console.log(chalk.dim('Note: Claude Code sessions from the old path will not carry over.'));
-    console.log(chalk.dim('PCP memories persist automatically via bootstrap.'));
+    console.log(chalk.dim('Inkwell memories persist automatically via bootstrap.'));
   } catch (error) {
     spinner.fail(`Failed to initialize: ${error}`);
     console.error('');
@@ -759,13 +759,13 @@ async function createStudio(
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
-  const agentId = options.agent || resolveAgentId() || 'sb';
+  const sbSlug = options.agent || resolveSlug() || 'sb';
   const spinner = ora(`Creating studio: ${name}`).start();
 
   try {
     const gitRoot = findGitRoot();
     const wsPath = getStudioPath(gitRoot, name);
-    const branch = overrides?.branch || options.branch || getDefaultStudioMainBranch(agentId, name);
+    const branch = overrides?.branch || options.branch || getDefaultStudioMainBranch(sbSlug, name);
 
     spinner.text = 'Creating studio...';
     const createResult = await createStudioInner(name, options, overrides);
@@ -779,7 +779,7 @@ async function createStudio(
     console.log('');
     console.log(chalk.dim('  Path:   ') + wsPath);
     console.log(chalk.dim('  Branch: ') + branch);
-    console.log(chalk.dim('  Agent:  ') + agentId);
+    console.log(chalk.dim('  Agent:  ') + sbSlug);
     if (options.template) {
       console.log(chalk.dim('  Role:   ') + options.template + chalk.dim(' (.ink/ROLE.md)'));
     }
@@ -815,17 +815,17 @@ const DEFAULT_STUDIO_SET: Array<{ suffix: string; template: string; purpose: str
 ];
 
 async function setupStudios(
-  agentId: string,
+  sbSlug: string,
   options: { backend?: string; copyFrom?: string; inheritClaudePermissions?: boolean }
 ): Promise<void> {
-  console.log(chalk.bold(`\nSetting up studios for ${chalk.cyan(agentId)}...\n`));
+  console.log(chalk.bold(`\nSetting up studios for ${chalk.cyan(sbSlug)}...\n`));
 
   const gitRoot = findGitRoot();
   const results: Array<{ name: string; status: 'created' | 'exists' | 'failed'; path: string }> =
     [];
 
   for (const studio of DEFAULT_STUDIO_SET) {
-    const name = `${agentId}-${studio.suffix}`;
+    const name = `${sbSlug}-${studio.suffix}`;
     const wsPath = getStudioPath(gitRoot, name);
 
     if (existsSync(wsPath)) {
@@ -836,7 +836,7 @@ async function setupStudios(
     const spinner = ora(`Creating studio: ${name}`).start();
     try {
       await createStudioInner(name, {
-        agent: agentId,
+        agent: sbSlug,
         purpose: studio.purpose,
         template: studio.template,
         backend: options.backend,
@@ -894,11 +894,11 @@ async function createStudioInner(
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<StudioCreateResult> {
-  const agentId = options.agent || resolveAgentId() || 'sb';
+  const sbSlug = options.agent || resolveSlug() || 'sb';
   const gitRoot = findGitRoot();
   const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
   const wsPath = getStudioPath(gitRoot, name);
-  const branch = overrides?.branch || options.branch || getDefaultStudioMainBranch(agentId, name);
+  const branch = overrides?.branch || options.branch || getDefaultStudioMainBranch(sbSlug, name);
 
   if (existsSync(wsPath)) {
     throw new Error(`Studio already exists at ${wsPath}`);
@@ -948,9 +948,9 @@ async function createStudioInner(
     }
   }
 
-  // PCP identity
-  const pcpDir = join(wsPath, '.ink');
-  mkdirSync(pcpDir, { recursive: true });
+  // Inkwell identity
+  const inkDir = join(wsPath, '.ink');
+  mkdirSync(inkDir, { recursive: true });
 
   let sbId: string | undefined;
   const auth = loadAuth();
@@ -962,7 +962,7 @@ async function createStudioInner(
   }
 
   const identity: StudioIdentity = {
-    agentId,
+    sbSlug,
     ...(sbId ? { sbId } : {}),
     context: `studio-${name}`,
     ...(options.backend ? { backend: options.backend } : {}),
@@ -974,10 +974,10 @@ async function createStudioInner(
     createdBy: getCurrentUser(),
   };
 
-  writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+  writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
   if (roleContent) {
-    writeFileSync(join(pcpDir, 'ROLE.md'), roleContent);
+    writeFileSync(join(inkDir, 'ROLE.md'), roleContent);
   }
 
   // Install hooks for all backends (claude, codex, gemini) in every studio.
@@ -1019,7 +1019,9 @@ async function renameStudio(from: string, to: string): Promise<void> {
     try {
       const identityPath = join(fromPath, '.ink', 'identity.json');
       if (existsSync(identityPath)) {
-        const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as RenameIdentity;
+        const identity = normalizeIdentityJson(
+          JSON.parse(readFileSync(identityPath, 'utf-8'))
+        ) as RenameIdentity;
         studioId = identity.studioId;
         branchRenamePlan = planStudioHomeBranchRename(identity, from, to);
       }
@@ -1056,9 +1058,9 @@ async function renameStudio(from: string, to: string): Promise<void> {
     if (studioId) {
       spinner.text = 'Syncing rename to cloud...';
       try {
-        await callPcpTool('update_studio', {
+        await callInkTool('update_studio', {
           studioId,
-          agentId: resolveAgentId() || 'unknown',
+          sbSlug: resolveSlug() || 'unknown',
           worktreePath: toPath,
           slug: to,
         });
@@ -1101,7 +1103,7 @@ function listCommand(): void {
     return;
   }
 
-  console.log(chalk.bold('\nPCP Studios:\n'));
+  console.log(chalk.bold('\nInkwell Studios:\n'));
 
   for (const ws of studios) {
     console.log(chalk.cyan(`  ${ws.name}`));
@@ -1109,7 +1111,7 @@ function listCommand(): void {
     console.log(chalk.dim(`    Path:   ${ws.path}`));
     console.log(chalk.dim(`    Branch: ${ws.branch}`));
     if (ws.identity) {
-      console.log(chalk.dim(`    Agent:  ${ws.identity.agentId}`));
+      console.log(chalk.dim(`    Agent:  ${ws.identity.sbSlug}`));
       if (ws.identity.createdBy) {
         console.log(chalk.dim(`    Owner:  ${ws.identity.createdBy}`));
       }
@@ -1281,8 +1283,10 @@ function resolveDefaultCliName(): string {
   const identityPath = join(cwd, '.ink', 'identity.json');
   if (existsSync(identityPath)) {
     try {
-      const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-      if (identity.agentId) return `ink-${identity.agentId}`;
+      const identity = normalizeIdentityJson(JSON.parse(readFileSync(identityPath, 'utf-8'))) as {
+        sbSlug?: string;
+      };
+      if (identity.sbSlug) return `ink-${identity.sbSlug}`;
     } catch {
       // fall through
     }
@@ -1457,11 +1461,11 @@ export type { InitResult };
 async function registerStudioCommand(options: { agent?: string }): Promise<void> {
   const gitRoot = findGitRoot();
   const repoRoot = resolveCanonicalRepoRoot(gitRoot);
-  const agentId = options.agent || resolveAgentId();
+  const sbSlug = options.agent || resolveSlug();
   const email = getCurrentUser();
 
-  if (!agentId) {
-    console.error(chalk.red('No agent ID found. Use --agent <id> or set up .ink/identity.json'));
+  if (!sbSlug) {
+    console.error(chalk.red('No SB slug found. Use --agent <id> or set up .ink/identity.json'));
     process.exit(1);
   }
 
@@ -1471,12 +1475,12 @@ async function registerStudioCommand(options: { agent?: string }): Promise<void>
   }
 
   const repoName = basename(repoRoot);
-  console.log(chalk.dim(`Registering ${repoName} for agent ${agentId}...`));
+  console.log(chalk.dim(`Registering ${repoName} for agent ${sbSlug}...`));
 
   try {
-    const result = await callPcpTool('register_studio', {
+    const result = await callInkTool('register_studio', {
       email,
-      agentId,
+      sbSlug,
       repoRoot,
     });
 
@@ -1495,7 +1499,7 @@ async function registerStudioCommand(options: { agent?: string }): Promise<void>
     }
     console.log(chalk.dim(`  id:    ${studio.id}`));
     console.log(chalk.dim(`  slug:  ${studio.slug}`));
-    console.log(chalk.dim(`  agent: ${studio.agentId}`));
+    console.log(chalk.dim(`  agent: ${studio.sbSlug}`));
     console.log(chalk.dim(`  path:  ${studio.worktreePath}`));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -1518,11 +1522,11 @@ export function registerStudioCommands(program: Command): void {
   studio
     .command('create [name]')
     .description('Create a new studio with git worktree')
-    .option('-a, --agent <agent>', 'Agent ID for this studio')
+    .option('-a, --agent <agent>', 'SB slug for this studio')
     .option('-p, --purpose <desc>', 'Description/purpose of the studio')
     .option(
       '-br, --branch <branch>',
-      'Custom branch name (default: <agentId>/studio/main-<studio-name>)'
+      'Custom branch name (default: <sbSlug>/studio/main-<studio-name>)'
     )
     .option('-b, --backend <name>', 'Primary backend (claude-code, codex, gemini)')
     .option('-t, --template <name>', 'Role template (reviewer, builder, product, or custom)')
@@ -1546,8 +1550,8 @@ export function registerStudioCommands(program: Command): void {
         try {
           const gitRoot = findGitRoot();
           const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
-          const agentId = options.agent || resolveAgentId() || 'sb';
-          const result = await runInteractiveFlow(agentId, copySourceRoot);
+          const sbSlug = options.agent || resolveSlug() || 'sb';
+          const result = await runInteractiveFlow(sbSlug, copySourceRoot);
           return createStudio(
             result.name,
             { ...options, inheritClaudePermissions: result.inheritClaudePermissions },
@@ -1600,7 +1604,7 @@ export function registerStudioCommands(program: Command): void {
     .action(cdCommand);
 
   studio
-    .command('setup <agentId>')
+    .command('setup <sbSlug>')
     .description('Create a standard set of studios (review, build, product) for an agent')
     .option('-b, --backend <name>', 'Primary backend (claude-code, codex, gemini)')
     .option(
@@ -1623,7 +1627,7 @@ export function registerStudioCommands(program: Command): void {
   studio
     .command('register')
     .description('Register the current repository as a studio (makes it visible in the dashboard)')
-    .option('-a, --agent <agent>', 'Agent ID to own the studio')
+    .option('-a, --agent <agent>', 'SB slug to own the studio')
     .action(registerStudioCommand);
 
   registerStudioSandboxCommands(studio);

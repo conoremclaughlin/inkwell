@@ -22,7 +22,7 @@ export interface StudioSandboxContext {
   studioPath: string;
   studioName: string;
   studioId?: string;
-  agentId?: string;
+  sbSlug?: string;
   canonicalRepoRoot: string;
   canonicalGitDir?: string;
   worktreePaths: string[];
@@ -287,7 +287,7 @@ export function getStudioSandboxContext(cwd: string): StudioSandboxContext {
     studioPath,
     studioName: identity?.studio || basename(studioPath),
     studioId: identity?.studioId,
-    agentId: identity?.agentId,
+    sbSlug: identity?.sbSlug,
     canonicalRepoRoot,
     canonicalGitDir: resolveCanonicalGitDir(canonicalRepoRoot),
     worktreePaths: getWorktreePaths(canonicalRepoRoot),
@@ -386,7 +386,7 @@ export function buildStudioSandboxPlan(
     env: {
       HOME: CONTAINER_HOME,
       INK_SERVER_URL: resolveSandboxServerUrl(),
-      ...(context.agentId ? { AGENT_ID: context.agentId } : {}),
+      ...(context.sbSlug ? { SB_SLUG: context.sbSlug, AGENT_ID: context.sbSlug } : {}),
       ...(context.studioId ? { INK_STUDIO_ID: context.studioId } : {}),
       INK_SANDBOX: 'docker',
       INK_STUDIO_PATH: '/studio',
@@ -416,8 +416,8 @@ export function buildDockerRunArgs(
   args.push('--workdir', plan.workdir);
   args.push('--add-host', 'host.docker.internal:host-gateway');
   args.push('--hostname', plan.containerName);
-  args.push('--label', 'pcp.studio-sandbox=true');
-  args.push('--label', `pcp.studio.path=${plan.context.studioPath}`);
+  args.push('--label', 'ink.studio-sandbox=true');
+  args.push('--label', `ink.studio.path=${plan.context.studioPath}`);
 
   if (plan.uid !== undefined && plan.gid !== undefined) {
     args.push('--user', `${plan.uid}:${plan.gid}`);

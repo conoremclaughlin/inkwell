@@ -12,7 +12,7 @@ function mkMsg(id: string, sender = 'lumen') {
   msgClock += 1;
   return {
     id,
-    senderAgentId: sender,
+    senderSlug: sender,
     content: `content ${id}`,
     messageType: 'message',
     createdAt: new Date(1700000000000 + msgClock * 1000).toISOString(),
@@ -48,7 +48,7 @@ function createHarness(
   const notifications: Array<{ content: string; meta: Record<string, unknown> }> = [];
 
   const deps: PollDeps = {
-    callPcp: vi.fn(async (tool: string, args: Record<string, unknown>) => {
+    callInk: vi.fn(async (tool: string, args: Record<string, unknown>) => {
       if (tool === 'get_thread_messages') {
         fetchArgs.push(args);
         const fixture = threadFixtures[args.threadKey as string];
@@ -73,7 +73,7 @@ function createHarness(
       notifications.push({ content, meta });
     }),
     log: vi.fn(),
-    agentId: 'wren',
+    sbSlug: 'wren',
     email: 'test@test.com',
     studioId: 'studio-1',
   };
@@ -156,7 +156,7 @@ describe('drainThreads — cold-fetch ack protocol (spec §1)', () => {
 
     // Poll 1: emit succeeds but the ack write fails.
     const h1 = createHarness({ 'pr:x': { messages: msgs, skipped: 3 } });
-    (h1.deps.callPcp as ReturnType<typeof vi.fn>).mockImplementation(
+    (h1.deps.callInk as ReturnType<typeof vi.fn>).mockImplementation(
       async (tool: string, args: Record<string, unknown>) => {
         if (tool === 'get_thread_messages') {
           h1.fetchArgs.push(args);
@@ -302,7 +302,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     const ackArgs: Array<Record<string, unknown>> = [];
     const notifications: Array<{ content: string; meta: Record<string, unknown> }> = [];
     const deps: PollDeps = {
-      callPcp: vi.fn(async (tool: string, args: Record<string, unknown>) => {
+      callInk: vi.fn(async (tool: string, args: Record<string, unknown>) => {
         if (tool === 'mark_inbox_read') {
           ackArgs.push(args);
           return opts.ackFail ? { success: false } : { success: true };
@@ -316,7 +316,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
         notifications.push({ content, meta });
       }),
       log: vi.fn(),
-      agentId: 'wren',
+      sbSlug: 'wren',
       email: 'test@test.com',
       studioId: 'studio-1',
     };
@@ -341,7 +341,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     expect(notifications).toHaveLength(3);
     // Delivered oldest-first; the ack is the newest processed id.
     expect(ackArgs).toHaveLength(1);
-    expect(ackArgs[0]).toMatchObject({ agentId: 'wren', throughMessageId: 'm3' });
+    expect(ackArgs[0]).toMatchObject({ sbSlug: 'wren', throughMessageId: 'm3' });
   });
 
   it('an emit failure stops the ack range — the newer remainder redelivers', async () => {
@@ -366,13 +366,13 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     const { deps, ackArgs, notifications } = legacyHarness();
     const seen = new Set<string>();
     const page = [
-      { ...mkMsg('own'), senderAgentId: 'wren', createdAt: '2026-08-16T12:00:00Z' },
+      { ...mkMsg('own'), senderSlug: 'wren', createdAt: '2026-08-16T12:00:00Z' },
       { ...mkMsg('m1'), createdAt: '2026-08-16T10:00:00Z' },
     ];
 
     // Skip own messages (the caller-side filter).
     const res = await drainLegacyInbox(deps, seen, page, (m) =>
-      m.senderAgentId === 'wren' ? 'skip' : 'deliver'
+      m.senderSlug === 'wren' ? 'skip' : 'deliver'
     );
 
     expect(res.injected).toBe(1);

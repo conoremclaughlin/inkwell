@@ -24,7 +24,7 @@ vi.mock('../../utils/request-context', async (original) => ({
   ...(await original<typeof import('../../utils/request-context')>()),
   getRequestContext: vi.fn().mockReturnValue({ userId: 'user-a', sessionId: 'session-a' }),
   getSessionContext: vi.fn().mockReturnValue(undefined),
-  getPinnedAgentId: vi.fn().mockReturnValue(undefined),
+  getPinnedSlug: vi.fn().mockReturnValue(undefined),
 }));
 vi.mock('../../channels/agent-gateway', () => ({
   getAgentGateway: vi.fn().mockReturnValue({
@@ -73,8 +73,8 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     const db = client();
     await handleSendToInbox(
       {
-        senderAgentId: 'wren',
-        recipientAgentId: 'lumen',
+        senderSlug: 'wren',
+        recipientSlug: 'lumen',
         threadKey: 'pr:618',
         content: 'hello',
         triggerAgents: ['nonparticipant'],
@@ -87,7 +87,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
   it('the full human send path wakes every SB on an existing thread, not only the addressed one', async () => {
     const db = client();
     await handleSendToInbox(
-      { recipientAgentId: 'lumen', threadKey: 'pr:618', content: 'human reply' },
+      { recipientSlug: 'lumen', threadKey: 'pr:618', content: 'human reply' },
       { getClient: () => db } as never,
       { sender: { principal: userPrincipal('user-a'), workspaceId: 'ws-a' } }
     );
@@ -119,7 +119,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     }) as never;
     await expect(
       handleSendToInbox(
-        { recipientAgentId: 'lumen', threadKey: 'pr:618', content: 'human reply', trigger: false },
+        { recipientSlug: 'lumen', threadKey: 'pr:618', content: 'human reply', trigger: false },
         { getClient: () => db } as never,
         { sender: { principal: userPrincipal('user-a'), workspaceId: 'ws-a' } }
       )
@@ -139,7 +139,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
       return q;
     }) as never;
     await handleSendToInbox(
-      { recipientAgentId: 'lumen', threadKey: 'pr:618', content: 'human reply', trigger: false },
+      { recipientSlug: 'lumen', threadKey: 'pr:618', content: 'human reply', trigger: false },
       { getClient: () => db } as never,
       { sender: { principal: userPrincipal('user-a'), workspaceId: 'ws-a' } }
     );
@@ -150,7 +150,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
   it("an SB's dispatch carries its own identity so a failure notice can find its owner", async () => {
     const db = client();
     await handleSendToInbox(
-      { senderAgentId: 'wren', recipientAgentId: 'lumen', threadKey: 'pr:618', content: 'hi' },
+      { senderSlug: 'wren', recipientSlug: 'lumen', threadKey: 'pr:618', content: 'hi' },
       { getClient: () => db } as never
     );
     const payloads = vi.mocked(getAgentGateway().dispatchTrigger).mock.calls.map((c) => c[0]);
@@ -174,11 +174,11 @@ describe('send boundary (Lumen, #618 round 1)', () => {
       workspace_members: [{ workspace_id: 'ws-a', user_id: 'user-a', role: 'member' }],
     });
     await handleAddThreadParticipant(
-      { threadKey: 'pr:618', addedByAgentId: 'wren', agentId: 'lumen' },
+      { threadKey: 'pr:618', addedBySlug: 'wren', sbSlug: 'lumen' },
       { getClient: () => db } as never
     );
     const payloads = vi.mocked(getAgentGateway().dispatchTrigger).mock.calls.map((c) => c[0]);
-    expect(payloads.map((p) => [p.fromAgentId, p.fromSbId, p.toSbId])).toEqual([
+    expect(payloads.map((p) => [p.fromSlug, p.fromSbId, p.toSbId])).toEqual([
       ['wren', 'sb-a', 'sb-b'],
     ]);
   });
@@ -188,12 +188,12 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     await db.from('workspace_members').update({ role: 'viewer' }).eq('user_id', 'user-a');
     await expect(
       handleSendToInbox(
-        { senderAgentId: 'wren', recipientAgentId: 'lumen', threadKey: 'pr:618', content: 'hi' },
+        { senderSlug: 'wren', recipientSlug: 'lumen', threadKey: 'pr:618', content: 'hi' },
         { getClient: () => db } as never
       )
     ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
     await expect(
-      handleAddThreadParticipant({ threadKey: 'pr:618', addedByAgentId: 'wren', agentId: 'myra' }, {
+      handleAddThreadParticipant({ threadKey: 'pr:618', addedBySlug: 'wren', sbSlug: 'myra' }, {
         getClient: () => db,
       } as never)
     ).rejects.toThrow('Your role in this workspace (viewer) cannot add a participant');
@@ -202,7 +202,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
   });
 
   it("a person's token sending without a sender name writes as THEMSELVES — a viewer is refused, a member's message is the person's, and 'system' from a tool is refused (#624)", async () => {
-    // No senderAgentId and no internal context: an external token whose
+    // No senderSlug and no internal context: an external token whose
     // user is a person. The message is theirs, their role gates it, and
     // system authorship is not something a tool call can claim.
     // The server resolved ws-a for this person's request (header or session).
@@ -216,7 +216,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     await viewer.from('workspace_members').update({ role: 'viewer' }).eq('user_id', 'user-a');
     await expect(
       handleSendToInbox(
-        { recipientAgentId: 'wren', threadKey: 'pr:618', content: 'hello', trigger: false },
+        { recipientSlug: 'wren', threadKey: 'pr:618', content: 'hello', trigger: false },
         { getClient: () => viewer } as never
       )
     ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
@@ -224,7 +224,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
 
     const member = client();
     await handleSendToInbox(
-      { recipientAgentId: 'wren', threadKey: 'pr:618', content: 'hello', trigger: false },
+      { recipientSlug: 'wren', threadKey: 'pr:618', content: 'hello', trigger: false },
       { getClient: () => member } as never
     );
     const rows = (await member.from('inbox_thread_messages').select('*')).data;
@@ -243,8 +243,8 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     await expect(
       handleSendToInbox(
         {
-          senderAgentId: 'system',
-          recipientAgentId: 'wren',
+          senderSlug: 'system',
+          recipientSlug: 'wren',
           threadKey: 'pr:618',
           content: 'x',
           trigger: false,
@@ -264,16 +264,16 @@ describe('send boundary (Lumen, #618 round 1)', () => {
       userId: 'user-a',
       sessionId: 'session-a',
       sbId: 'sb-a',
-      agentId: 'wren',
+      sbSlug: 'wren',
       agentTokenBound: true,
     } as never);
-    vi.mocked(requestContext.getPinnedAgentId).mockReturnValue('wren');
+    vi.mocked(requestContext.getPinnedSlug).mockReturnValue('wren');
     const db = client();
     await db
       .from('agent_identities')
       .insert({ id: 'sb-e', agent_id: 'echo', user_id: 'user-a', workspace_id: 'ws-a' });
     await handleSendToInbox(
-      { recipientAgentId: 'echo', threadKey: 'pr:618', content: 'strategy notice', trigger: false },
+      { recipientSlug: 'echo', threadKey: 'pr:618', content: 'strategy notice', trigger: false },
       { getClient: () => db } as never,
       { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );

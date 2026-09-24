@@ -38,12 +38,12 @@ describe('resolveOutboundAttachments — happy path', () => {
   });
 
   it('reads a contained file with its bytes and inferred type', async () => {
-    const file = join(root, 'insurance-front.jpg');
+    const file = join(root, 'sample-front.jpg');
     await writeFile(file, 'JPEGBYTES');
 
     const [attachment] = await resolve([{ path: file }]);
 
-    expect(attachment.filename).toBe('insurance-front.jpg');
+    expect(attachment.filename).toBe('sample-front.jpg');
     expect(attachment.mimeType).toBe('image/jpeg');
     expect(attachment.content.toString()).toBe('JPEGBYTES');
   });
@@ -52,9 +52,9 @@ describe('resolveOutboundAttachments — happy path', () => {
     const file = join(root, '1739_scan.pdf');
     await writeFile(file, 'PDF');
 
-    const [attachment] = await resolve([{ path: file, filename: 'Insurance Card.pdf' }]);
+    const [attachment] = await resolve([{ path: file, filename: 'Sample Report.pdf' }]);
 
-    expect(attachment.filename).toBe('Insurance Card.pdf');
+    expect(attachment.filename).toBe('Sample Report.pdf');
     expect(attachment.mimeType).toBe('application/pdf');
   });
 
@@ -100,12 +100,9 @@ describe('resolveOutboundAttachments — happy path', () => {
     expect(attachment.mimeType).toBe('application/octet-stream');
   });
 
-  // Myra found this by listing the media root rather than reasoning about it:
-  // Telegram voice notes land as `.oga`, 6 of the 23 files there, and `.oga`
-  // was absent from the map — so a file we positively know is Ogg audio went
-  // out as generic bytes.
+  // Voice-note downloads use .oga, which must be classified as Ogg audio.
   it('types a Telegram voice note as Ogg audio', async () => {
-    const file = join(root, 'AgACAgUAAxkBAAIJQmqH_1787251286114.oga');
+    const file = join(root, 'synthetic-voice-note.oga');
     await writeFile(file, 'OGGBYTES');
 
     const [attachment] = await resolve([{ path: file }]);
@@ -236,7 +233,7 @@ describe('resolveOutboundAttachments — containment', () => {
     const bad = join(outside, 'oops.txt');
     await writeFile(bad, 'X');
 
-    await expect(resolve([{ path: bad }])).rejects.toThrow(new RegExp(bad.replace(/\./g, '\\.')));
+    await expect(resolve([{ path: bad }])).rejects.toThrow(bad);
   });
 });
 

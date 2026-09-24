@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
   aggregateStudioHistory,
+  isSessionLive,
   mergeThreadSpines,
   missingThreadKeys,
+  SESSION_LIVE_WINDOW_MS,
   type SpineGroupRow,
   type SpineSessionRow,
   type SpineStudioRow,
@@ -18,8 +20,9 @@ const thread = (over: Partial<SpineThreadRow> = {}): SpineThreadRow => ({
   keyType: 'pr',
   keyId: '531',
   title: 'Command center viz',
+  summary: null,
   status: 'open',
-  createdByAgentId: 'wren',
+  createdBySlug: 'wren',
   updatedAt: at(10),
   closedAt: null,
   participants: ['wren', 'lumen'],
@@ -28,7 +31,7 @@ const thread = (over: Partial<SpineThreadRow> = {}): SpineThreadRow => ({
 
 const session = (over: Partial<SpineSessionRow> = {}): SpineSessionRow => ({
   id: 's1',
-  agentId: 'wren',
+  sbSlug: 'wren',
   lifecycle: 'running',
   status: 'active',
   currentPhase: 'implementing',
@@ -43,10 +46,10 @@ const studio = (over: Partial<SpineStudioRow> = {}): SpineStudioRow => ({
   id: 'st1',
   slug: 'wren-omega',
   branch: 'wren/feat/x',
-  agentId: 'wren',
+  sbSlug: 'wren',
   threadKey: null,
   leaseThreadKey: null,
-  leaseAgentId: null,
+  leaseSlug: null,
   updatedAt: at(8),
   ...over,
 });
@@ -88,7 +91,7 @@ describe('mergeThreadSpines', () => {
     const spines = mergeThreadSpines({
       threads: [thread()],
       sessions: [session({ threadKey: 'pr:531', activeThreadKey: 'pr:531', updatedAt: at(11) })],
-      studios: [studio({ leaseThreadKey: 'pr:531', leaseAgentId: 'lumen', updatedAt: at(6) })],
+      studios: [studio({ leaseThreadKey: 'pr:531', leaseSlug: 'lumen', updatedAt: at(6) })],
       groups: [group()],
       parse: noParse,
     });
@@ -172,9 +175,7 @@ describe('mergeThreadSpines', () => {
     const spines = mergeThreadSpines({
       threads: [],
       sessions: [],
-      studios: [
-        studio({ threadKey: 'spec:fleet', leaseThreadKey: 'pr:540', leaseAgentId: 'wren' }),
-      ],
+      studios: [studio({ threadKey: 'spec:fleet', leaseThreadKey: 'pr:540', leaseSlug: 'wren' })],
       groups: [],
       parse: noParse,
     });
@@ -182,10 +183,10 @@ describe('mergeThreadSpines', () => {
     const byKey = new Map(spines.map((s) => [s.key, s]));
     expect(byKey.get('spec:fleet')?.studios[0].relation).toBe('affinity');
     // Affinity alone says nothing about who is present.
-    expect(byKey.get('spec:fleet')?.studios[0].leaseAgentId).toBeNull();
+    expect(byKey.get('spec:fleet')?.studios[0].leaseSlug).toBeNull();
     expect(byKey.get('spec:fleet')?.participants).toEqual([]);
     expect(byKey.get('pr:540')?.studios[0].relation).toBe('lease');
-    expect(byKey.get('pr:540')?.studios[0].leaseAgentId).toBe('wren');
+    expect(byKey.get('pr:540')?.studios[0].leaseSlug).toBe('wren');
     expect(byKey.get('pr:540')?.participants).toEqual(['wren']);
   });
 
@@ -212,7 +213,7 @@ describe('lastActivityAt vs studio heartbeats', () => {
       threads: [thread({ updatedAt: at(1) })],
       sessions: [session({ threadKey: 'pr:531', updatedAt: at(2) })],
       // Studio row touched moments ago by the lease heartbeat.
-      studios: [studio({ leaseThreadKey: 'pr:531', leaseAgentId: 'wren', updatedAt: at(12) })],
+      studios: [studio({ leaseThreadKey: 'pr:531', leaseSlug: 'wren', updatedAt: at(12) })],
       groups: [],
       parse: noParse,
     });
@@ -237,7 +238,7 @@ describe('lastActivityAt vs studio heartbeats', () => {
 describe('aggregateStudioHistory', () => {
   const ev = (over: Partial<StudioLeaseEventRow>): StudioLeaseEventRow => ({
     studioId: 'st-a',
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     event: 'acquired',
     createdAt: at(5),
     ...over,
@@ -267,9 +268,9 @@ describe('aggregateStudioHistory', () => {
 
   it('aggregates agents and orders studios by most recent occupancy, input order irrelevant', () => {
     const entries = aggregateStudioHistory([
-      ev({ studioId: 'st-a', agentId: 'wren', event: 'acquired', createdAt: at(1) }),
+      ev({ studioId: 'st-a', sbSlug: 'wren', event: 'acquired', createdAt: at(1) }),
       ev({ studioId: 'st-b', event: 'expired', createdAt: at(9) }),
-      ev({ studioId: 'st-a', agentId: 'lumen', event: 'released', createdAt: at(3) }),
+      ev({ studioId: 'st-a', sbSlug: 'lumen', event: 'released', createdAt: at(3) }),
     ]);
 
     expect(entries.map((e) => e.studioId)).toEqual(['st-b', 'st-a']);
@@ -341,5 +342,159 @@ describe('missingThreadKeys', () => {
       pinned: true,
     });
     expect(parserCalls).toBe(0);
+  });
+});
+
+/**
+ * Liveness. The reason this rule exists at all: on 2026-09-17 production had
+ * 73 sessions whose lifecycle said `running`, 3 of which had been written to
+ * in the previous fifteen minutes, and the oldest of which had claimed to be
+ * running since March. `lifecycle` is a stored state nothing ever reaps, so
+ * reading it as presence marks ~50 threads live for one agent.
+ */
+describe('isSessionLive', () => {
+  const NOW = Date.UTC(2026, 8, 17, 12, 0, 0);
+  const agedMinutes = (m: number) => new Date(NOW - m * 60_000).toISOString();
+
+  const live = (over: Partial<Parameters<typeof isSessionLive>[0]> = {}) =>
+    isSessionLive(
+      { lifecycle: 'running', currentPhase: 'implementing', updatedAt: agedMinutes(1), ...over },
+      NOW
+    );
+
+  it('is live when a working lifecycle wrote recently', () => {
+    expect(live()).toBe(true);
+    expect(live({ lifecycle: 'compacting' })).toBe(true);
+  });
+
+  it.each(['idle', 'completed', 'failed', 'interrupted', null])(
+    'is not live in lifecycle %o, however recent the write',
+    (lifecycle) => {
+      expect(live({ lifecycle, updatedAt: agedMinutes(0) })).toBe(false);
+    }
+  );
+
+  // The dashboard tested for this value; it is not in the SessionLifecycle
+  // union, so that branch matched nothing. Pinned so the dead value cannot
+  // quietly come back as a third definition.
+  it('does not treat `generating` as a lifecycle — it is not one', () => {
+    expect(live({ lifecycle: 'generating', updatedAt: agedMinutes(0) })).toBe(false);
+  });
+
+  it('is not live once the last write falls outside the window', () => {
+    const edgeMinutes = SESSION_LIVE_WINDOW_MS / 60_000;
+    expect(live({ updatedAt: agedMinutes(edgeMinutes - 1) })).toBe(true);
+    expect(live({ updatedAt: agedMinutes(edgeMinutes + 1) })).toBe(false);
+  });
+
+  // Observed shape: a session that finished its work and said so, whose
+  // lifecycle was never moved off `running`. The phase is the later statement.
+  it('believes a `complete` phase over a stale `running` lifecycle', () => {
+    expect(live({ currentPhase: 'complete', updatedAt: agedMinutes(0) })).toBe(false);
+  });
+
+  /**
+   * Completion has more than one spelling, and this rule does not get to
+   * invent a narrower one. isTerminalPhaseMarker is the fleet's predicate
+   * (session reopen honours it, and the CLI's picker mirrors it); a session
+   * the picker treats as history must not be advertised as live here.
+   *
+   * `completed` is in the live database today. `complete:<reason>` is the
+   * documented form for phases carrying a reason, which is how every
+   * `waiting:` and `blocked:` phase is already written.
+   */
+  it.each(['completed', 'complete:merged', 'completed:superseded', 'COMPLETE', '  complete  '])(
+    'treats %o as finished, not live',
+    (phase) => {
+      expect(live({ currentPhase: phase, updatedAt: agedMinutes(0) })).toBe(false);
+    }
+  );
+
+  // The colon is what separates a marker from a word that starts the same
+  // way; these are ordinary working phases and must stay live.
+  it.each(['completeness', 'completion-review', 'completing the port'])(
+    'does not mistake %o for a completion marker',
+    (phase) => {
+      expect(live({ currentPhase: phase, updatedAt: agedMinutes(0) })).toBe(true);
+    }
+  );
+
+  it('holds the real 2026-03 row stale rather than calling it live', () => {
+    expect(
+      isSessionLive(
+        { lifecycle: 'running', currentPhase: 'reviewing', updatedAt: '2026-03-03T19:04:25Z' },
+        NOW
+      )
+    ).toBe(false);
+  });
+
+  it('treats an unparseable timestamp as no evidence, and clock skew as live', () => {
+    expect(live({ updatedAt: 'not a date' })).toBe(false);
+    expect(live({ updatedAt: agedMinutes(-5) })).toBe(true);
+  });
+});
+
+describe('mergeThreadSpines liveness', () => {
+  const NOW = Date.UTC(2026, 8, 17, 12, 0, 0);
+  const agedMinutes = (m: number) => new Date(NOW - m * 60_000).toISOString();
+
+  it('marks each session live or not, rather than leaving clients to guess', () => {
+    const spines = mergeThreadSpines({
+      threads: [],
+      sessions: [
+        session({ id: 'fresh', threadKey: 'pr:1', updatedAt: agedMinutes(1) }),
+        session({ id: 'abandoned', threadKey: 'pr:2', updatedAt: agedMinutes(60 * 24) }),
+      ],
+      studios: [],
+      groups: [],
+      parse: () => null,
+      nowMs: NOW,
+    });
+    const liveByKey = Object.fromEntries(spines.map((s) => [s.key, s.sessions[0].live]));
+    expect(liveByKey).toEqual({ 'pr:1': true, 'pr:2': false });
+  });
+
+  /**
+   * A session carried by two keys (anchor + a different active focus) is one
+   * session, and both copies must carry the same verdict.
+   *
+   * Note what this does NOT prove. With `nowMs` pinned, moving the
+   * isSessionLive call inside the key loop is behaviourally equivalent, so
+   * this test cannot fail on that relocation and no test should be contrived
+   * to make it. What it pins is the property — same session, same answer —
+   * which is what would break if the classifier ever went back to reading the
+   * clock itself. That is why `nowMs` is a parameter rather than a Date.now()
+   * inside the function.
+   */
+  it('gives one session the same verdict on every key it carries', () => {
+    const spines = mergeThreadSpines({
+      threads: [],
+      sessions: [
+        session({
+          id: 's1',
+          threadKey: 'pr:10',
+          activeThreadKey: 'pr:11',
+          updatedAt: agedMinutes(2),
+        }),
+      ],
+      studios: [],
+      groups: [],
+      parse: () => null,
+      nowMs: NOW,
+    });
+    expect(spines.map((s) => s.sessions[0].live)).toEqual([true, true]);
+    expect(spines.map((s) => s.sessions[0].relation).sort()).toEqual(['active', 'anchor']);
+  });
+
+  it('carries the thread summary through to the spine', () => {
+    const [spine] = mergeThreadSpines({
+      threads: [thread({ summary: 'Wren is porting the discovery shim.' })],
+      sessions: [],
+      studios: [],
+      groups: [],
+      parse: () => null,
+      nowMs: NOW,
+    });
+    expect(spine.thread?.summary).toBe('Wren is porting the discovery shim.');
   });
 });

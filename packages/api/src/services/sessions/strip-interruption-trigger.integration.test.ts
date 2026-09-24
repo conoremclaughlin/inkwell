@@ -367,7 +367,7 @@ d('session_running_write trigger', () => {
         const foreign = {
           sessionId: randomUUID(),
           threadKey: 'pr:1',
-          agentId: 'wren',
+          sbSlug: 'wren',
           acquiredAt: new Date().toISOString(),
           heartbeatAt: new Date().toISOString(),
         };
@@ -456,7 +456,7 @@ d('session_running_write trigger', () => {
         sessionId,
         threadKey,
         threadKeys: [threadKey],
-        agentId: 'wren',
+        sbSlug: 'wren',
         workspaceId: WS,
         reason: 'cli-prompt-regrant',
       };
@@ -589,7 +589,7 @@ d('session_running_write trigger', () => {
       const studioId = randomUUID();
       const { error: userError } = await client.from('users').insert({
         id: otherUserId,
-        email: `pcp-test-${otherUserId.slice(0, 8)}@example.invalid`,
+        email: `ink-test-${otherUserId.slice(0, 8)}@example.invalid`,
       } as never);
       expect(userError).toBeNull();
       const { error: studioError } = await client.from('studios').insert({
@@ -608,7 +608,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:cross', agentId: 'wren', workspaceId: WS },
+          p_regrant: { sessionId, threadKey: 'test:cross', sbSlug: 'wren', workspaceId: WS },
         } as never);
         expect((data as unknown as { outcome: string }).outcome).toBe('forbidden');
 
@@ -929,7 +929,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:pathless', agentId: 'wren', workspaceId: WS },
+          p_regrant: { sessionId, threadKey: 'test:pathless', sbSlug: 'wren', workspaceId: WS },
         } as never);
         const verdict = won as unknown as { outcome: string; regranted: boolean };
         expect(verdict.outcome).toBe('claimed');
@@ -951,7 +951,7 @@ d('session_running_write trigger', () => {
           lease: {
             sessionId: randomUUID(),
             threadKey: 'pr:pathless-sibling',
-            agentId: 'lumen',
+            sbSlug: 'lumen',
             acquiredAt: new Date().toISOString(),
             heartbeatAt: new Date().toISOString(),
           },
@@ -962,7 +962,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:pathless', agentId: 'wren', workspaceId: WS },
+          p_regrant: { sessionId, threadKey: 'test:pathless', sbSlug: 'wren', workspaceId: WS },
         } as never);
         expect((refused as unknown as { outcome: string }).outcome).toBe('lease-lost');
       } finally {
@@ -999,7 +999,7 @@ d('session_running_write trigger', () => {
         lease: {
           sessionId: randomUUID(),
           threadKey: 'pr:sibling',
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           acquiredAt: new Date().toISOString(),
           heartbeatAt: new Date().toISOString(),
         },
@@ -1011,7 +1011,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:norm', agentId: 'wren', workspaceId: WS },
+          p_regrant: { sessionId, threadKey: 'test:norm', sbSlug: 'wren', workspaceId: WS },
         } as never);
         expect((data as unknown as { outcome: string }).outcome).toBe('lease-lost');
         const { data: after } = await client

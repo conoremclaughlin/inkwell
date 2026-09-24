@@ -17,7 +17,7 @@ function makeDeps(overrides: Partial<TurnSignalDeps> = {}) {
   );
   const deps: TurnSignalDeps = {
     getSessionId: () => 'sess-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     getServerUrl: () => 'http://localhost:3001/',
     getToken: async () => 'tok-abc',
     workingDir: '/work/tree',
@@ -47,7 +47,7 @@ describe('createTurnSignal', () => {
       sessionId: 'sess-1',
       lifecycle: 'running',
       event: 'prompt',
-      agentId: 'wren',
+      sbSlug: 'wren',
       workingDir: '/work/tree',
     });
   });
@@ -66,10 +66,10 @@ describe('createTurnSignal', () => {
     await expect(createTurnSignal(deps).detach()).resolves.toBe(true);
 
     const body = bodyOf(fetchImpl);
-    expect(body).toEqual({ sessionId: 'sess-1', cliAttached: false, agentId: 'wren' });
+    expect(body).toEqual({ sessionId: 'sess-1', cliAttached: false, sbSlug: 'wren' });
   });
 
-  it('reports UNACKNOWLEDGED with no PCP session — a failed start_session must not slip the gate', async () => {
+  it('reports UNACKNOWLEDGED with no Inkwell session — a failed start_session must not slip the gate', async () => {
     const { deps, fetchImpl } = makeDeps({ getSessionId: () => undefined });
     const signal = createTurnSignal(deps);
     await expect(signal.open()).resolves.toBe(false);
@@ -215,7 +215,7 @@ describe('turnGateDecision — the exact predicate chain the turn queue evaluate
     // tools in a managed worktree with no marker protecting the lease.
     const gate = turnGateDecision(undefined, false, WORKTREE_STUDIO);
     expect(gate.allow).toBe(false);
-    if (!gate.allow) expect(gate.reason).toContain('no PCP session');
+    if (!gate.allow) expect(gate.reason).toContain('no Inkwell session');
   });
 
   it('refuses a worktree-studio turn whose open was not acknowledged', () => {

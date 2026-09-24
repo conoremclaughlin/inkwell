@@ -17,7 +17,7 @@ const USER_ID = '11111111-1111-1111-1111-111111111111';
 function baseContext(overrides: Partial<InjectedContext> = {}): InjectedContext {
   return {
     agent: {
-      agentId: 'aster',
+      sbSlug: 'aster',
       name: 'Aster',
       role: 'Development collaborator',
       values: [],
@@ -43,7 +43,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: 'session-1',
     userId: USER_ID,
-    agentId: 'aster',
+    sbSlug: 'aster',
     backendSessionId: null,
     type: 'primary',
     lifecycle: 'running',

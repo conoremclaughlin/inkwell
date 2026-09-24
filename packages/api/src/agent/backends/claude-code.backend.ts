@@ -107,7 +107,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
     // If we have a system prompt, write it to temp file now
     if (this.config.systemPrompt && !this.systemPromptFile) {
-      this.systemPromptFile = join(tmpdir(), `pcp-system-prompt-${Date.now()}.md`);
+      this.systemPromptFile = join(tmpdir(), `ink-system-prompt-${Date.now()}.md`);
       writeFileSync(this.systemPromptFile, this.config.systemPrompt, 'utf-8');
       logger.debug(`System prompt written to: ${this.systemPromptFile}`);
     }
@@ -164,7 +164,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
       logger.info(`Spawning Claude Code with args: ${args.join(' ')}`);
 
-      // Strip CLAUDECODE to prevent "nested session" detection when PCP is
+      // Strip CLAUDECODE to prevent "nested session" detection when Inkwell is
       // launched from inside a Claude Code session (e.g., via PM2).
       const { CLAUDECODE, ...cleanEnv } = process.env;
       const proc = spawn('claude', args, {
@@ -443,7 +443,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
     if (this.config.systemPrompt) {
       // Write system prompt to a temp file to avoid shell escaping issues
-      this.systemPromptFile = join(tmpdir(), `pcp-system-prompt-${Date.now()}.md`);
+      this.systemPromptFile = join(tmpdir(), `ink-system-prompt-${Date.now()}.md`);
       writeFileSync(this.systemPromptFile, this.config.systemPrompt, 'utf-8');
       args.push('--system-prompt', this.systemPromptFile);
       logger.debug(`System prompt written to: ${this.systemPromptFile}`);
@@ -452,7 +452,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     if (this.config.appendSystemPrompt) {
       // --append-system-prompt is re-injected on every invocation (including --resume),
       // so it survives compaction. Use this for identity and critical directives.
-      const appendFile = join(tmpdir(), `pcp-append-prompt-${Date.now()}.md`);
+      const appendFile = join(tmpdir(), `ink-append-prompt-${Date.now()}.md`);
       writeFileSync(appendFile, this.config.appendSystemPrompt, 'utf-8');
       args.push('--append-system-prompt', appendFile);
       logger.debug(`Append system prompt written to: ${appendFile}`);
@@ -493,7 +493,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
         `Context injection: ${isResuming ? 'MINIMAL (resuming)' : 'FULL (new session)'}`,
         {
           sessionId: this.sessionId,
-          hasIdentity: !!message.injectedContext.agentIdentity,
+          hasIdentity: !!message.injectedContext.sbIdentity,
         }
       );
       if (isResuming) {
@@ -564,18 +564,18 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     sections.push('<user-context>');
 
     // Agent identity - who am I?
-    if (context.agentIdentity) {
+    if (context.sbIdentity) {
       sections.push('## My Identity');
-      sections.push(`I am **${context.agentIdentity.name}** (${context.agentIdentity.agentId})`);
-      sections.push(`Role: ${context.agentIdentity.role}`);
-      if (context.agentIdentity.description) {
-        sections.push(context.agentIdentity.description);
+      sections.push(`I am **${context.sbIdentity.name}** (${context.sbIdentity.sbSlug})`);
+      sections.push(`Role: ${context.sbIdentity.role}`);
+      if (context.sbIdentity.description) {
+        sections.push(context.sbIdentity.description);
       }
-      if (context.agentIdentity.values && context.agentIdentity.values.length > 0) {
-        sections.push(`Values: ${context.agentIdentity.values.join(', ')}`);
+      if (context.sbIdentity.values && context.sbIdentity.values.length > 0) {
+        sections.push(`Values: ${context.sbIdentity.values.join(', ')}`);
       }
-      if (context.agentIdentity.capabilities && context.agentIdentity.capabilities.length > 0) {
-        sections.push(`Capabilities: ${context.agentIdentity.capabilities.join(', ')}`);
+      if (context.sbIdentity.capabilities && context.sbIdentity.capabilities.length > 0) {
+        sections.push(`Capabilities: ${context.sbIdentity.capabilities.join(', ')}`);
       }
       sections.push('');
     }
@@ -673,8 +673,8 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     parts.push('<context-update>');
 
     // Brief identity reminder (one line)
-    if (context.agentIdentity) {
-      parts.push(`[I am ${context.agentIdentity.name}]`);
+    if (context.sbIdentity) {
+      parts.push(`[I am ${context.sbIdentity.name}]`);
     }
 
     // Current time (always include - it changes!)

@@ -18,13 +18,13 @@ import { ContextLedger } from './context-ledger.js';
 import { SbHookRegistry, type HookResult, type HookRuntimeState } from './hook-registry.js';
 import { readFileSync } from 'fs';
 
-// ─── PCP Client ─────────────────────────────────────────────────
+// ─── Inkwell Client ─────────────────────────────────────────────────
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 
 let serverAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
@@ -37,7 +37,7 @@ interface RecallMemory {
   source: string;
   salience: string;
   topics: string[];
-  agentId: string | null;
+  sbSlug: string | null;
   createdAt: string;
 }
 
@@ -47,9 +47,9 @@ interface RecallResponse {
   memories: RecallMemory[];
 }
 
-async function pcpRecall(
+async function inkRecall(
   query: string,
-  options?: { limit?: number; agentId?: string; recallMode?: string }
+  options?: { limit?: number; sbSlug?: string; recallMode?: string }
 ): Promise<RecallResponse> {
   const authPath = `${process.env.HOME}/.ink/auth.json`;
   let accessToken: string;
@@ -58,10 +58,10 @@ async function pcpRecall(
     accessToken = auth.accessToken || auth.access_token;
     if (!accessToken) throw new Error('No access token');
   } catch {
-    throw new Error(`Cannot read PCP auth from ${authPath}`);
+    throw new Error(`Cannot read Inkwell auth from ${authPath}`);
   }
 
-  const resp = await fetch(`${PCP_URL}/mcp`, {
+  const resp = await fetch(`${INK_URL}/mcp`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -76,7 +76,7 @@ async function pcpRecall(
         name: 'recall',
         arguments: {
           query,
-          agentId: options?.agentId || 'wren',
+          sbSlug: options?.sbSlug || 'wren',
           includeShared: true,
           limit: options?.limit || 5,
           recallMode: options?.recallMode || 'hybrid',
@@ -85,7 +85,7 @@ async function pcpRecall(
     }),
   });
 
-  if (!resp.ok) throw new Error(`PCP recall failed: ${resp.status}`);
+  if (!resp.ok) throw new Error(`Inkwell recall failed: ${resp.status}`);
   const raw = await resp.text();
   const dataLine = raw.split('\n').find((l) => l.startsWith('data: '));
   if (!dataLine) throw new Error('No SSE data line');
@@ -277,7 +277,7 @@ describe('Passive recall: relevance benchmark', () => {
     for (const scenario of SCENARIOS) {
       const signal = extractTopicSignal(scenario.userInput, scenario.assistantResponse);
       const start = performance.now();
-      const recall = await pcpRecall(signal, { limit: 5 });
+      const recall = await inkRecall(signal, { limit: 5 });
       const latency = performance.now() - start;
 
       const relevance = scoreRelevance(recall.memories, scenario.expectedKeywords);
@@ -354,7 +354,7 @@ describe('Passive recall: relevance benchmark', () => {
 
       for (const topic of topics) {
         const signal = extractTopicSignal(topic.input, topic.assistantResponse);
-        const recall = await pcpRecall(signal, { limit: 5 });
+        const recall = await inkRecall(signal, { limit: 5 });
         memoryIdSets.set(topic.label, new Set(recall.memories.map((m) => m.id)));
       }
 
@@ -438,7 +438,7 @@ describe('Passive recall: relevance benchmark', () => {
         topic: 'auth',
         user: 'Quick question about MCP auth — does Codex send the Authorization header?',
         assistant:
-          'No, that was the bug. The Codex runner set PCP_ACCESS_TOKEN in the env but never told Codex to send it as a header.',
+          'No, that was the bug. The Codex runner set INK_ACCESS_TOKEN in the env but never told Codex to send it as a header.',
         keywords: ['auth', 'codex', 'header', 'token'],
       },
     ];
@@ -457,7 +457,7 @@ describe('Passive recall: relevance benchmark', () => {
 
         let recall: RecallResponse;
         try {
-          recall = await pcpRecall(signal, { limit: 3, agentId: 'wren' });
+          recall = await inkRecall(signal, { limit: 3, sbSlug: 'wren' });
         } catch {
           return;
         }
@@ -490,7 +490,7 @@ describe('Passive recall: relevance benchmark', () => {
 
       const result = await registry.fire('turn_end', {
         ledger,
-        runtime: { agentId: 'wren', turnCount: i + 1, budgetUtilization: 0.3 },
+        runtime: { sbSlug: 'wren', turnCount: i + 1, budgetUtilization: 0.3 },
         lastTurn: { userInput: turn.user, assistantResponse: turn.assistant, turnIndex: i + 1 },
       });
 

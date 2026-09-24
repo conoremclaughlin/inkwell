@@ -57,7 +57,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { access, lstat, rm } from 'fs/promises';
-import { bootstrapStudio } from '@inklabs/shared';
+import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
 import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
@@ -410,11 +410,11 @@ export class StudioOverflowService {
    */
   async ensureOverflowStudio(opts: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     parentStudio: Studio;
     threadKey: string;
   }): Promise<Studio | null> {
-    const { userId, agentId, threadKey } = opts;
+    const { userId, sbSlug, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
     // Same-thread ensures in this process take turns END TO END — preflight,
     // worktree, setup (up to the dependency install), row — so the second
@@ -425,13 +425,13 @@ export class StudioOverflowService {
     // from another process are still arbitrated by the live-ownership unique
     // index on the insert.
     return withKeyedLock(`overflow-ensure:${userId}:${parentStudio.id}:${threadKey}`, () =>
-      this.ensureOverflowStudioExclusive(userId, agentId, parentStudio, threadKey)
+      this.ensureOverflowStudioExclusive(userId, sbSlug, parentStudio, threadKey)
     );
   }
 
   private async ensureOverflowStudioExclusive(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     parentStudio: Studio,
     threadKey: string
   ): Promise<Studio | null> {
@@ -454,7 +454,7 @@ export class StudioOverflowService {
 
       const created = await this.createWorktree(parentStudio, s.slug, {
         worktreePath: ephemeralWorktreePath({
-          agentId,
+          sbSlug,
           repoRoot: parentStudio.repoRoot,
           leaf: s.slug,
         }),
@@ -490,7 +490,7 @@ export class StudioOverflowService {
           });
           await this.leases.logEvent(userId, revived.id, 'overflow', {
             threadKey,
-            agentId,
+            sbSlug,
             reason: `revived ephemeral studio; parent ${parentStudio.id} leased`,
           });
           return revived;
@@ -514,7 +514,7 @@ export class StudioOverflowService {
       try {
         const studio = await this.studios.create({
           userId,
-          agentId,
+          sbSlug,
           repoRoot: parentStudio.repoRoot,
           worktreePath: created.worktreePath,
           branch: created.branch,
@@ -536,7 +536,7 @@ export class StudioOverflowService {
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
-          agentId,
+          sbSlug,
           reason: `created ephemeral studio; parent ${parentStudio.id} leased`,
         });
         logger.info('[StudioOverflow] Created ephemeral studio', {
@@ -618,13 +618,14 @@ export class StudioOverflowService {
    */
   async ensureParentStudio(opts: {
     userId: string;
-    agentId: string;
+    sbSlug: string;
     repoRoot: string;
     /** Canonical identity UUID — authoritative over the display slug. */
     sbId?: string | null;
   }): Promise<Studio | null> {
-    const { userId, agentId, repoRoot, sbId } = opts;
-    const slug = `${path.basename(repoRoot)}--${agentId}`;
+    const { userId, sbSlug, repoRoot, sbId } = opts;
+    if (!isSafeStudioComponent(sbSlug)) throw new Error('Invalid SB path component');
+    const slug = `${path.basename(repoRoot)}--${sbSlug}`;
 
     const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
     if (existing) {
@@ -644,7 +645,7 @@ export class StudioOverflowService {
         !existing.ephemeral &&
         existing.userId === userId &&
         existing.repoRoot === repoRoot &&
-        (sbId ? existing.sbId === sbId : existing.agentId === agentId) &&
+        (sbId ? existing.sbId === sbId : existing.sbSlug === sbSlug) &&
         (existing.status === 'active' || existing.status === 'idle');
 
       if (reusable) {
@@ -662,7 +663,7 @@ export class StudioOverflowService {
       logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
         slug,
         repoRoot,
-        agentId,
+        sbSlug,
         collidingStudioId: existing.id,
       });
       return null;
@@ -677,20 +678,20 @@ export class StudioOverflowService {
     } as Studio;
 
     const created = await this.createWorktree(parentLike, slug, {
-      branch: `${agentId}/studio/${agentId}`,
+      branch: `${sbSlug}/studio/${sbSlug}`,
     });
     if (!created) return null;
 
     try {
       const studio = await this.studios.create({
         userId,
-        agentId,
+        sbSlug,
         sbId: sbId ?? undefined,
         repoRoot,
         worktreePath: created.worktreePath,
         branch: created.branch,
         baseBranch: parentLike.baseBranch,
-        purpose: `Home studio for ${agentId} on ${path.basename(repoRoot)} (auto-created)`,
+        purpose: `Home studio for ${sbSlug} on ${path.basename(repoRoot)} (auto-created)`,
         ephemeral: false,
         defaultProjectId: seed?.defaultProjectId ?? null,
         metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
@@ -699,7 +700,7 @@ export class StudioOverflowService {
         studioId: studio.id,
         slug: studio.slug,
         repoRoot,
-        agentId,
+        sbSlug,
         worktreePath: created.worktreePath,
       });
       return studio;
@@ -725,9 +726,7 @@ export class StudioOverflowService {
     // Ephemeral callers pass the canonical-root path; the durable D1 parent
     // omits it and keeps the legacy sibling-of-repo location. `git worktree
     // add` creates missing parent directories itself (verified empirically).
-    const worktreePath =
-      opts?.worktreePath ??
-      path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+    const worktreePath = opts?.worktreePath ?? studioSiblingPath(mainRoot, slug);
     const baseBranch = parentStudio.baseBranch || 'main';
 
     if (opts?.branch) {
@@ -1022,7 +1021,7 @@ export class StudioOverflowService {
           }
         );
         await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
-          agentId: studio.agentId ?? undefined,
+          sbSlug: studio.sbSlug ?? undefined,
           reason: `teardown-aborted-rescue-failed (${opts.reason})`,
           detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
         });
@@ -1063,7 +1062,7 @@ export class StudioOverflowService {
           { studioId: studio.id, worktreePath: studio.worktreePath }
         );
         await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
-          agentId: studio.agentId ?? undefined,
+          sbSlug: studio.sbSlug ?? undefined,
           reason: `teardown-remove-failed (${opts.reason})`,
           detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
         });
@@ -1080,8 +1079,10 @@ export class StudioOverflowService {
     // ONE user+exact-claim-guarded CAS records cleaned + clears the claim
     // together (round 7) — a claim replaced mid-teardown fails here and the
     // sweep reconciles instead of us reporting a phantom success.
+    // Opts out of the default terminator: the `released` event below already
+    // closes this teardown window under the caller's own reason.
     const finalized = await this.leases
-      .finalizeTeardown(studio.id, studio.userId, claim)
+      .finalizeTeardown(studio.id, studio.userId, claim, { closeReason: null })
       .catch(() => false);
     if (!finalized) {
       logger.error(
@@ -1093,7 +1094,7 @@ export class StudioOverflowService {
       return;
     }
     await this.leases.logEvent(studio.userId, studio.id, 'released', {
-      agentId: studio.agentId ?? undefined,
+      sbSlug: studio.sbSlug ?? undefined,
       reason: opts.reason,
       detail: {
         teardown: true,

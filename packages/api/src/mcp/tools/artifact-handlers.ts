@@ -15,7 +15,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
 import { mergeWithContext } from '../../utils/request-context';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
@@ -92,7 +92,7 @@ const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
     .optional()
     .default('document')
     .describe('Type of artifact'),
-  agentId: z.string().optional().describe('Agent creating this artifact'),
+  sbSlug: z.string().optional().describe('Agent creating this artifact'),
   editMode: z
     .enum(['workspace', 'editors'])
     .optional()
@@ -143,7 +143,7 @@ const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
     .describe(
       'Version this edit is based on. When provided, enables three-way merge: if the artifact has been modified since this version, the server will attempt to merge changes automatically. Omit for legacy last-write-wins behavior.'
     ),
-  agentId: z.string().optional().describe('Agent making the update'),
+  sbSlug: z.string().optional().describe('Agent making the update'),
   editMode: z.enum(['workspace', 'editors']).optional().describe('Updated edit permission mode'),
   editors: z.array(z.string()).optional().describe('Updated editor IDs'),
   collaborators: z.array(z.string()).optional().describe('Backward-compatible alias for editors'),
@@ -169,7 +169,7 @@ const addArtifactCommentSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().guid().optional().describe('ID of the artifact'),
   content: z.string().min(1).describe('Comment text'),
-  agentId: z.string().optional().describe('Agent authoring the comment'),
+  sbSlug: z.string().optional().describe('Agent authoring the comment'),
   parentCommentId: z
     .string()
     .guid()
@@ -226,7 +226,7 @@ function normalizeEditMode(value: string | null | undefined): ArtifactEditMode {
   return value === 'editors' ? 'editors' : 'workspace';
 }
 
-function normalizeEditorAgentIds(values: string[] | undefined): string[] {
+function normalizeEditorSlugs(values: string[] | undefined): string[] {
   if (!values) return [];
   return Array.from(
     new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))
@@ -236,7 +236,7 @@ function normalizeEditorAgentIds(values: string[] | undefined): string[] {
 async function deriveWorkspaceIdFromAgent(
   supabase: SupabaseClient<Database>,
   userId: string,
-  agentId: string
+  sbSlug: string
 ): Promise<string | null> {
   // TODO(lumen): Deduplicate with MCPServer.deriveWorkspaceIdFromAgent in
   // server.ts via a shared helper; keep strict throw-on-ambiguous behavior
@@ -245,12 +245,12 @@ async function deriveWorkspaceIdFromAgent(
     .from('agent_identities')
     .select('workspace_id')
     .eq('user_id', userId)
-    .eq('agent_id', agentId);
+    .eq('agent_id', sbSlug);
 
   if (error) {
     logger.warn('Failed to derive workspace from agent identity', {
       userId,
-      agentId,
+      sbSlug,
       error: error.message,
     });
     return null;
@@ -267,7 +267,7 @@ async function deriveWorkspaceIdFromAgent(
   if (workspaceIds.length === 1) return workspaceIds[0];
   if (workspaceIds.length > 1) {
     throw new Error(
-      `Workspace is ambiguous for agent "${agentId}". Provide workspaceId or X-PCP-Workspace-Id.`
+      `Workspace is ambiguous for agent "${sbSlug}". Provide workspaceId or x-ink-workspace-id.`
     );
   }
 
@@ -278,15 +278,15 @@ async function resolveIdentityForAgent(
   supabase: SupabaseClient<Database>,
   userId: string,
   workspaceId: string | undefined,
-  agentId?: string
+  sbSlug?: string
 ) {
-  if (!agentId) return null;
+  if (!sbSlug) return null;
 
   let query = supabase
     .from('agent_identities')
     .select('id, agent_id, name, backend')
     .eq('user_id', userId)
-    .eq('agent_id', agentId);
+    .eq('agent_id', sbSlug);
 
   query = withWorkspaceFilter(query, workspaceId);
   const { data, error } = await query.maybeSingle();
@@ -296,7 +296,7 @@ async function resolveIdentityForAgent(
       'Failed to resolve identity UUID for agent slug; continuing with slug-only reference',
       {
         userId,
-        agentId,
+        sbSlug,
         error: error.message,
       }
     );
@@ -306,7 +306,7 @@ async function resolveIdentityForAgent(
   if (!data) {
     logger.warn('No identity row found for agent slug; continuing with slug-only reference', {
       userId,
-      agentId,
+      sbSlug,
     });
     return null;
   }
@@ -429,22 +429,22 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     metadata = {},
     workspaceId,
   } = parsed;
-  const normalizedEditors = normalizeEditorAgentIds(editors ?? collaborators);
+  const normalizedEditors = normalizeEditorSlugs(editors ?? collaborators);
   if (editMode === 'editors' && normalizedEditors.length === 0) {
     throw new Error('editMode "editors" requires at least one editor');
   }
   const effectiveEditors = normalizedEditors;
-  const agentId = getEffectiveAgentId(parsed.agentId);
+  const sbSlug = getEffectiveSlug(parsed.sbSlug);
   const workspaceResolution = await resolveWorkspaceScopeForWrite({
     rawArgs,
     explicitWorkspaceId: workspaceId,
-    agentId,
-    deriveWorkspaceIdFromAgent: (candidateAgentId) =>
-      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateAgentId),
+    sbSlug,
+    deriveWorkspaceIdFromAgent: (candidateSlug) =>
+      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateSlug),
   });
   if (!workspaceResolution) {
     throw new Error(
-      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+      'Artifact write requires workspace scope. Provide x-ink-workspace-id, workspaceId, or a workspace-scoped agent identity.'
     );
   }
   const workspaceScope = workspaceResolution.workspaceId;
@@ -452,7 +452,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     supabase,
     resolved.user.id,
     workspaceScope,
-    agentId
+    sbSlug
   );
 
   // Check if URI already exists
@@ -515,12 +515,12 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     title,
     content,
     changed_by_sb_id: authorIdentity?.id || null,
-    changed_by_user_id: agentId ? null : resolved.user.id,
+    changed_by_user_id: sbSlug ? null : resolved.user.id,
     change_type: 'create',
     change_summary: 'Initial creation',
   });
 
-  logger.info('Artifact created', { uri, type: artifactType, agentId });
+  logger.info('Artifact created', { uri, type: artifactType, sbSlug });
 
   // Best-effort embedding — don't block the response
   tryEmbedArtifact(
@@ -588,7 +588,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     parentCommentId: string | null;
     content: string;
     metadata: Json | null;
-    createdByAgentId: string | null;
+    createdBySlug: string | null;
     createdByUserId: string | null;
     createdByUser: {
       id: string;
@@ -597,7 +597,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       email: string | null;
     } | null;
     createdBySbId: string | null;
-    createdByIdentity: { id: string; agentId: string; name: string; backend: string | null } | null;
+    createdByIdentity: { id: string; sbSlug: string; name: string; backend: string | null } | null;
     createdAt: string | null;
     updatedAt: string | null;
   }> = [];
@@ -676,7 +676,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
         parentCommentId: comment.parent_comment_id,
         content: comment.content,
         metadata: comment.metadata,
-        createdByAgentId: identity?.agent_id ?? null,
+        createdBySlug: identity?.agent_id ?? null,
         createdByUserId: commentAuthorUserId,
         createdByUser: commentAuthorUser
           ? {
@@ -690,7 +690,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
         createdByIdentity: identity
           ? {
               id: identity.id,
-              agentId: identity.agent_id,
+              sbSlug: identity.agent_id,
               name: identity.name,
               backend: identity.backend,
             }
@@ -759,17 +759,17 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     changeSummary,
     workspaceId,
   } = parsed;
-  const agentId = getEffectiveAgentId(parsed.agentId);
+  const sbSlug = getEffectiveSlug(parsed.sbSlug);
   const workspaceResolution = await resolveWorkspaceScopeForWrite({
     rawArgs,
     explicitWorkspaceId: workspaceId,
-    agentId,
-    deriveWorkspaceIdFromAgent: (candidateAgentId) =>
-      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateAgentId),
+    sbSlug,
+    deriveWorkspaceIdFromAgent: (candidateSlug) =>
+      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateSlug),
   });
   if (!workspaceResolution) {
     throw new Error(
-      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+      'Artifact write requires workspace scope. Provide x-ink-workspace-id, workspaceId, or a workspace-scoped agent identity.'
     );
   }
   const workspaceScope = workspaceResolution.workspaceId;
@@ -777,7 +777,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     supabase,
     resolved.user.id,
     workspaceScope,
-    agentId
+    sbSlug
   );
 
   // First, get the current artifact (alias-aware: renamed URIs keep working)
@@ -793,7 +793,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
   }
 
   // Check if agent has permission to edit
-  if (agentId) {
+  if (sbSlug) {
     const currentEditMode = normalizeEditMode(current.edit_mode);
     const currentEditors = current.collaborators || [];
     const editorIdentityId = editorIdentity?.id || null;
@@ -801,10 +801,10 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     const hasEditorAccess =
       currentEditMode === 'workspace' ||
       (!!editorIdentityId && currentEditors.includes(editorIdentityId)) ||
-      currentEditors.includes(agentId);
+      currentEditors.includes(sbSlug);
 
     if (!isCreator && !hasEditorAccess) {
-      throw new Error(`Agent ${agentId} does not have permission to edit this artifact`);
+      throw new Error(`Agent ${sbSlug} does not have permission to edit this artifact`);
     }
   }
 
@@ -845,7 +845,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
       uri: current.uri,
       baseVersion,
       currentVersion: current.version,
-      agentId,
+      sbSlug,
     });
 
     // Fetch the base version content from history
@@ -897,7 +897,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
         baseVersion,
         currentVersion: current.version,
         conflictCount: conflicts.length,
-        agentId,
+        sbSlug,
       });
 
       return {
@@ -926,7 +926,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
       uri: current.uri,
       baseVersion,
       currentVersion: current.version,
-      agentId,
+      sbSlug,
     });
   }
 
@@ -938,13 +938,13 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     updated_at: new Date().toISOString(),
     metadata: {
       ...(current.metadata as Record<string, unknown>),
-      lastEditedBy: agentId || 'user',
+      lastEditedBy: sbSlug || 'user',
       lastEditedAt: new Date().toISOString(),
     },
   };
 
   const currentEditMode = normalizeEditMode(current.edit_mode);
-  const requestedEditors = normalizeEditorAgentIds(editors ?? collaborators);
+  const requestedEditors = normalizeEditorSlugs(editors ?? collaborators);
   const nextEditMode: ArtifactEditMode = editMode ?? currentEditMode;
   let nextEditors =
     editors !== undefined || collaborators !== undefined
@@ -1018,7 +1018,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     logger.warn('CAS conflict: artifact version changed during update', {
       uri: current.uri,
       expectedVersion,
-      agentId,
+      sbSlug,
     });
 
     return {
@@ -1058,7 +1058,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     title: updated.title,
     content: updated.content,
     changed_by_sb_id: editorIdentity?.id || null,
-    changed_by_user_id: agentId ? null : resolved.user.id,
+    changed_by_user_id: sbSlug ? null : resolved.user.id,
     change_type: changeType,
     change_summary: mergeSummary,
   });
@@ -1066,7 +1066,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
   logger.info('Artifact updated', {
     uri: current.uri,
     version: updated.version,
-    agentId,
+    sbSlug,
     mergePerformed,
   });
 
@@ -1234,23 +1234,23 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
   const parsed = parseWithContext(addArtifactCommentSchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId, content, agentId, parentCommentId, metadata = {}, workspaceId } = parsed;
+  const { uri, artifactId, content, sbSlug, parentCommentId, metadata = {}, workspaceId } = parsed;
   const trimmed = content.trim();
   if (!trimmed) {
     throw new Error('Comment content cannot be empty');
   }
 
-  const effectiveAgentId = getEffectiveAgentId(agentId);
+  const effectiveSlug = getEffectiveSlug(sbSlug);
   const workspaceResolution = await resolveWorkspaceScopeForWrite({
     rawArgs,
     explicitWorkspaceId: workspaceId,
-    agentId: effectiveAgentId,
-    deriveWorkspaceIdFromAgent: (candidateAgentId) =>
-      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateAgentId),
+    sbSlug: effectiveSlug,
+    deriveWorkspaceIdFromAgent: (candidateSlug) =>
+      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateSlug),
   });
   if (!workspaceResolution) {
     throw new Error(
-      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+      'Artifact write requires workspace scope. Provide x-ink-workspace-id, workspaceId, or a workspace-scoped agent identity.'
     );
   }
   const workspaceScope = workspaceResolution.workspaceId;
@@ -1283,7 +1283,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
     supabase,
     resolved.user.id,
     workspaceScope,
-    effectiveAgentId
+    effectiveSlug
   );
 
   const { data: created, error: createError } = await supabase
@@ -1308,7 +1308,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
   logger.info('Artifact comment added', {
     artifactId: artifact.id,
     commentId: created.id,
-    agentId: effectiveAgentId || null,
+    sbSlug: effectiveSlug || null,
     sbId: authorIdentity?.id || null,
   });
 
@@ -1325,7 +1325,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
             parentCommentId: created.parent_comment_id,
             content: created.content,
             metadata: created.metadata,
-            createdByAgentId: authorIdentity?.agent_id || null,
+            createdBySlug: authorIdentity?.agent_id || null,
             createdByUserId: created.created_by_user_id || resolved.user.id,
             createdByUser: {
               id: resolved.user.id,
@@ -1337,7 +1337,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
             createdByIdentity: authorIdentity
               ? {
                   id: authorIdentity.id,
-                  agentId: authorIdentity.agent_id,
+                  sbSlug: authorIdentity.agent_id,
                   name: authorIdentity.name,
                   backend: authorIdentity.backend,
                 }
@@ -1454,7 +1454,7 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
               parentCommentId: comment.parent_comment_id,
               content: comment.content,
               metadata: comment.metadata,
-              createdByAgentId: identity?.agent_id ?? null,
+              createdBySlug: identity?.agent_id ?? null,
               createdByUserId: commentAuthorUserId,
               createdByUser: commentAuthorUser
                 ? {
@@ -1468,7 +1468,7 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
               createdByIdentity: identity
                 ? {
                     id: identity.id,
-                    agentId: identity.agent_id,
+                    sbSlug: identity.agent_id,
                     name: identity.name,
                     backend: identity.backend,
                   }

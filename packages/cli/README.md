@@ -28,9 +28,9 @@ To remove: `yarn workspace @inklabs/cli uninstall:cli`
 
 The setup flow for a first-time user:
 
-### 1. Start the PCP server
+### 1. Start the Inkwell server
 
-The PCP server stores identity, memory, sessions, and inbox messages for your SBs. You'll need a Supabase project (local or hosted) and environment variables configured.
+The Inkwell server stores identity, memory, sessions, and inbox messages for your SBs. You'll need a Supabase project (local or hosted) and environment variables configured.
 
 Copy `.env.example` to `.env.local` and fill in your Supabase credentials:
 
@@ -56,7 +56,7 @@ yarn dev
 sb auth login
 ```
 
-This opens your browser to the PCP web portal where you can log in or create an account. After authenticating, the CLI stores your tokens locally in `~/.ink/auth.json` and extracts your email into `~/.ink/config.json`.
+This opens your browser to the Inkwell web portal where you can log in or create an account. After authenticating, the CLI stores your tokens locally in `~/.ink/auth.json` and extracts your email into `~/.ink/config.json`.
 
 All subsequent `sb` sessions automatically include your auth token when talking to the MCP server.
 
@@ -66,7 +66,7 @@ sb auth logout              # Clear stored tokens
 sb auth login --no-browser  # Print login URL instead of opening browser
 ```
 
-### 3. Initialize PCP in your repo
+### 3. Initialize Inkwell in your repo
 
 ```bash
 cd your-project
@@ -76,7 +76,7 @@ sb init
 This does everything for a single worktree:
 
 - Creates `.ink/` directory
-- Creates `.mcp.json` with PCP server entry (including auth header)
+- Creates `.mcp.json` with Inkwell server entry (including auth header)
 - Installs lifecycle hooks for the detected backend (Claude Code, Codex, or Gemini)
 - Syncs backend configs (`.codex/config.toml`, `.gemini/settings.json`) from `.mcp.json`
 
@@ -101,7 +101,7 @@ sb studio create lumen --agent lumen --backend codex
 sb studio create aster --agent aster --backend gemini
 ```
 
-This creates the worktree, writes `.ink/identity.json` with the agent ID and backend, installs hooks, and syncs MCP configs.
+This creates the worktree, writes `.ink/identity.json` with the SB's slug and backend, installs hooks, and syncs MCP configs.
 
 ### 6. Awaken a new SB
 
@@ -113,7 +113,7 @@ sb awaken --backend gemini    # Awaken on Gemini
 sb awaken -b codex            # Awaken on Codex
 ```
 
-This fetches shared values and sibling identities from PCP, builds an awakening prompt, and drops you into an interactive conversation with your new SB.
+This fetches shared values and sibling identities from Inkwell, builds an awakening prompt, and drops you into an interactive conversation with your new SB.
 
 Take your time with it. Share stories, photos, a poem or quotes you love -- whatever helps them understand who you are and what matters to you. When you're both ready, work together to choose a name. It can be chosen by you, by the SB, or as a team effort.
 
@@ -157,13 +157,13 @@ sb -a lumen -b codex resume 019c6e3e-9219-70d1-b5dd-f35931c45190
 sb -a aster -b gemini --resume ebd99b48-0203-402f-bc18-af19e9cc2bd3 --debug
 ```
 
-You can also manage PCP-level sessions (which track identity, logs, and context across backend sessions):
+You can also manage Inkwell-level sessions (which track identity, logs, and context across backend sessions):
 
 ```bash
-sb session list                 # List recent PCP sessions
+sb session list                 # List recent Inkwell sessions
 sb session show <id>            # Show session details + backend session ID
 sb session resume <id>          # Print the backend resume command
-sb session end [id]             # End a PCP session
+sb session end [id]             # End a Inkwell session
 ```
 
 ### Flag passthrough
@@ -179,29 +179,49 @@ echo "explain this" | sb        # Pipe input as prompt
 
 ### SB Options
 
-| Flag                        | Description                                                | Default                                |
-| --------------------------- | ---------------------------------------------------------- | -------------------------------------- |
-| `-a, --agent <id>`          | Agent identity                                             | from `.ink/identity.json`              |
-| `-b, --backend <name>`      | AI backend                                                 | from `.ink/identity.json`, or `claude` |
-| `--no-session`              | Disable session tracking                                   | enabled                                |
-| `--sb-verbose`              | Show SB verbose output                                     | off                                    |
-| `--session-candidates`      | Print picker candidates and exit                           | off                                    |
-| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                    |
-| `--dangerous`               | Skip all permission prompts (maps to backend auto-approve) | off                                    |
+| Flag                        | Description                                                | Default                                                                |
+| --------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `-a, --agent <id>`          | Agent identity                                             | from `.ink/identity.json`                                              |
+| `-b, --backend <name>`      | AI backend                                                 | the `-a` agent's own backend, else `.ink/identity.json`, else `claude` |
+| `--no-session`              | Disable session tracking                                   | enabled                                                                |
+| `--sb-verbose`              | Show SB verbose output                                     | off                                                                    |
+| `--session-candidates`      | Print picker candidates and exit                           | off                                                                    |
+| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                                                    |
+| `--yolo`                    | Skip all permission prompts (maps to backend auto-approve) | off                                                                    |
 
 Any flag not listed above is forwarded to the backend.
+
+#### How the backend is chosen
+
+Most explicit wins:
+
+1. `-b/--backend`
+2. **The `-a` agent's own backend**, read from their identity record (`agent_identities.backend`) and cached at `~/.ink/agent-backends.json` for a day
+3. `.ink/identity.json` → `backend`, i.e. whatever this studio was made for
+4. `claude`
+
+The agent sits above `.ink/identity.json` on purpose. `-a lumen` is an explicit
+request for Lumen; the directory's recorded backend describes whichever SB the
+studio was created for, so letting it win would mean `ink -a lumen` inside a
+wren studio still starting claude.
+
+The cache means the usual path costs nothing and keeps working offline. When
+the server is unreachable a stale entry is still used — an SB's runtime changes
+about once a year, and the alternative is silently launching them on the wrong
+one. If a record names a backend this CLI has no adapter for, it says so and
+falls through rather than quietly substituting another.
 
 Testing and regression workflows for session-candidate resolution live in [`packages/cli/TESTS.md`](./TESTS.md).
 
 ### Quick reference
 
 ```bash
-sb init                         # Set up PCP in current repo
+sb init                         # Set up Inkwell in current repo
 sb doctor                       # Check linked studio CLI binary health
 sb doctor --fix                 # Prompt to relink current studio binary
 sb mission                      # Mission control (sessions + unread inbox by SB)
 sb mission --watch              # Live-refresh mission dashboard
-sb chat                         # First-class PCP REPL (experimental)
+sb chat                         # First-class Inkwell REPL (experimental)
 sb chat -b codex                # REPL using Codex backend
 sb hooks install --all          # Install hooks across all worktrees
 sb studio create feat-auth      # Create a studio (git worktree)
@@ -212,7 +232,7 @@ sb --help                       # Full help
 
 ### Optional: local semantic memory embeddings
 
-The PCP memory system does **not** require embeddings to work. Without them, `remember` and `recall` still work via text retrieval. Semantic embeddings are **disabled by default** until you opt in.
+The Inkwell memory system does **not** require embeddings to work. Without them, `remember` and `recall` still work via text retrieval. Semantic embeddings are **disabled by default** until you opt in.
 
 If you want local semantic recall via Ollama:
 
@@ -270,12 +290,13 @@ echo 'MEMORY_CHUNKED_RECALL_ENABLED=true' >> .env.local
 
 ### Identity Resolution
 
-The agent ID is resolved in order:
+The SB's slug is resolved in order:
 
 1. `-a` / `--agent` flag
-2. `.ink/identity.json` in current directory
-3. `~/.ink/config.json` → `agentMapping.claude-code`
-4. Error — run `sb init` or `sb awaken` to configure identity
+2. `SB_SLUG` environment variable
+3. `.ink/identity.json` in current directory
+4. `~/.ink/config.json` → `sbMapping.claude-code`
+5. Error — run `sb init` or `sb awaken` to configure identity
 
 The backend is resolved similarly:
 
@@ -306,7 +327,7 @@ sb studio cli --unlink          # Remove linked binary
 
 Options for `create`:
 
-- `-a, --agent <agent>` — Agent ID for this studio (default: wren)
+- `-a, --agent <agent>` — SB slug for this studio (default: wren)
 - `-p, --purpose <desc>` — Description
 - `-b, --backend <name>` — Primary backend (claude-code, codex, gemini)
 - `-br, --branch <branch>` — Custom branch (default: `<agent>/studio/main-<studio-name>`)
@@ -322,16 +343,16 @@ sb agent list                   # List known agents
 
 ### Hooks (`sb hooks`)
 
-Manage lifecycle hooks that connect CLI backends (Claude Code, Codex, Gemini) to PCP's session/memory/inbox system. Hooks fire on events like session start, compaction, and stop — injecting context, checking inbox, and saving state.
+Manage lifecycle hooks that connect CLI backends (Claude Code, Codex, Gemini) to Inkwell's session/memory/inbox system. Hooks fire on events like session start, compaction, and stop — injecting context, checking inbox, and saving state.
 
 ```bash
 sb hooks install                   # Install for detected backend
 sb hooks install --all             # Install across ALL git worktrees
 sb hooks install -b codex          # Target a specific backend
-sb hooks install --force           # Overwrite non-PCP hooks
+sb hooks install --force           # Overwrite non-Inkwell hooks
 
 sb hooks status                    # Show installed hooks
-sb hooks uninstall                 # Remove PCP hooks
+sb hooks uninstall                 # Remove Inkwell hooks
 sb hooks uninstall --all           # Remove from all worktrees
 ```
 
@@ -339,7 +360,7 @@ Hooks are installed to **local-only** config by default (e.g., `.claude/settings
 
 **Hook events:**
 
-| PCP Event          | What it does                   | Claude Code        | Codex           | Gemini         |
+| Inkwell Event      | What it does                   | Claude Code        | Codex           | Gemini         |
 | ------------------ | ------------------------------ | ------------------ | --------------- | -------------- |
 | `on-session-start` | Bootstrap identity + inbox     | `SessionStart`     | `session_start` | `SessionStart` |
 | `pre-compact`      | Save context before compaction | `PreCompact`       | —               | `PreCompress`  |
@@ -402,7 +423,9 @@ sb permissions reset         # Remove all rules (Claude will prompt for everythi
 - **Allow**: `Bash(*)`, `Edit(*)`, `Write(*)`, `Read(*)`, `WebFetch(*)`, MCP tools — no prompts for normal dev work
 - **Deny**: `rm -rf`, `git push --force`, `git reset --hard`, `git clean -f` — always blocked
 
-> ⚠️ **`--dangerous` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
+> ⚠️ **`--yolo` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
+>
+> It was called `--dangerous` until 2026-09-22. That spelling still works and always will — it is in shell history and in hook commands already written to disk — but it is hidden from `--help`, and using it prints a one-line note. The banner the flag prints still says DANGEROUS: the shorter name does not make the behaviour milder. Codex and Gemini both call their equivalent `--yolo`, so this also stops `ink` being the odd one out.
 
 ### Mission Control (`sb mission`)
 
@@ -417,7 +440,7 @@ sb mission --json              # Machine-readable output
 
 ### First-Class REPL (`sb chat`) (experimental)
 
-`sb chat` is the native PCP REPL where PCP controls session lifecycle and context instead of relying solely on backend CLI compaction behavior.
+`sb chat` is the native Inkwell REPL where Inkwell controls session lifecycle and context instead of relying solely on backend CLI compaction behavior.
 
 ```bash
 sb chat                          # Start REPL (default backend: claude)
@@ -429,7 +452,7 @@ sb chat --attach                 # Pick an active session for this SB and attach
 sb chat --attach pr:61           # Pick from active sessions filtered by query
 sb chat --attach-latest          # Auto-attach newest active session for this SB
 sb chat --attach-latest pr:61    # Auto-attach newest active session matching query
-sb chat --session-id <pcp-id>    # Attach to an existing PCP session
+sb chat --session-id <ink-id>    # Attach to an existing Inkwell session
 sb chat --non-interactive --message "run heartbeat pass"
 sb chat --tail-transcript <session-or-path>  # Stream transcript output
 sb chat --max-context-tokens 16000
@@ -438,22 +461,22 @@ sb chat --tools off              # Disable backend-native tool usage
 sb chat --tools privileged       # Allow broad tool execution
 ```
 
-When a blocked `/pcp` tool is attempted, REPL prompts inline to allow once, allow for the active PCP session, allow always (persisted), or deny always.
+When a blocked `/ink` tool is attempted, REPL prompts inline to allow once, allow for the active Inkwell session, allow always (persisted), or deny always.
 
 Inside REPL:
 
 - `/inbox` force inbox refresh
-- `/events [now|on|off]` poll or toggle merged PCP activity stream during chat
+- `/events [now|on|off]` poll or toggle merged Inkwell activity stream during chat
 - `/sessions [watch|off]` show active sessions (id + SB + status + thread)
 - `/bookmark [label]` create a context bookmark
 - `/eject <bookmark|last>` eject context up to bookmark (and persist a `remember` checkpoint)
 - `/backend <claude|codex|gemini>` switch backend
 - `/model <id>` set/clear model override
 - `/tools <backend|off|privileged>` adjust tool policy mode
-- `/grant <tool> [uses]` scoped grant for blocked PCP tool calls
-- `/grant-session <tool>` allow a blocked PCP tool for the current PCP session only
-- `/allow <tool>` persistently allow a PCP tool
-- `/deny <tool>` persistently deny a PCP tool
+- `/grant <tool> [uses]` scoped grant for blocked Inkwell tool calls
+- `/grant-session <tool>` allow a blocked Inkwell tool for the current Inkwell session only
+- `/allow <tool>` persistently allow a Inkwell tool
+- `/deny <tool>` persistently deny a Inkwell tool
 - `/policy` inspect active policy and storage path
 - `/skills` list discovered local skills from .codex/.ink/.claude/.gemini roots
 - `/skill-trust <all|trusted-only>` set trust policy mode for skill activation
@@ -466,17 +489,17 @@ Inside REPL:
 - `/delegate-send <to> <scopes> <message>` send inbox task with delegation token metadata
 - `/skill-use <name>` activate a discovered skill and inject SKILL.md guidance into prompt context
 - `/skill-clear [name]` clear active skills
-- `/pcp <tool> [jsonArgs]` invoke PCP tools directly from REPL
+- `/ink <tool> [jsonArgs]` invoke Inkwell tools directly from REPL
 - `/usage` show visual context token meter (budget %, delta since last turn, per-role breakdown + backend usage when available)
 - `/session` show session/thread routing info
-- `/quit` end REPL and close PCP session
+- `/quit` end REPL and close Inkwell session
 
 ## Environment Variables
 
 | Variable               | Description                                   | Default                            |
 | ---------------------- | --------------------------------------------- | ---------------------------------- |
-| `INK_SERVER_URL`       | PCP server URL                                | `http://localhost:3001`            |
-| `AGENT_ID`             | Override agent identity                       | (from identity resolution)         |
+| `INK_SERVER_URL`       | Inkwell server URL                            | `http://localhost:3001`            |
+| `SB_SLUG`              | Override the SB slug                          | (from identity resolution)         |
 | `INK_TOOL_POLICY_PATH` | Override persisted REPL tool-policy JSON path | `~/.ink/security/tool-policy.json` |
 
 ## Development

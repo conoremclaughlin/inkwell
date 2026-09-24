@@ -90,6 +90,43 @@ describe('SessionRepository', () => {
     expect(updateCall.backend_session_id).toBe('019ceb00-codex-uuid');
   });
 
+  /**
+   * The assumption the refused-resume fix rests on: a field left OUT of the
+   * updates object leaves its column alone, rather than being written as null.
+   * session-service drops `cliAttached` and `messageCount` from the finalize
+   * payload when the backend refused the run before accepting it, and that is
+   * only state-preserving if this holds. Pinned here against the real
+   * buildUpdatePayload rather than restated in a fake.
+   */
+  it('omits columns for fields the updates object does not carry', async () => {
+    const { supabase, builder } = createMockSupabase();
+    const repo = new SessionRepository(supabase as never);
+
+    // The payload session-service builds for a refused resume: identity fields
+    // and the pre-turn lifecycle, and nothing that would record an outcome.
+    await repo.update('sess-1', { backend: 'codex-cli', lifecycle: 'running' });
+
+    const updateCall = builder.update.mock.calls[0][0] as Record<string, unknown>;
+    expect(updateCall).not.toHaveProperty('cli_attached');
+    expect(updateCall).not.toHaveProperty('message_count');
+    // Control: the fields that WERE passed still make it through, so the
+    // assertions above are about omission and not about an empty payload.
+    expect(updateCall.backend).toBe('codex-cli');
+    expect(updateCall.lifecycle).toBe('running');
+  });
+
+  it('writes cli_attached and message_count when they are provided', async () => {
+    const { supabase, builder } = createMockSupabase();
+    const repo = new SessionRepository(supabase as never);
+
+    await repo.update('sess-1', { cliAttached: false, messageCount: 8, lifecycle: 'failed' });
+
+    const updateCall = builder.update.mock.calls[0][0] as Record<string, unknown>;
+    expect(updateCall.cli_attached).toBe(false);
+    expect(updateCall.message_count).toBe(8);
+    expect(updateCall.lifecycle).toBe('failed');
+  });
+
   it('markCompacted with null should not overwrite backend_session_id', async () => {
     const { supabase, builder, fakeRow } = createMockSupabase();
     // Simulate a session that already has a backend session ID
@@ -175,7 +212,7 @@ describe('SessionRepository', () => {
 
     const session = await repo.create({
       userId: 'user-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       backendSessionId: null,
       type: 'primary',
       lifecycle: 'idle',

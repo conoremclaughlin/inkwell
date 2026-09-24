@@ -52,6 +52,10 @@ export const BOOKKEEPING_REASON = 'server-shutdown-after-turn';
  *   normal finalizer writing `idle`. Named for what we observed rather than
  *   `already-terminal`, which claimed more than a zero-row match proves
  *   (Lumen, PR #490 round 3).
+ * - `never-started` — the backend refused the run before accepting it, so no
+ *   turn began and this process observed nothing about the session. The row
+ *   is left untouched and nobody is told a turn failed, because none did
+ *   (Lumen's review of PR #660 P1).
  * - `unknown` — we could not read it, could not write it, the row is gone, or
  *   it still reads as running after our conditional write matched nothing.
  *   Deliberately NOT folded into the above: asserting a session finished when
@@ -61,6 +65,7 @@ export type InterruptState =
   | 'interrupted'
   | 'finished-unrecorded'
   | 'finalized-elsewhere'
+  | 'never-started'
   | 'unknown';
 
 /** Human-scale duration for the notice: "42m", "14h 33m". */
@@ -189,10 +194,10 @@ function noticeContent(
   // not claim a process was running, whatever else we failed to establish
   // (pr:558: a 14-hour-old finished turn was reported as "still running").
   const head = run.runnerSettledAt
-    ? `⚠️ ${run.agentId}'s turn${thread} had already finished when the Inkwell ` +
+    ? `⚠️ ${run.sbSlug}'s turn${thread} had already finished when the Inkwell ` +
       `server shut down — the ${run.backend} process had exited, but its ` +
       `completion was never recorded.`
-    : `⚠️ ${run.agentId}'s turn${thread} was cut short — the Inkwell server shut ` +
+    : `⚠️ ${run.sbSlug}'s turn${thread} was cut short — the Inkwell server shut ` +
       `down while the ${run.backend} process was still running (turn started ` +
       `${age} ago).`;
 
@@ -399,7 +404,7 @@ async function transitionSession(
  */
 export interface InterruptActivityEntry {
   userId: string;
-  agentId: string;
+  sbSlug: string;
   type: string;
   subtype: string;
   content: string;
@@ -429,6 +434,25 @@ export async function interruptActiveRuns(
       noticed: false,
       alreadyTerminal: false,
     };
+
+    // The backend refused this run before accepting it: no turn began, so
+    // there is no terminal state to record and no failure to report. The
+    // epoch fence below would NOT stop us — the refused run genuinely holds
+    // the row's epoch, because the takeover wrote it before the spawn — so
+    // the settled-failed path would write `lifecycle: 'failed'` onto a row
+    // that may belong to a live owner, and then post a turn-failure notice
+    // about it. That is the defect of PR #660 reached through shutdown
+    // instead of through finalize (Lumen's review, P1). Leave both alone:
+    // the refusal was already reported to whoever asked, by the ordinary
+    // failure path, as the trigger failure it is.
+    if (run.settledOutcome === 'refused') {
+      logger.warn('[Shutdown] Backend refused this run; recording nothing about the session', {
+        sessionId: run.sessionId,
+        backend: run.backend,
+      });
+      outcome.state = 'never-started';
+      return outcome;
+    }
 
     const settled = Boolean(run.runnerSettledAt);
     const fenceEpochs =
@@ -462,7 +486,7 @@ export async function interruptActiveRuns(
       try {
         await opts.logActivity({
           userId: run.userId,
-          agentId: run.agentId,
+          sbSlug: run.sbSlug,
           type: 'error',
           subtype: 'turn_interrupted',
           content: `Backend turn interrupted by server shutdown (${run.backend}${
@@ -514,10 +538,10 @@ export async function interruptActiveRuns(
         workspaceId,
         // The notice is FOR whoever asked; absent a sender it still belongs in
         // the thread, where every participant sees it.
-        fromAgentId: run.senderAgentId || run.agentId,
-        toAgentId: run.agentId,
+        fromSlug: run.senderSlug || run.sbSlug,
+        toSlug: run.sbSlug,
         threadKey: run.threadKey,
-        subject: `Turn interrupted — ${run.agentId} (${run.backend})`,
+        subject: `Turn interrupted — ${run.sbSlug} (${run.backend})`,
         content: noticeContent(run, outcome),
         metadata: {
           kind: 'session_interrupted',

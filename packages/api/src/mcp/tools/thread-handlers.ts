@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -29,6 +29,7 @@ import {
   type UserPrincipal,
 } from '../../services/principals';
 import { assertWriteRole, resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
+import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -103,11 +104,11 @@ const threadKeySchema = z
   .max(200)
   .regex(/^[a-zA-Z][a-zA-Z0-9_-]*:[^\s]+$/, 'threadKey must look like "type:identifier"');
 
-const agentIdSchema = z.string().min(1).max(64);
+const sbSlugSchema = z.string().min(1).max(64);
 
 const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: z.string().describe('Agent ID requesting access (must be a participant)'),
+  sbSlug: z.string().describe('SB slug requesting access (must be a participant)'),
   limit: z.number().int().min(1).max(200).optional().default(50),
   beforeMessageId: z.string().guid().optional().describe('Cursor: get messages before this ID'),
   afterMessageId: z.string().guid().optional().describe('Cursor: get messages after this ID'),
@@ -145,8 +146,8 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
 
 const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: agentIdSchema.describe('Agent ID to add to the thread'),
-  addedByAgentId: agentIdSchema.optional(),
+  sbSlug: sbSlugSchema.describe('SB slug to add to the thread'),
+  addedBySlug: sbSlugSchema.optional(),
   reason: z.string().max(500).optional(),
   triggerNewParticipant: z.boolean().optional().default(true),
   metadata: z.record(z.string(), z.unknown()).optional(),
@@ -154,23 +155,55 @@ const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
 
 const closeThreadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: agentIdSchema.describe('Agent ID closing the thread (must be a participant)'),
+  sbSlug: sbSlugSchema.describe('SB slug closing the thread (must be a participant)'),
 });
 
 const reopenThreadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: agentIdSchema.describe('Agent ID reopening the thread (must be a participant)'),
+  sbSlug: sbSlugSchema.describe('SB slug reopening the thread (must be a participant)'),
 });
 
+// Bounds live in thread-bounds.ts so findOrCreateThread can reach them without
+// importing this module. Re-exported because callers already import them here.
+export { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX };
+
+const updateThreadSchema = userIdentifierBaseSchema
+  .extend({
+    threadKey: threadKeySchema,
+    sbSlug: sbSlugSchema.describe('SB slug making the change (must be a participant)'),
+    title: z
+      .string()
+      .max(THREAD_TITLE_MAX)
+      .nullable()
+      .optional()
+      .describe(
+        `Short label for the thread, max ${THREAD_TITLE_MAX} chars. The threadKey identifies the thread; this describes it. Pass null to clear.`
+      ),
+    summary: z
+      .string()
+      .max(THREAD_SUMMARY_MAX)
+      .nullable()
+      .optional()
+      .describe(
+        `Brief, concise description of what the thread is about NOW, max ${THREAD_SUMMARY_MAX} chars. Rewrite it as the discussion moves on. Pass null to clear.`
+      ),
+  })
+  // Distinguishing "not provided" from "explicitly cleared" is the whole point
+  // of allowing null, so a call that provides neither is a caller error rather
+  // than a silent no-op that reports success.
+  .refine((v) => v.title !== undefined || v.summary !== undefined, {
+    message: 'Provide at least one of title or summary',
+  });
+
 const listThreadsSchema = userIdentifierBaseSchema.extend({
-  agentId: agentIdSchema.describe('Agent ID to list threads for'),
+  sbSlug: sbSlugSchema.describe('SB slug to list threads for'),
   status: z.enum(['open', 'closed', 'all']).optional().default('open'),
   limit: z.number().int().min(1).max(100).optional().default(20),
 });
 
 const markThreadReadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
-  agentId: agentIdSchema.describe('Agent ID marking the thread as read'),
+  sbSlug: sbSlugSchema.describe('SB slug marking the thread as read'),
   throughMessageId: z
     .string()
     .guid()
@@ -190,6 +223,16 @@ export interface ThreadRow {
   created_by_sb_id: string | null;
   created_by_user_id: string | null;
   title: string | null;
+  summary: string | null;
+  /**
+   * NULL means the field still holds its creation-time value. That is the
+   * signal a reader needs: it distinguishes a description someone has kept
+   * current from one that has never been touched since the thread opened.
+   */
+  title_updated_at: string | null;
+  title_updated_by_sb_id: string | null;
+  summary_updated_at: string | null;
+  summary_updated_by_sb_id: string | null;
   status: string;
   metadata: Json;
   created_at: string;
@@ -205,7 +248,7 @@ export interface ThreadParticipant {
   sbId: string | null;
   userId: string | null;
   /** The SB's slug (null for a person). */
-  agentId: string | null;
+  sbSlug: string | null;
   sessionId: string | null;
   joinedAt: string | null;
 }
@@ -213,19 +256,19 @@ export interface ThreadParticipant {
 /** The SB participants only — the set dispatch operates on (§7). */
 export function sbParticipants(ps: ThreadParticipant[]): SbRef[] {
   return ps
-    .filter((p): p is ThreadParticipant & { sbId: string; agentId: string } => !!p.sbId)
-    .map((p) => ({ sbId: p.sbId, agentId: p.agentId ?? p.sbId }));
+    .filter((p): p is ThreadParticipant & { sbId: string; sbSlug: string } => !!p.sbId)
+    .map((p) => ({ sbId: p.sbId, sbSlug: p.sbSlug ?? p.sbId }));
 }
 
 /** Slugs of the SB participants, for tool output and legacy callers. */
 export function participantSlugs(ps: ThreadParticipant[]): string[] {
-  return sbParticipants(ps).map((p) => p.agentId);
+  return sbParticipants(ps).map((p) => p.sbSlug);
 }
 
 /** An SB named for dispatch: canonical id plus its slug for display. */
 export interface SbRef {
   sbId: string;
-  agentId: string;
+  sbSlug: string;
 }
 
 /** The creator or closer of a thread as a principal, from the row. */
@@ -234,7 +277,7 @@ export function threadCreator(t: ThreadRow): Principal {
     return {
       kind: 'sb',
       sbId: t.created_by_sb_id,
-      agentId: '',
+      sbSlug: '',
       userId: '',
       workspaceId: t.workspace_id,
     };
@@ -296,12 +339,12 @@ export async function getParticipants(
   }>;
   const sbIds = rows.map((r) => r.sb_id).filter((id): id is string => !!id);
   const slugById = new Map(
-    (await resolveSbsByIds(supabase, sbIds)).map((sb) => [sb.sbId, sb.agentId])
+    (await resolveSbsByIds(supabase, sbIds)).map((sb) => [sb.sbId, sb.sbSlug])
   );
   return rows.map((r) => ({
     sbId: r.sb_id,
     userId: r.user_id,
-    agentId: r.sb_id ? (slugById.get(r.sb_id) ?? null) : null,
+    sbSlug: r.sb_id ? (slugById.get(r.sb_id) ?? null) : null,
     sessionId: r.session_id,
     joinedAt: r.joined_at,
   }));
@@ -413,7 +456,7 @@ export function resolveTriggeredAgents(opts: {
 
   // Precedence 3: default rules by SB cardinality
   const others = participants.filter((p) => p.sbId !== senderSbId);
-  const self: SbRef = byId.get(senderSbId) ?? { sbId: senderSbId, agentId: sender.agentId };
+  const self: SbRef = byId.get(senderSbId) ?? { sbId: senderSbId, sbSlug: sender.sbSlug };
 
   // Self-thread (no other SB): wake self only on cross-studio or actionable
   // types — session_resume / task_request to self are "wake me up" signals.
@@ -446,7 +489,7 @@ export function resolveTriggeredAgents(opts: {
   // No explicit recipients: a non-creator wakes the SB creator; the creator
   // (or anyone, when the creator is a person or the system) wakes the others.
   if (creator.kind === 'sb' && creator.sbId !== senderSbId) {
-    return [byId.get(creator.sbId) ?? { sbId: creator.sbId, agentId: creator.agentId }];
+    return [byId.get(creator.sbId) ?? { sbId: creator.sbId, sbSlug: creator.sbSlug }];
   }
   return others;
 }
@@ -459,7 +502,7 @@ export function resolveTriggeredAgents(opts: {
 export function dispatchTriggers(
   targets: SbRef[],
   opts: {
-    fromAgentId: string;
+    fromSlug: string;
     /** The sender's canonical identity, when it is an SB (failure notices go to its owner). */
     fromSbId?: string;
     threadKey: string;
@@ -476,9 +519,9 @@ export function dispatchTriggers(
   const gateway = getAgentGateway();
   for (const target of targets) {
     const payload: AgentTriggerPayload = {
-      fromAgentId: opts.fromAgentId,
+      fromSlug: opts.fromSlug,
       ...(opts.fromSbId ? { fromSbId: opts.fromSbId } : {}),
-      toAgentId: target.agentId,
+      toSlug: target.sbSlug,
       toSbId: target.sbId,
       threadMessageId: opts.threadMessageId,
       threadId: opts.threadId,
@@ -501,10 +544,10 @@ export async function creatorLabel(
   participants: ThreadParticipant[]
 ): Promise<string> {
   if (thread.created_by_kind === 'sb' && thread.created_by_sb_id) {
-    const known = participants.find((p) => p.sbId === thread.created_by_sb_id)?.agentId;
+    const known = participants.find((p) => p.sbId === thread.created_by_sb_id)?.sbSlug;
     if (known) return known;
     const [sb] = await resolveSbsByIds(supabase, [thread.created_by_sb_id]);
-    return sb?.agentId ?? thread.created_by_sb_id;
+    return sb?.sbSlug ?? thread.created_by_sb_id;
   }
   return thread.created_by_kind;
 }
@@ -515,8 +558,8 @@ export function creatorForDispatch(
   participants: ThreadParticipant[]
 ): TriggerPrincipal {
   if (thread.created_by_kind === 'sb' && thread.created_by_sb_id) {
-    const known = participants.find((p) => p.sbId === thread.created_by_sb_id)?.agentId;
-    return { kind: 'sb', sbId: thread.created_by_sb_id, agentId: known ?? thread.created_by_sb_id };
+    const known = participants.find((p) => p.sbId === thread.created_by_sb_id)?.sbSlug;
+    return { kind: 'sb', sbId: thread.created_by_sb_id, sbSlug: known ?? thread.created_by_sb_id };
   }
   return thread.created_by_kind === 'user' ? { kind: 'user' } : { kind: 'system' };
 }
@@ -528,7 +571,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   const parsed = getThreadMessagesSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const {
     threadKey,
     limit,
@@ -542,7 +585,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   } = parsed;
 
   // The caller's identity fixes the workspace the thread is looked up in.
-  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
   const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return {
@@ -563,7 +606,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           type: 'text' as const,
           text: JSON.stringify({
             success: false,
-            error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+            error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
           }),
         },
       ],
@@ -595,6 +638,10 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   //   1. last_read_at (explicit read pointer from prior reads)
   //   2. joined_at (participant join time — no replay of pre-join history)
   let readStateFloor: string | null = null;
+  // WHICH floor it is. `COALESCE(last_read_at, joined_at)` collapses two very
+  // different facts — "you were given these" and "these predate you" — and the
+  // hint must not claim the first when it only knows the second.
+  let readFloorSource: 'pointer' | 'join' | null = null;
   if (!afterMessageId && !beforeMessageId && !parsed.fullHistory) {
     const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
       .select('last_read_at')
@@ -602,6 +649,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       .eq('sb_id', caller.sbId)
       .maybeSingle();
     readStateFloor = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
+    if (readStateFloor) readFloorSource = 'pointer';
 
     if (!readStateFloor) {
       const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
@@ -610,6 +658,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
         .eq('sb_id', caller.sbId)
         .maybeSingle();
       readStateFloor = (participant as { joined_at?: string } | null)?.joined_at || null;
+      if (readStateFloor) readFloorSource = 'join';
     }
   }
 
@@ -637,6 +686,15 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
 
   let messages: Record<string, unknown>[] | null = null;
   let skippedOlderCount = 0;
+  // How many messages the read-state floor withheld. Only computed when the
+  // answer would otherwise be a bare empty list — see below.
+  let hiddenByReadState = 0;
+  // Set when the oldest-first page filled exactly and more messages matched.
+  let truncatedNewer = 0;
+  // Why a diagnostic count is missing. An unknown count is reported as unknown
+  // — never as zero, which would read as a definite "nothing there" and rebuild
+  // the ambiguity this handler exists to remove.
+  let diagnosticsUnavailable: string | null = null;
 
   if (!newestFirst) {
     const { data, error } = await buildQuery('*')
@@ -646,6 +704,21 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       throw new Error(`Failed to get thread messages: ${error.message}`);
     }
     messages = data;
+
+    if ((messages?.length ?? 0) === effectiveLimit) {
+      // The page filled exactly, so newer messages may exist past it. This
+      // branch is oldest-first, so a truncated page silently hands back the
+      // WRONG END of the thread — the caller asked what is going on and got
+      // the beginning of the conversation.
+      const { count, error: truncErr } = await buildQuery('id', true);
+      if (truncErr) {
+        // An unknown count must not read as a complete page. Say the number is
+        // missing rather than implying there is nothing past the end.
+        diagnosticsUnavailable = truncErr.message;
+      } else {
+        truncatedNewer = Math.max(0, (count ?? 0) - effectiveLimit);
+      }
+    }
   } else {
     // Count everything past the floor so truncation is visible, not silent.
     const { count: totalMatching, error: countErr } = await buildQuery('id', true);
@@ -689,6 +762,57 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     messages = delivered.reverse();
   }
 
+  // An empty result has two completely different meanings — "this thread has
+  // nothing in it" and "you have already been given all of this" — and the
+  // response said exactly the same thing for both.
+  //
+  // On 2026-09-11 a trigger woke a session with "Fetch the thread using
+  // get_thread_messages(threadKey: ...)". Between the spawn and that call, the
+  // session's OWN channel plugin pushed the same message inline and acked it
+  // (poll-core.ts) — a correct ack, after a real render. So the instructed
+  // fetch returned [], correctly by its own rules, and read as an empty thread.
+  // The recipient went to Postgres to find a message that had been delivered to
+  // it a second earlier.
+  //
+  // Two delivery paths share one pointer and there is no ordering between them.
+  // Whichever loses must at least be able to say what happened, so count what
+  // the floor withheld. Costs a query only in the ambiguous case.
+  //
+  // Runs AFTER window selection and keys off `!channelPoll`, not off query
+  // direction: `newestFirst` is also true for any ordinary caller passing
+  // `latestN`, and asking for recent context is a normal agent call that
+  // deserves the same answer. A delivery poll is the one caller that does not —
+  // it manages its own cursor and an empty cold start is expected there.
+  if (!channelPoll && readStateFloor && (messages?.length ?? 0) === 0) {
+    let consumed = threadTable(supabase, 'inbox_thread_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('thread_id', thread.id);
+    if (!includeSystemEvents) consumed = consumed.neq('message_type', 'system');
+    if (beforeTs) consumed = consumed.lt('created_at', beforeTs);
+
+    // Lift ONLY the read floor. The caller's own filters stay on, or a message
+    // excluded purely by an explicit `newerThan` gets reported as already
+    // consumed — and the suggested `fullHistory` retry would still return
+    // nothing, because the filter was never the read state.
+    const explicitFloor = resolveEffectiveFloor({ readStateFloor: null, afterTs, newerThan });
+    if (explicitFloor) consumed = consumed.gt('created_at', explicitFloor);
+
+    // Bounded above by the floor we captured at the top of this request, so a
+    // message inserted mid-request cannot be counted as something you already
+    // read. Only what sits at or below the pointer was withheld by it.
+    consumed = consumed.lte('created_at', readStateFloor);
+
+    const { count, error: countErr } = await consumed;
+    if (countErr) {
+      // The whole point of this PR is that an empty list must say why. Falling
+      // back to zero here would restore the exact ambiguity it removes, so the
+      // unknown is reported as unknown.
+      diagnosticsUnavailable = countErr.message;
+    } else {
+      hiddenByReadState = count ?? 0;
+    }
+  }
+
   // Get participants
   const participants = await getParticipants(supabase, thread.id);
 
@@ -726,7 +850,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
               advanceFailed = true;
               logger.error('[GetThreadMessages] deliberate_skip advance failed', {
                 threadKey,
-                agentId,
+                sbSlug,
                 throughMessageId: newestSkipped.id,
               });
             }
@@ -754,7 +878,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           advanceFailed = true;
           logger.error('[GetThreadMessages] markRead advance failed', {
             threadKey,
-            agentId,
+            sbSlug,
             throughMessageId: maxMessageId,
           });
         }
@@ -771,6 +895,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           threadKey,
           threadId: thread.id,
           title: thread.title,
+          summary: thread.summary ?? null,
+          titleUpdatedAt: thread.title_updated_at ?? null,
+          summaryUpdatedAt: thread.summary_updated_at ?? null,
           status: thread.status,
           createdBy: await creatorLabel(supabase, thread, participants),
           participants: participantSlugs(participants),
@@ -780,6 +907,48 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           // messages were cut by the cold-start guard or latestN window.
           ...(skippedOlderCount > 0 ? { skippedOlderCount } : {}),
           ...(guardActive ? { coldStartGuard: true } : {}),
+          // Empty because already-read, NOT because the thread is empty.
+          ...(hiddenByReadState > 0
+            ? {
+                hiddenByReadState,
+                // The wording follows the floor's provenance. Claiming previous
+                // delivery when only `joined_at` supplied the floor would tell
+                // a brand-new participant it had already been sent a history it
+                // has never seen.
+                hint:
+                  readFloorSource === 'join'
+                    ? `Nothing in this thread postdates the moment you joined it, but ` +
+                      `${hiddenByReadState} earlier ${hiddenByReadState === 1 ? 'message' : 'messages'} ` +
+                      `exist. They are pre-join history, not messages you were sent. Pass ` +
+                      `fullHistory: true with latestN to read them.`
+                    : `No messages are newer than your read pointer, but this thread has ` +
+                      `${hiddenByReadState}. They may already have been delivered to you by ` +
+                      `another path (an inline channel push acks on render). Pass ` +
+                      `fullHistory: true with latestN to see them.`,
+              }
+            : {}),
+          // A count we could not take. Reported rather than silently zeroed:
+          // "I don't know" and "there is nothing" must not look the same.
+          ...(diagnosticsUnavailable
+            ? {
+                diagnosticsUnavailable: true,
+                warning:
+                  `Could not determine whether messages were withheld by read state or ` +
+                  `truncation (${diagnosticsUnavailable}). An empty or full page here is ` +
+                  `NOT evidence the thread is empty or complete — retry with ` +
+                  `fullHistory: true and an explicit latestN.`,
+              }
+            : {}),
+          // The page filled and this branch is oldest-first, so what came back
+          // is the START of the thread, not the latest of it.
+          ...(truncatedNewer > 0
+            ? {
+                truncatedNewerCount: truncatedNewer,
+                hint:
+                  `Returned the OLDEST ${effectiveLimit} messages; ${truncatedNewer} newer ` +
+                  `ones were cut. Pass latestN to get the most recent instead.`,
+              }
+            : {}),
           // Checked write surfaced to the caller (spec §5): messages were
           // returned, but the read-pointer advance did NOT persist — read
           // state is stale and messages may re-deliver.
@@ -790,17 +959,27 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
                   'read-pointer advance failed — read state is stale; messages may re-deliver',
               }
             : {}),
-          messages: (messages || []).map((m: Record<string, unknown>) => ({
-            id: m.id,
-            senderKind: m.sender_kind,
-            senderAgentId: m.sender_agent_id ?? m.sender_kind,
-            senderUserId: m.sender_user_id,
-            content: m.content,
-            messageType: m.message_type,
-            priority: m.priority,
-            metadata: m.metadata,
-            createdAt: m.created_at,
-          })),
+          messages: (messages || []).map((m: Record<string, unknown>) => {
+            // The sender's subject, whole. send_to_inbox stores it under
+            // metadata.pcp so a bounded thread title is never the only copy
+            // (#641 round 2); lifted to the top level here because that is
+            // where every other reader of a message expects to find it, and
+            // digging it out of a metadata blob is not something a caller
+            // should have to know to do. Omitted when there was no subject.
+            const subject = threadMessageSubject(m.metadata);
+            return {
+              id: m.id,
+              senderKind: m.sender_kind,
+              senderSlug: m.sender_agent_id ?? m.sender_kind,
+              senderUserId: m.sender_user_id,
+              content: m.content,
+              messageType: m.message_type,
+              priority: m.priority,
+              ...(subject ? { subject } : {}),
+              metadata: m.metadata,
+              createdAt: m.created_at,
+            };
+          }),
         }),
       },
     ],
@@ -812,8 +991,8 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   const parsed = addThreadParticipantSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { threadKey, agentId, reason, triggerNewParticipant, metadata } = parsed;
-  const addedByAgentId = getEffectiveAgentId(parsed.addedByAgentId) ?? parsed.addedByAgentId;
+  const { threadKey, sbSlug, reason, triggerNewParticipant, metadata } = parsed;
+  const addedBySlug = getEffectiveSlug(parsed.addedBySlug) ?? parsed.addedBySlug;
 
   // The thread lives in the caller's workspace; the newcomer must resolve
   // there too — a foreign SB cannot be placed in this thread (§6).
@@ -821,7 +1000,7 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
     workspaceId,
     sb: actor,
     role,
-  } = await resolveCallerWorkspace(supabase, resolved.user.id, addedByAgentId);
+  } = await resolveCallerWorkspace(supabase, resolved.user.id, addedBySlug);
   assertWriteRole(role, 'add a participant');
   const thread = await findThread(supabase, workspaceId, threadKey);
   if (!thread) {
@@ -834,7 +1013,7 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
       ],
     };
   }
-  const newcomer = await resolveSbInWorkspace(supabase, thread.workspace_id, agentId);
+  const newcomer = await resolveSbInWorkspace(supabase, thread.workspace_id, sbSlug);
 
   // Idempotent: check if already participant
   if (await isParticipant(supabase, thread.id, newcomer)) {
@@ -844,7 +1023,7 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
           type: 'text' as const,
           text: JSON.stringify({
             success: true,
-            message: `${agentId} is already a participant in thread ${threadKey}`,
+            message: `${sbSlug} is already a participant in thread ${threadKey}`,
             alreadyParticipant: true,
             threadKey,
           }),
@@ -865,9 +1044,9 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   }
 
   // Add system message for audit trail
-  const systemContent = addedByAgentId
-    ? `${agentId} was added to the thread by ${addedByAgentId}${reason ? `: ${reason}` : ''}`
-    : `${agentId} joined the thread${reason ? `: ${reason}` : ''}`;
+  const systemContent = addedBySlug
+    ? `${sbSlug} was added to the thread by ${addedBySlug}${reason ? `: ${reason}` : ''}`
+    : `${sbSlug} joined the thread${reason ? `: ${reason}` : ''}`;
 
   await threadTable(supabase, 'inbox_thread_messages').insert({
     thread_id: thread.id,
@@ -876,20 +1055,20 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
     message_type: 'system',
     metadata: {
       type: 'participant_added',
-      agentId,
+      sbSlug,
       sbId: newcomer.sbId,
-      addedBy: addedByAgentId || null,
+      addedBy: addedBySlug || null,
       reason: reason || null,
       ...(metadata || {}),
     } as Json,
   });
 
-  logger.info('Thread participant added', { threadKey, agentId, addedBy: addedByAgentId });
+  logger.info('Thread participant added', { threadKey, sbSlug, addedBy: addedBySlug });
 
   // Trigger the new participant
   if (triggerNewParticipant) {
-    dispatchTriggers([{ sbId: newcomer.sbId, agentId: newcomer.agentId }], {
-      fromAgentId: addedByAgentId || 'system',
+    dispatchTriggers([{ sbId: newcomer.sbId, sbSlug: newcomer.sbSlug }], {
+      fromSlug: addedBySlug || 'system',
       // The actor's identity rides with the trigger so a failure notice can
       // find the sender's owner; without it the notice had only the thread
       // lane on this path (Lumen, #618 round 2).
@@ -900,7 +1079,7 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
       senderIsBridge: await isBridgeIdentity(
         supabase,
         resolved.user.id,
-        addedByAgentId || null,
+        addedBySlug || null,
         senderSbId()
       ),
       threadKey,
@@ -916,9 +1095,9 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          message: `${agentId} added to thread ${threadKey}`,
+          message: `${sbSlug} added to thread ${threadKey}`,
           threadKey,
-          agentId,
+          sbSlug,
           triggered: triggerNewParticipant,
         }),
       },
@@ -931,10 +1110,10 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   const parsed = closeThreadSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const { threadKey } = parsed;
 
-  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
   assertWriteRole(caller.ownerRole, 'close a thread');
   const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
@@ -971,7 +1150,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
           type: 'text' as const,
           text: JSON.stringify({
             success: false,
-            error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+            error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
           }),
         },
       ],
@@ -999,9 +1178,9 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   await threadTable(supabase, 'inbox_thread_messages').insert({
     thread_id: thread.id,
     ...senderColumns(SYSTEM_PRINCIPAL),
-    content: `Thread closed by ${agentId}`,
+    content: `Thread closed by ${sbSlug}`,
     message_type: 'system',
-    metadata: { type: 'thread_closed', closedBy: agentId, closedBySbId: caller.sbId } as Json,
+    metadata: { type: 'thread_closed', closedBy: sbSlug, closedBySbId: caller.sbId } as Json,
   });
 
   // Automatic lease release — the work unit completing is what lets studios
@@ -1045,7 +1224,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
     });
   }
 
-  logger.info('Thread closed', { threadKey, closedBy: agentId });
+  logger.info('Thread closed', { threadKey, closedBy: sbSlug });
 
   return {
     content: [
@@ -1055,7 +1234,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
           success: true,
           message: `Thread ${threadKey} closed`,
           threadKey,
-          closedBy: agentId,
+          closedBy: sbSlug,
         }),
       },
     ],
@@ -1125,13 +1304,13 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
   const parsed = reopenThreadSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const { threadKey } = parsed;
   const reply = (payload: Record<string, unknown>) => ({
     content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
   });
 
-  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
   assertWriteRole(caller.ownerRole, 'reopen a thread');
   const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
@@ -1142,7 +1321,7 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
   if (!(await isParticipant(supabase, thread.id, caller))) {
     return reply({
       success: false,
-      error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+      error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
     });
   }
 
@@ -1171,13 +1350,169 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
     });
   }
 
-  logger.info('Thread reopened', { threadKey, reopenedBy: agentId });
+  logger.info('Thread reopened', { threadKey, reopenedBy: sbSlug });
 
   return reply({
     success: true,
     message: `Thread ${threadKey} reopened`,
     threadKey,
-    reopenedBy: agentId,
+    reopenedBy: sbSlug,
+  });
+}
+
+/** What one update_thread call writes: the fields it touches, and who by. */
+export interface ThreadMetadataEdit {
+  setTitle: boolean;
+  title: string | null;
+  setSummary: boolean;
+  summary: string | null;
+  editorSbId: string | null;
+  editorSlug: string;
+  attributedBy: 'identity' | 'slug-only';
+}
+
+/**
+ * Write a title/summary edit AND its timeline event — in ONE transaction, the
+ * `update_inbox_thread_metadata` SQL function (migration 20260916020035).
+ *
+ * The same two-round-trip shape Lumen caught on reopen in #615, and caught
+ * again here in #641: as an UPDATE followed by an INSERT these are two
+ * transactions, so a rejected audit INSERT left the edit standing with nothing
+ * in the timeline recording who made it. The first cut also discarded the
+ * INSERT's error, which turned that into `success: true` — and in the
+ * `slug-only` attribution case the timeline message is the only durable record
+ * of the editor, so the response claimed a trail it had just failed to write.
+ *
+ * Throwing after the fact would have detected the failure without restoring the
+ * trail. One function restores it: either both land or neither does.
+ *
+ * Returns the timestamp the row was written with, so the response reports the
+ * stored instant rather than an app-side guess at it.
+ */
+export async function updateThreadMetadataRow(
+  supabase: SupabaseClient,
+  threadId: string,
+  edit: ThreadMetadataEdit
+): Promise<string> {
+  const { data, error } = await supabase.rpc('update_inbox_thread_metadata', {
+    p_thread_id: threadId,
+    p_set_title: edit.setTitle,
+    p_title: edit.title,
+    p_set_summary: edit.setSummary,
+    p_summary: edit.summary,
+    p_editor_sb_id: edit.editorSbId,
+    p_editor_slug: edit.editorSlug,
+    p_attributed_by: edit.attributedBy,
+  });
+  if (error) {
+    throw new Error(`Failed to update thread: ${error.message}`);
+  }
+  if (typeof data !== 'string' || !data) {
+    // The function returns exactly a timestamptz; anything else means the call
+    // did not reach it (a missing migration, a mocked client).
+    throw new Error(`Failed to update thread: unexpected reply ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+/**
+ * Set or update a thread's title and summary.
+ *
+ * The threadKey is a stable identifier by design, and that stability is what
+ * makes it useless as a description: one thread routinely spans several PRs,
+ * specs and incidents. So the descriptive layer is mutable precisely because
+ * the key is not.
+ *
+ * Any participant may edit. A thread is collaborative — restricting edits to
+ * the creator would mean a thread Myra opened can never be retitled by the SB
+ * actually doing the work, which is the common case.
+ *
+ * Each field carries its own editor and timestamp. The timestamp is the load
+ * bearing part: a summary without one is read as current no matter how old it
+ * is, which is the failure this feature exists to fix rather than reproduce.
+ */
+export async function handleUpdateThread(args: unknown, dataComposer: DataComposer) {
+  const supabase = dataComposer.getClient();
+  const parsed = updateThreadSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
+  const { threadKey, title, summary } = parsed;
+
+  const reply = (payload: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
+  });
+
+  // The caller is a principal in a workspace (spec inkmail-thread-scope
+  // §1/§3): the thread is looked up in that workspace, and a viewer's SB
+  // cannot edit (Lumen, #621 P1).
+  const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
+  assertWriteRole(caller.ownerRole, 'edit a thread');
+  const thread = await findThread(supabase, caller.workspaceId, threadKey);
+  if (!thread) {
+    return reply({ success: false, error: `Thread not found: ${threadKey}` });
+  }
+
+  // Closed threads stay editable. Closed is a work-state signal, not a lock
+  // (spec inkmail-thread-scope §2), and a finished thread is exactly the one
+  // whose summary is most worth correcting for whoever reads it later.
+  if (!(await isParticipant(supabase, thread.id, caller))) {
+    return reply({
+      success: false,
+      error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
+    });
+  }
+
+  // Attribution by canonical UUID. Since the cutover the caller IS an
+  // identity in a workspace — resolved by resolveCallerSb above, never
+  // re-derived from the slug, which is unique only per workspace — so the
+  // provenance is always the identity. The response still says which case
+  // it recorded, because the field is part of the tool's contract and a
+  // reader must not read null as either.
+  const editorSbId: string = caller.sbId;
+  const attributedBy = 'identity' as const;
+
+  // `undefined` means "not provided" and `null` means "explicitly cleared" —
+  // never collapse them, or a caller editing only the summary silently wipes
+  // the title. The two are carried to SQL as a set-flag and a value for the
+  // same reason.
+  const changed: string[] = [];
+  if (title !== undefined) changed.push('title');
+  if (summary !== undefined) changed.push('summary');
+
+  // The edit and its timeline event, in one transaction. See
+  // updateThreadMetadataRow: a failed audit must not leave an edit standing.
+  const now = await updateThreadMetadataRow(supabase, thread.id, {
+    setTitle: title !== undefined,
+    title: title ?? null,
+    setSummary: summary !== undefined,
+    summary: summary ?? null,
+    editorSbId,
+    editorSlug: sbSlug,
+    attributedBy,
+  });
+
+  logger.info('[Thread] Title/summary updated', {
+    threadKey,
+    sbSlug,
+    fields: changed,
+    attributedBy,
+  });
+
+  return reply({
+    success: true,
+    message: `Thread ${threadKey} ${changed.join(' and ')} updated`,
+    threadKey,
+    updatedBy: sbSlug,
+    // 'identity' = a canonical UUID was recorded. 'slug-only' = the slug could
+    // not be resolved to one identity, so the column is null and the timeline
+    // message carries the slug. Stated rather than left to be inferred from a
+    // null column, which cannot distinguish "unresolvable" from "never tried".
+    attributedBy,
+    updatedFields: changed,
+    ...(title !== undefined ? { title } : {}),
+    ...(summary !== undefined ? { summary } : {}),
+    updatedAt: now,
   });
 }
 
@@ -1186,9 +1521,9 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
   const parsed = listThreadsSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const { status, limit } = parsed;
-  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
 
   // Get thread IDs where this SB is a participant
   const { data: participantRows, error: pError } = await threadTable(
@@ -1208,7 +1543,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
       content: [
         {
           type: 'text' as const,
-          text: JSON.stringify({ success: true, agentId, count: 0, threads: [] }),
+          text: JSON.stringify({ success: true, sbSlug, count: 0, threads: [] }),
         },
       ],
     };
@@ -1266,6 +1601,12 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
       return {
         threadKey: t.thread_key,
         title: t.title,
+        summary: t.summary ?? null,
+        // Ages travel with the text. A summary shown without one is read as
+        // current however old it is — the exact misread this feature exists to
+        // prevent, so omitting these would reproduce it on a new surface.
+        titleUpdatedAt: t.title_updated_at ?? null,
+        summaryUpdatedAt: t.summary_updated_at ?? null,
         status: t.status,
         createdBy: await creatorLabel(supabase, t, participants),
         participants: participantSlugs(participants),
@@ -1290,7 +1631,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          agentId,
+          sbSlug,
           count: threadsWithMeta.length,
           threads: threadsWithMeta,
         }),
@@ -1304,10 +1645,10 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   const parsed = markThreadReadSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const sbSlug = getEffectiveSlug(parsed.sbSlug) ?? parsed.sbSlug;
   const { threadKey } = parsed;
 
-  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, sbSlug);
   const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return {
@@ -1328,7 +1669,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
           type: 'text' as const,
           text: JSON.stringify({
             success: false,
-            error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+            error: `Agent ${sbSlug} is not a participant in thread ${threadKey}`,
           }),
         },
       ],
@@ -1371,7 +1712,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     }
     logger.info('Thread read acknowledged through message', {
       threadKey,
-      agentId,
+      sbSlug,
       throughMessageId: ackMsg.id,
     });
     return {
@@ -1382,7 +1723,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
             success: true,
             message: `Thread ${threadKey} acknowledged through ${ackMsg.id}`,
             threadKey,
-            agentId,
+            sbSlug,
             throughMessageId: ackMsg.id,
           }),
         },
@@ -1416,7 +1757,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     }
   }
 
-  logger.info('Thread marked as read', { threadKey, agentId });
+  logger.info('Thread marked as read', { threadKey, sbSlug });
 
   return {
     content: [
@@ -1426,7 +1767,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
           success: true,
           message: `Thread ${threadKey} marked as read`,
           threadKey,
-          agentId,
+          sbSlug,
         }),
       },
     ],
@@ -1478,4 +1819,30 @@ export const threadToolDefinitions = [
     schema: reopenThreadSchema,
     handler: handleReopenThread,
   },
+  {
+    name: 'update_thread',
+    description:
+      "Set or update a thread's title and brief summary, so it is clear what the thread is actually about now. The threadKey is a stable identifier, not a description — one thread routinely covers several PRs, specs and incidents, and 'pr:632' says none of it. Keep the summary BRIEF AND CONCISE (bounded at 280 chars) and rewrite it as the discussion moves on; a summary that grows without bound is the thing this replaces. Any participant may edit, including on a closed thread. Each field records who changed it and when, and the age is shown wherever the summary is, so a reader can tell a current description from an old one.",
+    schema: updateThreadSchema,
+    handler: handleUpdateThread,
+  },
 ];
+
+/**
+ * Look up a thread tool definition by name.
+ *
+ * Registration used to index this array positionally (`threadToolDefinitions[3]`),
+ * which silently rebinds every later tool to the wrong schema the moment
+ * anything is inserted rather than appended — a trap that fired immediately
+ * when `update_thread` was first added in the middle. Names do not shift.
+ */
+export function threadTool(name: string): (typeof threadToolDefinitions)[number] {
+  const found = threadToolDefinitions.find((t) => t.name === name);
+  if (!found) {
+    // Throwing beats returning undefined: a missing tool is a programming error
+    // at startup, and a silently unregistered tool is invisible until a caller
+    // needs it.
+    throw new Error(`Unknown thread tool: ${name}`);
+  }
+  return found;
+}

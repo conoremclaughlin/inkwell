@@ -18,15 +18,15 @@ import type { Request, Response } from 'express';
 // Mocks — same structure as admin-auth.test.ts
 // ---------------------------------------------------------------------------
 
-const mockVerifyPcpAccessToken = vi.fn();
+const mockVerifyInkAccessToken = vi.fn();
 const mockExchangeRefreshToken = vi.fn();
-const mockSignPcpAccessToken = vi.fn();
+const mockSignInkAccessToken = vi.fn();
 const mockCreateRefreshToken = vi.fn();
 
-vi.mock('../auth/pcp-tokens', () => ({
-  verifyPcpAccessToken: (...args: unknown[]) => mockVerifyPcpAccessToken(...args),
+vi.mock('../auth/ink-tokens', () => ({
+  verifyInkAccessToken: (...args: unknown[]) => mockVerifyInkAccessToken(...args),
   exchangeRefreshToken: (...args: unknown[]) => mockExchangeRefreshToken(...args),
-  signPcpAccessToken: (...args: unknown[]) => mockSignPcpAccessToken(...args),
+  signInkAccessToken: (...args: unknown[]) => mockSignInkAccessToken(...args),
   createRefreshToken: (...args: unknown[]) => mockCreateRefreshToken(...args),
 }));
 
@@ -87,11 +87,9 @@ vi.mock('../services/oauth', () => ({
   })),
 }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -191,9 +189,9 @@ function createAuthenticatedReq(overrides: Record<string, unknown> = {}): Reques
     query: {},
     path: '/test',
     user: { email: 'test@example.com' },
-    pcpUserId: TEST_USER_ID,
-    pcpWorkspaceId: TEST_WORKSPACE_ID,
-    pcpWorkspaceRole: 'member',
+    inkUserId: TEST_USER_ID,
+    inkWorkspaceId: TEST_WORKSPACE_ID,
+    inkWorkspaceRole: 'member',
     header: vi.fn(() => undefined),
     ...overrides,
   } as unknown as Request;
@@ -256,7 +254,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
     vi.clearAllMocks();
 
     // Auth setup: Tier 1 always succeeds
-    mockVerifyPcpAccessToken.mockReturnValue({
+    mockVerifyInkAccessToken.mockReturnValue({
       type: 'pcp_admin',
       sub: TEST_USER_ID,
       email: 'test@example.com',
@@ -874,7 +872,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
             syncedAt: '2026-03-11T10:00:00Z',
             session: {
               id: 'session-in-workspace',
-              agentId: 'wren',
+              sbSlug: 'wren',
               agentName: 'Wren',
               agentRole: 'SB',
               backend: 'claude',
@@ -1262,7 +1260,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         credentials: [
           {
             email: 'me@example.com',
-            path: '/srv/google/me@example.com.json',
+            path: '/srv/google/me@example.com' + '.json',
             scopes: ['a'],
             obtainedAt: '2026-09-08T18:00:00.000Z',
             state: 'refresh_required',
@@ -1292,7 +1290,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       ]);
       expect(body.providers[0]).toEqual({ name: 'google', configured: true, connected: true });
       // Bound by the authenticated user, never by anything the client sent.
-      expect(mockDescribeDesktopCredentials).toHaveBeenCalledWith(req.pcpUserId);
+      expect(mockDescribeDesktopCredentials).toHaveBeenCalledWith(req.inkUserId);
     });
 
     it('does not ask about desktop files when the source is not configured', async () => {
@@ -1473,7 +1471,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
     });
   });
 
-  describe('PATCH /identities/:agentId/settings', () => {
+  describe('PATCH /identities/:sbSlug/settings', () => {
     it('should update sandbox_bypass on a valid identity', async () => {
       mockSupabaseFrom.mockImplementation((table: string) => {
         if (table === 'agent_identities') {
@@ -1505,9 +1503,9 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         return createQueryChain(null);
       });
 
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
       const req = createAuthenticatedReq({
-        params: { agentId: 'lumen' },
+        params: { sbSlug: 'lumen' },
         body: { sandboxBypass: true },
       });
       const res = createMockRes();
@@ -1531,9 +1529,9 @@ describe('admin endpoint handlers (no-500 regression)', () => {
         }),
       }));
 
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
       const req = createAuthenticatedReq({
-        params: { agentId: 'nonexistent' },
+        params: { sbSlug: 'nonexistent' },
         body: { sandboxBypass: true },
       });
       const res = createMockRes();
@@ -1582,8 +1580,8 @@ describe('admin endpoint handlers (no-500 regression)', () => {
     };
 
     const patchSettings = async (body: Record<string, unknown>) => {
-      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
-      const req = createAuthenticatedReq({ params: { agentId: 'myra' }, body });
+      const handler = findRouteHandler('patch', '/identities/:sbSlug/settings');
+      const req = createAuthenticatedReq({ params: { sbSlug: 'myra' }, body });
       const res = createMockRes();
       await handler!(req, res);
       return res;

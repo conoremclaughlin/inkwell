@@ -89,7 +89,7 @@ interface ActivityEvent {
   type: string;
   subtype: string | null;
   content: string;
-  agentId: string;
+  sbSlug: string;
   sessionId: string | null;
   platform: string | null;
   payload: Record<string, unknown>;
@@ -102,7 +102,7 @@ interface ActivityResponse {
 
 interface CommentIdentity {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   backend: string | null;
 }
@@ -112,7 +112,7 @@ interface TaskGroupComment {
   taskGroupId: string;
   commentType: 'comment' | 'conclusion' | 'status_change';
   content: string;
-  agentId: string | null;
+  sbSlug: string | null;
   metadata: Record<string, unknown>;
   createdBySbId: string | null;
   createdByIdentity: CommentIdentity | null;
@@ -411,8 +411,8 @@ function CheckInEntry({ event }: { event: ActivityEvent }) {
 
 /** Cross-agent inkmail (dispatch/deliver) — from → to with thread key badge */
 function AgentMessageEntry({ event }: { event: ActivityEvent }) {
-  const from = typeof event.payload?.fromAgentId === 'string' ? event.payload.fromAgentId : null;
-  const to = typeof event.payload?.toAgentId === 'string' ? event.payload.toAgentId : null;
+  const from = typeof event.payload?.fromSlug === 'string' ? event.payload.fromSlug : null;
+  const to = typeof event.payload?.toSlug === 'string' ? event.payload.toSlug : null;
   const threadKey = typeof event.payload?.threadKey === 'string' ? event.payload.threadKey : null;
   const delivered = event.type === 'inkmail_deliver';
 
@@ -581,7 +581,7 @@ function streamActivityToEvent(activity: StreamActivity): ActivityEvent {
     type: activity.type,
     subtype: activity.subtype,
     content: activity.content,
-    agentId: activity.agentId,
+    sbSlug: activity.sbSlug,
     sessionId: activity.sessionId,
     platform: activity.platform,
     payload: activity.payload,
@@ -674,8 +674,8 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
               const label = meta?.label ?? event.subtype ?? event.type;
               const isLatest =
                 i === dayEvents.length - 1 && dateLabel === [...dateGroups.keys()].at(-1);
-              const agentBadge = event.agentId
-                ? (AGENT_BADGE_COLORS[event.agentId] ?? 'bg-muted text-muted-foreground')
+              const agentBadge = event.sbSlug
+                ? (AGENT_BADGE_COLORS[event.sbSlug] ?? 'bg-muted text-muted-foreground')
                 : null;
 
               return (
@@ -712,7 +712,7 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
                               agentBadge
                             )}
                           >
-                            {event.agentId}
+                            {event.sbSlug}
                           </span>
                         )}
                         {event.sessionId && (
@@ -777,11 +777,11 @@ function CommentsThread({ groupId }: { groupId: string }) {
         const isStatusChange = comment.commentType === 'status_change';
         const authorName =
           comment.createdByIdentity?.name ||
-          comment.createdByIdentity?.agentId ||
-          comment.agentId ||
+          comment.createdByIdentity?.sbSlug ||
+          comment.sbSlug ||
           'Unknown';
-        const agentBadge = comment.agentId
-          ? (AGENT_BADGE_COLORS[comment.agentId] ?? 'bg-muted text-muted-foreground')
+        const agentBadge = comment.sbSlug
+          ? (AGENT_BADGE_COLORS[comment.sbSlug] ?? 'bg-muted text-muted-foreground')
           : null;
 
         if (isStatusChange) {

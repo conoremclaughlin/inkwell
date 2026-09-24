@@ -26,7 +26,7 @@ export type LiveBackend = 'claude' | 'codex' | 'gemini';
 
 export interface ReflectedRequestContext {
   transport: string;
-  pinnedAgentId: string | null;
+  pinnedSlug: string | null;
   requestContext: Record<string, unknown> | null;
   sessionContext: Record<string, unknown> | null;
 }
@@ -57,7 +57,7 @@ export interface SpawnAndReflectResult {
   exitCode: number | null;
 }
 
-const RESULT_MARKER = 'PCP_DEBUG_RESULT:';
+const RESULT_MARKER = 'INK_DEBUG_RESULT:';
 
 /**
  * Prompt crafted to be compact and unambiguous across backends. We ask the
@@ -118,9 +118,16 @@ export async function spawnAndReflect(
 ): Promise<SpawnAndReflectResult> {
   const inkBin = options.inkBin ?? 'ink';
   const timeoutMs = options.timeoutMs ?? 90_000;
-  // `--dangerous` is required: in `-p` mode there's no interactive permission
+  // Auto-approve is required: in `-p` mode there's no interactive permission
   // prompt, so any MCP tool call is rejected by default. Live tests run against
   // a trusted local server, so auto-approving is safe here.
+  //
+  // Deliberately the OLD spelling. `inkBin` defaults to whatever `ink` on PATH
+  // resolves to, which is the global link and may point at a checkout built
+  // before `--yolo` existed. There, `--yolo` would not match the flag table,
+  // would be forwarded to the backend as an unknown passthrough arg, and the
+  // reflection would fail on the permission prompt this line exists to avoid.
+  // `--dangerous` works against every build, old and new.
   const args: string[] = ['--dangerous', '-b', options.backend];
   if (options.agent) {
     args.push('-a', options.agent);

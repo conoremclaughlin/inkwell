@@ -659,11 +659,11 @@ export class DiscordListener extends EventEmitter {
       const path = await import('path');
       const os = await import('os');
 
-      const pcpFilesDir = path.join(os.homedir(), '.ink', 'files', 'discord');
-      await fs.mkdir(pcpFilesDir, { recursive: true });
+      const inkFilesDir = path.join(os.homedir(), '.ink', 'files', 'discord');
+      await fs.mkdir(inkFilesDir, { recursive: true });
 
       const safeName = (filename || `attachment_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_');
-      const filePath = path.join(pcpFilesDir, `${Date.now()}_${safeName}`);
+      const filePath = path.join(inkFilesDir, `${Date.now()}_${safeName}`);
 
       await fs.writeFile(filePath, Buffer.from(buffer));
 

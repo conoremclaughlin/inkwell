@@ -1,18 +1,18 @@
 # Development Guide
 
-This guide covers the development workflow for the Personal Context Protocol (PCP) project.
+This guide covers the development workflow for the Inkwell project.
 
 ## Architecture Overview
 
-PCP runs as a **single unified server** process that hosts all services:
+Inkwell runs as a **single unified server** process that hosts all services:
 
 | Service     | Purpose                             | Port              |
 | ----------- | ----------------------------------- | ----------------- |
-| **API/MCP** | MCP tools, admin API, agent gateway | `PCP_PORT_BASE`   |
-| **Web**     | Next.js admin dashboard             | `PCP_PORT_BASE+1` |
-| **Myra**    | Telegram/WhatsApp messaging bridge  | `PCP_PORT_BASE+2` |
+| **API/MCP** | MCP tools, admin API, agent gateway | `INK_PORT_BASE`   |
+| **Web**     | Next.js admin dashboard             | `INK_PORT_BASE+1` |
+| **Myra**    | Telegram/WhatsApp messaging bridge  | `INK_PORT_BASE+2` |
 
-Default `PCP_PORT_BASE` is **3001**, so API runs on 3001, web on 3002, Myra on 3003.
+Default `INK_PORT_BASE` is **3001**, so API runs on 3001, web on 3002, Myra on 3003.
 
 ## Getting Started
 
@@ -30,9 +30,9 @@ yarn install
 yarn dev
 
 # View server logs
-yarn logs:pcp              # Structured JSON logs
-yarn logs:pcp:raw          # Raw log output
-yarn logs:pcp:errors       # Errors only
+yarn logs:ink              # Structured JSON logs
+yarn logs:ink:raw          # Raw log output
+yarn logs:ink:errors       # Errors only
 ```
 
 `yarn dev` runs `scripts/dev-concurrently.mjs`, which starts API and web in parallel with hot reload. Migration status warnings are checked on startup.
@@ -43,10 +43,10 @@ To run an isolated instance (e.g., for testing changes without disrupting the ma
 
 ```bash
 # Starts API on 4001, web on 4002, Myra on 4003
-PCP_PORT_BASE=4001 yarn dev
+INK_PORT_BASE=4001 yarn dev
 
 # Point CLI at your test server
-PCP_SERVER_URL=http://localhost:4001 sb mission
+INK_SERVER_URL=http://localhost:4001 sb mission
 ```
 
 Both instances share the same Supabase database, so data changes are visible to both.
@@ -76,7 +76,7 @@ JWT_SECRET=your_jwt_secret_min_32_chars
 ### Optional Variables
 
 ```bash
-PCP_PORT_BASE=3001              # Base port (default: 3001)
+INK_PORT_BASE=3001              # Base port (default: 3001)
 MCP_TRANSPORT=http              # stdio or http (default: stdio)
 TELEGRAM_BOT_TOKEN=...          # For Myra Telegram
 ENABLE_WHATSAPP=true            # WhatsApp support
@@ -98,8 +98,8 @@ LOG_LEVEL=info                  # error, warn, info, debug
 Winston writes structured logs to `~/.ink/logs/`:
 
 ```bash
-yarn logs:pcp              # Formatted JSON logs
-yarn logs:pcp:errors       # Errors only
+yarn logs:ink              # Formatted JSON logs
+yarn logs:ink:errors       # Errors only
 
 # Or tail directly
 tail -f ~/.ink/logs/combined.log
@@ -143,7 +143,7 @@ kill -9 <PID>
 
 1. Check the server is running and port 3001 is accessible
 2. Verify `.mcp.json` config file exists in the project root
-3. Check logs: `yarn logs:pcp`
+3. Check logs: `yarn logs:ink`
 
 ## Architecture Diagram
 

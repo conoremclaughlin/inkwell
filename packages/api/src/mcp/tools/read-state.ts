@@ -90,7 +90,7 @@ export async function advanceThreadReadPointer(
 
 export interface AdvanceInboxReadPointerParams {
   userId: string;
-  agentId: string;
+  sbSlug: string;
   /** The pointer advances through this message's created_at. */
   throughMessageId: string;
   /** Call-site label for logs (e.g. 'get_inbox:markRead'). */
@@ -125,17 +125,17 @@ export async function advanceAgentInboxReadPointer(
   supabase: unknown,
   params: AdvanceInboxReadPointerParams
 ): Promise<AdvanceInboxReadPointerResult> {
-  const { userId, agentId, throughMessageId, source } = params;
+  const { userId, sbSlug, throughMessageId, source } = params;
   try {
     const { data, error } = await (supabase as RpcClient).rpc('advance_agent_inbox_read_pointer', {
       p_user_id: userId,
-      p_agent_id: agentId,
+      p_agent_id: sbSlug,
       p_through_message_id: throughMessageId,
     });
     if (error) {
       logger.error('[ReadState] Failed to advance agent inbox read pointer', {
         userId,
-        agentId,
+        sbSlug,
         throughMessageId,
         source,
         error: error.message,
@@ -151,7 +151,7 @@ export async function advanceAgentInboxReadPointer(
   } catch (err) {
     logger.error('[ReadState] Agent inbox read pointer advance threw', {
       userId,
-      agentId,
+      sbSlug,
       throughMessageId,
       source,
       error: err instanceof Error ? err.message : String(err),

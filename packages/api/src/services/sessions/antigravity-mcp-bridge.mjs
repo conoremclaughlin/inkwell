@@ -33,7 +33,7 @@ import { createInterface } from 'node:readline';
  * INK_MCP_URL is the explicit endpoint the runner passes; INK_SERVER_URL is the
  * canonical runtime/container variable (ENV.SERVER_URL) that the orchestrator
  * rewrites for Docker. Defaulting straight to localhost:3001 would mean an
- * isolated server on PCP_PORT_BASE=4001 sends its bearer token and context to
+ * isolated server on INK_PORT_BASE=4001 sends its bearer token and context to
  * the MAIN server instead — the one thing this repo is emphatic about not
  * disturbing — and a container would dial port 3001 inside itself.
  */
@@ -69,7 +69,8 @@ function outboundHeaders() {
   // Legacy individual headers — fallbacks for when the context token is absent.
   if (process.env.INK_SESSION_ID) headers['x-ink-session-id'] = process.env.INK_SESSION_ID;
   if (process.env.INK_STUDIO_ID) headers['x-ink-studio-id'] = process.env.INK_STUDIO_ID;
-  if (process.env.AGENT_ID) headers['x-ink-agent-id'] = process.env.AGENT_ID;
+  const sbSlug = process.env.SB_SLUG || process.env.AGENT_ID;
+  if (sbSlug) headers['x-ink-agent-id'] = sbSlug;
   if (mcpSessionId) headers['mcp-session-id'] = mcpSessionId;
   return headers;
 }

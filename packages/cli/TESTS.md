@@ -61,7 +61,7 @@ yarn workspace @inklabs/cli test -- src/cli.test.ts
 yarn workspace @inklabs/cli test -- src/commands/claude.test.ts
 yarn workspace @inklabs/cli test -- src/commands/claude.integration.test.ts
 yarn workspace @inklabs/cli test -- src/commands/hooks.test.ts
-yarn workspace @inklabs/cli test -- src/lib/pcp-mcp.test.ts
+yarn workspace @inklabs/cli test -- src/lib/ink-mcp.test.ts
 ```
 
 ## Optional local smoke tests (not CI)
@@ -75,7 +75,7 @@ yarn workspace @inklabs/cli test:smoke:live
 
 The smoke runner:
 
-- requires a live PCP API server (`INK_SERVER_URL`, default `http://localhost:3101`)
+- requires a live Inkwell API server (`INK_SERVER_URL`, default `http://localhost:3101`)
 - uses real backend CLIs (claude/codex/gemini) if installed
 - checks for `local tool get_inbox` in output as proof that tool execution happened in sb runtime
 

@@ -13,7 +13,7 @@ interface SessionWorkspace {
 
 interface Session {
   id: string;
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   backend: string | null;
@@ -93,7 +93,7 @@ function phaseText(lifecycle: string | null, phase: string | null): string {
 function matchesSearch(session: Session, query: string): boolean {
   const q = query.toLowerCase();
   return (
-    session.agentId.toLowerCase().includes(q) ||
+    session.sbSlug.toLowerCase().includes(q) ||
     session.agentName.toLowerCase().includes(q) ||
     (session.activeThreadKey?.toLowerCase().includes(q) ?? false) ||
     (session.studio?.branch?.toLowerCase().includes(q) ?? false) ||
@@ -164,13 +164,13 @@ function SessionItem({
 }
 
 function AgentGroup({
-  agentId,
+  sbSlug,
   sessions,
   selectedId,
   onSelect,
   defaultExpanded,
 }: {
-  agentId: string;
+  sbSlug: string;
   sessions: Session[];
   selectedId: string | null;
   onSelect: (id: string) => void;
@@ -198,9 +198,9 @@ function AgentGroup({
           <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
         </svg>
         <div
-          className={`w-2.5 h-2.5 rounded-full shrink-0 ${AGENT_COLORS[agentId] ?? 'bg-gray-400'}`}
+          className={`w-2.5 h-2.5 rounded-full shrink-0 ${AGENT_COLORS[sbSlug] ?? 'bg-gray-400'}`}
         />
-        <span className="text-xs font-semibold text-gray-700 capitalize">{agentId}</span>
+        <span className="text-xs font-semibold text-gray-700 capitalize">{sbSlug}</span>
         <span className="text-[10px] text-gray-400">{sessions.length}</span>
         {activeCount > 0 && (
           <span className="text-[10px] text-green-600 ml-auto">{activeCount} active</span>
@@ -248,7 +248,7 @@ export function SessionSidebar({
   const grouped = useMemo(() => {
     const groups = new Map<string, Session[]>();
     for (const s of filtered) {
-      const key = s.agentId;
+      const key = s.sbSlug;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key)!.push(s);
     }
@@ -312,10 +312,10 @@ export function SessionSidebar({
 
       {/* Session list */}
       <div className="flex-1 overflow-y-auto">
-        {grouped.map(([agentId, agentSessions]) => (
+        {grouped.map(([sbSlug, agentSessions]) => (
           <AgentGroup
-            key={agentId}
-            agentId={agentId}
+            key={sbSlug}
+            sbSlug={sbSlug}
             sessions={agentSessions}
             selectedId={selectedId}
             onSelect={onSelect}

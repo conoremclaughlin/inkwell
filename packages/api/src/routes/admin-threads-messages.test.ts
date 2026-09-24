@@ -12,11 +12,11 @@ import type { Request, Response } from 'express';
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({ handleSendToInbox: vi.fn() }));
 vi.mock('../mcp/tools/thread-handlers', () => ({ getParticipants: vi.fn() }));
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 const tables = vi.hoisted(() => ({
@@ -116,9 +116,9 @@ function createReq(viewerUserId: string): Request {
     headers: {},
     cookies: {},
     params: {},
-    pcpUserId: viewerUserId,
-    pcpWorkspaceId: 'ws-1',
-    pcpWorkspaceRole: 'member',
+    inkUserId: viewerUserId,
+    inkWorkspaceId: 'ws-1',
+    inkWorkspaceRole: 'member',
   } as unknown as Request;
 }
 

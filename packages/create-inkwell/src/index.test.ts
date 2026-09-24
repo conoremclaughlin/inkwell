@@ -2,56 +2,31 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import {
+  LEGACY_STATE_FILE,
+  STATE_FILE,
+  isComplete,
+  loadState,
+  markComplete,
+  saveState,
+  type ProgressState,
+} from './progress.js';
 
 /**
- * Since the utility functions are not exported from index.ts (they're internal),
- * we test them via a minimal re-implementation that mirrors the same logic.
- * This validates the state management and resumability contract.
+ * These used to be a re-implementation of index.ts's helpers, because index.ts
+ * calls main() at module load and importing it would launch the wizard. A
+ * mirror cannot fail when the real code changes, so #659 moved the helpers
+ * into progress.ts and this file now exercises them directly.
  */
 
-const STATE_FILE = '.create-pcp-progress.json';
-
-interface ProgressState {
-  completedSteps: string[];
-  targetDir: string;
-  dbMode?: 'local' | 'hosted';
-  backend?: string;
-}
-
-function loadState(dir: string): ProgressState {
-  const file = join(dir, STATE_FILE);
-  if (existsSync(file)) {
-    try {
-      return JSON.parse(readFileSync(file, 'utf-8'));
-    } catch {
-      // Corrupted state — start fresh
-    }
-  }
-  return { completedSteps: [], targetDir: dir };
-}
-
-function saveState(state: ProgressState): void {
-  if (!existsSync(state.targetDir)) return;
-  const file = join(state.targetDir, STATE_FILE);
-  writeFileSync(file, JSON.stringify(state, null, 2) + '\n');
-}
-
-function markComplete(state: ProgressState, step: string): void {
-  if (!state.completedSteps.includes(step)) {
-    state.completedSteps.push(step);
-    saveState(state);
-  }
-}
-
-function isComplete(state: ProgressState, step: string): boolean {
-  return state.completedSteps.includes(step);
-}
-
-describe('create-pcp state management', () => {
+describe('create-inkwell state management', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = join(tmpdir(), `create-pcp-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    tmpDir = join(
+      tmpdir(),
+      `create-inkwell-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
     mkdirSync(tmpDir, { recursive: true });
   });
 
@@ -157,5 +132,63 @@ describe('create-pcp state management', () => {
       'server',
       'auth',
     ]);
+  });
+
+  // A setup interrupted before #659 left its progress under the old name.
+  // Ignoring it silently restarts a nine-step wizard from zero.
+  it('resumes from the pre-rename progress file', () => {
+    writeFileSync(
+      join(tmpDir, LEGACY_STATE_FILE),
+      JSON.stringify({ completedSteps: ['clone', 'install'], targetDir: tmpDir })
+    );
+
+    const state = loadState(tmpDir);
+
+    expect(state.completedSteps).toEqual(['clone', 'install']);
+    expect(isComplete(state, 'install')).toBe(true);
+  });
+
+  it('prefers the current progress file when both exist', () => {
+    writeFileSync(
+      join(tmpDir, LEGACY_STATE_FILE),
+      JSON.stringify({ completedSteps: ['stale'], targetDir: tmpDir })
+    );
+    writeFileSync(
+      join(tmpDir, STATE_FILE),
+      JSON.stringify({ completedSteps: ['current'], targetDir: tmpDir })
+    );
+
+    expect(loadState(tmpDir).completedSteps).toEqual(['current']);
+  });
+
+  it('writes only the current progress file', () => {
+    writeFileSync(
+      join(tmpDir, LEGACY_STATE_FILE),
+      JSON.stringify({ completedSteps: [], targetDir: tmpDir })
+    );
+    const state: ProgressState = loadState(tmpDir);
+
+    markComplete(state, 'clone');
+
+    expect(existsSync(join(tmpDir, STATE_FILE))).toBe(true);
+    expect(
+      JSON.parse(readFileSync(join(tmpDir, LEGACY_STATE_FILE), 'utf-8')).completedSteps
+    ).toEqual([]);
+  });
+
+  // index.ts calls main() at module load, so the entry path cannot be
+  // imported and exercised. It gated the load on the CURRENT progress file
+  // existing, which meant a legacy-only resume never reached loadState at
+  // all: the helper below resumed correctly and the wizard still started from
+  // zero. The gate is gone, so loadState is the only route to a state — this
+  // asserts it stays that way.
+  it('has exactly one route to a progress state', () => {
+    const source = readFileSync(join(__dirname, 'index.ts'), 'utf-8');
+
+    expect(source).toContain('loadState(targetDir)');
+    // The inline default the gate fell back to. Its absence is what makes
+    // loadState the single decision point.
+    expect(source).not.toMatch(/completedSteps:\s*\[\]/);
+    expect(source).not.toMatch(/existsSync\([^)]*STATE_FILE/);
   });
 });

@@ -1,4 +1,4 @@
-# Personal Context Protocol (PCP) — Specification v0.1
+# Personal Context Protocol — Specification v0.1
 
 **Status:** Draft
 **Authors:** Wren, with input from Lumen, Aster, Myra, and Conor
@@ -9,9 +9,9 @@
 
 ## 1. Introduction
 
-PCP gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces. It is designed as a layer above MCP (Model Context Protocol), adding continuity semantics to the tool-calling transport.
+Inkwell gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces. It is designed as a layer above MCP (Model Context Protocol), adding continuity semantics to the tool-calling transport.
 
-PCP is **backend-agnostic**. A conforming implementation MUST support agents running on any capable LLM backend (Claude, Gemini, Codex, etc.) without requiring backend-specific protocol extensions.
+Inkwell is **backend-agnostic**. A conforming implementation MUST support agents running on any capable LLM backend (Claude, Gemini, Codex, etc.) without requiring backend-specific protocol extensions.
 
 ### 1.1 Scope
 
@@ -54,12 +54,12 @@ The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" are used as 
 
 Every agent identity MUST have:
 
-| Field     | Type   | Description                                                        |
-| --------- | ------ | ------------------------------------------------------------------ |
-| `id`      | UUID   | Canonical, immutable identifier                                    |
-| `agentId` | string | Slug derived from name (lowercase, alphanumeric). Unique per user. |
-| `name`    | string | Display name chosen by the agent                                   |
-| `role`    | string | Description of the agent's function                                |
+| Field    | Type   | Description                                                        |
+| -------- | ------ | ------------------------------------------------------------------ |
+| `id`     | UUID   | Canonical, immutable identifier                                    |
+| `sbSlug` | string | Slug derived from name (lowercase, alphanumeric). Unique per user. |
+| `name`   | string | Display name chosen by the agent                                   |
+| `role`   | string | Description of the agent's function                                |
 
 Every agent identity SHOULD have:
 
@@ -68,7 +68,7 @@ Every agent identity SHOULD have:
 | `backend`       | string   | LLM runtime identifier (last-known or default backend) |
 | `description`   | string   | Extended narrative about nature/personality            |
 | `values`        | string[] | Core principles                                        |
-| `relationships` | object   | Map of agentId → relationship description              |
+| `relationships` | object   | Map of sbSlug → relationship description               |
 | `capabilities`  | string[] | What this agent can do                                 |
 
 Every agent identity MAY have:
@@ -90,14 +90,14 @@ Every agent identity MAY have:
 An agent MUST go through a naming ceremony to establish identity:
 
 1. Agent calls `choose_name(name, role, ...)`
-2. Implementation derives `agentId` from `name` (lowercase, non-alphanumeric removed)
-3. Implementation verifies no existing identity with this `agentId` for this user
+2. Implementation derives `sbSlug` from `name` (lowercase, non-alphanumeric removed)
+3. Implementation verifies no existing identity with this `sbSlug` for this user
 4. Identity record is created with `version: 1`
 5. Relationships are auto-populated from existing sibling identities
 
 An agent SHOULD call `meet_family` before `choose_name` to read sibling identities for context. This populates the `relationships` field bidirectionally.
 
-`choose_name` MUST be a one-time operation. Attempting to create a duplicate `agentId` for the same user MUST fail.
+`choose_name` MUST be a one-time operation. Attempting to create a duplicate `sbSlug` for the same user MUST fail.
 
 **Updates (`save_identity`)**
 
@@ -109,7 +109,7 @@ Each update MUST increment `version` and archive the previous state to an identi
 
 Identity MUST be portable across backends. An agent's identity record does not depend on which LLM backend animates it. Changing an agent's `backend` field MUST NOT require re-creation of the identity.
 
-Implementations SHOULD sync identity to local files (`~/.ink/individuals/{agentId}/`) for offline access and system prompt injection.
+Implementations SHOULD sync identity to local files (`~/.ink/individuals/{sbSlug}/`) for offline access and system prompt injection.
 
 ### 2.3 User-Level Shared Documents
 
@@ -137,7 +137,7 @@ Every memory MUST have:
 | `content`  | string         | The memory text                                                                           |
 | `source`   | enum           | One of: `conversation`, `observation`, `user_stated`, `inferred`, `session`, `reflection` |
 | `salience` | enum           | One of: `low`, `medium`, `high`, `critical`                                               |
-| `agentId`  | string or null | Creator agent. Null = shared across all agents.                                           |
+| `sbSlug`   | string or null | Creator agent. Null = shared across all agents.                                           |
 
 The `source` field indicates how the memory was created:
 
@@ -216,7 +216,7 @@ Implementations SHOULD define a bootstrap memory budget as a **recommended minim
 
 ### 3.5 Agent Scoping
 
-When `agentId` is set on a memory, that memory is private to that agent. When `agentId` is null, the memory is shared across all agents for that user.
+When `sbSlug` is set on a memory, that memory is private to that agent. When `sbSlug` is null, the memory is shared across all agents for that user.
 
 `recall` MUST return both agent-specific and shared memories by default. Implementations SHOULD provide a flag to exclude shared memories.
 
@@ -267,11 +267,11 @@ The frequency and scope of reflection is implementation-defined and MAY be confi
 
 Every session MUST have:
 
-| Field     | Type   | Description                                          |
-| --------- | ------ | ---------------------------------------------------- |
-| `id`      | UUID   | Canonical session identifier                         |
-| `agentId` | string | Owning agent                                         |
-| `status`  | enum   | One of: `active`, `paused`, `resumable`, `completed` |
+| Field    | Type   | Description                                          |
+| -------- | ------ | ---------------------------------------------------- |
+| `id`     | UUID   | Canonical session identifier                         |
+| `sbSlug` | string | Owning agent                                         |
+| `status` | enum   | One of: `active`, `paused`, `resumable`, `completed` |
 
 Every session SHOULD have:
 
@@ -290,16 +290,16 @@ Every session SHOULD have:
 
 Starting a session MUST follow this matching priority:
 
-1. If `threadKey` is provided, match existing active session with same `agentId` + `threadKey`
-2. If no threadKey match, match by `agentId` + `studioId` (if provided)
-3. If no studio match, match by `agentId` alone
+1. If `threadKey` is provided, match existing active session with same `sbSlug` + `threadKey`
+2. If no threadKey match, match by `sbSlug` + `studioId` (if provided)
+3. If no studio match, match by `sbSlug` alone
 4. If `forceNew: true`, always create a new session
 
 If an existing session matches, it MUST be returned (with an `isExisting` indicator). No duplicate active sessions for the same scope.
 
 **Session Uniqueness Invariant**
 
-Implementations MUST ensure at most one active session exists per `(userId, agentId, threadKey)` tuple. If multiple active sessions are discovered for the same tuple (e.g., due to race conditions or manual database edits), implementations MUST:
+Implementations MUST ensure at most one active session exists per `(userId, sbSlug, threadKey)` tuple. If multiple active sessions are discovered for the same tuple (e.g., due to race conditions or manual database edits), implementations MUST:
 
 1. Select the most recently created session as canonical
 2. Mark all other matches as `completed` with a system-generated summary noting the deduplication
@@ -361,7 +361,7 @@ Sessions MAY have a human-readable `alias` that enables explicit routing without
 
 **Alias rules:**
 
-1. Aliases MUST be unique per `(userId, agentId)` among active sessions
+1. Aliases MUST be unique per `(userId, sbSlug)` among active sessions
 2. Aliases are case-insensitive
 3. The alias `"main"` is reserved for the agent's primary interactive session
 4. When `send_to_inbox` includes a `sessionAlias`, routing MUST match by alias before falling through to threadKey or studio resolution
@@ -399,8 +399,8 @@ Reminders are a special case of scheduled triggers. An agent or user MAY create 
 
 Conforming implementations that support reminders SHOULD provide:
 
-- **`create_reminder(agentId, content, deliverAt, ...)`** — Schedule a future trigger
-- **`list_reminders(agentId?, status?)`** — View pending/completed reminders
+- **`create_reminder(sbSlug, content, deliverAt, ...)`** — Schedule a future trigger
+- **`list_reminders(sbSlug?, status?)`** — View pending/completed reminders
 - **`cancel_reminder(id)`** — Cancel a pending reminder
 
 Reminders are OPTIONAL for v0.1 conformance but are documented here because they are a natural extension of the heartbeat pattern and important for agents that need temporal awareness (e.g., reflection, follow-ups, scheduled check-ins).
@@ -413,22 +413,22 @@ Reminders are OPTIONAL for v0.1 conformance but are documented here because they
 
 Every inbox message MUST have:
 
-| Field              | Type   | Description                                                         |
-| ------------------ | ------ | ------------------------------------------------------------------- |
-| `id`               | UUID   | Unique message identifier                                           |
-| `recipientAgentId` | string | Target agent                                                        |
-| `content`          | string | Message body                                                        |
-| `messageType`      | enum   | One of: `message`, `task_request`, `session_resume`, `notification` |
-| `priority`         | enum   | One of: `low`, `normal`, `high`, `urgent`                           |
-| `status`           | enum   | One of: `unread`, `read`, `acknowledged`, `completed`               |
+| Field           | Type   | Description                                                         |
+| --------------- | ------ | ------------------------------------------------------------------- |
+| `id`            | UUID   | Unique message identifier                                           |
+| `recipientSlug` | string | Target agent                                                        |
+| `content`       | string | Message body                                                        |
+| `messageType`   | enum   | One of: `message`, `task_request`, `session_resume`, `notification` |
+| `priority`      | enum   | One of: `low`, `normal`, `high`, `urgent`                           |
+| `status`        | enum   | One of: `unread`, `read`, `acknowledged`, `completed`               |
 
 Every inbox message SHOULD have:
 
-| Field           | Type   | Description                       |
-| --------------- | ------ | --------------------------------- |
-| `senderAgentId` | string | Origin agent (null if from human) |
-| `subject`       | string | Message title                     |
-| `threadKey`     | string | Conversation continuity key       |
+| Field        | Type   | Description                       |
+| ------------ | ------ | --------------------------------- |
+| `senderSlug` | string | Origin agent (null if from human) |
+| `subject`    | string | Message title                     |
+| `threadKey`  | string | Conversation continuity key       |
 
 Every inbox message MAY have:
 
@@ -439,7 +439,7 @@ Every inbox message MAY have:
 | `expiresAt`          | timestamp | Auto-expire                   |
 | `metadata`           | object    | Routing hints, sender context |
 
-> **Note:** The inbox system handles inter-agent messaging within PCP. Agent-to-user delivery via external channels (Telegram, WhatsApp, email, etc.) is handled by a **channel gateway**, which is implementation-defined and outside the scope of this specification. Implementations that support user-facing agents SHOULD provide a channel routing mechanism (e.g., `send_response(channel, conversationId, content)`) but the specific API is not standardized in v0.1.
+> **Note:** The inbox system handles inter-agent messaging within Inkwell. Agent-to-user delivery via external channels (Telegram, WhatsApp, email, etc.) is handled by a **channel gateway**, which is implementation-defined and outside the scope of this specification. Implementations that support user-facing agents SHOULD provide a channel routing mechanism (e.g., `send_response(channel, conversationId, content)`) but the specific API is not standardized in v0.1.
 
 ### 5.2 Message Types and Trigger Behavior
 
@@ -476,7 +476,7 @@ Implementations SHOULD enrich message metadata with routing hints:
 ```json
 {
   "pcp": {
-    "sender": { "agentId": "wren", "sessionId": "...", "studioId": "..." },
+    "sender": { "sbSlug": "wren", "sessionId": "...", "studioId": "..." },
     "recipient": { "threadKey": "pr:32", "studioHint": "main" }
   }
 }
@@ -507,7 +507,7 @@ Implementations MAY define additional types.
 
 When a message is sent with a `threadKey`, and the recipient has an active session with the same `threadKey`, the message MUST be routed to that session. This is the primary mechanism for multi-turn cross-agent conversations.
 
-**Uniqueness:** At most one active session MUST exist per `(userId, agentId, threadKey)` tuple at any point in time. See §4.2 (Session Uniqueness Invariant) for deduplication behavior.
+**Uniqueness:** At most one active session MUST exist per `(userId, sbSlug, threadKey)` tuple at any point in time. See §4.2 (Session Uniqueness Invariant) for deduplication behavior.
 
 **No-match behavior:** When a message arrives with a `threadKey` and no active session exists for that key, the implementation SHOULD create a new session with the given `threadKey` rather than routing to an unrelated default session. This preserves the semantic isolation that threadKeys are designed to provide.
 
@@ -565,23 +565,23 @@ Agent identities MUST be scoped to a user. Agent A under User 1 MUST NOT be able
 
 ### 8.2 Memory Privacy
 
-Memories with a non-null `agentId` MUST only be visible to that agent (plus the owning user). Shared memories (null `agentId`) are visible to all agents under the same user.
+Memories with a non-null `sbSlug` MUST only be visible to that agent (plus the owning user). Shared memories (null `sbSlug`) are visible to all agents under the same user.
 
 ### 8.3 Inbox Privacy
 
-Inbox messages MUST only be readable by the designated `recipientAgentId` under the designated user.
+Inbox messages MUST only be readable by the designated `recipientSlug` under the designated user.
 
 ### 8.4 Authentication
 
-PCP does not define its own authentication mechanism. Implementations SHOULD use the underlying transport's authentication (e.g., MCP OAuth) and map authenticated principals to PCP user IDs.
+Inkwell does not define its own authentication mechanism. Implementations SHOULD use the underlying transport's authentication (e.g., MCP OAuth) and map authenticated principals to Inkwell user IDs.
 
 ### 8.5 Sender Authenticity
 
-The `senderAgentId` field on inbox messages MUST be server-derived from the authenticated principal. Implementations MUST NOT trust `senderAgentId` from client payloads without verification. This prevents agent impersonation (e.g., Agent A sending a message that appears to come from Agent B).
+The `senderSlug` field on inbox messages MUST be server-derived from the authenticated principal. Implementations MUST NOT trust `senderSlug` from client payloads without verification. This prevents agent impersonation (e.g., Agent A sending a message that appears to come from Agent B).
 
 ### 8.6 Authorization
 
-An API caller MUST be authorized to act as the claimed `agentId` under the authenticated user. The authorization mechanism is implementation-defined but MUST verify that the caller has a valid binding between the authenticated user principal and the claimed agent identity.
+An API caller MUST be authorized to act as the claimed `sbSlug` under the authenticated user. The authorization mechanism is implementation-defined but MUST verify that the caller has a valid binding between the authenticated user principal and the claimed agent identity.
 
 ### 8.7 Replay and Idempotency
 
@@ -615,7 +615,7 @@ When a human principal authenticates via OAuth, implementations MAY issue **dele
 
 If delegated tokens are used, implementations MUST:
 
-- Bind each delegated token to exactly one SB identity (`agentId`, and ideally canonical `identityId`)
+- Bind each delegated token to exactly one SB identity (`sbSlug`, and ideally canonical `identityId`)
 - Keep delegated tokens short-lived (recommended: 15-60 minutes)
 - Validate that the requested SB belongs to the authenticated user before minting
 - Preserve user-level ownership (`sub` remains the user principal) while enforcing SB-level scope
@@ -632,11 +632,11 @@ This model supports least-privilege SB execution in multi-agent environments whi
 
 ## 9. Relationship to MCP
 
-PCP is designed as a **layer above MCP**. MCP provides the tool-calling transport; PCP provides the continuity semantics.
+Inkwell is designed as a **layer above MCP**. MCP provides the tool-calling transport; Inkwell provides the continuity semantics.
 
-A PCP server exposes its capabilities as MCP tools (e.g., `remember`, `recall`, `start_session`, `send_to_inbox`). Any MCP-compatible client can connect to a PCP server.
+A Inkwell server exposes its capabilities as MCP tools (e.g., `remember`, `recall`, `start_session`, `send_to_inbox`). Any MCP-compatible client can connect to a Inkwell server.
 
-PCP does NOT modify or extend the MCP specification. It is purely additive.
+Inkwell does NOT modify or extend the MCP specification. It is purely additive.
 
 ---
 

@@ -1,12 +1,12 @@
 /**
  * Lumen's PR #605 round-2 probe, turned from a defect assertion into the
- * regression: the acting identity is the credential's, not the typed agentId.
+ * regression: the acting identity is the credential's, not the typed sbSlug.
  *
- * A signed Lumen request typed as `agentId: "wren"`, naming Lumen's OWN valid
+ * A signed Lumen request typed as `sbSlug: "wren"`, naming Lumen's OWN valid
  * session, passed session authorization (the session is Lumen's) and then ran
  * the real thread binding under wren's name: wren's participant row on the
  * thread was overwritten with Lumen's session, the lease named wren, and the
- * log line said agentId=wren next to Lumen's sbId. This file drives the real
+ * log line said sbSlug=wren next to Lumen's sbId. This file drives the real
  * findOrCreateThread / assignThreadParticipant path against the fake Supabase
  * so the stamp itself is what is asserted, not a mock's arguments.
  */
@@ -38,11 +38,11 @@ const roots: string[] = [];
 /** Lumen's signed credential, running in Lumen's own session. */
 const lumenContext = {
   userId: USER,
-  agentId: 'lumen',
+  sbSlug: 'lumen',
   sbId: SB,
   sessionId: OWN,
   agentTokenBound: true,
-  tokenAgentId: 'lumen',
+  tokenSlug: 'lumen',
   tokenSbId: SB,
   tokenSessionId: OWN,
   timestamp: new Date(),
@@ -58,7 +58,7 @@ function setup() {
   const own = {
     id: OWN,
     userId: USER,
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     sbId: SB,
     contactId: null,
     studioId: ORIGINAL,
@@ -66,10 +66,10 @@ function setup() {
     endedAt: null,
     status: 'active',
   };
-  const foreign = { ...own, id: FOREIGN, sbId: 'other-sb', agentId: 'wren' };
+  const foreign = { ...own, id: FOREIGN, sbId: 'other-sb', sbSlug: 'wren' };
   const lease = {
     sessionId: OWN,
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     sbId: SB,
     threadKey: 'thread:original',
     threadKeys: ['thread:original'],
@@ -138,7 +138,7 @@ function setup() {
   let studio: Record<string, unknown> = {
     id: STUDIO,
     userId: USER,
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     branch: 'lumen/feat/test',
     worktreePath: repoRoot,
     routePatterns: [],
@@ -150,8 +150,8 @@ function setup() {
     tables.studios.push({
       id: STUDIO,
       user_id: USER,
-      agent_id: input.agentId,
-      sb_id: input.agentId === 'lumen' ? SB : 'other-sb',
+      agent_id: input.sbSlug,
+      sb_id: input.sbSlug === 'lumen' ? SB : 'other-sb',
       status: 'active',
       session_id: input.sessionId,
       worktree_path: input.worktreePath,
@@ -181,10 +181,10 @@ function setup() {
       activityStream: { logActivity },
     },
   };
-  const sbOf = (agentId: string) =>
-    tables.agent_identities.find((r) => r.agent_id === agentId && r.id !== TWIN_ID)?.id;
-  const stampOf = (agentId: string) =>
-    tables.inbox_thread_participants.find((r) => r.sb_id === sbOf(agentId))?.session_id;
+  const sbOf = (sbSlug: string) =>
+    tables.agent_identities.find((r) => r.agent_id === sbSlug && r.id !== TWIN_ID)?.id;
+  const stampOf = (sbSlug: string) =>
+    tables.inbox_thread_participants.find((r) => r.sb_id === sbOf(sbSlug))?.session_id;
   return { repoRoot, dc, create, update, linkSession, logActivity, tables, stampOf, supabase };
 }
 
@@ -193,7 +193,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe("the acting identity is the credential's, not the typed agentId (Lumen, PR #605 r2)", () => {
+describe("the acting identity is the credential's, not the typed sbSlug (Lumen, PR #605 r2)", () => {
   it.each(['create', 'adopt'] as const)(
     "%s typed as wren on Lumen's credential is refused, and wren's thread home is untouched",
     async (operation) => {
@@ -202,7 +202,7 @@ describe("the acting identity is the credential's, not the typed agentId (Lumen,
         operation === 'create'
           ? handleCreateStudio(
               {
-                agentId: 'wren',
+                sbSlug: 'wren',
                 repoRoot: f.repoRoot,
                 slug: 'probe',
                 skipGitOperations: true,
@@ -212,13 +212,13 @@ describe("the acting identity is the credential's, not the typed agentId (Lumen,
               f.dc as never
             )
           : handleAdoptStudio(
-              { agentId: 'wren', studioId: STUDIO, sessionId: OWN, threadKey: 'pr:probe' },
+              { sbSlug: 'wren', studioId: STUDIO, sessionId: OWN, threadKey: 'pr:probe' },
               f.dc as never
             )
       );
       const payload = JSON.parse(result.content[0].text);
       expect(payload.success).toBe(false);
-      expect(payload.error).toContain('agentId wren is not the authenticated identity (lumen)');
+      expect(payload.error).toContain('sbSlug wren is not the authenticated identity (lumen)');
       expect(f.stampOf('wren')).toBe(FOREIGN);
       expect(f.stampOf('lumen')).toBeNull();
       expect(f.create).not.toHaveBeenCalled();
@@ -233,7 +233,7 @@ describe("the acting identity is the credential's, not the typed agentId (Lumen,
     const result = await runWithRequestContext(lumenContext, () =>
       handleCreateStudio(
         {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           repoRoot: f.repoRoot,
           slug: 'probe',
           skipGitOperations: true,
@@ -253,7 +253,7 @@ describe("the acting identity is the credential's, not the typed agentId (Lumen,
     expect(f.stampOf('wren')).toBe(FOREIGN);
     expect(f.logActivity).toHaveBeenCalledTimes(1);
     expect(f.logActivity.mock.calls[0][0]).toMatchObject({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       sbId: SB,
       sessionId: OWN,
     });
@@ -311,7 +311,7 @@ describe('the canonical identity the credential carries is the one written (Lume
     const result = await runWithRequestContext(lumenContext, () =>
       handleCreateStudio(
         {
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           repoRoot: f.repoRoot,
           slug: 'probe',
           skipGitOperations: true,
@@ -328,9 +328,9 @@ describe('the canonical identity the credential carries is the one written (Lume
     const row = f.tables.studios.find((r) => r.id === STUDIO);
     expect(row?.sb_id).toBe(SB);
     expect(row?.session_id).toBe(OWN);
-    expect(row?.lease).toMatchObject({ sbId: SB, sessionId: OWN, agentId: 'lumen' });
+    expect(row?.lease).toMatchObject({ sbId: SB, sessionId: OWN, sbSlug: 'lumen' });
     expect(f.logActivity).toHaveBeenCalledWith(
-      expect.objectContaining({ agentId: 'lumen', sbId: SB, sessionId: OWN })
+      expect.objectContaining({ sbSlug: 'lumen', sbId: SB, sessionId: OWN })
     );
   });
 
@@ -352,7 +352,7 @@ describe('the canonical identity the credential carries is the one written (Lume
     });
     const result = await runWithRequestContext(lumenContext, () =>
       handleAdoptStudio(
-        { agentId: 'lumen', studioId: STUDIO, sessionId: OWN, threadKey: 'pr:probe' },
+        { sbSlug: 'lumen', studioId: STUDIO, sessionId: OWN, threadKey: 'pr:probe' },
         f.dc as never
       )
     );

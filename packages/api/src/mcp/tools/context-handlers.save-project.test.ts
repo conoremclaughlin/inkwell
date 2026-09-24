@@ -24,7 +24,7 @@ vi.mock('../../utils/request-context', async (original) => ({
   ...(await original<typeof import('../../utils/request-context')>()),
   getRequestContext: vi.fn(() => ({ userId: 'user-a', sessionId: 'session-a', sbId: ctx.sbId })),
   getSessionContext: vi.fn().mockReturnValue(undefined),
-  getPinnedAgentId: vi.fn().mockReturnValue(undefined),
+  getPinnedSlug: vi.fn().mockReturnValue(undefined),
 }));
 
 function composer() {

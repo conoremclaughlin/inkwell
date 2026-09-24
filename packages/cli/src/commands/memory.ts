@@ -240,7 +240,7 @@ async function backfillCommand(options: BackfillOptions): Promise<void> {
 
   if (!userId) {
     throw new Error(
-      'Could not determine PCP userId. Pass --user-id <uuid> or ensure ~/.ink/config.json contains userId.'
+      'Could not determine Inkwell userId. Pass --user-id <uuid> or ensure ~/.ink/config.json contains userId.'
     );
   }
 
@@ -284,7 +284,10 @@ export function registerMemoryCommands(program: Command): void {
   memory
     .command('backfill')
     .description('Generate embeddings for existing memories that do not have them yet')
-    .option('--user-id <uuid>', 'PCP user ID to backfill (defaults to ~/.ink/config.json userId)')
+    .option(
+      '--user-id <uuid>',
+      'Inkwell user ID to backfill (defaults to ~/.ink/config.json userId)'
+    )
     .option('--agent <id>', 'Optional agent filter (e.g. lumen, wren)')
     .option('--limit <n>', 'Maximum number of memories to backfill in this run')
     .option(

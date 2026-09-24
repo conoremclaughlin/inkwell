@@ -2,8 +2,9 @@ import { toNodeHandler } from '@modelcontextprotocol/node';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import express from 'express';
-import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import { createHttpRateLimiters } from '../security/http-rate-limit';
+import { createBrowserCors, requireCookieCsrfHeader } from '../security/cookie-csrf';
 import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
@@ -28,6 +29,9 @@ import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
 import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
+import { createAlertsRouter } from '../routes/alerts';
+import { AlertDispatchService } from '../services/alerts/alert-dispatch.service';
+import { startStalenessSweep } from '../services/alerts/alert-sweep';
 import {
   ChannelGateway,
   createChannelGateway,
@@ -37,8 +41,9 @@ import {
 import { runWithRequestContext, tokenIdentityContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
-import { PcpAuthProvider } from './auth/pcp-auth-provider';
-import { signPcpAccessToken } from '../auth/pcp-tokens';
+import { getHeartbeatTickHealth } from '../services/heartbeat';
+import { InkAuthProvider } from './auth/ink-auth-provider';
+import { signInkAccessToken } from '../auth/ink-tokens';
 
 export { setWhatsAppListener, getAgentGateway };
 
@@ -72,12 +77,14 @@ export class MCPServer {
   private toolsVersion = 0;
   private channelGateway: ChannelGateway | null = null;
   private config: MCPServerConfig;
-  private authProvider: PcpAuthProvider;
+  private authProvider: InkAuthProvider;
+  /** Staleness sweep ticker; cleared on shutdown so tests and restarts exit. */
+  private alertSweepTimer: NodeJS.Timeout | null = null;
 
   constructor(dataComposer: DataComposer, config: MCPServerConfig = {}) {
     this.dataComposer = dataComposer;
     this.config = config;
-    this.authProvider = new PcpAuthProvider();
+    this.authProvider = new InkAuthProvider();
 
     // Load mini-apps once (shared across all sessions)
     this.miniApps = loadMiniApps();
@@ -95,12 +102,12 @@ export class MCPServer {
    * Validate a context token by verifying the sessionId against the database.
    * The session was created via an authenticated start_session call, so a
    * matching active session proves the caller owns the identity. We also
-   * verify the agentId matches to prevent session-id reuse across agents.
+   * verify the sbSlug matches to prevent session-id reuse across agents.
    */
   private async resolveUserFromContextSession(
     sessionId: string,
-    agentId: string
-  ): Promise<{ userId: string; email: string; agentId: string; sbId: string } | null> {
+    sbSlug: string
+  ): Promise<{ userId: string; email: string; sbSlug: string; sbId: string } | null> {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!UUID_RE.test(sessionId)) {
       logger.debug('Context-based auth: malformed sessionId', { sessionId });
@@ -127,11 +134,11 @@ export class MCPServer {
       return null;
     }
 
-    if (session.agentId !== agentId) {
-      logger.warn('Context-based auth: agentId mismatch', {
+    if (session.sbSlug !== sbSlug) {
+      logger.warn('Context-based auth: sbSlug mismatch', {
         sessionId,
-        sessionAgentId: session.agentId,
-        contextAgentId: agentId,
+        sessionSlug: session.sbSlug,
+        contextSlug: sbSlug,
       });
       return null;
     }
@@ -158,32 +165,32 @@ export class MCPServer {
         });
         return null;
       }
-      if (data.user_id !== session.userId || data.agent_id !== agentId) {
+      if (data.user_id !== session.userId || data.agent_id !== sbSlug) {
         logger.warn('Context-based auth: session sb_id does not match session user/agent', {
           sessionId,
           sbId: session.sbId,
           identityUserId: data.user_id,
           sessionUserId: session.userId,
-          identityAgentId: data.agent_id,
-          contextAgentId: agentId,
+          identitySlug: data.agent_id,
+          contextSlug: sbSlug,
         });
         return null;
       }
       const email = (data.users as unknown as { email: string })?.email ?? '';
-      return { userId: session.userId, email, agentId, sbId: data.id };
+      return { userId: session.userId, email, sbSlug, sbId: data.id };
     }
 
     const { data, error } = await this.dataComposer
       .getClient()
       .from('agent_identities')
       .select('id, user_id, users!inner(email)')
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .eq('user_id', session.userId)
       .single();
 
     if (error || !data) {
       logger.debug('Context-based auth: no identity found for session user+agent', {
-        agentId,
+        sbSlug,
         userId: session.userId,
       });
       return null;
@@ -193,7 +200,7 @@ export class MCPServer {
     return {
       userId: session.userId,
       email,
-      agentId,
+      sbSlug,
       sbId: data.id,
     };
   }
@@ -232,15 +239,15 @@ export class MCPServer {
    * create_artifact fails wanting workspace scope (found live by Myra).
    */
   private async enrichIdentityFromContextSession(
-    userData: { userId: string; email: string; agentId?: string; sbId?: string } | null,
-    contextToken: { sessionId?: string; agentId?: string } | null
-  ): Promise<{ userId: string; email: string; agentId?: string; sbId?: string } | null> {
+    userData: { userId: string; email: string; sbSlug?: string; sbId?: string } | null,
+    contextToken: { sessionId?: string; sbSlug?: string } | null
+  ): Promise<{ userId: string; email: string; sbSlug?: string; sbId?: string } | null> {
     if (!userData) return userData;
-    if (userData.agentId || !contextToken?.sessionId || !contextToken?.agentId) return userData;
+    if (userData.sbSlug || !contextToken?.sessionId || !contextToken?.sbSlug) return userData;
 
     const sessionIdentity = await this.resolveUserFromContextSession(
       contextToken.sessionId,
-      contextToken.agentId
+      contextToken.sbSlug
     );
     if (!sessionIdentity) return userData;
     if (sessionIdentity.userId !== userData.userId) {
@@ -254,17 +261,14 @@ export class MCPServer {
 
     logger.debug('Context session enrichment: agent identity attached to user-token request', {
       sessionId: contextToken.sessionId,
-      agentId: sessionIdentity.agentId,
+      sbSlug: sessionIdentity.sbSlug,
       sbId: sessionIdentity.sbId,
       userId: userData.userId,
     });
-    return { ...userData, agentId: sessionIdentity.agentId, sbId: sessionIdentity.sbId };
+    return { ...userData, sbSlug: sessionIdentity.sbSlug, sbId: sessionIdentity.sbId };
   }
 
-  private async deriveWorkspaceIdFromAgent(
-    userId: string,
-    agentId: string
-  ): Promise<string | null> {
+  private async deriveWorkspaceIdFromAgent(userId: string, sbSlug: string): Promise<string | null> {
     // TODO(lumen): Deduplicate this with the artifact-handler variant in a
     // shared helper that can choose ambiguous-workspace behavior (warn/throw).
     const { data, error } = await this.dataComposer
@@ -272,12 +276,12 @@ export class MCPServer {
       .from('agent_identities')
       .select('workspace_id')
       .eq('user_id', userId)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
 
     if (error) {
       logger.warn('Failed to derive workspace from agent identity in MCP request context', {
         userId,
-        agentId,
+        sbSlug,
         error: error.message,
       });
       return null;
@@ -296,7 +300,7 @@ export class MCPServer {
     if (workspaceIds.length > 1) {
       logger.warn('Ambiguous workspace mapping for agent identity in MCP request context', {
         userId,
-        agentId,
+        sbSlug,
         workspaceCount: workspaceIds.length,
       });
     }
@@ -306,7 +310,7 @@ export class MCPServer {
 
   private async resolveWorkspaceContextForMcpRequest(
     req: express.Request,
-    userData: { userId: string; email: string; agentId?: string; sbId?: string }
+    userData: { userId: string; email: string; sbSlug?: string; sbId?: string }
   ): Promise<{ workspaceId?: string; workspaceSource?: 'header' | 'derived' }> {
     const requestedWorkspaceId = req.header('x-ink-workspace-id')?.trim();
 
@@ -325,8 +329,8 @@ export class MCPServer {
       // the same agent_id exists in multiple workspaces.
       deriveWorkspaceIdFromAgent: userData.sbId
         ? () => this.deriveWorkspaceIdFromSbId(userData.sbId!)
-        : userData.agentId
-          ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
+        : userData.sbSlug
+          ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.sbSlug!)
           : undefined,
     });
 
@@ -401,12 +405,15 @@ export class MCPServer {
     const app = express();
 
     // Enable CORS for web portal, MCP clients, and agents
-    app.use(
-      cors({
-        origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'],
-        credentials: true,
-      })
-    );
+    app.use(createBrowserCors());
+
+    // Bound work before any authentication, DB lookup, process spawn, or file
+    // read. Direct loopback clients are exempt by default; forwarded requests
+    // are not. The OAuth bucket is additional, not reserved lifecycle capacity:
+    // even OAuth-rejected attempts still count against the ingress bucket.
+    const httpRateLimiters = createHttpRateLimiters(env);
+    app.use(httpRateLimiters.ingress);
+    app.use(['/authorize', '/mcp/auth/callback', '/token', '/register'], httpRateLimiters.oauth);
 
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)
@@ -444,29 +451,29 @@ export class MCPServer {
 
       // Parse x-ink-context early so we can use it for auth fallback.
       const contextHeader = req.header('x-ink-context')?.trim();
-      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
+      let contextToken: import('@inklabs/shared').InkContextToken | null = null;
       if (contextHeader) {
         const { decodeContextToken } = await import('@inklabs/shared');
         contextToken = decodeContextToken(contextHeader);
       }
 
       // Session-validated context auth: when NO Authorization header is present
-      // but the request carries an x-ink-context with a sessionId + agentId,
+      // but the request carries an x-ink-context with a sessionId + sbSlug,
       // verify the session exists and is active in the database. The session was
       // created through an authenticated start_session call, so a matching
       // active session proves the caller owns the identity.
       //
       // This is NOT attempted when an Authorization header IS present but
       // invalid — that's a hard auth failure, not a fallback scenario.
-      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.agentId) {
+      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.sbSlug) {
         userData = await this.resolveUserFromContextSession(
           contextToken.sessionId,
-          contextToken.agentId
+          contextToken.sbSlug
         );
         if (userData) {
           logger.debug('Context-based auth: resolved identity from verified session', {
             sessionId: contextToken.sessionId,
-            agentId: contextToken.agentId,
+            sbSlug: contextToken.sbSlug,
             userId: userData.userId,
           });
         }
@@ -479,7 +486,7 @@ export class MCPServer {
 
       if (shouldChallenge) {
         const challengeParts = [
-          'Bearer realm="pcp"',
+          'Bearer realm="inkwell"',
           'scope="mcp:tools"',
           `authorization_uri="${baseUrl}/authorize"`,
           `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
@@ -511,7 +518,7 @@ export class MCPServer {
         ? {
             userId: userData.userId,
             email: userData.email,
-            agentId: userData.agentId,
+            sbSlug: userData.sbSlug,
             sbId: userData.sbId,
           }
         : {};
@@ -529,7 +536,7 @@ export class MCPServer {
       const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
       if (effectiveIdentity && effectiveIdentity !== userData) {
         Object.assign(ctx, {
-          agentId: effectiveIdentity.agentId,
+          sbSlug: effectiveIdentity.sbSlug,
           sbId: effectiveIdentity.sbId,
         });
       }
@@ -588,7 +595,7 @@ export class MCPServer {
         } catch (error) {
           logger.warn('Rejected MCP request due to invalid workspace scope', {
             userId: effectiveIdentity.userId,
-            agentId: effectiveIdentity.agentId,
+            sbSlug: effectiveIdentity.sbSlug,
             error: error instanceof Error ? error.message : String(error),
           });
           res.status(403).json({
@@ -694,6 +701,25 @@ export class MCPServer {
         },
       };
 
+      /**
+       * Scheduler liveness, reported from outside the scheduler.
+       *
+       * A heartbeat that stops ticking cannot report itself — the failure IS
+       * the inability to run code on time, so any check scheduled by the thing
+       * under test goes quiet with it. What survives is the timestamp of the
+       * last tick, read by whoever asks. Stale `lastTickAt` with a healthy
+       * process is the signature of a suspended host, and it is invisible in
+       * `uptime` and `startedAt`, both of which count straight through a sleep.
+       *
+       * Advisory only: it never moves the 200/503, which stays the database's
+       * call. A laptop closed overnight is not an unhealthy server.
+       */
+      const tickHealth = getHeartbeatTickHealth();
+      checks.heartbeat = {
+        status: 'ok',
+        details: tickHealth,
+      };
+
       const dbOk = checks.database?.status === 'ok';
       const overallStatus = dbOk ? 'healthy' : 'unhealthy';
 
@@ -716,11 +742,11 @@ export class MCPServer {
     app.post('/register', express.json(), (req, res) => {
       logger.info('MCP /register called', { body: req.body });
 
-      const clientId = req.body.client_id || `pcp-client-${Date.now()}`;
+      const clientId = req.body.client_id || `ink-client-${Date.now()}`;
 
       res.json({
         client_id: clientId,
-        client_secret: 'pcp-local-secret',
+        client_secret: 'ink-local-secret',
         redirect_uris: req.body.redirect_uris || ['http://localhost:3001/callback'],
         token_endpoint_auth_method: 'client_secret_post',
         grant_types: ['authorization_code', 'refresh_token'],
@@ -752,7 +778,7 @@ export class MCPServer {
         codeChallenge: code_challenge as string,
         redirectUri: redirect_uri as string,
         state: state as string,
-        agentId: agent_id as string | undefined,
+        sbSlug: agent_id as string | undefined,
       });
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';
@@ -869,12 +895,12 @@ export class MCPServer {
         return;
       }
 
-      const requestedAgentId =
-        typeof req.body?.agentId === 'string' ? req.body.agentId.trim().toLowerCase() : '';
-      if (!requestedAgentId) {
+      const requestedSlug =
+        typeof req.body?.sbSlug === 'string' ? req.body.sbSlug.trim().toLowerCase() : '';
+      if (!requestedSlug) {
         res.status(400).json({
           error: 'invalid_request',
-          error_description: 'Missing required field: agentId',
+          error_description: 'Missing required field: sbSlug',
         });
         return;
       }
@@ -884,13 +910,13 @@ export class MCPServer {
         .from('agent_identities')
         .select('id, agent_id')
         .eq('user_id', userData.userId)
-        .eq('agent_id', requestedAgentId)
+        .eq('agent_id', requestedSlug)
         .maybeSingle();
 
       if (identityError) {
         logger.error('Failed to resolve agent identity for delegated token', {
           userId: userData.userId,
-          requestedAgentId,
+          requestedSlug,
           error: identityError.message,
         });
         res.status(500).json({
@@ -908,13 +934,13 @@ export class MCPServer {
         return;
       }
 
-      const accessToken = signPcpAccessToken(
+      const accessToken = signInkAccessToken(
         {
           type: 'mcp_access',
           sub: userData.userId,
           email: userData.email,
           scope: 'mcp:tools',
-          agentId: identity.agent_id,
+          sbSlug: identity.agent_id,
           identityId: identity.id,
         },
         DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS
@@ -959,6 +985,7 @@ export class MCPServer {
     // Admin & Agent routes
     // ============================================================================
     app.use(express.json());
+    app.use(requireCookieCsrfHeader);
     app.use(cookieParser());
     app.use('/api/admin', adminRouter);
     logger.info('Admin API routes registered at /api/admin');
@@ -1034,6 +1061,13 @@ export class MCPServer {
     app.use('/api/sessions', sessionsRouter);
     logger.info('Session event routes registered at /api/sessions');
 
+    // Alert webhook routes. Registered synchronously and unconditionally —
+    // an alarm path that silently fails to mount is worse than no alarm path,
+    // because the absence is invisible until the outage it was meant to catch.
+    const alertsRouter = createAlertsRouter(this.dataComposer);
+    app.use('/api/alerts', alertsRouter);
+    logger.info('Alert webhook routes registered at /api/alerts');
+
     // Kindle routes (registered below after import)
     import('../routes/kindle.js')
       .then(({ createKindleRouter }) => {
@@ -1104,12 +1138,33 @@ export class MCPServer {
       logger.info(`Graph reconciliation sweep enabled (every ${Math.round(sweepMs / 1000)}s)`);
     }
 
+    this.startAlertStalenessSweep();
+
     // Initialize channel gateway if message handler is configured
     if (this.config.messageHandler) {
       await this.startChannelGateway();
     } else {
       logger.info('ChannelGateway not started (no messageHandler configured)');
     }
+  }
+
+  /**
+   * Schedule the alert staleness sweep.
+   *
+   * Without this the whole liveness half of the alerting schema is inert:
+   * check-ins are stored and GET /sources can *report* a stale verdict when
+   * something asks, but no dead checker ever raises an incident on its own.
+   * A monitor you have to remember to look at is not a monitor (PR #539,
+   * Lumen — sweepStaleSources was written and never scheduled).
+   *
+   * The interval and non-overlap semantics live in alert-sweep.ts so they can
+   * be tested; this is only the wiring.
+   */
+  private startAlertStalenessSweep(): void {
+    this.alertSweepTimer = startStalenessSweep(
+      new AlertDispatchService(this.dataComposer),
+      env.ALERT_STALENESS_SWEEP_SECONDS
+    );
   }
 
   /**
@@ -1196,6 +1251,11 @@ export class MCPServer {
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down MCP server...');
+
+    if (this.alertSweepTimer) {
+      clearInterval(this.alertSweepTimer);
+      this.alertSweepTimer = null;
+    }
 
     // Stop channel gateway first
     if (this.channelGateway) {

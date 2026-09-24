@@ -14,8 +14,8 @@ import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } 
 import express from 'express';
 import type { Server } from 'http';
 
-vi.mock('../mcp/auth/pcp-auth-provider', () => ({
-  PcpAuthProvider: class {
+vi.mock('../mcp/auth/ink-auth-provider', () => ({
+  InkAuthProvider: class {
     verifyAccessToken(header?: string) {
       return header ? { userId: 'user-1' } : null;
     }

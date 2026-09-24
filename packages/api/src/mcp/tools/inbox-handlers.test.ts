@@ -57,7 +57,7 @@ vi.mock('../../utils/request-context', async (importOriginal) => {
     ...actual,
     getRequestContext: vi.fn().mockReturnValue({ sessionId: 'session-mock-123' }),
     getSessionContext: vi.fn().mockReturnValue(undefined),
-    getPinnedAgentId: vi.fn().mockReturnValue(undefined),
+    getPinnedSlug: vi.fn().mockReturnValue(undefined),
   };
 });
 
@@ -119,7 +119,7 @@ const IDENTITY_ROWS = Object.entries(SB_IDS).map(([slug, id]) => ({
 const P = (slug: string, sessionId: string | null = null) => ({
   sbId: SB_IDS[slug],
   userId: null,
-  agentId: slug,
+  sbSlug: slug,
   sessionId,
   joinedAt: '2026-03-09T10:00:00Z',
 });
@@ -127,12 +127,12 @@ const P = (slug: string, sessionId: string | null = null) => ({
 const PERSON = (userId: string) => ({
   sbId: null,
   userId,
-  agentId: null,
+  sbSlug: null,
   sessionId: null,
   joinedAt: '2026-03-09T10:00:00Z',
 });
 /** An SbRef as resolveTriggeredAgents returns it. */
-const REF = (slug: string) => ({ sbId: SB_IDS[slug], agentId: slug });
+const REF = (slug: string) => ({ sbId: SB_IDS[slug], sbSlug: slug });
 /** A post-cutover inbox_threads row. */
 const THREAD_ROW = (overrides: Record<string, unknown> = {}) => ({
   id: 'thread-pr210',
@@ -157,7 +157,7 @@ const THREAD_ROW = (overrides: Record<string, unknown> = {}) => ({
  * An agent_identities chain that FILTERS like PostgREST: eq / in / not
  * narrow the rows, maybeSingle takes the first, awaiting yields the list.
  * Every principal resolver (resolveCallerSb, resolveSbInWorkspace,
- * resolveSbsByIds) and the legacy resolveIdentityId run against it.
+ * resolveSbsByIds) and the legacy resolveSbId run against it.
  */
 function createIdentityChain(rows: Array<Record<string, unknown>> = IDENTITY_ROWS) {
   const make = () => {
@@ -304,8 +304,8 @@ describe('handleSendToInbox - threadKey', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         content: 'Hello',
       },
       mockDc as never
@@ -328,8 +328,8 @@ describe('handleSendToInbox - threadKey', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         content: 'Hello',
       },
       mockDc as never
@@ -354,8 +354,8 @@ describe('handleSendToInbox - threadKey', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'myra',
-        senderAgentId: 'wren',
+        recipientSlug: 'myra',
+        senderSlug: 'wren',
         messageType: 'notification',
         content: 'FYI',
       },
@@ -364,7 +364,7 @@ describe('handleSendToInbox - threadKey', () => {
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'myra',
+        toSlug: 'myra',
       })
     );
   });
@@ -379,8 +379,8 @@ describe('handleSendToInbox - threadKey', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         messageType: 'session_resume',
         recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
         content: 'Resume this session',
@@ -405,8 +405,8 @@ describe('handleSendToInbox - threadKey', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         messageType: 'session_resume',
         recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
         content: 'Resume this session',
@@ -428,7 +428,7 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.recipientSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
   });
 
-  it('should trigger without senderAgentId using unknown sender', async () => {
+  it('should trigger without senderSlug using unknown sender', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
     const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
 
@@ -438,7 +438,7 @@ describe('handleSendToInbox - threadKey', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
+        recipientSlug: 'lumen',
         messageType: 'task_request',
         content: 'Human-sent coordination message',
       },
@@ -447,7 +447,7 @@ describe('handleSendToInbox - threadKey', () => {
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        fromAgentId: 'unknown',
+        fromSlug: 'unknown',
       })
     );
   });
@@ -462,8 +462,8 @@ describe('handleSendToInbox - threadKey', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         messageType: 'message',
         content: 'casual ping',
       },
@@ -474,7 +474,7 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.trigger.triggered).toBe(true);
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'lumen',
+        toSlug: 'lumen',
       })
     );
   });
@@ -489,8 +489,8 @@ describe('handleSendToInbox - threadKey', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         messageType: 'task_request',
         content: 'Please do this work',
       },
@@ -513,8 +513,8 @@ describe('handleSendToInbox - threadKey', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'wren',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
         messageType: 'session_resume',
         content: 'Strategy kickoff',
         metadata: {
@@ -550,8 +550,8 @@ describe('handleSendToInbox - threadKey', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'wren',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
         messageType: 'session_resume',
         threadKey: 'strategy:new-group-123',
         content: 'Strategy kickoff — first trigger',
@@ -561,7 +561,7 @@ describe('handleSendToInbox - threadKey', () => {
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'wren',
+        toSlug: 'wren',
         threadKey: 'strategy:new-group-123',
       })
     );
@@ -571,7 +571,7 @@ describe('handleSendToInbox - threadKey', () => {
   // 2FA SECURITY — permission_grant from agent senders must be rejected
   // ===================================================================
 
-  it('rejects permission_grant when senderAgentId is present', async () => {
+  it('rejects permission_grant when senderSlug is present', async () => {
     const mockSb = createMockSupabase();
     const mockDc = createMockDataComposer(mockSb);
 
@@ -579,8 +579,8 @@ describe('handleSendToInbox - threadKey', () => {
       handleSendToInbox(
         {
           email: 'test@test.com',
-          recipientAgentId: 'wren',
-          senderAgentId: 'wren',
+          recipientSlug: 'wren',
+          senderSlug: 'wren',
           messageType: 'permission_grant',
           content: 'granting self permission',
         },
@@ -591,7 +591,7 @@ describe('handleSendToInbox - threadKey', () => {
     expect(mockSb._chainable.insert).not.toHaveBeenCalled();
   });
 
-  it('allows permission_grant from the system layer (no senderAgentId)', async () => {
+  it('allows permission_grant from the system layer (no senderSlug)', async () => {
     // Use thread path so the message_type is exercised.
     const mockSb = createMockSupabase();
     const mockDc = createMockDataComposer(mockSb);
@@ -599,8 +599,8 @@ describe('handleSendToInbox - threadKey', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        // no senderAgentId — treated as system sender
+        recipientSlug: 'wren',
+        // no senderSlug — treated as system sender
         messageType: 'permission_grant',
         content: 'granted',
       },
@@ -811,8 +811,8 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'Please review this PR',
       },
@@ -823,12 +823,12 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     const insertedMeta = mockSb.getInsertedMetadata();
     expect(insertedMeta).toBeDefined();
     expect(insertedMeta!.pcp).toBeDefined();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
     // The sender is a principal (spec inkmail-thread-scope §3): kind and
     // canonical id beside the slug, never the slug alone.
-    expect(pcpMeta.sender).toEqual({
+    expect(inkMeta.sender).toEqual({
       kind: 'sb',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: SB_IDS.wren,
       userId: null,
       sessionId: 'wren-session-123',
@@ -850,8 +850,8 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'Hello',
       },
@@ -860,9 +860,9 @@ describe('Reply Routing — thread message metadata enrichment', () => {
 
     const insertedMeta = mockSb.getInsertedMetadata();
     expect(insertedMeta).toBeDefined();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
-    expect(sender.agentId).toBe('wren');
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
+    expect(sender.sbSlug).toBe('wren');
     expect(sender.sessionId).toBeNull();
     expect(sender.studioId).toBeNull();
   });
@@ -891,7 +891,7 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
         metadata: {
           pcp: {
             sender: {
-              agentId: 'lumen',
+              sbSlug: 'lumen',
               sessionId: 'lumen-session-456',
               studioId: 'studio-lumen',
             },
@@ -908,8 +908,8 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'Reply to your review',
       },
@@ -919,7 +919,7 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     // Trigger should include the auto-resolved recipientSessionId
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'lumen',
+        toSlug: 'lumen',
         threadKey: 'pr:210',
         recipientSessionId: 'lumen-session-456',
       })
@@ -943,8 +943,8 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:999',
         content: 'First message on this thread',
       },
@@ -953,7 +953,7 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'lumen',
+        toSlug: 'lumen',
         threadKey: 'pr:999',
         recipientSessionId: undefined,
       })
@@ -971,7 +971,7 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
         metadata: {
           pcp: {
             sender: {
-              agentId: 'lumen',
+              sbSlug: 'lumen',
               sessionId: 'lumen-old-session',
               studioId: 'studio-lumen',
             },
@@ -988,8 +988,8 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         recipientSessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
         content: 'Using explicit routing',
@@ -1031,15 +1031,15 @@ describe('Reply Routing — sender session fallback behavior', () => {
     // threadKey-scoped lookup returns a matching session
     vi.mocked(mockDc.repositories.memory.getActiveSessionByThreadKey).mockResolvedValue({
       id: 'thread-scoped-session-123',
-      agentId: 'wren',
+      sbSlug: 'wren',
       studioId: 'studio-wren',
     } as never);
 
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:42',
         content: 'Should use threadKey lookup',
       },
@@ -1057,8 +1057,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
     // Verify metadata has the threadKey-resolved session
     const insertedMeta = mockSb.getInsertedMetadata();
     expect(insertedMeta).toBeDefined();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
     expect(sender.sessionId).toBe('thread-scoped-session-123');
   });
 
@@ -1079,8 +1079,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'thread:new-topic',
         content: 'First message, no prior session',
       },
@@ -1092,8 +1092,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
 
     // Sender session should be null, not a random most-recent session
     const insertedMeta = mockSb.getInsertedMetadata();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
     expect(sender.sessionId).toBeNull();
   });
 
@@ -1129,8 +1129,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         content: 'Legacy path, no threadKey',
       },
       mockDc as never
@@ -1157,8 +1157,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:99',
         content: 'Header should win',
       },
@@ -1170,8 +1170,8 @@ describe('Reply Routing — sender session fallback behavior', () => {
 
     // Sender session comes from request context header
     const insertedMeta = mockSb.getInsertedMetadata();
-    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
-    const sender = pcpMeta.sender as Record<string, unknown>;
+    const inkMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = inkMeta.sender as Record<string, unknown>;
     expect(sender.sessionId).toBe('header-session-xyz');
     expect(sender.studioId).toBe('header-studio-abc');
   });
@@ -1204,7 +1204,7 @@ describe('handleGetInbox - recipient session naming', () => {
     const result = await handleGetInbox(
       {
         email: 'test@test.com',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
       },
       mockDc as never
     );
@@ -1237,7 +1237,7 @@ describe('handleGetInbox — threadKey alias', () => {
     const result = await handleGetInbox(
       {
         email: 'test@test.com',
-        agentId: 'myra',
+        sbSlug: 'myra',
         threadKey: 'thread:wholly-in-ink-vet',
         limit: 10,
       },
@@ -1248,7 +1248,7 @@ describe('handleGetInbox — threadKey alias', () => {
     expect(mockHandleGetThreadMessages).toHaveBeenCalledOnce();
     const delegatedArgs = mockHandleGetThreadMessages.mock.calls[0]![0] as Record<string, unknown>;
     expect(delegatedArgs.threadKey).toBe('thread:wholly-in-ink-vet');
-    expect(delegatedArgs.agentId).toBe('myra');
+    expect(delegatedArgs.sbSlug).toBe('myra');
     expect(delegatedArgs.limit).toBe(10);
     expect(delegatedArgs.fullHistory).toBeUndefined();
   });
@@ -1262,7 +1262,7 @@ describe('handleGetInbox — threadKey alias', () => {
     await handleGetInbox(
       {
         email: 'test@test.com',
-        agentId: 'myra',
+        sbSlug: 'myra',
         threadKey: 'pr:463',
         status: 'all',
       },
@@ -1273,11 +1273,11 @@ describe('handleGetInbox — threadKey alias', () => {
     expect(delegatedArgs.fullHistory).toBe(true);
   });
 
-  it('rejects threadKey without agentId — thread access is participant-scoped', async () => {
+  it('rejects threadKey without sbSlug — thread access is participant-scoped', async () => {
     const mockDc = createMockDataComposer(createMockSupabase());
     await expect(
       handleGetInbox({ email: 'test@test.com', threadKey: 'pr:463' }, mockDc as never)
-    ).rejects.toThrow(/requires agentId/);
+    ).rejects.toThrow(/requires sbSlug/);
     expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
   });
 
@@ -1285,7 +1285,7 @@ describe('handleGetInbox — threadKey alias', () => {
     const mockDc = createMockDataComposer(createMockSupabase());
     await expect(
       handleGetInbox(
-        { email: 'test@test.com', agentId: 'myra', threadKey: 'not a thread key' },
+        { email: 'test@test.com', sbSlug: 'myra', threadKey: 'not a thread key' },
         mockDc as never
       )
     ).rejects.toThrow();
@@ -1300,7 +1300,7 @@ describe('handleGetInbox — threadKey alias', () => {
     const mockDc = createMockDataComposer(createMockSupabase());
     await expect(
       handleGetInbox(
-        { email: 'test@test.com', agentId: 'myra', threadKye: 'pr:464' },
+        { email: 'test@test.com', sbSlug: 'myra', threadKye: 'pr:464' },
         mockDc as never
       )
     ).rejects.toThrow(/threadKye/);
@@ -1319,7 +1319,7 @@ describe('handleGetInbox — threadKey alias', () => {
     const mockDc = createMockDataComposer(createMockSupabase());
     await expect(
       handleGetInbox(
-        { email: 'test@test.com', agentId: 'myra', threadKey: 'pr:464', ...filter },
+        { email: 'test@test.com', sbSlug: 'myra', threadKey: 'pr:464', ...filter },
         mockDc as never
       )
     ).rejects.toThrow(pattern);
@@ -1340,21 +1340,21 @@ describe('isThreadOwnedByStudio', () => {
   });
 
   it('accepts when agent has a message from this studio', () => {
-    const messages = [{ metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } }];
+    const messages = [{ metadata: { pcp: { sender: { sbSlug: 'wren', studioId: MY_STUDIO } } } }];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(true);
   });
 
   it('rejects when agent has messages only from a different studio', () => {
     const messages = [
-      { metadata: { pcp: { sender: { agentId: 'wren', studioId: OTHER_STUDIO } } } },
+      { metadata: { pcp: { sender: { sbSlug: 'wren', studioId: OTHER_STUDIO } } } },
     ];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
   });
 
   it('accepts when at least one message matches (mixed studios)', () => {
     const messages = [
-      { metadata: { pcp: { sender: { agentId: 'wren', studioId: OTHER_STUDIO } } } },
-      { metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } },
+      { metadata: { pcp: { sender: { sbSlug: 'wren', studioId: OTHER_STUDIO } } } },
+      { metadata: { pcp: { sender: { sbSlug: 'wren', studioId: MY_STUDIO } } } },
     ];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(true);
   });
@@ -1365,7 +1365,7 @@ describe('isThreadOwnedByStudio', () => {
   });
 
   it('rejects when messages have pcp.sender but no studioId', () => {
-    const messages = [{ metadata: { pcp: { sender: { agentId: 'wren' } } } }];
+    const messages = [{ metadata: { pcp: { sender: { sbSlug: 'wren' } } } }];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
   });
 
@@ -1381,7 +1381,7 @@ describe('isThreadOwnedByStudio', () => {
       {
         metadata: {
           pcp: {
-            sender: { agentId: 'wren', studioId: OTHER_STUDIO },
+            sender: { sbSlug: 'wren', studioId: OTHER_STUDIO },
             recipient: { studioId: MY_STUDIO },
           },
         },
@@ -1395,7 +1395,7 @@ describe('isThreadOwnedByStudio', () => {
       {
         metadata: {
           pcp: {
-            sender: { agentId: 'wren', studioId: OTHER_STUDIO },
+            sender: { sbSlug: 'wren', studioId: OTHER_STUDIO },
             recipient: { studioId: 'some-third-studio' },
           },
         },
@@ -1510,7 +1510,7 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
       {
         email: 'test@test.com',
         messageId: threadMsgId,
-        agentId: 'wren',
+        sbSlug: 'wren',
         status: 'completed',
       },
       mockDc as never
@@ -1543,7 +1543,7 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
         {
           email: 'test@test.com',
           messageId: threadMsgId,
-          agentId: 'wren',
+          sbSlug: 'wren',
           status: 'completed',
         },
         mockDc as never
@@ -1569,9 +1569,9 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     vi.mocked(resolveTriggeredAgents).mockReturnValue([]);
   });
 
-  it('fires a trigger even when senderAgentId is "system" and there is no request context', async () => {
+  it('fires a trigger even when senderSlug is "system" and there is no request context', async () => {
     // This is the watchdog/heartbeat path: StrategyService.triggerWatchdog()
-    // sends with senderAgentId='system' from a heartbeat tick that has no
+    // sends with senderSlug='system' from a heartbeat tick that has no
     // x-ink-context token and no session context. The old
     // missingSenderSession guard suppressed the trigger here, so the
     // watchdog marked the reminder delivered without waking the owner.
@@ -1588,7 +1588,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
+        recipientSlug: 'wren',
         threadKey: 'strategy:group-1',
         content: 'Resume strategy task',
         messageType: 'session_resume',
@@ -1603,8 +1603,8 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     // Trigger must fire — not suppressed by missingSenderSession.
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'wren',
-        fromAgentId: 'system',
+        toSlug: 'wren',
+        fromSlug: 'system',
       })
     );
     // And the warning about suppressed triggers must NOT appear.
@@ -1630,7 +1630,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
+        recipientSlug: 'wren',
         threadKey: 'strategy:group-1',
         content: 'Kick off the strategy task',
         messageType: 'session_resume',
@@ -1644,7 +1644,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
 
     expect(JSON.parse(result.content[0].text).success).toBe(true);
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
-      expect.objectContaining({ toAgentId: 'wren', forceSpawn: true })
+      expect.objectContaining({ toSlug: 'wren', forceSpawn: true })
     );
 
     // Contrast: an ordinary send maps NO forceSpawn — inline delivery stays
@@ -1653,7 +1653,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
+        recipientSlug: 'wren',
         threadKey: 'strategy:group-1',
         content: 'plain message',
         messageType: 'notification',
@@ -1685,8 +1685,8 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'thread:quiet-fyi',
         content: 'No rush — for your next inbox check.',
         messageType: 'notification',
@@ -1699,7 +1699,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     expect(parsed.success).toBe(true);
     // Assignment happened SYNCHRONOUSLY (processTrigger, awaited) with routeOnly
     expect(mockGateway.processTrigger).toHaveBeenCalledWith(
-      expect.objectContaining({ toAgentId: 'lumen', routeOnly: true })
+      expect.objectContaining({ toSlug: 'lumen', routeOnly: true })
     );
     // No wake dispatch fired
     expect(mockGateway.dispatchTrigger).not.toHaveBeenCalled();
@@ -1719,7 +1719,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     const withHistory = createThreadMockSupabase({
       existingThread: { id: 'thread-hist' },
       recipientPriorMessage: {
-        metadata: { pcp: { sender: { agentId: 'lumen', sessionId: 'lumen-old-session' } } },
+        metadata: { pcp: { sender: { sbSlug: 'lumen', sessionId: 'lumen-old-session' } } },
       },
     });
     const { findThread, getParticipants, resolveTriggeredAgents } =
@@ -1733,15 +1733,15 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:hist',
         content: 'reply',
       },
       createThreadMockDataComposer(withHistory) as never
     );
     const historyCall = (mockGateway.processTrigger as ReturnType<typeof vi.fn>).mock.calls.find(
-      (c: unknown[]) => (c[0] as { toAgentId: string }).toAgentId === 'lumen'
+      (c: unknown[]) => (c[0] as { toSlug: string }).toSlug === 'lumen'
     );
     expect(historyCall![0]).toEqual(
       expect.objectContaining({ recipientSessionId: 'lumen-old-session' })
@@ -1759,8 +1759,8 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'wren',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
         recipientStudioId: '123e4567-e89b-12d3-a456-426614174000',
         threadKey: 'thread:studio-target',
         content: 'handoff',
@@ -1769,7 +1769,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       createThreadMockDataComposer(plain) as never
     );
     expect(mockGateway.processTrigger).toHaveBeenCalledWith(
-      expect.objectContaining({ toAgentId: 'wren', explicitRecipientTarget: true })
+      expect.objectContaining({ toSlug: 'wren', explicitRecipientTarget: true })
     );
   });
 
@@ -1781,16 +1781,16 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     const mockSb = createMockSupabase();
     const mockDc = createMockDataComposer(mockSb);
 
-    // With agentId
+    // With sbSlug
     const result = await handleGetInbox(
-      { email: 'test@test.com', agentId: 'wren', channelPoll: true },
+      { email: 'test@test.com', sbSlug: 'wren', channelPoll: true },
       mockDc as never
     );
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.warning).toContain('channel_poll_unscoped');
     expect(parsed.messages).toEqual([]);
 
-    // And WITHOUT agentId — the gate must not be bypassable by omitting it
+    // And WITHOUT sbSlug — the gate must not be bypassable by omitting it
     const result2 = await handleGetInbox(
       { email: 'test@test.com', channelPoll: true },
       mockDc as never
@@ -1818,8 +1818,8 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:999',
         content: 'Review please',
         messageType: 'task_request',
@@ -1853,8 +1853,8 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'wren',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
         recipientStudioId: '123e4567-e89b-12d3-a456-426614174000',
         threadKey: 'thread:self-handoff',
         content: 'Pick this up in the other studio',
@@ -1884,8 +1884,8 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'wren',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
         sessionAlias: 'review',
         threadKey: 'thread:self-alias-handoff',
         content: 'Pick this up in the review session',
@@ -1917,7 +1917,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
+        recipientSlug: 'wren',
         threadKey: 'strategy:group-1',
         content: 'Resume strategy task',
         messageType: 'session_resume',
@@ -1930,7 +1930,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'wren',
+        toSlug: 'wren',
         studioId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
       })
     );
@@ -1950,7 +1950,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
+        recipientSlug: 'wren',
         threadKey: 'strategy:group-2',
         content: 'Resume strategy task',
         messageType: 'session_resume',
@@ -1963,7 +1963,7 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'wren',
+        toSlug: 'wren',
         studioHint: 'wren-omega',
       })
     );
@@ -1999,8 +1999,8 @@ describe('Session-scoped thread filtering', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'Review this PR',
         messageType: 'task_request',
@@ -2011,7 +2011,7 @@ describe('Session-scoped thread filtering', () => {
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
         threadId: 'thread-pr210',
-        toAgentId: 'lumen',
+        toSlug: 'lumen',
       })
     );
   });
@@ -2050,8 +2050,8 @@ describe('Session-scoped thread filtering', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'Updated review',
         messageType: 'message',
@@ -2079,8 +2079,8 @@ describe('Session-scoped thread filtering', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'Check this',
         messageType: 'message',
@@ -2115,8 +2115,8 @@ describe('Session-scoped thread filtering', () => {
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'wren',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'Cross-studio self-delegation',
         messageType: 'task_request',
@@ -2161,8 +2161,8 @@ describe('handleSendToInbox — assignment failure surfacing (round 2)', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:460',
         content: 'trigger:false must not fake success',
         messageType: 'message',
@@ -2176,7 +2176,7 @@ describe('handleSendToInbox — assignment failure surfacing (round 2)', () => {
     // message behind an unqualified success.
     expect(parsed.success).toBe(false);
     expect(parsed.routingFailures).toEqual([
-      { agentId: 'lumen', error: expect.stringContaining('stamp not persisted') },
+      { sbSlug: 'lumen', error: expect.stringContaining('stamp not persisted') },
     ]);
     expect(parsed.message).toContain('routing FAILED');
     expect(parsed.messageId).toBeTruthy();
@@ -2193,8 +2193,8 @@ describe('handleSendToInbox — assignment failure surfacing (round 2)', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:460',
         content: 'assignment crash must surface',
         messageType: 'task_request',
@@ -2203,9 +2203,7 @@ describe('handleSendToInbox — assignment failure surfacing (round 2)', () => {
     );
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(false);
-    expect(parsed.routingFailures).toEqual([
-      { agentId: 'lumen', error: 'gateway handler crashed' },
-    ]);
+    expect(parsed.routingFailures).toEqual([{ sbSlug: 'lumen', error: 'gateway handler crashed' }]);
     // Wake still attempted: the wake handler re-runs assignment (a transient
     // failure may clear) and the wake itself surfaces the message.
     expect(mockGateway.dispatchTrigger).toHaveBeenCalled();
@@ -2216,8 +2214,8 @@ describe('handleSendToInbox — assignment failure surfacing (round 2)', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:460',
         content: 'happy path unchanged',
         messageType: 'message',
@@ -2306,14 +2304,14 @@ function createScopedPollMockSupabase(
 describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
-    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+    const { getRequestContext, getSessionContext, getPinnedSlug } =
       await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
     vi.mocked(getSessionContext).mockReturnValue(undefined as never);
-    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedSlug).mockReturnValue(undefined as never);
   });
 
-  it('derives agentId from the session when omitted — never reads the all-agent surface', async () => {
+  it('derives sbSlug from the session when omitted — never reads the all-agent surface', async () => {
     const mockSb = createScopedPollMockSupabase();
     const result = await handleGetInbox(
       { email: 'test@test.com', channelPoll: true },
@@ -2322,7 +2320,7 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
     expect(parsed.warning).toBeUndefined();
-    expect(parsed.agentId).toBe('wren');
+    expect(parsed.sbSlug).toBe('wren');
     // The legacy fetch ran agent-scoped: recipient_agent_id was applied.
     const inboxEqs = mockSb.getEqCalls()['agent_inbox'] || [];
     expect(inboxEqs).toContainEqual(['recipient_agent_id', 'wren']);
@@ -2335,10 +2333,10 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
   });
 
   it('fails closed when the session agent does not match the pinned identity (round 3)', async () => {
-    // A pinned Myra caller presenting a Wren session id with agentId omitted
+    // A pinned Myra caller presenting a Wren session id with sbSlug omitted
     // must NOT have the read scope switched to Wren.
-    const { getPinnedAgentId } = await import('../../utils/request-context');
-    vi.mocked(getPinnedAgentId).mockReturnValue('myra' as never);
+    const { getPinnedSlug } = await import('../../utils/request-context');
+    vi.mocked(getPinnedSlug).mockReturnValue('myra' as never);
     const mockSb = createScopedPollMockSupabase(); // session agent is wren
     const result = await handleGetInbox(
       { email: 'test@test.com', channelPoll: true },
@@ -2352,8 +2350,8 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
   });
 
   it('passes when the pinned identity matches the session agent (round 3)', async () => {
-    const { getPinnedAgentId } = await import('../../utils/request-context');
-    vi.mocked(getPinnedAgentId).mockReturnValue('wren' as never);
+    const { getPinnedSlug } = await import('../../utils/request-context');
+    vi.mocked(getPinnedSlug).mockReturnValue('wren' as never);
     const mockSb = createScopedPollMockSupabase();
     const result = await handleGetInbox(
       { email: 'test@test.com', channelPoll: true },
@@ -2361,13 +2359,13 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
     );
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.warning).toBeUndefined();
-    expect(parsed.agentId).toBe('wren');
+    expect(parsed.sbSlug).toBe('wren');
   });
 
-  it('fails closed when the provided agentId does not match the session agent', async () => {
+  it('fails closed when the provided sbSlug does not match the session agent', async () => {
     const mockSb = createScopedPollMockSupabase(); // session agent is wren
     const result = await handleGetInbox(
-      { email: 'test@test.com', agentId: 'myra', channelPoll: true },
+      { email: 'test@test.com', sbSlug: 'myra', channelPoll: true },
       createMockDataComposer(mockSb as never) as never
     );
     const parsed = JSON.parse(result.content[0].text);
@@ -2392,7 +2390,7 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
   it('fails closed on a session lookup ERROR — unverifiable scope never widens into a read', async () => {
     const mockSb = createScopedPollMockSupabase({ sessionLookupError: true });
     const result = await handleGetInbox(
-      { email: 'test@test.com', agentId: 'wren', channelPoll: true },
+      { email: 'test@test.com', sbSlug: 'wren', channelPoll: true },
       createMockDataComposer(mockSb as never) as never
     );
     expect(JSON.parse(result.content[0].text).warning).toContain('channel_poll_unscoped');
@@ -2408,11 +2406,11 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
 describe('handleGetInbox — channelPoll thread paging via get_unread_thread_candidates', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
-    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+    const { getRequestContext, getSessionContext, getPinnedSlug } =
       await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
     vi.mocked(getSessionContext).mockReturnValue(undefined as never);
-    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedSlug).mockReturnValue(undefined as never);
   });
 
   function withCandidates(
@@ -2484,7 +2482,7 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     // The recency page now filters membership with an !inner join instead.
     const mockSb = createScopedPollMockSupabase();
     await handleGetInbox(
-      { email: 'test@test.com', agentId: 'wren' },
+      { email: 'test@test.com', sbSlug: 'wren' },
       createMockDataComposer(mockSb as never) as never
     );
     const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
@@ -2553,7 +2551,7 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     const { logger } = await import('../../utils/logger');
     expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
       'channel_poll_candidates_failed',
-      expect.objectContaining({ agentId: 'wren' })
+      expect.objectContaining({ sbSlug: 'wren' })
     );
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
@@ -2601,8 +2599,8 @@ describe('handleSendToInbox — a thread home resolves the recipient session bef
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'lumen',
+        recipientSlug: 'wren',
+        senderSlug: 'lumen',
         threadKey: 'pr:600',
         content: 'first reply on the thread',
         trigger: true,
@@ -2611,7 +2609,7 @@ describe('handleSendToInbox — a thread home resolves the recipient session bef
     );
     expect(JSON.parse(result.content[0].text).success).toBe(true);
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
-      expect.objectContaining({ toAgentId: 'wren', recipientSessionId: 'creator-sess' })
+      expect.objectContaining({ toSlug: 'wren', recipientSessionId: 'creator-sess' })
     );
   });
 
@@ -2630,8 +2628,8 @@ describe('handleSendToInbox — a thread home resolves the recipient session bef
     await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'wren',
-        senderAgentId: 'lumen',
+        recipientSlug: 'wren',
+        senderSlug: 'lumen',
         threadKey: 'pr:600',
         content: 'a later reply',
         trigger: true,
@@ -2639,7 +2637,7 @@ describe('handleSendToInbox — a thread home resolves the recipient session bef
       mockDc as never
     );
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
-      expect.objectContaining({ toAgentId: 'wren', recipientSessionId: 'history-sess' })
+      expect.objectContaining({ toSlug: 'wren', recipientSessionId: 'history-sess' })
     );
   });
 });
@@ -2707,11 +2705,11 @@ function createRecordingSupabase(rows: Record<string, unknown[]>) {
 describe('Closed threads accept replies and stay deliverable (spec inkmail-thread-scope §2)', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
-    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+    const { getRequestContext, getSessionContext, getPinnedSlug } =
       await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
     vi.mocked(getSessionContext).mockReturnValue(undefined as never);
-    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedSlug).mockReturnValue(undefined as never);
   });
 
   it('stores a reply on a closed thread instead of refusing it', async () => {
@@ -2734,8 +2732,8 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:210',
         content: 'one more thing, after the close',
       },
@@ -2753,7 +2751,7 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
   it('get_inbox recency page does not filter threads by status', async () => {
     const mockSb = createScopedPollMockSupabase();
     await handleGetInbox(
-      { email: 'test@test.com', agentId: 'wren' },
+      { email: 'test@test.com', sbSlug: 'wren' },
       createMockDataComposer(mockSb as never) as never
     );
     const threadEqs = mockSb.getEqCalls()['inbox_threads'] || [];
@@ -2776,7 +2774,7 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     });
 
     const result = await handleGetAgentSummaries(
-      { email: 'test@test.com', agentIds: ['wren'] },
+      { email: 'test@test.com', sbSlugs: ['wren'] },
       createMockDataComposer(mockSb as never) as never
     );
     const parsed = JSON.parse(result.content[0].text);
@@ -2789,7 +2787,7 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     ]);
     const threadEqs = mockSb.getEqCalls()['inbox_threads'] || [];
     expect(threadEqs).not.toContainEqual(['status', 'open']);
-    const wren = parsed.agents.find((a: { agentId: string }) => a.agentId === 'wren');
+    const wren = parsed.agents.find((a: { sbSlug: string }) => a.sbSlug === 'wren');
     expect(wren).toBeDefined();
     expect(wren.threadUnread).toBe(1);
   });
@@ -2847,7 +2845,7 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
       string,
       unknown
     >;
-    expect(sender).toMatchObject({ kind: 'user', userId: 'user-123', agentId: null, sbId: null });
+    expect(sender).toMatchObject({ kind: 'user', userId: 'user-123', sbSlug: null, sbId: null });
     // The person's own pointer advanced through their message — by user id.
     expect(
       mockSb.getRpcCalls().find((c) => c.fn === 'advance_thread_read_pointer')?.args
@@ -2892,7 +2890,7 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     // Every wake names an SB by canonical id; no payload was built for the person.
     for (const w of wakes) {
       expect(typeof w.toSbId).toBe('string');
-      expect(typeof w.toAgentId).toBe('string');
+      expect(typeof w.toSlug).toBe('string');
       expect(w.threadId).toBe('thread-person');
     }
     expect(resolveTriggeredAgents).toHaveBeenCalledWith(
@@ -2961,11 +2959,11 @@ describe('Unread parity with SQL candidacy once closed threads are in scope (Lum
   // join time.
   beforeEach(async () => {
     vi.clearAllMocks();
-    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+    const { getRequestContext, getSessionContext, getPinnedSlug } =
       await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
     vi.mocked(getSessionContext).mockReturnValue(undefined as never);
-    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedSlug).mockReturnValue(undefined as never);
   });
 
   async function summariesUnread(opts: {
@@ -2989,7 +2987,7 @@ describe('Unread parity with SQL candidacy once closed threads are in scope (Lum
       ],
     });
     const result = await handleGetAgentSummaries(
-      { email: 'test@test.com', agentIds: ['lumen'] },
+      { email: 'test@test.com', sbSlugs: ['lumen'] },
       createMockDataComposer(db as never) as never
     );
     return JSON.parse(result.content[0].text).agents[0].threadUnread as number;
@@ -3073,7 +3071,7 @@ describe('Unread parity with SQL candidacy once closed threads are in scope (Lum
       ],
     });
     const result = await handleGetInbox(
-      { email: 'test@test.com', agentId: 'lumen', markRead: false },
+      { email: 'test@test.com', sbSlug: 'lumen', markRead: false },
       createMockDataComposer(db as never) as never
     );
     const parsed = JSON.parse(result.content[0].text);

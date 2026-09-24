@@ -28,11 +28,11 @@ export function AgentPanel() {
   const studios = useCommandStore((s) => s.studios);
   const selectAgent = useCommandStore((s) => s.selectAgent);
 
-  const agent = agents.find((a) => a.agentId === selectedAgent);
+  const agent = agents.find((a) => a.sbSlug === selectedAgent);
   if (!agent) return null;
 
-  const agentStudios = studios.filter((s) => s.agentId === agent.agentId);
-  const color = AGENT_COLORS[agent.agentId] ?? '#888';
+  const agentStudios = studios.filter((s) => s.sbSlug === agent.sbSlug);
+  const color = AGENT_COLORS[agent.sbSlug] ?? '#888';
 
   return (
     <div

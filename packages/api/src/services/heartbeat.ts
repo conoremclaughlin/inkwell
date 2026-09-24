@@ -13,12 +13,18 @@
  */
 
 import * as cron from 'node-cron';
+import { randomUUID } from 'node:crypto';
 import { isWithinQuietHours } from './quiet-hours.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
+import {
+  createHeartbeatNotificationStore,
+  type EpisodeBoundary,
+} from './heartbeat-notification-store.js';
 import type { Database, Json } from '../data/supabase/types.js';
+import type { ErrorClassification } from '@inklabs/shared';
 
 // DueReminder is the subset of fields we need for processing
 export interface DueReminder {
@@ -46,6 +52,84 @@ interface HeartbeatConfig {
   onHeartbeat?: () => Promise<void>;
 }
 
+/**
+ * How far back to look when measuring a failure streak. Only the leading run
+ * of failures is counted, so this is a ceiling on the reported number, not a
+ * window that can hide one: any outage longer than this still reports as
+ * "at least this many" and has long since alerted on its first beat.
+ *
+ * It bounds the COUNT and nothing else. The episode boundary is read by its own
+ * query (`lastDeliveredBeat`) precisely so that it cannot be truncated away —
+ * see the note there.
+ */
+const FAILURE_STREAK_LOOKBACK = 50;
+
+/**
+ * The `reminder_history` column the streak sorts by.
+ *
+ * Exported so the integration tier can run the sort against the real table
+ * rather than a mock. A mocked `order()` returns the builder for ANY string,
+ * so the unit tier cannot tell a real column from a typo — and a typo here is
+ * silent and total: PostgREST fails the sort with 42703, the catch turns that
+ * into a streak of 0, every failed beat then reads as its own first, and the
+ * result is an alert on EVERY beat and an all-clear on none. Shipped exactly
+ * that way on this branch until Myra's report sent me back to the schema.
+ */
+export const FAILURE_STREAK_ORDER_COLUMN = 'triggered_at';
+
+/**
+ * The streak's bounded read: the most recent beats, newest first.
+ *
+ * Exported, like the column constant above and for the same reason — so the
+ * integration tier can run the query production runs rather than a copy of it
+ * that has drifted.
+ */
+export function selectFailureStreakWindow(client: SupabaseClient<Database>, reminderId: string) {
+  return client
+    .from('reminder_history')
+    .select('status, triggered_at')
+    .eq('reminder_id', reminderId)
+    .in('status', ['delivered', 'failed'])
+    .order(FAILURE_STREAK_ORDER_COLUMN, { ascending: false })
+    .limit(FAILURE_STREAK_LOOKBACK);
+}
+
+/**
+ * The boundary read: the single most recent DELIVERED beat.
+ *
+ * Deliberately NOT the query above with a filter bolted on. It has no window, so
+ * no number of failed beats stacked on top can push the answer out of range —
+ * which is the entire reason it is a separate query. See `lastDeliveredBeat`.
+ */
+export function selectLastDeliveredBeat(client: SupabaseClient<Database>, reminderId: string) {
+  return client
+    .from('reminder_history')
+    .select('triggered_at')
+    .eq('reminder_id', reminderId)
+    .eq('status', 'delivered')
+    .order(FAILURE_STREAK_ORDER_COLUMN, { ascending: false })
+    .limit(1);
+}
+
+/**
+ * Who an outage alert would reach: a given SB, on a given channel, at a given
+ * address. `null` when the beat has no owning SB, which leaves it to dedupe on
+ * its own streak alone.
+ *
+ * The failure streak is per-REMINDER, but the failures worth alerting on are
+ * per-BACKEND: a logged-out backend fails every beat its SB owns, each with an
+ * independent streak of 1, so each alerts. Myra owns two active beats whose
+ * crons collide at 16:00Z daily — one cause, two alerts, two counts, landing in
+ * the same Telegram chat in the same second. She found it on 2026-09-11.
+ *
+ * Collapsing on this key holds the module's promise — two messages per outage,
+ * not two per beat — for every beat that shares a destination.
+ */
+function alertDestination(reminder: DueReminder): string | null {
+  if (!reminder.sb_id) return null;
+  return `${reminder.sb_id}|${reminder.delivery_channel}|${reminder.delivery_target}`;
+}
+
 // Singleton state
 let cronTask: ReturnType<typeof cron.schedule> | null = null;
 let supabase: SupabaseClient<Database> | null = null;
@@ -53,6 +137,96 @@ let heartbeatRunning = false;
 
 // Store the onHeartbeat callback
 let heartbeatCallback: (() => Promise<void>) | null = null;
+
+/**
+ * Liveness of the scheduler itself, as opposed to the delivery it schedules.
+ *
+ * Every alerting path in this module hangs off a delivery ATTEMPT: a beat runs,
+ * the callback fails, a failure row lands, the streak crosses one, somebody is
+ * told. A tick that never happens attempts nothing, so it writes no row, moves
+ * no streak, and escalates to nobody. It is an absence, and absences were
+ * invisible here until 2026-09-18.
+ *
+ * What that cost, measured over the 64 hours of log retained at the time:
+ * 39 of 771 expected five-minute ticks never ran (5.1%), in nine separate
+ * outages, the longest 50 minutes. Every one of them fell inside a window where
+ * the host was asleep — `pmset -g log` accounts for all 39 with zero residual,
+ * and the machine was asleep for 5.2% of the span against 5.1% of slots missed.
+ * The process was never restarted and `/health` was correct throughout: this is
+ * not a crash, and looking for a bug inside the process finds nothing, because
+ * the process was suspended along with everything else on the machine. On a
+ * laptop, heartbeat coverage is laptop uptime, and nothing reported the
+ * difference.
+ *
+ * Reminders themselves survive it — the due query has no lower bound, so an
+ * overdue beat is picked up by whatever tick runs next. They arrive late, not
+ * never. The exception is a recurring beat, which carries a single
+ * `next_run_at`: several occurrences slept through collapse into one late
+ * delivery.
+ */
+let lastTickAt: Date | null = null;
+/**
+ * The tick before `lastTickAt`. Only the missed-tick record reads it, and
+ * only to survive the drain ordering described where it is used.
+ */
+let previousTickAt: Date | null = null;
+let lastTickCompletedAt: Date | null = null;
+let lastMissedTickAt: Date | null = null;
+let missedTickCount = 0;
+
+/**
+ * Which scheduler these numbers belong to.
+ *
+ * `initHeartbeatService` stops the old cron, so a retired scheduler cannot fire
+ * again — but a tick already in flight keeps running, and its `finally` lands
+ * after the reset. Without a fence it writes `lastTickCompletedAt` into the
+ * successor's freshly cleared state, reporting a completion the new scheduler
+ * never had, next to a `lastTickAt` still null. Health then claims work
+ * finished before any was scheduled. Found by Lumen reviewing #656, against
+ * the reset this very change introduced; the original re-init test missed it
+ * because it reset synchronously, while the old tick was still suspended.
+ *
+ * Compared at the moment of each write, never captured at entry: retirement is
+ * exactly what happens during the await.
+ */
+let schedulerGeneration = 0;
+
+/**
+ * What the scheduler has and has not done, for anything that needs to notice a
+ * tick that did not happen.
+ *
+ * Exposed on `/health` because that is the only place it can do its job. The
+ * failure mode is the process being unable to run its own code, so a check that
+ * has to run inside the process cannot report it — a stale `lastTickAt` read
+ * from outside can.
+ *
+ * TWO TIMESTAMPS, BECAUSE THERE ARE TWO WAYS TO GO QUIET. `lastTickAt` is the
+ * scheduler firing; `lastTickCompletedAt` is the work finishing. A suspended
+ * host freezes both. A tick wedged on a hung await freezes only the second,
+ * while the overlap guard turns every subsequent fire into a `debug`-level skip
+ * — which is the same invisible absence wearing different clothes, and reading
+ * `lastTickAt` alone would call it healthy. A widening distance between them is
+ * the signal.
+ */
+export function getHeartbeatTickHealth(): {
+  lastTickAt: string | null;
+  lastTickCompletedAt: string | null;
+  lastMissedTickAt: string | null;
+  missedTickCount: number;
+  sinceLastTickMs: number | null;
+  sinceLastCompletedTickMs: number | null;
+} {
+  return {
+    lastTickAt: lastTickAt?.toISOString() ?? null,
+    lastTickCompletedAt: lastTickCompletedAt?.toISOString() ?? null,
+    lastMissedTickAt: lastMissedTickAt?.toISOString() ?? null,
+    missedTickCount,
+    sinceLastTickMs: lastTickAt ? Date.now() - lastTickAt.getTime() : null,
+    sinceLastCompletedTickMs: lastTickCompletedAt
+      ? Date.now() - lastTickCompletedAt.getTime()
+      : null,
+  };
+}
 
 /**
  * Initialize the heartbeat service
@@ -76,10 +250,25 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
   // Initialize typed Supabase client
   supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
 
+  // A fresh scheduler has not missed anything yet, and must not inherit the
+  // previous one's gap: re-init is a new process's worth of history. The
+  // generation bump retires the old scheduler's writes along with its numbers —
+  // clearing the fields is not enough while its last tick is still in flight.
+  const generation = ++schedulerGeneration;
+  lastTickAt = null;
+  previousTickAt = null;
+  lastTickCompletedAt = null;
+  lastMissedTickAt = null;
+  missedTickCount = 0;
+
   if (enableLocalCron) {
     logger.info('Starting local heartbeat cron scheduler', { interval });
 
     cronTask = cron.schedule(interval, async () => {
+      if (generation === schedulerGeneration) {
+        previousTickAt = lastTickAt;
+        lastTickAt = new Date();
+      }
       if (heartbeatRunning) {
         logger.debug('Heartbeat tick skipped — previous tick still running');
         return;
@@ -92,8 +281,84 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
       } catch (error) {
         logger.error('Heartbeat cron error:', error);
       } finally {
+        // Deliberately unfenced: the overlap guard is shared, and a retired
+        // tick finishing is exactly when the successor becomes free to run.
+        // Only the health numbers belong to a generation.
         heartbeatRunning = false;
+        if (generation === schedulerGeneration) lastTickCompletedAt = new Date();
       }
+    });
+
+    /**
+     * node-cron already knows when a tick was missed. It compares the slot it
+     * expected against the clock every time its own timer fires late, and for
+     * each slot it skipped it warns and advances. We were discarding that:
+     * node-cron's logger is its own, `console.warn` only, so the one component
+     * in the system that noticed was writing to a terminal and reaching no
+     * durable surface. Grepping `~/.ink/logs/combined.log` for `missed
+     * execution` returned 0 against 732 for `Heartbeat tick`.
+     *
+     * THE EVENT, NOT THE OPTION, AND THE DIFFERENCE IS SILENT. The runner takes
+     * an `onMissedExecution` hook, but it is not reachable from here:
+     * `schedule()` accepts `TaskOptions`, which does not declare it, and
+     * `InlineScheduledTask` copies four keys (`timezone`, `noOverlap`,
+     * `maxExecutions`, `maxRandomDelay`) into its `RunnerOptions` by name. A
+     * hook passed to `schedule()` is dropped without complaint — the wire would
+     * be dead and a test against a mocked `cron.schedule` would still pass,
+     * because asserting we passed an argument is not asserting anybody calls
+     * it. The task wires that hook to `execution:missed` on its own emitter,
+     * and that event is public, typed, and actually fires.
+     *
+     * The event's date is deliberately not read. The runner advances its
+     * pointer BEFORE invoking the hook, so the date handed over is the next
+     * match after the missed one, and the last call of a burst reports a slot
+     * still in the future. `lastTickAt` is ours and is not off by one.
+     */
+    cronTask.on('execution:missed', () => {
+      if (generation !== schedulerGeneration) return;
+      const detectedAt = new Date();
+      missedTickCount += 1;
+      lastMissedTickAt = detectedAt;
+      /*
+       * Two exact measurements, and deliberately no third number derived from
+       * them.
+       *
+       * When the event loop unblocks, the missed events and the recovery tick
+       * both come off the queue and node-cron decides the order. If the events
+       * drain first, `lastTickAt` is still the last HEALTHY tick and
+       * `sinceLastTickMs` is the silence. If the recovery tick drains first,
+       * `lastTickAt` IS that tick and the silence is `lastTickGapMs` instead.
+       *
+       * Round 1 of #665 reported max() of the two, which reads as "the gap"
+       * and is not. Consecutive stalls of different lengths break it: a 10s
+       * stall followed by a 3s one reports 10s for the second, because the
+       * first stall's interval is still the larger number and has nothing to
+       * do with the miss being recorded. Lumen built that case; it is now a
+       * test.
+       *
+       * So both intervals are reported under names that say exactly what they
+       * measure, with the timestamps they were measured from. A reader
+       * attributes a stall by comparing timestamps, which is the only thing
+       * that distinguishes consecutive stalls. Inventing a single "gap" field
+       * would be pretending to a precision the drain order does not allow.
+       */
+      const sinceLastTickMs = lastTickAt ? detectedAt.getTime() - lastTickAt.getTime() : null;
+      const lastTickGapMs =
+        lastTickAt && previousTickAt ? lastTickAt.getTime() - previousTickAt.getTime() : null;
+
+      logger.warn('Heartbeat tick missed — the scheduler did not run on schedule', {
+        detectedAt: detectedAt.toISOString(),
+        lastTickAt: lastTickAt?.toISOString() ?? null,
+        previousTickAt: previousTickAt?.toISOString() ?? null,
+        /** detectedAt − lastTickAt. The silence, when the events drained first. */
+        sinceLastTickMs,
+        /** lastTickAt − previousTickAt. The silence, when the recovery tick drained first. */
+        lastTickGapMs,
+        missedTickCount,
+        // The overwhelmingly likely cause on a laptop, and the one worth ruling
+        // in or out first: check `pmset -g log` for a Sleep spanning the gap.
+        likelyCause: 'host suspended, blocking IO, or CPU starvation',
+      });
     });
 
     cronTask.start();
@@ -115,6 +380,134 @@ export function stopHeartbeatService(): void {
 }
 
 /**
+ * What a delivery attempt actually did.
+ *
+ * A bare boolean was the whole reporting surface until 2026-09-11, and it is
+ * why eight consecutive failed heartbeats produced exactly as much noise as
+ * zero: the callback knew the backend was logged out, `false` could not carry
+ * that, and the recorded reason was the literal string
+ * "Delivery callback returned false". The error is the only part of a failed
+ * beat worth keeping — carry it.
+ *
+ * Three states, not two. `false` conflated "the beat did not run" with "there
+ * was deliberately nothing to do" — a strategy watchdog cancels itself when its
+ * group completes and returns false, which is correct behaviour and used to
+ * read as an outage. A skipped beat is not a failure: it does not escalate, it
+ * does not alert, and it does not touch the failure streak.
+ */
+export type HeartbeatDeliveryOutcome =
+  | { status: 'delivered' }
+  /**
+   * The failure as the delivery path saw it. Recorded and escalated verbatim.
+   *
+   * `error` is an excerpt by the time it gets here — a runner bounded it for a
+   * log field and a DB column. `classification` is the verdict reached on the
+   * full output before that bounding, when the path that produced the failure
+   * had one; absent otherwise, and the escalation falls back to reading the
+   * text. Carrying it is what stops the outage alert naming a different
+   * category from the one the server acted on (Lumen, review of PR #662).
+   */
+  | { status: 'failed'; error?: string; classification?: ErrorClassification }
+  /** A deliberate no-op. Recorded for the trail, reported to nobody. */
+  | { status: 'skipped'; reason: string };
+
+/** Callbacks may still return a bare boolean; it means "no detail available". */
+export type HeartbeatDeliverResult = boolean | HeartbeatDeliveryOutcome;
+
+/**
+ * What else this run already said to the same place, and which outage we are
+ * talking about.
+ *
+ * `destinationAlreadyAlerted` means a sibling beat — same SB, same channel,
+ * same address — has already SUCCESSFULLY produced this run's outage alert or
+ * all-clear. Successfully is the operative word: an attempted-but-failed send
+ * does not claim the destination, or one dead send would silence every sibling.
+ * The durable per-reminder record is still written either way; it is only the
+ * unsolicited message to the human that collapses.
+ *
+ * `episodeKey` identifies the outage itself, so "have we already told them
+ * about THIS one" is answerable across beats and across restarts. It is a uuid
+ * minted on the first failure of an episode and read back from
+ * `heartbeat_notifications` on every beat after that, shared by the outage
+ * notice and the recovery notice that closes it.
+ *
+ * It used to be derived from `reminder_history` — the timestamp of the oldest
+ * failure in the current run — and that drifted between the first beat of an
+ * outage (which had no prior row and fell back to an application timestamp) and
+ * the second (which read the first's `triggered_at` from the database). Two
+ * ordinary beats produced two keys and two alarms for one outage. An identity
+ * has to be assigned once, not recomputed from a moving window.
+ */
+export interface HeartbeatEscalationContext {
+  destinationAlreadyAlerted: boolean;
+  episodeKey: string;
+  destination: string | null;
+  /**
+   * What the failure was classified as by whoever could still see all of it.
+   *
+   * The hook receives `error` as a string, and by then it is an excerpt: a
+   * runner bounded it for a log field long before this. Classifying that
+   * string is classifying what survived a budget, which is precisely how an
+   * outage alert reported `unknown` for a failure the server had already
+   * judged retryable. Absent when the failure came from a path that does not
+   * classify — a throw, a runner without the seam — and the hook falls back
+   * to reading the text, as it did before.
+   */
+  classification?: ErrorClassification;
+}
+
+/**
+ * What a hook reports back.
+ *
+ * `alerted` must mean a notice actually reached the human, not that one was
+ * attempted. It is what decides whether the destination is claimed for the rest
+ * of the run, and treating an attempt as an outcome here is precisely the defect
+ * that made a single failed send silence every subsequent beat.
+ */
+export interface HeartbeatNoticeResult {
+  alerted: boolean;
+}
+
+/**
+ * What `reminder_history` says about the beats leading up to this one.
+ *
+ * The count is NOT an identity. It once carried the timestamp the run began and
+ * the escalation path used that as the episode key; identity is minted and
+ * stored by `heartbeat-notification-store` now, because a value recomputed from
+ * a bounded history window changed between the first and second beat of every
+ * outage.
+ *
+ * The `boundary` is a different thing and is not identity either: it is the
+ * evidence that separates one run from the next. The notification store cannot
+ * derive it, because every record the store could consult is one the store
+ * writes — and the run worth surviving is the one where those writes failed.
+ * `reminder_history` is written here instead, so a failing notification store
+ * cannot corrupt it.
+ */
+interface FailureStreak {
+  streak: number;
+  boundary: EpisodeBoundary;
+}
+
+export type HeartbeatFailureHook = (
+  reminder: DueReminder,
+  error: string,
+  consecutive: number,
+  context: HeartbeatEscalationContext
+) => Promise<HeartbeatNoticeResult | void>;
+
+export type HeartbeatRecoveryHook = (
+  reminder: DueReminder,
+  failedBeats: number,
+  context: HeartbeatEscalationContext
+) => Promise<HeartbeatNoticeResult | void>;
+
+function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeliveryOutcome {
+  if (typeof result !== 'boolean') return result;
+  return result ? { status: 'delivered' } : { status: 'failed' };
+}
+
+/**
  * Process heartbeat - query due reminders and deliver via callback.
  *
  * The `deliver` callback is how the caller wakes the agent. Typically this
@@ -123,9 +516,28 @@ export function stopHeartbeatService(): void {
  *
  * If no callback is provided, reminders are still queried and logged
  * but not delivered (useful for dry runs or external HTTP triggers).
+ *
+ * `onFailure` is the escalation hook. Heartbeats never enter the agent
+ * gateway — `deliverReminderViaSession` calls sessionService.handleMessage()
+ * directly — so the `trigger:error` → `[TriggerFailure]` machinery that
+ * reports every OTHER kind of failed delivery has no path to a failed beat.
+ * This is that path.
+ *
+ * `onRecovery` is its other half. An alert with no resolution is its own kind
+ * of noise: the human is left holding a failure notice and has to ask the SB
+ * whether it is back — and if it is not back, it cannot answer. So an outage
+ * is exactly two messages, one at each edge.
+ *
+ * Both hooks receive the consecutive-failure count, derived from
+ * `reminder_history` rather than process memory. It has to be durable: it is
+ * the deduplication key for the direct alert, and a process-local counter
+ * would re-alert on every server restart — which is precisely when a monitor
+ * is most likely to be failing.
  */
 export async function processHeartbeat(
-  deliver?: (reminder: DueReminder) => Promise<boolean>
+  deliver?: (reminder: DueReminder) => Promise<HeartbeatDeliverResult>,
+  onFailure?: HeartbeatFailureHook,
+  onRecovery?: HeartbeatRecoveryHook
 ): Promise<{
   processed: number;
   delivered: number;
@@ -161,6 +573,36 @@ export async function processHeartbeat(
   }
 
   logger.info(`Found ${dueReminders.length} due reminders`);
+
+  // Destinations already told about an outage — or an all-clear — in THIS run.
+  // Scoped to the run rather than to a clock window because "the same tick" is
+  // exactly the collision being collapsed, and a duration would be a guess
+  // about how long a tick takes. Beats far enough apart to land in different
+  // runs still alert separately, and their own durable streak is what stops
+  // them repeating.
+  const alertedThisRun = new Set<string>();
+  const recoveredThisRun = new Set<string>();
+
+  /**
+   * Whether this destination has already been told, WITHOUT claiming it.
+   *
+   * Peek and claim are separate because the claim has to wait for the send to
+   * succeed. The original single `claimDestination` added the key before the
+   * hook ran — so if the first beat's send failed, it had still claimed the
+   * destination and silenced its sibling, and no alert reached anyone. An
+   * attempt is not an outcome.
+   */
+  const destinationAlreadyTold = (seen: Set<string>, reminder: DueReminder): boolean => {
+    const destination = alertDestination(reminder);
+    if (!destination) return false;
+    return seen.has(destination);
+  };
+
+  /** Claim the destination — only ever called after a notice actually landed. */
+  const markDestinationTold = (seen: Set<string>, reminder: DueReminder): void => {
+    const destination = alertDestination(reminder);
+    if (destination) seen.add(destination);
+  };
 
   // Process each reminder
   for (const reminder of dueReminders as DueReminder[]) {
@@ -204,33 +646,398 @@ export async function processHeartbeat(
       }
 
       // Deliver via caller-provided callback
-      let delivered = false;
+      let outcome: HeartbeatDeliveryOutcome;
       if (deliver) {
-        delivered = await deliver(reminder);
+        outcome = normalizeDeliveryOutcome(await deliver(reminder));
       } else {
         logger.warn(`No deliver callback for reminder ${reminder.id} - skipping`);
+        outcome = { status: 'failed', error: 'no deliver callback registered' };
       }
 
-      if (delivered) {
+      // Read the streak BEFORE recording this attempt, so it describes the run
+      // of beats leading up to now. Recording first would make every failure
+      // look like at least its own predecessor.
+      const history: FailureStreak =
+        outcome.status === 'skipped'
+          ? { streak: 0, boundary: { kind: 'unknown' } }
+          : await readBeatHistory(reminder.id);
+      const priorFailures = history.streak;
+
+      if (outcome.status === 'delivered') {
         stats.delivered++;
         await recordDeliveryAttempt(reminder.id, 'delivered');
+        if (priorFailures > 0) {
+          const alerted = await announceRecovery(
+            reminder,
+            priorFailures,
+            onRecovery,
+            destinationAlreadyTold(recoveredThisRun, reminder),
+            // The episode that just ended, read back from the store so it is
+            // the same key the outage notice used. The boundary is the healthy
+            // beat BEFORE the outage, because `history` was read before this
+            // beat's own delivered row was written — so it validates the
+            // episode rather than invalidating it.
+            await resolveEpisodeKey(reminder.id, history.boundary),
+            alertDestination(reminder)
+          );
+          if (alerted) markDestinationTold(recoveredThisRun, reminder);
+        } else {
+          // A recovery notice whose send failed has no edge to fire on again:
+          // once the beat is healthy the streak is zero, so the branch above
+          // never runs. This is its retry. Without it, round two's "a failed
+          // recovery send has no triggering edge on the next healthy beat"
+          // stays true no matter how durable the record is.
+          await retryOwedRecovery(reminder, onRecovery, recoveredThisRun);
+        }
+      } else if (outcome.status === 'skipped') {
+        // Deliberate no-op — a self-cancelling watchdog on a finished group,
+        // not a monitor that stopped working. Recorded, never escalated.
+        logger.info('[Heartbeat] Delivery skipped (no action needed)', {
+          reminderId: reminder.id,
+          title: reminder.title,
+          reason: outcome.reason,
+        });
+        stats.skipped++;
+        await recordDeliveryAttempt(reminder.id, 'skipped', outcome.reason);
       } else {
         stats.failed++;
-        await recordDeliveryAttempt(reminder.id, 'failed', 'Delivery callback returned false');
+        const reason = outcome.error || 'delivery reported failure with no detail';
+        // error, not info. A beat that did not run is the monitor failing,
+        // and it belongs in error.log where a failing monitor is looked for.
+        logger.error('[Heartbeat] Delivery FAILED', {
+          reminderId: reminder.id,
+          title: reminder.title,
+          sbId: reminder.sb_id,
+          deliveryChannel: reminder.delivery_channel,
+          error: reason,
+        });
+        await recordDeliveryAttempt(reminder.id, 'failed', reason);
+        const alerted = await escalate(
+          reminder,
+          reason,
+          priorFailures + 1,
+          onFailure,
+          destinationAlreadyTold(alertedThisRun, reminder),
+          // The episode in progress, minted on its first failure and reused by
+          // every beat after that — but only while it is provably part of THIS
+          // run of failures. See `EpisodeBoundary`.
+          await resolveEpisodeKey(reminder.id, history.boundary),
+          alertDestination(reminder),
+          // Whatever judged this failure while it could still see all of it.
+          // `reason` above is the same text with a budget already applied.
+          outcome.classification
+        );
+        if (alerted) markDestinationTold(alertedThisRun, reminder);
       }
     } catch (error) {
       logger.error(`Failed to process reminder ${reminder.id}:`, error);
       stats.failed++;
-      await recordDeliveryAttempt(
-        reminder.id,
-        'failed',
-        error instanceof Error ? error.message : 'Unknown error'
+      const reason = error instanceof Error ? error.message : 'Unknown error';
+      const history = await readBeatHistory(reminder.id);
+      await recordDeliveryAttempt(reminder.id, 'failed', reason);
+      // A throw is exactly as silent as a false return — escalate both.
+      const alerted = await escalate(
+        reminder,
+        reason,
+        history.streak + 1,
+        onFailure,
+        destinationAlreadyTold(alertedThisRun, reminder),
+        await resolveEpisodeKey(reminder.id, history.boundary),
+        alertDestination(reminder)
       );
+      if (alerted) markDestinationTold(alertedThisRun, reminder);
     }
   }
 
-  logger.info('Heartbeat processing complete', stats);
+  // A tick with failures is not a routine completion. Logging the whole run at
+  // info was the last place the twelve-hour outage could have surfaced and
+  // did not.
+  if (stats.failed > 0) {
+    logger.error('Heartbeat processing complete WITH FAILURES', stats);
+  } else {
+    logger.info('Heartbeat processing complete', stats);
+  }
   return stats;
+}
+
+/**
+ * Report a failed beat to whoever can act on it.
+ *
+ * Never throws: escalation runs inside the per-reminder catch, and an
+ * escalation that breaks the loop would take the remaining reminders down
+ * with it — turning one silent failure into several.
+ */
+async function escalate(
+  reminder: DueReminder,
+  reason: string,
+  consecutive: number,
+  onFailure?: HeartbeatFailureHook,
+  destinationAlreadyAlerted = false,
+  episodeKey = new Date().toISOString(),
+  destination: string | null = null,
+  classification?: ErrorClassification
+): Promise<boolean> {
+  if (!onFailure) return false;
+  try {
+    const result = await onFailure(reminder, reason, consecutive, {
+      destinationAlreadyAlerted,
+      episodeKey,
+      destination,
+      ...(classification ? { classification } : {}),
+    });
+    return typeof result === 'object' && result !== null && result.alerted === true;
+  } catch (err) {
+    logger.error('[Heartbeat] Escalation itself failed', {
+      reminderId: reminder.id,
+      originalError: reason,
+      escalationError: err instanceof Error ? err.message : String(err),
+    });
+    // A hook that threw did not alert anyone, so the destination stays unclaimed
+    // and a sibling beat is still free to try.
+    return false;
+  }
+}
+
+/**
+ * Report that a beat is running again, closing out an earlier outage alert.
+ *
+ * Same never-throws contract as `escalate`: a recovery notice that breaks the
+ * loop would stop the remaining reminders from being delivered, which is a
+ * worse outcome than a missing all-clear.
+ */
+async function announceRecovery(
+  reminder: DueReminder,
+  failedBeats: number,
+  onRecovery?: HeartbeatRecoveryHook,
+  destinationAlreadyAlerted = false,
+  episodeKey = new Date().toISOString(),
+  destination: string | null = null
+): Promise<boolean> {
+  logger.info('[Heartbeat] Recovered after failures', {
+    reminderId: reminder.id,
+    title: reminder.title,
+    failedBeats,
+  });
+  if (!onRecovery) return false;
+  try {
+    const result = await onRecovery(reminder, failedBeats, {
+      destinationAlreadyAlerted,
+      episodeKey,
+      destination,
+    });
+    return typeof result === 'object' && result !== null && result.alerted === true;
+  } catch (err) {
+    logger.error('[Heartbeat] Recovery notice itself failed', {
+      reminderId: reminder.id,
+      failedBeats,
+      recoveryError: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
+ * The episode this reminder's current outage belongs to.
+ *
+ * Delegates to the store, which mints a uuid on an episode's first failure and
+ * returns that same uuid on every beat afterwards. Falls back to a fresh uuid
+ * when there is no database to ask, which fails toward a duplicate alert rather
+ * than toward attaching a beat to an episode nobody can verify.
+ *
+ * `boundary` passes down what only the caller knows: where the current run of
+ * failures begins, read from `reminder_history` before this beat was recorded.
+ * The store cannot work that out for itself — every record it could consult is
+ * one it writes, and the run worth surviving is the one where those writes were
+ * failing.
+ */
+async function resolveEpisodeKey(reminderId: string, boundary: EpisodeBoundary): Promise<string> {
+  if (!supabase) return randomUUID();
+  return createHeartbeatNotificationStore(supabase).openEpisode(reminderId, boundary);
+}
+
+/**
+ * Send an all-clear that is still owed from an earlier episode.
+ *
+ * A recovery notice has one natural trigger: the beat that goes from failing to
+ * healthy. If its send fails there, the streak is already zero by the next beat,
+ * so that edge never comes round again and the human is left holding an outage
+ * alert for something that recovered hours ago. This sweep runs on healthy beats
+ * that are NOT a recovery edge and gives the owed notice another go.
+ *
+ * The debt is read from the OUTAGE row — an episode announced and not yet
+ * closed — rather than from a pending recovery row. That distinction is the
+ * whole point: the case this has to survive is the one where the recovery row
+ * was never written, because the store was failing at exactly the moment the
+ * recovery notice was owed.
+ */
+async function retryOwedRecovery(
+  reminder: DueReminder,
+  onRecovery: HeartbeatRecoveryHook | undefined,
+  recoveredThisRun: Set<string>
+): Promise<void> {
+  if (!onRecovery || !supabase) return;
+
+  try {
+    const store = createHeartbeatNotificationStore(supabase);
+    const owed = await store.findOwedRecovery(reminder.id);
+    if (!owed) return;
+
+    const destination = alertDestination(reminder);
+    const alreadyTold = destination ? recoveredThisRun.has(destination) : false;
+
+    logger.info('[Heartbeat] Sending an all-clear that was owed from an earlier beat', {
+      reminderId: reminder.id,
+      episodeKey: owed.episodeKey,
+      priorAttempts: owed.attempts,
+    });
+
+    const alerted = await announceRecovery(
+      reminder,
+      owed.failedBeats,
+      onRecovery,
+      alreadyTold,
+      owed.episodeKey,
+      destination
+    );
+    if (alerted && destination) recoveredThisRun.add(destination);
+  } catch (err) {
+    // Never let the retry take down the beat it is describing.
+    logger.warn('[Heartbeat] Owed-recovery retry threw', {
+      reminderId: reminder.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * How many beats in a row have failed, counting back from the most recent.
+ *
+ * Derived from `reminder_history` rather than held in memory, because this
+ * number is the deduplication key for the direct outage alert. A process-local
+ * counter resets on restart, and a server restart is exactly the moment a
+ * monitor is most likely to be broken — so an in-memory streak would re-alert
+ * on every bounce and go quiet on the one that mattered.
+ *
+ * `skipped` and `pending` rows are excluded rather than treated as successes:
+ * a watchdog that self-cancels mid-outage has not fixed anything, and should
+ * not read as a recovery. The same exclusion is why the boundary is a DELIVERED
+ * beat and not merely a non-failed one.
+ *
+ * This reads the COUNT only. The boundary used to come off the same walk — the
+ * row it stopped on — which made the two share a window, and a window is a thing
+ * that can be full. See `lastDeliveredBeat`.
+ */
+async function consecutiveFailureCount(reminderId: string): Promise<number> {
+  if (!supabase) return 0;
+
+  // Never let the streak lookup take down the beat it is describing, whether
+  // it resolves with an error (PostgREST's usual shape) or throws (a transport
+  // failure). An unknown streak reports as zero, which fails toward alerting
+  // rather than toward silence — silence is the bug this path exists to fix.
+  try {
+    const { data, error } = await selectFailureStreakWindow(supabase, reminderId);
+
+    if (error) {
+      logger.warn('[Heartbeat] Could not read failure streak', {
+        reminderId,
+        error: error.message,
+      });
+      return 0;
+    }
+
+    if (!Array.isArray(data)) return 0;
+
+    // Rows arrive newest first; count back until a success or the end of the
+    // window. Saturating at the window is fine for a count: the number is only
+    // ever reported as "this many beats have failed", and an outage long enough
+    // to fill the window alerted on its first beat, many beats ago.
+    let streak = 0;
+    for (const row of data as { status: string }[]) {
+      if (row?.status !== 'failed') break;
+      streak++;
+    }
+    return streak;
+  } catch (err) {
+    logger.warn('[Heartbeat] Failure streak lookup threw', {
+      reminderId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return 0;
+  }
+}
+
+/**
+ * The most recent DELIVERED beat: where the run of failures happening now began.
+ *
+ * Its own query, and that is the whole point of it. This used to be a by-product
+ * of the streak walk — the row that walk stopped on — which quietly gave the
+ * boundary the same 50-row window the count has. A window bounds a count
+ * harmlessly and bounds a boundary catastrophically: after fifty failed beats
+ * the healthy beat that separates this outage from the last one falls off the
+ * end, the walk reports `none`, and `none` means "reuse the open episode". The
+ * episode it then reuses is a finished one whose alert was already delivered, so
+ * every retry is suppressed — the original silent-outage bug, reached by a
+ * longer road. An outage of exactly the kind that most needs alerting (long) is
+ * the one that would have been silenced.
+ *
+ * A status filter with LIMIT 1 has no such window. It returns the newest
+ * delivered row if one exists, however many failures are stacked on top of it.
+ *
+ * The three answers are kept apart because two of them look alike and must not
+ * behave alike — see `EpisodeBoundary`:
+ *
+ * - a row with a timestamp -> `healthy-beat`, the separator.
+ * - no rows at all         -> `none`. Established absence, not truncation: this
+ *                             reminder has never delivered, so there is no
+ *                             earlier run to be confused with and the open
+ *                             episode is still this one.
+ * - unreadable, or a delivered row with no timestamp -> `unknown`. Nothing
+ *                             verifiable, so nothing may be reused. Costs a
+ *                             duplicate alert, never silence.
+ */
+async function lastDeliveredBeat(reminderId: string): Promise<EpisodeBoundary> {
+  // No database is not "no healthy beat" — it is no evidence at all.
+  if (!supabase) return { kind: 'unknown' };
+
+  try {
+    const { data, error } = await selectLastDeliveredBeat(supabase, reminderId);
+
+    if (error) {
+      logger.warn('[Heartbeat] Could not read the last delivered beat', {
+        reminderId,
+        error: error.message,
+      });
+      return { kind: 'unknown' };
+    }
+
+    if (!Array.isArray(data)) return { kind: 'unknown' };
+    if (data.length === 0) return { kind: 'none' };
+
+    const at = (data[0] as { triggered_at: string | null } | undefined)?.triggered_at;
+    return at ? { kind: 'healthy-beat', at } : { kind: 'unknown' };
+  } catch (err) {
+    logger.warn('[Heartbeat] Last-delivered-beat lookup threw', {
+      reminderId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { kind: 'unknown' };
+  }
+}
+
+/**
+ * What the beats before this one did: how many failed in a row, and where that
+ * run begins.
+ *
+ * Two reads, in this order deliberately. A delivered row landing between them
+ * makes the boundary NEWER than the streak accounts for, which refuses an
+ * episode that is still live and costs one duplicate alert. Reversed, the same
+ * interleaving would hand back a boundary older than reality and accept an
+ * episode that has already ended — which is silence, and silence is the bug.
+ */
+async function readBeatHistory(reminderId: string): Promise<FailureStreak> {
+  const streak = await consecutiveFailureCount(reminderId);
+  const boundary = await lastDeliveredBeat(reminderId);
+  return { streak, boundary };
 }
 
 /**
@@ -435,7 +1242,7 @@ export async function createReminder(params: {
 export async function ensureDefaultReminders(params: {
   userId: string;
   sbId: string;
-  agentId: string;
+  sbSlug: string;
   deliveryChannel?: string;
   deliveryTarget?: string;
 }): Promise<void> {
@@ -471,7 +1278,7 @@ export async function ensureDefaultReminders(params: {
       } else {
         logger.warn('ensureDefaultReminders: no delivery channel available, skipping', {
           userId: params.userId,
-          agentId: params.agentId,
+          sbSlug: params.sbSlug,
         });
         return;
       }
@@ -491,12 +1298,12 @@ export async function ensureDefaultReminders(params: {
       .from('agent_identities')
       .select('id, workspace_id')
       .eq('user_id', params.userId)
-      .eq('agent_id', params.agentId);
+      .eq('agent_id', params.sbSlug);
     if (identityError) {
       // Fail closed: without the candidate set we cannot prove there is no
       // check-in, and a duplicate reports to no one (Lumen, PR #595).
       logger.warn('ensureDefaultReminders: identity lookup failed, skipping seed', {
-        agentId: params.agentId,
+        sbSlug: params.sbSlug,
         sbId: params.sbId,
         error: identityError.message,
       });
@@ -518,7 +1325,7 @@ export async function ensureDefaultReminders(params: {
       // or suppress a real check-in, so skip and say so.
       logger.warn(
         'ensureDefaultReminders: unscoped identity with several scoped siblings — ambiguous, skipping seed',
-        { agentId: params.agentId, sbId: params.sbId, scopedRows: scopedRows.length }
+        { sbSlug: params.sbSlug, sbId: params.sbId, scopedRows: scopedRows.length }
       );
       return;
     } else {
@@ -540,7 +1347,7 @@ export async function ensureDefaultReminders(params: {
         'ensureDefaultReminders: daily-checkin already exists for this agent, skipping',
         {
           sbId: params.sbId,
-          agentId: params.agentId,
+          sbSlug: params.sbSlug,
           existingReminderId: existing[0].id,
           boundTo: existing[0].sb_id,
         }
@@ -551,7 +1358,7 @@ export async function ensureDefaultReminders(params: {
     const result = await createReminder({
       userId: params.userId,
       title: 'Daily check-in',
-      description: `Good morning! Time for your daily check-in with ${params.agentId}.`,
+      description: `Good morning! Time for your daily check-in with ${params.sbSlug}.`,
       deliveryChannel,
       deliveryTarget,
       cronExpression: '0 9 * * *',
@@ -563,7 +1370,7 @@ export async function ensureDefaultReminders(params: {
       logger.info('ensureDefaultReminders: created daily check-in', {
         reminderId: result.id,
         sbId: params.sbId,
-        agentId: params.agentId,
+        sbSlug: params.sbSlug,
       });
     }
   } catch (error) {

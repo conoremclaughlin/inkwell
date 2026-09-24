@@ -19,6 +19,22 @@ describe('MemoryRepository', () => {
 
   beforeEach(() => {
     mockSupabase = createMockSupabaseClient();
+    // The embedding swap and clear are database functions, and their default
+    // answer has to be the successful one or every test that merely touches a
+    // memory's text would read as a failed publish. Scoped by name so the
+    // recall RPCs keep the generic mock's behaviour; tests that want a failure
+    // override it.
+    const rpc = mockSupabase.rpc as unknown as ReturnType<typeof vi.fn>;
+    const passthrough = rpc.getMockImplementation();
+    rpc.mockImplementation((fn: string, args: unknown) => {
+      if (fn === 'swap_memory_embedding' || fn === 'clear_memory_embedding') {
+        return Promise.resolve({ data: 'ok', error: null });
+      }
+      if (fn === 'invalidate_memory_extractions') {
+        return Promise.resolve({ data: null, error: null });
+      }
+      return passthrough ? passthrough(fn, args) : Promise.resolve({ data: null, error: null });
+    });
     repo = new MemoryRepository(mockSupabase as unknown as SupabaseClient);
   });
 
@@ -91,7 +107,7 @@ describe('MemoryRepository', () => {
         metadata: {},
       });
 
-      await repo.startSession({ userId: 'user-1', agentId: 'myra', sbId: 'sb-myra' });
+      await repo.startSession({ userId: 'user-1', sbSlug: 'myra', sbId: 'sb-myra' });
 
       const insert = (
         mockSupabase._queryBuilder.insert as unknown as { mock: { calls: unknown[][] } }
@@ -208,7 +224,7 @@ describe('MemoryRepository', () => {
         salience: 'high',
         topics: ['self-awareness', 'growth'],
         embedding: null,
-        metadata: { agentId: 'wren', reflectionType: 'periodic' },
+        metadata: { sbSlug: 'wren', reflectionType: 'periodic' },
         version: 1,
         created_at: '2026-01-26T12:00:00Z',
         expires_at: null,
@@ -222,12 +238,12 @@ describe('MemoryRepository', () => {
         source: 'reflection',
         salience: 'high',
         topics: ['self-awareness', 'growth'],
-        metadata: { agentId: 'wren', reflectionType: 'periodic' },
+        metadata: { sbSlug: 'wren', reflectionType: 'periodic' },
       });
 
       expect(result.source).toBe('reflection');
       expect(result.topics).toContain('self-awareness');
-      expect(result.metadata).toHaveProperty('agentId', 'wren');
+      expect(result.metadata).toHaveProperty('sbSlug', 'wren');
     });
 
     it('should throw on database error', async () => {
@@ -542,6 +558,214 @@ describe('MemoryRepository', () => {
 
       expect(result).toBeNull();
     });
+
+    it('should update content and summary and refresh embeddings', async () => {
+      const refreshSpy = vi
+        .spyOn(repo as any, 'refreshMemoryEmbedding')
+        .mockResolvedValue(undefined);
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Corrected content',
+        summary: 'Corrected summary',
+        source: 'observation',
+        salience: 'medium',
+        topics: ['existing'],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', {
+        content: 'Corrected content',
+        summary: 'Corrected summary',
+      });
+
+      expect(result?.content).toBe('Corrected content');
+      expect(result?.summary).toBe('Corrected summary');
+      expect(result?.version).toBe(2);
+
+      // Only the provided fields are written — undefined fields stay untouched
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({
+        content: 'Corrected content',
+        summary: 'Corrected summary',
+      });
+
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+      expect(refreshSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'mem-123', content: 'Corrected content' })
+      );
+    });
+
+    it('makes no separate call to invalidate extractions', async () => {
+      // It used to, and that second call was the finding (Lumen, r3): between
+      // the UPDATE committing and the invalidation landing, a concurrent edit
+      // lets the archive trigger snapshot the new text carrying the OLD
+      // extractions into history, which clearing the current row can never
+      // reach. A BEFORE UPDATE trigger does it inside the write instead, so
+      // the repository's correct behaviour here is to do nothing.
+      //
+      // The trigger itself is covered against a real database in
+      // memory-embedding-swap.integration.test.ts; a mock cannot run it.
+      mockSupabase._setReturnData({
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Unchanged content',
+        summary: 'New summary',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      });
+
+      await repo.updateMemory('mem-123', 'user-456', { summary: 'New summary' });
+
+      const rpcNames = (
+        mockSupabase.rpc as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls.map((call) => call[0]);
+      expect(rpcNames).not.toContain('invalidate_memory_extractions');
+    });
+
+    it('should not touch content/summary or refresh embeddings on salience-only update', async () => {
+      const refreshSpy = vi
+        .spyOn(repo as any, 'refreshMemoryEmbedding')
+        .mockResolvedValue(undefined);
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Original content',
+        summary: 'Original summary',
+        source: 'observation',
+        salience: 'critical',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', {
+        salience: 'critical',
+      });
+
+      expect(result?.salience).toBe('critical');
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({ salience: 'critical' });
+      expect(refreshSpy).not.toHaveBeenCalled();
+    });
+
+    it('should clear summary when an empty string is passed', async () => {
+      vi.spyOn(repo as any, 'refreshMemoryEmbedding').mockResolvedValue(undefined);
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Content',
+        summary: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', { summary: '' });
+
+      expect(result?.summary).toBeUndefined();
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({ summary: null });
+    });
+
+    it('should clear stale embedding artifacts when re-embedding fails after a content edit', async () => {
+      // Embeddings disabled → tryEmbedMemory returns false → stale vectors must be cleared
+      disableEmbeddings();
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Edited content',
+        summary: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {
+          keep: 'me',
+          embedding: { provider: 'ollama', model: 'mxbai-embed-large', dimensions: 1024 },
+          embedding_chunks: { chunkCount: 2 },
+        },
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', {
+        content: 'Edited content',
+      });
+
+      // One fenced call, not a chunk delete followed by a row update: the
+      // point of the function is that neither store moves without the other.
+      expect(mockSupabase.rpc).toHaveBeenCalledWith(
+        'clear_memory_embedding',
+        expect.objectContaining({
+          p_memory_id: 'mem-123',
+          p_user_id: 'user-456',
+          p_expected_version: 2,
+          // Named keys, so anything else on the row survives.
+          p_metadata_remove: ['embedding', 'embedding_chunks'],
+        })
+      );
+
+      expect(result?.metadata).toEqual({ keep: 'me' });
+      expect(result?.embedding).toBeUndefined();
+    });
+
+    // This used to assert the opposite — that a memory whose metadata mentions
+    // no embedding is left alone — and that assertion was the bug (Lumen, r2).
+    // remember() upserts chunk rows BEFORE it updates the memory row, so a
+    // failure in between leaves rows behind that no metadata admits to. The
+    // row's opinion of its own embeddings is not evidence about what is in the
+    // chunk table, and the chunk search RPC reads the table.
+    it('cleans chunk rows even when the memory row admits to no embeddings', async () => {
+      disableEmbeddings();
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Edited content',
+        summary: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      await repo.updateMemory('mem-123', 'user-456', { content: 'Edited content' });
+
+      expect(mockSupabase.rpc).toHaveBeenCalledWith(
+        'clear_memory_embedding',
+        expect.objectContaining({ p_memory_id: 'mem-123' })
+      );
+    });
   });
 
   describe('Session Management', () => {
@@ -560,15 +784,16 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         const result = await repo.startSession({
           userId: 'user-456',
-          agentId: 'claude-code',
+          sbSlug: 'claude-code',
         });
 
         expect(result.id).toBe('session-123');
         expect(result.userId).toBe('user-456');
-        expect(result.agentId).toBe('claude-code');
+        expect(result.sbSlug).toBe('claude-code');
         expect(result.studioId).toBeUndefined();
         expect(result.studioId).toBeUndefined();
         expect(result.endedAt).toBeUndefined();
@@ -587,10 +812,11 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         const result = await repo.startSession({
           userId: 'user-456',
-          agentId: 'wren',
+          sbSlug: 'wren',
           studioId: 'ws-abc-123',
         });
 
@@ -619,10 +845,11 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         await repo.startSession({
           userId: 'user-456',
-          agentId: 'wren',
+          sbSlug: 'wren',
           studioId: 'studio-abc',
         });
 
@@ -646,10 +873,11 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         await repo.startSession({
           userId: 'user-456',
-          agentId: 'wren',
+          sbSlug: 'wren',
         });
 
         const insertCall = mockSupabase._queryBuilder.insert.mock.calls[0][0];
@@ -847,7 +1075,7 @@ describe('MemoryRepository', () => {
       it('should not filter by studio when studioId is omitted', async () => {
         mockSupabase._setArrayData([]);
 
-        await repo.listSessions('user-456', { agentId: 'wren' });
+        await repo.listSessions('user-456', { sbSlug: 'wren' });
 
         const eqCalls = mockSupabase._queryBuilder.eq.mock.calls;
         const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'studio_id');
@@ -1258,10 +1486,10 @@ describe('MemoryRepository', () => {
         user_id: 'user-456',
         content: 'Some content',
         summary: null,
-        topic_key: 'project:pcp',
+        topic_key: 'project:inkwell',
         source: 'observation',
         salience: 'medium',
-        topics: ['project:pcp', 'dev'],
+        topics: ['project:inkwell', 'dev'],
         agent_id: null,
         embedding: null,
         metadata: {},
@@ -1275,14 +1503,14 @@ describe('MemoryRepository', () => {
       await repo.remember({
         userId: 'user-456',
         content: 'Some content',
-        topicKey: 'project:pcp',
+        topicKey: 'project:inkwell',
         topics: ['dev'],
       });
 
       // topicKey should be prepended to topics
       expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
         expect.objectContaining({
-          topics: ['project:pcp', 'dev'],
+          topics: ['project:inkwell', 'dev'],
         })
       );
     });
@@ -1293,10 +1521,10 @@ describe('MemoryRepository', () => {
         user_id: 'user-456',
         content: 'Some content',
         summary: null,
-        topic_key: 'project:pcp',
+        topic_key: 'project:inkwell',
         source: 'observation',
         salience: 'medium',
-        topics: ['project:pcp', 'dev'],
+        topics: ['project:inkwell', 'dev'],
         agent_id: null,
         embedding: null,
         metadata: {},
@@ -1310,14 +1538,14 @@ describe('MemoryRepository', () => {
       await repo.remember({
         userId: 'user-456',
         content: 'Some content',
-        topicKey: 'project:pcp',
-        topics: ['project:pcp', 'dev'],
+        topicKey: 'project:inkwell',
+        topics: ['project:inkwell', 'dev'],
       });
 
-      // Should NOT have duplicated project:pcp
+      // Should NOT have duplicated project:inkwell
       expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
         expect.objectContaining({
-          topics: ['project:pcp', 'dev'],
+          topics: ['project:inkwell', 'dev'],
         })
       );
     });
@@ -1365,10 +1593,10 @@ describe('MemoryRepository', () => {
         user_id: 'user-456',
         content: 'A'.repeat(1800),
         summary: 'Chunked summary',
-        topic_key: 'project:pcp/memory',
+        topic_key: 'project:inkwell/memory',
         source: 'observation',
         salience: 'high',
-        topics: ['project:pcp/memory'],
+        topics: ['project:inkwell/memory'],
         agent_id: 'lumen',
         embedding: null,
         metadata: {},
@@ -1403,48 +1631,45 @@ describe('MemoryRepository', () => {
 
       const result = await repo.remember({
         userId: 'user-456',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         content: 'A'.repeat(1800),
         summary: 'Chunked summary',
-        topicKey: 'project:pcp/memory',
+        topicKey: 'project:inkwell/memory',
         salience: 'high',
       });
 
-      const chunkRows = mockSupabase._queryBuilder.upsert.mock.calls[0][0] as Array<
-        Record<string, unknown>
-      >;
+      const swapCall = (mockSupabase.rpc as unknown as { mock: { calls: unknown[][] } }).mock.calls
+        .filter((call) => call[0] === 'swap_memory_embedding')
+        .pop() as [string, Record<string, unknown>];
+      expect(swapCall).toBeTruthy();
+      const args = swapCall[1];
+      const chunkRows = args.p_chunks as Array<Record<string, unknown>>;
+
       expect(embedDocument).toHaveBeenCalledTimes(chunkRows.length);
       expect(chunkRows.length).toBeGreaterThan(1);
-      expect(mockSupabase.from).toHaveBeenCalledWith('memory_embedding_chunks');
-      expect(mockSupabase._queryBuilder.upsert).toHaveBeenCalledWith(
-        expect.arrayContaining([
-          expect.objectContaining({
-            memory_id: 'mem-hm-5',
-            chunk_type: 'content',
-            chunk_index: 0,
-          }),
-        ]),
-        expect.objectContaining({ onConflict: 'memory_id,chunk_index' })
+      expect(chunkRows[0]).toEqual(
+        expect.objectContaining({ memory_id: 'mem-hm-5', chunk_type: 'content', chunk_index: 0 })
       );
       expect(chunkRows.every((row) => row.chunk_type === 'content')).toBe(true);
-      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
+
+      expect(args.p_chunks_version).toBe(MEMORY_EMBEDDING_CHUNKS_VERSION);
+      expect(args.p_chunk_count).toBe(chunkRows.length);
+      expect(args.p_expected_version).toBe(1);
+
+      // Only the keys the embedding owns — the function merges them onto
+      // whatever the row holds at commit time.
+      expect(Object.keys(args.p_metadata_patch as object).sort()).toEqual([
+        'embedding',
+        'embedding_chunks',
+      ]);
+      expect(args.p_metadata_patch).toEqual(
         expect.objectContaining({
-          embedding_chunks_version: MEMORY_EMBEDDING_CHUNKS_VERSION,
-          embedding_chunk_count: chunkRows.length,
-          metadata: expect.objectContaining({
-            embedding_chunks: expect.objectContaining({
-              chunkCount: chunkRows.length,
-              version: MEMORY_EMBEDDING_CHUNKS_VERSION,
-              viewCounts: expect.objectContaining({
-                content: chunkRows.length,
-                summary: 0,
-              }),
-            }),
-            embedding: expect.objectContaining({
-              provider: 'ollama',
-              model: 'mxbai-embed-large',
-            }),
+          embedding_chunks: expect.objectContaining({
+            chunkCount: chunkRows.length,
+            version: MEMORY_EMBEDDING_CHUNKS_VERSION,
+            viewCounts: expect.objectContaining({ content: chunkRows.length, summary: 0 }),
           }),
+          embedding: expect.objectContaining({ provider: 'ollama', model: 'mxbai-embed-large' }),
         })
       );
       expect(result.embedding).toEqual(new Array(1024).fill(0.1));
@@ -1543,7 +1768,7 @@ describe('MemoryRepository', () => {
       expect(results[0].topicKey).toBe('decision:auth');
     });
 
-    it('should filter by agentId when provided', async () => {
+    it('should filter by sbSlug when provided', async () => {
       mockSupabase._setArrayData([]);
 
       await repo.getKnowledgeMemories('user-456', 'wren');
@@ -1553,7 +1778,7 @@ describe('MemoryRepository', () => {
       );
     });
 
-    it('should not filter by agentId when not provided', async () => {
+    it('should not filter by sbSlug when not provided', async () => {
       mockSupabase._setArrayData([]);
 
       await repo.getKnowledgeMemories('user-456');
@@ -1648,7 +1873,7 @@ describe('MemoryRepository', () => {
       expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('agent_id', '__shared__');
     });
 
-    it('should use provided agentId for cache key', async () => {
+    it('should use provided sbSlug for cache key', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 
       await repo.getCachedSummary('user-456', 'wren');
@@ -1675,7 +1900,7 @@ describe('MemoryRepository', () => {
       );
     });
 
-    it('should use __shared__ when agentId is undefined', async () => {
+    it('should use __shared__ when sbSlug is undefined', async () => {
       mockSupabase._setReturnData(null);
 
       await repo.setCachedSummary('user-456', undefined, 'Shared summary', 10);
@@ -1707,10 +1932,10 @@ describe('MemoryRepository', () => {
             user_id: 'user-456',
             content: 'Legacy semantic memory',
             summary: 'Legacy semantic memory',
-            topic_key: 'project:pcp/memory',
+            topic_key: 'project:inkwell/memory',
             source: 'observation',
             salience: 'high',
-            topics: ['project:pcp/memory'],
+            topics: ['project:inkwell/memory'],
             agent_id: 'lumen',
             embedding: '[0.1,0.2,0.3]',
             metadata: {},
@@ -1844,10 +2069,10 @@ describe('MemoryRepository', () => {
               user_id: 'user-456',
               content: 'Legacy semantic memory',
               summary: 'Legacy semantic memory',
-              topic_key: 'project:pcp/memory',
+              topic_key: 'project:inkwell/memory',
               source: 'observation',
               salience: 'high',
-              topics: ['project:pcp/memory'],
+              topics: ['project:inkwell/memory'],
               agent_id: 'lumen',
               embedding: '[0.1,0.2,0.3]',
               metadata: {},

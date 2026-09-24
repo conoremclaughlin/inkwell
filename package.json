@@ -22,8 +22,8 @@
     "prod:up": "./scripts/prod-up.sh",
     "prod": "yarn prod:up",
     "logs:ink": "tail -n 200 -f $HOME/.ink/logs/combined.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",
-    "logs:pcp:raw": "tail -n 200 -f $HOME/.ink/logs/combined.log",
-    "logs:pcp:errors": "tail -n 200 -f $HOME/.ink/logs/error.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",
+    "logs:ink:raw": "tail -n 200 -f $HOME/.ink/logs/combined.log",
+    "logs:ink:errors": "tail -n 200 -f $HOME/.ink/logs/error.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",
     "ink": "yarn workspace @inklabs/cli cli",
     "cli": "yarn workspace @inklabs/cli cli",
     "ws": "yarn workspace @inklabs/cli cli ws",
@@ -80,11 +80,13 @@
   },
   "packageManager": "yarn@4.13.0",
   "resolutions": {
-    "libsignal": "npm:2.0.1",
     "minimatch@9.0.3": "9.0.7",
-    "undici": "6.24.0",
+    "@discordjs/rest/undici": "6.28.1",
+    "discord.js/undici": "6.28.1",
     "lodash": "4.18.0",
-    "brace-expansion@^1": "1.1.13",
+    "brace-expansion@^1.1.7": "1.1.18",
+    "concurrently/shell-quote": "1.9.0",
+    "express/qs": "6.16.0",
     "@slack/bolt/path-to-regexp": "8.4.0",
     "handlebars": "4.7.9"
   }

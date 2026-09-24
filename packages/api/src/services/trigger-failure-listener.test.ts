@@ -81,9 +81,9 @@ const threadBorne = {
   triggerId: 'trig-1',
   error: new Error('runner exited 1'),
   payload: {
-    fromAgentId: 'wren',
+    fromSlug: 'wren',
     fromSbId: 'sb-a',
-    toAgentId: 'lumen',
+    toSlug: 'lumen',
     toSbId: 'sb-b',
     threadId: 'thread-a',
     threadKey: 'pr:618',
@@ -111,7 +111,7 @@ describe('handleTriggerFailure', () => {
     expect(String(notices[0].content)).toContain('Trigger to lumen failed');
     expect(await rows(db, 'agent_inbox')).toHaveLength(0);
     expect(logInkmailFailure).toHaveBeenCalledWith(
-      expect.objectContaining({ toAgentId: 'lumen' }),
+      expect.objectContaining({ toSlug: 'lumen' }),
       'user-b',
       { error: 'runner exited 1' }
     );
@@ -148,8 +148,8 @@ describe('handleTriggerFailure', () => {
         triggerId: 'trig-5',
         error: new Error('boom'),
         payload: {
-          fromAgentId: 'system',
-          toAgentId: 'lumen',
+          fromSlug: 'system',
+          toSlug: 'lumen',
           toSbId: 'sb-b',
           threadId: 'thread-a',
           threadKey: 'pr:618',
@@ -172,8 +172,8 @@ describe('handleTriggerFailure', () => {
         triggerId: 'trig-6',
         error: new Error('boom'),
         payload: {
-          fromAgentId: 'system',
-          toAgentId: 'lumen',
+          fromSlug: 'system',
+          toSlug: 'lumen',
           toSbId: 'sb-b',
           threadId: 'thread-a',
           threadKey: 'pr:618',
@@ -195,8 +195,8 @@ describe('handleTriggerFailure', () => {
         triggerId: 'trig-2',
         error: new Error('boom'),
         payload: {
-          fromAgentId: 'wren',
-          toAgentId: 'lumen',
+          fromSlug: 'wren',
+          toSlug: 'lumen',
           toSbId: 'sb-b',
           triggerType: 'message',
         },
@@ -224,8 +224,8 @@ describe('handleTriggerFailure', () => {
         error: new Error('boom'),
         payload: {
           inboxMessageId: 'm1',
-          fromAgentId: 'wren',
-          toAgentId: 'lumen',
+          fromSlug: 'wren',
+          toSlug: 'lumen',
           triggerType: 'message',
         },
       },
@@ -247,7 +247,7 @@ describe('handleTriggerFailure', () => {
         triggerId: 'trig-4',
         error: new Error('boom'),
         payload: {
-          toAgentId: 'lumen',
+          toSlug: 'lumen',
           toSbId: 'sb-b',
           threadId: 'thread-a',
           triggerType: 'message',

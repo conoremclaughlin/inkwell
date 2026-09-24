@@ -1,5 +1,5 @@
 /**
- * GET /individuals/:agentId/inbox — the group-thread section since the
+ * GET /individuals/:sbSlug/inbox — the group-thread section since the
  * cutover (spec inkmail-thread-scope §3, §5). Threads are found by the
  * agent's identities and the viewer's workspace, never by slug or owner;
  * every author is named for the viewer; a failed read is reported, not
@@ -11,11 +11,11 @@ import type { Request, Response } from 'express';
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({ handleSendToInbox: vi.fn() }));
 vi.mock('../mcp/tools/thread-handlers', () => ({ getParticipants: vi.fn() }));
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 type Row = Record<string, unknown>;
@@ -96,21 +96,21 @@ function getInboxHandler(): Handler {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const layer = (router as any).stack.find(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (entry: any) => entry.route?.path === '/individuals/:agentId/inbox' && entry.route?.methods?.get
+    (entry: any) => entry.route?.path === '/individuals/:sbSlug/inbox' && entry.route?.methods?.get
   );
-  if (!layer) throw new Error('GET /individuals/:agentId/inbox not found in router stack');
+  if (!layer) throw new Error('GET /individuals/:sbSlug/inbox not found in router stack');
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
 function createReq(viewerUserId: string): Request {
   return {
-    params: { agentId: 'wren' },
+    params: { sbSlug: 'wren' },
     query: {},
     headers: {},
     cookies: {},
-    pcpUserId: viewerUserId,
-    pcpWorkspaceId: 'ws-1',
-    pcpWorkspaceRole: 'member',
+    inkUserId: viewerUserId,
+    inkWorkspaceId: 'ws-1',
+    inkWorkspaceRole: 'member',
   } as unknown as Request;
 }
 interface MockResponse extends Response {
@@ -254,7 +254,7 @@ beforeEach(() => {
   };
 });
 
-describe('GET /individuals/:agentId/inbox — group threads since the cutover', () => {
+describe('GET /individuals/:sbSlug/inbox — group threads since the cutover', () => {
   it("finds threads by the agent's identities in the viewer's workspace, never by slug or owner", async () => {
     const out = await readAs('user-a');
     expect(out.groupThreads.map((t) => t.threadKey)).toEqual(['pr:621']);

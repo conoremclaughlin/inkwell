@@ -127,7 +127,7 @@ export class WhatsAppListener extends EventEmitter {
       version,
       logger: baileysLogger,
       printQRInTerminal: false,
-      browser: ['PCP', 'Chrome', '1.0.0'],
+      browser: ['Inkwell', 'Chrome', '1.0.0'],
       syncFullHistory: false,
       markOnlineOnConnect: false,
     });
@@ -607,7 +607,7 @@ export class WhatsAppListener extends EventEmitter {
       }
     }
 
-    // Account ID from WhatsApp self JID (e.g. "+16266621947")
+    // Account ID from WhatsApp self JID (e.g. "+15555550123")
     const accountId = this.selfJid ? this.jidToE164(this.selfJid) : undefined;
 
     const message: InboundMessage = {

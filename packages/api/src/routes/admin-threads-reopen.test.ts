@@ -26,11 +26,11 @@ vi.mock('../mcp/tools/thread-handlers', () => ({
   reopenThreadRow: (...args: unknown[]) => mockReopenThreadRow(...args),
 }));
 
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 const mockSupabaseFrom = vi.fn();
@@ -46,12 +46,9 @@ vi.mock('../data/composer', () => ({
 vi.mock('../services/authorization', () => ({ getAuthorizationService: vi.fn(() => ({})) }));
 vi.mock('../services/oauth', () => ({ getOAuthService: vi.fn(() => ({})) }));
 
-vi.mock('../config/env', () => ({
+vi.mock('../config/env', async () => ({
   env: {
-    SUPABASE_URL: 'http://localhost:54321',
-    SUPABASE_SECRET_KEY: 'test-secret',
-    SUPABASE_PUBLISHABLE_KEY: 'test-publishable',
-    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
+    ...(await import('../test/fake-env')).fakeEnv,
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
   },
@@ -80,16 +77,16 @@ function getReopenHandler(): Handler {
 }
 
 function createReq(body: Record<string, unknown>, role = 'owner'): Request {
-  // pcpUserId / pcpWorkspaceId / pcpWorkspaceRole are what adminAuthMiddleware
+  // inkUserId / inkWorkspaceId / inkWorkspaceRole are what adminAuthMiddleware
   // attaches; the handler is driven directly here, so they are injected.
   return {
     body,
     headers: {},
     cookies: {},
     params: {},
-    pcpUserId: 'user-1',
-    pcpWorkspaceId: 'ws-1',
-    pcpWorkspaceRole: role,
+    inkUserId: 'user-1',
+    inkWorkspaceId: 'ws-1',
+    inkWorkspaceRole: role,
   } as unknown as Request;
 }
 

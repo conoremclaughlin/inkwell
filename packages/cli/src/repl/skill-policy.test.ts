@@ -16,7 +16,12 @@ describe('skill policy integration', () => {
       source: 'home:~/.codex/skills',
       trustLevel: 'local' as const,
     },
-    { name: 'secret', path: '/etc/pcp/skills/secret', source: 'system', trustLevel: 'untrusted' as const },
+    {
+      name: 'secret',
+      path: '/etc/ink/skills/secret',
+      source: 'system',
+      trustLevel: 'untrusted' as const,
+    },
   ];
 
   it('filters by both skill allowlist and read-path allowlist', () => {
@@ -44,7 +49,7 @@ describe('skill policy integration', () => {
     policy.allowSkill('secret');
     expect(canActivateSkill(skills[2], policy)).toEqual({
       allowed: false,
-      reason: 'Skill path blocked by read allowlist policy: /etc/pcp/skills/secret',
+      reason: 'Skill path blocked by read allowlist policy: /etc/ink/skills/secret',
     });
   });
 

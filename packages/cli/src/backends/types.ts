@@ -16,7 +16,7 @@ export interface TurnMedia {
 }
 
 export interface BackendConfig {
-  agentId: string;
+  sbSlug: string;
   model?: string; // undefined = use backend's default model
   /** Reasoning effort (claude: low | medium | high | xhigh | max). undefined = provider default. */
   effort?: string;
@@ -35,7 +35,7 @@ export interface BackendConfig {
    * model_instructions_file, gemini: GEMINI_SYSTEM_MD).
    */
   systemPromptOverride?: string;
-  pcpSessionId?: string;
+  inkSessionId?: string;
   backendSessionId?: string;
   backendSessionSeedId?: string;
   studioId?: string;

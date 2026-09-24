@@ -33,7 +33,7 @@ describe('resolveThreadTriggerScope', () => {
     const scope = await resolveThreadTriggerScope(world() as never, {
       threadId: 'thread-a',
       toSbId: 'sb-b',
-      targetAgentId: 'lumen',
+      targetSlug: 'lumen',
       authUserId: 'user-a',
     });
     expect(scope).toEqual({
@@ -48,7 +48,7 @@ describe('resolveThreadTriggerScope', () => {
     const scope = await resolveThreadTriggerScope(world() as never, {
       threadMessageId: 'msg-1',
       toSbId: 'sb-b',
-      targetAgentId: 'lumen',
+      targetSlug: 'lumen',
       authUserId: 'user-a',
     });
     expect(scope.threadId).toBe('thread-a');
@@ -59,7 +59,7 @@ describe('resolveThreadTriggerScope', () => {
       resolveThreadTriggerScope(world() as never, {
         threadId: 'thread-a',
         toSbId: 'sb-b',
-        targetAgentId: 'lumen',
+        targetSlug: 'lumen',
         authUserId: 'outsider',
       })
     ).rejects.toThrow('sender is not a member of the thread workspace');
@@ -70,7 +70,7 @@ describe('resolveThreadTriggerScope', () => {
       resolveThreadTriggerScope(world() as never, {
         threadId: 'thread-a',
         toSbId: 'sb-c',
-        targetAgentId: 'aster',
+        targetSlug: 'aster',
         authUserId: 'user-a',
       })
     ).rejects.toThrow('target identity is not in the thread workspace');
@@ -81,7 +81,7 @@ describe('resolveThreadTriggerScope', () => {
       resolveThreadTriggerScope(world() as never, {
         threadId: 'thread-a',
         toSbId: 'sb-b',
-        targetAgentId: 'wren',
+        targetSlug: 'wren',
         authUserId: 'user-a',
       })
     ).rejects.toThrow('target identity is "lumen", not "wren"');
@@ -92,7 +92,7 @@ describe('resolveThreadTriggerScope', () => {
       resolveThreadTriggerScope(world() as never, {
         threadId: 'missing-thread',
         toSbId: 'sb-b',
-        targetAgentId: 'lumen',
+        targetSlug: 'lumen',
         authUserId: 'outsider',
       })
     ).rejects.toThrow('thread could not be resolved');
@@ -114,7 +114,7 @@ describe('resolveThreadTriggerScope', () => {
       resolveThreadTriggerScope(db as never, {
         threadId: 'thread-a',
         toSbId: 'sb-b',
-        targetAgentId: 'lumen',
+        targetSlug: 'lumen',
         authUserId: 'outsider',
       })
     ).rejects.toThrow('thread could not be resolved');
@@ -125,7 +125,7 @@ describe('resolveThreadTriggerScope', () => {
       resolveThreadTriggerScope(world() as never, {
         threadMessageId: 'no-such-message',
         toSbId: 'sb-b',
-        targetAgentId: 'lumen',
+        targetSlug: 'lumen',
         authUserId: 'user-a',
       })
     ).rejects.toThrow('thread message could not be resolved');
@@ -135,14 +135,14 @@ describe('resolveThreadTriggerScope', () => {
     expect(
       await resolveThreadTriggerScope(world() as never, {
         threadId: 'thread-a',
-        targetAgentId: 'lumen',
+        targetSlug: 'lumen',
         authUserId: 'user-a',
       })
     ).toEqual({ threadId: 'thread-a', threadWorkspaceId: 'ws-a' });
     await expect(
       resolveThreadTriggerScope(world() as never, {
         threadId: 'thread-a',
-        targetAgentId: 'lumen',
+        targetSlug: 'lumen',
         authUserId: 'outsider',
       })
     ).rejects.toThrow('sender is not a member');

@@ -50,8 +50,8 @@ describe('AgentGateway', () => {
 
   describe('processTrigger', () => {
     const basePayload: AgentTriggerPayload = {
-      fromAgentId: 'wren',
-      toAgentId: 'myra',
+      fromSlug: 'wren',
+      toSlug: 'myra',
       triggerType: 'message',
       summary: 'Test trigger',
     };
@@ -147,8 +147,8 @@ describe('AgentGateway', () => {
 
   describe('dispatchTrigger', () => {
     const basePayload: AgentTriggerPayload = {
-      fromAgentId: 'wren',
-      toAgentId: 'myra',
+      fromSlug: 'wren',
+      toSlug: 'myra',
       triggerType: 'message',
       summary: 'Async trigger',
     };
@@ -180,20 +180,20 @@ describe('AgentGateway', () => {
       const processedAgents: string[] = [];
 
       gateway.setDefaultHandler(async (payload) => {
-        processedAgents.push(payload.toAgentId);
+        processedAgents.push(payload.toSlug);
       });
 
-      await gateway.processTrigger({ ...basePayload, toAgentId: 'myra' });
-      await gateway.processTrigger({ ...basePayload, toAgentId: 'wren' });
-      await gateway.processTrigger({ ...basePayload, toAgentId: 'benson' });
-      await gateway.processTrigger({ ...basePayload, toAgentId: 'unknown-agent' });
+      await gateway.processTrigger({ ...basePayload, toSlug: 'myra' });
+      await gateway.processTrigger({ ...basePayload, toSlug: 'wren' });
+      await gateway.processTrigger({ ...basePayload, toSlug: 'benson' });
+      await gateway.processTrigger({ ...basePayload, toSlug: 'unknown-agent' });
 
       expect(processedAgents).toEqual(['myra', 'wren', 'benson', 'unknown-agent']);
     });
 
     const basePayload: AgentTriggerPayload = {
-      fromAgentId: 'wren',
-      toAgentId: 'myra',
+      fromSlug: 'wren',
+      toSlug: 'myra',
       triggerType: 'message',
     };
   });
