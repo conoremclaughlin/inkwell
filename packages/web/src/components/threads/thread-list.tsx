@@ -9,7 +9,7 @@ import { hasUnread, type ReadCursorStore } from './read-cursors';
 import { previewLine, sbAuthor, type NameFor } from './to-conversation';
 import type { SpineIdentity, SpineSession, ThreadSpine } from './thread-types';
 
-export type StatusFilter = 'all' | 'unread' | 'active' | 'unannounced' | 'closed';
+export type StatusFilter = 'all' | 'unread' | 'active' | 'closed';
 
 /** The server decides liveness (isSessionLive); lifecycle is the fallback for older payloads. */
 export function isSessionLive(session: SpineSession): boolean {
@@ -128,7 +128,6 @@ const FILTERS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'all', label: 'All' },
   { value: 'unread', label: 'Unread' },
   { value: 'active', label: 'Active' },
-  { value: 'unannounced', label: 'No thread yet' },
   { value: 'closed', label: 'Closed' },
 ];
 
@@ -208,7 +207,7 @@ export function ThreadList({
         <div className="flex items-baseline justify-between">
           <h1 className="text-lg font-semibold tracking-tight">Threads</h1>
           <span className="text-xs tabular-nums text-muted-foreground">
-            {loading ? '' : `${spines.length} keys`}
+            {loading ? '' : `${spines.length} threads`}
           </span>
         </div>
         <div className="flex gap-2">
@@ -330,7 +329,6 @@ function ThreadRow({
   const title = displayTitle(spine);
   const last = spine.thread?.lastMessage;
   const line = last ? previewLine(last, nameFor) : null;
-  const liveAgents = liveAgentsOf(spine);
 
   return (
     <button
@@ -376,11 +374,6 @@ function ThreadRow({
               <>
                 <span className={cn(unread && 'font-medium')}>{line.sender}:</span> {line.text}
               </>
-            ) : status === 'unannounced' ? (
-              <span className="italic">
-                No thread yet
-                {liveAgents.length > 0 && ` · ${liveAgents.map(nameFor).join(', ')} working`}
-              </span>
             ) : (
               <span className="italic">No messages yet</span>
             )}

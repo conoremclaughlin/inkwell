@@ -18,7 +18,7 @@ import { AuthorAvatar } from '@/components/conversation/author-avatar';
 import { formatRelativeTime } from '@/components/conversation/format';
 import { EvidenceNodeCard, type GraphEvidenceResponse } from './evidence';
 import { sbAuthor, type NameFor } from './to-conversation';
-import { isSessionLive, TypeChip } from './thread-list';
+import { displayTitle, isSessionLive, TypeChip } from './thread-list';
 import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
 
 /**
@@ -91,6 +91,9 @@ export function ThreadDetails({
 
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
         <section className="space-y-2">
+          {displayTitle(spine) && (
+            <h3 className="text-base font-semibold leading-snug">{displayTitle(spine)}</h3>
+          )}
           <div className="flex flex-wrap items-center gap-1.5">
             <Hash className="h-3.5 w-3.5 text-muted-foreground" />
             <span className="break-all font-mono text-xs font-medium">{spine.key}</span>

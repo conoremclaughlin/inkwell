@@ -85,6 +85,9 @@ function ThreadsChat() {
   const nameFor = useMemo(() => nameLookup(identities?.individuals), [identities]);
 
   const spines = useMemo(() => data?.spines ?? [], [data]);
+  // The list is conversations. A key only a session, studio or task group
+  // references has nothing to read yet; it stays reachable by link.
+  const threads = useMemo(() => spines.filter((spine) => spine.thread !== null), [spines]);
   const selected = useMemo(
     () => spines.find((spine) => spine.key === selectedKey) ?? null,
     [spines, selectedKey]
@@ -134,7 +137,7 @@ function ThreadsChat() {
         }
       >
         <ThreadList
-          spines={spines}
+          spines={threads}
           selectedKey={selectedKey}
           onSelect={select}
           cursors={cursors}
@@ -167,7 +170,7 @@ function ThreadsChat() {
             state={
               selectedKey && !isLoading
                 ? 'missing'
-                : spines.length === 0 && !isLoading
+                : threads.length === 0 && !isLoading
                   ? 'empty'
                   : 'idle'
             }
@@ -226,8 +229,7 @@ function NoConversation({
               {state === 'empty' ? 'No threads yet' : 'Pick a thread'}
             </p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Every threadKey the system knows is on the left — conversations, and keys someone is
-              working that nobody has announced yet.
+              Every conversation between you and the SBs is on the left, newest activity first.
             </p>
           </>
         )}

@@ -76,15 +76,33 @@ export const MessageRow = memo(function MessageRow({
   const fullTime = new Date(message.createdAt).toLocaleString();
 
   if (author.kind === 'system') {
+    // Events wrap and keep their markdown: some carry the only record of
+    // what went wrong ("lumen's turn was cut short — ..."), and a one-line
+    // pill cut them off mid-sentence. High and urgent ones are warnings.
+    const warning = message.priority === 'high' || message.priority === 'urgent';
     return (
-      <div className="flex justify-center px-4 py-2" data-message-id={message.id}>
-        <span className="inline-flex max-w-full items-center gap-1.5 rounded-full bg-muted/70 px-3 py-1 text-[11px] text-muted-foreground">
-          <Info className="h-3 w-3 shrink-0" />
-          <span className="truncate">{message.body}</span>
-          <time dateTime={message.createdAt} title={fullTime} className="shrink-0 tabular-nums">
-            · {clock}
+      <div className="flex justify-center px-4 py-2 md:px-6" data-message-id={message.id}>
+        <div
+          className={cn(
+            'flex max-w-2xl items-start gap-2 rounded-xl px-3 py-1.5 text-[11px] leading-relaxed',
+            warning
+              ? 'border border-amber-500/30 bg-amber-500/10 text-amber-900 dark:text-amber-200'
+              : 'bg-muted/70 text-muted-foreground'
+          )}
+        >
+          {!warning && <Info className="mt-[3px] h-3 w-3 shrink-0" />}
+          <MessageMarkdown
+            content={message.body}
+            className="min-w-0 flex-1 text-[11px] text-inherit prose-p:my-0.5 prose-p:text-inherit prose-strong:text-inherit prose-code:text-inherit"
+          />
+          <time
+            dateTime={message.createdAt}
+            title={fullTime}
+            className="shrink-0 pt-px tabular-nums opacity-80"
+          >
+            {clock}
           </time>
-        </span>
+        </div>
       </div>
     );
   }
