@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  abandonCatchUp,
   absorbNewest,
   absorbOlder,
   EMPTY_HISTORY,
@@ -7,6 +8,7 @@ import {
   MAX_CATCH_UP_PAGES,
   nextGap,
   olderGap,
+  readableThrough,
   unblockGaps,
   unreadBeyondLoaded,
   type ThreadHistory,
@@ -148,6 +150,33 @@ describe('thread history', () => {
     }
     expect(history.messages).toHaveLength(200);
     expect(history.messages.map((m) => m.id)).toEqual(all.map((m) => m.id));
+  });
+
+  describe('how far a reader can be said to have read', () => {
+    const newest = (h: ThreadHistory) => h.messages[h.messages.length - 1];
+
+    it('is wherever they are when nothing is missing', () => {
+      const history = absorbNewest(EMPTY_HISTORY, server(200).newest(), at(200));
+      expect(readableThrough(history.gaps, newest(history)).id).toBe('m0200');
+    });
+
+    it('stops below a stretch a poll skipped, until it fills', () => {
+      let history = absorbNewest(EMPTY_HISTORY, server(200).newest(), at(200));
+      history = absorbNewest(history, server(350).newest(), at(200));
+      expect(readableThrough(history.gaps, newest(history)).id).toBe('m0200');
+      history = fillGaps(history, server(350));
+      expect(readableThrough(history.gaps, newest(history)).id).toBe('m0350');
+    });
+
+    it('stays at the read cursor while a catch-up has not reached it', () => {
+      let history = absorbNewest(EMPTY_HISTORY, server(800).newest(), at(50));
+      history = fillGaps(history, server(800));
+      expect(readableThrough(history.gaps, newest(history)).createdAt).toBe(at(50));
+      // Marking all read abandons the catch-up; nothing holds the reader back.
+      history = abandonCatchUp(history);
+      expect(unreadBeyondLoaded(history)).toBe(false);
+      expect(readableThrough(history.gaps, newest(history)).id).toBe('m0800');
+    });
   });
 
   describe('opening behind the read cursor', () => {

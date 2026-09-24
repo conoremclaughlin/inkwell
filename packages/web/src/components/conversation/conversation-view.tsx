@@ -21,6 +21,8 @@ const BOTTOM_SLACK_PX = 64;
 const TOP_LOAD_PX = 120;
 /** Room left above the new-messages divider when a conversation opens on it. */
 const UNREAD_OFFSET_PX = 56;
+/** Longest a smooth scroll to the end is expected to take. */
+const FOLLOW_MS = 1_000;
 
 export interface ConversationViewProps {
   /** Any order; the view sorts by time. */
@@ -50,6 +52,8 @@ export interface ConversationViewProps {
   onLoadOlder?: () => void;
   /** The viewer has seen through this message: at the end, with the page visible. */
   onReadThrough?: (message: ConversationMessage) => void;
+  /** Offered while unread messages remain above: skip them, explicitly. */
+  onMarkAllRead?: () => void;
   /** Shown above the first message once there is no older history. */
   intro?: ReactNode;
   /** Shown when there are no messages at all. */
@@ -77,6 +81,7 @@ export function ConversationView({
   loadingOlder = false,
   onLoadOlder,
   onReadThrough,
+  onMarkAllRead,
   intro,
   empty,
   className,
@@ -100,7 +105,26 @@ export function ConversationView({
   const [newCount, setNewCount] = useState(0);
 
   const positioned = useRef(false);
-  const seen = useRef<{ firstId?: string; lastId?: string; height: number }>({ height: 0 });
+  const seen = useRef<{ lastId?: string }>({});
+  // The message at the top of the view and where it sat. A change above it
+  // — older history, a filled gap, an image loading — moves the content,
+  // never the reader.
+  const anchor = useRef<{ id: string; top: number } | null>(null);
+
+  const captureAnchor = useCallback(() => {
+    const el = scrollerRef.current;
+    anchor.current = el ? topVisibleMessage(el) : null;
+  }, []);
+
+  const holdAnchor = useCallback(() => {
+    const el = scrollerRef.current;
+    const held = anchor.current;
+    if (!el || !held) return;
+    const node = messageNode(el, held.id);
+    const moved = node ? node.getBoundingClientRect().top - held.top : 0;
+    // Only write when something moved: any write cancels a smooth scroll.
+    if (moved !== 0) el.scrollTop += moved;
+  }, []);
 
   const measure = useCallback(() => {
     const el = scrollerRef.current;
@@ -113,9 +137,17 @@ export function ConversationView({
     if (bottom) setNewCount(0);
   }, []);
 
+  // A smooth scroll to the end is under way until this time. Content that
+  // grows mid-animation re-pins rather than holding the anchor: writing the
+  // scroll position cancels the animation short of the end.
+  const followingUntil = useRef(0);
+  const pinned = useCallback(() => atBottomRef.current || Date.now() < followingUntil.current, []);
+
   const scrollToEnd = useCallback((behavior: ScrollBehavior) => {
     const el = scrollerRef.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior });
+    if (!el) return;
+    if (behavior === 'smooth') followingUntil.current = Date.now() + FOLLOW_MS;
+    el.scrollTo({ top: el.scrollHeight, behavior });
   }, []);
 
   // Everything that moves the scroll position in response to the messages
@@ -138,28 +170,38 @@ export function ConversationView({
         el.scrollTop = el.scrollHeight;
       }
     } else {
-      // Older history arrived above: hold what the reader is looking at
-      // still by moving down exactly as far as the content grew.
-      if (first.id !== seen.current.firstId && last.id === seen.current.lastId) {
-        el.scrollTop += el.scrollHeight - seen.current.height;
-      }
-      // New messages at the end.
-      if (last.id !== seen.current.lastId) {
-        const lastSeenIndex = ordered.findIndex((m) => m.id === seen.current.lastId);
-        const arrived = ordered.slice(lastSeenIndex + 1);
-        if (last.author.isOwn) {
-          // The reader just sent this: take them to it wherever they were.
-          scrollToEnd('smooth');
-        } else if (atBottomRef.current) {
-          el.scrollTop = el.scrollHeight;
-        } else {
+      const newAtEnd = last.id !== seen.current.lastId;
+      if (newAtEnd && last.author.isOwn) {
+        // The reader just sent this: take them to it wherever they were.
+        scrollToEnd('smooth');
+      } else if (pinned()) {
+        // Pinned stays pinned, whatever changed — including a gap filling
+        // in above, which grows the content without touching its end.
+        el.scrollTop = el.scrollHeight;
+      } else {
+        holdAnchor();
+        if (newAtEnd) {
+          const lastSeenIndex = ordered.findIndex((m) => m.id === seen.current.lastId);
+          const arrived = ordered.slice(lastSeenIndex + 1);
           setNewCount((count) => count + arrived.filter((m) => !m.author.isOwn).length);
         }
       }
     }
-    seen.current = { firstId: first.id, lastId: last.id, height: el.scrollHeight };
+    seen.current = { lastId: last.id };
     measure();
-  }, [first, last, ordered, loading, unreadBeyond, measure, scrollToEnd]);
+    captureAnchor();
+  }, [
+    first,
+    last,
+    ordered,
+    loading,
+    unreadBeyond,
+    measure,
+    scrollToEnd,
+    pinned,
+    holdAnchor,
+    captureAnchor,
+  ]);
 
   // Growth that is not a new message — an image loading, a code block
   // laying out, a streaming body getting longer — keeps a pinned view pinned.
@@ -168,15 +210,17 @@ export function ConversationView({
     const content = contentRef.current;
     if (!el || !content || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => {
-      if (atBottomRef.current) el.scrollTop = el.scrollHeight;
-      seen.current.height = el.scrollHeight;
+      if (pinned()) el.scrollTop = el.scrollHeight;
+      else holdAnchor();
+      captureAnchor();
     });
     observer.observe(content);
     return () => observer.disconnect();
-  }, []);
+  }, [pinned, holdAnchor, captureAnchor]);
 
   const onScroll = useCallback(() => {
     measure();
+    captureAnchor();
     const el = scrollerRef.current;
     // Not while unread messages remain above: opening on the first loaded
     // one lands inside this zone, and loading on arrival would slide the
@@ -192,7 +236,7 @@ export function ConversationView({
     ) {
       onLoadOlder?.();
     }
-  }, [measure, hasOlder, unreadBeyond, loadingOlder, onLoadOlder]);
+  }, [measure, captureAnchor, hasOlder, unreadBeyond, loadingOlder, onLoadOlder]);
 
   // Seen means at the end with the page in front of the reader. A hidden
   // tab polling in new messages must not mark them read.
@@ -226,7 +270,7 @@ export function ConversationView({
           ) : (
             <>
               {hasOlder ? (
-                <div className="flex justify-center py-3">
+                <div className="flex items-center justify-center gap-2 py-3">
                   <button
                     type="button"
                     onClick={onLoadOlder}
@@ -245,6 +289,15 @@ export function ConversationView({
                         ? 'Load earlier unread messages'
                         : 'Load earlier messages'}
                   </button>
+                  {unreadBeyond && onMarkAllRead && (
+                    <button
+                      type="button"
+                      onClick={onMarkAllRead}
+                      className="rounded-full px-2 py-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                    >
+                      Mark all read
+                    </button>
+                  )}
                 </div>
               ) : (
                 intro
@@ -314,6 +367,40 @@ export function ConversationView({
       )}
     </div>
   );
+}
+
+function messageNodes(scroller: HTMLElement): HTMLElement[] {
+  return Array.from(scroller.querySelectorAll<HTMLElement>('[data-message-id]'));
+}
+
+function messageNode(scroller: HTMLElement, id: string): HTMLElement | null {
+  return messageNodes(scroller).find((node) => node.dataset.messageId === id) ?? null;
+}
+
+/**
+ * The first message whose bottom is below the top of the view, and where
+ * its top sits. Binary search: rows are in document order, so their
+ * bottoms only increase, and a long conversation should not measure every
+ * row on every scroll event.
+ */
+function topVisibleMessage(scroller: HTMLElement): { id: string; top: number } | null {
+  const nodes = messageNodes(scroller);
+  const viewTop = scroller.getBoundingClientRect().top;
+  let low = 0;
+  let high = nodes.length - 1;
+  let found = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (nodes[mid].getBoundingClientRect().bottom > viewTop) {
+      found = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  if (found < 0) return null;
+  const node = nodes[found];
+  return { id: node.dataset.messageId ?? '', top: node.getBoundingClientRect().top };
 }
 
 function ConversationSkeleton() {

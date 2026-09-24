@@ -20,12 +20,14 @@ import {
   TypeChip,
 } from './thread-list';
 import {
+  abandonCatchUp,
   absorbNewest,
   absorbOlder,
   EMPTY_HISTORY,
   failGap,
   nextGap,
   olderGap,
+  readableThrough,
   unblockGaps,
   unreadBeyondLoaded,
   type ThreadHistory,
@@ -142,10 +144,26 @@ export function ThreadConversation({
   // positions once, on the real first unread message.
   const opening = history.started ? !history.ready : isLoading;
 
+  // Reading is acknowledged only as far as the history is whole. The
+  // callback changes with the gaps, so the view acknowledges again — now
+  // further — once repaired history has reached it.
+  const gaps = history.gaps;
   const onReadThrough = useCallback(
-    (message: ConversationMessage) => cursors.advance(key, message.createdAt),
-    [cursors, key]
+    (message: ConversationMessage) =>
+      cursors.advance(
+        key,
+        readableThrough(gaps, { createdAt: message.createdAt, id: message.id }).createdAt
+      ),
+    [cursors, key, gaps]
   );
+
+  // The explicit way past unread messages that were never loaded.
+  const markAllRead = useCallback(() => {
+    const newest = history.messages[history.messages.length - 1];
+    if (newest) cursors.advance(key, newest.createdAt);
+    setUnreadAfter(null);
+    setHistory((current) => abandonCatchUp(current));
+  }, [cursors, key, history.messages]);
 
   const title = displayTitle(spine) ?? key;
   const status = spineStatus(spine);
@@ -233,6 +251,7 @@ export function ThreadConversation({
         loadingOlder={loadingOlder}
         onLoadOlder={() => void loadOlder()}
         onReadThrough={onReadThrough}
+        onMarkAllRead={markAllRead}
         intro={
           <div className="px-4 pb-2 pt-8 md:px-6">
             <ParticipantCluster participants={spine.participants} nameFor={nameFor} />

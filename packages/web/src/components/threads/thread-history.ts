@@ -253,3 +253,29 @@ export function unblockGaps(history: ThreadHistory): ThreadHistory {
     gaps: history.gaps.map((gap) => (gap.blocked ? { ...gap, blocked: false } : gap)),
   };
 }
+
+/**
+ * How far a reader at `message` can be said to have read. Never past a
+ * stretch that is still missing: a reader pinned at the end of a poll that
+ * jumped ahead has not seen what the gap below them will bring, and
+ * acknowledging through it would lose those messages' unread state for
+ * good if they leave before it fills (Lumen, #670 round 3). The limit is
+ * the floor of the earliest gap — for a catch-up, the read cursor itself.
+ */
+export function readableThrough(gaps: HistoryGap[], message: HistoryPosition): HistoryPosition {
+  let limit = message;
+  for (const gap of gaps) {
+    if (comparePosition(gap.floor, limit) < 0) limit = gap.floor;
+  }
+  return limit;
+}
+
+/**
+ * The reader marked everything read with unread messages still unloaded
+ * above: the catch-up has nothing left to catch up to. What it was
+ * fetching is now ordinary older history.
+ */
+export function abandonCatchUp(history: ThreadHistory): ThreadHistory {
+  if (!history.gaps.some((gap) => gap.initial)) return history;
+  return { ...history, gaps: history.gaps.filter((gap) => !gap.initial) };
+}
