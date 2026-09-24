@@ -1086,15 +1086,17 @@ Type: ${payload.triggerType}`;
       // description nobody has touched since the thread opened cannot be read
       // as a current statement of what it is about.
       //
-      // targetSlug is passed because this text is about to be written into that
-      // SB's prompt, and a trigger may name any threadKey: the loader delivers
-      // nothing unless the recipient is a participant.
+      // The recipient's canonical id is passed because this text is about to
+      // be written into that SB's prompt, and a trigger may name any threadKey:
+      // the loader delivers nothing unless that principal is a participant. The
+      // scope is the thread's workspace for a thread-borne trigger, else the
+      // identity's own — a thread is one row per (workspace, key).
       if (dataComposer) {
         const descriptor = await loadThreadDescriptor(
           dataComposer.getClient(),
-          userId,
+          threadWorkspaceId ?? resolvedWorkspaceId,
           payload.threadKey,
-          targetSlug
+          resolvedIdentityId
         );
         for (const line of formatThreadDescriptorLines(descriptor)) {
           triggerMessage += `\n${line}`;

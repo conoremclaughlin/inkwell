@@ -38,7 +38,7 @@ export function messageTime(iso: string, nowMs: number = Date.now()): string {
 /**
  * Display name for a message sender, and whether it is the viewer's own.
  * The server names every author (spec inkmail-thread-scope §3) and says
- * which person is the viewer — `isOwn` is compared there against the PCP
+ * which person is the viewer — `isOwn` is compared there against the Inkwell
  * user, which is not the id this app holds from its auth provider. Only an
  * own message reads "You" and sits on the right; another person's message
  * carries their name and sits with the agents'.

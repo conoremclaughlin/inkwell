@@ -2,9 +2,9 @@
  * How a person is shown to another person. Messages and participant rows
  * name a person by user id (spec inkmail-thread-scope §3); a reader needs
  * a label, and needs to know which person is themselves. Both are decided
- * here, on the server, against the PCP user the request resolved to — a
+ * here, on the server, against the Inkwell user the request resolved to — a
  * client comparing against its auth provider's id would compare the wrong
- * id (Lumen, #620: the Supabase Auth UUID is not the PCP user id).
+ * id (Lumen, #620: the Supabase Auth UUID is not the Inkwell user id).
  */
 
 export interface PersonDisplay {

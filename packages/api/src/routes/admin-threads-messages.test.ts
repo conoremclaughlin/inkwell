@@ -3,7 +3,7 @@
  *
  * Every author is named on the server (spec inkmail-thread-scope §3): an SB
  * by its slug, a person by their profile, the system as system. Which person
- * is "You" is decided against the PCP user the request resolved to — never
+ * is "You" is decided against the Inkwell user the request resolved to — never
  * left to a client that only knows its auth provider's id (Lumen, #620).
  */
 

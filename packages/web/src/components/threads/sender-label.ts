@@ -2,7 +2,7 @@
  * Display name for a message sender. The server names every author (spec
  * inkmail-thread-scope §3): an SB by its slug, a person from their profile,
  * the system as 'system'. It also says which person is the viewer — that
- * comparison happens there, against the PCP user, which is not the id this
+ * comparison happens there, against the Inkwell user, which is not the id this
  * app holds from its auth provider (Lumen, #620). Only the viewer's own
  * message reads "You"; another person's message carries their name.
  */

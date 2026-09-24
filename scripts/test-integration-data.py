@@ -39,6 +39,7 @@ class DataTests(unittest.TestCase):
         self.database = "postgres"
         self.failed_tool = None
         self.catalog = data.FIXTURE_TABLES + data.EXCLUDED_TABLES
+        self.checksum_tables = self.catalog
         patch = mock.patch.object(data.subprocess, "run", self.run_command)
         patch.start()
         self.addCleanup(patch.stop)
@@ -61,15 +62,16 @@ class DataTests(unittest.TestCase):
             elif "SELECT tablename FROM pg_tables" in (kwargs.get("input") or ""):
                 output = "\n".join(self.catalog)
             elif "SELECT jsonb_build_object" in (kwargs.get("input") or ""):
-                output = json.dumps({t: "fixture-checksum" for t in data.FIXTURE_TABLES + data.EXCLUDED_TABLES})
+                output = json.dumps({t: "fixture-checksum" for t in self.checksum_tables})
             elif kwargs.get("input") == "SELECT current_database();\n":
                 output = self.database + "\n"
             else:
                 output = ""
         return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
 
-    def clean(self):
-        data.clean_fixtures(self.workdir, self.project, self.id[:12], 55422, self.state, [7], self.signature, self.run_id)
+    def clean(self, until=""):
+        data.clean_fixtures(self.workdir, self.project, self.id[:12], 55422, self.state, [7], self.signature, self.run_id,
+                            until)
 
     def mutations(self):
         return [kwargs["input"] for _, kwargs in self.calls if "TRUNCATE " in (kwargs.get("input") or "")]
@@ -213,6 +215,48 @@ class DataTests(unittest.TestCase):
                  mock.patch.object(data.subprocess, "run", side_effect=result if isinstance(result, Exception) else None,
                                    return_value=result), self.assertRaises(data.Refusal):
                 self.clean()
+
+    def test_windowed_fixture_tables_follow_the_rehearsal_cut(self):
+        window = ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")
+        self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES)
+        # The CI rehearsal cut: the creating migration applied, the dropping one withheld.
+        self.assertEqual(data.fixture_tables("20260913090000"), data.FIXTURE_TABLES + window)
+        # Cut at or before the creator (never created), or after the dropper (dropped).
+        for until in ("20260913081634", "20260913081633", "20260913090001", "20270101000000"):
+            with self.subTest(until=until):
+                self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES)
+        # The window is part of the policy, so changing it invalidates cached baselines.
+        for name in window:
+            self.assertIn(name, data.POLICY)
+
+    def test_rehearsal_cut_classifies_and_truncates_the_windowed_tables(self):
+        window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
+        self.catalog = data.FIXTURE_TABLES + window + data.EXCLUDED_TABLES
+        # A full-schema stack must not carry them ...
+        with self.assertRaisesRegex(data.Refusal, "classification differs"):
+            self.clean()
+        self.assertEqual(self.mutations(), [])
+        # ... a rehearsal stack must, and its cleanup truncates them with the rest.
+        self.clean(until="20260913090000")
+        truncate = self.mutations()[0]
+        for name in window:
+            self.assertIn("ONLY public." + name, truncate)
+        # A rehearsal stack without them is refused just the same, before mutation.
+        self.catalog = data.FIXTURE_TABLES + data.EXCLUDED_TABLES
+        self.calls = []
+        with self.assertRaisesRegex(data.Refusal, "classification differs"):
+            self.clean(until="20260913090000")
+        self.assertEqual(self.mutations(), [])
+
+    def test_cold_capture_under_the_rehearsal_cut_dumps_the_windowed_tables(self):
+        window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
+        self.catalog = data.FIXTURE_TABLES + window + data.EXCLUDED_TABLES
+        self.checksum_tables = self.catalog
+        data.capture_baseline(self.workdir, self.project, self.id, 55422, [7], self.signature, self.run_id,
+                              "20260913090000")
+        dump = next(args for args, _ in self.calls if "pg_dump" in args)
+        for name in window:
+            self.assertIn("--table=public." + name, dump)
 
     def test_unclassified_or_missing_table_refuses_before_mutation(self):
         for tables in (self.catalog + ("unclassified_fixture",), self.catalog[1:]):

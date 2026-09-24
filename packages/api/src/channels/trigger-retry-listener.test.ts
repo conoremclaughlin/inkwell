@@ -274,7 +274,7 @@ function rig(options: RigOptions = {}) {
     // The real loader answers null for a thread nobody has described — which is
     // this synthetic thread — and catches its own query errors rather than
     // throwing, so these stand-ins are the shipping behaviour and not a softened
-    // version of it. They record their arguments because the recipient slug is
+    // version of it. They record their arguments because the recipient's id is
     // the entire membership check on the reading side: a description is written
     // into that SB's prompt, and a trigger may name any thread key.
     loadThreadDescriptor: async (...args: unknown[]) => {
@@ -546,13 +546,16 @@ describe('the thread describes itself in the prompt the SB actually reads', () =
     await r.gateway.handler!(r.threadPayload);
 
     expect(r.descriptorLoads, 'the descriptor was never loaded').toHaveLength(1);
-    const [, userId, threadKey, recipientSlug] = r.descriptorLoads[0];
-    expect(userId).toBe('user-synthetic');
+    const [, workspaceId, threadKey, recipientSbId] = r.descriptorLoads[0];
+    // The thread's workspace (spec inkmail-thread-scope §1): a thread is one
+    // row per (workspace, key), so this is what makes the key mean one thread.
+    expect(workspaceId).toBe('workspace-synthetic');
     expect(threadKey).toBe('pr:42');
-    // The argument that makes the membership JOIN mean anything. Dropping it
-    // does not leak — the loader refuses a falsy slug — but it silently costs
-    // every thread its description, which no other test in this file would see.
-    expect(recipientSlug).toBe('recipient-test');
+    // The argument that makes the membership JOIN mean anything: the canonical
+    // id of the recipient identity, never its slug. Dropping it does not leak —
+    // the loader refuses a falsy id — but it silently costs every thread its
+    // description, which no other test in this file would see.
+    expect(recipientSbId).toBe('identity-synthetic');
   });
 
   it('says nothing extra when the thread has no description', async () => {

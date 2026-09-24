@@ -79,7 +79,7 @@ export interface ThreadMessage {
   senderUserId: string | null;
   /** Named on the server: the SB's slug, the person's profile name, or 'system'. */
   senderName: string;
-  /** The viewer's own message — decided on the server against the PCP user, never here. */
+  /** The viewer's own message — decided on the server against the Inkwell user, never here. */
   isOwn: boolean;
   content: string;
   messageType: string;
@@ -98,7 +98,7 @@ export interface ThreadMessagesResponse {
     closedAt: string | null;
   } | null;
   messages: ThreadMessage[];
-  /** The PCP user this response was rendered for. */
+  /** The Inkwell user this response was rendered for. */
   viewerUserId?: string;
   meta?: { fetched: number; total: number; truncated: boolean };
 }

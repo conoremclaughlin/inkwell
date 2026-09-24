@@ -7623,7 +7623,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const total = messagesCount ?? fetched;
 
     // Every author is named here, for this viewer. A person is named from
-    // their profile and is "own" only when they are the PCP user this
+    // their profile and is "own" only when they are the Inkwell user this
     // request resolved to — a client comparing against its auth provider's
     // id would compare the wrong id (Lumen, #620).
     const viewerUserId = authReq.inkUserId;

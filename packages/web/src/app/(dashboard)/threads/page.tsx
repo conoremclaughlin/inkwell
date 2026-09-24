@@ -129,7 +129,7 @@ interface ThreadMessagesResponse {
     senderUserId: string | null;
     /** Named on the server: the SB's slug, the person's profile name, or 'system'. */
     senderName: string;
-    /** The viewer's own message — decided on the server against the PCP user. */
+    /** The viewer's own message — decided on the server against the Inkwell user. */
     isOwn: boolean;
     content: string;
     messageType: string;
@@ -137,7 +137,7 @@ interface ThreadMessagesResponse {
     metadata?: Record<string, unknown> | null;
     createdAt: string;
   }>;
-  /** The PCP user this response was rendered for. */
+  /** The Inkwell user this response was rendered for. */
   viewerUserId?: string;
   meta?: FeedMeta;
 }

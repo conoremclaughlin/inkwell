@@ -401,13 +401,13 @@ def manage(root, harness, args, env):
                         write_state(state_path, state)
                 db_id = containers(project).get(db_name)
                 baseline_state = capture_baseline(workdir, project, db_id, ports[1], lock_fds,
-                                                  signature, marker["runId"])
+                                                  signature, marker["runId"], until)
             else:
                 marker["phase"] = "cleaning"
                 write_state(marker_path, marker)
                 say("Cleaning allowlisted fixture tables (not resetting the database or containers)")
                 clean_fixtures(workdir, project, db_id, ports[1], baseline_state, lock_fds,
-                               signature, marker["runId"])
+                               signature, marker["runId"], until)
             if containers(project).get(db_name) != db_id:
                 raise Refusal("Database container changed during fixture preparation; suite not started.")
             if not fresh:

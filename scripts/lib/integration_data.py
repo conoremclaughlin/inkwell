@@ -41,8 +41,34 @@ task_graph_revisions task_group_comments task_groups tasks thread_key_types
 trusted_users user_identity user_identity_history user_permissions users
 workspace_members workspaces
 """.split())
+# Fixture tables that exist only in a window of the migration sequence: created
+# by one migration and dropped by a later one. A rehearsal stack cut between the
+# two (INTEGRATION_MIGRATIONS_UNTIL, spec inkmail-thread-scope §4) carries them
+# and the rehearsal suite writes to them, so for that stack they are fixture
+# tables; for every other stack they are absent, and the catalog check expects
+# exactly that in both directions. Entries are (created_by, dropped_by, tables).
+WINDOWED_FIXTURE_TABLES = (
+    ("20260913081634", "20260913090000",
+     ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")),
+)
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
-POLICY = "fixture-baseline-v3:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES)
+POLICY = ("fixture-baseline-v4:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
+          ";".join(created + "-" + dropped + ":" + ",".join(tables)
+                   for created, dropped, tables in WINDOWED_FIXTURE_TABLES))
+
+
+def fixture_tables(until=""):
+    """The fixture tables of a stack whose migrations stop before `until`.
+
+    Empty means every migration applied. The stack withholds a migration whose
+    stamp is >= until (integration-stack.prepare), so a windowed table exists
+    when its creating migration was applied and its dropping one withheld.
+    """
+    tables = FIXTURE_TABLES
+    for created_by, dropped_by, names in WINDOWED_FIXTURE_TABLES:
+        if until and created_by < until <= dropped_by:
+            tables += names
+    return tables
 DATABASE_GUARD = """DO $guard$ BEGIN
   IF current_database() <> 'postgres' THEN
     RAISE EXCEPTION 'Refusing fixture cleanup: wrong database name' USING ERRCODE = 'PC001';
@@ -140,12 +166,12 @@ def literal(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def verify_catalog(container_id, lock_fds):
+def verify_catalog(container_id, lock_fds, tables=FIXTURE_TABLES):
     output = execute(container_id, "psql", ["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-f", "-"],
                      lock_fds, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;\n",
                      phase="catalog probe")
     actual = set(output.splitlines())
-    expected = set(FIXTURE_TABLES + EXCLUDED_TABLES)
+    expected = set(tables + EXCLUDED_TABLES)
     if actual != expected:
         # Names are not printed: an unexpected relation can contain private text.
         raise Refusal("Public table classification differs (" + str(len(actual - expected)) +
@@ -203,25 +229,26 @@ def transaction(container_id, sql, lock_fds, phase="transaction"):
                    lock_fds, "SET TIME ZONE 'UTC';\nSET lock_timeout = '5s';\n" + sql, phase=phase)
 
 
-def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature, run_id):
+def capture_baseline(workdir, project, recorded_id, db_port, lock_fds, signature, run_id, until=""):
     """Called ONLY after successful managed reset, before tests can write rows."""
     run_id = canonical_uuid(run_id)
+    tables = fixture_tables(until)
     container_id = checked_container(project, recorded_id, db_port)
     verify_database(container_id, lock_fds)
-    verify_catalog(container_id, lock_fds)
+    verify_catalog(container_id, lock_fds, tables)
     checksums = execute(container_id, "psql", ["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-f", "-"],
-                        lock_fds, "SET TIME ZONE 'UTC';\nSELECT " + checksum_expression(FIXTURE_TABLES + EXCLUDED_TABLES) + ";\n",
+                        lock_fds, "SET TIME ZONE 'UTC';\nSELECT " + checksum_expression(tables + EXCLUDED_TABLES) + ";\n",
                         phase="cold checksum capture")
     # psql emits SET even in tuples-only mode. The final line is the JSON row.
     try:
         checksums = json.loads(checksums.strip().splitlines()[-1])
-        if set(checksums) != set(FIXTURE_TABLES + EXCLUDED_TABLES):
+        if set(checksums) != set(tables + EXCLUDED_TABLES):
             raise ValueError()
     except (ValueError, IndexError, TypeError):
         raise Refusal("Could not record the cold fixture baseline checksums.") from None
     args = ["--data-only", "--column-inserts", "--no-owner",
             "--no-privileges", "--no-comments", "--strict-names", "--no-blobs"]
-    for table in FIXTURE_TABLES:
+    for table in tables:
         args += ["--table=public." + table]
     baseline = execute(container_id, "pg_dump", args, lock_fds, phase="baseline dump")
     if not baseline.strip() or len(baseline.encode()) > 10 * 1024 * 1024:
@@ -249,8 +276,9 @@ INSERT INTO _ink_it.stack VALUES (true, """ + ", ".join(map(literal, (
     return {"hash": hashlib.sha256(baseline.encode()).hexdigest(), "token": token}
 
 
-def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_fds, signature, run_id):
+def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_fds, signature, run_id, until=""):
     path = workdir / BASELINE_FILE
+    tables = fixture_tables(until)
     if (path.is_symlink() or not path.is_file() or not isinstance(baseline_state, dict)
             or not baseline_state.get("hash") or not baseline_state.get("token")):
         raise Refusal("Fixture baseline is missing or unmanaged; run --reset once.")
@@ -261,7 +289,7 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
         raise Refusal("Fixture baseline changed outside the harness; refusing cleanup. Use --reset.")
     container_id = checked_container(project, recorded_id, db_port)
     verify_database(container_id, lock_fds)
-    verify_catalog(container_id, lock_fds)
+    verify_catalog(container_id, lock_fds, tables)
     guard = identity_guard(project, container_id, signature, baseline_state["token"])
     # Commit the diagnostic marker BEFORE cleanup; failed cleanup/suite leaves it.
     transaction(container_id, guard + "UPDATE _ink_it.stack SET run_id = " + literal(run_id) +
@@ -275,10 +303,10 @@ def clean_fixtures(workdir, project, recorded_id, db_port, baseline_state, lock_
     # Row checksums after restoring origin mode still gate the transaction.
     # pg_dump resets lock_timeout and search_path: keep TRUNCATE before its
     # preamble and everything after it schema-qualified.
-    truncate = "TRUNCATE " + ", ".join("ONLY public." + t for t in FIXTURE_TABLES) + " CONTINUE IDENTITY RESTRICT;\n"
+    truncate = "TRUNCATE " + ", ".join("ONLY public." + t for t in tables) + " CONTINUE IDENTITY RESTRICT;\n"
     restore = "SET LOCAL session_replication_role = replica;\n" + baseline + "\nSET LOCAL session_replication_role = origin;\n"
     transaction(container_id, guard + checksum_guard(EXCLUDED_TABLES) + truncate + restore +
-                checksum_guard(FIXTURE_TABLES + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup")
+                checksum_guard(tables + EXCLUDED_TABLES), lock_fds, phase="scoped cleanup")
 
 
 def finish_run(project, recorded_id, db_port, baseline_state, lock_fds, signature, run_id):

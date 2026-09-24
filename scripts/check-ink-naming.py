@@ -89,6 +89,10 @@ FILE_ALLOWED: dict[str, list[tuple[str, str]]] = {
         (r"'pcp'", "pins the pcp->inkwell project alias"),
         (r"pcp:[A-Za-z0-9:_-]*", "alias-prefixed thread keys under test"),
     ],
+    "packages/api/src/data/cutover/thread-scope-cutover.integration.test.ts": [
+        (r"'pcp'", "pins the pcp->inkwell project alias the cutover moves"),
+        (r"pcp:[A-Za-z0-9:_-]*", "alias-prefixed thread keys under test"),
+    ],
     "packages/api/src/services/thread-key/unregistered-prefix.test.ts": [
         (r"'pcp'", "pins the project alias"),
         (r"`pcp`", "pins the project alias"),
