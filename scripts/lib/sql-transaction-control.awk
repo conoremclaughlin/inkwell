@@ -15,6 +15,11 @@
 # A dollar quote needs a token boundary before it: PostgreSQL lexes foo$tag$
 # as one identifier (identifiers may contain $ after their first character),
 # so a $ that follows an identifier character never opens a quote here.
+# PostgreSQL's identifier characters are ASCII letters, digits, _ and $,
+# plus every byte above 0x7F (it does not interpret non-ASCII further), so
+# this scanner works on bytes and must run under LC_ALL=C, which the wrapper
+# sets: the same file then lexes the same way on every machine, and awk
+# never fails on multibyte input.
 #
 # Refused at the top level: BEGIN, START TRANSACTION, COMMIT, END, ROLLBACK,
 # ABORT, SAVEPOINT, RELEASE, PREPARE TRANSACTION, any spelling (COMMIT WORK,
@@ -44,6 +49,31 @@ function judge(s,    t, u) {
   }
 }
 
+# PostgreSQL's identifier characters, byte-wise: ASCII letter/digit/_/$, or
+# any byte >= 0x80. Under LC_ALL=C string comparison is byte comparison.
+function ident_char(ch) {
+  return ch != "" && (ch ~ /[A-Za-z0-9_$]/ || ch >= "\200")
+}
+function ident_start(ch) {
+  return ch != "" && (ch ~ /[A-Za-z_]/ || ch >= "\200")
+}
+
+# The dollar tag that starts at position p, or "" if none: $$, or $ then an
+# identifier-start, identifier characters (no $), then $.
+function dollar_tag(p,    q, ch) {
+  if (substr(src, p + 1, 1) == "$") return "$$"
+  q = p + 1
+  ch = substr(src, q, 1)
+  if (!ident_start(ch)) return ""
+  while (q <= n) {
+    ch = substr(src, q, 1)
+    if (ch == "$") return substr(src, p, q - p + 1)
+    if (!ident_char(ch)) return ""
+    q++
+  }
+  return ""
+}
+
 function report(kind, text) {
   found = 1
   if (length(text) > 60) text = substr(text, 1, 57) "..."
@@ -70,10 +100,10 @@ END {
         mode = "sq"; stmt = stmt " "; continue
       }
       if (c == "\"") { mode = "dq"; stmt = stmt " "; continue }
-      if (c == "$" && (i == 1 || substr(src, i - 1, 1) !~ /[A-Za-z0-9_$]/)) {
-        if (match(substr(src, i), /^\$[A-Za-z_][A-Za-z0-9_]*\$/) || match(substr(src, i), /^\$\$/)) {
-          tag = substr(src, i, RLENGTH)
-          mode = "dollar"; i += RLENGTH - 1; stmt = stmt " "; continue
+      if (c == "$" && (i == 1 || !ident_char(substr(src, i - 1, 1)))) {
+        tag = dollar_tag(i)
+        if (tag != "") {
+          mode = "dollar"; i += length(tag) - 1; stmt = stmt " "; continue
         }
       }
       if (c == "\\") {

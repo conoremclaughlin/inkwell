@@ -94,7 +94,7 @@ bad() {
 # Only what the scripts and this suite call. Resolved from the host once,
 # here, so nothing else on the host PATH is reachable during the checks.
 mkdir -p "$work/tools"
-for tool in sh git node awk sed grep basename dirname cat mktemp head rm sort cut tr wc cp mkdir chmod ln date od; do
+for tool in sh git node awk sed grep basename dirname cat mktemp head rm sort cut tr wc cp mkdir chmod ln date od locale; do
   bin=$(command -v "$tool") || {
     echo "cannot find $tool on the host PATH" >&2
     exit 1
@@ -320,9 +320,11 @@ printf 'COMMIT AND CHAIN;\n' > "$tcm/20260209000000_chain.sql"
 printf 'SELECT 1 \\gset\n' > "$tcm/20260210000000_gset.sql"
 printf 'SELECT 1 AS foo$tag$; COMMIT; SELECT 1 AS foo$tag$;\n' > "$tcm/20260218000000_ident_dollar_bypass.sql"
 printf 'SELECT 1 AS foo$$; COMMIT; SELECT 1 AS bar$$;\n' > "$tcm/20260219000000_ident_dollardollar_bypass.sql"
+# caf\303\251 is "café": a non-ASCII identifier character before the $
+printf 'SELECT 1 AS caf\303\251$tag$; COMMIT; SELECT 1 AS caf\303\251$tag$;\n' > "$tcm/20260222000000_ident_nonascii_bypass.sql"
 for f in 20260201000000_commit_work 20260202000000_two_on_a_line 20260203000000_end 20260204000000_rollback_work \
   20260205000000_start 20260206000000_savepoint 20260207000000_meta 20260208000000_atomic 20260209000000_chain 20260210000000_gset \
-  20260218000000_ident_dollar_bypass 20260219000000_ident_dollardollar_bypass; do
+  20260218000000_ident_dollar_bypass 20260219000000_ident_dollardollar_bypass 20260222000000_ident_nonascii_bypass; do
   reset_log
   out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
   rc=$?
@@ -341,8 +343,9 @@ printf 'SELECT CASE WHEN true THEN 1 END;\n' > "$tcm/20260216000000_case_end.sql
 printf "DO \$\$ BEGIN RAISE NOTICE 'it''s fine'; END \$\$;\n" > "$tcm/20260217000000_do_block.sql"
 printf 'SELECT 1 AS foo$tag$;\nSELECT 2 AS x$$;\n' > "$tcm/20260220000000_ident_with_dollar.sql"
 printf 'SELECT $$COMMIT;$$;\nSELECT 1;\n' > "$tcm/20260221000000_dollar_string_at_boundary.sql"
+printf 'SELECT 1 AS caf\303\251$tag$;\nSELECT $caf\303\251$ BEGIN; COMMIT; $caf\303\251$;\n' > "$tcm/20260223000000_nonascii_ident_and_tag.sql"
 for f in 20260211000000_block_comment 20260212000000_line_comment 20260213000000_quoted 20260214000000_dollar_body \
-  20260215000000_tagged_body 20260216000000_case_end 20260217000000_do_block 20260220000000_ident_with_dollar 20260221000000_dollar_string_at_boundary; do
+  20260215000000_tagged_body 20260216000000_case_end 20260217000000_do_block 20260220000000_ident_with_dollar 20260221000000_dollar_string_at_boundary 20260223000000_nonascii_ident_and_tag; do
   reset_log
   out=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply "supabase/migrations/$f.sql" 2>&1)
   rc=$?
@@ -352,13 +355,33 @@ for f in 20260211000000_block_comment 20260212000000_line_comment 20260213000000
     bad "accepted and applied: $f" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
   fi
 done
-out=$(awk -f "$guard" "$tcm/20260201000000_commit_work.sql" 2>&1)
+out=$(LC_ALL=C awk -f "$guard" "$tcm/20260201000000_commit_work.sql" 2>&1)
 rc=$?
 [ "$rc" -eq 1 ] && [ "$out" = "transaction control: COMMIT WORK" ] && ok "the scanner names the offending statement and exits 1" ||
   bad "the scanner names the offending statement and exits 1" "exit $rc: $out"
-out=$(awk -f "$guard" "$tcm/20260214000000_dollar_body.sql" 2>&1)
+out=$(LC_ALL=C awk -f "$guard" "$tcm/20260214000000_dollar_body.sql" 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && [ -z "$out" ] && ok "the scanner is silent and exits 0 on a clean file" || bad "the scanner is silent and exits 0 on a clean file" "exit $rc: $out"
+
+# The wrapper's verdict must not depend on the caller's locale: the same
+# non-ASCII bypass and the same benign file, under C and under a UTF-8 locale.
+utf8=$(locale -a 2>/dev/null | grep -iE '^(C|en_US)\.(UTF-8|utf8)$' | head -1)
+[ -n "$utf8" ] || bad "a UTF-8 locale is available for the locale-independence checks" "locale -a listed none"
+for loc in C ${utf8:-}; do
+  reset_log
+  out=$(cd "$tc" && LC_ALL="$loc" STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply supabase/migrations/20260222000000_ident_nonascii_bypass.sql 2>&1)
+  rc=$?
+  [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'transaction control: COMMIT' &&
+    ok "under LC_ALL=$loc: the non-ASCII identifier bypass is refused before psql" ||
+    bad "under LC_ALL=$loc: the non-ASCII identifier bypass is refused before psql" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  reset_log
+  : > "$work/ledger-tc-$loc.txt"
+  out=$(cd "$tc" && LC_ALL="$loc" STUB_LEDGER="$work/ledger-tc-$loc.txt" sh "$script" apply supabase/migrations/20260223000000_nonascii_ident_and_tag.sql 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ "$(apply_calls)" -eq 1 ] &&
+    ok "under LC_ALL=$loc: a non-ASCII identifier and a non-ASCII dollar tag are accepted" ||
+    bad "under LC_ALL=$loc: a non-ASCII identifier and a non-ASCII dollar tag are accepted" "exit $rc: $out"
+done
 
 reset_log
 out=$(cd "$repo" && STUB_NO_STACK=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)

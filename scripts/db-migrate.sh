@@ -29,7 +29,8 @@
 # would commit the row and the partial file and leave a later failure
 # un-rolled-back. The judgement is SQL-aware (lib/sql-transaction-control.awk):
 # comments, strings and dollar-quoted bodies are invisible to it, so a
-# function body's BEGIN and END do not count.
+# function body's BEGIN and END do not count. It runs under LC_ALL=C so it
+# lexes bytes the way PostgreSQL does, identically on every machine.
 #
 # Usage:
 #   sh scripts/db-migrate.sh apply supabase/migrations/<version>_<name>.sql [...]
@@ -125,7 +126,8 @@ apply_one() {
   dir=$(cd "$(dirname "$file")" && pwd -P) || die "cannot enter $(dirname "$file")"
   [ "$dir" = "$checkout/supabase/migrations" ] ||
     die "$base must live in $checkout/supabase/migrations (found it in $dir)"
-  findings=$(awk -f "$guard" "$file" 2>&1)
+  # Byte-wise, in the C locale, on every machine: see the guard's header.
+  findings=$(LC_ALL=C awk -f "$guard" "$file" 2>&1)
   case $? in
     0) ;;
     1)
