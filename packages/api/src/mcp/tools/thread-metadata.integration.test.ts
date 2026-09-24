@@ -16,7 +16,7 @@
  * Run via: yarn workspace @inklabs/api test:integration:db
  */
 
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 import {
@@ -27,9 +27,9 @@ import {
   THREAD_TITLE_MAX,
 } from './thread-handlers';
 import { findOrCreateThread } from './inbox-handlers';
+import type { SbPrincipal } from '../../services/principals';
 
 const OWNER = 'echo';
-const OUTSIDER = 'not-a-participant';
 const DB_URL = process.env.INTEGRATION_DB_URL;
 
 function parse<T>(raw: { content: Array<{ text: string }> }): T {
@@ -39,12 +39,52 @@ function parse<T>(raw: { content: Array<{ text: string }> }): T {
 describe('Thread title and summary (integration)', () => {
   let dataComposer: DataComposer;
   let userId: string;
+  let workspaceId: string;
+  let echoSbId: string;
+  let echo: SbPrincipal;
+  // A second SB in the same workspace (spec inkmail-thread-scope §1): "not a
+  // participant" has to be a principal that exists and is refused for that
+  // reason, not an unknown slug refused for not existing.
+  const OUTSIDER = `outsider-${Date.now()}`;
+  let outsiderSbId: string | null = null;
   const created: string[] = [];
 
   beforeAll(async () => {
     dataComposer = await getDataComposer();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
     userId = fixture.userId;
+    workspaceId = fixture.workspaceId;
+    echoSbId = fixture.echoSbId;
+    echo = { kind: 'sb', sbId: echoSbId, sbSlug: OWNER, userId, workspaceId };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const raw = dataComposer.getClient() as any;
+    const { data: outsider, error } = await raw
+      .from('agent_identities')
+      .insert({
+        user_id: userId,
+        workspace_id: workspaceId,
+        agent_id: OUTSIDER,
+        name: 'Outsider',
+        role: 'Integration test fixture agent',
+        description: 'Fixture identity that is never a participant',
+        values: [],
+        relationships: {},
+        capabilities: [],
+        metadata: { fixture: true },
+        backend: 'claude',
+      })
+      .select('id')
+      .single();
+    if (error || !outsider) throw new Error(`outsider identity insert: ${error?.message}`);
+    outsiderSbId = outsider.id as string;
+  });
+
+  afterAll(async () => {
+    if (!outsiderSbId) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const raw = dataComposer.getClient() as any;
+    await raw.from('agent_identities').delete().eq('id', outsiderSbId);
   });
 
   afterEach(async () => {
@@ -55,7 +95,7 @@ describe('Thread title and summary (integration)', () => {
       const { data: thread } = await raw
         .from('inbox_threads')
         .select('id')
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .eq('thread_key', key)
         .maybeSingle();
       if (thread?.id) {
@@ -77,8 +117,9 @@ describe('Thread title and summary (integration)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: threadKey,
-        user_id: userId,
-        created_by_agent_id: OWNER,
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         status: 'open',
       })
       .select('id, title, summary')
@@ -89,7 +130,9 @@ describe('Thread title and summary (integration)', () => {
     expect(data.title).toBeNull();
     expect(data.summary).toBeNull();
 
-    await raw.from('inbox_thread_participants').insert([{ thread_id: data.id, agent_id: OWNER }]);
+    await raw
+      .from('inbox_thread_participants')
+      .insert([{ thread_id: data.id, workspace_id: workspaceId, sb_id: echoSbId, user_id: null }]);
     return data.id;
   }
 
@@ -146,15 +189,18 @@ describe('Thread title and summary (integration)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: threadKey,
-        user_id: userId,
-        created_by_agent_id: OWNER,
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         status: 'open',
         // The spec:review-requests shape: a title asserting a stale version.
         title: 'New spec to brainstorm: Review Requests — ink://specs/review-requests v1',
       })
       .select('id')
       .single();
-    await raw.from('inbox_thread_participants').insert([{ thread_id: data.id, agent_id: OWNER }]);
+    await raw
+      .from('inbox_thread_participants')
+      .insert([{ thread_id: data.id, workspace_id: workspaceId, sb_id: echoSbId, user_id: null }]);
 
     await handleUpdateThread(
       {
@@ -231,17 +277,11 @@ describe('Thread title and summary (integration)', () => {
     // read as current forever, and it does not depend on naming an author.
     expect(data.summary_updated_at).toBeTruthy();
 
-    // The UUID is conditional, and the response says which case happened rather
-    // than leaving a null column to be read as either. This fixture user
-    // carries two `echo` identities (one workspace-less), so the slug genuinely
-    // does not resolve to one identity here — the 'slug-only' branch is real,
-    // not theoretical, which is why it is a stated outcome and not an error.
-    expect(['identity', 'slug-only']).toContain(result.attributedBy);
-    if (result.attributedBy === 'identity') {
-      expect(data.summary_updated_by_sb_id).toBeTruthy();
-    } else {
-      expect(data.summary_updated_by_sb_id).toBeNull();
-    }
+    // Since the cutover the caller IS an identity in a workspace (spec
+    // inkmail-thread-scope §3), so the UUID is always recorded and the response
+    // says so; the field stays because it is part of the tool's contract.
+    expect(result.attributedBy).toBe('identity');
+    expect(data.summary_updated_by_sb_id).toBe(echoSbId);
 
     // Either way the edit is attributable in the timeline, by slug.
     expect(result.updatedBy).toBe(OWNER);
@@ -402,11 +442,11 @@ describe('Thread title and summary (integration)', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = dataComposer.getClient() as any;
     const thread = await findOrCreateThread(raw, {
-      userId,
+      workspaceId,
       threadKey,
-      creatorSlug: OWNER,
+      creator: echo,
       title: subject,
-      participants: [OWNER],
+      participants: [echo],
     });
     expect(thread.isNew).toBe(true);
 
@@ -431,11 +471,11 @@ describe('Thread title and summary (integration)', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = dataComposer.getClient() as any;
     const thread = await findOrCreateThread(raw, {
-      userId,
+      workspaceId,
       threadKey,
-      creatorSlug: OWNER,
+      creator: echo,
       title: subject,
-      participants: [OWNER],
+      participants: [echo],
     });
 
     const { data: row } = await raw

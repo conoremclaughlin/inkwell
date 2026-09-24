@@ -20,6 +20,17 @@ DIAGNOSTICS_INVOKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DIAGNOSTICS_SINCE="$(python3 -c 'import sys; from datetime import datetime, timedelta; print((datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ") - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))' "${DIAGNOSTICS_INVOKED_AT}")"
 
 echo "[integration-db] Exporting local Supabase env..."
+# The isolated stack's values, and ONLY those. These used to be
+# `${SUPABASE_URL:-${API_URL}}`: a shell that already carried the main
+# server's SUPABASE_URL (every dev shell here does) sent the whole suite —
+# fixture writes included — to the shared local database while the banner
+# still named the isolated stack (Lumen, #621). Every name that could have
+# been inherited is unset BEFORE the stack's output is read, so whatever is
+# set afterwards came from the stack. The CLI's output has changed names
+# across versions (ANON_KEY/PUBLISHABLE_KEY, SERVICE_ROLE_KEY/SECRET_KEY,
+# JWT_SECRET/AUTH_JWT_SECRET); either generation is accepted.
+unset SUPABASE_URL SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY JWT_SECRET DB_URL \
+  API_URL ANON_KEY PUBLISHABLE_KEY SERVICE_ROLE_KEY SECRET_KEY AUTH_JWT_SECRET
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
 
 # Both endpoints come from the stack this script started, and from nothing the
@@ -36,6 +47,14 @@ export INTEGRATION_SUPABASE_WORKDIR="${SUPABASE_WORKDIR}"
 # loopback endpoint on the port this script reserved — not merely contain the
 # port (Lumen, #623: a substring test passed foreign hosts and fragments). The
 # check lives in scripts/lib so it can be tested alone.
+# shellcheck source=lib/assert-isolated-supabase-url.sh
+source "${ROOT_DIR}/scripts/lib/assert-isolated-supabase-url.sh"
+assert_isolated_supabase_url "${SUPABASE_URL}" "${API_PORT}" || exit 1
+
+# Prove the target before a single test runs: the API URL must be exactly
+# the loopback endpoint on the port this script reserved — not merely
+# contain the port (Lumen, #623: a substring test passed foreign hosts and
+# fragments). The check lives in scripts/lib so it can be tested alone.
 # shellcheck source=lib/assert-isolated-supabase-url.sh
 source "${ROOT_DIR}/scripts/lib/assert-isolated-supabase-url.sh"
 assert_isolated_supabase_url "${SUPABASE_URL}" "${API_PORT}" || exit 1
@@ -115,7 +134,11 @@ dump_stack_diagnostics() {
 }
 
 echo "[integration-db] Running API DB integration suite against ${SUPABASE_URL}"
-if ! yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db "$@"; then
+# INTEGRATION_VITEST_ARGS narrows the run (a path filter, a -t pattern); the
+# rehearsal job uses it to run only the cutover suite at the older schema.
+# Arguments passed through the managed entry point narrow it the same way.
+# shellcheck disable=SC2086
+if ! yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db ${INTEGRATION_VITEST_ARGS:-} "$@"; then
   dump_stack_diagnostics
   exit 1
 fi

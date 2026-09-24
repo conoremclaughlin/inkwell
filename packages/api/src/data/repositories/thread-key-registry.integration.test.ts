@@ -42,7 +42,13 @@ const available = !!(SUPABASE_URL && SUPABASE_KEY);
 const d = available ? describe : describe.skip;
 
 const USER = INTEGRATION_TEST_USER_ID;
+// The namespace is the WORKSPACE since the thread-scope cutover (spec
+// inkmail-thread-scope §1b): projects, aliases and type overrides are
+// keyed by workspace_id, and the registry resolves inside one workspace.
+let WS: string;
+let ECHO_SB: string;
 let OTHER_USER: string;
+let OTHER_WS: string;
 const SLUG = 'tkitest';
 const ALIAS = 'tkitalias';
 const TYPE = 'tkitesttype';
@@ -62,10 +68,46 @@ d('thread-key registry + pin integrity (real DB)', () => {
     });
     repo = new ThreadKeyTypesRepository(client);
 
+    // The fixture user's personal workspace and the echo identity in it —
+    // threads need a workspace and a creator principal.
+    const { data: ws } = await client
+      .from('workspaces')
+      .select('id')
+      .eq('user_id', USER)
+      .eq('type', 'personal')
+      .eq('slug', 'personal')
+      .is('archived_at', null)
+      .maybeSingle();
+    if (!ws?.id) throw new Error('fixture user has no personal workspace');
+    WS = ws.id;
+    const { data: echo } = await client
+      .from('agent_identities')
+      .select('id')
+      .eq('user_id', USER)
+      .eq('agent_id', 'echo')
+      .eq('workspace_id', WS)
+      .maybeSingle();
+    if (echo?.id) {
+      ECHO_SB = echo.id;
+    } else {
+      const { data: orphan } = await client
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', USER)
+        .eq('agent_id', 'echo')
+        .is('workspace_id', null)
+        .maybeSingle();
+      if (!orphan?.id) throw new Error('fixture has no echo identity');
+      await client.from('agent_identities').update({ workspace_id: WS }).eq('id', orphan.id);
+      ECHO_SB = orphan.id;
+    }
+
     // A SUITE-OWNED second user for the owner-change bypass test. Never
     // borrow a real user: fresh isolated CI databases have only the fixture
     // user (single() fails), and on the shared DB the test would mutate a
-    // real user's registry (Lumen, PR #516 round 4).
+    // real user's registry (Lumen, PR #516 round 4). The database provisions
+    // their personal workspace — the second NAMESPACE this suite moves
+    // rows between.
     OTHER_USER = crypto.randomUUID();
     const { error: userErr } = await client.from('users').insert({
       id: OTHER_USER,
@@ -73,12 +115,22 @@ d('thread-key registry + pin integrity (real DB)', () => {
       username: `tk-itest-${OTHER_USER.slice(0, 8)}`,
     });
     if (userErr) throw userErr;
+    const { data: otherWs } = await client
+      .from('workspaces')
+      .select('id')
+      .eq('user_id', OTHER_USER)
+      .eq('type', 'personal')
+      .eq('slug', 'personal')
+      .is('archived_at', null)
+      .maybeSingle();
+    if (!otherWs?.id) throw new Error('the database did not provision the second user a workspace');
+    OTHER_WS = otherWs.id;
 
-    // A project with a slug for the integration user, so project-prefixed
+    // A project with a slug in the integration workspace, so project-prefixed
     // pinning is exercised. Cleaned up in afterAll.
     const { data, error } = await client
       .from('projects')
-      .insert({ user_id: USER, name: `TK Integration ${Date.now()}`, slug: SLUG })
+      .insert({ user_id: USER, workspace_id: WS, name: `TK Integration ${Date.now()}`, slug: SLUG })
       .select('id')
       .single();
     if (error) throw error;
@@ -89,7 +141,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
     // DELETE CASCADE from projects is the backstop).
     const { error: aliasErr } = await client
       .from('project_slug_aliases')
-      .insert({ user_id: USER, alias: ALIAS, project_id: data.id });
+      .insert({ user_id: USER, workspace_id: WS, alias: ALIAS, project_id: data.id });
     if (aliasErr) throw aliasErr;
   });
 
@@ -99,22 +151,32 @@ d('thread-key registry + pin integrity (real DB)', () => {
     // Scoped to suite-owned rows only — the fixture user is shared, and other
     // suites' overrides are not ours to delete (Lumen, PR #516 round 3).
     if (overrideTypes.length) {
-      await client.from('thread_key_types').delete().eq('user_id', USER).in('type', overrideTypes);
+      await client
+        .from('thread_key_types')
+        .delete()
+        .eq('workspace_id', WS)
+        .in('type', overrideTypes);
     }
     if (raceTypeIds.length) {
       await client.from('thread_key_types').delete().in('id', raceTypeIds);
     }
-    await client.from('project_slug_aliases').delete().eq('user_id', USER).eq('alias', ALIAS);
+    await client.from('project_slug_aliases').delete().eq('workspace_id', WS).eq('alias', ALIAS);
     if (projectId) await client.from('projects').delete().eq('id', projectId);
-    // The temp user last: the ON DELETE CASCADE on thread_key_types.user_id
-    // clears any registry row a failed assertion left behind.
+    // The temp user last: their workspace cascades from them, and the ON
+    // DELETE CASCADE on thread_key_types.workspace_id clears any registry
+    // row a failed assertion left behind.
     if (OTHER_USER) await client.from('users').delete().eq('id', OTHER_USER);
   });
 
   async function createThread(threadKey: string) {
     const { data, error } = await client
       .from('inbox_threads')
-      .insert({ thread_key: threadKey, user_id: USER, created_by_agent_id: 'echo' })
+      .insert({
+        thread_key: threadKey,
+        workspace_id: WS,
+        created_by_kind: 'sb',
+        created_by_sb_id: ECHO_SB,
+      })
       .select('id, key_project, key_type, key_id')
       .single();
     if (error) throw error;
@@ -160,10 +222,10 @@ d('thread-key registry + pin integrity (real DB)', () => {
   });
 
   it('the namespace is DB-serialized in both directions', async () => {
-    // type name colliding with the user's project slug
+    // type name colliding with the workspace's project slug
     const { error: typeErr } = await client
       .from('thread_key_types')
-      .insert({ user_id: USER, type: SLUG, write_intent: 'write', studio_policy: 'reuse-only' });
+      .insert({ workspace_id: WS, type: SLUG, write_intent: 'write', studio_policy: 'reuse-only' });
     expect(typeErr?.message).toMatch(/collides/);
 
     // project slug colliding with a shipped template type
@@ -179,7 +241,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
     // worktree auto-built. This pins the migration against the real DB so a
     // rebuild cannot silently resurrect write-typed (queueing) discussions.
     for (const type of ['thread', 'spec', 'issue', 'debug']) {
-      const effective = await repo.getEffective(USER, type);
+      const effective = await repo.getEffective(WS, type);
       expect(effective).toMatchObject({
         writeIntent: 'presence',
         studioPolicy: 'reuse-only',
@@ -189,17 +251,17 @@ d('thread-key registry + pin integrity (real DB)', () => {
   });
 
   it('registry round-trip: override shadows template, reset restores it', async () => {
-    const before = await repo.getEffective(USER, 'debug');
+    const before = await repo.getEffective(WS, 'debug');
     expect(before).toMatchObject({ writeIntent: 'presence', source: 'template' });
 
     overrideTypes.push('debug');
-    await repo.setOverride(USER, 'debug', { writeIntent: 'write', studioPolicy: 'provision' });
-    const overridden = await repo.getEffective(USER, 'debug');
+    await repo.setOverride(WS, 'debug', { writeIntent: 'write', studioPolicy: 'provision' });
+    const overridden = await repo.getEffective(WS, 'debug');
     expect(overridden).toMatchObject({ studioPolicy: 'provision', source: 'override' });
 
-    const removed = await repo.clearOverride(USER, 'debug');
+    const removed = await repo.clearOverride(WS, 'debug');
     expect(removed).toBe(true);
-    const after = await repo.getEffective(USER, 'debug');
+    const after = await repo.getEffective(WS, 'debug');
     expect(after).toMatchObject({ studioPolicy: 'reuse-only', source: 'template' });
   });
 
@@ -213,8 +275,9 @@ d('thread-key registry + pin integrity (real DB)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: `${SLUG}:issue:${marker}`,
-        user_id: USER,
-        created_by_agent_id: 'echo',
+        workspace_id: WS,
+        created_by_kind: 'sb',
+        created_by_sb_id: ECHO_SB,
         key_project: 'FORGED',
         key_type: 'FORGED',
         key_id: 'FORGED',
@@ -226,14 +289,15 @@ d('thread-key registry + pin integrity (real DB)', () => {
     expect(data).toMatchObject({ key_project: SLUG, key_type: 'issue', key_id: marker });
   });
 
-  it('moving a type override to a colliding owner is rejected (owner-change bypass)', async () => {
+  it('moving a type override to a colliding workspace is rejected (owner-change bypass)', async () => {
     // Round-3 blocker 2 (Lumen): the namespace triggers fired on name changes
-    // only, so type 'x' created under user B could be MOVED to user A who
-    // owns project slug 'x'. They now fire on owner changes too.
+    // only, so type 'x' created under namespace B could be MOVED to
+    // namespace A which owns project slug 'x'. They now fire on workspace
+    // changes too (the namespace is the workspace since the cutover).
     const { data: victim, error: insErr } = await client
       .from('thread_key_types')
       .insert({
-        user_id: OTHER_USER,
+        workspace_id: OTHER_WS,
         type: SLUG,
         write_intent: 'write',
         studio_policy: 'reuse-only',
@@ -245,7 +309,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
     try {
       const { error: moveErr } = await client
         .from('thread_key_types')
-        .update({ user_id: USER })
+        .update({ workspace_id: WS })
         .eq('id', victim!.id);
       expect(moveErr?.message).toMatch(/collides/);
     } finally {
@@ -262,7 +326,12 @@ d('thread-key registry + pin integrity (real DB)', () => {
       const name = `race-${Date.now()}-${round}`;
       const claimType = client
         .from('thread_key_types')
-        .insert({ user_id: USER, type: name, write_intent: 'write', studio_policy: 'reuse-only' })
+        .insert({
+          workspace_id: WS,
+          type: name,
+          write_intent: 'write',
+          studio_policy: 'reuse-only',
+        })
         .select('id')
         .single();
       const claimSlug = client
@@ -283,7 +352,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
       expect(winners).toBe(1);
 
       if (!typeRes.error) {
-        await client.from('thread_key_types').delete().eq('user_id', USER).eq('type', name);
+        await client.from('thread_key_types').delete().eq('workspace_id', WS).eq('type', name);
       }
     }
   });
@@ -297,7 +366,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
   it('alias grammar is CHECKed like slugs', async () => {
     const { error } = await client
       .from('project_slug_aliases')
-      .insert({ user_id: USER, alias: 'Bad_Alias', project_id: projectId! });
+      .insert({ user_id: USER, workspace_id: WS, alias: 'Bad_Alias', project_id: projectId! });
     expect(error?.message).toMatch(/project_slug_aliases_alias_check/);
   });
 
@@ -306,14 +375,22 @@ d('thread-key registry + pin integrity (real DB)', () => {
     // blocker 1: the original table resolved user A's keys to user B's slug).
     const { data: otherProj, error: opErr } = await client
       .from('projects')
-      .insert({ user_id: OTHER_USER, name: `TK Other ${Date.now()}`, slug: 'tkitestother' })
+      .insert({
+        user_id: OTHER_USER,
+        workspace_id: OTHER_WS,
+        name: `TK Other ${Date.now()}`,
+        slug: 'tkitestother',
+      })
       .select('id')
       .single();
     expect(opErr).toBeNull();
     try {
-      const { error } = await client
-        .from('project_slug_aliases')
-        .insert({ user_id: USER, alias: 'tkitestforeign', project_id: otherProj!.id });
+      const { error } = await client.from('project_slug_aliases').insert({
+        user_id: USER,
+        workspace_id: WS,
+        alias: 'tkitestforeign',
+        project_id: otherProj!.id,
+      });
       expect(error?.message).toMatch(/must belong to the target project's owner/);
     } finally {
       await client.from('projects').delete().eq('id', otherProj!.id);
@@ -323,14 +400,14 @@ d('thread-key registry + pin integrity (real DB)', () => {
   it('an aliased project cannot clear its slug, and an owner move carries the alias', async () => {
     const { data: proj2, error: p2Err } = await client
       .from('projects')
-      .insert({ user_id: USER, name: `TK Move ${Date.now()}`, slug: 'tkitest2' })
+      .insert({ user_id: USER, workspace_id: WS, name: `TK Move ${Date.now()}`, slug: 'tkitest2' })
       .select('id')
       .single();
     expect(p2Err).toBeNull();
     try {
       const { error: a2Err } = await client
         .from('project_slug_aliases')
-        .insert({ user_id: USER, alias: 'tkitest2alias', project_id: proj2!.id });
+        .insert({ user_id: USER, workspace_id: WS, alias: 'tkitest2alias', project_id: proj2!.id });
       expect(a2Err).toBeNull();
 
       // Slug clear while aliased: rejected (blocker 2 — the alias would
@@ -341,29 +418,31 @@ d('thread-key registry + pin integrity (real DB)', () => {
         .eq('id', proj2!.id);
       expect(clearErr?.message).toMatch(/cannot clear the slug/);
 
-      // Owner move: the alias follows the project, exactly like the slug
-      // itself does (blocker 1's owner-move variant).
+      // Owner move — owner AND workspace, the project's namespace: the alias
+      // follows the project, exactly like the slug itself does (blocker 1's
+      // owner-move variant).
       const { error: moveErr } = await client
         .from('projects')
-        .update({ user_id: OTHER_USER })
+        .update({ user_id: OTHER_USER, workspace_id: OTHER_WS })
         .eq('id', proj2!.id);
       expect(moveErr).toBeNull();
       const { data: moved } = await client
         .from('project_slug_aliases')
-        .select('user_id')
+        .select('user_id, workspace_id')
         .eq('alias', 'tkitest2alias')
         .single();
       expect(moved?.user_id).toBe(OTHER_USER);
+      expect(moved?.workspace_id).toBe(OTHER_WS);
 
-      // The alias now parses for the NEW owner and no longer for the old.
+      // The alias now parses in the NEW workspace and no longer in the old.
       const { data: newParse } = await client.rpc('compute_thread_key_pin', {
-        p_user_id: OTHER_USER,
+        p_workspace_id: OTHER_WS,
         p_key: 'tkitest2alias:pr:1',
       });
       const np = (Array.isArray(newParse) ? newParse[0] : newParse) as NonNullable<typeof newParse>;
       expect(np.o_project).toBe('tkitest2');
       const { data: oldParse } = await client.rpc('compute_thread_key_pin', {
-        p_user_id: USER,
+        p_workspace_id: WS,
         p_key: 'tkitest2alias:pr:1',
       });
       const op = (Array.isArray(oldParse) ? oldParse[0] : oldParse) as NonNullable<typeof oldParse>;
@@ -378,17 +457,17 @@ d('thread-key registry + pin integrity (real DB)', () => {
     // An alias colliding with a registered (builtin) type is rejected.
     const { error: aliasVsType } = await client
       .from('project_slug_aliases')
-      .insert({ user_id: USER, alias: 'pr', project_id: projectId! });
+      .insert({ user_id: USER, workspace_id: WS, alias: 'pr', project_id: projectId! });
     expect(aliasVsType?.message).toMatch(/collides with a registered thread-key type/);
 
     // A type override colliding with an existing alias is rejected.
     const { data: typeRow, error: typeVsAlias } = await client
       .from('thread_key_types')
-      .insert({ user_id: USER, type: ALIAS, write_intent: 'write', studio_policy: 'reuse-only' })
+      .insert({ workspace_id: WS, type: ALIAS, write_intent: 'write', studio_policy: 'reuse-only' })
       .select('id')
       .single();
     if (typeRow) raceTypeIds.push(typeRow.id);
-    expect(typeVsAlias?.message).toMatch(/collides with your project slug alias/);
+    expect(typeVsAlias?.message).toMatch(/collides with a project slug alias in this workspace/);
   });
 
   it('the alias-insert vs slug-clear race has exactly one winner', async () => {
@@ -397,15 +476,18 @@ d('thread-key registry + pin integrity (real DB)', () => {
     // the aliases, and each side passes its own snapshot check.
     const { data: proj3, error: p3Err } = await client
       .from('projects')
-      .insert({ user_id: USER, name: `TK Race ${Date.now()}`, slug: 'tkitest3' })
+      .insert({ user_id: USER, workspace_id: WS, name: `TK Race ${Date.now()}`, slug: 'tkitest3' })
       .select('id')
       .single();
     expect(p3Err).toBeNull();
     try {
       const [aliasRes, clearRes] = await Promise.all([
-        client
-          .from('project_slug_aliases')
-          .insert({ user_id: USER, alias: 'tkitest3alias', project_id: proj3!.id }),
+        client.from('project_slug_aliases').insert({
+          user_id: USER,
+          workspace_id: WS,
+          alias: 'tkitest3alias',
+          project_id: proj3!.id,
+        }),
         client.from('projects').update({ slug: null }).eq('id', proj3!.id),
       ]);
       const aliasWon = aliasRes.error === null;
@@ -419,7 +501,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
   it('TS parser and SQL compute_thread_key_pin agree (parity guard)', async () => {
     // The lookup comes from the PRODUCTION loader, so this also guards the
     // service's alias join against the SQL alias branch.
-    const lookup = await new ThreadKeyService(client).projectSlugLookup(USER);
+    const lookup = await new ThreadKeyService(client).projectSlugLookup(WS);
     const cases = [
       `${SLUG}:pr:42`, // project-prefixed
       `${SLUG}:pr:42:with:colons`, // composite id under a project
@@ -435,7 +517,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
     for (const key of cases) {
       const ts = parseThreadKey(key, lookup);
       const { data, error } = await client.rpc('compute_thread_key_pin', {
-        p_user_id: USER,
+        p_workspace_id: WS,
         p_key: key,
       });
       expect(error).toBeNull();

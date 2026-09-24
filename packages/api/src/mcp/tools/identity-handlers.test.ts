@@ -12,6 +12,11 @@ import {
 } from './identity-handlers';
 import { createMockSupabaseClient, type MockSupabaseClient } from '../../test/mocks/supabase.mock';
 
+// First-save tests must not seed reminders in the operator's database.
+vi.mock('../../services/heartbeat', () => ({
+  ensureDefaultReminders: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock the user-resolver module
 vi.mock('../../services/user-resolver', () => ({
   userIdentifierBaseSchema: {

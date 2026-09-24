@@ -35,6 +35,14 @@ export interface SpineThreadRow {
   participants: string[];
   /** Newest deliverable message, when the route fetched one. */
   lastMessage?: ThreadLastMessage | null;
+  /** People on the thread, named for the viewer — never woken, never in `participants`. */
+  people?: SpinePerson[];
+}
+
+export interface SpinePerson {
+  userId: string;
+  name: string;
+  isOwn: boolean;
 }
 
 export interface SpineSessionRow {
@@ -94,6 +102,7 @@ export interface ThreadSpine {
     status: string;
     createdBySlug: string;
     participants: string[];
+    people: SpinePerson[];
     closedAt: string | null;
     /** Newest deliverable (non-system) message; null when there is none. */
     lastMessage: ThreadLastMessage | null;
@@ -380,6 +389,9 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
       status: t.status,
       createdBySlug: t.createdBySlug,
       participants: t.participants,
+      // Carried through, not merged into `participants`: a person is not an
+      // agent to wake (Lumen, #620 — the merger used to drop this).
+      people: t.people ?? [],
       closedAt: t.closedAt,
       lastMessage: t.lastMessage ?? null,
     };

@@ -37,8 +37,10 @@ const API_SRC = resolve(__dirname, '../..');
  *                                 refusedBeforeAcceptance), and the queue
  *                                 flush (decides whether queued work is
  *                                 discarded)
- *   server.ts                 x1  the trigger:error listener (decides whether
- *                                 a retry is scheduled)
+ *   trigger-failure-listener  x1  the trigger:error listener (decides whether
+ *                                 a retry is scheduled) — lifted out of
+ *                                 server.ts so it runs over a table-backed
+ *                                 client (#618); the decision is unchanged
  *   heartbeat-escalation.ts   x1  the channel alert and the durable inbox copy
  *
  * A fallback is not a loophole: a spawn failure, an internal throw, or a
@@ -47,9 +49,9 @@ const API_SRC = resolve(__dirname, '../..');
  * never cut.
  */
 const EXPECTED_CALL_SITES: Record<string, number> = {
-  'server.ts': 1,
   'services/heartbeat-escalation.ts': 1,
   'services/sessions/session-service.ts': 2,
+  'services/trigger-failure-listener.ts': 1,
 };
 
 function sourceFiles(dir: string): string[] {

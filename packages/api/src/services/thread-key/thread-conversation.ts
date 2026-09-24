@@ -15,7 +15,7 @@
  * window, with no per-thread round trip and no migration.
  */
 export const LAST_MESSAGE_EMBED =
-  'last_message:inbox_thread_messages(id, sender_agent_id, content, message_type, metadata, created_at)';
+  'last_message:inbox_thread_messages(id, sender_kind, sender_agent_id, sender_user_id, content, message_type, created_at)';
 
 /**
  * How much of a message the browse list carries. The list only ever shows
@@ -57,13 +57,14 @@ export function withLastMessage<Q>(query: Q): Q {
 
 export interface ThreadLastMessage {
   id: string;
+  /** The author's principal kind (spec inkmail-thread-scope §3). */
+  senderKind: 'sb' | 'user' | 'system';
+  /** The SB's slug; for a person or the system, the kind. */
   senderSlug: string;
-  /**
-   * A person wrote it. Human replies land with the sender slot 'unknown' and
-   * metadata.sentBy = 'user' (see POST /threads/reply) until the principal
-   * columns of spec inkmail-thread-scope §3 land.
-   */
-  sentByUser: boolean;
+  /** Named for the viewer: the SB's slug, a person's name, or 'system'. */
+  senderName: string;
+  /** The viewer wrote it. */
+  isOwn: boolean;
   messageType: string;
   /** Whitespace-collapsed and capped at PREVIEW_MAX_CHARS. */
   preview: string;
@@ -72,10 +73,11 @@ export interface ThreadLastMessage {
 
 interface LastMessageRow {
   id: string;
-  sender_agent_id: string;
+  sender_kind: string;
+  sender_agent_id: string | null;
+  sender_user_id: string | null;
   content: string | null;
   message_type: string;
-  metadata: unknown;
   created_at: string;
 }
 
@@ -86,23 +88,39 @@ export function previewText(content: string, max: number = PREVIEW_MAX_CHARS): s
   return `${flat.slice(0, max - 1).trimEnd()}…`;
 }
 
+function lastMessageRow(embed: unknown): LastMessageRow | undefined {
+  return Array.isArray(embed) ? (embed as LastMessageRow[])[0] : undefined;
+}
+
+/** The person who wrote the embedded message, to be named with the rest. */
+export function lastMessageUserIds(embed: unknown): string[] {
+  const row = lastMessageRow(embed);
+  return row?.sender_kind === 'user' && row.sender_user_id ? [row.sender_user_id] : [];
+}
+
 /**
  * The `last_message` embed as the list carries it. PostgREST answers a
  * to-many embed as an array; an empty one (no deliverable message yet) is
- * null here, never a fabricated preview.
+ * null here, never a fabricated preview. `describePerson` names a person
+ * author for the viewer and says whether it is them — the same labelling
+ * the conversation's own messages get.
  */
-export function toLastMessage(embed: unknown): ThreadLastMessage | null {
-  const rows = Array.isArray(embed) ? (embed as LastMessageRow[]) : [];
-  const row = rows[0];
+export function toLastMessage(
+  embed: unknown,
+  describePerson: (userId: string) => { name: string; isOwn: boolean }
+): ThreadLastMessage | null {
+  const row = lastMessageRow(embed);
   if (!row) return null;
-  const metadata =
-    row.metadata && typeof row.metadata === 'object'
-      ? (row.metadata as Record<string, unknown>)
-      : null;
+  const senderKind: ThreadLastMessage['senderKind'] =
+    row.sender_kind === 'sb' || row.sender_kind === 'user' ? row.sender_kind : 'system';
+  const person =
+    senderKind === 'user' && row.sender_user_id ? describePerson(row.sender_user_id) : null;
   return {
     id: row.id,
-    senderSlug: row.sender_agent_id,
-    sentByUser: metadata?.sentBy === 'user',
+    senderKind,
+    senderSlug: row.sender_agent_id ?? senderKind,
+    senderName: person?.name ?? (senderKind === 'sb' ? (row.sender_agent_id ?? 'an SB') : 'system'),
+    isOwn: person?.isOwn ?? false,
     messageType: row.message_type,
     preview: previewText(row.content ?? ''),
     createdAt: row.created_at,

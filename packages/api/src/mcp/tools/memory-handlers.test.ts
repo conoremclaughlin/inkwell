@@ -49,6 +49,14 @@ vi.mock('../../utils/logger', () => ({
 }));
 
 // Mock request-context
+// Project lists follow the caller's workspace (spec inkmail-thread-scope
+// §1b); the resolver is mocked so these tests stay about memory.
+vi.mock('./caller-principal', () => ({
+  resolveCallerWorkspace: vi.fn(async () => ({ workspaceId: 'ws-1', sb: null, role: 'owner' })),
+  resolveCallerSb: vi.fn(),
+  assertWriteRole: vi.fn(),
+}));
+
 vi.mock('../../utils/request-context', () => ({
   setSessionContext: vi.fn(),
   getSessionContext: vi.fn().mockReturnValue(undefined),
@@ -88,7 +96,7 @@ function createMockDataComposer() {
   };
 
   const mockProjectsRepo = {
-    findAllByUser: vi.fn(),
+    findAllByWorkspace: vi.fn(),
   };
 
   const mockProjectTasksRepo = {
@@ -1252,7 +1260,7 @@ describe('handleUpdateSessionState', () => {
         id: 'memory-104',
         content: 'test',
       });
-      mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
+      mockDataComposer.repositories.projects.findAllByWorkspace.mockResolvedValue([
         { id: 'project-1', name: 'Inkwell' },
       ]);
       mockDataComposer.repositories.tasks.create.mockResolvedValue({
@@ -1297,7 +1305,7 @@ describe('handleUpdateSessionState', () => {
         id: 'memory-105',
         content: 'test',
       });
-      mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
+      mockDataComposer.repositories.projects.findAllByWorkspace.mockResolvedValue([
         { id: 'project-1', name: 'Inkwell' },
       ]);
       mockDataComposer.repositories.tasks.create.mockResolvedValue({
@@ -1335,7 +1343,7 @@ describe('handleUpdateSessionState', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.projects.findAllByUser).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.projects.findAllByWorkspace).not.toHaveBeenCalled();
       expect(mockDataComposer.repositories.tasks.create).not.toHaveBeenCalled();
     });
 
@@ -1361,7 +1369,7 @@ describe('handleUpdateSessionState', () => {
         id: 'memory-107',
         content: 'test',
       });
-      mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
+      mockDataComposer.repositories.projects.findAllByWorkspace.mockResolvedValue([
         { id: 'project-1', name: 'Inkwell' },
       ]);
       mockDataComposer.repositories.tasks.create.mockRejectedValue(
@@ -1389,7 +1397,7 @@ describe('handleUpdateSessionState', () => {
         id: 'memory-108',
         content: 'test',
       });
-      mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([]);
+      mockDataComposer.repositories.projects.findAllByWorkspace.mockResolvedValue([]);
 
       const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'blocked:test', createTask: true },

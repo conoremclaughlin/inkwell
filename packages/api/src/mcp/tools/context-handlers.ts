@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
+import { assertWriteRole, resolveCallerWorkspace } from './caller-principal';
 
 // =====================================================
 // PROJECT TOOLS
@@ -42,17 +43,24 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
   const params = saveProjectSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  // A project lives in a workspace (spec inkmail-thread-scope §1b): the
+  // caller's SB workspace when an SB is calling, else the person's personal
+  // workspace. Server-resolved, never a caller-claimed value.
+  const { workspaceId, role } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  assertWriteRole(role, 'save a project');
+
   // Reserved-name rule (thread-key-grammar v2): a project slug must not
-  // collide with a registered thread-key TYPE — template or this user's
-  // override. That collision is the grammar's one structural ambiguity
-  // ("is pr:... segment 1 a project or a type?"), killed at write time.
+  // collide with a registered thread-key TYPE — template or this
+  // workspace's override. That collision is the grammar's one structural
+  // ambiguity ("is pr:... segment 1 a project or a type?"), killed at
+  // write time.
   if (params.slug) {
     const { data: typeRows, error: typeErr } = await dataComposer
       .getClient()
       .from('thread_key_types')
-      .select('type, user_id')
+      .select('type, workspace_id')
       .eq('type', params.slug)
-      .or(`user_id.is.null,user_id.eq.${user.id}`);
+      .or(`workspace_id.is.null,workspace_id.eq.${workspaceId}`);
     if (typeErr) {
       // Fail closed: cannot prove no collision -> refuse, never guess.
       throw new Error(`Could not verify slug against thread-key types: ${typeErr.message}`);
@@ -67,6 +75,7 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
 
   const project = await dataComposer.repositories.projects.upsertByName({
     user_id: user.id,
+    workspace_id: workspaceId,
     name: params.name,
     description: params.description,
     status: params.status,
@@ -111,9 +120,17 @@ export async function handleListProjects(args: unknown, dataComposer: DataCompos
   const params = listProjectsSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const projects = await dataComposer.repositories.projects.findAllByUser(user.id, params.status);
+  // Reads follow the same namespace as writes (spec inkmail-thread-scope
+  // §1b): the caller's workspace, whoever created each project. Scoped by
+  // owner, a member could update a colleague's project and then not list
+  // it (Lumen, #622).
+  const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  const projects = await dataComposer.repositories.projects.findAllByWorkspace(
+    workspaceId,
+    params.status
+  );
 
-  logger.info(`Listed ${projects.length} projects for user ${user.id}`);
+  logger.info(`Listed ${projects.length} projects in workspace ${workspaceId} for user ${user.id}`);
 
   return {
     content: [
@@ -147,15 +164,19 @@ export async function handleGetProject(args: unknown, dataComposer: DataComposer
   const params = getProjectSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  // A project is readable by its workspace's members, not only its creator.
+  const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
   let project;
   if (params.projectId) {
     project = await dataComposer.repositories.projects.findById(params.projectId);
-    // Verify ownership
-    if (project && project.user_id !== user.id) {
+    if (project && project.workspace_id !== workspaceId) {
       project = null;
     }
   } else if (params.name) {
-    project = await dataComposer.repositories.projects.findByUserAndName(user.id, params.name);
+    project = await dataComposer.repositories.projects.findByWorkspaceAndName(
+      workspaceId,
+      params.name
+    );
   }
 
   if (!project) {
@@ -227,8 +248,9 @@ export async function handleSetFocus(args: unknown, dataComposer: DataComposer) 
   // Resolve project if name provided
   let projectId = params.projectId;
   if (params.projectName && !projectId) {
-    const project = await dataComposer.repositories.projects.findByUserAndName(
-      user.id,
+    const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+    const project = await dataComposer.repositories.projects.findByWorkspaceAndName(
+      workspaceId,
       params.projectName
     );
     if (project) {

@@ -68,6 +68,7 @@ import type {
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
+import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 
 /**
  * Configuration for SessionService.
@@ -814,10 +815,16 @@ export class SessionService implements ISessionService {
     }
 
     try {
+      // The thread is one row per (workspace, key), and the participant row
+      // is keyed by identity: without a canonical identity there is no
+      // workspace to look in, so a slug-only match is refused (fail closed).
+      if (!ctx.sbId) return false;
+      const workspaceId = await workspaceOfSb(this.supabase, ctx.sbId);
+      if (!workspaceId) return false;
       const { data: thread, error: threadErr } = await this.supabase
         .from('inbox_threads')
         .select('id')
-        .eq('user_id', ctx.userId)
+        .eq('workspace_id', workspaceId)
         .eq('thread_key', ctx.threadKey)
         .maybeSingle();
       if (threadErr || !thread) return false;
@@ -826,7 +833,7 @@ export class SessionService implements ISessionService {
         .from('inbox_thread_participants')
         .select('session_id')
         .eq('thread_id', thread.id)
-        .eq('agent_id', ctx.sbSlug)
+        .eq('sb_id', ctx.sbId)
         .maybeSingle();
       if (partErr || participant?.session_id !== holder.sessionId) return false;
 
@@ -1140,20 +1147,28 @@ export class SessionService implements ISessionService {
    */
   private async resolveThreadBehavior(
     userId: string,
+    sbId: string | null,
     threadKey: string
   ): Promise<{ writeIntent: WriteIntent; studioPolicy: StudioPolicy }> {
     const fallback = { writeIntent: 'write', studioPolicy: 'reuse-only' } as const;
     if (!this.supabase) return fallback;
     try {
+      // The registry and the thread are workspace-scoped (§1b): the
+      // identity's workspace when the session has one, the user's personal
+      // workspace otherwise.
+      const workspaceId = sbId
+        ? await workspaceOfSb(this.supabase, sbId)
+        : await personalWorkspaceOf(this.supabase, userId);
+      if (!workspaceId) return fallback;
       const { data, error } = await this.supabase
         .from('inbox_threads')
         .select('key_type')
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .eq('thread_key', threadKey)
         .maybeSingle();
       if (error) return fallback;
       const service = new ThreadKeyService(this.supabase);
-      const behavior = await service.typeBehavior(userId, data?.key_type ?? null);
+      const behavior = await service.typeBehavior(workspaceId, data?.key_type ?? null);
       return { writeIntent: behavior.writeIntent, studioPolicy: behavior.studioPolicy };
     } catch {
       return fallback;
@@ -2695,7 +2710,7 @@ export class SessionService implements ISessionService {
     // and both overflow entry points consult it. Without a threadKey neither
     // gate runs at all, so the values are inert.
     const { writeIntent, studioPolicy } = options?.threadKey
-      ? await this.resolveThreadBehavior(userId, options.threadKey)
+      ? await this.resolveThreadBehavior(userId, identitySbId, options.threadKey)
       : ({ writeIntent: 'write', studioPolicy: 'provision' } as const);
 
     let routing = await this.resolveStudioId(userId, sbSlug, {

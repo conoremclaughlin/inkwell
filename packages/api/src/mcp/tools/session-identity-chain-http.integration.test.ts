@@ -36,13 +36,17 @@ describe('Session Identity Chain — HTTP Integration', () => {
   let mcpServer: MCPServer;
   let baseUrl: string;
   let testToken: string;
+  // Threads are workspace rows since the cutover (spec inkmail-thread-scope
+  // §1): echo's sends land in the fixture user's personal workspace.
+  let workspaceId: string;
   const createdSessionIds: string[] = [];
   const createdStudioIds: string[] = [];
   const createdThreadKeys: string[] = [];
 
   beforeAll(async () => {
     dataComposer = await getDataComposer();
-    await ensureEchoIntegrationFixture(dataComposer);
+    const fixture = await ensureEchoIntegrationFixture(dataComposer);
+    workspaceId = fixture.workspaceId;
 
     // Sign a test JWT for the integration test user + echo agent
     testToken = signInkAccessToken(
@@ -93,7 +97,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
         .from('inbox_threads' as never)
         .select('id')
         .eq('thread_key', tk)
-        .eq('user_id', INTEGRATION_TEST_USER_ID)
+        .eq('workspace_id', workspaceId)
         .maybeSingle();
 
       if (thread) {
@@ -330,7 +334,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
       .from('inbox_threads' as never)
       .select('id')
       .eq('thread_key', threadKey)
-      .eq('user_id', INTEGRATION_TEST_USER_ID)
+      .eq('workspace_id', workspaceId)
       .maybeSingle();
 
     expect(thread).not.toBeNull();
@@ -426,7 +430,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
       .from('inbox_threads' as never)
       .select('id')
       .eq('thread_key', threadKey)
-      .eq('user_id', INTEGRATION_TEST_USER_ID)
+      .eq('workspace_id', workspaceId)
       .maybeSingle();
 
     expect(thread).not.toBeNull();
@@ -484,7 +488,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
       .from('inbox_threads' as never)
       .select('id')
       .eq('thread_key', threadKey)
-      .eq('user_id', INTEGRATION_TEST_USER_ID)
+      .eq('workspace_id', workspaceId)
       .maybeSingle();
 
     expect(thread).not.toBeNull();

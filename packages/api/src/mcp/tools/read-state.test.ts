@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state';
 
+// The pointer belongs to a principal (spec inkmail-thread-scope §3): an SB
+// by identity id, or a person by user id — exactly one of the two.
 const PARAMS = {
   threadId: 'thread-1',
-  sbSlug: 'wren',
+  sbId: 'sb-wren',
   throughMessageId: 'msg-9',
   source: 'test',
 };
@@ -15,9 +17,48 @@ describe('advanceThreadReadPointer', () => {
     expect(ok).toBe(true);
     expect(rpc).toHaveBeenCalledWith('advance_thread_read_pointer', {
       p_thread_id: 'thread-1',
-      p_agent_id: 'wren',
+      p_sb_id: 'sb-wren',
+      p_user_id: null,
       p_through_message_id: 'msg-9',
     });
+  });
+
+  it("advances a person's pointer by user id, in the same table", async () => {
+    const rpc = vi.fn().mockResolvedValue({ data: '2026-08-06T00:00:00Z', error: null });
+    const ok = await advanceThreadReadPointer(
+      { rpc },
+      { threadId: 'thread-1', userId: 'user-1', throughMessageId: 'msg-9', source: 'test' }
+    );
+    expect(ok).toBe(true);
+    expect(rpc).toHaveBeenCalledWith('advance_thread_read_pointer', {
+      p_thread_id: 'thread-1',
+      p_sb_id: null,
+      p_user_id: 'user-1',
+      p_through_message_id: 'msg-9',
+    });
+  });
+
+  it('refuses a call naming no principal, or both, without touching the database', async () => {
+    const rpc = vi.fn().mockResolvedValue({ data: null, error: null });
+    await expect(
+      advanceThreadReadPointer(
+        { rpc },
+        { threadId: 'thread-1', throughMessageId: 'msg-9', source: 'test' }
+      )
+    ).resolves.toBe(false);
+    await expect(
+      advanceThreadReadPointer(
+        { rpc },
+        {
+          threadId: 'thread-1',
+          sbId: 'sb-wren',
+          userId: 'user-1',
+          throughMessageId: 'msg-9',
+          source: 'test',
+        }
+      )
+    ).resolves.toBe(false);
+    expect(rpc).not.toHaveBeenCalled();
   });
 
   it('returns false and does not throw when the RPC reports an error', async () => {

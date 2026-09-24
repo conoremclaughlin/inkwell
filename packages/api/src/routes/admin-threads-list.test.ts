@@ -220,8 +220,10 @@ interface Spine {
     summary: string | null;
     lastMessage: {
       id: string;
+      senderKind: string;
       senderSlug: string;
-      sentByUser: boolean;
+      senderName: string;
+      isOwn: boolean;
       messageType: string;
       preview: string;
       createdAt: string;
@@ -369,12 +371,15 @@ describe('GET /threads', () => {
   });
 
   describe('last message preview', () => {
+    // Authors are principals (spec inkmail-thread-scope §3): an SB with its
+    // display slug, a person by user id, or the system with neither.
     const message = (over: Record<string, unknown> = {}) => ({
       id: 'msg-1',
+      sender_kind: 'sb',
       sender_agent_id: 'lumen',
+      sender_user_id: null,
       content: 'Reviewed.',
       message_type: 'message',
-      metadata: {},
       created_at: ago(10),
       ...over,
     });
@@ -395,7 +400,8 @@ describe('GET /threads', () => {
               // Newer still, but a system event: not a preview, not unread.
               message({
                 id: 'closed-event',
-                sender_agent_id: 'system',
+                sender_kind: 'system',
+                sender_agent_id: null,
                 content: 'Thread closed',
                 message_type: 'system',
                 created_at: ago(1),
@@ -406,24 +412,50 @@ describe('GET /threads', () => {
       });
       expect(spine.thread?.lastMessage).toEqual({
         id: 'newest',
+        senderKind: 'sb',
         senderSlug: 'lumen',
-        sentByUser: false,
+        senderName: 'lumen',
+        isOwn: false,
         messageType: 'message',
         preview: 'Round 2: **approve** — ship it',
         createdAt: newestAt,
       });
     });
 
-    it("marks a person's reply as sent by a person", async () => {
-      const [spine] = await listSpines({
+    /**
+     * Two people in one workspace: the viewer's own reply is theirs, and the
+     * other person's is named and NOT theirs — it is news to the viewer.
+     */
+    it('names a person author for the viewer, and says which one is them', async () => {
+      const person = (userId: string) =>
+        message({ sender_kind: 'user', sender_agent_id: null, sender_user_id: userId });
+      const users = [
+        { id: 'user-1', first_name: 'Ada', last_name: 'Viewer' },
+        { id: 'user-2', first_name: 'Grace', last_name: 'Other' },
+      ];
+      const spines = await listSpines({
         inbox_threads: [
+          threadRow({ last_message: [person('user-1')] }),
           threadRow({
-            last_message: [message({ sender_agent_id: 'unknown', metadata: { sentBy: 'user' } })],
+            id: 'thread-2',
+            thread_key: 'inkwell:pr:2',
+            last_message: [person('user-2')],
           }),
         ],
+        users,
       });
-      expect(spine.thread?.lastMessage?.sentByUser).toBe(true);
-      expect(spine.thread?.lastMessage?.senderSlug).toBe('unknown');
+      const byKey = Object.fromEntries(spines.map((s) => [s.key, s.thread?.lastMessage]));
+      expect(byKey['inkwell:pr:632']).toMatchObject({
+        senderKind: 'user',
+        senderSlug: 'user',
+        senderName: 'Ada Viewer',
+        isOwn: true,
+      });
+      expect(byKey['inkwell:pr:2']).toMatchObject({
+        senderKind: 'user',
+        senderName: 'Grace Other',
+        isOwn: false,
+      });
     });
 
     it('answers null for a thread with only system events, and keeps the thread', async () => {

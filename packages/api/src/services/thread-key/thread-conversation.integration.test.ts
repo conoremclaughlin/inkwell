@@ -24,6 +24,8 @@ describe('thread conversation reads (integration)', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let supabase: any;
   let userId: string;
+  let workspaceId: string;
+  let echoSbId: string;
   const threadIds: string[] = [];
   const run = `${Date.now()}`;
 
@@ -32,8 +34,9 @@ describe('thread conversation reads (integration)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: `test:chat-${label}-${run}`,
-        user_id: userId,
-        created_by_agent_id: 'echo',
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         title: `chat fixture ${label}`,
       })
       .select('id')
@@ -43,13 +46,21 @@ describe('thread conversation reads (integration)', () => {
     return data.id as string;
   }
 
+  /** Authored by the echo SB, by the fixture person, or by the system (spec §3). */
   async function message(
     threadId: string,
-    over: { content: string; created_at: string; message_type?: string }
+    over: { content: string; created_at: string; message_type?: string },
+    author: 'sb' | 'user' | 'system' = over.message_type === 'system' ? 'system' : 'sb'
   ): Promise<string> {
+    const principal =
+      author === 'sb'
+        ? { sender_kind: 'sb', sender_sb_id: echoSbId, sender_agent_id: 'echo' }
+        : author === 'user'
+          ? { sender_kind: 'user', sender_user_id: userId }
+          : { sender_kind: 'system' };
     const { data, error } = await supabase
       .from('inbox_thread_messages')
-      .insert({ thread_id: threadId, sender_agent_id: 'echo', ...over })
+      .insert({ thread_id: threadId, ...principal, ...over })
       .select('id')
       .single();
     if (error) throw new Error(`Failed to insert message: ${error.message}`);
@@ -59,7 +70,10 @@ describe('thread conversation reads (integration)', () => {
   beforeAll(async () => {
     const dataComposer = await getDataComposer();
     supabase = dataComposer.getClient();
-    userId = (await ensureEchoIntegrationFixture(dataComposer)).userId;
+    const fixture = await ensureEchoIntegrationFixture(dataComposer);
+    userId = fixture.userId;
+    workspaceId = fixture.workspaceId;
+    echoSbId = fixture.echoSbId;
   });
 
   afterAll(async () => {
@@ -75,10 +89,13 @@ describe('thread conversation reads (integration)', () => {
     const eventsOnly = await thread('events-only');
 
     await message(chatty, { content: 'first', created_at: '2026-09-20T10:00:00Z' });
-    const newest = await message(chatty, {
-      content: 'newest real message',
-      created_at: '2026-09-20T11:00:00Z',
-    });
+    // The newest real message is a person's: the embed must carry the
+    // principal columns the preview names its author from.
+    const newest = await message(
+      chatty,
+      { content: 'newest real message', created_at: '2026-09-20T11:00:00Z' },
+      'user'
+    );
     // Newer than every real message, and must not win the preview.
     await message(chatty, {
       content: 'Thread closed',
@@ -95,7 +112,7 @@ describe('thread conversation reads (integration)', () => {
     const { data, error } = await withLastMessage(
       supabase.from('inbox_threads').select(`id, ${LAST_MESSAGE_EMBED}`)
     )
-      .eq('user_id', userId)
+      .eq('workspace_id', workspaceId)
       .in('id', [chatty, quiet, eventsOnly]);
     expect(error).toBeNull();
 
@@ -110,10 +127,20 @@ describe('thread conversation reads (integration)', () => {
     expect([...byId.keys()].sort()).toEqual([chatty, quiet, eventsOnly].sort());
     // The limit is per parent: each thread has exactly its own newest.
     expect(byId.get(chatty)).toHaveLength(1);
-    expect(toLastMessage(byId.get(chatty))?.id).toBe(newest);
-    expect(toLastMessage(byId.get(quiet))?.id).toBe(quietOnly);
+    const namePerson = (id: string) => ({ name: 'the fixture person', isOwn: id === userId });
+    expect(toLastMessage(byId.get(chatty), namePerson)).toMatchObject({
+      id: newest,
+      senderKind: 'user',
+      senderName: 'the fixture person',
+      isOwn: true,
+    });
+    expect(toLastMessage(byId.get(quiet), namePerson)).toMatchObject({
+      id: quietOnly,
+      senderKind: 'sb',
+      senderSlug: 'echo',
+    });
     expect(byId.get(eventsOnly)).toEqual([]);
-    expect(toLastMessage(byId.get(eventsOnly))).toBeNull();
+    expect(toLastMessage(byId.get(eventsOnly), namePerson)).toBeNull();
   });
 
   it('pages backwards through timestamp twins without skipping or repeating one', async () => {
