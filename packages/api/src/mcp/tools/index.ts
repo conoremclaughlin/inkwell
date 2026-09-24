@@ -6172,7 +6172,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'close_studio',
     {
-      description: `Close a git worktree studio and optionally clean worktree/branch.`,
+      description: `Close a git worktree studio and optionally clean worktree/branch. The session that holds the studio's lease closes it immediately (uncommitted work is rescue-stashed first; the directory you may be standing in is removed, so cd out first). A studio held by ANOTHER live session is deferred: its lease is marked for release at that holder's turn boundary and the call reports it.`,
       inputSchema: studioToolDefinitions[4].schema,
     },
     async (args: Record<string, unknown>) => {

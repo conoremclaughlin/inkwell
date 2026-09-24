@@ -82,6 +82,12 @@ jobs:
       - name: Pre-push commit replay
         run: sh scripts/check-push.test.sh
 
+      # The migration wrapper (run a file, record it under the file's own
+      # version) and the startup status parser, against stub supabase/psql
+      # commands: no Docker, no database.
+      - name: Migration ledger wrapper and status parser
+        run: sh scripts/db-migrate.test.sh
+
       # The integration-DB harness's endpoint isolation. Mock-only: synthetic
       # `supabase status` payloads, no Docker and no database. CI has no
       # ambient Supabase env, so the contamination this covers cannot arise

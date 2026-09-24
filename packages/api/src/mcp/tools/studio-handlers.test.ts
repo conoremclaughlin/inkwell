@@ -238,6 +238,46 @@ describe('close_studio rescues before removal (source order)', () => {
   });
 });
 
+describe('close_studio lets the holder close its own studio (source order, task e7752d29)', () => {
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'studio-handlers.ts'),
+    'utf-8'
+  );
+  const closeAt = source.indexOf('export async function handleCloseStudio(');
+  const releaseAt = source.indexOf('.releaseByStudio(', closeAt);
+  const deferredAt = source.indexOf("releaseOutcome === 'deferred'", releaseAt);
+
+  it('passes the caller session into the release, resolved before it', () => {
+    expect(closeAt).toBeGreaterThan(-1);
+    expect(releaseAt).toBeGreaterThan(closeAt);
+    const call = source.slice(releaseAt, deferredAt);
+    expect(call).toContain('callerSessionId');
+    const resolvedAt = source.lastIndexOf('const callerSessionId', releaseAt);
+    expect(resolvedAt).toBeGreaterThan(closeAt);
+  });
+
+  it('takes that session from the authorized ambient context, never from the typed arguments', () => {
+    // Everything between the handler's start and the release call: the
+    // ambient session is loaded and authorized there, and callerSessionId is
+    // read off that result, not off the parsed arguments.
+    const derivation = source.slice(closeAt, releaseAt);
+    expect(derivation).toContain(
+      'loadAuthorizedAmbientSession(dataComposer, closingUser.id, caller)'
+    );
+    expect(derivation).toContain('const callerSessionId = ambient.session?.id');
+    expect(derivation).not.toContain('parsed.sessionId');
+    // The close schema has no sessionId argument to spoof the holder with.
+    const schemaAt = source.indexOf('const closeStudioSchema');
+    const schema = source.slice(schemaAt, source.indexOf('});', schemaAt));
+    expect(schema).not.toContain('sessionId');
+  });
+
+  it('keeps the deferral for a holder that is a different live session', () => {
+    const refusal = source.slice(deferredAt, source.indexOf('}', deferredAt + 400));
+    expect(refusal).toContain('live session other than this one');
+  });
+});
+
 // ── Provenance: who made a studio, and why (studio-model piece 1) ──
 
 describe('create_studio / adopt_studio provenance', () => {

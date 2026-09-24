@@ -1704,10 +1704,22 @@ export class StudioLeaseService {
    * Release a studio's lease, or mark it pendingRelease when the holder's
    * process is still live. Wired into close_studio. Never releases a live
    * holder's worktree out from under it — the boundary completes the release.
+   *
+   * Except when the holder is the one asking. `callerSessionId` is the
+   * session the close request runs in, already loaded and authorized as the
+   * calling identity's own by the handler (never the typed argument). When
+   * it is the lease holder, the liveness rule is moot: the deferral exists
+   * to keep a worktree from being pulled out from under a session that did
+   * not ask for it, and this session did. It releases now, in one call.
+   * Without this, a session could never retire its own studio: the direct
+   * call deferred to a turn boundary that mid-turn prompts and a
+   * working-directory-keyed epoch record kept from ever completing, and a
+   * helper routed in from elsewhere landed back inside the holder
+   * (task e7752d29, task c07f35c8).
    */
   async releaseByStudio(
     studioId: string,
-    opts: { userId: string; reason?: string }
+    opts: { userId: string; reason?: string; callerSessionId?: string }
   ): Promise<'released' | 'deferred' | 'none'> {
     const { data } = await this.supabase
       .from('studios')
@@ -1718,6 +1730,18 @@ export class StudioLeaseService {
       .maybeSingle();
     const lease = parseStudioLease(data?.lease);
     if (!data || !lease || lease.quarantined) return 'none';
+
+    if (opts.callerSessionId && lease.sessionId === opts.callerSessionId) {
+      logger.info('[StudioLease] Holder is closing its own studio — releasing now', {
+        studioId,
+        sessionId: lease.sessionId,
+        reason: opts.reason ?? 'studio-closed',
+      });
+      const own = await this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
+        reason: opts.reason ?? 'studio-closed',
+      });
+      return own ? 'released' : 'none';
+    }
 
     // Same conservative rule as adoption: a fresh non-terminal holder is
     // presumed live (admission gap) — defer, never clear.

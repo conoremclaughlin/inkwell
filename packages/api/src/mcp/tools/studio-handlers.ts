@@ -21,7 +21,11 @@ import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inkl
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { resolveCaller, resolveImplicitSession } from './memory-handlers';
-import { isSessionAuthorized, type CallerIdentity } from './caller-identity';
+import {
+  isSessionAuthorized,
+  loadAuthorizedAmbientSession,
+  type CallerIdentity,
+} from './caller-identity';
 import { resolveCallerSb } from './caller-principal';
 import { findOrCreateThread } from './inbox-handlers';
 import { assignThreadParticipant } from '../../services/sessions/thread-assignment';
@@ -1094,14 +1098,30 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
     errors: [],
   };
 
+  // The session this close runs in, loaded and authorized as the calling
+  // identity's own (the signed claim or the context header, checked against
+  // the row — never the typed sbSlug). When it holds the lease, the holder is
+  // retiring its own studio and the release happens now; the liveness
+  // deferral below is for a holder that did NOT ask. Anything short of an
+  // authorized ambient session leaves this undefined and the old rule
+  // applies unchanged.
+  const caller = await resolveCaller(dataComposer, closingUser.id, sbSlug);
+  const ambient = await loadAuthorizedAmbientSession(dataComposer, closingUser.id, caller);
+  const callerSessionId = ambient.session?.id;
+
   // Release any lease before touching the worktree — closing the studio is a
   // terminal act for its occupant, and release captures final branch/commit
   // state while the worktree still exists. A holder without a safe
   // terminal/stale proof refuses the whole close (lease marked
-  // pendingRelease; re-run close after the holder's boundary frees it).
+  // pendingRelease; re-run close after the holder's boundary frees it) —
+  // unless the holder is this very session, which releases immediately.
   const leaseService = new StudioLeaseService(dataComposer.getClient());
   const releaseOutcome = await leaseService
-    .releaseByStudio(studioId, { userId: closingUser.id, reason: 'studio-closed' })
+    .releaseByStudio(studioId, {
+      userId: closingUser.id,
+      reason: 'studio-closed',
+      ...(callerSessionId ? { callerSessionId } : {}),
+    })
     .catch((leaseErr: unknown) => {
       logger.warn('[StudioLease] Release on close_studio failed', {
         studioId,
@@ -1111,7 +1131,7 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
     });
   if (releaseOutcome === 'deferred') {
     return errorResponse(
-      `Studio ${studioId} is in use by a live session. Its lease is marked for release at the holder's turn boundary — close the studio again once the session has finished.`
+      `Studio ${studioId} is in use by a live session other than this one. Its lease is marked for release at that holder's turn boundary — close the studio again once that session has finished, or close it from the session that holds it.`
     );
   }
   // 'none' is NOT proof of vacancy — it also covers quarantine, a lost CAS,
