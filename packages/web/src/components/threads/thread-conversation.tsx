@@ -76,6 +76,7 @@ export function ThreadConversation({
     loadOlder,
     abandonCatchUp,
   } = useThreadHistory({
+    threadKey: key,
     newestPage: data,
     newestPageAt: dataUpdatedAt,
     newestPageLoading: isLoading,
