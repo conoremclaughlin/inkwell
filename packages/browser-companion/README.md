@@ -162,3 +162,32 @@ browser-restricted execution/egress contracts. A privacy marker in a prompt does
 not contain an unrestricted coding backend with shell/network access. Unit tests
 use synthetic snapshots, injected clocks and fake adapters, not native Chrome or
 an actual authenticated SB roundtrip.
+
+## Sidebar conversation view (not enabled)
+
+`src/chat-panel.ts` and `src/chat-panel.css` provide the next conversation view,
+without changing the installed prototype or adding network access. The view
+accepts a trusted, typed state snapshot plus injected send/Stop/subscription
+callbacks; these are UI contracts, not server API schemas or authorization.
+
+- The selected SB, thread, attached page, sharing and connection states stay
+  visible. Messages render as bounded plain text, never HTML or executable links.
+- Storage, queueing, active execution, completion, rejection and uncertain
+  delivery remain distinct. A successful HTTP request is not a read receipt.
+- One send is pending at a time. Editing remains possible; an older receipt
+  cannot erase a newer draft. Thread/account/SB/controller/grant/document changes
+  fence late callbacks and discard drafts rather than carry them to a new target.
+- Stop calls the local revoker synchronously, even during pending IO. It does not
+  claim remote cancellation or undo effects already started.
+- An ambiguous send blocks resubmission until the adapter reconciles its exact
+  operation ID. Switching away and back does not clear that guard. This bounded
+  in-memory tracking is **not durable idempotency**; the adapter must reconcile
+  after a view reload and provide ordered, authenticated snapshots.
+- Draft typing and unchanged-history refreshes preserve transcript nodes and
+  selection. Destroy removes listeners, clears visible data and aborts local
+  pending delivery, but is not a remote grant-revocation operation.
+
+Production entrypoints do not import this view yet. Pairing, thread-scoped API,
+page-grant admission, browser-restricted runtime/egress, real Chrome targeting,
+and authenticated multi-turn acceptance remain necessary before enabling live
+page-aware chat. Unit tests use synthetic state and fake callbacks, not an SB.
