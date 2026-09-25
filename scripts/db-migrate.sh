@@ -43,12 +43,16 @@
 # operator is inside that window (writers stopped, snapshot taken). Nothing
 # behind it is applied until it is.
 #
-# `pending --for <SUPABASE_URL>` first proves the stack: the root stack's
-# API_URL (from `supabase status`) must be the URL given, or nothing is
-# applied. The startup preflight passes the runtime's effective SUPABASE_URL,
-# so an automatic apply can only ever land on the database the server is
-# about to use; a runtime on another loopback port is refused, not migrated
-# by proxy. The listing itself is validated whole before any row is acted on
+# `pending --for <SUPABASE_URL>` first proves the stack: one `supabase status`
+# answer supplies both the API_URL and the DB_URL, the API_URL must be the
+# URL given (same origin: scheme, host, port), and the transaction then goes
+# to the DB_URL of that same answer. DB_MIGRATE_URL is refused under --for:
+# an automatic apply cannot take its connection from anywhere the proof did
+# not cover. The startup preflight passes the runtime's effective
+# SUPABASE_URL, so an automatic apply can only ever land on the database the
+# server is about to use; a runtime on another loopback port is refused, not
+# migrated by proxy. Diagnostics name origins only, never userinfo, query or
+# fragment. The listing itself is validated whole before any row is acted on
 # (header present, every row well formed), the same contract as
 # migration-status.mjs: unrecognized output is a refusal, never "nothing
 # pending".
@@ -58,6 +62,7 @@
 #   sh scripts/db-migrate.sh pending [--dry-run] [--for <SUPABASE_URL>]
 #   sh scripts/db-migrate.sh status
 #   sh scripts/db-migrate.sh is-window supabase/migrations/<file>.sql
+#   sh scripts/db-migrate.sh safe-origin <url>
 #
 # DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
 # exists for the integration test (a disposable database) and for a stack
@@ -77,6 +82,7 @@ usage: sh scripts/db-migrate.sh apply [--window] <supabase/migrations/FILE.sql> 
        sh scripts/db-migrate.sh pending [--dry-run] [--for <SUPABASE_URL>]
        sh scripts/db-migrate.sh status
        sh scripts/db-migrate.sh is-window <supabase/migrations/FILE.sql>
+       sh scripts/db-migrate.sh safe-origin <url>
 USAGE
   exit 2
 }
@@ -104,15 +110,32 @@ window_runbook() {
 
 # `is-window FILE`: exit 0 and print the runbook (possibly empty) when the
 # file carries the marker, 1 when it does not, 2 when it cannot be read. For
-# other scripts (prod-migrate.sh) so the marker has one definition.
+# other scripts (prod-migrate.sh) so the marker has one definition. A file
+# that cannot be read is a refusal, never "not a window".
 if [ "$mode" = "is-window" ]; then
   [ "$#" -eq 1 ] || usage
   [ -f "$1" ] || die "no such file: $1"
+  [ -r "$1" ] || die "cannot read $1"
   if is_window "$1"; then
     window_runbook "$1"
     exit 0
   fi
   exit 1
+fi
+
+# The part of a URL that is safe to print: scheme, host and port. Userinfo,
+# path, query and fragment are dropped, so a SUPABASE_URL that happens to
+# carry a password or a token can be named in a refusal without leaking it.
+safe_origin() {
+  printf '%s' "$1" | sed -E -e 's/[?#].*$//' -e 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#' -e 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]*).*$#\1#'
+}
+
+# `safe-origin URL`: the same, for other scripts' messages.
+if [ "$mode" = "safe-origin" ]; then
+  [ "$#" -eq 1 ] || usage
+  safe_origin "$1"
+  printf '\n'
+  exit 0
 fi
 
 here=$(cd "$(dirname "$0")" && pwd -P) || die "cannot locate the scripts directory"
@@ -140,13 +163,19 @@ db_url() {
     sed -n 's/^DB_URL="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1
 }
 
-url=${DB_MIGRATE_URL:-}
-if [ -z "$url" ]; then
-  need_cli
-  url=$(db_url)
-  [ -n "$url" ] ||
-    die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
-fi
+# The connection every mode uses: DB_MIGRATE_URL when set, else the root
+# stack's DB_URL. Resolved by the mode that needs it, so that `pending --for`
+# can bind its own connection to the same status answer as its proof.
+url=''
+connect() {
+  url=${DB_MIGRATE_URL:-}
+  if [ -z "$url" ]; then
+    need_cli
+    url=$(db_url)
+    [ -n "$url" ] ||
+      die "the local Supabase stack is not running (supabase status gave no DB_URL). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database)"
+  fi
+}
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/db-migrate.XXXXXX") || die "could not create a temp directory"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
@@ -197,15 +226,17 @@ classify_table() {
     }'
 }
 
-# Loopback spellings name the same machine; the port is what tells two local
-# stacks apart. Everything else must match as written.
+# Origins are compared canonically: loopback spellings name the same machine,
+# and the port is what tells two local stacks apart. Userinfo, path, query and
+# fragment never take part, so they can never make two different stacks look
+# alike or the same stack look different.
 canon_url() {
-  printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E -e 's#/*$##' -e 's#://localhost(:|/|$)#://127.0.0.1\1#' -e 's#://\[::1\](:|/|$)#://127.0.0.1\1#'
+  safe_origin "$1" | tr 'A-Z' 'a-z' | sed -E -e 's#/*$##' -e 's#://localhost(:|/|$)#://127.0.0.1\1#' -e 's#://\[::1\](:|/|$)#://127.0.0.1\1#'
 }
 
-api_url() {
-  supabase status --workdir "$root" -o env 2>/dev/null |
-    sed -n 's/^API_URL="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1
+# One value out of a `supabase status -o env` answer held in $1.
+status_value() {
+  printf '%s\n' "$1" | sed -n 's/^'"$2"'="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1
 }
 
 allow_window=0
@@ -286,6 +317,7 @@ case "$mode" in
       shift
     fi
     [ "$#" -ge 1 ] || usage
+    connect
     status=0
     for f in "$@"; do
       apply_one "$f" || status=1
@@ -308,14 +340,23 @@ case "$mode" in
     done
     need_cli
     if [ -n "$expect" ]; then
-      # Prove the stack before anything else: the root stack must be the one
-      # the runtime names, or an automatic apply would land on a database the
-      # server does not use. API URLs carry no credentials, so both are shown.
-      actual=$(api_url)
-      [ -n "$actual" ] || die "the local Supabase stack did not report an API_URL, so it cannot be matched against $expect; nothing applied"
+      # Prove the stack before anything else, and bind the connection to the
+      # proof: one status answer gives the API_URL that must match the runtime
+      # and the DB_URL the transaction will use. An override would let the
+      # write land somewhere the proof never looked, so it is refused here.
+      [ -z "${DB_MIGRATE_URL:-}" ] ||
+        die "DB_MIGRATE_URL is set, but an automatic apply (--for) proves its target through supabase status and takes the database endpoint from that same answer; unset DB_MIGRATE_URL, or run without --for. Nothing applied."
+      stack=$(supabase status --workdir "$root" -o env 2>/dev/null) ||
+        die "the local Supabase stack is not running (supabase status failed). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database). Nothing applied."
+      actual=$(status_value "$stack" API_URL)
+      url=$(status_value "$stack" DB_URL)
+      [ -n "$actual" ] || die "the local Supabase stack did not report an API_URL, so it cannot be matched against $(safe_origin "$expect"); nothing applied"
+      [ -n "$url" ] || die "the local Supabase stack did not report a DB_URL in the same answer as its API_URL; nothing applied"
       if [ "$(canon_url "$actual")" != "$(canon_url "$expect")" ]; then
-        die "the runtime's SUPABASE_URL is $expect but the local stack advertises $actual; refusing to apply migrations to a stack the server does not use (a second stack on another port?). Nothing applied."
+        die "the runtime's SUPABASE_URL is $(safe_origin "$expect") but the local stack advertises $(safe_origin "$actual"); refusing to apply migrations to a stack the server does not use (a second stack on another port?). Nothing applied."
       fi
+    else
+      connect
     fi
     # Same table as `status`, same endpoint, judged whole before any row is
     # acted on; a local-only row is a gap.
@@ -334,6 +375,7 @@ case "$mode" in
         die "expected exactly one file for pending version $v under supabase/migrations (found $#); nothing after it was applied"
       f=$1
       base=$(basename "$f")
+      [ -r "$f" ] || die "cannot read $base; nothing after it was applied"
       if is_window "$f"; then
         runbook=$(window_runbook "$f")
         rest=$(printf '%s\n' "$versions" | awk -v v="$v" '$0 > v' | wc -l | tr -d ' ')
@@ -352,6 +394,7 @@ case "$mode" in
     ;;
   status)
     [ "$#" -eq 0 ] || usage
+    connect
     need_cli
     # The CLI prints a table: local version | remote version | time. Bound to
     # the same endpoint as apply; the files come from this checkout.

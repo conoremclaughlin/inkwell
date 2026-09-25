@@ -77,16 +77,26 @@ anything to the shared stack; it warns, as before. A linked (hosted) target is
 not driven by the wrapper: pending there refuses the start and points at
 `yarn linked:migrate`.
 
-Before an automatic apply the stack is proven: the preflight hands the
-runtime's effective `SUPABASE_URL` to `pending --for <url>`, and the wrapper
-refuses unless the root stack's `API_URL` (from `supabase status`) is that
-URL, port and all. A runtime pointed at a second local stack on another port
-is refused, not migrated by proxy. The listing is judged whole before any row
+Before an automatic apply the stack is proven, and the connection is bound to
+the proof. The preflight resolves the runtime's effective `SUPABASE_URL`
+through the runtime's own env loader (`scripts/lib/runtime-env.mjs`: the
+process environment, then `.env.local`, then `.env.{NODE_ENV}` or its
+`.env.dev`/`.env.prod` alias, then `.env`, exactly as
+`packages/api/src/config/env.ts` layers them; `LOCAL_SUPABASE_URL` is nothing
+to the runtime and nothing here) and hands it to `pending --for <url>`. The
+wrapper takes one `supabase status` answer, requires its `API_URL` to be that
+URL's origin (scheme, host, port; loopback spellings unified), and sends the
+transaction to the `DB_URL` of that same answer. `DB_MIGRATE_URL` is refused
+under `--for`: an automatic apply cannot take its connection from anywhere the
+proof did not cover. A runtime pointed at a second local stack on another
+port is refused, not migrated by proxy. Refusals name origins only, never
+userinfo, path, query or fragment. The listing is judged whole before any row
 is acted on, the same contract as `migration-status.mjs`: no header, or one
 row the parser does not recognise, is a refusal, never "nothing pending".
-`yarn prod:migrate` (what `yarn prod:up` runs) goes through the same wrapper
-for the local target and refuses a pending window migration on either target
-before `db push` is reached.
+`yarn prod:migrate` (what `yarn prod:up` runs) reads one validated listing,
+refuses a pending window migration on either target before `db push` is
+reached, goes through the same wrapper for the local target, and treats a
+file it cannot judge as a refusal.
 
 ### Window migrations
 

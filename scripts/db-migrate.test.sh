@@ -54,6 +54,14 @@
 #     pins its children to its own checkout whatever the caller's cwd; and
 #     prod:migrate sits behind the same window guard on both targets, the
 #     local one going through the wrapper
+#   - (review round 2) under --for the connection is bound to the proof: one
+#     status answer gives both the API URL checked and the DB URL used, and
+#     DB_MIGRATE_URL is refused; the runtime URL comes from the runtime's own
+#     env loader (scripts/lib/runtime-env.mjs: process env, .env.local,
+#     .env.{NODE_ENV} with aliases, .env; LOCAL_SUPABASE_URL means nothing);
+#     prod:migrate reads one validated listing and never a second; every
+#     diagnostic names an origin, never userinfo, query or fragment; a file
+#     that cannot be read is a refusal, never a non-window
 #
 # Usage:  sh scripts/db-migrate.test.sh
 #
@@ -137,6 +145,17 @@ case "$cmd $sub" in
     exit 0
     ;;
   "migration list")
+    # STUB_LIST_FAULT_FROM_CALL=N faults this and every later listing call
+    # (the log line above already counts this one); the kind is
+    # STUB_LIST_FAULT_KIND, fail (exit 1) or garbage (exit 0, no table).
+    if [ -n "${STUB_LIST_FAULT_FROM_CALL:-}" ] && [ "$(grep -c '^supabase migration list' "$STUB_LOG")" -ge "$STUB_LIST_FAULT_FROM_CALL" ]; then
+      if [ "${STUB_LIST_FAULT_KIND:-fail}" = "garbage" ]; then
+        echo "unrecognized CLI output"
+        exit 0
+      fi
+      echo "connection refused" >&2
+      exit 1
+    fi
     [ -n "${STUB_LIST_FAIL:-}" ] && {
       echo "connection refused" >&2
       exit 1
@@ -815,6 +834,9 @@ cp "$preflight_src" "$pf/scripts/preflight.mjs"
 cp "$status_mjs" "$pf/scripts/migration-status.mjs"
 cp "$script" "$pf/scripts/db-migrate.sh"
 cp "$guard" "$pf/scripts/lib/sql-transaction-control.awk"
+cp "$root/scripts/lib/runtime-env.mjs" "$pf/scripts/lib/runtime-env.mjs"
+# the copied scripts import dotenv through the shared env loader
+ln -s "$root/node_modules" "$pf/node_modules"
 (cd "$pf" && git init -q -b main && git -c user.name=fixture -c user.email=fixture@example.com commit -q --allow-empty -F "$work/msg") || bad "pf fixture" "git init failed"
 printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
 printf 'select 1;\n' > "$pf/supabase/migrations/20260401000000_p.sql"
@@ -826,7 +848,7 @@ pf_run() {
   shift
   (
     cd "$dir" || exit 97
-    unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS
+    unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS DB_MIGRATE_URL NODE_ENV
     for kv in "$@"; do export "$kv"; done
     STUB_LEDGER="$pfl" node scripts/preflight.mjs 2>&1
   )
@@ -880,6 +902,8 @@ fi
 mkdir -p "$work/pfwt/scripts/lib" "$work/pfwt/supabase/migrations"
 cp "$pf/scripts/preflight.mjs" "$pf/scripts/migration-status.mjs" "$pf/scripts/db-migrate.sh" "$work/pfwt/scripts/"
 cp "$guard" "$work/pfwt/scripts/lib/sql-transaction-control.awk"
+cp "$root/scripts/lib/runtime-env.mjs" "$work/pfwt/scripts/lib/runtime-env.mjs"
+ln -s "$root/node_modules" "$work/pfwt/node_modules"
 cp "$pf/.env.local" "$work/pfwt/.env.local"
 printf 'select 5;\n' > "$work/pfwt/supabase/migrations/20260405000000_branch.sql"
 reset_log
@@ -1013,7 +1037,7 @@ rc=$?
 # applied, the worktree's is not, and the worktree exemption is not what
 # decided it (the main checkout is what ran).
 reset_log
-out=$(cd "$work/pfwt" && (unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS; STUB_LEDGER="$pfl" node "$pf/scripts/preflight.mjs" 2>&1))
+out=$(cd "$work/pfwt" && (unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS DB_MIGRATE_URL NODE_ENV; STUB_LEDGER="$pfl" node "$pf/scripts/preflight.mjs" 2>&1))
 rc=$?
 if [ "$rc" -eq 1 ] && grep -qx 20260400500000 "$pfl" && ! grep -qx 20260405000000 "$pfl" && echo "$out" | grep -q 'window migration is pending'; then
   ok "preflight by absolute path from a worktree cwd: acts on its own checkout (applies its file, stops at its window), never the cwd's"
@@ -1030,7 +1054,7 @@ pm_run() {
   shift
   (
     cd "$work" || exit 97
-    unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS
+    unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS DB_MIGRATE_URL NODE_ENV
     for kv in "$@"; do export "$kv"; done
     STUB_LEDGER="$pfl" bash "$dir/scripts/prod-migrate.sh" 2>&1
   )
@@ -1087,6 +1111,184 @@ rc=$?
   ok "prod:migrate: an unrecognized listing is a refusal, not a best-effort apply" ||
   bad "prod:migrate: an unrecognized listing is a refusal, not a best-effort apply" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
 mv "$work/w.sql.parked" "$pf/supabase/migrations/20260403000000_w.sql"
+
+# --- review round 2 (Lumen, PR #675): the proof binds the connection ------
+
+reset_log
+printf 'select 11;\n' > "$pm/20260309000000_i.sql"
+out=$(cd "$pend" && DB_MIGRATE_URL='postgresql://stub:ovSECRET@127.0.0.1:2/other' STUB_LEDGER="$pl" sh "$script" pending --for http://127.0.0.1:54321 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'DB_MIGRATE_URL' && ! echo "$out" | grep -q 'ovSECRET' && ! grep -qx 20260309000000 "$pl"; then
+  ok "pending --for with DB_MIGRATE_URL set: refused before any database call, the override never printed"
+else
+  bad "pending --for with DB_MIGRATE_URL set: refused before any database call, the override never printed" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for http://127.0.0.1:54321 2>&1)
+rc=$?
+status_calls=$(calls | grep -c '^supabase status')
+if [ "$rc" -eq 0 ] && [ "$status_calls" -eq 1 ] && grep -qx 20260309000000 "$pl" && calls | grep '^psql.* -f ' | grep -q "$STUB_DB_URL"; then
+  ok "pending --for: one status answer supplies both the API URL checked and the DB URL used; one status call, the apply goes to that DB_URL"
+else
+  bad "pending --for: one status answer supplies both the API URL checked and the DB URL used; one status call, the apply goes to that DB_URL" "exit $rc, status calls $status_calls: $out; calls: $(calls | tr '\n' ' ')"
+fi
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for 'http://fixture-user:SYNTHPW@127.0.0.1:55421/?token=SYNTHTOK#f' 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! echo "$out" | grep -q 'SYNTHPW' && ! echo "$out" | grep -q 'SYNTHTOK' && echo "$out" | grep -q 'http://127.0.0.1:55421' && ! calls | grep -q '^psql'; then
+  ok "pending --for a URL carrying userinfo and a query token: the mismatch names the origin only"
+else
+  bad "pending --for a URL carrying userinfo and a query token: the mismatch names the origin only" "exit $rc: (output withheld: $(echo "$out" | grep -c 'SYNTH') secret hits)"
+fi
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for 'http://fixture-user:SYNTHPW@127.0.0.1:54321/?token=SYNTHTOK' 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ! echo "$out" | grep -q 'SYNTH' && ok "pending --for the stack's own origin dressed with userinfo and a query: same stack, applies, nothing printed" ||
+  bad "pending --for the stack's own origin dressed with userinfo and a query: same stack, applies, nothing printed" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits"
+out=$(sh "$script" safe-origin 'https://User:Pw@Host.Example:8443/path?x=1#y' 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "https://Host.Example:8443" ] && ok "safe-origin keeps scheme, host and port only" || bad "safe-origin keeps scheme, host and port only" "exit $rc: $out"
+# An unreadable pending file is a refusal for pending and for is-window.
+printf 'select 12;\n' > "$pm/20260310000000_j.sql"
+chmod 000 "$pm/20260310000000_j.sql"
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ! calls | grep -q '^psql.* -f ' && ! grep -qx 20260310000000 "$pl" && echo "$out" | grep -q 'cannot read' &&
+  ok "pending: an unreadable file is a refusal, not an apply and not a non-window" ||
+  bad "pending: an unreadable file is a refusal, not an apply and not a non-window" "exit $rc: $out"
+out=$(cd "$pend" && sh "$script" is-window supabase/migrations/20260310000000_j.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ok "is-window: an unreadable file exits 2, never 1" || bad "is-window: an unreadable file exits 2, never 1" "exit $rc: $out"
+chmod 644 "$pm/20260310000000_j.sql"
+
+# --- review round 2: the runtime URL is the runtime's ----------------------
+# The same layers as packages/api/src/config/env.ts: process env, then
+# .env.local, then .env.{NODE_ENV} (or its .env.dev/.env.prod alias), then
+# .env. LOCAL_SUPABASE_URL is nothing to the runtime and nothing here.
+
+pf_env_reset() {
+  rm -f "$pf/.env.local" "$pf/.env" "$pf/.env.development" "$pf/.env.dev" "$pf/.env.production" "$pf/.env.prod"
+}
+pf_env_reset
+printf 'select 20;\n' > "$pf/supabase/migrations/20260400100000_layers.sql"
+: > "$pf/.env.local"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env"
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pf/.env.development"
+reset_log
+out=$(pf_run "$pf" NODE_ENV=development)
+rc=$?
+[ "$rc" -eq 1 ] && ! calls | grep -q '^psql' && ! grep -qx 20260400100000 "$pfl" && echo "$out" | grep -q '55421' &&
+  ok "preflight env layers: .env.development outranks .env, so the runtime's 55421 is what is proven (refused)" ||
+  bad "preflight env layers: .env.development outranks .env, so the runtime's 55421 is what is proven (refused)" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+rm "$pf/.env.development"
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pf/.env.dev"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+[ "$rc" -eq 1 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q '55421' &&
+  ok "preflight env layers: the .env.dev alias counts for NODE_ENV=development (the default)" ||
+  bad "preflight env layers: the .env.dev alias counts for NODE_ENV=development (the default)" "exit $rc: $out"
+rm "$pf/.env.dev"
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pf/.env.local"
+reset_log
+out=$(pf_run "$pf" LOCAL_SUPABASE_URL=http://127.0.0.1:54321)
+rc=$?
+[ "$rc" -eq 1 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q '55421' &&
+  ok "preflight env layers: a shell LOCAL_SUPABASE_URL cannot redirect the proof; the runtime never reads it" ||
+  bad "preflight env layers: a shell LOCAL_SUPABASE_URL cannot redirect the proof; the runtime never reads it" "exit $rc: $out"
+reset_log
+out=$(pf_run "$pf" SUPABASE_URL=http://127.0.0.1:54321)
+rc=$?
+# The fixture's window file is still pending behind the layered file, so a
+# successful proof shows as: the layered file recorded, then the stop at
+# the window (exit 1), exactly as the earlier window check.
+[ "$rc" -eq 1 ] && grep -qx 20260400100000 "$pfl" && echo "$out" | grep -q 'window migration is pending' &&
+  ok "preflight env layers: a shell SUPABASE_URL outranks .env.local, as it does for the server (applied, then the window stop)" ||
+  bad "preflight env layers: a shell SUPABASE_URL outranks .env.local, as it does for the server (applied, then the window stop)" "exit $rc: $out"
+printf 'select 21;\n' > "$pf/supabase/migrations/20260400200000_layers_two.sql"
+: > "$pf/.env.local"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env"
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pf/.env.production"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+[ "$rc" -eq 1 ] && grep -qx 20260400200000 "$pfl" && echo "$out" | grep -q 'window migration is pending' &&
+  ok "preflight env layers: .env.production is not read under the default NODE_ENV; .env decides (applied, then the window stop)" ||
+  bad "preflight env layers: .env.production is not read under the default NODE_ENV; .env decides (applied, then the window stop)" "exit $rc: $out"
+printf 'select 22;\n' > "$pf/supabase/migrations/20260400300000_layers_three.sql"
+reset_log
+out=$(pf_run "$pf" NODE_ENV=production)
+rc=$?
+[ "$rc" -eq 1 ] && ! grep -qx 20260400300000 "$pfl" && echo "$out" | grep -q '55421' &&
+  ok "preflight env layers: under NODE_ENV=production the .env.production value is what is proven (refused)" ||
+  bad "preflight env layers: under NODE_ENV=production the .env.production value is what is proven (refused)" "exit $rc: $out"
+pf_env_reset
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+reset_log
+out=$(pf_run "$pf" DB_MIGRATE_URL='postgresql://stub:ovSECRET@127.0.0.1:2/other')
+rc=$?
+[ "$rc" -eq 1 ] && ! calls | grep -q '^psql' && ! grep -qx 20260400300000 "$pfl" && ! echo "$out" | grep -q 'ovSECRET' && echo "$out" | grep -q 'DB_MIGRATE_URL' &&
+  ok "preflight: an inherited DB_MIGRATE_URL refuses the start; the proof covers the connection, not only the API" ||
+  bad "preflight: an inherited DB_MIGRATE_URL refuses the start; the proof covers the connection, not only the API" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+[ "$rc" -eq 1 ] && grep -qx 20260400300000 "$pfl" && echo "$out" | grep -q 'window migration is pending' &&
+  ok "preflight: without the override the layered file applies and the run stops at the window as before" ||
+  bad "preflight: without the override the layered file applies and the run stops at the window as before" "exit $rc: $out"
+printf 'SUPABASE_URL=http://fixture-user:SYNTHPW@127.0.0.1:55421/?token=SYNTHTOK\n' > "$pf/.env.local"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+[ "$rc" -eq 1 ] && ! echo "$out" | grep -q 'SYNTHPW' && ! echo "$out" | grep -q 'SYNTHTOK' && echo "$out" | grep -q '55421' &&
+  ok "preflight: a runtime URL with userinfo and a token is refused by origin, and neither is printed" ||
+  bad "preflight: a runtime URL with userinfo and a token is refused by origin, and neither is printed" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+
+# --- review round 2: prod:migrate reads one listing ------------------------
+
+cp "$prod_migrate_src" "$pf/scripts/prod-migrate.sh"
+printf 'SUPABASE_URL=https://example.supabase.co\n' > "$pf/.env.local"
+for kind in fail garbage; do
+  reset_log
+  out=$(pm_run "$pf" STUB_LIST_FAULT_FROM_CALL=2 STUB_LIST_FAULT_KIND=$kind)
+  rc=$?
+  lists=$(calls | grep -c '^supabase migration list')
+  if [ "$rc" -eq 3 ] && ! calls | grep -q '^supabase db push' && ! grep -qx 20260403000000 "$pfl" && [ "$lists" -eq 1 ] && echo "$out" | grep -q 'window migration'; then
+    ok "prod:migrate with a second listing that would $kind: there is no second listing; the one answer refuses the window"
+  else
+    bad "prod:migrate with a second listing that would $kind: there is no second listing; the one answer refuses the window" "exit $rc, listings $lists: $out; calls: $(calls | tr '\n' ' ')"
+  fi
+done
+mv "$pf/supabase/migrations/20260403000000_w.sql" "$work/w.sql.parked"
+reset_log
+out=$(pm_run "$pf" STUB_LIST_FAULT_FROM_CALL=1 STUB_LIST_FAULT_KIND=garbage)
+rc=$?
+[ "$rc" -eq 2 ] && ! calls | grep -q '^supabase db push' && echo "$out" | grep -q 'unknown listing' &&
+  ok "prod:migrate: a listing that is not a listing is a refusal with the status named" ||
+  bad "prod:migrate: a listing that is not a listing is a refusal with the status named" "exit $rc: $out"
+# 20260407000000_local_two.sql is the file still pending on this target.
+chmod 000 "$pf/supabase/migrations/20260407000000_local_two.sql"
+reset_log
+out=$(pm_run "$pf")
+rc=$?
+[ "$rc" -eq 2 ] && ! calls | grep -q '^supabase db push' && ! grep -qx 20260407000000 "$pfl" && echo "$out" | grep -q 'could not judge' &&
+  ok "prod:migrate: a pending file the marker check cannot read is a refusal, not a non-window" ||
+  bad "prod:migrate: a pending file the marker check cannot read is a refusal, not a non-window" "exit $rc: $out"
+chmod 644 "$pf/supabase/migrations/20260407000000_local_two.sql"
+mv "$work/w.sql.parked" "$pf/supabase/migrations/20260403000000_w.sql"
+printf 'SUPABASE_URL=http://fixture-user:SYNTHPW@127.0.0.1:54321/?token=SYNTHTOK\n' > "$pf/.env.local"
+mv "$pf/supabase/migrations/20260403000000_w.sql" "$work/w.sql.parked"
+printf 'select 23;\n' > "$pf/supabase/migrations/20260408000000_local_three.sql"
+reset_log
+out=$(pm_run "$pf")
+rc=$?
+[ "$rc" -eq 0 ] && grep -qx 20260408000000 "$pfl" && ! echo "$out" | grep -q 'SYNTH' && echo "$out" | grep -q 'for http://127.0.0.1:54321' &&
+  ok "prod:migrate, local target: the runtime URL is logged as its origin only, and the apply goes through" ||
+  bad "prod:migrate, local target: the runtime URL is logged as its origin only, and the apply goes through" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits; $out"
+mv "$work/w.sql.parked" "$pf/supabase/migrations/20260403000000_w.sql"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
