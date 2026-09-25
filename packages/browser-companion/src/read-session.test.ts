@@ -369,7 +369,9 @@ describe('read discussion local authority (no real executor or network)', () => 
         expect(rejected).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1);
         expect(rejected).toHaveBeenCalledExactlyOnceWith(expect.any(Error));
-        expect(rejected.mock.calls[0][0].message).toContain('interrupted');
+        expect(rejected.mock.calls[0]?.[0]).toMatchObject({
+          message: expect.stringContaining('interrupted'),
+        });
       } finally {
         f.session.stop();
         await reading;
