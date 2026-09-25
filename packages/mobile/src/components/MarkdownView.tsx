@@ -18,8 +18,13 @@ import { colors, spacing, type } from '../ui/theme';
 
 type Tone = 'default' | 'muted';
 
-/** Table columns: roughly a body glyph's width, and the bounds a column stays within. */
-const TABLE_CHAR_WIDTH = 8;
+/**
+ * Table columns: a generous glyph width, and the bounds a column stays
+ * within. Headers are bold, and at 8pt a character "Surface" and
+ * "Markdown" broke mid-word in the simulator; 10pt fits bold body text
+ * with room. It is an estimate: a run of wide glyphs can still wrap.
+ */
+const TABLE_CHAR_WIDTH = 10;
 const TABLE_CELL_PADDING = spacing.sm;
 const TABLE_COLUMN_MIN = 72;
 const TABLE_COLUMN_MAX = 240;
