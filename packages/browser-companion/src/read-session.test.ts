@@ -14,6 +14,7 @@ const target = (): ReadTarget => ({
   tabId: 7,
   documentId: 'synthetic-document',
   navigationId: 'nav-1',
+  origin: 'https://fixture.test',
 });
 const grant = (changes: Partial<ReadGrant> = {}): ReadGrant => ({
   id: 'synthetic-grant',
@@ -77,7 +78,7 @@ describe('read discussion local authority (no real executor or network)', () => 
     expect(next.text).toBe('Changed page');
     expect(f.adapter.verify).toHaveBeenCalledTimes(2);
     expect(f.adapter.capture).toHaveBeenCalledTimes(2);
-    expect(f.session.status).toEqual({
+    expect(f.session.status()).toEqual({
       state: 'ready',
       reason: undefined,
       readsUsed: 2,
@@ -114,7 +115,7 @@ describe('read discussion local authority (no real executor or network)', () => 
     const check = deferred<number>();
     f.adapter.verify.mockReturnValueOnce(check.promise);
     const reading = f.session.read('page', f.adapter);
-    expect(f.session.status.state).toBe('reading');
+    expect(f.session.status().state).toBe('reading');
     await expect(f.session.read('page', f.adapter)).rejects.toThrow('already in progress');
     expect(f.adapter.verify).toHaveBeenCalledTimes(1);
     check.resolve(1000);
@@ -146,7 +147,7 @@ describe('read discussion local authority (no real executor or network)', () => 
     await Promise.resolve();
     expect(f.adapter.capture).not.toHaveBeenCalled();
     await expect(f.session.read('page', f.adapter)).rejects.toThrow('stopped: user');
-    expect(f.session.status.reason).toBe('user');
+    expect(f.session.status().reason).toBe('user');
   });
 
   it('Stop also suppresses a late capture and aborts the local adapter signal', async () => {
@@ -168,7 +169,7 @@ describe('read discussion local authority (no real executor or network)', () => 
     expect(signal.aborted).toBe(true);
     observation.resolve({ target: target(), snapshot: f.snapshot() });
     await Promise.resolve();
-    expect(f.session.status.state).toBe('stopped');
+    expect(f.session.status().state).toBe('stopped');
   });
 
   it('rechecks Stop at the observation handoff, after capture resolves but before read returns', async () => {
@@ -191,17 +192,19 @@ describe('read discussion local authority (no real executor or network)', () => 
     await expect(reading).rejects.toThrow('liveness expired');
   });
 
-  it.each([{ tabId: 8 }, { documentId: 'replacement-document' }, { navigationId: 'nav-2' }])(
-    'invalidates authority on attachment change %j',
-    async (change) => {
-      const f = fixture();
-      f.session.observeTarget(target());
-      await f.session.read('page', f.adapter);
-      f.session.observeTarget({ ...target(), ...change });
-      await expect(f.session.read('page', f.adapter)).rejects.toThrow('stopped: navigation');
-      expect(f.adapter.verify).toHaveBeenCalledTimes(1);
-    }
-  );
+  it.each([
+    { tabId: 8 },
+    { documentId: 'replacement-document' },
+    { navigationId: 'nav-2' },
+    { origin: 'https://other.test' },
+  ])('invalidates authority on attachment change %j', async (change) => {
+    const f = fixture();
+    f.session.observeTarget(target());
+    await f.session.read('page', f.adapter);
+    f.session.observeTarget({ ...target(), ...change });
+    await expect(f.session.read('page', f.adapter)).rejects.toThrow('stopped: navigation');
+    expect(f.adapter.verify).toHaveBeenCalledTimes(1);
+  });
 
   it('refuses a capture from a different trusted document without returning its data', async () => {
     const f = fixture();
@@ -210,7 +213,7 @@ describe('read discussion local authority (no real executor or network)', () => 
       snapshot: f.snapshot(),
     });
     await expect(f.session.read('page', f.adapter)).rejects.toThrow();
-    expect(f.session.status.reason).toBe('navigation');
+    expect(f.session.status().reason).toBe('navigation');
   });
 
   it.each([0, -1, NaN, Infinity])('refuses invalid liveness %s', async (duration) => {
@@ -312,7 +315,7 @@ describe('read discussion local authority (no real executor or network)', () => 
       return { target: target(), snapshot: f.snapshot() };
     });
     await expect(f.session.read('page', f.adapter)).rejects.toThrow();
-    expect(f.session.status.reason).toBe('expired');
+    expect(f.session.status().reason).toBe('expired');
   });
 
   it.each([
@@ -338,8 +341,110 @@ describe('read discussion local authority (no real executor or network)', () => 
     expect((await f.session.read('selection', f.adapter)).mode).toBe('selection');
   });
 
+  it.each(['wall', 'monotonic'] as const)(
+    'expires a read when only the %s clock advances during capture',
+    async (which) => {
+      const f = fixture();
+      f.adapter.verify.mockResolvedValueOnce(1000);
+      f.adapter.capture.mockImplementationOnce(async () => {
+        const snapshot = f.snapshot();
+        f.time[which] += 1000;
+        return { target: target(), snapshot };
+      });
+      await expect(f.session.read('page', f.adapter)).rejects.toThrow('liveness expired');
+    }
+  );
+
+  it.each(['wall', 'monotonic'] as const)(
+    'the %s session deadline independently shortens the hung-read timer',
+    async (which) => {
+      const f = fixture({ expiresAt: WALL + 1000 });
+      // Move just one clock before the read: the two session terms must differ.
+      f.time[which] += 500;
+      f.adapter.capture.mockReturnValueOnce(new Promise(() => {}));
+      const rejected = vi.fn();
+      const reading = f.session.read('page', f.adapter).catch(rejected);
+      try {
+        await vi.advanceTimersByTimeAsync(499);
+        expect(rejected).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(rejected).toHaveBeenCalledExactlyOnceWith(expect.any(Error));
+        expect(rejected.mock.calls[0][0].message).toContain('interrupted');
+      } finally {
+        f.session.stop();
+        await reading;
+      }
+    }
+  );
+
+  it('rejects an unknown mode before reserving budget or calling either adapter', async () => {
+    const f = fixture();
+    await expect(
+      f.session.read('screenshot' as BrowserSnapshot['mode'], f.adapter)
+    ).rejects.toThrow('Unsupported read mode');
+    expect(f.session.status().readsUsed).toBe(0);
+    expect(f.adapter.verify).not.toHaveBeenCalled();
+    expect(f.adapter.capture).not.toHaveBeenCalled();
+  });
+
+  it('preserves the first Stop reason when later observations notice expiry', () => {
+    const f = fixture();
+    f.session.stop('user');
+    f.advance(MAX_READ_SESSION_MS);
+    expect(f.session.status().reason).toBe('user');
+    f.session.stop('disconnected');
+    expect(f.session.status().reason).toBe('user');
+  });
+
+  it.each([
+    'https://fixture.test.evil.test/article',
+    'https://fixture.test:444/article',
+    'http://fixture.test/article',
+    'https://other.test/article',
+  ])('rejects a snapshot outside the exact trusted origin: %s', async (url) => {
+    const f = fixture();
+    f.adapter.capture.mockResolvedValueOnce({
+      target: target(),
+      snapshot: { ...f.snapshot(), url },
+    });
+    await expect(f.session.read('page', f.adapter)).rejects.toThrow('does not belong');
+  });
+
+  it('allows a different path on the bound origin; document/navigation remain adapter checks', async () => {
+    const f = fixture();
+    f.adapter.capture.mockResolvedValueOnce({
+      target: target(),
+      snapshot: { ...f.snapshot(), url: 'https://fixture.test/other-path' },
+    });
+    expect((await f.session.read('page', f.adapter)).url).toBe('https://fixture.test/other-path');
+  });
+
+  it.each([
+    '',
+    'not a URL',
+    'null',
+    'file://',
+    'https://fixture.test/',
+    'https://fixture.test/path',
+    'https://fixture.test?query=synthetic',
+    'https://fixture.test#fragment',
+    'https://synthetic@fixture.test',
+  ])('rejects non-canonical attachment origins: %s', (origin) => {
+    expect(
+      () =>
+        new PageReadSession(
+          grant(),
+          { ...target(), origin },
+          {
+            wall: () => WALL,
+            monotonic: () => 0,
+          }
+        )
+    ).toThrow('Invalid page-read');
+  });
+
   it('clamps a larger server budget locally and validates construction', () => {
-    expect(fixture({ maxReads: 1000 }).session.status.readLimit).toBe(MAX_READ_OPERATIONS);
+    expect(fixture({ maxReads: 1000 }).session.status().readLimit).toBe(MAX_READ_OPERATIONS);
     for (const change of [
       { maxReads: 0 },
       { maxReads: 1.5 },
@@ -358,6 +463,6 @@ describe('read discussion local authority (no real executor or network)', () => 
     await expect(f.session.read('page', f.adapter)).rejects.toThrow('stopped: user');
     expect(f.adapter.verify).not.toHaveBeenCalled();
     expect(f.adapter.capture).not.toHaveBeenCalled();
-    expect(f.session.status.state).toBe('stopped');
+    expect(f.session.status().state).toBe('stopped');
   });
 });
