@@ -48,12 +48,18 @@
 #     stops the start when one fails or a window migration is pending; a
 #     worktree warns and applies nothing; a linked target refuses and points
 #     at linked:migrate; INK_SKIP_MIGRATIONS=1 starts anyway and says so
+#   - (review round 1) the listing is judged whole before any row is acted on,
+#     by the wrapper and by migration-status.mjs alike; `pending --for` proves
+#     the root stack is the one the runtime names, port and all; the preflight
+#     pins its children to its own checkout whatever the caller's cwd; and
+#     prod:migrate sits behind the same window guard on both targets, the
+#     local one going through the wrapper
 #
 # Usage:  sh scripts/db-migrate.test.sh
 #
-# SCRIPT_UNDER_TEST, STATUS_UNDER_TEST and PREFLIGHT_UNDER_TEST point the
-# suite at other copies of the three scripts, so a check can be shown red
-# against an older head.
+# SCRIPT_UNDER_TEST, STATUS_UNDER_TEST, PREFLIGHT_UNDER_TEST and
+# PROD_MIGRATE_UNDER_TEST point the suite at other copies of the four scripts,
+# so a check can be shown red against an older head.
 
 set -u
 
@@ -104,7 +110,7 @@ bad() {
 # Only what the scripts and this suite call. Resolved from the host once,
 # here, so nothing else on the host PATH is reachable during the checks.
 mkdir -p "$work/tools"
-for tool in sh git node awk sed grep basename dirname cat mktemp head rm sort cut tr wc cp mkdir chmod ln date od locale; do
+for tool in sh bash git node awk sed grep basename dirname cat mktemp head rm mv sort cut tr wc cp mkdir chmod ln date od locale; do
   bin=$(command -v "$tool") || {
     echo "cannot find $tool on the host PATH" >&2
     exit 1
@@ -144,6 +150,7 @@ case "$cmd $sub" in
       exit 0
     }
     printf '\n  \n   Local          | Remote         | Time (UTC)          \n  ----------------|----------------|---------------------\n'
+    [ -n "${STUB_LIST_PREPEND_MALFORMED:-}" ] && printf '   this is not a row\n'
     : > "$STUB_TMP/local"
     for f in "$workdir"/supabase/migrations/*.sql; do
       [ -e "$f" ] || continue
@@ -169,6 +176,20 @@ case "$cmd $sub" in
   "migration repair")
     echo "stub supabase: migration repair must not be called by the wrapper" >&2
     exit 98
+    ;;
+  "db push")
+    # stands in for the CLI: every local file the ledger lacks is recorded
+    for f in "$workdir"/supabase/migrations/*.sql; do
+      [ -e "$f" ] || continue
+      b=$(basename "$f")
+      case "$b" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_*.sql) ;;
+        *) continue ;;
+      esac
+      v=${b%%_*}
+      grep -qx "$v" "$STUB_LEDGER" || echo "$v" >> "$STUB_LEDGER"
+    done
+    exit 0
     ;;
 esac
 echo "stub supabase: unexpected $*" >&2
@@ -890,6 +911,182 @@ out=$(PATH="$work/tools" pf_run "$pf" INK_SKIP_MIGRATIONS=1)
 rc=$?
 [ "$rc" -eq 0 ] && echo "$out" | grep -q 'Ready' &&
   ok "preflight without the Supabase CLI, skipped by request: starts" || bad "preflight without the Supabase CLI, skipped by request: starts" "exit $rc: $out"
+
+# --- review round 1 (Lumen, PR #675): the listing is judged whole ----------
+
+for knob in STUB_LIST_GARBAGE STUB_LIST_MALFORMED STUB_LIST_PREPEND_MALFORMED; do
+  reset_log
+  printf '20260301000000\n20260302000000\n' > "$pl"
+  out=$(cd "$pend" && export "$knob=1" && STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+  rc=$?
+  if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'unrecognized' && [ "$(wc -l < "$pl" | tr -d ' ')" -eq 2 ]; then
+    ok "pending under $knob: the listing is refused whole, nothing applied"
+  else
+    bad "pending under $knob: the listing is refused whole, nothing applied" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+  fi
+done
+# A malformed line ahead of a valid pending row must not let the row through.
+reset_log
+printf '20260301000000\n20260302000000\n20260303000000\n' > "$pl"
+out=$(cd "$pend" && STUB_LIST_PREPEND_MALFORMED=1 STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ! grep -qx 20260304000000 "$pl" && ! calls | grep -q '^psql' &&
+  ok "pending: a malformed row before a valid pending row applies nothing" ||
+  bad "pending: a malformed row before a valid pending row applies nothing" "exit $rc: $out; ledger: $(cat "$pl" | tr '\n' ' ')"
+reset_log
+out=$(cd "$pend" && STUB_LIST_MALFORMED=1 STUB_LEDGER="$pl" sh "$script" status 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'malformed row' && ! echo "$out" | grep -q 'recorded,' &&
+  ok "status: a malformed row is a refusal, never a count" || bad "status: a malformed row is a refusal, never a count" "exit $rc: $out"
+# The wrapper and migration-status.mjs agree on what a listing is.
+for knob in STUB_LIST_GARBAGE STUB_LIST_MALFORMED STUB_LIST_PREPEND_MALFORMED; do
+  m=$(cd "$pend" && export "$knob=1" && STUB_LEDGER="$pl" node "$status_mjs" --local --workdir "$pend" --json 2>/dev/null; echo "rc=$?")
+  w=$(cd "$pend" && export "$knob=1" && STUB_LEDGER="$pl" sh "$script" pending --dry-run >/dev/null 2>&1; echo "rc=$?")
+  echo "$m" | grep -q '"state":"unknown"' && [ "$w" = "rc=2" ] &&
+    ok "under $knob: migration-status.mjs says unknown and the wrapper refuses" ||
+    bad "under $knob: migration-status.mjs says unknown and the wrapper refuses" "mjs: $m; wrapper: $w"
+done
+
+# --- review round 1: the stack must be the one the runtime names ---------
+
+reset_log
+printf '20260301000000\n20260302000000\n20260303000000\n20260304000000\n20260305000000\n' > "$pl"
+printf 'select 8;\n' > "$pm/20260308000000_h.sql"
+rm -f "$pm/20260307000000_g_twin.sql"
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for http://127.0.0.1:55421 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && ! calls | grep -q '^supabase migration list' &&
+  echo "$out" | grep -q '55421' && echo "$out" | grep -q '54321' && echo "$out" | grep -q 'Nothing applied'; then
+  ok "pending --for a URL on another port: refused before the listing is even read, both API URLs named"
+else
+  bad "pending --for a URL on another port: refused before the listing is even read, both API URLs named" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+if ! echo "$out" | grep -q 's3cretpw'; then
+  ok "the mismatch message names API URLs only, never the connection string"
+else
+  bad "the mismatch message names API URLs only, never the connection string" "$out"
+fi
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for http://LOCALHOST:54321/ 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && grep -qx 20260306000000 "$pl" && ok "pending --for the stack's own URL (localhost spelling, trailing slash) applies" ||
+  bad "pending --for the stack's own URL (localhost spelling, trailing slash) applies" "exit $rc: $out"
+reset_log
+out=$(cd "$pend" && STUB_NO_STACK=1 STUB_LEDGER="$pl" sh "$script" pending --for http://127.0.0.1:54321 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && ok "pending --for with the stack down: refused before psql" ||
+  bad "pending --for with the stack down: refused before psql" "exit $rc: $out"
+
+out=$(cd "$pend" && sh "$script" is-window supabase/migrations/20260303000000_c_window.sql 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "docs/runbooks/example-window.md" ] && ok "is-window: a marked file exits 0 and prints its runbook" ||
+  bad "is-window: a marked file exits 0 and prints its runbook" "exit $rc: $out"
+out=$(cd "$pend" && sh "$script" is-window supabase/migrations/20260301000000_a.sql 2>&1)
+rc=$?
+[ "$rc" -eq 1 ] && [ -z "$out" ] && ok "is-window: an ordinary file exits 1, silently" || bad "is-window: an ordinary file exits 1, silently" "exit $rc: $out"
+out=$(cd "$pend" && PATH="$work/tools" sh "$script" is-window supabase/migrations/20260303000000_c_window.sql 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "is-window needs neither the CLI nor psql" || bad "is-window needs neither the CLI nor psql" "exit $rc: $out"
+
+# --- review round 1: preflight proves the stack and pins its cwd ----------
+
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pf/.env.local"
+printf 'select 6;\n' > "$pf/supabase/migrations/20260400500000_early.sql"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+if [ "$rc" -eq 1 ] && ! calls | grep -q '^psql' && ! grep -qx 20260400500000 "$pfl" && echo "$out" | grep -q '55421' && ! echo "$out" | grep -q 'Ready'; then
+  ok "preflight: a runtime on another loopback port refuses the start; the root stack is not migrated by proxy"
+else
+  bad "preflight: a runtime on another loopback port refuses the start; the root stack is not migrated by proxy" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+
+reset_log
+out=$(pf_run "$pf" STUB_LIST_GARBAGE=1)
+rc=$?
+[ "$rc" -eq 1 ] && ! calls | grep -q '^psql' && ! echo "$out" | grep -q 'Ready' && echo "$out" | grep -q 'unrecognized' &&
+  ok "preflight: an unrecognized listing refuses the start, applies nothing" ||
+  bad "preflight: an unrecognized listing refuses the start, applies nothing" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+
+# Invoked by absolute path from a worktree's cwd: the main checkout's file is
+# applied, the worktree's is not, and the worktree exemption is not what
+# decided it (the main checkout is what ran).
+reset_log
+out=$(cd "$work/pfwt" && (unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS; STUB_LEDGER="$pfl" node "$pf/scripts/preflight.mjs" 2>&1))
+rc=$?
+if [ "$rc" -eq 1 ] && grep -qx 20260400500000 "$pfl" && ! grep -qx 20260405000000 "$pfl" && echo "$out" | grep -q 'window migration is pending'; then
+  ok "preflight by absolute path from a worktree cwd: acts on its own checkout (applies its file, stops at its window), never the cwd's"
+else
+  bad "preflight by absolute path from a worktree cwd: acts on its own checkout (applies its file, stops at its window), never the cwd's" "exit $rc: $out; ledger: $(cat "$pfl" | tr '\n' ' ')"
+fi
+
+# --- review round 1: prod:migrate is behind the same guard ----------------
+
+prod_migrate_src="${PROD_MIGRATE_UNDER_TEST:-$root/scripts/prod-migrate.sh}"
+cp "$prod_migrate_src" "$pf/scripts/prod-migrate.sh"
+pm_run() {
+  dir=$1
+  shift
+  (
+    cd "$work" || exit 97
+    unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS
+    for kv in "$@"; do export "$kv"; done
+    STUB_LEDGER="$pfl" bash "$dir/scripts/prod-migrate.sh" 2>&1
+  )
+}
+reset_log
+out=$(pm_run "$pf")
+rc=$?
+if [ "$rc" -eq 3 ] && ! calls | grep -q '^supabase db push' && ! calls | grep -q '^psql.* -f ' && ! grep -qx 20260403000000 "$pfl" &&
+  echo "$out" | grep -q 'window migration' && echo "$out" | grep -q 'docs/runbooks/example-window.md'; then
+  ok "prod:migrate, local target: a pending window migration is refused before any apply; db push is never reached"
+else
+  bad "prod:migrate, local target: a pending window migration is refused before any apply; db push is never reached" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+printf 'SUPABASE_URL=https://example.supabase.co\n' > "$pf/.env.local"
+reset_log
+out=$(pm_run "$pf")
+rc=$?
+[ "$rc" -eq 3 ] && ! calls | grep -q '^supabase db push' && echo "$out" | grep -q 'window migration' &&
+  ok "prod:migrate, linked target: a pending window migration is refused before db push" ||
+  bad "prod:migrate, linked target: a pending window migration is refused before db push" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+mv "$pf/supabase/migrations/20260403000000_w.sql" "$work/w.sql.parked"
+reset_log
+out=$(pm_run "$pf")
+rc=$?
+if [ "$rc" -eq 0 ] && calls | grep -q '^supabase db push --linked' && ! calls | grep -q '^psql.* -f ' && grep -qx 20260404000000 "$pfl"; then
+  ok "prod:migrate, linked target, ordinary pending files: db push --linked runs, the local wrapper does not"
+else
+  bad "prod:migrate, linked target, ordinary pending files: db push --linked runs, the local wrapper does not" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+printf 'select 9;\n' > "$pf/supabase/migrations/20260406000000_local_only.sql"
+reset_log
+out=$(pm_run "$pf")
+rc=$?
+if [ "$rc" -eq 0 ] && ! calls | grep -q '^supabase db push' && calls | grep -q '^psql.* -f .*20260406000000_local_only.sql' && grep -qx 20260406000000 "$pfl" &&
+  calls | grep -q '^supabase status'; then
+  ok "prod:migrate, local target, ordinary pending file: the wrapper applies it with the stack proven; db push is not used"
+else
+  bad "prod:migrate, local target, ordinary pending file: the wrapper applies it with the stack proven; db push is not used" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pf/.env.local"
+printf 'select 10;\n' > "$pf/supabase/migrations/20260407000000_local_two.sql"
+reset_log
+out=$(pm_run "$pf")
+rc=$?
+[ "$rc" -eq 2 ] && ! calls | grep -q '^psql.* -f ' && ! grep -qx 20260407000000 "$pfl" && echo "$out" | grep -q '55421' &&
+  ok "prod:migrate, local target on another port: refused, nothing applied" ||
+  bad "prod:migrate, local target on another port: refused, nothing applied" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+reset_log
+out=$(pm_run "$pf" STUB_LIST_GARBAGE=1)
+rc=$?
+[ "$rc" -ne 0 ] && ! calls | grep -q '^supabase db push' && ! calls | grep -q '^psql.* -f ' &&
+  ok "prod:migrate: an unrecognized listing is a refusal, not a best-effort apply" ||
+  bad "prod:migrate: an unrecognized listing is a refusal, not a best-effort apply" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+mv "$work/w.sql.parked" "$pf/supabase/migrations/20260403000000_w.sql"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

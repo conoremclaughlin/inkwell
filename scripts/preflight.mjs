@@ -66,8 +66,11 @@ function isGitWorktree(dir) {
   return false;
 }
 
+// Every child runs in rootDir: the wrapper resolves the checkout (and so the
+// migration files) from its cwd, and the worktree exemption above was decided
+// for rootDir, not for wherever the caller happened to be.
 function run(command, args) {
-  const result = spawnSync(command, args, { stdio: 'inherit' });
+  const result = spawnSync(command, args, { stdio: 'inherit', cwd: rootDir });
   if (result.error) {
     log(`✗ could not run ${command}: ${result.error.message}`);
     return 127;
@@ -75,11 +78,16 @@ function run(command, args) {
   return result.status ?? 1;
 }
 
-function statusTarget() {
-  const result = spawnSync('node', [statusScript, '--workdir', rootDir, '--print-target'], {
+function statusQuery(flag) {
+  const result = spawnSync('node', [statusScript, '--workdir', rootDir, flag], {
     encoding: 'utf-8',
+    cwd: rootDir,
   });
-  const target = String(result.stdout || '').trim();
+  return String(result.stdout || '').trim();
+}
+
+function statusTarget() {
+  const target = statusQuery('--print-target');
   // Unknown means "not the local stack": never apply on a guess.
   return target === 'local' ? 'local' : 'linked';
 }
@@ -116,7 +124,15 @@ if (!onPath('supabase')) {
     process.exit(1);
   }
 } else {
-  const code = run('sh', [wrapper, 'pending']);
+  // The runtime's own URL goes with the request: the wrapper refuses unless
+  // the stack it would write to is the one the server is about to use.
+  const runtimeUrl = statusQuery('--print-supabase-url');
+  if (!runtimeUrl) {
+    log('✗ could not resolve the runtime SUPABASE_URL; not applying migrations on a guess.');
+    log(`  ${escape}`);
+    process.exit(1);
+  }
+  const code = run('sh', [wrapper, 'pending', '--for', runtimeUrl]);
   if (code === 3) {
     log("✗ a window migration is pending. It is applied inside its runbook's window (writers");
     log(`  stopped, snapshot taken), never at startup. Run the window, then start; or ${escape}`);

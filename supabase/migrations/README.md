@@ -77,6 +77,17 @@ anything to the shared stack; it warns, as before. A linked (hosted) target is
 not driven by the wrapper: pending there refuses the start and points at
 `yarn linked:migrate`.
 
+Before an automatic apply the stack is proven: the preflight hands the
+runtime's effective `SUPABASE_URL` to `pending --for <url>`, and the wrapper
+refuses unless the root stack's `API_URL` (from `supabase status`) is that
+URL, port and all. A runtime pointed at a second local stack on another port
+is refused, not migrated by proxy. The listing is judged whole before any row
+is acted on, the same contract as `migration-status.mjs`: no header, or one
+row the parser does not recognise, is a refusal, never "nothing pending".
+`yarn prod:migrate` (what `yarn prod:up` runs) goes through the same wrapper
+for the local target and refuses a pending window migration on either target
+before `db push` is reached.
+
 ### Window migrations
 
 A migration that needs writers stopped, a snapshot, or a manifest loaded first
@@ -86,11 +97,13 @@ announces itself in its first ten lines:
 -- db-migrate: window docs/runbooks/<name>.md
 ```
 
-`pending`, and so startup, stops in front of such a file with exit 3, names the
-runbook, and applies nothing behind it. `apply` takes it only as
-`yarn db:migrate --window <file>`, which says the operator is inside that
-window. `20260913090000_inkmail_thread_scope_cutover.sql` is the first, and
-its runbook is `docs/runbooks/inkmail-thread-scope-cutover.md`.
+`pending`, and so startup and `yarn prod:migrate`, stops in front of such a
+file with exit 3, names the runbook, and applies nothing behind it. `apply`
+takes it only as `yarn db:migrate --window <file>`, which says the operator is
+inside that window. `sh scripts/db-migrate.sh is-window <file>` answers the
+question for other scripts (exit 0 and the runbook on stdout, 1 otherwise) so
+the marker has one definition. `20260913090000_inkmail_thread_scope_cutover.sql`
+is the first, and its runbook is `docs/runbooks/inkmail-thread-scope-cutover.md`.
 
 Two other ways of applying exist, and both leave the ledger wrong:
 

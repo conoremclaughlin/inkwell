@@ -43,10 +43,21 @@
 # operator is inside that window (writers stopped, snapshot taken). Nothing
 # behind it is applied until it is.
 #
+# `pending --for <SUPABASE_URL>` first proves the stack: the root stack's
+# API_URL (from `supabase status`) must be the URL given, or nothing is
+# applied. The startup preflight passes the runtime's effective SUPABASE_URL,
+# so an automatic apply can only ever land on the database the server is
+# about to use; a runtime on another loopback port is refused, not migrated
+# by proxy. The listing itself is validated whole before any row is acted on
+# (header present, every row well formed), the same contract as
+# migration-status.mjs: unrecognized output is a refusal, never "nothing
+# pending".
+#
 # Usage:
 #   sh scripts/db-migrate.sh apply [--window] supabase/migrations/<version>_<name>.sql [...]
-#   sh scripts/db-migrate.sh pending [--dry-run]
+#   sh scripts/db-migrate.sh pending [--dry-run] [--for <SUPABASE_URL>]
 #   sh scripts/db-migrate.sh status
+#   sh scripts/db-migrate.sh is-window supabase/migrations/<file>.sql
 #
 # DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
 # exists for the integration test (a disposable database) and for a stack
@@ -63,8 +74,9 @@ set -u
 usage() {
   cat >&2 <<'USAGE'
 usage: sh scripts/db-migrate.sh apply [--window] <supabase/migrations/FILE.sql> [...]
-       sh scripts/db-migrate.sh pending [--dry-run]
+       sh scripts/db-migrate.sh pending [--dry-run] [--for <SUPABASE_URL>]
        sh scripts/db-migrate.sh status
+       sh scripts/db-migrate.sh is-window <supabase/migrations/FILE.sql>
 USAGE
   exit 2
 }
@@ -77,6 +89,31 @@ die() {
 mode=${1:-}
 [ -n "$mode" ] || usage
 shift
+
+# A window migration announces itself in its first ten lines:
+#   -- db-migrate: window docs/runbooks/<name>.md
+# Ten lines, so the marker is visible without opening the file and a runbook
+# that merely mentions the phrase further down does not count. The text after
+# "window" is the runbook, named in every refusal.
+is_window() {
+  head -n 10 "$1" | grep -qE '^--[[:space:]]*db-migrate:[[:space:]]*window([[:space:]]|$)'
+}
+window_runbook() {
+  head -n 10 "$1" | sed -n 's/^--[[:space:]]*db-migrate:[[:space:]]*window[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//'
+}
+
+# `is-window FILE`: exit 0 and print the runbook (possibly empty) when the
+# file carries the marker, 1 when it does not, 2 when it cannot be read. For
+# other scripts (prod-migrate.sh) so the marker has one definition.
+if [ "$mode" = "is-window" ]; then
+  [ "$#" -eq 1 ] || usage
+  [ -f "$1" ] || die "no such file: $1"
+  if is_window "$1"; then
+    window_runbook "$1"
+    exit 0
+  fi
+  exit 1
+fi
 
 here=$(cd "$(dirname "$0")" && pwd -P) || die "cannot locate the scripts directory"
 guard="$here/lib/sql-transaction-control.awk"
@@ -123,16 +160,52 @@ recorded_count() {
     -c "SELECT count(*) FROM supabase_migrations.schema_migrations WHERE version = '$1'"
 }
 
-# A window migration announces itself in its first ten lines:
-#   -- db-migrate: window docs/runbooks/<name>.md
-# Ten lines, so the marker is visible without opening the file and a runbook
-# that merely mentions the phrase further down does not count. The text after
-# "window" is the runbook, named in every refusal.
-is_window() {
-  head -n 10 "$1" | grep -qE '^--[[:space:]]*db-migrate:[[:space:]]*window([[:space:]]|$)'
+# The listing `supabase migration list` prints, judged whole. Lines before
+# the `Local | Remote` header are the CLI's chatter and are skipped; after it,
+# every non-blank line that is not the rule must be a row: an optional
+# 14-digit version, a pipe, an optional 14-digit version, a pipe, then the
+# time, with at least one version. One line that is not is a refusal for the
+# whole listing (exit 1, the line on stderr); no header at all is the same.
+# Rows come out classified: "L v" local-only (pending), "R v" remote-only
+# (applied from another checkout), "B v" both. This is the contract
+# migration-status.mjs enforces for the startup listing, in awk so the
+# wrapper has no second opinion about what a listing is.
+classify_table() {
+  awk -F'|' '
+    function trim(x) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", x); return x }
+    function isver(x) { return (x ~ /^[0-9]+$/ && length(x) == 14) }
+    !header {
+      if ($0 ~ /^[[:space:]]*Local[[:space:]]*\|[[:space:]]*Remote[[:space:]]*\|/) header = 1
+      next
+    }
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*-+[[:space:]]*\|[[:space:]]*-+[[:space:]]*\|/ { next }
+    {
+      l = trim($1); r = trim($2); t = (NF >= 3) ? trim($3) : ""
+      if (NF < 3 || t == "" || (l != "" && !isver(l)) || (r != "" && !isver(r)) || (l == "" && r == "")) {
+        printf "malformed row: %s\n", substr(trim($0), 1, 60) > "/dev/stderr"
+        bad = 1
+        exit 1
+      }
+      if (l != "" && r != "") print "B " l
+      else if (l != "") print "L " l
+      else print "R " r
+    }
+    END {
+      if (bad) exit 1
+      if (!header) { print "no Local | Remote header" > "/dev/stderr"; exit 1 }
+    }'
 }
-window_runbook() {
-  head -n 10 "$1" | sed -n 's/^--[[:space:]]*db-migrate:[[:space:]]*window[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//'
+
+# Loopback spellings name the same machine; the port is what tells two local
+# stacks apart. Everything else must match as written.
+canon_url() {
+  printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E -e 's#/*$##' -e 's#://localhost(:|/|$)#://127.0.0.1\1#' -e 's#://\[::1\](:|/|$)#://127.0.0.1\1#'
+}
+
+api_url() {
+  supabase status --workdir "$root" -o env 2>/dev/null |
+    sed -n 's/^API_URL="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -1
 }
 
 allow_window=0
@@ -221,21 +294,36 @@ case "$mode" in
     ;;
   pending)
     dry=0
-    if [ "${1:-}" = "--dry-run" ]; then
-      dry=1
-      shift
-    fi
-    [ "$#" -eq 0 ] || usage
+    expect=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --dry-run) dry=1; shift ;;
+        --for)
+          [ -n "${2:-}" ] || usage
+          expect=$2
+          shift 2
+          ;;
+        *) usage ;;
+      esac
+    done
     need_cli
-    # Same table as `status`, same endpoint; a local-only row is a gap.
+    if [ -n "$expect" ]; then
+      # Prove the stack before anything else: the root stack must be the one
+      # the runtime names, or an automatic apply would land on a database the
+      # server does not use. API URLs carry no credentials, so both are shown.
+      actual=$(api_url)
+      [ -n "$actual" ] || die "the local Supabase stack did not report an API_URL, so it cannot be matched against $expect; nothing applied"
+      if [ "$(canon_url "$actual")" != "$(canon_url "$expect")" ]; then
+        die "the runtime's SUPABASE_URL is $expect but the local stack advertises $actual; refusing to apply migrations to a stack the server does not use (a second stack on another port?). Nothing applied."
+      fi
+    fi
+    # Same table as `status`, same endpoint, judged whole before any row is
+    # acted on; a local-only row is a gap.
     table=$(supabase migration list --db-url "$url" --workdir "$checkout" 2>/dev/null) ||
       die "supabase migration list failed (the endpoint is not shown because it can carry a password)"
-    versions=$(printf '%s\n' "$table" | awk -F'|' '
-      NF >= 2 {
-        gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2)
-        l = (length($1) == 14 && $1 ~ /^[0-9]+$/); r = (length($2) == 14 && $2 ~ /^[0-9]+$/)
-        if (l && !r) print $1
-      }' | sort)
+    rows=$(printf '%s\n' "$table" | classify_table 2>"$tmpdir/parse.err") ||
+      die "unrecognized \`supabase migration list\` output ($(cat "$tmpdir/parse.err")); nothing applied"
+    versions=$(printf '%s\n' "$rows" | awk '$1 == "L" { print $2 }' | sort)
     if [ -z "$versions" ]; then
       printf 'db-migrate: nothing pending in this checkout\n'
       exit 0
@@ -270,12 +358,10 @@ case "$mode" in
     table=$(supabase migration list --db-url "$url" --workdir "$checkout" 2>/dev/null) ||
       die "supabase migration list failed (the endpoint is not shown because it can carry a password)"
     printf '%s\n' "$table"
-    printf '%s\n' "$table" | awk -F'|' '
-      NF >= 2 {
-        gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2)
-        l = (length($1) == 14 && $1 ~ /^[0-9]+$/); r = (length($2) == 14 && $2 ~ /^[0-9]+$/)
-        if (l && r) both++; else if (l) pending++; else if (r) elsewhere++
-      }
+    rows=$(printf '%s\n' "$table" | classify_table 2>"$tmpdir/parse.err") ||
+      die "unrecognized \`supabase migration list\` output ($(cat "$tmpdir/parse.err"))"
+    printf '%s\n' "$rows" | awk '
+      $1 == "B" { both++ } $1 == "L" { pending++ } $1 == "R" { elsewhere++ }
       END {
         printf "db-migrate: %d recorded, %d pending in this checkout, %d applied from another checkout\n", both, pending, elsewhere
         if (pending) print "db-migrate: apply pending files with: yarn db:migrate supabase/migrations/<file>"

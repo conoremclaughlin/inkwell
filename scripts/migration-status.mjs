@@ -11,6 +11,7 @@ function parseArgs(argv) {
     quiet: false,
     target: 'auto',
     printTarget: false,
+    printSupabaseUrl: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -52,6 +53,10 @@ function parseArgs(argv) {
     }
     if (token === '--print-target') {
       args.printTarget = true;
+      continue;
+    }
+    if (token === '--print-supabase-url') {
+      args.printSupabaseUrl = true;
       continue;
     }
   }
@@ -98,6 +103,24 @@ function isLocalSupabaseUrl(value) {
   }
 }
 
+// The URL the runtime will actually use, resolved the way the server resolves
+// it: the process environment first, then .env.local, then .env, in the
+// --workdir checkout. The startup preflight hands this to the wrapper so the
+// stack it applies to is proven to be the one the server is about to use.
+function resolveSupabaseUrl(args) {
+  const envLocal = parseEnvFile(resolvePath(args.workdir, '.env.local'));
+  const envFallback = parseEnvFile(resolvePath(args.workdir, '.env'));
+  return (
+    process.env.SUPABASE_URL ||
+    process.env.LOCAL_SUPABASE_URL ||
+    envLocal.SUPABASE_URL ||
+    envLocal.LOCAL_SUPABASE_URL ||
+    envFallback.SUPABASE_URL ||
+    envFallback.LOCAL_SUPABASE_URL ||
+    ''
+  );
+}
+
 function resolveTarget(args) {
   if (args.target === 'local' || args.target === 'linked') return args.target;
 
@@ -106,18 +129,7 @@ function resolveTarget(args) {
     .toLowerCase();
   if (override === 'local' || override === 'linked') return override;
 
-  const envLocal = parseEnvFile(resolvePath(args.workdir, '.env.local'));
-  const envFallback = parseEnvFile(resolvePath(args.workdir, '.env'));
-
-  const supabaseUrl =
-    process.env.SUPABASE_URL ||
-    process.env.LOCAL_SUPABASE_URL ||
-    envLocal.SUPABASE_URL ||
-    envLocal.LOCAL_SUPABASE_URL ||
-    envFallback.SUPABASE_URL ||
-    envFallback.LOCAL_SUPABASE_URL;
-
-  return isLocalSupabaseUrl(supabaseUrl) ? 'local' : 'linked';
+  return isLocalSupabaseUrl(resolveSupabaseUrl(args)) ? 'local' : 'linked';
 }
 
 // `supabase migration list` prints a table, whatever -o says (that flag
@@ -202,6 +214,11 @@ function main() {
   const target = resolveTarget(args);
   if (args.printTarget) {
     console.log(target);
+    process.exit(0);
+    return;
+  }
+  if (args.printSupabaseUrl) {
+    console.log(resolveSupabaseUrl(args));
     process.exit(0);
     return;
   }

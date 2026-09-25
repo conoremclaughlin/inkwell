@@ -365,7 +365,7 @@ npx prettier --write "path/to/file"
 yarn dev                   # Start API+web with hot reload (default: port 3001)
 yarn prod                  # One-shot: build + migrate + start (alias for prod:up)
 yarn prod:refresh          # Install + build latest code after pull
-yarn prod:migrate          # Apply pending migrations (auto-detects local vs remote)
+yarn prod:migrate          # Apply pending migrations (local: through the wrapper, stack proven; linked: db push; a window migration is refused on both)
 yarn prod:direct           # Run API+web directly in production mode
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
