@@ -2762,9 +2762,12 @@ export class SessionService implements ISessionService {
       turnEpochCandidate: options?.turnEpochCandidate,
     };
 
-    // Resolve default_session_id from agent identity. When set, threadKey
-    // misses route to this session instead of creating new ones.
-    const defaultSessionId = await this.resolveDefaultSessionId(userId, sbSlug, identitySbId);
+    // Resolve default_session_id from agent identity. When set, thread misses
+    // AND unthreaded requests route to this session instead of creating new
+    // ones — it is the identity's home. The bridge flag rides along for the
+    // duplicate-home check at creation.
+    const identityRouting = await this.resolveIdentityRouting(userId, sbSlug, identitySbId);
+    const defaultSessionId = identityRouting.defaultSessionId;
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
@@ -2918,6 +2921,29 @@ export class SessionService implements ISessionService {
       }
 
       if (!options?.threadKey) {
+        // Home rung. An identity with a default_session_id has ONE session
+        // that everything unaddressed belongs to. Until now this rung ran only
+        // for threaded requests, so a thread miss went to the default session
+        // while an unthreaded channel message or heartbeat went through
+        // general-active — two anchors, free to name two sessions. They did:
+        // on 2026-09-09 Myra's home session crashed (a broken ink build),
+        // general-active skipped it as `failed`, the next Telegram message
+        // created 64e1eb49, and for fifteen days her reminders fired in one
+        // session while her threads (bound by this rung) lived in 88b728cb.
+        // A contact-scoped request is exempt: the default session is the
+        // owner's, and a per-sender contact must never land in it.
+        if (defaultSessionId && !options?.contactId) {
+          const defaultSession = await this.repository.findById(defaultSessionId);
+          if (defaultSession && !defaultSession.endedAt) {
+            this.logRungMatch('default-session', defaultSession, routing, options?.threadKey);
+            return this.withStudioLease(defaultSession, routing, leaseCtx);
+          }
+          logger.debug('default_session_id is set but session is ended/missing; falling through', {
+            defaultSessionId,
+            sbSlug,
+          });
+        }
+
         // Fall back to general active session for non-threaded requests.
         // Ambiguous identity with no canonical id: general reuse would fall
         // back to the slug and hand back a sibling's session, so skip reuse
@@ -2931,6 +2957,12 @@ export class SessionService implements ISessionService {
               ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
               contactId: options?.contactId,
               sbId: identitySbId,
+              // A crashed home session is still the home session. Excluding
+              // `failed` here is what turned one bad build into a second
+              // Myra: the crash is a lifecycle the next turn overwrites, and
+              // the recipient-session and default-session rungs already
+              // resume such a session without a second thought.
+              includeFailed: true,
             })
           : null;
 
@@ -3055,6 +3087,21 @@ export class SessionService implements ISessionService {
       });
     }
 
+    // Is this a HOME creation for a bridge — unthreaded, unaliased, owner-
+    // scoped, studioless? Then a sibling home session must not exist, and if
+    // one does the new row records it and the log says so at error level.
+    // Checked before the insert so the twin is labelled from birth.
+    const isHomeCreation =
+      type === 'primary' &&
+      !options?.threadKey &&
+      !options?.alias &&
+      !options?.contactId &&
+      !resolvedStudioId;
+    const homeSiblings =
+      isHomeCreation && identityRouting.bridge
+        ? await this.findHomeSiblings(userId, sbSlug, identitySbId)
+        : [];
+
     // Create new session
     const session = await this.repository.create({
       userId,
@@ -3095,6 +3142,7 @@ export class SessionService implements ISessionService {
           occupancyChecked: routing.occupancyChecked,
           ...(routing.diverted ? { diverted: { ...routing.diverted } } : {}),
           resolvedAt: new Date().toISOString(),
+          ...(homeSiblings.length > 0 ? { homeSiblings: homeSiblings.map((s) => s.id) } : {}),
         },
       },
     });
@@ -3108,6 +3156,22 @@ export class SessionService implements ISessionService {
       studioId: resolvedStudioId || null,
       routingTier: routing.tier,
     });
+
+    if (homeSiblings.length > 0) {
+      // ERROR, not warn: a second home for a bridge is a second Myra. Every
+      // reminder, thread and Telegram message from here on picks one of them
+      // by anchor, and the two drift. The row carries the sibling ids
+      // (metadata.routing_decision.homeSiblings) so the census is a query.
+      logger.error('[SessionRouting] Bridge identity now has more than one home session', {
+        sbSlug,
+        sbId: identitySbId,
+        createdSessionId: session.id,
+        siblings: homeSiblings,
+        recovery:
+          'end the newer session, rebind its inbox_thread_participants rows and ' +
+          'channel_routes.active_session_id to the survivor',
+      });
+    }
 
     this.logRungMatch('created', session, routing, options?.threadKey);
     return this.withStudioLease(session, routing, leaseCtx);
@@ -4157,29 +4221,82 @@ This session will continue with a fresh context after compaction. Your identity,
    * misses route to this session instead of creating new ones (Myra, etc.).
    * Returns the session UUID or null.
    */
-  private async resolveDefaultSessionId(
+  private async resolveIdentityRouting(
     userId: string,
     sbSlug: string,
     sbId?: string | null
-  ): Promise<string | null> {
-    if (!this.supabase) return null;
+  ): Promise<{ defaultSessionId: string | null; bridge: boolean }> {
+    const none = { defaultSessionId: null, bridge: false };
+    if (!this.supabase) return none;
     try {
       // default_session_id not yet in generated types — cast result
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let q = (this.supabase as any)
         .from('agent_identities')
-        .select('default_session_id')
+        .select('default_session_id, metadata')
         .eq('user_id', userId);
       // Canonical identity when known: reading the default session by slug
       // could hand identity A the session identity B configured
       // (Lumen, PR #514 round 5).
       q = sbId ? q.eq('id', sbId) : q.eq('agent_id', sbSlug).not('workspace_id', 'is', null);
       const { data } = (await q.limit(1).maybeSingle()) as {
-        data: { default_session_id: string | null } | null;
+        data: { default_session_id: string | null; metadata?: unknown } | null;
       };
-      return data?.default_session_id || null;
+      const meta = data?.metadata;
+      const bridge =
+        !!meta && typeof meta === 'object' && (meta as Record<string, unknown>).bridge === true;
+      return { defaultSessionId: data?.default_session_id || null, bridge };
     } catch {
-      return null;
+      return none;
+    }
+  }
+
+  /**
+   * A bridge identity (Telegram/WhatsApp/Discord relay) has exactly one home:
+   * the unended session with no studio, no thread and no contact. Every reuse
+   * rung above creation resolves to it, so reaching creation for such a
+   * request is correct only when nothing exists. This asks the table before
+   * the row is written, so a twin is born labelled as one — the 2026-09-10
+   * twin went unnoticed for fifteen days because nothing at the moment of
+   * creation could see the session it duplicated.
+   */
+  private async findHomeSiblings(
+    userId: string,
+    sbSlug: string,
+    sbId: string | null
+  ): Promise<Array<{ id: string; lifecycle: string | null; startedAt: string | null }>> {
+    if (!this.supabase) return [];
+    try {
+      let q = this.supabase
+        .from('sessions')
+        .select('id, lifecycle, started_at')
+        .eq('user_id', userId)
+        .is('ended_at', null)
+        .is('studio_id', null)
+        .is('thread_key', null)
+        .is('contact_id', null)
+        .order('started_at', { ascending: false })
+        .limit(5);
+      q = sbId ? q.eq('sb_id', sbId) : q.eq('agent_id', sbSlug);
+      const { data, error } = await q;
+      if (error) {
+        logger.warn('[SessionRouting] Home-sibling lookup failed', {
+          sbSlug,
+          error: error.message,
+        });
+        return [];
+      }
+      return (data ?? []).map((row) => ({
+        id: row.id,
+        lifecycle: row.lifecycle,
+        startedAt: row.started_at,
+      }));
+    } catch (err) {
+      logger.warn('[SessionRouting] Home-sibling lookup threw', {
+        sbSlug,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
     }
   }
 

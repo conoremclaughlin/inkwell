@@ -244,6 +244,8 @@ export class SessionRepository implements ISessionRepository {
       contactId?: string;
       /** Canonical identity UUID — preferred over the ambiguous slug. */
       sbId?: string | null;
+      /** See ISessionRepository.findByUserAndAgent. */
+      includeFailed?: boolean;
     }
   ): Promise<Session | null> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -252,9 +254,16 @@ export class SessionRepository implements ISessionRepository {
       .select('*')
       .eq('user_id', userId)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+    // `failed` is a lifecycle, not an ending: the row is unended and its
+    // agent resumes it next (list_sessions' own `attachable` filter says so).
+    // Routing reuse therefore asks for it explicitly. Everything else keeps
+    // the exclusion — a crashed session is not what a picker or a liveness
+    // badge means by "active".
+    if (!options?.includeFailed) {
+      query = query.neq('lifecycle', 'failed');
+    }
     // Same-slug siblings must not satisfy general reuse (Lumen, #514 r7).
     query = options?.sbId ? query.eq('sb_id', options.sbId) : query.eq('agent_id', sbSlug);
 
