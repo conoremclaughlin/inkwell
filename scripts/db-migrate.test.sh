@@ -64,9 +64,12 @@
 #     that cannot be read is a refusal, never a non-window
 #   - (review round 3) the origin comes from the URL parser, so a password
 #     containing "@" is still userinfo and an unparseable value is a refusal
-#     that shows nothing; prod:direct and prod:migrate decide NODE_ENV
-#     (production unless the caller says otherwise) before any migration
-#     decision, so the proof reads the layer the server will
+#     that shows nothing; prod:direct and prod:up force production before any
+#     migration decision, the mode their servers are started under whatever
+#     the caller's shell says, so the proof reads the layer the server will;
+#     prod:migrate defaults to production for the same reason
+#   - (review round 4) outside values reach node after "--", so a string
+#     shaped like a node option is rejected as a URL and never executed
 #
 # Usage:  sh scripts/db-migrate.test.sh
 #
@@ -1309,6 +1312,18 @@ rc=$?
 out=$(sh "$script" safe-origin 'mailto:someone@example.com' 2>&1)
 rc=$?
 [ "$rc" -eq 1 ] && [ -z "$out" ] && ok "safe-origin: an opaque origin is not an origin" || bad "safe-origin: an opaque origin is not an origin" "exit $rc: $out"
+# A value shaped like a node option is an argument to the parser, never a
+# flag: it must be rejected as a URL, and it must not run.
+out=$(sh "$script" safe-origin '--eval=process.stdout.write("SYNTHFLAG")' 2>&1)
+rc=$?
+[ "$rc" -eq 1 ] && [ -z "$out" ] && ok "safe-origin: an option-shaped value is not parsed as a node option; rejected, nothing printed" ||
+  bad "safe-origin: an option-shaped value is not parsed as a node option; rejected, nothing printed" "exit $rc: $(echo "$out" | grep -c 'SYNTHFLAG') payload hits"
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for '--eval=process.stdout.write("SYNTHFLAG")' 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ! echo "$out" | grep -q 'SYNTHFLAG' && echo "$out" | grep -q 'not a parseable URL' && ! calls | grep -q '^psql' &&
+  ok "pending --for an option-shaped value: refused as unparseable, never executed" ||
+  bad "pending --for an option-shaped value: refused as unparseable, never executed" "exit $rc: $(echo "$out" | grep -c 'SYNTHFLAG') payload hits"
 reset_log
 out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for "$u" 2>&1)
 rc=$?
@@ -1393,13 +1408,27 @@ if [ "$rc" -eq 1 ] && grep -qx 20260701000000 "$pdl" && echo "$out" | grep -q 'M
 else
   bad "prod:direct with .env.production naming the stack: the file is applied under production, then the missing build stops the start" "exit $rc: $out; ledger: $(cat "$pdl" | tr '\n' ' ')"
 fi
+# The API and web processes are started under production whatever the caller
+# says, so the proof is made under production whatever the caller says: one
+# mode for both, never a split.
 printf 'select 31;\n' > "$pd/supabase/migrations/20260702000000_prod_two.sql"
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pd/.env.development"
 reset_log
 out=$(pd_run prod-direct.sh NODE_ENV=development)
 rc=$?
 [ "$rc" -eq 1 ] && grep -qx 20260702000000 "$pdl" && echo "$out" | grep -q 'Missing packages/api/dist' &&
-  ok "prod:direct with NODE_ENV set by the caller: the caller's value is kept (development's layer, 54321, applies)" ||
-  bad "prod:direct with NODE_ENV set by the caller: the caller's value is kept (development's layer, 54321, applies)" "exit $rc: $out"
+  ok "prod:direct with a caller NODE_ENV=development and the development layer naming another stack: production's layer decides (applies), as it does for the servers" ||
+  bad "prod:direct with a caller NODE_ENV=development and the development layer naming another stack: production's layer decides (applies), as it does for the servers" "exit $rc: $out"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pd/.env.development"
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pd/.env.production"
+printf 'select 32;\n' > "$pd/supabase/migrations/20260703000000_prod_three.sql"
+reset_log
+out=$(pd_run prod-direct.sh NODE_ENV=development)
+rc=$?
+[ "$rc" -ne 0 ] && ! calls | grep -q '^psql' && ! grep -qx 20260703000000 "$pdl" && echo "$out" | grep -q '55421' && ! echo "$out" | grep -q 'Missing packages/api/dist' &&
+  ok "prod:direct with a caller NODE_ENV=development and the production layer naming another stack: refused on production's stack before any apply" ||
+  bad "prod:direct with a caller NODE_ENV=development and the production layer naming another stack: refused on production's stack before any apply" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pd/.env.production"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

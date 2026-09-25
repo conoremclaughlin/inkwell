@@ -55,7 +55,7 @@ read -r target state pending_versions < <(node -e '
   const pending = r && Array.isArray(r.pending) && r.pending.every((v) => /^[0-9]{14}$/.test(String(v))) ? r.pending : null;
   if (!target || !state || pending === null) process.exit(0);
   console.log([target, state, ...pending].join(" "));
-' "${status_json}" || true)
+' -- "${status_json}" || true)
 target="${target:-}"
 state="${state:-}"
 pending_versions="${pending_versions:-}"

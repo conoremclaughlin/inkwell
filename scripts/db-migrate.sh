@@ -132,7 +132,8 @@ fi
 # ends: a password may itself contain "@", and the last one is the
 # delimiter. A value the parser rejects, or one with an opaque origin, is
 # not a URL for our purposes: nothing is printed and the status is 1, so a
-# caller refuses rather than guessing what to show.
+# caller refuses rather than guessing what to show. The value follows "--",
+# so one shaped like a node option (--eval=...) is an argument, never a flag.
 safe_origin() {
   node -e '
     let origin = "";
@@ -144,7 +145,7 @@ safe_origin() {
     }
     process.stdout.write(origin);
     process.exit(origin ? 0 : 1);
-  ' "$1" 2>/dev/null
+  ' -- "$1" 2>/dev/null
 }
 
 # `safe-origin URL`: the same, for other scripts' messages: the origin and

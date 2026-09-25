@@ -32,13 +32,12 @@ load_env_file "${ROOT_DIR}/.env.local"
 # shellcheck disable=SC1090
 source "${PRESERVED_ENV_FILE}"
 
-# Production mode is decided here, before any migration decision: the
-# preflight resolves the runtime's SUPABASE_URL through the same env layers
-# the API will use, and .env.production is one of them. The API and web
-# processes below are started with NODE_ENV=production explicitly; without
-# this line the proof would read .env.development while the server read
-# .env.production.
-export NODE_ENV="${NODE_ENV:-production}"
+# This is the production entrypoint: the API and web processes below are
+# started with NODE_ENV=production whatever the caller's shell says, so the
+# migration decision is made under production too, whatever the caller's
+# shell says. One mode for the proof and for the servers; a caller-set
+# NODE_ENV does not split them.
+export NODE_ENV=production
 
 # The restart is the deploy: pending migrations are applied (local target) or
 # refused (linked target, window migration) before anything starts, and a
