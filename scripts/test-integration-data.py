@@ -147,9 +147,12 @@ class DataTests(unittest.TestCase):
         self.assertEqual(names, data.FIXTURE_TABLES)
         self.assertEqual(len(set(names)), len(names))
         # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539).
+        # 73 -> 77 with the revocation amendment's publication_operations,
+        # publication_operation_events, observation_conflicts and
+        # task_authority_holds (spec workflow-graph-revocation).
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 73)
+        self.assertEqual(len(names), 77)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
