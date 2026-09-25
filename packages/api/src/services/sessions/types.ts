@@ -345,10 +345,12 @@ export interface SessionResult {
     detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
       anchor?: 'studio' | 'session';
       occupied?: { studioId: string; holderThreadKey: string };
       policy?: 'reuse-only';
+      /** The thread's pinned project, when the decision was made by it (task b5c71bc3). */
+      project?: { slug: string; cause?: 'unset' | 'unresolved' | 'unreadable'; repoRoot?: string };
     };
   };
 }

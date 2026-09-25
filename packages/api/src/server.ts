@@ -1191,12 +1191,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // routingHold stamp.
     const refuseAndHold = async (refusal: {
       threadKey: string;
-      detail: {
-        triedCallerRepo: boolean;
-        callerRepoRoot?: string;
-        reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
-        occupied?: { studioId: string; holderThreadKey: string };
-      };
+      // The refusal's own detail shape, so a new reason (project-without-repo,
+      // task b5c71bc3) reaches the hold instead of being narrowed away here.
+      detail: RoutingRefusedError['detail'];
       message: string;
     }): Promise<void> => {
       // ERROR, not warn. processTrigger converts the failure into a
