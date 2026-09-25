@@ -365,7 +365,7 @@ npx prettier --write "path/to/file"
 yarn dev                   # Start API+web with hot reload (default: port 3001)
 yarn prod                  # One-shot: build + migrate + start (alias for prod:up)
 yarn prod:refresh          # Install + build latest code after pull
-yarn prod:migrate          # Apply pending migrations (auto-detects local vs remote)
+yarn prod:migrate          # Apply pending migrations (local: through the wrapper, stack proven; linked: db push; a window migration is refused on both)
 yarn prod:direct           # Run API+web directly in production mode
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
@@ -377,6 +377,8 @@ yarn local:migrate         # Apply local migrations
 yarn linked:migrate        # Apply linked (remote) migrations
 yarn db:migrate <file>     # Apply one migration file to the local stack, recorded under the file's version (any worktree)
 yarn db:migrate:status     # Local ledger vs the files in this checkout
+yarn db:migrate:pending    # Apply every pending file in version order (yarn dev runs this first)
+yarn dev:no-migrations     # Start without applying pending migrations, on purpose
 yarn test:integration:db:local   # DB integration suite against isolated local Supabase
 yarn test:integration:runtime    # Runtime/CLI integration suite
 yarn logs:ink              # View Inkwell server logs (structured JSON)

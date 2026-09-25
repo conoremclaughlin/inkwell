@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from 'child_process';
 import { resolve as resolvePath } from 'path';
-import { existsSync, readFileSync } from 'fs';
+import { resolveRuntimeEnv } from './lib/runtime-env.mjs';
 
 function parseArgs(argv) {
   const args = {
@@ -11,6 +11,7 @@ function parseArgs(argv) {
     quiet: false,
     target: 'auto',
     printTarget: false,
+    printSupabaseUrl: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -54,38 +55,13 @@ function parseArgs(argv) {
       args.printTarget = true;
       continue;
     }
+    if (token === '--print-supabase-url') {
+      args.printSupabaseUrl = true;
+      continue;
+    }
   }
 
   return args;
-}
-
-function parseEnvFile(filePath) {
-  if (!existsSync(filePath)) return {};
-  try {
-    const raw = readFileSync(filePath, 'utf-8');
-    const out = {};
-    for (const line of raw.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-
-      const candidate = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
-      const eqIndex = candidate.indexOf('=');
-      if (eqIndex <= 0) continue;
-      const key = candidate.slice(0, eqIndex).trim();
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-      let value = candidate.slice(eqIndex + 1).trim();
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
-      out[key] = value;
-    }
-    return out;
-  } catch {
-    return {};
-  }
 }
 
 function isLocalSupabaseUrl(value) {
@@ -98,6 +74,16 @@ function isLocalSupabaseUrl(value) {
   }
 }
 
+// The URL the runtime will actually use: SUPABASE_URL through the runtime's
+// own env loader (scripts/lib/runtime-env.mjs, the layering and precedence of
+// packages/api/src/config/env.ts) in the --workdir checkout. The startup
+// preflight hands this to the wrapper so the stack it applies to is proven to
+// be the one the server is about to use. LOCAL_SUPABASE_URL is not consulted:
+// the runtime never reads it, so it must not be able to redirect a write.
+function resolveSupabaseUrl(args) {
+  return resolveRuntimeEnv(args.workdir).env.SUPABASE_URL || '';
+}
+
 function resolveTarget(args) {
   if (args.target === 'local' || args.target === 'linked') return args.target;
 
@@ -106,18 +92,7 @@ function resolveTarget(args) {
     .toLowerCase();
   if (override === 'local' || override === 'linked') return override;
 
-  const envLocal = parseEnvFile(resolvePath(args.workdir, '.env.local'));
-  const envFallback = parseEnvFile(resolvePath(args.workdir, '.env'));
-
-  const supabaseUrl =
-    process.env.SUPABASE_URL ||
-    process.env.LOCAL_SUPABASE_URL ||
-    envLocal.SUPABASE_URL ||
-    envLocal.LOCAL_SUPABASE_URL ||
-    envFallback.SUPABASE_URL ||
-    envFallback.LOCAL_SUPABASE_URL;
-
-  return isLocalSupabaseUrl(supabaseUrl) ? 'local' : 'linked';
+  return isLocalSupabaseUrl(resolveSupabaseUrl(args)) ? 'local' : 'linked';
 }
 
 // `supabase migration list` prints a table, whatever -o says (that flag
@@ -202,6 +177,11 @@ function main() {
   const target = resolveTarget(args);
   if (args.printTarget) {
     console.log(target);
+    process.exit(0);
+    return;
+  }
+  if (args.printSupabaseUrl) {
+    console.log(resolveSupabaseUrl(args));
     process.exit(0);
     return;
   }

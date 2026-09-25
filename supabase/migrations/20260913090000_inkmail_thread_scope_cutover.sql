@@ -1,3 +1,4 @@
+-- db-migrate: window docs/runbooks/inkmail-thread-scope-cutover.md
 -- Inkmail thread scope — the cutover
 -- Spec: ink://specs/inkmail-thread-scope §1, §1b, §1c, §3, §4, §4a (v9, approved 2026-09-12)
 --
