@@ -75,6 +75,25 @@ describe('toConversationMessage', () => {
     expect(sam.id).not.toBe(kim.id);
   });
 
+  it('names a person the server could not name as a person, never "You" to a stranger', () => {
+    const author = toConversationMessage(
+      message({
+        senderKind: 'user',
+        senderSlug: 'user',
+        senderUserId: 'u2',
+        senderName: undefined,
+      }),
+      names
+    ).author;
+    expect(author).toMatchObject({ kind: 'user', name: 'a workspace member', isOwn: false });
+  });
+
+  it('ignores the retired metadata hint that once marked a person’s reply', () => {
+    expect(
+      toConversationMessage(message({ metadata: { sentBy: 'user' } }), names).author
+    ).toMatchObject({ kind: 'sb', id: 'wren', name: 'Wren', isOwn: false });
+  });
+
   it('drops a priority it does not recognise instead of passing it through', () => {
     expect(
       toConversationMessage(message({ priority: 'whenever' }), names).priority

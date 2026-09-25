@@ -5,6 +5,7 @@
  * returning to the app never shows stale data for long.
  */
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { THREADS_PATH, threadMessagesPath } from '@inklabs/shared/stories/threads-api';
 import { apiFetch } from '../lib/api';
 import { getWorkspaceId, setWorkspaceId } from '../lib/storage';
 import type {
@@ -28,7 +29,7 @@ const FLEET_POLL_MS = 20_000;
 export function useThreads() {
   return useQuery({
     queryKey: ['threads'],
-    queryFn: () => apiFetch<ThreadsResponse>('/api/admin/threads'),
+    queryFn: () => apiFetch<ThreadsResponse>(THREADS_PATH),
     refetchInterval: THREAD_LIST_POLL_MS,
   });
 }
@@ -36,10 +37,7 @@ export function useThreads() {
 export function useThreadMessages(threadKey: string) {
   return useQuery({
     queryKey: ['thread', threadKey],
-    queryFn: () =>
-      apiFetch<ThreadMessagesResponse>(
-        `/api/admin/threads/messages?key=${encodeURIComponent(threadKey)}`
-      ),
+    queryFn: () => apiFetch<ThreadMessagesResponse>(threadMessagesPath(threadKey)),
     refetchInterval: THREAD_DETAIL_POLL_MS,
   });
 }

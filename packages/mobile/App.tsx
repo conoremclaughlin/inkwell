@@ -14,6 +14,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import type { AuthStackParamList, RootStackParamList, TabParamList } from './src/navigation';
 import { ThreadsScreen } from './src/screens/ThreadsScreen';
 import { ThreadScreen } from './src/screens/ThreadScreen';
+import { ThreadDetailsScreen } from './src/screens/ThreadDetailsScreen';
 import { FleetScreen } from './src/screens/FleetScreen';
 import { ChatScreen } from './src/screens/ChatScreen';
 import { NewThreadScreen } from './src/screens/NewThreadScreen';
@@ -25,6 +26,7 @@ import { ConnectScreen } from './src/screens/ConnectScreen';
 import {
   ChatIcon,
   FleetIcon,
+  InfoIcon,
   PlusIcon,
   SettingsIcon,
   ThreadsIcon,
@@ -184,7 +186,27 @@ export default function App() {
               <Stack.Screen
                 name="Thread"
                 component={ThreadScreen}
-                options={({ route }) => ({ title: route.params.title ?? route.params.threadKey })}
+                options={({ route, navigation }) => ({
+                  title: route.params.title ?? route.params.threadKey,
+                  headerRight: () => (
+                    <Pressable
+                      onPress={() =>
+                        navigation.navigate('ThreadDetails', { threadKey: route.params.threadKey })
+                      }
+                      hitSlop={12}
+                      style={{ paddingHorizontal: 4 }}
+                      accessibilityLabel="Thread details"
+                      accessibilityRole="button"
+                    >
+                      <InfoIcon color={colors.textSecondary} />
+                    </Pressable>
+                  ),
+                })}
+              />
+              <Stack.Screen
+                name="ThreadDetails"
+                component={ThreadDetailsScreen}
+                options={{ title: 'Details' }}
               />
               <Stack.Screen
                 name="NewThread"

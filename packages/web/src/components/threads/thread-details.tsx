@@ -15,7 +15,11 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import type { ThreadMessagesResponse, ThreadSpine } from '@inklabs/shared/stories/threads-api';
-import { displayTitle, isSessionLive } from '@inklabs/shared/stories/thread-browsing';
+import {
+  displayTitle,
+  isSessionLive,
+  SESSION_RELATION_LABELS,
+} from '@inklabs/shared/stories/thread-browsing';
 import {
   creatorLabel,
   formatRelativeTime,
@@ -26,18 +30,6 @@ import { useApiQuery } from '@/lib/api';
 import { AuthorAvatar } from '@/components/conversation/author-avatar';
 import { EvidenceNodeCard, type GraphEvidenceResponse } from './evidence';
 import { TypeChip } from './thread-list';
-
-/**
- * Session→key relations, in words a reader shouldn't have to decode:
- * "routed here" = this key is the session's immutable routing anchor (where
- * inbox triggers landed it); "working now" = the session's mutable current
- * focus; both when they coincide. These are session facts, not studios.
- */
-const RELATION_LABELS: Record<'anchor' | 'active' | 'both', string> = {
-  anchor: 'routed here',
-  active: 'working now',
-  both: 'routed · working',
-};
 
 const RELATION_TOOLTIP =
   'Session relation to this key — "routed here": the key this session was originally routed/spawned for; "working now": the session\'s current focus (its activeThreadKey)';
@@ -243,7 +235,7 @@ export function ThreadDetails({
                     className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px]"
                     title={RELATION_TOOLTIP}
                   >
-                    {RELATION_LABELS[s.relation]}
+                    {SESSION_RELATION_LABELS[s.relation]}
                   </span>
                   <span className="ml-auto shrink-0 text-muted-foreground">
                     {formatRelativeTime(s.updatedAt)}
