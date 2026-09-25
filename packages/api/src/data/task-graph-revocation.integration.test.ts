@@ -710,6 +710,121 @@ d('workflow graph revocation, supersession and holds (real DB)', () => {
     });
   }
 
+  // ── Lumen's round-three probes (PR #678): the revoked gate itself and a
+  //    failed intermediate carry no hold rows, yet an edge from either onto a
+  //    completed bridge must still carry the withdrawal; and a late edge that
+  //    puts held ancestry above a claimed node fences that claim.
+
+  for (const linkSource of ['G', 'H'] as const) {
+    for (const type of ['work', 'gate'] as const) {
+      it(`round3: hold inheritance from ${linkSource} reaches new ${type}`, async () => {
+        const { group, id } = await buildGraph(
+          'failed source late bridge',
+          [
+            { key: 'G', type: 'gate', binding: 'A' },
+            { key: 'W', type: 'work' },
+            { key: 'H', type: 'gate' },
+            { key: 'X', type: 'work' },
+            { key: 'N', type },
+          ],
+          [
+            ['G', 'W'],
+            ['W', 'H'],
+            ['X', 'N'],
+          ]
+        );
+        await sweep(group);
+        expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+        await claimAndComplete(id.W, sess1);
+        expect((await verdict(id.H, reviewer, 'failed')).success).toBe(true);
+        await claimAndComplete(id.X, sess1);
+        const r = await revoke(id.G, { identity: reviewer });
+        expect(r.success).toBe(true);
+        expect(await openHolds(id.W)).toHaveLength(1);
+        expect(await openHolds(id.H)).toHaveLength(0);
+        const changed = await groups.applyTaskGraph({
+          userId: USER,
+          taskGroupId: group,
+          expectedVersion: 2,
+          actorIdentityId: author,
+          edges: [
+            { from: id.G, to: id.W },
+            { from: id.W, to: id.H },
+            { from: id[linkSource], to: id.X },
+            { from: id.X, to: id.N },
+          ],
+        });
+        if (!changed.success) return;
+        const claim = await groups.claimGraphTask({ userId: USER, taskId: id.N, sessionId: sess2 });
+        expect(claim.success, JSON.stringify({ claim, evaluation: changed.evaluation })).toBe(
+          false
+        );
+        expect(await openHolds(id.N)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ cause_event_id: r.eventId, source_gate_id: id.G }),
+          ])
+        );
+      });
+    }
+  }
+
+  for (const type of ['work', 'gate'] as const) {
+    it(`round3: new held ancestry fences an existing ${type} claim`, async () => {
+      const { group, id } = await buildGraph(
+        'fence via late edge',
+        [
+          { key: 'G', type: 'gate', binding: 'A' },
+          { key: 'W', type: 'work' },
+          { key: 'X', type: 'work' },
+          { key: 'N', type },
+        ],
+        [
+          ['G', 'W'],
+          ['X', 'N'],
+        ]
+      );
+      await sweep(group);
+      expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+      await claimAndComplete(id.W, sess1);
+      await claimAndComplete(id.X, sess1);
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: id.N, sessionId: sess2 });
+      expect(claim.success).toBe(true);
+      expect((await revoke(id.G, { identity: reviewer })).success).toBe(true);
+      const changed = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: group,
+        expectedVersion: 2,
+        actorIdentityId: author,
+        edges: [
+          { from: id.G, to: id.W },
+          { from: id.W, to: id.X },
+          { from: id.X, to: id.N },
+        ],
+      });
+      expect(changed.success).toBe(true);
+      expect((await gate(id.N)).claimed_by_session_id).toBeNull();
+      expect(await openHolds(id.N)).toHaveLength(1);
+      const released = (await events(id.N)).filter((e) => e.event === 'claim_released');
+      expect(released).toEqual([
+        expect.objectContaining({ reason: 'upstream-revoked', claim_token: claim.claimToken }),
+      ]);
+      const late =
+        type === 'work'
+          ? await groups.completeGraphTask({
+              userId: USER,
+              taskId: id.N,
+              sessionId: sess2,
+              claimToken: claim.claimToken as string,
+              outcome: 'completed',
+            })
+          : await verdict(id.N, reviewer, 'passed', {
+              sessionId: sess2,
+              claimToken: claim.claimToken as string,
+            });
+      expect(late.success).toBe(false);
+    });
+  }
+
   it('case 7 minimal: G → P(completed) → C(pending) — C does not become ready through P while held', async () => {
     const { group, id } = await buildGraph(
       'case 7 minimal',

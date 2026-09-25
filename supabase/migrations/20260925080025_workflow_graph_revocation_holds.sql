@@ -336,6 +336,21 @@ AS $$
   SELECT node FROM reach;
 $$;
 
+-- Every ancestor of a node over task_edges: the same deduplicating
+-- reachability, upstream.
+CREATE OR REPLACE FUNCTION public._graph_ancestors(p_task_id uuid)
+RETURNS SETOF uuid
+LANGUAGE sql STABLE
+SET search_path = public, pg_temp
+AS $$
+  WITH RECURSIVE up(node) AS (
+    SELECT e.from_task FROM task_edges e WHERE e.to_task = p_task_id
+    UNION
+    SELECT e.from_task FROM up r JOIN task_edges e ON e.to_task = r.node
+  )
+  SELECT node FROM up;
+$$;
+
 -- The phase of an operation is a projection of its events, never a column.
 CREATE OR REPLACE FUNCTION public._publication_operation_phase(p_operation_id uuid)
 RETURNS text
@@ -1782,23 +1797,32 @@ BEGIN
 END;
 $$;
 
--- ── Holds travel with edges (Lumen, PR #678 round two) ─────────────────
+-- ── Holds travel with edges (Lumen, PR #678 rounds two and three) ──────
 --
 -- A hold is placed over the closure that exists when authority is lost.
 -- The graph can change afterwards: an inbound edit can wire a completed,
 -- unheld node beneath a held one, and everything downstream of that bridge
 -- then sees only satisfied, unheld sources. Readiness that inspects
 -- immediate sources cannot preserve the closure; the invariant has to be
--- maintained by the write that changes it. So every edge insert inherits
--- the unreleased holds of its source onto its target and the target's
--- descendants — same kind, cause, source gate, attempt and binding — with
--- the same per-state effects placement has (an open gate closes with a fresh
--- window, a claim is released with reason upstream-revoked), and the same
--- per-cause release lifts them later. A node already holding that cause is
--- skipped, so a re-added edge is idempotent. The trigger runs inside the
--- serialized mutation's own transaction, under its group lock, whichever RPC
--- inserted the edge (apply_task_graph, add_graph_nodes, conversion): the
--- fence lives in the write, never beside it.
+-- maintained by the write that changes it.
+--
+-- What an edge carries is not the source's own hold rows but every
+-- unresolved cause in its ANCESTRY: the unreleased holds of the source and
+-- of every node upstream of it, and the unresolved withdrawals of every
+-- gate upstream of it — the revoked gate itself carries no hold row (its
+-- new attempt is the ordinary decide-again state) and a failed intermediate
+-- was skipped by placement, yet an edge from either onto a completed bridge
+-- would otherwise let the bridge's descendants out (round three). Each
+-- cause is placed on the target and the target's descendants through
+-- _graph_place_holds — same kind, cause, source gate, attempt and binding —
+-- with the per-state effects placement has (an open gate closes with a
+-- fresh window, a claim is released with reason upstream-revoked) and the
+-- per-cause release later. Placement is idempotent per (node, cause), so a
+-- re-added edge changes nothing. The trigger runs inside the serialized
+-- mutation's own transaction under its group lock, whichever RPC inserted
+-- the edge (apply_task_graph, add_graph_nodes, conversion): the fence lives
+-- in the write, never beside it. AFTER ROW triggers fire once the whole
+-- statement's rows are in, so the ancestry they read is the new graph.
 
 CREATE OR REPLACE FUNCTION public._graph_edge_inherits_holds()
 RETURNS trigger
@@ -1808,24 +1832,45 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_target record;
-  v_hold record;
+  v_cause record;
 BEGIN
   SELECT t.user_id, t.task_group_id INTO v_target
   FROM tasks t WHERE t.id = NEW.to_task;
   IF NOT FOUND OR v_target.task_group_id IS NULL THEN
     RETURN NEW;
   END IF;
-  FOR v_hold IN
-    SELECT h.kind, h.cause_event_id, h.cause_operation_id,
-           h.source_gate_id, h.source_attempt, h.binding_hash
-    FROM task_authority_holds h
-    WHERE h.task_id = NEW.from_task AND h.released_at IS NULL
-    ORDER BY h.placed_at, h.id
+  FOR v_cause IN
+    WITH lineage AS (
+      SELECT NEW.from_task AS id
+      UNION
+      SELECT _graph_ancestors(NEW.from_task)
+    ),
+    causes AS (
+      -- (a) unreleased holds anywhere in the ancestry
+      SELECT h.kind, h.cause_event_id, h.cause_operation_id,
+             h.source_gate_id, h.source_attempt, h.binding_hash, h.placed_at AS since
+      FROM task_authority_holds h
+      WHERE h.task_id IN (SELECT id FROM lineage) AND h.released_at IS NULL
+      UNION
+      -- (b) unresolved withdrawals of any gate in the ancestry, which the
+      --     gate itself does not carry as a hold
+      SELECT 'authority-withdrawn', e.id, NULL::uuid,
+             g.id, e.attempt, e.binding_hash, e.created_at
+      FROM tasks g
+      JOIN task_gate_events e ON e.task_id = g.id AND e.event = 'revoked'
+      WHERE g.id IN (SELECT id FROM lineage)
+        AND g.task_type = 'verification'
+        AND e.id IN (SELECT graph_unresolved_withdrawals(g.id, e.binding_hash))
+    )
+    SELECT DISTINCT ON (cause_event_id, cause_operation_id)
+           kind, cause_event_id, cause_operation_id, source_gate_id, source_attempt, binding_hash
+    FROM causes
+    ORDER BY cause_event_id, cause_operation_id, since
   LOOP
     PERFORM set_config('app.graph_executor', 'on', true);
     PERFORM _graph_place_holds(v_target.user_id, v_target.task_group_id, NEW.to_task, true,
-      v_hold.kind, v_hold.cause_event_id, v_hold.cause_operation_id,
-      v_hold.source_gate_id, v_hold.source_attempt, v_hold.binding_hash);
+      v_cause.kind, v_cause.cause_event_id, v_cause.cause_operation_id,
+      v_cause.source_gate_id, v_cause.source_attempt, v_cause.binding_hash);
   END LOOP;
   RETURN NEW;
 END;
@@ -1838,6 +1883,9 @@ CREATE TRIGGER task_edges_inherit_holds
 
 REVOKE ALL ON FUNCTION public._graph_edge_inherits_holds() FROM PUBLIC;
 REVOKE ALL ON FUNCTION public._graph_edge_inherits_holds() FROM anon, authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public._graph_ancestors(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public._graph_ancestors(uuid) FROM anon, authenticated, service_role;
 
 -- ── The execution-path fence covers the gate's request columns ──────────
 
