@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { senderLabel } from './sender-label';
+import { senderLabel } from './sender-label.js';
 
 describe('senderLabel', () => {
   // Two people on one thread, as each of them sees it: "You" is the

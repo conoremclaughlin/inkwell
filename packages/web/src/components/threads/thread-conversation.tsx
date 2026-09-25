@@ -1,44 +1,35 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { ChevronLeft, Info, MessageSquareDashed } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import {
+  threadMessagesPath,
+  type ThreadMessagesResponse,
+  type ThreadSpine,
+} from '@inklabs/shared/stories/threads-api';
+import { displayTitle, liveAgentsOf, spineStatus } from '@inklabs/shared/stories/thread-browsing';
+import {
+  creatorLabel,
+  formatDayLabel,
+  readableThrough,
+  sbAuthor,
+  toConversationMessage,
+  unreadBeyondLoaded,
+  useThreadHistory,
+  type ConversationMessage,
+  type NameFor,
+} from '@inklabs/shared/stories/thread-viewing';
 import { apiGet, useApiQuery } from '@/lib/api';
 import { AvatarStack } from '@/components/conversation/author-avatar';
 import { ConversationView } from '@/components/conversation/conversation-view';
-import { formatDayLabel } from '@/components/conversation/format';
-import type { ConversationMessage } from '@/components/conversation/types';
 import type { ReadCursorStore } from './read-cursors';
 import { ReopenThreadButton } from './reopen-button';
 import { ReplyComposer } from './reply-composer';
-import { creatorLabel, sbAuthor, toConversationMessage, type NameFor } from './to-conversation';
-import {
-  displayTitle,
-  liveAgentsOf,
-  ParticipantCluster,
-  spineStatus,
-  TypeChip,
-} from './thread-list';
-import {
-  abandonCatchUp,
-  absorbNewest,
-  absorbOlder,
-  EMPTY_HISTORY,
-  failGap,
-  nextGap,
-  olderGap,
-  readableThrough,
-  unblockGaps,
-  unreadBeyondLoaded,
-  type ThreadHistory,
-} from './thread-history';
-import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
+import { ParticipantCluster, TypeChip } from './thread-list';
 
 /** How often an open conversation looks for new messages while the tab is visible. */
 const POLL_MS = 5_000;
-
-const pagePath = (key: string, beforeId?: string) =>
-  `/api/admin/threads/messages?key=${encodeURIComponent(key)}${beforeId ? `&before=${beforeId}` : ''}`;
 
 /**
  * One thread as a conversation: header, timeline, composer. Mount it keyed
@@ -65,84 +56,39 @@ export function ThreadConversation({
 
   const { data, dataUpdatedAt, isLoading } = useApiQuery<ThreadMessagesResponse>(
     ['thread-messages', key],
-    pagePath(key),
+    threadMessagesPath(key),
     { refetchInterval: hasThread ? POLL_MS : false }
   );
 
   // Where the reader was when they opened the thread. Held for the whole
   // visit so the divider stays put while they read past it; a send clears it.
   const [unreadAfter, setUnreadAfter] = useState<string | null>(() => cursors.cursorFor(key));
-  // The same cursor, kept for the history to catch up to on open whatever
-  // happens to the divider meanwhile.
-  const [openingCursor] = useState(() => cursors.cursorFor(key));
 
-  // Every newest page is merged into the history in the render it arrives,
-  // so no poll ever shows the conversation without rows it had a moment ago.
-  const [history, setHistory] = useState<ThreadHistory>(EMPTY_HISTORY);
-  const [absorbed, setAbsorbed] = useState<ThreadMessagesResponse | undefined>(undefined);
-  if (data && data !== absorbed) {
-    setAbsorbed(data);
-    setHistory((current) => absorbNewest(current, data, openingCursor));
-  }
-
-  const [loadingOlder, setLoadingOlder] = useState(false);
-  const [olderError, setOlderError] = useState<string | null>(null);
-
-  // Every successful poll — even one that brought nothing new, which hands
-  // back the same data object — is the server answering: retry what failed.
-  useEffect(() => {
-    if (dataUpdatedAt) setHistory((current) => unblockGaps(current));
-  }, [dataUpdatedAt]);
-
-  // Work the history's gaps one at a time: the catch-up to the read cursor
-  // on open, and any stretch a poll skipped. Paused and blocked gaps wait.
-  const gap = nextGap(history);
-  useEffect(() => {
-    if (!gap) return;
-    let cancelled = false;
-    apiGet<ThreadMessagesResponse>(pagePath(key, gap.beforeId))
-      .then((page) => {
-        if (!cancelled) setHistory((current) => absorbOlder(current, page, gap));
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setOlderError(error instanceof Error ? error.message : 'Failed to load messages');
-        setHistory((current) => failGap(current, gap));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [gap, key]);
+  const fetchOlder = useCallback(
+    (beforeId: string) => apiGet<ThreadMessagesResponse>(threadMessagesPath(key, beforeId)),
+    [key]
+  );
+  const {
+    history,
+    opening,
+    loadingOlder,
+    error: olderError,
+    loadOlder,
+    abandonCatchUp,
+  } = useThreadHistory({
+    newestPage: data,
+    newestPageAt: dataUpdatedAt,
+    newestPageLoading: isLoading,
+    fetchOlder,
+    // The history catches up to this cursor on open, whatever happens to
+    // the divider meanwhile.
+    openingCursor: cursors.cursorFor(key),
+  });
 
   const messages = useMemo<ConversationMessage[]>(
     () => history.messages.map((m) => toConversationMessage(m, nameFor)),
     [history.messages, nameFor]
   );
-
-  // Older history continues the catch-up when one stopped short — so reading
-  // upwards closes it and the divider lands on the real boundary — and is
-  // otherwise an ordinary page back from the oldest loaded message.
-  const loadOlder = useCallback(async () => {
-    const oldest = history.messages[0];
-    if (loadingOlder || !oldest) return;
-    const catchUp = olderGap(history);
-    setLoadingOlder(true);
-    setOlderError(null);
-    try {
-      const page = await apiGet<ThreadMessagesResponse>(
-        pagePath(key, catchUp?.beforeId ?? oldest.id)
-      );
-      setHistory((current) => absorbOlder(current, page, catchUp));
-    } catch (error) {
-      setOlderError(error instanceof Error ? error.message : 'Failed to load earlier messages');
-    } finally {
-      setLoadingOlder(false);
-    }
-  }, [loadingOlder, history, key]);
-
-  // Not ready to show until the history reaches the read cursor: the view
-  // positions once, on the real first unread message.
-  const opening = history.started ? !history.ready : isLoading;
 
   // Reading is acknowledged only as far as the history is whole. The
   // callback changes with the gaps, so the view acknowledges again — now
@@ -162,8 +108,8 @@ export function ThreadConversation({
     const newest = history.messages[history.messages.length - 1];
     if (newest) cursors.advance(key, newest.createdAt);
     setUnreadAfter(null);
-    setHistory((current) => abandonCatchUp(current));
-  }, [cursors, key, history.messages]);
+    abandonCatchUp();
+  }, [cursors, key, history.messages, abandonCatchUp]);
 
   const title = displayTitle(spine) ?? key;
   const status = spineStatus(spine);

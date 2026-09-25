@@ -1,17 +1,17 @@
 /**
  * Thread payloads → the conversation shapes every chat surface renders.
- * The only place the threads page decides who wrote a message.
+ * The only place any client decides who wrote a thread message.
  */
 
-import type { ConversationAuthor, ConversationMessage } from '@/components/conversation/types';
-import type { ThreadLastMessage, ThreadMessage } from './thread-types';
+import type { ThreadMessage } from '../threads-api/index.js';
+import type { ConversationAuthor, ConversationMessage } from './conversation.js';
 
 /** Slug → display name ("wren" → "Wren"), falling back to the slug. */
 export type NameFor = (sbSlug: string) => string;
 
 const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 
-/** The one person using this dashboard, as their own messages show them. */
+/** The viewer, as their own messages show them. */
 export const YOU: ConversationAuthor = { kind: 'user', id: 'user', name: 'You', isOwn: true };
 export const SYSTEM: ConversationAuthor = {
   kind: 'system',
@@ -77,39 +77,6 @@ export function nameLookup(
     if (identity.name?.trim()) names.set(identity.sbSlug, identity.name.trim());
   }
   return (sbSlug) => names.get(sbSlug) ?? sbSlug;
-}
-
-/**
- * Markdown reduced to what reads well on one line of a list: emphasis,
- * code ticks, heading and quote markers, and link syntax removed, the text
- * they wrapped kept.
- */
-export function plainPreview(markdown: string): string {
-  return markdown
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/```[a-z]*|`/gi, '')
-    .replace(/(\*\*|__)(.+?)\1/g, '$2')
-    .replace(/(^|\s)[*_](\S(?:.*?\S)?)[*_](?=\s|$|[.,;:!?])/g, '$1$2')
-    .replace(/(^|\s)(#{1,6}|>)\s+/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/** "Lumen: Round 2 — approve" for a list row. */
-export function previewLine(
-  lastMessage: Pick<
-    ThreadLastMessage,
-    'senderKind' | 'senderSlug' | 'senderName' | 'isOwn' | 'preview'
-  >,
-  nameFor: NameFor
-): { sender: string; text: string } {
-  const sender = lastMessage.isOwn
-    ? 'You'
-    : lastMessage.senderKind === 'sb'
-      ? nameFor(lastMessage.senderSlug)
-      : lastMessage.senderName;
-  return { sender, text: plainPreview(lastMessage.preview) };
 }
 
 /**

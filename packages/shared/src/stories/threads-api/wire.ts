@@ -1,5 +1,6 @@
 /**
- * Payloads of the threads API, as this app reads them.
+ * Payloads of the threads API, as every client reads them — the web
+ * dashboard, the mobile app, and whatever comes next.
  * Mirrors GET /api/admin/threads and GET /api/admin/threads/messages.
  */
 

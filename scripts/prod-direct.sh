@@ -32,11 +32,18 @@ load_env_file "${ROOT_DIR}/.env.local"
 # shellcheck disable=SC1090
 source "${PRESERVED_ENV_FILE}"
 
-if command -v supabase >/dev/null 2>&1; then
-  node "${ROOT_DIR}/scripts/migration-status.mjs" --workdir "${ROOT_DIR}" --warn-only || true
-else
-  echo "[migrations] ⚠ Supabase CLI not found; cannot check linked migration status."
-fi
+# This is the production entrypoint: the API and web processes below are
+# started with NODE_ENV=production whatever the caller's shell says, so the
+# migration decision is made under production too, whatever the caller's
+# shell says. One mode for the proof and for the servers; a caller-set
+# NODE_ENV does not split them.
+export NODE_ENV=production
+
+# The restart is the deploy: pending migrations are applied (local target) or
+# refused (linked target, window migration) before anything starts, and a
+# refusal stops the start here. See scripts/preflight.mjs;
+# INK_SKIP_MIGRATIONS=1 skips the step on purpose.
+node "${ROOT_DIR}/scripts/preflight.mjs"
 
 if [[ ! -f "${ROOT_DIR}/packages/api/dist/server.js" ]]; then
   echo "Missing packages/api/dist/server.js."

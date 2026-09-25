@@ -10,7 +10,7 @@ export interface ReplyResponse {
   threadId: string;
 }
 
-export { senderLabel } from './sender-label';
+export { senderLabel } from '@inklabs/shared/stories/thread-viewing';
 
 /**
  * A person's way into a thread from the dashboard. Posts through the same
