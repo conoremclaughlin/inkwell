@@ -32,8 +32,20 @@
 # function body's BEGIN and END do not count. It runs under LC_ALL=C so it
 # lexes bytes the way PostgreSQL does, identically on every machine.
 #
+# `pending` applies every file the ledger lacks, in version order, one
+# transaction each. `yarn dev` and `yarn prod:direct` run it from the main
+# checkout before the servers start, so a restart cannot outrun its migrations
+# again: on 2026-09-24 the server came up on a release whose cutover had not
+# been applied, and every poll failed on a renamed function until the window
+# was run. A file whose first ten lines carry `-- db-migrate: window [<runbook>]`
+# is a stop-the-world migration: `pending` stops in front of it (exit 3) and
+# names the runbook, and `apply` takes it only with --window, which says the
+# operator is inside that window (writers stopped, snapshot taken). Nothing
+# behind it is applied until it is.
+#
 # Usage:
-#   sh scripts/db-migrate.sh apply supabase/migrations/<version>_<name>.sql [...]
+#   sh scripts/db-migrate.sh apply [--window] supabase/migrations/<version>_<name>.sql [...]
+#   sh scripts/db-migrate.sh pending [--dry-run]
 #   sh scripts/db-migrate.sh status
 #
 # DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
@@ -42,14 +54,16 @@
 # part: a password can sit in the userinfo, in a ?password= parameter, or in
 # keyword/value form, so no message names the endpoint at all.
 #
-# Exit codes: 0 applied and recorded (or already recorded); 1 the transaction
-# failed and rolled back; 2 usage or environment, before anything ran.
+# Exit codes: 0 applied and recorded (or already recorded, or nothing pending);
+# 1 a transaction failed and rolled back; 2 usage, environment, or a refusal
+# before anything ran; 3 `pending` stopped in front of a window migration.
 
 set -u
 
 usage() {
   cat >&2 <<'USAGE'
-usage: sh scripts/db-migrate.sh apply <supabase/migrations/FILE.sql> [...]
+usage: sh scripts/db-migrate.sh apply [--window] <supabase/migrations/FILE.sql> [...]
+       sh scripts/db-migrate.sh pending [--dry-run]
        sh scripts/db-migrate.sh status
 USAGE
   exit 2
@@ -109,6 +123,20 @@ recorded_count() {
     -c "SELECT count(*) FROM supabase_migrations.schema_migrations WHERE version = '$1'"
 }
 
+# A window migration announces itself in its first ten lines:
+#   -- db-migrate: window docs/runbooks/<name>.md
+# Ten lines, so the marker is visible without opening the file and a runbook
+# that merely mentions the phrase further down does not count. The text after
+# "window" is the runbook, named in every refusal.
+is_window() {
+  head -n 10 "$1" | grep -qE '^--[[:space:]]*db-migrate:[[:space:]]*window([[:space:]]|$)'
+}
+window_runbook() {
+  head -n 10 "$1" | sed -n 's/^--[[:space:]]*db-migrate:[[:space:]]*window[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//'
+}
+
+allow_window=0
+
 apply_one() {
   file=$1
   [ -f "$file" ] || die "no such file: $file"
@@ -126,6 +154,16 @@ apply_one() {
   dir=$(cd "$(dirname "$file")" && pwd -P) || die "cannot enter $(dirname "$file")"
   [ "$dir" = "$checkout/supabase/migrations" ] ||
     die "$base must live in $checkout/supabase/migrations (found it in $dir)"
+  if is_window "$file"; then
+    runbook=$(window_runbook "$file")
+    if [ "$allow_window" -ne 1 ]; then
+      printf 'db-migrate: %s is a window migration (stop-the-world): it is applied inside its runbook'\''s window, with writers stopped and a snapshot taken%s\n' \
+        "$base" "${runbook:+; runbook: $runbook}" >&2
+      die "run it deliberately, from inside that window, with: yarn db:migrate --window $file"
+    fi
+    printf 'db-migrate: %s is a window migration; --window given, so writers are stopped and the snapshot is taken%s\n' \
+      "$base" "${runbook:+ (runbook: $runbook)}"
+  fi
   # Byte-wise, in the C locale, on every machine: see the guard's header.
   findings=$(LC_ALL=C awk -f "$guard" "$file" 2>&1)
   case $? in
@@ -170,12 +208,59 @@ SQL
 
 case "$mode" in
   apply)
+    if [ "${1:-}" = "--window" ]; then
+      allow_window=1
+      shift
+    fi
     [ "$#" -ge 1 ] || usage
     status=0
     for f in "$@"; do
       apply_one "$f" || status=1
     done
     exit "$status"
+    ;;
+  pending)
+    dry=0
+    if [ "${1:-}" = "--dry-run" ]; then
+      dry=1
+      shift
+    fi
+    [ "$#" -eq 0 ] || usage
+    need_cli
+    # Same table as `status`, same endpoint; a local-only row is a gap.
+    table=$(supabase migration list --db-url "$url" --workdir "$checkout" 2>/dev/null) ||
+      die "supabase migration list failed (the endpoint is not shown because it can carry a password)"
+    versions=$(printf '%s\n' "$table" | awk -F'|' '
+      NF >= 2 {
+        gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2)
+        l = (length($1) == 14 && $1 ~ /^[0-9]+$/); r = (length($2) == 14 && $2 ~ /^[0-9]+$/)
+        if (l && !r) print $1
+      }' | sort)
+    if [ -z "$versions" ]; then
+      printf 'db-migrate: nothing pending in this checkout\n'
+      exit 0
+    fi
+    for v in $versions; do
+      set -- "$checkout"/supabase/migrations/"$v"_*.sql
+      { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+        die "expected exactly one file for pending version $v under supabase/migrations (found $#); nothing after it was applied"
+      f=$1
+      base=$(basename "$f")
+      if is_window "$f"; then
+        runbook=$(window_runbook "$f")
+        rest=$(printf '%s\n' "$versions" | awk -v v="$v" '$0 > v' | wc -l | tr -d ' ')
+        printf 'db-migrate: stopped at %s: a window migration (stop-the-world) is never applied by pending or at startup. Run its window%s, then run pending again; %s later file(s) wait behind it.\n' \
+          "$base" "${runbook:+ (runbook: $runbook)}" "$rest" >&2
+        exit 3
+      fi
+      if [ "$dry" -eq 1 ]; then
+        printf 'db-migrate: would apply %s\n' "$base"
+        continue
+      fi
+      apply_one "$f" || exit 1
+    done
+    [ "$dry" -eq 1 ] && printf 'db-migrate: dry run; nothing was applied\n'
+    exit 0
     ;;
   status)
     [ "$#" -eq 0 ] || usage

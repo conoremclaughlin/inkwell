@@ -32,11 +32,11 @@ load_env_file "${ROOT_DIR}/.env.local"
 # shellcheck disable=SC1090
 source "${PRESERVED_ENV_FILE}"
 
-if command -v supabase >/dev/null 2>&1; then
-  node "${ROOT_DIR}/scripts/migration-status.mjs" --workdir "${ROOT_DIR}" --warn-only || true
-else
-  echo "[migrations] ⚠ Supabase CLI not found; cannot check linked migration status."
-fi
+# The restart is the deploy: pending migrations are applied (local target) or
+# refused (linked target, window migration) before anything starts, and a
+# refusal stops the start here. See scripts/preflight.mjs;
+# INK_SKIP_MIGRATIONS=1 skips the step on purpose.
+node "${ROOT_DIR}/scripts/preflight.mjs"
 
 if [[ ! -f "${ROOT_DIR}/packages/api/dist/server.js" ]]; then
   echo "Missing packages/api/dist/server.js."

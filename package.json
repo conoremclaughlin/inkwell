@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "dev": "node scripts/preflight.mjs && node scripts/dev-concurrently.mjs",
+    "dev:no-migrations": "INK_SKIP_MIGRATIONS=1 yarn dev",
     "dev:api": "yarn workspace @inklabs/api server:dev",
     "dev:web": "yarn workspace @inklabs/web dev",
     "dev:mcp": "yarn workspace @inklabs/api dev:mcp",
@@ -21,6 +22,7 @@
     "linked:migrate": "./scripts/prod-migrate.sh --linked",
     "db:migrate": "sh ./scripts/db-migrate.sh apply",
     "db:migrate:status": "sh ./scripts/db-migrate.sh status",
+    "db:migrate:pending": "sh ./scripts/db-migrate.sh pending",
     "prod:up": "./scripts/prod-up.sh",
     "prod": "yarn prod:up",
     "logs:ink": "tail -n 200 -f $HOME/.ink/logs/combined.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",

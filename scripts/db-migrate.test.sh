@@ -1,7 +1,8 @@
 #!/bin/sh
 # Regression coverage for scripts/db-migrate.sh (apply a migration file to the
-# local stack and record it in the ledger under the file's own version) and
-# for the table parsing in scripts/migration-status.mjs.
+# local stack and record it in the ledger under the file's own version; apply
+# the pending set), for the table parsing in scripts/migration-status.mjs, and
+# for scripts/preflight.mjs (what `yarn dev` runs before the servers start).
 #
 # Hermetic: PATH is a directory of stub `supabase` and `psql` commands plus a
 # directory of symlinks to the few utilities the scripts need. No Docker, no
@@ -39,11 +40,20 @@
 #   - no message ever prints the connection string, in any of its forms
 #   - the integration harness's own refusals: a failed CREATE DATABASE issues
 #     no DROP, and a connection that reports another database stops before DDL
+#   - `pending` applies the ledger's gaps in version order, one transaction
+#     each, stops in front of a window migration (exit 3) naming its runbook,
+#     and refuses an ambiguous version; `apply` takes a window file only with
+#     --window; a marker below line ten is not a marker
+#   - the startup preflight applies pending files from the main checkout and
+#     stops the start when one fails or a window migration is pending; a
+#     worktree warns and applies nothing; a linked target refuses and points
+#     at linked:migrate; INK_SKIP_MIGRATIONS=1 starts anyway and says so
 #
 # Usage:  sh scripts/db-migrate.test.sh
 #
-# SCRIPT_UNDER_TEST and STATUS_UNDER_TEST point the suite at other copies of
-# the two scripts, so a check can be shown red against an older head.
+# SCRIPT_UNDER_TEST, STATUS_UNDER_TEST and PREFLIGHT_UNDER_TEST point the
+# suite at other copies of the three scripts, so a check can be shown red
+# against an older head.
 
 set -u
 
@@ -674,6 +684,212 @@ out=$(DB_MIGRATE_TEST_ADMIN_URL='postgresql://stub:pw@127.0.0.1:54322/postgres' 
 rc=$?
 [ "$rc" -eq 2 ] && echo "$out" | grep -q 'shared local stack' && ok "integration harness: the shared stack's port is refused" ||
   bad "integration harness: the shared stack's port is refused" "exit $rc: $out"
+
+# --- pending: the ledger's gaps, in version order, stopping at a window ------
+# Its own fixture checkout and ledger, so the counts above stay put.
+
+pend="$work/pend"
+mkdir -p "$pend/supabase/migrations"
+(cd "$pend" && git init -q -b main && git -c user.name=fixture -c user.email=fixture@example.com commit -q --allow-empty -F "$work/msg") || bad "pend fixture" "git init failed"
+pm="$pend/supabase/migrations"
+printf 'select 1;\n' > "$pm/20260301000000_a.sql"
+printf 'select 2;\n' > "$pm/20260302000000_b.sql"
+printf -- '-- the cutover\n-- db-migrate: window docs/runbooks/example-window.md\nselect 3;\n' > "$pm/20260303000000_c_window.sql"
+printf 'select 4;\n' > "$pm/20260304000000_d.sql"
+pl="$work/ledger-pend.txt"
+printf '20260301000000\n' > "$pl"
+
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --dry-run 2>&1)
+rc=$?
+if [ "$rc" -eq 3 ] && [ "$(apply_calls)" -eq 0 ] && echo "$out" | grep -q 'would apply 20260302000000_b.sql' &&
+  echo "$out" | grep -q 'stopped at 20260303000000_c_window.sql' && echo "$out" | grep -q 'docs/runbooks/example-window.md' &&
+  ! echo "$out" | grep -q '20260304000000_d.sql' && [ "$(wc -l < "$pl" | tr -d ' ')" -eq 1 ]; then
+  ok "pending --dry-run: names what it would apply, stops at the window file naming its runbook, touches nothing"
+else
+  bad "pending --dry-run: names what it would apply, stops at the window file naming its runbook, touches nothing" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+if [ "$rc" -eq 3 ] && [ "$(apply_calls)" -eq 1 ] && grep -qx 20260302000000 "$pl" && ! grep -qx 20260303000000 "$pl" &&
+  ! grep -qx 20260304000000 "$pl" && echo "$out" | grep -q 'recorded 20260302000000_b.sql' &&
+  echo "$out" | grep -q 'stopped at 20260303000000_c_window.sql' && echo "$out" | grep -q '1 later file'; then
+  ok "pending: applies the gap before the window file, stops in front of it (exit 3), leaves the file behind it alone"
+else
+  bad "pending: applies the gap before the window file, stops in front of it (exit 3), leaves the file behind it alone" "exit $rc: $out; ledger: $(cat "$pl" | tr '\n' ' ')"
+fi
+
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" apply supabase/migrations/20260303000000_c_window.sql 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'window migration' &&
+  echo "$out" | grep -q 'docs/runbooks/example-window.md' && echo "$out" | grep -q -- '--window'; then
+  ok "apply without --window refuses a window file before psql, naming the runbook and the flag"
+else
+  bad "apply without --window refuses a window file before psql, naming the runbook and the flag" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" apply --window supabase/migrations/20260303000000_c_window.sql 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(apply_calls)" -eq 1 ] && grep -qx 20260303000000 "$pl" && echo "$out" | grep -q 'window migration'; then
+  ok "apply --window applies a window file and says so"
+else
+  bad "apply --window applies a window file and says so" "exit $rc: $out"
+fi
+
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(apply_calls)" -eq 1 ] && grep -qx 20260304000000 "$pl" && echo "$out" | grep -q 'recorded 20260304000000_d.sql'; then
+  ok "pending after the window: the file behind it is applied"
+else
+  bad "pending after the window: the file behind it is applied" "exit $rc: $out"
+fi
+
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'nothing pending' &&
+  ok "pending with nothing pending: exit 0, no psql" || bad "pending with nothing pending: exit 0, no psql" "exit $rc: $out"
+
+# A marker below line ten is prose, not a marker.
+printf 'select 1;\nselect 2;\nselect 3;\nselect 4;\nselect 5;\nselect 6;\nselect 7;\nselect 8;\nselect 9;\nselect 10;\n-- db-migrate: window late\nselect 11;\n' > "$pm/20260305000000_e_late_marker.sql"
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && grep -qx 20260305000000 "$pl" && ok "a marker after line ten does not make a window file" ||
+  bad "a marker after line ten does not make a window file" "exit $rc: $out"
+
+printf 'select 6;\n' > "$pm/20260306000000_f.sql"
+reset_log
+out=$(cd "$pend" && STUB_PSQL_RC=1 STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+[ "$rc" -eq 1 ] && ! grep -qx 20260306000000 "$pl" && echo "$out" | grep -q 'rolled back' &&
+  ok "pending: a file that fails exits 1 and records nothing" || bad "pending: a file that fails exits 1 and records nothing" "exit $rc: $out"
+
+printf 'select 7;\n' > "$pm/20260307000000_g.sql"
+printf 'select 7;\n' > "$pm/20260307000000_g_twin.sql"
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && grep -qx 20260306000000 "$pl" && ! grep -qx 20260307000000 "$pl" && echo "$out" | grep -q 'exactly one file for pending version 20260307000000'; then
+  ok "pending: applies what precedes an ambiguous version, then refuses it before psql"
+else
+  bad "pending: applies what precedes an ambiguous version, then refuses it before psql" "exit $rc: $out; ledger: $(cat "$pl" | tr '\n' ' ')"
+fi
+
+# --- preflight: the restart is the deploy -----------------------------------
+# preflight.mjs finds its scripts beside itself, so the fixture gets a copy
+# of the four files; the stubs, tools and ledger are the ones above. The host
+# shell may export the target's own variables, so each run unsets them: the
+# fixture's .env.local decides the target.
+
+preflight_src="${PREFLIGHT_UNDER_TEST:-$root/scripts/preflight.mjs}"
+pf="$work/pf"
+mkdir -p "$pf/scripts/lib" "$pf/supabase/migrations"
+cp "$preflight_src" "$pf/scripts/preflight.mjs"
+cp "$status_mjs" "$pf/scripts/migration-status.mjs"
+cp "$script" "$pf/scripts/db-migrate.sh"
+cp "$guard" "$pf/scripts/lib/sql-transaction-control.awk"
+(cd "$pf" && git init -q -b main && git -c user.name=fixture -c user.email=fixture@example.com commit -q --allow-empty -F "$work/msg") || bad "pf fixture" "git init failed"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+printf 'select 1;\n' > "$pf/supabase/migrations/20260401000000_p.sql"
+pfl="$work/ledger-pf.txt"
+: > "$pfl"
+pf_run() {
+  # $1 = checkout to run in; the rest = VAR=value assignments for this run
+  dir=$1
+  shift
+  (
+    cd "$dir" || exit 97
+    unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS
+    for kv in "$@"; do export "$kv"; done
+    STUB_LEDGER="$pfl" node scripts/preflight.mjs 2>&1
+  )
+}
+
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(apply_calls)" -eq 1 ] && grep -qx 20260401000000 "$pfl" && echo "$out" | grep -q 'Ready'; then
+  ok "preflight, main checkout, local target: a pending file is applied before the start"
+else
+  bad "preflight, main checkout, local target: a pending file is applied before the start" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+printf 'select 2;\n' > "$pf/supabase/migrations/20260402000000_q.sql"
+reset_log
+out=$(pf_run "$pf" STUB_PSQL_RC=1)
+rc=$?
+if [ "$rc" -eq 1 ] && ! grep -qx 20260402000000 "$pfl" && echo "$out" | grep -q 'could not be applied' && echo "$out" | grep -q 'dev:no-migrations'; then
+  ok "preflight: a file that fails to apply stops the start and names the escape hatch"
+else
+  bad "preflight: a file that fails to apply stops the start and names the escape hatch" "exit $rc: $out"
+fi
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+[ "$rc" -eq 0 ] && grep -qx 20260402000000 "$pfl" && ok "preflight: the next start applies it" || bad "preflight: the next start applies it" "exit $rc: $out"
+
+printf -- '-- db-migrate: window docs/runbooks/example-window.md\nselect 3;\n' > "$pf/supabase/migrations/20260403000000_w.sql"
+printf 'select 4;\n' > "$pf/supabase/migrations/20260404000000_after.sql"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+if [ "$rc" -eq 1 ] && ! calls | grep -q '^psql.* -f ' && ! grep -qx 20260403000000 "$pfl" && ! grep -qx 20260404000000 "$pfl" &&
+  echo "$out" | grep -q 'docs/runbooks/example-window.md' && echo "$out" | grep -q 'window migration is pending' && echo "$out" | grep -q 'dev:no-migrations'; then
+  ok "preflight: a pending window migration refuses the start, names the runbook, applies nothing"
+else
+  bad "preflight: a pending window migration refuses the start, names the runbook, applies nothing" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+reset_log
+out=$(pf_run "$pf" INK_SKIP_MIGRATIONS=1)
+rc=$?
+if [ "$rc" -eq 0 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'SKIPPED' && echo "$out" | grep -q '2 pending' && echo "$out" | grep -q 'Ready'; then
+  ok "preflight: INK_SKIP_MIGRATIONS=1 starts anyway, applies nothing, and lists what stays pending"
+else
+  bad "preflight: INK_SKIP_MIGRATIONS=1 starts anyway, applies nothing, and lists what stays pending" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+(cd "$pf" && git worktree add -q "$work/pfwt" -b pf-feature) || bad "pf worktree" "git worktree add failed"
+mkdir -p "$work/pfwt/scripts/lib" "$work/pfwt/supabase/migrations"
+cp "$pf/scripts/preflight.mjs" "$pf/scripts/migration-status.mjs" "$pf/scripts/db-migrate.sh" "$work/pfwt/scripts/"
+cp "$guard" "$work/pfwt/scripts/lib/sql-transaction-control.awk"
+cp "$pf/.env.local" "$work/pfwt/.env.local"
+printf 'select 5;\n' > "$work/pfwt/supabase/migrations/20260405000000_branch.sql"
+reset_log
+out=$(pf_run "$work/pfwt")
+rc=$?
+if [ "$rc" -eq 0 ] && ! calls | grep -q '^psql' && ! grep -qx 20260405000000 "$pfl" && echo "$out" | grep -q 'worktree checkout' && echo "$out" | grep -q 'Ready'; then
+  ok "preflight from a worktree: warns, applies nothing to the shared stack, starts"
+else
+  bad "preflight from a worktree: warns, applies nothing to the shared stack, starts" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+
+printf 'SUPABASE_URL=https://example.supabase.co\n' > "$pf/.env.local"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+if [ "$rc" -eq 1 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'linked:migrate' && ! echo "$out" | grep -q 'Ready'; then
+  ok "preflight, linked target: pending refuses the start and points at yarn linked:migrate, never the local wrapper"
+else
+  bad "preflight, linked target: pending refuses the start and points at yarn linked:migrate, never the local wrapper" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+
+reset_log
+out=$(PATH="$work/tools" pf_run "$pf")
+rc=$?
+[ "$rc" -eq 1 ] && echo "$out" | grep -q 'Supabase CLI not found' && ! echo "$out" | grep -q 'Ready' &&
+  ok "preflight without the Supabase CLI: refuses to start" || bad "preflight without the Supabase CLI: refuses to start" "exit $rc: $out"
+out=$(PATH="$work/tools" pf_run "$pf" INK_SKIP_MIGRATIONS=1)
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'Ready' &&
+  ok "preflight without the Supabase CLI, skipped by request: starts" || bad "preflight without the Supabase CLI, skipped by request: starts" "exit $rc: $out"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
