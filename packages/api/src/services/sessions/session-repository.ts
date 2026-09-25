@@ -264,6 +264,17 @@ export class SessionRepository implements ISessionRepository {
     if (!options?.includeFailed) {
       query = query.neq('lifecycle', 'failed');
     }
+    // The type predicate belongs in the query, before LIMIT (Lumen, PR #680
+    // round 1). Checking the one fetched row afterwards let any newer
+    // non-primary session hide an older primary; with failed rows admitted,
+    // a crashed task in front of the home turned "reuse the home" into
+    // "create a twin". Rows with no metadata.type are primary by convention
+    // (mapDbToSession reads them so), and the predicate keeps them.
+    if (options?.type === 'primary') {
+      query = query.or('metadata->>type.eq.primary,metadata->>type.is.null');
+    } else if (options?.type) {
+      query = query.eq('metadata->>type', options.type);
+    }
     // Same-slug siblings must not satisfy general reuse (Lumen, #514 r7).
     query = options?.sbId ? query.eq('sb_id', options.sbId) : query.eq('agent_id', sbSlug);
 

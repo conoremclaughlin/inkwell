@@ -2932,15 +2932,40 @@ export class SessionService implements ISessionService {
         // session while her threads (bound by this rung) lived in 88b728cb.
         // A contact-scoped request is exempt: the default session is the
         // owner's, and a per-sender contact must never land in it.
+        //
+        // Two more boundaries (Lumen, PR #680 round 1), both about what
+        // "unaddressed" means:
+        //  - Identity. The default session is read by slug when no canonical
+        //    id settled, so with two same-slug identities it is a guess.
+        //    The row must belong to the settled identity — the same check
+        //    every explicit anchor passes — or it is not a home.
+        //  - Placement. A caller who named a studio, by id or by hint, has
+        //    addressed the work. The home is honoured only where it lives:
+        //    a home in another studio (or none) never steals a request the
+        //    caller pointed somewhere specific, and the studio-scoped
+        //    general lookup below answers instead. Myra's channel route
+        //    hints "main", which resolves to no studio for her, and her home
+        //    has none: that is a match, and it is the case this rung is for.
         if (defaultSessionId && !options?.contactId) {
           const defaultSession = await this.repository.findById(defaultSessionId);
-          if (defaultSession && !defaultSession.endedAt) {
+          const usable = defaultSession
+            ? defaultSession.endedAt
+              ? 'ended'
+              : !anchorBelongsToTarget(defaultSession)
+                ? 'foreign-identity'
+                : (defaultSession.studioId ?? null) !== (resolvedStudioId ?? null)
+                  ? 'other-placement'
+                  : 'home'
+            : 'missing';
+          if (usable === 'home' && defaultSession) {
             this.logRungMatch('default-session', defaultSession, routing, options?.threadKey);
             return this.withStudioLease(defaultSession, routing, leaseCtx);
           }
-          logger.debug('default_session_id is set but session is ended/missing; falling through', {
+          logger.debug('default_session_id is not a home for this request; falling through', {
             defaultSessionId,
             sbSlug,
+            reason: usable,
+            requestedStudioId: resolvedStudioId ?? null,
           });
         }
 
@@ -3097,8 +3122,10 @@ export class SessionService implements ISessionService {
       !options?.alias &&
       !options?.contactId &&
       !resolvedStudioId;
+    // Only for a settled canonical identity: by slug alone the census would
+    // count another workspace's same-named bridge as a sibling.
     const homeSiblings =
-      isHomeCreation && identityRouting.bridge
+      isHomeCreation && identityRouting.bridge && identitySbId
         ? await this.findHomeSiblings(userId, sbSlug, identitySbId)
         : [];
 

@@ -3123,14 +3123,22 @@ describe('SessionService', () => {
     // general-active skipped the failed row, and a twin (64e1eb49) was born.
     // For fifteen days reminders fired in one session and threads in the
     // other. These pin the three rules that close that path.
-    function chain(terminal: unknown) {
+    // One terminal per table, shaped the way each reader expects it: an
+    // awaited chain yields rows (an object becomes a one-row list, so the
+    // identity scope settles on its `id`), maybeSingle/single yield the row.
+    function chain(terminal: { data?: unknown; error?: unknown }) {
+      const data = terminal.data;
+      const rows = Array.isArray(data) || data == null ? (data ?? null) : [data];
+      const row = Array.isArray(data) ? (data[0] ?? null) : (data ?? null);
+      const error = terminal.error ?? null;
       const c: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'or', 'in', 'order', 'limit']) {
         c[m] = vi.fn().mockReturnValue(c);
       }
-      c.maybeSingle = vi.fn().mockResolvedValue(terminal);
-      c.single = vi.fn().mockResolvedValue(terminal);
-      c.then = (resolve: (v: unknown) => unknown) => Promise.resolve(terminal).then(resolve);
+      c.maybeSingle = vi.fn().mockResolvedValue({ data: row, error });
+      c.single = vi.fn().mockResolvedValue({ data: row, error });
+      c.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: rows, error }).then(resolve);
       return c;
     }
     function serviceWith(tables: Record<string, unknown>) {
@@ -3149,12 +3157,14 @@ describe('SessionService', () => {
     const sibling = { id: 'older-home', lifecycle: 'failed', started_at: '2026-08-04T00:30:52Z' };
 
     it('an unthreaded request goes to the identity default session, not the newest active one', async () => {
-      const home = createMockSession({ id: 'home-session' });
+      const home = createMockSession({ id: 'home-session', sbId: 'sb-myra' });
       const newerTwin = createMockSession({ id: 'newer-twin' });
       vi.mocked(mockRepository.findById).mockResolvedValue(home);
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(newerTwin);
       const { service } = serviceWith({
-        agent_identities: { data: { default_session_id: 'home-session', metadata: {} } },
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
       });
 
       const session = await service.getOrCreateSession('user-456', 'myra', {});
@@ -3172,7 +3182,9 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findById).mockResolvedValue(ended);
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(current);
       const { service } = serviceWith({
-        agent_identities: { data: { default_session_id: 'home-session', metadata: {} } },
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
       });
 
       const session = await service.getOrCreateSession('user-456', 'myra', {});
@@ -3182,11 +3194,13 @@ describe('SessionService', () => {
     });
 
     it("a contact-scoped request never lands in the owner's default session", async () => {
-      const home = createMockSession({ id: 'home-session' });
+      const home = createMockSession({ id: 'home-session', sbId: 'sb-myra' });
       vi.mocked(mockRepository.findById).mockResolvedValue(home);
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
       const { service } = serviceWith({
-        agent_identities: { data: { default_session_id: 'home-session', metadata: {} } },
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
       });
 
       await service.getOrCreateSession('user-456', 'myra', { contactId: 'contact-9' });
@@ -3221,7 +3235,9 @@ describe('SessionService', () => {
     it('a second home for a bridge is born labelled, and the log says so at error level', async () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
       const { service, from } = serviceWith({
-        agent_identities: { data: { default_session_id: null, metadata: { bridge: true } } },
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: null, metadata: { bridge: true } },
+        },
         sessions: { data: [sibling], error: null },
       });
       const { logger } = await import('../../utils/logger.js');
@@ -3250,7 +3266,7 @@ describe('SessionService', () => {
     it('a non-bridge identity is never checked for home siblings', async () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
       const { service, from } = serviceWith({
-        agent_identities: { data: { default_session_id: null, metadata: {} } },
+        agent_identities: { data: { id: 'sb-wren', default_session_id: null, metadata: {} } },
         sessions: { data: [sibling], error: null },
       });
       const { logger } = await import('../../utils/logger.js');
