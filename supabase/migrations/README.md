@@ -89,8 +89,13 @@ URL's origin (scheme, host, port; loopback spellings unified), and sends the
 transaction to the `DB_URL` of that same answer. `DB_MIGRATE_URL` is refused
 under `--for`: an automatic apply cannot take its connection from anywhere the
 proof did not cover. A runtime pointed at a second local stack on another
-port is refused, not migrated by proxy. Refusals name origins only, never
-userinfo, path, query or fragment. The listing is judged whole before any row
+port is refused, not migrated by proxy. Refusals name origins only, as the
+URL parser defines them (so a password that itself contains `@` is still
+userinfo), never path, query or fragment; a runtime URL the parser rejects is
+a refusal that shows nothing. `yarn prod:direct`, `yarn prod:up` and
+`yarn prod:migrate` set `NODE_ENV=production` (unless the caller set it)
+before any migration decision, so the proof reads the env layer the
+production server will. The listing is judged whole before any row
 is acted on, the same contract as `migration-status.mjs`: no header, or one
 row the parser does not recognise, is a refusal, never "nothing pending".
 `yarn prod:migrate` (what `yarn prod:up` runs) reads one validated listing,

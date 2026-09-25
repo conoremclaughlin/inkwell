@@ -62,12 +62,18 @@
 #     prod:migrate reads one validated listing and never a second; every
 #     diagnostic names an origin, never userinfo, query or fragment; a file
 #     that cannot be read is a refusal, never a non-window
+#   - (review round 3) the origin comes from the URL parser, so a password
+#     containing "@" is still userinfo and an unparseable value is a refusal
+#     that shows nothing; prod:direct and prod:migrate decide NODE_ENV
+#     (production unless the caller says otherwise) before any migration
+#     decision, so the proof reads the layer the server will
 #
 # Usage:  sh scripts/db-migrate.test.sh
 #
-# SCRIPT_UNDER_TEST, STATUS_UNDER_TEST, PREFLIGHT_UNDER_TEST and
-# PROD_MIGRATE_UNDER_TEST point the suite at other copies of the four scripts,
-# so a check can be shown red against an older head.
+# SCRIPT_UNDER_TEST, STATUS_UNDER_TEST, PREFLIGHT_UNDER_TEST,
+# PROD_MIGRATE_UNDER_TEST and PROD_DIRECT_UNDER_TEST point the suite at other
+# copies of the five scripts, so a check can be shown red against an older
+# head.
 
 set -u
 
@@ -118,7 +124,7 @@ bad() {
 # Only what the scripts and this suite call. Resolved from the host once,
 # here, so nothing else on the host PATH is reachable during the checks.
 mkdir -p "$work/tools"
-for tool in sh bash git node awk sed grep basename dirname cat mktemp head rm mv sort cut tr wc cp mkdir chmod ln date od locale; do
+for tool in sh bash git node awk sed grep basename dirname cat mktemp head rm mv sort cut tr wc cp mkdir chmod ln date od locale env; do
   bin=$(command -v "$tool") || {
     echo "cannot find $tool on the host PATH" >&2
     exit 1
@@ -1147,7 +1153,7 @@ rc=$?
   bad "pending --for the stack's own origin dressed with userinfo and a query: same stack, applies, nothing printed" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits"
 out=$(sh "$script" safe-origin 'https://User:Pw@Host.Example:8443/path?x=1#y' 2>&1)
 rc=$?
-[ "$rc" -eq 0 ] && [ "$out" = "https://Host.Example:8443" ] && ok "safe-origin keeps scheme, host and port only" || bad "safe-origin keeps scheme, host and port only" "exit $rc: $out"
+[ "$rc" -eq 0 ] && [ "$out" = "https://host.example:8443" ] && ok "safe-origin keeps scheme, host and port only (the parser's origin, host lowercased)" || bad "safe-origin keeps scheme, host and port only (the parser's origin, host lowercased)" "exit $rc: $out"
 # An unreadable pending file is a refusal for pending and for is-window.
 printf 'select 12;\n' > "$pm/20260310000000_j.sql"
 chmod 000 "$pm/20260310000000_j.sql"
@@ -1289,6 +1295,111 @@ rc=$?
   bad "prod:migrate, local target: the runtime URL is logged as its origin only, and the apply goes through" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits; $out"
 mv "$work/w.sql.parked" "$pf/supabase/migrations/20260403000000_w.sql"
 printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+
+# --- review round 3 (Lumen, PR #675): a parser decides where userinfo ends --
+
+u='http://fixture-user:prefix@SYNTHSECRET@127.0.0.1:55421/path?token=SYNTHQUERY'
+out=$(sh "$script" safe-origin "$u" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "http://127.0.0.1:55421" ] && ok "safe-origin: a password containing @ is userinfo up to the last @, as the URL parser reads it" ||
+  bad "safe-origin: a password containing @ is userinfo up to the last @, as the URL parser reads it" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits"
+out=$(sh "$script" safe-origin 'not a url' 2>&1)
+rc=$?
+[ "$rc" -eq 1 ] && [ -z "$out" ] && ok "safe-origin: an unparseable value prints nothing and exits 1" || bad "safe-origin: an unparseable value prints nothing and exits 1" "exit $rc: $out"
+out=$(sh "$script" safe-origin 'mailto:someone@example.com' 2>&1)
+rc=$?
+[ "$rc" -eq 1 ] && [ -z "$out" ] && ok "safe-origin: an opaque origin is not an origin" || bad "safe-origin: an opaque origin is not an origin" "exit $rc: $out"
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for "$u" 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! echo "$out" | grep -q 'SYNTH' && echo "$out" | grep -q 'http://127.0.0.1:55421' && ! calls | grep -q '^psql'; then
+  ok "pending --for a URL whose password contains @: refused by origin, neither secret printed"
+else
+  bad "pending --for a URL whose password contains @: refused by origin, neither secret printed" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits; calls: $(calls | tr '\n' ' ')"
+fi
+reset_log
+out=$(cd "$pend" && STUB_LEDGER="$pl" sh "$script" pending --for 'not a url at all SYNTHRAW' 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ] && ! echo "$out" | grep -q 'SYNTHRAW' && echo "$out" | grep -q 'not a parseable URL' && ! calls | grep -q '^supabase status' && ! calls | grep -q '^psql'; then
+  ok "pending --for an unparseable value: refused before the stack is even asked, the value not shown"
+else
+  bad "pending --for an unparseable value: refused before the stack is even asked, the value not shown" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+printf 'SUPABASE_URL=%s\n' "$u" > "$pf/.env.local"
+reset_log
+out=$(pf_run "$pf")
+rc=$?
+[ "$rc" -eq 1 ] && ! echo "$out" | grep -q 'SYNTH' && echo "$out" | grep -q '55421' && ! calls | grep -q '^psql' &&
+  ok "preflight: a runtime URL whose password contains @ is refused by origin and nothing of it is printed" ||
+  bad "preflight: a runtime URL whose password contains @ is refused by origin and nothing of it is printed" "exit $rc: $(echo "$out" | grep -c 'SYNTH') secret hits"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pf/.env.local"
+
+# --- review round 3: the production entrypoint decides its mode first -----
+# prod-direct.sh sources .env and .env.local into its own environment, runs
+# the preflight, then checks for the server build. With no build in the
+# fixture it stops right after the preflight, which is all that is needed:
+# the proof must have read the production layer, with NODE_ENV unset by the
+# caller, before any apply.
+
+prod_direct_src="${PROD_DIRECT_UNDER_TEST:-$root/scripts/prod-direct.sh}"
+pd="$work/pd"
+mkdir -p "$pd/scripts/lib" "$pd/supabase/migrations"
+cp "$pf/scripts/preflight.mjs" "$pf/scripts/migration-status.mjs" "$pf/scripts/db-migrate.sh" "$pd/scripts/"
+cp "$prod_migrate_src" "$pd/scripts/prod-migrate.sh"
+cp "$prod_direct_src" "$pd/scripts/prod-direct.sh"
+cp "$guard" "$pd/scripts/lib/sql-transaction-control.awk"
+cp "$root/scripts/lib/runtime-env.mjs" "$pd/scripts/lib/runtime-env.mjs"
+ln -s "$root/node_modules" "$pd/node_modules"
+(cd "$pd" && git init -q -b main && git -c user.name=fixture -c user.email=fixture@example.com commit -q --allow-empty -F "$work/msg") || bad "pd fixture" "git init failed"
+: > "$pd/.env"
+: > "$pd/.env.local"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pd/.env.development"
+printf 'SUPABASE_URL=http://127.0.0.1:55421\n' > "$pd/.env.production"
+printf 'select 30;\n' > "$pd/supabase/migrations/20260701000000_prod.sql"
+pdl="$work/ledger-pd.txt"
+: > "$pdl"
+pd_run() {
+  # $1 = script under $pd/scripts; the rest = VAR=value for this run.
+  # NODE_ENV is unset on purpose: the entrypoint must decide it.
+  sc=$1
+  shift
+  (
+    cd "$pd" || exit 97
+    unset SUPABASE_URL LOCAL_SUPABASE_URL INK_MIGRATION_TARGET INK_SKIP_MIGRATIONS DB_MIGRATE_URL NODE_ENV
+    for kv in "$@"; do export "$kv"; done
+    HOME="$work" TMPDIR="$work" STUB_LEDGER="$pdl" bash "$pd/scripts/$sc" 2>&1
+  )
+}
+reset_log
+out=$(pd_run prod-direct.sh)
+rc=$?
+if [ "$rc" -ne 0 ] && ! calls | grep -q '^psql' && ! grep -qx 20260701000000 "$pdl" && echo "$out" | grep -q '55421' && ! echo "$out" | grep -q 'Missing packages/api/dist'; then
+  ok "prod:direct with NODE_ENV unset: the proof reads .env.production (55421) and refuses before any apply"
+else
+  bad "prod:direct with NODE_ENV unset: the proof reads .env.production (55421) and refuses before any apply" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+fi
+reset_log
+out=$(pd_run prod-migrate.sh)
+rc=$?
+[ "$rc" -eq 2 ] && ! calls | grep -q '^psql.* -f ' && ! calls | grep -q '^supabase db push' && echo "$out" | grep -q '55421' &&
+  ok "prod:migrate with NODE_ENV unset: production's layer is what is proven; refused" ||
+  bad "prod:migrate with NODE_ENV unset: production's layer is what is proven; refused" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+printf 'SUPABASE_URL=http://127.0.0.1:54321\n' > "$pd/.env.production"
+reset_log
+out=$(pd_run prod-direct.sh)
+rc=$?
+if [ "$rc" -eq 1 ] && grep -qx 20260701000000 "$pdl" && echo "$out" | grep -q 'Missing packages/api/dist'; then
+  ok "prod:direct with .env.production naming the stack: the file is applied under production, then the missing build stops the start"
+else
+  bad "prod:direct with .env.production naming the stack: the file is applied under production, then the missing build stops the start" "exit $rc: $out; ledger: $(cat "$pdl" | tr '\n' ' ')"
+fi
+printf 'select 31;\n' > "$pd/supabase/migrations/20260702000000_prod_two.sql"
+reset_log
+out=$(pd_run prod-direct.sh NODE_ENV=development)
+rc=$?
+[ "$rc" -eq 1 ] && grep -qx 20260702000000 "$pdl" && echo "$out" | grep -q 'Missing packages/api/dist' &&
+  ok "prod:direct with NODE_ENV set by the caller: the caller's value is kept (development's layer, 54321, applies)" ||
+  bad "prod:direct with NODE_ENV set by the caller: the caller's value is kept (development's layer, 54321, applies)" "exit $rc: $out"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

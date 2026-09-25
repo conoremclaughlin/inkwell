@@ -64,6 +64,9 @@
 #   sh scripts/db-migrate.sh is-window supabase/migrations/<file>.sql
 #   sh scripts/db-migrate.sh safe-origin <url>
 #
+# `--for`, `safe-origin` and `is-window` need node on the PATH (the URL
+# parser); `apply` and `status` do not.
+#
 # DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
 # exists for the integration test (a disposable database) and for a stack
 # the CLI cannot describe. The connection string is never printed, in any
@@ -123,19 +126,36 @@ if [ "$mode" = "is-window" ]; then
   exit 1
 fi
 
-# The part of a URL that is safe to print: scheme, host and port. Userinfo,
-# path, query and fragment are dropped, so a SUPABASE_URL that happens to
-# carry a password or a token can be named in a refusal without leaking it.
+# The part of a URL that is safe to print: its origin (scheme, host, port),
+# as the WHATWG URL parser in node defines it. Userinfo, path, query and
+# fragment are gone, and the parser, not a regex, decides where userinfo
+# ends: a password may itself contain "@", and the last one is the
+# delimiter. A value the parser rejects, or one with an opaque origin, is
+# not a URL for our purposes: nothing is printed and the status is 1, so a
+# caller refuses rather than guessing what to show.
 safe_origin() {
-  printf '%s' "$1" | sed -E -e 's/[?#].*$//' -e 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#' -e 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]*).*$#\1#'
+  node -e '
+    let origin = "";
+    try {
+      const u = new URL(process.argv[1]);
+      if (u.origin !== "null") origin = u.origin;
+    } catch {
+      origin = "";
+    }
+    process.stdout.write(origin);
+    process.exit(origin ? 0 : 1);
+  ' "$1" 2>/dev/null
 }
 
-# `safe-origin URL`: the same, for other scripts' messages.
+# `safe-origin URL`: the same, for other scripts' messages: the origin and
+# exit 0, or nothing and exit 1.
 if [ "$mode" = "safe-origin" ]; then
   [ "$#" -eq 1 ] || usage
-  safe_origin "$1"
-  printf '\n'
-  exit 0
+  if origin=$(safe_origin "$1"); then
+    printf '%s\n' "$origin"
+    exit 0
+  fi
+  exit 1
 fi
 
 here=$(cd "$(dirname "$0")" && pwd -P) || die "cannot locate the scripts directory"
@@ -227,11 +247,11 @@ classify_table() {
 }
 
 # Origins are compared canonically: loopback spellings name the same machine,
-# and the port is what tells two local stacks apart. Userinfo, path, query and
-# fragment never take part, so they can never make two different stacks look
-# alike or the same stack look different.
-canon_url() {
-  safe_origin "$1" | tr 'A-Z' 'a-z' | sed -E -e 's#/*$##' -e 's#://localhost(:|/|$)#://127.0.0.1\1#' -e 's#://\[::1\](:|/|$)#://127.0.0.1\1#'
+# and the port is what tells two local stacks apart. Only origins reach this
+# (see safe_origin), so userinfo, path, query and fragment can never make two
+# different stacks look alike or the same stack look different.
+canon_origin() {
+  printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E -e 's#://localhost(:|$)#://127.0.0.1\1#' -e 's#://\[::1\](:|$)#://127.0.0.1\1#'
 }
 
 # One value out of a `supabase status -o env` answer held in $1.
@@ -346,14 +366,20 @@ case "$mode" in
       # write land somewhere the proof never looked, so it is refused here.
       [ -z "${DB_MIGRATE_URL:-}" ] ||
         die "DB_MIGRATE_URL is set, but an automatic apply (--for) proves its target through supabase status and takes the database endpoint from that same answer; unset DB_MIGRATE_URL, or run without --for. Nothing applied."
+      # Only origins are compared or printed. A runtime URL the parser rejects
+      # is a refusal on its own, and its value is not shown.
+      expect_origin=$(safe_origin "$expect") ||
+        die "the runtime's SUPABASE_URL is not a parseable URL, so no stack can be proven to be its own; nothing applied (the value is not shown)"
       stack=$(supabase status --workdir "$root" -o env 2>/dev/null) ||
         die "the local Supabase stack is not running (supabase status failed). Start it from the root checkout with: supabase start   (NOT yarn supabase:local:setup, which resets the database). Nothing applied."
       actual=$(status_value "$stack" API_URL)
       url=$(status_value "$stack" DB_URL)
-      [ -n "$actual" ] || die "the local Supabase stack did not report an API_URL, so it cannot be matched against $(safe_origin "$expect"); nothing applied"
+      [ -n "$actual" ] || die "the local Supabase stack did not report an API_URL, so it cannot be matched against $expect_origin; nothing applied"
       [ -n "$url" ] || die "the local Supabase stack did not report a DB_URL in the same answer as its API_URL; nothing applied"
-      if [ "$(canon_url "$actual")" != "$(canon_url "$expect")" ]; then
-        die "the runtime's SUPABASE_URL is $(safe_origin "$expect") but the local stack advertises $(safe_origin "$actual"); refusing to apply migrations to a stack the server does not use (a second stack on another port?). Nothing applied."
+      actual_origin=$(safe_origin "$actual") ||
+        die "the local Supabase stack's API_URL is not a parseable URL; nothing applied"
+      if [ "$(canon_origin "$actual_origin")" != "$(canon_origin "$expect_origin")" ]; then
+        die "the runtime's SUPABASE_URL is $expect_origin but the local stack advertises $actual_origin; refusing to apply migrations to a stack the server does not use (a second stack on another port?). Nothing applied."
       fi
     else
       connect

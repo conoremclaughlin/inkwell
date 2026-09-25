@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+# This is the production apply (prod:up runs it before prod:direct), so the
+# runtime's SUPABASE_URL is resolved under production's env layers unless the
+# caller says otherwise. The local:/linked: aliases inherit this; set
+# NODE_ENV explicitly to read another layer.
+export NODE_ENV="${NODE_ENV:-production}"
+
 requested_target="${INK_MIGRATION_TARGET:-auto}"
 if [[ "${1:-}" == "--local" || "${1:-}" == "local" ]]; then
   requested_target="local"
@@ -111,7 +117,8 @@ if [[ "${target}" == "local" ]]; then
     echo "[prod-migrate] ✗ could not resolve the runtime SUPABASE_URL; not applying on a guess."
     exit 1
   fi
-  echo "[prod-migrate] Applying local migrations (yarn db:migrate:pending, for $(sh "${wrapper}" safe-origin "${runtime_url}"))..."
+  shown_origin="$(sh "${wrapper}" safe-origin "${runtime_url}" 2>/dev/null || echo '<unparseable URL>')"
+  echo "[prod-migrate] Applying local migrations (yarn db:migrate:pending, for ${shown_origin})..."
   set +e
   sh "${wrapper}" pending --for "${runtime_url}"
   wrapper_code=$?
