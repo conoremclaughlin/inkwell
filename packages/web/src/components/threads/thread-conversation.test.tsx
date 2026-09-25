@@ -102,9 +102,11 @@ const spine = {
 
 function mount(cursorAt: string) {
   const cursors = createReadCursorStore(null, () => new Date(cursorAt));
+  let workspaceId: string | null = null;
   const ui = () => (
     <ThreadConversation
       spine={spine}
+      workspaceId={workspaceId}
       nameFor={(s) => s}
       cursors={cursors}
       onBack={() => {}}
@@ -113,7 +115,13 @@ function mount(cursorAt: string) {
     />
   );
   const rendered = render(ui());
-  return { rerender: () => rendered.rerender(ui()) };
+  return {
+    rerender: () => rendered.rerender(ui()),
+    switchWorkspace: (id: string) => {
+      workspaceId = id;
+      rendered.rerender(ui());
+    },
+  };
 }
 
 afterEach(() => {
@@ -154,6 +162,22 @@ describe('ThreadConversation', () => {
     for (const n of [101, 200, 201, 250, 251, 350]) {
       expect(screen.queryByTestId(`m${n}`), `m${n}`).not.toBeNull();
     }
+  });
+
+  it('starts over when the workspace changes under an open thread (Lumen, #679)', () => {
+    // The same key names another thread in the other workspace.
+    const inOther = (page: ThreadMessagesResponse): ThreadMessagesResponse => ({
+      ...page,
+      messages: page.messages.map((m) => ({ ...m, id: `other-${m.id}` })),
+    });
+    fake.newest = pageOf(1, 3);
+    const view = mount(at(3));
+    expect(screen.getByTestId('m1')).toBeTruthy();
+
+    fake.newest = inOther(pageOf(1, 2));
+    view.switchWorkspace('fixture-workspace-b');
+    expect(screen.getByTestId('other-m1')).toBeTruthy();
+    expect(screen.queryByTestId('m1'), 'the first workspace’s message must not stay').toBeNull();
   });
 
   it('retries a failed fill once a poll succeeds, even a poll that brought nothing new', async () => {

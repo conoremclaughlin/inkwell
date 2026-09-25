@@ -38,6 +38,7 @@ const POLL_MS = 5_000;
  */
 export function ThreadConversation({
   spine,
+  workspaceId,
   nameFor,
   cursors,
   onBack,
@@ -45,6 +46,8 @@ export function ThreadConversation({
   onToggleDetails,
 }: {
   spine: ThreadSpine;
+  /** The workspace the thread was opened in. The same key can be another thread elsewhere. */
+  workspaceId: string | null;
   nameFor: NameFor;
   cursors: ReadCursorStore;
   onBack: () => void;
@@ -55,7 +58,10 @@ export function ThreadConversation({
   const hasThread = spine.sources.includes('thread');
 
   const { data, dataUpdatedAt, isLoading } = useApiQuery<ThreadMessagesResponse>(
-    ['thread-messages', key],
+    // Keyed by workspace too, so a switch never serves the previous
+    // workspace's cached page. ['thread-messages', key] stays the prefix
+    // that invalidation matches.
+    ['thread-messages', key, workspaceId],
     threadMessagesPath(key),
     { refetchInterval: hasThread ? POLL_MS : false }
   );
@@ -77,6 +83,7 @@ export function ThreadConversation({
     abandonCatchUp,
   } = useThreadHistory({
     threadKey: key,
+    scope: workspaceId,
     newestPage: data,
     newestPageAt: dataUpdatedAt,
     newestPageLoading: isLoading,

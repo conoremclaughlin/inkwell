@@ -40,16 +40,19 @@ const RELATION_TOOLTIP =
  */
 export function ThreadDetails({
   spine,
+  workspaceId,
   nameFor,
   onClose,
 }: {
   spine: ThreadSpine;
+  /** The workspace the thread was opened in; shares the conversation's cached query. */
+  workspaceId: string | null;
   nameFor: NameFor;
   onClose?: () => void;
 }) {
   // Same query as the conversation — shared from the cache, not refetched.
   const { data: messagesData } = useApiQuery<ThreadMessagesResponse>(
-    ['thread-messages', spine.key],
+    ['thread-messages', spine.key, workspaceId],
     `/api/admin/threads/messages?key=${encodeURIComponent(spine.key)}`
   );
 

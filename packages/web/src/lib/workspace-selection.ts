@@ -17,8 +17,27 @@ export function setSelectedWorkspaceId(workspaceId: string | null): void {
 
   if (!workspaceId) {
     window.localStorage.removeItem(STORAGE_KEY);
-    return;
+  } else {
+    window.localStorage.setItem(STORAGE_KEY, workspaceId);
   }
+  for (const listener of listeners) listener();
+}
 
-  window.localStorage.setItem(STORAGE_KEY, workspaceId);
+const listeners = new Set<() => void>();
+
+/**
+ * Hear about a workspace switch, in this tab or another. A view that holds
+ * data across renders (an open thread's history) must start over when the
+ * workspace changes, because the same key can name another thread there.
+ */
+export function subscribeSelectedWorkspace(listener: () => void): () => void {
+  listeners.add(listener);
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === STORAGE_KEY) listener();
+  };
+  window.addEventListener('storage', onStorage);
+  return () => {
+    listeners.delete(listener);
+    window.removeEventListener('storage', onStorage);
+  };
 }

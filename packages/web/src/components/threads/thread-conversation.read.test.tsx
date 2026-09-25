@@ -101,6 +101,7 @@ function mount(cursorAt: string) {
   const ui = () => (
     <ThreadConversation
       spine={spine}
+      workspaceId={null}
       nameFor={(s) => s}
       cursors={cursors}
       onBack={() => {}}

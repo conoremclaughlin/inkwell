@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useMemo, useState } from 'react';
+import { useCallback, useLayoutEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -32,6 +32,7 @@ import {
   useThreadMessages,
 } from '../hooks/useInkwell';
 import { apiFetch } from '../lib/api';
+import { getWorkspaceId, subscribeWorkspace } from '../lib/storage';
 import type { RootStackParamList } from '../navigation';
 import { colors, spacing, type } from '../ui/theme';
 
@@ -53,13 +54,27 @@ const nameFor = (sbSlug: string) => sbSlug;
  * and the dashboard agree on where a day starts and whose header repeats.
  */
 export function ThreadScreen(props: Props) {
-  // One mount per thread. A deep link can reuse this screen for another
-  // thread; keyed, it starts clean — history, and a half-written draft that
-  // must never be sent to a thread it wasn't written for.
-  return <ThreadConversation key={props.route.params.threadKey} {...props} />;
+  // One mount per thread in one workspace. A deep link can reuse this screen
+  // for another thread, and Settings can switch the workspace under it (the
+  // same key can be another thread there). Keyed, it starts clean: history,
+  // and a half-written draft that must never be sent anywhere but where it
+  // was written.
+  const workspaceId = useSyncExternalStore(subscribeWorkspace, getWorkspaceId);
+  const { threadKey } = props.route.params;
+  return (
+    <ThreadConversation
+      key={JSON.stringify([workspaceId, threadKey])}
+      workspaceId={workspaceId}
+      {...props}
+    />
+  );
 }
 
-function ThreadConversation({ route, navigation }: Props) {
+function ThreadConversation({
+  route,
+  navigation,
+  workspaceId,
+}: Props & { workspaceId: string | null }) {
   const { threadKey, title, recipients, studioSlug } = route.params;
   const { data, dataUpdatedAt, isLoading, error } = useThreadMessages(threadKey);
 
@@ -86,6 +101,7 @@ function ThreadConversation({ route, navigation }: Props) {
     loadOlder,
   } = useThreadHistory({
     threadKey,
+    scope: workspaceId,
     newestPage: data,
     newestPageAt: dataUpdatedAt,
     newestPageLoading: isLoading,
