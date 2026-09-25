@@ -4,6 +4,10 @@ An opt-in Chrome MV3 extension for deliberately sharing page context and reviewi
 suggested field changes. Built with WXT, following Inkah's build pattern rather
 than copying its all-sites content script. No browsing recorder or background agent.
 
+The current UI is a snapshot/share/confirmed-fill prototype. It does **not** yet
+provide a live conversation in the sidebar or automatic follow-up page inspection.
+The required page-aware read/chat/interact experience is being built separately.
+
 ## Build and load
 
 Use Node 22 and the repository's Yarn version:
@@ -125,3 +129,36 @@ now preserve edited origins and keep actions disabled until refresh completes.
 Architecture and rollout live in the versioned Inkwell artifacts
 `ink://specs/browser-companion`, `ink://specs/live-agent-surfaces` and
 `ink://specs/task-scoped-skills`, not local copies of the specs.
+
+## Read-and-chat foundation (not enabled)
+
+`src/read-session.ts` provides a read-only local lifecycle for the successor:
+
+- One fixed attachment, including exact HTTP(S) origin and same-document navigation identity; fresh capture
+  and authoritative grant revalidation for each read, with no snapshot replay.
+- Local Stop rejects pending work without waiting for a network reply. Late
+  authorization/capture results cannot revive that stopped instance.
+- Fixed ten-minute/60-read local ceilings (shorter grants win), independent of the
+  15-second per-read liveness bound. Verification latency consumes that bound.
+  Failed attempts spend the local budget; concurrent reads refuse.
+- Snapshot URLs must match the exact trusted origin, including scheme and port;
+  this does not authenticate a page title or replace adapter document checks.
+- Explicit `status()` calls recheck expiry and may abort pending IO; property
+  inspection alone has no cancellation side effect.
+- Wall and monotonic clocks independently bound lifetime; clock rollback refuses.
+  Timers interrupt pending IO, while explicit deadline checks also cover delayed
+  timers. These checks do not depend on the server's heartbeat/reaper.
+
+This is an **unwired library**, not authenticated browser access or an egress
+boundary. It does not store credentials, grant Chrome permission, capture a real
+page, dispatch an SB or write to a website. Its adapter must authenticate and
+recheck the server grant/owner, atomically reserve the server budget, bind Chrome
+operations to the exact document/navigation, and enforce the private result path.
+Local counters do not survive worker replacement; persistent server budgets must.
+Do not restore a stopped instance or construct a replacement from stale authority.
+
+Production wiring requires the separate browser-client authorization and
+browser-restricted execution/egress contracts. A privacy marker in a prompt does
+not contain an unrestricted coding backend with shell/network access. Unit tests
+use synthetic snapshots, injected clocks and fake adapters, not native Chrome or
+an actual authenticated SB roundtrip.
