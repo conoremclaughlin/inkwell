@@ -9,6 +9,10 @@
  *   - stdout/stderr activity keeps a long-but-working turn alive,
  *   - the absolute backstop still reaps a process that emits forever,
  *   - provider-stall stderr signatures are classified in the kill log.
+ *
+ * The second block covers what the runner SAYS when a turn fails, which is a
+ * separate contract from when it reaps one: that text is quoted verbatim into
+ * the heartbeat outage alert a human reads.
  */
 
 import { EventEmitter } from 'events';
@@ -30,7 +34,11 @@ vi.mock('./resolve-binary', () => ({
   resolveBinaryPath: vi.fn(async () => '/fake/bin/ink'),
   buildSpawnPath: vi.fn(() => '/usr/bin:/bin'),
 }));
-vi.mock('@inklabs/shared', () => ({
+// Only the three side-effecting helpers are stubbed. Everything else is the
+// real module: `describeExit` is pure, and stubbing it would mean these tests
+// no longer observe the text the runner actually rejects with.
+vi.mock('@inklabs/shared', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@inklabs/shared')>()),
   injectSessionHeaders: vi.fn(() => null),
   buildSessionEnv: vi.fn(() => ({})),
   writeRuntimeSessionHint: vi.fn(),
@@ -54,7 +62,7 @@ function makeFakeChild(): FakeChild {
   return child;
 }
 
-const baseConfig = { workingDirectory: '/tmp', sbSlug: 'myra', pcpSessionId: 'sess-1' };
+const baseConfig = { workingDirectory: '/tmp', sbSlug: 'myra', inkSessionId: 'sess-1' };
 
 describe('InkRunner inactivity timeout', () => {
   let child: FakeChild;
@@ -188,5 +196,173 @@ describe('InkRunner inactivity timeout', () => {
 
     child.emit('close', 143);
     await runPromise;
+  });
+});
+
+/**
+ * A runtime error whose cause is on the first line and whose stack runs past
+ * any alert-sized budget — ~1.1KB of frames under one 19-character sentence.
+ * Kept verbatim from Lumen's review of PR #662 so the red/green evidence he
+ * measured and the check that shipped are the same check.
+ */
+function errorOverLongStack(): string {
+  const frames = Array.from(
+    { length: 10 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+  return `Error: fetch failed\n${frames.join('\n')}`;
+}
+
+/**
+ * The same failure with ordinary Node startup noise in front of it and three
+ * times the stack — Lumen's second fixture, kept verbatim for the same reason.
+ * ~3.5KB, so it overruns the diagnostic budget too: the head holds the
+ * warnings, the tail holds frames, and `Error: fetch failed` is in neither.
+ */
+function noisyStartupOverLongStack(): string {
+  const frames = Array.from(
+    { length: 30 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+  return [
+    '(node:123) Warning: Example optional feature is experimental',
+    '(Use node --trace-warnings to show where the warning was created)',
+    '[startup] initialising backend',
+    'Error: fetch failed',
+    ...frames,
+  ].join('\n');
+}
+
+describe('InkRunner failure text', () => {
+  let child: FakeChild;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    child = makeFakeChild();
+    spawnMock.mockReturnValue(child);
+    warnMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it('quotes the cause from the tail of stdout, not the banner at its head', async () => {
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The shape that produced the unreadable alert: ink reports the fatal
+    // error on STDOUT with stderr empty, behind a banner long enough to fill
+    // the old 1000-char HEAD slice on its own — so the head never reached the
+    // cause, and what it did reach was mostly escape sequences.
+    const banner =
+      '\x1b[2mApplied "Safe" profile\x1b[0m\n' +
+      '\x1b[36mIdentity context loaded:\x1b[0m wren\n' +
+      '{"type":"session_meta","id":"sess-1"}\n' +
+      '\x1b[38;5;213m▛▀▀▜\x1b[0m\n'.repeat(80);
+    const cause = 'Error: backend refused the run: no writer available';
+
+    expect(banner.length).toBeGreaterThan(1000); // else the old head slice would have caught the cause anyway
+
+    child.stdout.emit('data', Buffer.from(`${banner}${cause}\n`));
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    // The diagnostic survives...
+    expect(result.error).toContain('no writer available');
+    // ...and the noise that buried it does not.
+    expect(result.error).not.toContain('\x1b');
+    expect(result.error).not.toContain('Applied "Safe" profile');
+    expect(result.error).not.toContain('session_meta');
+  });
+
+  it('says so explicitly when a failed turn produced no output at all', async () => {
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    // An empty quote reads as "no error given"; this has to be unambiguous.
+    expect(result.error).toContain('no diagnostic output');
+  });
+
+  it('leaves the error line classifiable under a stack long enough to bury it', async () => {
+    const { classifyError } = await import('@inklabs/shared');
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Lumen's fixture, review of PR #662. An ordinary Node failure: the cause
+    // is the FIRST line and the stack that follows it is longer than a display
+    // budget. Asserted through `classifyError` on the real result rather than
+    // on the excerpt directly, because the defect was that this string is what
+    // session-service classifies — a test that fed the classifier its own text
+    // would pass against the bug.
+    child.stderr.emit('data', Buffer.from(errorOverLongStack()));
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    expect(classifyError({ errorText: result.error || '' }).category).toBe('network');
+  });
+
+  /**
+   * Lumen's second fixture, same review, and the one that showed a bigger
+   * budget is still a budget: ordinary Node startup noise ahead of the cause,
+   * and a stack long enough that the whole thing overruns the DIAGNOSTIC
+   * excerpt. The head keeps the warnings, the tail keeps frames, and the only
+   * line naming the fault is what the elision drops.
+   *
+   * Both assertions are load-bearing together. The first is the control: it
+   * establishes that the text genuinely cannot be classified, so the second
+   * cannot be satisfied by the excerpt happening to contain the answer.
+   */
+  it('carries a verdict its own excerpt can no longer support', async () => {
+    const { classifyError } = await import('@inklabs/shared');
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.stderr.emit('data', Buffer.from(noisyStartupOverLongStack()));
+    child.emit('close', 1);
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    expect(result.error).not.toContain('fetch failed');
+    expect(classifyError({ errorText: result.error || '' }).category).toBe('unknown');
+
+    expect(result.classification).toMatchObject({ category: 'network', retryable: true });
+  });
+
+  /**
+   * Bounded claim, pinned so the field is not read as more than it is: it is
+   * populated for a non-zero exit, where the runner saw the whole output. A
+   * spawn failure never had output to classify, so it carries nothing and
+   * consumers fall back to reading the message.
+   */
+  it('carries nothing when there was no process output to judge', async () => {
+    const runner = new InkRunner();
+    const runPromise = runner.run('hello', { config: baseConfig as never });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.emit('error', new Error('spawn ENOENT'));
+
+    const result = await runPromise;
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Failed to spawn ink');
+    expect(result.classification).toBeUndefined();
   });
 });

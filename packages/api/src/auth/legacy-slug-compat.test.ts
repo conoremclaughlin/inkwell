@@ -20,7 +20,7 @@ vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { verifyPcpAccessToken } from './pcp-tokens';
+import { verifyInkAccessToken } from './ink-tokens';
 import { parseStudioLease } from '../services/studio-lease.service';
 import { fakeEnv, fakeWrongValue } from '../test/fake-env';
 
@@ -37,7 +37,7 @@ describe('access tokens minted before the rename', () => {
       agentId: 'wren',
     });
 
-    const payload = verifyPcpAccessToken(token, 'mcp_access');
+    const payload = verifyInkAccessToken(token, 'mcp_access');
 
     // Every runner token issued in the hour before deploy looks like this.
     // Without the normalization the SB is anonymous for the rest of its life.
@@ -54,13 +54,13 @@ describe('access tokens minted before the rename', () => {
       agentId: 'wren',
     });
 
-    expect(verifyPcpAccessToken(token, 'mcp_access')?.sbSlug).toBe('lumen');
+    expect(verifyInkAccessToken(token, 'mcp_access')?.sbSlug).toBe('lumen');
   });
 
   it('leaves a token with neither claim without a slug', () => {
     const token = sign({ type: 'mcp_access', sub: 'user-1', email: 'a@b.c', scope: 'mcp:tools' });
 
-    expect(verifyPcpAccessToken(token, 'mcp_access')?.sbSlug).toBeUndefined();
+    expect(verifyInkAccessToken(token, 'mcp_access')?.sbSlug).toBeUndefined();
   });
 
   it('still rejects a token signed with the wrong secret', () => {
@@ -70,7 +70,7 @@ describe('access tokens minted before the rename', () => {
     );
 
     // Control: the compat path must not become a way in.
-    expect(verifyPcpAccessToken(forged, 'mcp_access')).toBeNull();
+    expect(verifyInkAccessToken(forged, 'mcp_access')).toBeNull();
   });
 });
 

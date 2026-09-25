@@ -132,10 +132,19 @@ const envSchema = z.object({
   TELEGRAM_BENSON_BOT_TOKEN: optionalString,
   TELEGRAM_WEBHOOK_URL: optionalUrl,
 
+  // Alert ingest — static credential for checkers that must work when the
+  // OAuth/LLM path is exactly what is broken. Both are required together:
+  // the token is bound to one user rather than trusting a userId in the body.
+  ALERT_INGEST_TOKEN: optionalString,
+  ALERT_INGEST_USER_ID: optionalString,
+  // How often the staleness sweep looks for monitors that have gone quiet.
+  // 0 disables it.
+  ALERT_STALENESS_SWEEP_SECONDS: z.string().transform(Number).optional(),
+
   // MCP Server
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
   MCP_HTTP_PORT: z.string().transform(Number).optional(),
-  MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://pcp.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
+  MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://inkwell.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
   MCP_REQUIRE_OAUTH: z
     .enum(['true', 'false'])
     .default('true')

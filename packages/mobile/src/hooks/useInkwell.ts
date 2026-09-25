@@ -4,9 +4,11 @@
  * (7s), the lists amble along at 20s, and everything refetches on focus so
  * returning to the app never shows stale data for long.
  */
+import { useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { THREADS_PATH, threadMessagesPath } from '@inklabs/shared/stories/threads-api';
 import { apiFetch } from '../lib/api';
-import { getWorkspaceId, setWorkspaceId } from '../lib/storage';
+import { getWorkspaceId, setWorkspaceId, subscribeWorkspace } from '../lib/storage';
 import type {
   IndividualsResponse,
   ReopenResponse,
@@ -28,18 +30,25 @@ const FLEET_POLL_MS = 20_000;
 export function useThreads() {
   return useQuery({
     queryKey: ['threads'],
-    queryFn: () => apiFetch<ThreadsResponse>('/api/admin/threads'),
+    queryFn: () => apiFetch<ThreadsResponse>(THREADS_PATH),
     refetchInterval: THREAD_LIST_POLL_MS,
   });
 }
 
+/**
+ * One thread's newest page. Keyed by workspace as well as thread key: the
+ * same key can be another thread in another workspace, and a switch must
+ * never serve the previous workspace's cached page under the new one
+ * (Lumen, #679). ['thread', threadKey] stays the prefix, so invalidating
+ * it still reaches every workspace's copy.
+ */
 export function useThreadMessages(threadKey: string) {
+  const workspaceId = useSyncExternalStore(subscribeWorkspace, getWorkspaceId);
   return useQuery({
-    queryKey: ['thread', threadKey],
+    queryKey: ['thread', threadKey, { workspaceId }],
+    // Bound as well as keyed: the request asks the workspace in the key.
     queryFn: () =>
-      apiFetch<ThreadMessagesResponse>(
-        `/api/admin/threads/messages?key=${encodeURIComponent(threadKey)}`
-      ),
+      apiFetch<ThreadMessagesResponse>(threadMessagesPath(threadKey), undefined, { workspaceId }),
     refetchInterval: THREAD_DETAIL_POLL_MS,
   });
 }

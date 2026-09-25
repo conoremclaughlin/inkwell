@@ -36,6 +36,15 @@ import type {
 import type { IActivityStream } from './session-service.js';
 
 // Mock logger (still needed as it's imported directly)
+// The thread-home check and the thread behavior lookup resolve the
+// workspace from the session's canonical identity (spec inkmail-thread-scope
+// §1, §1b); these suites pin routing, not identity lookup, so the workspace
+// is a fixed answer and the thread/participant rows below carry it.
+vi.mock('../principals.js', () => ({
+  workspaceOfSb: vi.fn(async () => 'ws-1'),
+  personalWorkspaceOf: vi.fn(async () => 'ws-1'),
+}));
+
 vi.mock('../../utils/logger.js', () => ({
   logger: {
     info: vi.fn(),
@@ -1004,7 +1013,7 @@ describe('SessionService', () => {
 
   describe('MCP endpoint propagation', () => {
     it('hands the runner the endpoint the server bound, not a config file', async () => {
-      // The standard isolation recipe (`PCP_PORT_BASE=4001 yarn dev`) does not
+      // The standard isolation recipe (`INK_PORT_BASE=4001 yarn dev`) does not
       // rewrite the committed .mcp.json, so a runner that trusts that file
       // sends an isolated server's bearer token to the MAIN server on 3001.
       // server.ts derives this from env.MCP_HTTP_PORT — the port the listener
@@ -3949,7 +3958,7 @@ describe('SessionService', () => {
       const now = new Date().toISOString();
       return {
         id: `tkt-${type}`,
-        user_id: null,
+        workspace_id: null,
         type,
         write_intent: writeIntent,
         studio_policy: studioPolicy,
@@ -4621,7 +4630,7 @@ describe('SessionService', () => {
                 data: [
                   {
                     id: 'o1',
-                    user_id: 'user-456',
+                    workspace_id: 'ws-1',
                     type: 'spec',
                     write_intent: 'presence',
                     studio_policy: 'reuse-only',
@@ -5876,7 +5885,7 @@ describe('SessionService', () => {
           },
         ],
         inbox_threads: [
-          { id: 'thread-1', user_id: 'user-456', thread_key: 'pr:3200', key_type: 'pr' },
+          { id: 'thread-1', workspace_id: 'ws-1', thread_key: 'pr:3200', key_type: 'pr' },
         ],
         thread_key_types: [
           {
@@ -5896,7 +5905,8 @@ describe('SessionService', () => {
             : [
                 {
                   thread_id: 'thread-1',
-                  agent_id: 'wren',
+                  workspace_id: 'ws-1',
+                  sb_id: 'sb-wren',
                   session_id: opts.participantSessionId ?? 'holder-session',
                 },
               ],
@@ -6112,7 +6122,7 @@ describe('SessionService', () => {
           },
         ],
         inbox_threads: [
-          { id: 'thread-1', user_id: 'user-456', thread_key: 'pr:3200', key_type: 'pr' },
+          { id: 'thread-1', workspace_id: 'ws-1', thread_key: 'pr:3200', key_type: 'pr' },
         ],
         thread_key_types: [
           {

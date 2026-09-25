@@ -60,12 +60,12 @@ export function boundThreadTitle(subject: string | null | undefined): string | n
  * wrote back through here, rather than asserting a shape at each end.
  *
  * Returns null for anything that is not a non-empty string, including a blob
- * shaped differently by a caller who put their own `pcp` key in metadata.
+ * shaped differently by a caller who put their own `inkMeta` key in metadata.
  */
 export function threadMessageSubject(metadata: unknown): string | null {
   if (!metadata || typeof metadata !== 'object') return null;
-  const pcp = (metadata as Record<string, unknown>).pcp;
-  if (!pcp || typeof pcp !== 'object') return null;
-  const subject = (pcp as Record<string, unknown>).subject;
+  const inkMeta = (metadata as Record<string, unknown>).pcp;
+  if (!inkMeta || typeof inkMeta !== 'object') return null;
+  const subject = (inkMeta as Record<string, unknown>).subject;
   return typeof subject === 'string' && subject.length > 0 ? subject : null;
 }

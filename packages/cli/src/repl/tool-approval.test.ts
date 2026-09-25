@@ -22,8 +22,8 @@ describe('tool approval', () => {
       choice: 'once',
     });
     expect(result.approved).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
   });
 
   it('applies session approval and fallback when no session', () => {
@@ -44,7 +44,7 @@ describe('tool approval', () => {
       choice: 'session',
     });
     expect(scoped.approved).toBe(true);
-    expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox', 'sess-1').allowed).toBe(true);
   });
 
   it('applies persistent allow and deny', () => {
@@ -55,14 +55,14 @@ describe('tool approval', () => {
       tool: 'send_to_inbox',
       choice: 'always',
     });
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(true);
 
     applyToolApprovalChoice({
       policy,
       tool: 'send_to_inbox',
       choice: 'deny',
     });
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
   });
 
   it('returns cancelled when user declines approval', () => {
@@ -75,6 +75,6 @@ describe('tool approval', () => {
       choice: 'cancel',
     });
     expect(result).toEqual({ approved: false, message: 'Cancelled.' });
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
   });
 });

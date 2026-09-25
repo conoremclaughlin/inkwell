@@ -12,7 +12,7 @@
  *
  * ~/.ink is the only location read. Reading the legacy ~/.pcp/config.json as a
  * fallback would report an email while `authFilePath()` (~/.ink/auth.json) and
- * PcpClient still see nothing — the command clears the signed-in gate and then
+ * InkClient still see nothing — the command clears the signed-in gate and then
  * fails deeper with a worse error. A pre-rename install needs `ink auth login`
  * anyway to mint tokens, and that writes ~/.ink/config.json on its way through.
  */

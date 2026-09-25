@@ -7,6 +7,29 @@ export interface ApiError extends Error {
 }
 
 /**
+ * A request that belongs to one workspace, whichever one is selected by the
+ * time it is sent. Null is the server's default (the personal workspace).
+ *
+ * Unbound requests take the selection at send time, which is what most of
+ * the dashboard wants: a switch invalidates every query, and the refetch
+ * asks the new workspace. A query whose cache key names a workspace must
+ * bind instead. The sidebar selects the new workspace and invalidates
+ * before any component re-renders, so the old workspace's still-active
+ * query refetches first, and an unbound request would store the new
+ * workspace's data under the old workspace's key (Lumen, #679).
+ */
+export interface WorkspaceBinding {
+  workspaceId: string | null;
+}
+
+declare module 'axios' {
+  interface AxiosRequestConfig {
+    /** Set by a workspace-bound request; the request interceptor honours it. */
+    inkWorkspace?: WorkspaceBinding;
+  }
+}
+
+/**
  * Axios client for API requests.
  * Auth is injected by middleware — no client-side token handling needed.
  */
@@ -45,11 +68,21 @@ async function handleInvalidTokenLogout(): Promise<void> {
   }
 }
 
-// Request interceptor - inject workspace scope header when selected.
-apiClient.interceptors.request.use(async (config) => {
-  const workspaceId = getSelectedWorkspaceId();
-  if (workspaceId) {
-    config.headers['X-PCP-Workspace-Id'] = workspaceId;
+// Request interceptor - inject workspace scope header: the request's own
+// binding when it has one, otherwise the current selection.
+apiClient.interceptors.request.use((config) => {
+  const workspaceId = config.inkWorkspace
+    ? config.inkWorkspace.workspaceId
+    : getSelectedWorkspaceId();
+  if (!workspaceId) {
+    // Bound to the default workspace: no header, whatever is selected.
+    delete config.headers['x-ink-workspace-id'];
+  } else {
+    // Must match what the server reads (server.ts, admin.ts): `x-ink-workspace-id`.
+    // This said `X-Inkwell-Workspace-Id` until #659 — a name the server stopped
+    // reading in 01b9047b, so every workspace selection here was silently
+    // dropped and the request fell back to the personal workspace.
+    config.headers['x-ink-workspace-id'] = workspaceId;
   }
 
   return config;
@@ -82,8 +115,8 @@ export { apiClient };
 /**
  * GET request
  */
-export async function apiGet<T>(path: string): Promise<T> {
-  const response = await apiClient.get<T>(path);
+export async function apiGet<T>(path: string, binding?: WorkspaceBinding): Promise<T> {
+  const response = await apiClient.get<T>(path, binding ? { inkWorkspace: binding } : undefined);
   return response.data;
 }
 

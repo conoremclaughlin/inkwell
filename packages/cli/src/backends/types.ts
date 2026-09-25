@@ -35,7 +35,7 @@ export interface BackendConfig {
    * model_instructions_file, gemini: GEMINI_SYSTEM_MD).
    */
   systemPromptOverride?: string;
-  pcpSessionId?: string;
+  inkSessionId?: string;
   backendSessionId?: string;
   backendSessionSeedId?: string;
   studioId?: string;

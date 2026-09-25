@@ -29,6 +29,27 @@ export function useApiQuery<T>(
 }
 
 /**
+ * A GET that belongs to one workspace. The workspace is appended to the
+ * cache key and bound to the request (and to react-query's retries, which
+ * call the same function), so what is cached under a workspace is always
+ * that workspace's data, even for a refetch that starts after a switch but
+ * before this component re-renders. `queryKey` without the workspace stays
+ * the prefix that invalidation matches.
+ */
+export function useWorkspaceApiQuery<T>(
+  queryKey: unknown[],
+  path: string,
+  workspaceId: string | null,
+  options?: Omit<UseQueryOptions<T, ApiError>, 'queryKey' | 'queryFn'>
+) {
+  return useQuery<T, ApiError>({
+    queryKey: [...queryKey, { workspaceId }],
+    queryFn: () => apiGet<T>(path, { workspaceId }),
+    ...options,
+  });
+}
+
+/**
  * Hook for authenticated POST mutations.
  *
  * @example

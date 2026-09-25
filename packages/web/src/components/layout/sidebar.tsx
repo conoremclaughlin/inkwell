@@ -361,7 +361,7 @@ export function Sidebar() {
   };
 
   return (
-    <div className="flex h-full w-64 flex-col border-r border-white/[0.06] bg-[#0f1117]">
+    <div className="flex h-full w-52 flex-col border-r border-white/[0.06] bg-[#0f1117]">
       {/* Workspace switcher */}
       <div className="relative px-3 pb-2 pt-4" ref={accountMenuRef}>
         <button
@@ -498,7 +498,7 @@ export function Sidebar() {
                 <div className="space-y-1">
                   <label className="text-sm font-medium text-gray-700">Workspace name</label>
                   <Input
-                    placeholder="e.g., PCP Team"
+                    placeholder="e.g., Inkwell Team"
                     value={newWorkspaceName}
                     onChange={(event) => setNewWorkspaceName(event.target.value)}
                   />

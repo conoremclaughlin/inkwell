@@ -48,7 +48,7 @@ function createHarness(
   const notifications: Array<{ content: string; meta: Record<string, unknown> }> = [];
 
   const deps: PollDeps = {
-    callPcp: vi.fn(async (tool: string, args: Record<string, unknown>) => {
+    callInk: vi.fn(async (tool: string, args: Record<string, unknown>) => {
       if (tool === 'get_thread_messages') {
         fetchArgs.push(args);
         const fixture = threadFixtures[args.threadKey as string];
@@ -156,7 +156,7 @@ describe('drainThreads — cold-fetch ack protocol (spec §1)', () => {
 
     // Poll 1: emit succeeds but the ack write fails.
     const h1 = createHarness({ 'pr:x': { messages: msgs, skipped: 3 } });
-    (h1.deps.callPcp as ReturnType<typeof vi.fn>).mockImplementation(
+    (h1.deps.callInk as ReturnType<typeof vi.fn>).mockImplementation(
       async (tool: string, args: Record<string, unknown>) => {
         if (tool === 'get_thread_messages') {
           h1.fetchArgs.push(args);
@@ -302,7 +302,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     const ackArgs: Array<Record<string, unknown>> = [];
     const notifications: Array<{ content: string; meta: Record<string, unknown> }> = [];
     const deps: PollDeps = {
-      callPcp: vi.fn(async (tool: string, args: Record<string, unknown>) => {
+      callInk: vi.fn(async (tool: string, args: Record<string, unknown>) => {
         if (tool === 'mark_inbox_read') {
           ackArgs.push(args);
           return opts.ackFail ? { success: false } : { success: true };

@@ -37,6 +37,56 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
 const d = SUPABASE_URL && SUPABASE_KEY ? describe : describe.skip;
 const USER = INTEGRATION_TEST_USER_ID;
+// Since the cutover (spec inkmail-thread-scope §1) a thread is one row per
+// (workspace, key) and a regrant names its workspace; the RPC refuses one
+// that does not. The fixture user's personal workspace and the `echo`
+// identity in it are resolved once, below, from the database.
+let WS = '';
+let ECHO_SB = '';
+async function resolveFixtureScope(client: SupabaseClient<Database>): Promise<void> {
+  if (WS && ECHO_SB) return;
+  const { data: ws } = await client
+    .from('workspaces')
+    .select('id')
+    .eq('user_id', USER)
+    .eq('type', 'personal')
+    .eq('slug', 'personal')
+    .is('archived_at', null)
+    .maybeSingle();
+  if (!ws?.id) throw new Error('fixture user has no personal workspace');
+  WS = ws.id;
+  const { data: sb } = await client
+    .from('agent_identities')
+    .select('id')
+    .eq('user_id', USER)
+    .eq('agent_id', 'echo')
+    .eq('workspace_id', WS)
+    .maybeSingle();
+  if (sb?.id) {
+    ECHO_SB = sb.id;
+    return;
+  }
+  // The seed may predate the cutover: adopt a workspace-less echo, else create one.
+  const { data: orphan } = await client
+    .from('agent_identities')
+    .select('id')
+    .eq('user_id', USER)
+    .eq('agent_id', 'echo')
+    .is('workspace_id', null)
+    .maybeSingle();
+  if (orphan?.id) {
+    await client.from('agent_identities').update({ workspace_id: WS }).eq('id', orphan.id);
+    ECHO_SB = orphan.id;
+    return;
+  }
+  const { data: created, error } = await client
+    .from('agent_identities')
+    .insert({ user_id: USER, workspace_id: WS, agent_id: 'echo', name: 'Echo', role: 'fixture' })
+    .select('id')
+    .single();
+  if (error || !created) throw new Error(`echo identity: ${error?.message}`);
+  ECHO_SB = created.id;
+}
 
 /**
  * Direct Postgres, for the one test that needs a second connection holding a
@@ -399,11 +449,15 @@ d('session_running_write trigger', () => {
         lease: null,
       } as never);
       expect(studioError).toBeNull();
+      await resolveFixtureScope(client);
+      // The workspace is the server's to resolve (from the session's identity)
+      // — the RPC refuses a regrant that does not carry one.
       const regrant = {
         sessionId,
         threadKey,
         threadKeys: [threadKey],
         sbSlug: 'wren',
+        workspaceId: WS,
         reason: 'cli-prompt-regrant',
       };
 
@@ -433,10 +487,14 @@ d('session_running_write trigger', () => {
 
         // 2) A CLOSED thread is a revocation — vacancy is not authorization.
         const { error: threadError } = await client.from('inbox_threads').insert({
-          user_id: USER,
+          workspace_id: WS,
           thread_key: threadKey,
-          created_by_agent_id: 'wren',
+          created_by_kind: 'sb',
+          created_by_sb_id: ECHO_SB,
           status: 'closed',
+          closed_at: new Date().toISOString(),
+          closed_by_kind: 'sb',
+          closed_by_sb_id: ECHO_SB,
         } as never);
         expect(threadError).toBeNull();
         const { data: revoked } = await client.rpc('claim_turn_epoch', {
@@ -446,7 +504,11 @@ d('session_running_write trigger', () => {
           p_regrant: regrant,
         } as never);
         expect((revoked as unknown as { outcome: string }).outcome).toBe('lease-lost');
-        await client.from('inbox_threads').delete().eq('user_id', USER).eq('thread_key', threadKey);
+        await client
+          .from('inbox_threads')
+          .delete()
+          .eq('workspace_id', WS)
+          .eq('thread_key', threadKey);
 
         // 3) ELIGIBLE vacancy: claimed + regranted, the lease installed with
         // the fresh epoch, and the session re-bound to the studio in the
@@ -507,7 +569,11 @@ d('session_running_write trigger', () => {
           .single();
         expect(unbound!.studio_id).toBeNull();
       } finally {
-        await client.from('inbox_threads').delete().eq('user_id', USER).eq('thread_key', threadKey);
+        await client
+          .from('inbox_threads')
+          .delete()
+          .eq('workspace_id', WS)
+          .eq('thread_key', threadKey);
         await client.from('studios').delete().eq('id', studioId);
       }
     });
@@ -516,13 +582,14 @@ d('session_running_write trigger', () => {
       // An authenticated caller's own session naming ANOTHER user's vacant
       // studio must not install a lease across tenants — the service role
       // bypasses RLS, so the boundary lives in the claim itself.
+      await resolveFixtureScope(client);
       const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
       const before = await readSession(sessionId);
       const otherUserId = randomUUID();
       const studioId = randomUUID();
       const { error: userError } = await client.from('users').insert({
         id: otherUserId,
-        email: `pcp-test-${otherUserId.slice(0, 8)}@example.invalid`,
+        email: `ink-test-${otherUserId.slice(0, 8)}@example.invalid`,
       } as never);
       expect(userError).toBeNull();
       const { error: studioError } = await client.from('studios').insert({
@@ -541,7 +608,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:cross', sbSlug: 'wren' },
+          p_regrant: { sessionId, threadKey: 'test:cross', sbSlug: 'wren', workspaceId: WS },
         } as never);
         expect((data as unknown as { outcome: string }).outcome).toBe('forbidden');
 
@@ -842,6 +909,7 @@ d('session_running_write trigger', () => {
       // class. A vacant eligible pathless studio must claim + regrant; a
       // pathless SIBLING holding a lease must refuse (one shared
       // defaultWorkingDirectory class per user, like the canonical grant).
+      await resolveFixtureScope(client);
       const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
       const studioId = randomUUID();
       const siblingId = randomUUID();
@@ -861,7 +929,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:pathless', sbSlug: 'wren' },
+          p_regrant: { sessionId, threadKey: 'test:pathless', sbSlug: 'wren', workspaceId: WS },
         } as never);
         const verdict = won as unknown as { outcome: string; regranted: boolean };
         expect(verdict.outcome).toBe('claimed');
@@ -894,7 +962,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:pathless', sbSlug: 'wren' },
+          p_regrant: { sessionId, threadKey: 'test:pathless', sbSlug: 'wren', workspaceId: WS },
         } as never);
         expect((refused as unknown as { outcome: string }).outcome).toBe('lease-lost');
       } finally {
@@ -906,6 +974,7 @@ d('session_running_write trigger', () => {
       // Two rows naming the same tree with different raw spellings: the
       // sibling's held lease must refuse the regrant, exactly as
       // grant_studio_lease's advisory-locked scan would.
+      await resolveFixtureScope(client);
       const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
       const studioId = randomUUID();
       const siblingId = randomUUID();
@@ -942,7 +1011,7 @@ d('session_running_write trigger', () => {
           p_session_id: sessionId,
           p_set_running: true,
           p_studio_id: studioId,
-          p_regrant: { sessionId, threadKey: 'test:norm', sbSlug: 'wren' },
+          p_regrant: { sessionId, threadKey: 'test:norm', sbSlug: 'wren', workspaceId: WS },
         } as never);
         expect((data as unknown as { outcome: string }).outcome).toBe('lease-lost');
         const { data: after } = await client

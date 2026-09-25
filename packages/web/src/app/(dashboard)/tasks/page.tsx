@@ -6,7 +6,6 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import {
   CheckCircle2,
-  Circle,
   Clock,
   AlertCircle,
   Layers,
@@ -32,6 +31,7 @@ import {
 } from 'lucide-react';
 import { useApiQuery, useApiPost, useApiPut, useQueryClient } from '@/lib/api';
 import clsx from 'clsx';
+import { resolvePriority, resolveStatus } from './task-display';
 
 // ─── Types ───
 
@@ -128,76 +128,6 @@ interface CommentsResponse {
 type StatusFilter = 'all' | 'active' | 'completed' | 'blocked';
 
 // ─── Constants ───
-
-const statusConfig = {
-  in_progress: {
-    icon: ArrowUpCircle,
-    label: 'In Progress',
-    color: 'text-emerald-700 dark:text-emerald-400',
-    bgColor: 'bg-emerald-50 dark:bg-emerald-900/30',
-    borderColor: 'border-emerald-200 dark:border-emerald-800',
-    accentColor: 'text-emerald-600 dark:text-emerald-400',
-    dotColor: 'bg-emerald-500',
-  },
-  pending: {
-    icon: Circle,
-    label: 'Pending',
-    color: 'text-blue-700 dark:text-blue-400',
-    bgColor: 'bg-blue-50 dark:bg-blue-900/30',
-    borderColor: 'border-blue-200 dark:border-blue-800',
-    accentColor: 'text-blue-600 dark:text-blue-400',
-    dotColor: 'bg-blue-500',
-  },
-  blocked: {
-    icon: AlertCircle,
-    label: 'Blocked',
-    color: 'text-red-700 dark:text-red-400',
-    bgColor: 'bg-red-50 dark:bg-red-900/30',
-    borderColor: 'border-red-200 dark:border-red-800',
-    accentColor: 'text-red-600 dark:text-red-400',
-    dotColor: 'bg-red-500',
-  },
-  completed: {
-    icon: CheckCircle2,
-    label: 'Completed',
-    color: 'text-muted-foreground',
-    bgColor: 'bg-muted/50',
-    borderColor: 'border-border',
-    accentColor: 'text-muted-foreground/70',
-    dotColor: 'bg-gray-400',
-  },
-} as const;
-
-const priorityConfig = {
-  critical: {
-    label: 'Critical',
-    color: 'text-red-700 dark:text-red-400',
-    bgColor: 'bg-red-50 dark:bg-red-900/30',
-    borderColor: 'border-red-200 dark:border-red-800',
-    dotColor: 'bg-red-500',
-  },
-  high: {
-    label: 'High',
-    color: 'text-orange-700 dark:text-orange-400',
-    bgColor: 'bg-orange-50 dark:bg-orange-900/30',
-    borderColor: 'border-orange-200 dark:border-orange-800',
-    dotColor: 'bg-orange-500',
-  },
-  medium: {
-    label: 'Medium',
-    color: 'text-muted-foreground',
-    bgColor: 'bg-muted/50',
-    borderColor: 'border-border',
-    dotColor: 'bg-gray-400',
-  },
-  low: {
-    label: 'Low',
-    color: 'text-slate-500 dark:text-slate-400',
-    bgColor: 'bg-slate-50 dark:bg-slate-900/30',
-    borderColor: 'border-slate-200 dark:border-slate-800',
-    dotColor: 'bg-slate-400',
-  },
-} as const;
 
 const PRIORITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
 const STATUS_ORDER: Record<string, number> = {
@@ -483,9 +413,11 @@ function ActivityTimeline({ groupId }: { groupId: string }) {
 
 // ─── Sub-components ───
 
-function PriorityBadge({ priority }: { priority: Task['priority'] }) {
-  const config = priorityConfig[priority];
-  if (priority === 'medium') return null;
+function PriorityBadge({ priority }: { priority: string | null | undefined }) {
+  // Total over any string the API returns, not just the declared union — see
+  // task-display.ts. Null means "no badge", never a crash.
+  const config = resolvePriority(priority);
+  if (!config) return null;
   return (
     <Badge
       className={clsx(
@@ -501,10 +433,10 @@ function PriorityBadge({ priority }: { priority: Task['priority'] }) {
   );
 }
 
-function StatusDot({ status }: { status: Task['status'] }) {
+function StatusDot({ status }: { status: string | null | undefined }) {
   return (
     <span
-      className={clsx('inline-block h-1.5 w-1.5 rounded-full', statusConfig[status].dotColor)}
+      className={clsx('inline-block h-1.5 w-1.5 rounded-full', resolveStatus(status).dotColor)}
     />
   );
 }
@@ -519,7 +451,7 @@ function TaskCard({
   compact?: boolean;
 }) {
   const [showComments, setShowComments] = useState(false);
-  const config = statusConfig[task.status];
+  const config = resolveStatus(task.status);
   const StatusIcon = config.icon;
   const isDone = task.status === 'completed';
   const isOverdue = task.dueDate && !isDone && new Date(task.dueDate) < new Date();
@@ -807,13 +739,16 @@ function UngroupedStatusSection({
   onStatusChange,
   defaultCollapsed,
 }: {
-  status: Task['status'];
+  // `string`, not Task['status']: the server can send a status outside the
+  // union and this section exists to render it rather than drop it. The union
+  // is what we intend, not what arrives.
+  status: string;
   tasks: Task[];
   onStatusChange: (id: string, status: Task['status']) => void;
   defaultCollapsed?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
-  const config = statusConfig[status];
+  const config = resolveStatus(status);
   const StatusIcon = config.icon;
   const sorted = useMemo(() => sortTasks(tasks), [tasks]);
 
@@ -959,17 +894,51 @@ export default function TasksPage() {
     });
   }, [grouped]);
 
-  // Group ungrouped by status
+  // Group ungrouped by status.
+  //
+  // A task whose status is outside the four keys below used to throw here —
+  // `groups[task.status]` is undefined and `.push` takes the page down, the
+  // same failure as the priority badge and in the same render. The display
+  // lookups were fixed by routing them through resolveStatus; this one is a
+  // GROUPING lookup and my audit grep, which searched for names ending in
+  // Config/COLORS, never had it in the population. Found by rendering a task
+  // with an unrecognised status rather than by reading.
+  //
+  // Unknown statuses are collected under their own key rather than dropped:
+  // silently omitting a task from every column is how you lose work without
+  // anything appearing wrong.
   const ungroupedByStatus = useMemo(() => {
-    const groups: Record<Task['status'], Task[]> = {
-      in_progress: [],
-      pending: [],
-      blocked: [],
-      completed: [],
-    };
-    for (const task of ungrouped) groups[task.status].push(task);
+    // Object.create(null), not an object literal. On an ordinary object,
+    // `groups['__proto__'] = []` invokes the inherited prototype SETTER instead
+    // of creating a property: hasOwnProperty stays false, Object.keys never
+    // sees the bucket, and every task with that status disappears — each one
+    // replacing the previous. A null-prototype map has no setter to invoke, so
+    // the key behaves like any other. (Lumen, #665 r3.)
+    const groups: Record<string, Task[]> = Object.create(null);
+    for (const known of STATUS_DISPLAY_ORDER) groups[known] = [];
+    for (const task of ungrouped) {
+      const key = task.status;
+      if (!Object.prototype.hasOwnProperty.call(groups, key)) groups[key] = [];
+      groups[key].push(task);
+    }
     return groups;
   }, [ungrouped]);
+
+  /**
+   * The four known statuses in their usual order, followed by any others the
+   * data actually contains.
+   *
+   * Without the tail, a task with an unrecognised status is grouped and then
+   * never rendered, because the column list is a fixed array — it would vanish
+   * from the board while still existing. A task you cannot see is worse than
+   * an oddly-labelled one.
+   */
+  const ungroupedSections = useMemo(() => {
+    const extra = Object.keys(ungroupedByStatus).filter(
+      (status) => !STATUS_DISPLAY_ORDER.includes(status as Task['status'])
+    );
+    return [...STATUS_DISPLAY_ORDER, ...extra];
+  }, [ungroupedByStatus]);
 
   const filterButtons: { key: StatusFilter; label: string; count: number }[] = [
     { key: 'all', label: 'All', count: stats.total },
@@ -1112,11 +1081,11 @@ export default function TasksPage() {
                 </h3>
               </div>
             )}
-            {STATUS_DISPLAY_ORDER.map((status) => (
+            {ungroupedSections.map((status) => (
               <UngroupedStatusSection
                 key={status}
                 status={status}
-                tasks={ungroupedByStatus[status]}
+                tasks={ungroupedByStatus[status] ?? []}
                 onStatusChange={handleStatusChange}
                 defaultCollapsed={status === 'completed'}
               />

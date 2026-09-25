@@ -26,7 +26,7 @@ export interface CloneRecord {
   label: string;
   prompt: string;
   status: CloneStatus;
-  /** The parent's PCP session, so the graph can link a clone to its origin. */
+  /** The parent's Inkwell session, so the graph can link a clone to its origin. */
   parentSessionId?: string;
   /** The clone's own JSONL transcript: `<parent>.<id>.jsonl`. */
   transcriptPath: string;

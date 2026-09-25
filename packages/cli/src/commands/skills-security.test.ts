@@ -18,7 +18,7 @@ vi.mock('os', async (importOriginal) => ({
   ...(await importOriginal<typeof import('os')>()),
   homedir: () => state.home,
 }));
-vi.mock('../lib/pcp-mcp.js', () => ({ callPcpTool: vi.fn() }));
+vi.mock('../lib/ink-mcp.js', () => ({ callInkTool: vi.fn() }));
 vi.mock('./mcp.js', () => ({ syncMcpConfig: vi.fn() }));
 vi.mock('child_process', () => ({
   execSync: vi.fn(() => {

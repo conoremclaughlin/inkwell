@@ -174,7 +174,7 @@ describe('CodexRunner', () => {
         mcpConfigPath: '',
         model: 'gpt-5-codex',
         appendSystemPrompt: 'identity override',
-        pcpAccessToken: 'test-pcp-token',
+        inkAccessToken: 'test-ink-token',
       },
     });
 
@@ -191,7 +191,7 @@ describe('CodexRunner', () => {
       string[],
       { env?: Record<string, string> },
     ];
-    expect(options.env?.INK_ACCESS_TOKEN).toBe('test-pcp-token');
+    expect(options.env?.INK_ACCESS_TOKEN).toBe('test-ink-token');
   });
 
   it('should return null backendSessionId when no session ID is found in stdout', async () => {
@@ -330,7 +330,7 @@ describe('CodexRunner', () => {
         Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: codexThreadId })}\n`)
       );
       mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'turn.started' })}\n`));
-      // Later: a tool call with conversationId (PCP routing key, NOT a backend session ID)
+      // Later: a tool call with conversationId (Inkwell routing key, NOT a backend session ID)
       mockProc.stdout.emit(
         'data',
         Buffer.from(

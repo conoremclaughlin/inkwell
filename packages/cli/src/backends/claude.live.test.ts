@@ -54,12 +54,12 @@ function buildFixtureDir(serverUrl: string): string {
   mkdirSync(join(root, '.ink'), { recursive: true });
   // Both headers are declared as templates so claude resolves them at MCP
   // connect time from its spawn env:
-  //   - INK_ACCESS_TOKEN:  set by the ink CLI via resolvePcpAuthEnv
+  //   - INK_ACCESS_TOKEN:  set by the ink CLI via resolveInkAuthEnv
   //   - INK_CONTEXT:       set by the claude backend adapter (encoded token)
   //
   // NOTE: in a real session, the ink CLI would layer x-ink-context on top of
   // the fixture via `injectSessionHeaders`, but that helper short-circuits
-  // when no PCP sessionId exists. Declaring the header up-front in the
+  // when no Inkwell sessionId exists. Declaring the header up-front in the
   // fixture keeps the test self-contained and still exercises the full
   // claude → server header chain.
   writeFileSync(

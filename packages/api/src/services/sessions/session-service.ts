@@ -12,7 +12,7 @@ import { randomUUID } from 'crypto';
 import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
-import { signRunnerAccessToken } from '../../auth/pcp-tokens';
+import { signRunnerAccessToken } from '../../auth/ink-tokens';
 import type { Database } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -55,7 +55,7 @@ import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
-import { classifyError } from '@inklabs/shared';
+import { classifyError, isPreAcceptanceRefusal, type ErrorClassification } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
@@ -68,6 +68,7 @@ import type {
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
+import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 
 /**
  * Configuration for SessionService.
@@ -814,10 +815,16 @@ export class SessionService implements ISessionService {
     }
 
     try {
+      // The thread is one row per (workspace, key), and the participant row
+      // is keyed by identity: without a canonical identity there is no
+      // workspace to look in, so a slug-only match is refused (fail closed).
+      if (!ctx.sbId) return false;
+      const workspaceId = await workspaceOfSb(this.supabase, ctx.sbId);
+      if (!workspaceId) return false;
       const { data: thread, error: threadErr } = await this.supabase
         .from('inbox_threads')
         .select('id')
-        .eq('user_id', ctx.userId)
+        .eq('workspace_id', workspaceId)
         .eq('thread_key', ctx.threadKey)
         .maybeSingle();
       if (threadErr || !thread) return false;
@@ -826,7 +833,7 @@ export class SessionService implements ISessionService {
         .from('inbox_thread_participants')
         .select('session_id')
         .eq('thread_id', thread.id)
-        .eq('agent_id', ctx.sbSlug)
+        .eq('sb_id', ctx.sbId)
         .maybeSingle();
       if (partErr || participant?.session_id !== holder.sessionId) return false;
 
@@ -1065,7 +1072,7 @@ export class SessionService implements ISessionService {
       // VERIFIED conflict + overflow failure: HOLD, do not degrade (Lumen
       // #517 r1 blocker 6). Clearing the binding sends the runner to
       // defaultWorkingDirectory — which on this server is routinely the SAME
-      // occupied root the conflict is about (three SBs share the pcp main
+      // occupied root the conflict is about (three SBs share the main
       // checkout). A held message is recoverable; a writer executing inside
       // the occupied tree via the fallback cwd is the exact stomp the lease
       // exists to prevent. The session row stays idle; the next delivery
@@ -1140,20 +1147,28 @@ export class SessionService implements ISessionService {
    */
   private async resolveThreadBehavior(
     userId: string,
+    sbId: string | null,
     threadKey: string
   ): Promise<{ writeIntent: WriteIntent; studioPolicy: StudioPolicy }> {
     const fallback = { writeIntent: 'write', studioPolicy: 'reuse-only' } as const;
     if (!this.supabase) return fallback;
     try {
+      // The registry and the thread are workspace-scoped (§1b): the
+      // identity's workspace when the session has one, the user's personal
+      // workspace otherwise.
+      const workspaceId = sbId
+        ? await workspaceOfSb(this.supabase, sbId)
+        : await personalWorkspaceOf(this.supabase, userId);
+      if (!workspaceId) return fallback;
       const { data, error } = await this.supabase
         .from('inbox_threads')
         .select('key_type')
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .eq('thread_key', threadKey)
         .maybeSingle();
       if (error) return fallback;
       const service = new ThreadKeyService(this.supabase);
-      const behavior = await service.typeBehavior(userId, data?.key_type ?? null);
+      const behavior = await service.typeBehavior(workspaceId, data?.key_type ?? null);
       return { writeIntent: behavior.writeIntent, studioPolicy: behavior.studioPolicy };
     } catch {
       return fallback;
@@ -1273,7 +1288,7 @@ export class SessionService implements ISessionService {
         logger.info('Session routing resolved', {
           channel: request.channel,
           conversationId: request.conversationId,
-          pcpSessionId: session.id,
+          inkSessionId: session.id,
           backendSessionId: session.backendSessionId || null,
           studioId: session.studioId || null,
           sbSlug,
@@ -1320,7 +1335,7 @@ export class SessionService implements ISessionService {
         // flush queued messages before processQueueOrReleaseLock runs —
         // every queued message would fail the same way.
         if (!result.success && result.error) {
-          this.flushQueueOnNonRetryableError(lockKey, result.error);
+          this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
         }
         // Routing admitted this message whether or not the turn succeeded —
         // a runner failure here is a backend outcome, not a routing one.
@@ -1477,7 +1492,7 @@ export class SessionService implements ISessionService {
         pending.resolve({ ...result, admitted: true });
         // Flush on non-retryable success:false results (e.g. InkRunner session limit)
         if (!result.success && result.error) {
-          this.flushQueueOnNonRetryableError(lockKey, result.error);
+          this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
         }
       } catch (error) {
         pending.reject(error instanceof Error ? error : new Error(String(error)));
@@ -1500,9 +1515,21 @@ export class SessionService implements ISessionService {
   /**
    * Flush remaining queued messages when the error is non-retryable (quota, auth, config).
    * Every pending message would fail the same way — flushing prevents budget burn.
+   *
+   * `carried` is the runner's own verdict, reached on everything the process
+   * said. Prefer it: `errorText` from a runner is a bounded excerpt, and this
+   * decision discards queued work in one direction and burns budget on a
+   * doomed queue in the other. Both directions were measured by Lumen (r3) —
+   * a carried `quota` whose excerpt reads `unknown` failed to flush, and a
+   * carried `capacity` whose excerpt reads `quota` flushed a queue that should
+   * have run. A throw carries no verdict and still classifies its text.
    */
-  private flushQueueOnNonRetryableError(lockKey: string, errorText: string): void {
-    const errorClass = classifyError({ errorText });
+  private flushQueueOnNonRetryableError(
+    lockKey: string,
+    errorText: string,
+    carried?: ErrorClassification
+  ): void {
+    const errorClass = carried ?? classifyError({ errorText });
     if (!errorClass.retryable && errorClass.category !== 'unknown') {
       const remaining = this.pendingQueues.get(lockKey);
       if (remaining && remaining.length > 0) {
@@ -1566,7 +1593,7 @@ export class SessionService implements ISessionService {
     );
 
     // 3. Build runner config
-    const pcpAccessToken = this.createRunnerAccessToken(
+    const inkAccessToken = this.createRunnerAccessToken(
       userId,
       sbSlug,
       injectedContext.user.email,
@@ -1667,15 +1694,15 @@ export class SessionService implements ISessionService {
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat,
         {
-          pcpSessionId: session.id,
+          inkSessionId: session.id,
           studioId: session.studioId || undefined,
           threadKey: session.threadKey || undefined,
         }
       ),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
-      ...(pcpAccessToken ? { pcpAccessToken } : {}),
-      pcpSessionId: session.id,
+      ...(inkAccessToken ? { inkAccessToken } : {}),
+      inkSessionId: session.id,
       sbSlug,
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
@@ -1948,6 +1975,12 @@ export class SessionService implements ISessionService {
 
     let result;
     let turnDurationMs: number;
+    // Classified inside the try, BEFORE the settled outcome is recorded, and
+    // declared here so the finalize payload and the boundary below can read it
+    // (Lumen's review of PR #660 P1: an unclassified `failed` recorded at the
+    // settle point is what shutdown terminalized the owner with).
+    let errorClassification: ErrorClassification | null = null;
+    let refusedBeforeAcceptance = false;
     const turnStartMs = Date.now();
 
     try {
@@ -1963,15 +1996,68 @@ export class SessionService implements ISessionService {
         mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
+      // Classified BEFORE the settled outcome is recorded, because the outcome
+      // depends on it. The backend can refuse a run before accepting it — most
+      // often because another writer already holds the thread we tried to
+      // resume — and that refusal is the one failure that says nothing about
+      // the target session's own state: no turn began, so nothing was
+      // observed. The outcome has to be right AT the settle point, because
+      // nothing downstream is guaranteed to revise it: the entry keeps the
+      // value until the run is cleared, that span contains the awaited
+      // finalize write, and on this path the finalize deliberately records no
+      // outcome at all — so a `failed` written here is simply retained, and it
+      // is what a shutdown during that span acts on. That retained value, not
+      // any gap between two adjacent statements, is the mechanism Lumen
+      // reproduced (his review of PR #660 P1, and his correction on the
+      // thread: adjacent synchronous statements are not preempted).
+      //
+      // The runner's own verdict wins when it has one. `result.error` is an
+      // excerpt — bounded for a log field and a DB column — so classifying it
+      // here means classifying whatever survived a text budget, and a budget
+      // is not a diagnosis: measured, `Error: fetch failed` above a long
+      // enough stack lands in the elided middle and comes out `unknown`
+      // /non-retryable instead of `network`/retryable (Lumen, second review of
+      // PR #662). A runner that saw the whole output classified it there.
+      // Runners without that seam carry nothing, and this falls back to
+      // exactly what it did before.
+      errorClassification =
+        !result.success && result.error
+          ? (result.classification ??
+            classifyError({ errorText: result.error, backend: resolvedBackend }))
+          : null;
+      refusedBeforeAcceptance = errorClassification
+        ? isPreAcceptanceRefusal(errorClassification.category)
+        : false;
+      if (refusedBeforeAcceptance) {
+        logger.warn('Backend refused the run before accepting it; not recording an outcome', {
+          sessionId: session.id,
+          backend: resolvedBackend,
+          category: errorClassification!.category,
+          summary: errorClassification!.summary,
+        });
+      }
       // The child has exited; only bookkeeping remains. NOT a clear — the run
       // stays registered until the terminal write lands — but from here a
       // shutdown report must say "finished, unrecorded", never "still running".
       // The intended outcome rides along: a success:false result means the
       // unrecorded terminal state is `failed`, and shutdown must say so
-      // rather than stamping a quiet success (Lumen, PR #563 P1).
-      markRunnerSettled(session.id, result.success ? 'succeeded' : 'failed');
+      // rather than stamping a quiet success (Lumen, PR #563 P1) — unless the
+      // backend refused, in which case there is no terminal state to record on
+      // the owner at all and shutdown must write none.
+      markRunnerSettled(
+        session.id,
+        refusedBeforeAcceptance ? 'refused' : result.success ? 'succeeded' : 'failed'
+      );
     } catch (runnerError) {
       markRunnerSettled(session.id, 'failed');
+      // Not classified for refusal, and that is a bounded claim rather than an
+      // oversight: the only backend whose refusal signature `classifyError`
+      // knows is Codex, and CodexRunner catches its own spawn failure and
+      // RETURNS `success: false` (codex-runner.ts) instead of throwing. So an
+      // `owner_conflict` cannot reach this branch without another backend
+      // emitting Codex's thread-store/thread-resume signature verbatim. If one
+      // ever does, this write has the same defect the result path just fixed.
+      //
       // Runner threw (spawn failure, capacity error, etc.) — mark session as
       // failed, unless shutdown already owns this session's state and would
       // have its interruption record overwritten by this write.
@@ -2041,12 +2127,9 @@ export class SessionService implements ISessionService {
       throw runnerError;
     }
 
-    // 5b. Log backend CLI completion to activity stream (fire-and-forget)
-    const errorClassification =
-      !result.success && result.error
-        ? classifyError({ errorText: result.error, backend: resolvedBackend })
-        : null;
-
+    // 5b. Log backend CLI completion to activity stream (fire-and-forget).
+    // `errorClassification` was computed above, before the settled outcome was
+    // recorded; it is read here only for the payload.
     this.activityStream
       .logActivity({
         userId,
@@ -2113,16 +2196,49 @@ export class SessionService implements ISessionService {
     // Shutdown owns the state from here (Lumen, PR #490 round 3).
     // One payload for both the inline attempt and any background retry, so a
     // retry writes the identical terminal state the first attempt meant to.
-    const finalizeUpdates = {
-      ...(result.backendSessionId !== session.backendSessionId
-        ? { backendSessionId: result.backendSessionId }
-        : {}),
-      messageCount: session.messageCount + 1,
-      backend: resolvedBackend,
-      ...(servedModel ? { model: servedModel } : {}),
-      lifecycle: postRunLifecycle as Session['lifecycle'],
-      cliAttached: false,
-    };
+    //
+    // A run the backend refused before accepting writes NO outcome field
+    // (2026-09-21, spec:live-agent-surfaces). It processed no message, so
+    // `messageCount` does not move; it observed no exit of the owner's
+    // process, so `cliAttached` is left exactly as it was read — clearing it
+    // is what told the dispatcher a live owner had gone away; and it learned
+    // nothing about `lifecycle`, so it leaves that column alone too.
+    //
+    // `lifecycle` is omitted rather than restored from the snapshot this turn
+    // read, which is the opposite of what the first version of this fix did.
+    // A snapshot replay is a WRITE of a value that may already be stale: the
+    // owner can move itself `running` → `failed` while the refused runner is
+    // in flight, that transition does not rotate the row's epoch, so the
+    // replay passes the fence and resurrects `running` over a newer, truer
+    // value (Lumen's review of PR #660 P1 — his probe reproduces exactly
+    // that). Omitting cannot lose an update; replaying can.
+    //
+    // What omitting costs, stated plainly: the takeover at the top of this
+    // method already stamped `running` before the runner spawned, so the row
+    // keeps OUR `running` rather than whatever it said before. That is the
+    // pre-spawn takeover write — along with the `turnEpoch` it stole and the
+    // `updated_at` it bumped — and it is separate debt with its own fix, not
+    // a licence for a second stale write here.
+    //
+    // This also does not treat the refusal as proof the owner is alive: a held
+    // thread-store lock is not a heartbeat, and no registration is refreshed
+    // and no lease extended from it.
+    //
+    // `backend` is all that survives on the refusal path, which keeps the
+    // update non-empty so it still goes through the epoch fence rather than
+    // becoming a no-op.
+    const finalizeUpdates = refusedBeforeAcceptance
+      ? { backend: resolvedBackend }
+      : {
+          ...(result.backendSessionId !== session.backendSessionId
+            ? { backendSessionId: result.backendSessionId }
+            : {}),
+          backend: resolvedBackend,
+          ...(servedModel ? { model: servedModel } : {}),
+          messageCount: session.messageCount + 1,
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        };
     const performFinalizeWrite = () => writeTerminalFenced(finalizeUpdates);
 
     // Run-boundary steps. Invoked ONLY after the terminal write durably
@@ -2139,6 +2255,20 @@ export class SessionService implements ISessionService {
       // epoch: if a newer turn registered over us while our late write landed
       // (it can only land while the row was still ours), its entry survives.
       clearActiveRunIfOwner(session.id, turnEpoch);
+      // The registry entry above is ours and always goes. The boundary effects
+      // below are not: they exist because "the server run IS the turn", and a
+      // run the backend refused before accepting was never a turn. Their
+      // ownership gate is the row's turnEpoch, which this turn DOES hold — so
+      // it does not stop them, and releaseGraphClaimsForSession would return
+      // the live owner's claims to the pool on the strength of a refusal that
+      // told us nothing about the owner. Same rule as the finalize payload:
+      // a run that observed nothing writes nothing.
+      if (refusedBeforeAcceptance) {
+        logger.warn('Skipping boundary effects; the backend refused this run before accepting it', {
+          sessionId: session.id,
+        });
+        return;
+      }
       // A QUEUED next turn is invisible to every DB-side fence: it acquires
       // and renews the lease BEFORE the processing lock, while the row epoch
       // is still ours (Lumen rounds 7–8 — a heartbeat cutoff rejected our own
@@ -2215,8 +2345,8 @@ export class SessionService implements ISessionService {
       });
     } else {
       if (result.backendSessionId !== session.backendSessionId) {
-        logger.info('Backend session ID linked to PCP session', {
-          pcpSessionId: session.id,
+        logger.info('Backend session ID linked to Inkwell session', {
+          inkSessionId: session.id,
           backendSessionId: result.backendSessionId,
           previousBackendSessionId: session.backendSessionId || null,
           backend: resolvedBackend,
@@ -2374,6 +2504,11 @@ export class SessionService implements ISessionService {
       compactionTriggered: false,
       finalTextResponse: result.finalTextResponse,
       error: result.error,
+      // The verdict this turn was judged by, not a fresh reading of `error`.
+      // The heartbeat outage alert prints a category to a human; deriving it
+      // again from the excerpt is how the alert could name one category while
+      // the server acted on another.
+      ...(errorClassification ? { classification: errorClassification } : {}),
     };
   }
 
@@ -2394,7 +2529,7 @@ export class SessionService implements ISessionService {
     session: { id: string; sbId?: string; contactId?: string }
   ): string | undefined {
     if (!email) {
-      logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
+      logger.warn('Cannot inject Inkwell access token for backend runner: missing user email', {
         userId,
         sbSlug,
       });
@@ -2402,7 +2537,7 @@ export class SessionService implements ISessionService {
     }
 
     if (!process.env.JWT_SECRET) {
-      logger.warn('Cannot inject PCP access token for backend runner: JWT_SECRET missing', {
+      logger.warn('Cannot inject Inkwell access token for backend runner: JWT_SECRET missing', {
         userId,
         sbSlug,
       });
@@ -2575,7 +2710,7 @@ export class SessionService implements ISessionService {
     // and both overflow entry points consult it. Without a threadKey neither
     // gate runs at all, so the values are inert.
     const { writeIntent, studioPolicy } = options?.threadKey
-      ? await this.resolveThreadBehavior(userId, options.threadKey)
+      ? await this.resolveThreadBehavior(userId, identitySbId, options.threadKey)
       : ({ writeIntent: 'write', studioPolicy: 'provision' } as const);
 
     let routing = await this.resolveStudioId(userId, sbSlug, {
@@ -3280,7 +3415,7 @@ export class SessionService implements ISessionService {
           // matches.length === 0 — the common silent fall-through case: studios
           // exist for this agent but none of their patterns match this threadKey.
           // Previously invisible; now log so dispatch-routing failures are
-          // traceable (see thread:pcp-to-ink-rename 2026-04-17 post-mortem).
+          // traceable (see thread:ink-to-ink-rename 2026-04-17 post-mortem).
           logger.warn('[StudioResolve] No studio pattern matched threadKey, falling through', {
             threadKey: options.threadKey,
             sbSlug,
@@ -3950,7 +4085,7 @@ This session will continue with a fresh context after compaction. Your identity,
           context.agent.heartbeat
         ),
         ...(runtimeModel ? { model: runtimeModel } : {}),
-        ...(compactionToken ? { pcpAccessToken: compactionToken } : {}),
+        ...(compactionToken ? { inkAccessToken: compactionToken } : {}),
         repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
       };
 

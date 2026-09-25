@@ -2,15 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import path from 'path';
 
-const mockVerifyPcpAccessToken = vi.fn();
+const mockVerifyInkAccessToken = vi.fn();
 const mockExchangeRefreshToken = vi.fn();
-const mockSignPcpAccessToken = vi.fn();
+const mockSignInkAccessToken = vi.fn();
 const mockCreateRefreshToken = vi.fn();
 
-vi.mock('../auth/pcp-tokens', () => ({
-  verifyPcpAccessToken: (...args: unknown[]) => mockVerifyPcpAccessToken(...args),
+vi.mock('../auth/ink-tokens', () => ({
+  verifyInkAccessToken: (...args: unknown[]) => mockVerifyInkAccessToken(...args),
   exchangeRefreshToken: (...args: unknown[]) => mockExchangeRefreshToken(...args),
-  signPcpAccessToken: (...args: unknown[]) => mockSignPcpAccessToken(...args),
+  signInkAccessToken: (...args: unknown[]) => mockSignInkAccessToken(...args),
   createRefreshToken: (...args: unknown[]) => mockCreateRefreshToken(...args),
 }));
 
@@ -151,9 +151,9 @@ function createAuthenticatedReq(overrides: Record<string, unknown> = {}): Reques
     query: {},
     path: '/test',
     user: { email: 'test@example.com' },
-    pcpUserId: TEST_USER_ID,
-    pcpWorkspaceId: TEST_WORKSPACE_ID,
-    pcpWorkspaceRole: 'member',
+    inkUserId: TEST_USER_ID,
+    inkWorkspaceId: TEST_WORKSPACE_ID,
+    inkWorkspaceRole: 'member',
     header: vi.fn(() => undefined),
     ...overrides,
   } as unknown as Request;
@@ -183,7 +183,7 @@ function createMockRes(): MockResponse {
 describe('POST /sessions/:id/sync-transcript', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockVerifyPcpAccessToken.mockReturnValue({
+    mockVerifyInkAccessToken.mockReturnValue({
       type: 'pcp_admin',
       sub: TEST_USER_ID,
       email: 'test@example.com',
@@ -218,7 +218,7 @@ describe('POST /sessions/:id/sync-transcript', () => {
             id: 'session-1',
             sb_id: 'identity-1',
             agent_id: 'lumen',
-            backend: 'pcp',
+            backend: 'ink',
             backend_session_id: 'backend-1',
             claude_session_id: null,
           },
@@ -285,11 +285,11 @@ describe('POST /sessions/:id/sync-transcript', () => {
     expect(res._json).toMatchObject({
       ok: true,
       sessionId: 'session-1',
-      backend: 'pcp',
+      backend: 'ink',
       backendSessionId: 'backend-1',
       format: 'jsonl',
       sourcePath: transcriptFile,
-      resolvedBy: 'pcp-runtime',
+      resolvedBy: 'ink-runtime',
       lineCount: 2,
     });
 
@@ -299,14 +299,14 @@ describe('POST /sessions/:id/sync-transcript', () => {
     expect(archiveRow).toMatchObject({
       user_id: TEST_USER_ID,
       session_id: 'session-1',
-      backend: 'pcp',
+      backend: 'ink',
       backend_session_id: 'backend-1',
       source_path: transcriptFile,
       line_count: 2,
     });
     expect(archiveRow.payload).toMatchObject({
       version: 1,
-      backend: 'pcp',
+      backend: 'ink',
       backendSessionId: 'backend-1',
       format: 'jsonl',
       sourcePath: transcriptFile,

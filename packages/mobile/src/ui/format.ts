@@ -35,22 +35,6 @@ export function messageTime(iso: string, nowMs: number = Date.now()): string {
   return `${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${time}`;
 }
 
-/**
- * Display name for a message sender. Human replies land with the sender slot
- * 'unknown' and metadata.sentBy = 'user' (see POST /threads/reply); that
- * metadata is the only way to tell a person from a genuinely unattributed
- * sender, so it is checked first.
- */
-export function senderName(
-  senderSlug: string,
-  metadata: Record<string, unknown> | null | undefined
-): { name: string; isUser: boolean } {
-  if (metadata && (metadata as { sentBy?: unknown }).sentBy === 'user') {
-    return { name: 'You', isUser: true };
-  }
-  return { name: senderSlug, isUser: false };
-}
-
 /** "runtime:idle" → "idle"; "active:implementing" → "implementing". */
 export function shortPhase(phase: string | null | undefined): string | null {
   if (!phase) return null;

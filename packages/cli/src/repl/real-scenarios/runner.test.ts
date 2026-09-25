@@ -57,11 +57,11 @@ describe('runner: simple convention-recall', () => {
 
   it('captures errors from recall without throwing', async () => {
     const recall: RecallFn = async () => {
-      throw new Error('PCP unavailable');
+      throw new Error('Inkwell unavailable');
     };
     const r = await runScenario(mergeScenario, recall);
     expect(r.passed).toBe(false);
-    expect(r.failureReasons[0]).toMatch(/PCP unavailable/);
+    expect(r.failureReasons[0]).toMatch(/Inkwell unavailable/);
   });
 });
 

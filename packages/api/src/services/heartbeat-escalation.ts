@@ -92,7 +92,7 @@ import type {
 import type { ChannelResponse, ChannelType } from './sessions/types.js';
 import type { HeartbeatNotificationStore, NoticeKey } from './heartbeat-notification-store.js';
 import { createHeartbeatNotificationStore } from './heartbeat-notification-store.js';
-import { classifyError } from '@inklabs/shared';
+import { classifyError, failureExcerpt, DISPLAY_EXCERPT } from '@inklabs/shared';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -270,7 +270,35 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     context: HeartbeatEscalationContext
   ): Promise<{ alerted: boolean }> => {
     const failedSlug = await resolveFailedSlug(reminder);
-    const classification = classifyError({ errorText: error });
+
+    // The producer's verdict when it reached one, our own reading of the text
+    // otherwise.
+    //
+    // Classifying ahead of the display trim below is necessary and is not
+    // sufficient, and round one of PR #662 answered only the first half. What
+    // arrives here is already an excerpt: a runner bounded it for a log field
+    // several layers up, and no budget chosen there is one a classifier should
+    // inherit — measured, `Error: fetch failed` above a long enough stack
+    // falls into the elided middle and arrives as text with nothing in it to
+    // match (Lumen, second review). Classifying ahead of OUR trim cannot
+    // recover what someone else's trim removed; only a verdict formed before
+    // any trim can, and that is what `context.classification` carries.
+    //
+    // Every backend still reaches this seam, and most of them do not classify.
+    // For those the fallback is exactly the behaviour that shipped.
+    const classification = context.classification ?? classifyError({ errorText: error });
+
+    // What a person actually reads. Every backend funnels here, and they
+    // compose their failure text differently — ink now sends a sanitised
+    // tail, but Claude and Gemini still reject with their whole raw stderr
+    // — so the sanitising is repeated at this seam rather than trusted to
+    // each runner. An alert is the last place a terminal escape sequence
+    // should survive: nothing downstream renders one, and on 2026-09-22 a
+    // screenful of them went to Conor's phone under a heading telling him
+    // his monitor had stopped. This is the seam where the DISPLAY budget is
+    // applied — the last one before a phone — and nothing reads its output
+    // but a person.
+    const readableError = failureExcerpt(error, DISPLAY_EXCERPT) || '(no diagnostic output)';
 
     // DESTINATION ONE: the durable copy. Kept even though it cannot be the only
     // destination — it is what survives a restart and what the dashboard reads.
@@ -296,7 +324,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
             `Your scheduled heartbeat "${reminder.title}" did not run.\n\n` +
             `Consecutive failures: ${consecutive}\n` +
             `Category: ${classification.category} (retryable: ${classification.retryable})\n` +
-            `Error: ${error}\n\n` +
+            `Error: ${readableError}\n\n` +
             `Whatever this beat monitors has NOT been checked since it started failing. ` +
             `If a human depends on it, tell them — a monitor that fails quietly is worse ` +
             `than no monitor, because they believe they are covered.`,
@@ -331,7 +359,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
         alertSent: false,
         alertSkipped: reachable.reason,
         ...(inboxError ? { inboxError } : {}),
-        error: error.slice(0, 500),
+        error: readableError,
       });
       return { alerted: false };
     }
@@ -371,7 +399,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     const alert = await alertOwnerDirectly(
       reminder,
       `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
-        `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${error}\n\n` +
+        `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
         `Whatever this beat monitors is NOT being checked. ` +
         `I will send one more message when it runs again.`
     );
@@ -388,7 +416,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       alertSent: alert.sent,
       ...(alert.reason ? { alertSkipped: alert.reason } : {}),
       ...(inboxError ? { inboxError } : {}),
-      error: error.slice(0, 500),
+      error: readableError,
     });
 
     return { alerted: alert.sent };

@@ -31,6 +31,8 @@ const FOREIGN = '33333333-3333-4333-8333-333333333333';
 const STUDIO = '44444444-4444-4444-8444-444444444444';
 const SB = '55555555-5555-4555-8555-555555555555';
 const ORIGINAL = '66666666-6666-4666-8666-666666666666';
+// The same-slug twin identity of the round-3 probe below; stampOf skips it.
+const TWIN_ID = '77777777-7777-4777-8777-777777777777';
 const roots: string[] = [];
 
 /** Lumen's signed credential, running in Lumen's own session. */
@@ -102,25 +104,28 @@ function setup() {
       { id: SB, user_id: USER, agent_id: 'lumen', workspace_id: 'ws' },
       { id: 'other-sb', user_id: USER, agent_id: 'wren', workspace_id: 'ws' },
     ],
+    workspace_members: [{ workspace_id: 'ws', user_id: USER, role: 'member' }],
     inbox_threads: [
       {
         id: 'thread',
-        user_id: USER,
+        workspace_id: 'ws',
         thread_key: 'pr:probe',
         key_type: 'pr',
         status: 'open',
-        created_by_agent_id: 'wren',
+        created_by_kind: 'sb',
+        created_by_sb_id: 'other-sb',
       },
     ],
     // wren already has a home on this thread; lumen is on it with no home yet.
+    // Participant rows are keyed by identity (spec inkmail-thread-scope §3).
     inbox_thread_participants: [
-      { thread_id: 'thread', agent_id: 'wren', session_id: FOREIGN },
-      { thread_id: 'thread', agent_id: 'lumen', session_id: null },
+      { thread_id: 'thread', workspace_id: 'ws', sb_id: 'other-sb', session_id: FOREIGN },
+      { thread_id: 'thread', workspace_id: 'ws', sb_id: SB, session_id: null },
     ],
     thread_key_types: [
       {
         id: 'pr-type',
-        user_id: null,
+        workspace_id: null,
         type: 'pr',
         write_intent: 'write',
         studio_policy: 'provision',
@@ -176,8 +181,10 @@ function setup() {
       activityStream: { logActivity },
     },
   };
+  const sbOf = (sbSlug: string) =>
+    tables.agent_identities.find((r) => r.agent_id === sbSlug && r.id !== TWIN_ID)?.id;
   const stampOf = (sbSlug: string) =>
-    tables.inbox_thread_participants.find((r) => r.agent_id === sbSlug)?.session_id;
+    tables.inbox_thread_participants.find((r) => r.sb_id === sbOf(sbSlug))?.session_id;
   return { repoRoot, dc, create, update, linkSession, logActivity, tables, stampOf, supabase };
 }
 
@@ -262,7 +269,7 @@ describe("the acting identity is the credential's, not the typed sbSlug (Lumen, 
  * is mocked.
  */
 describe('the canonical identity the credential carries is the one written (Lumen, PR #605 r3)', () => {
-  const TWIN = '77777777-7777-4777-8777-777777777777';
+  const TWIN = TWIN_ID;
 
   function withRealStudios(f: ReturnType<typeof setup>) {
     const older = f.tables.agent_identities.find((r) => r.id === SB);

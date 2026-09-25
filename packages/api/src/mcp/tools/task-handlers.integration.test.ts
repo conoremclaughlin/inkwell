@@ -28,7 +28,7 @@ if (existsSync(envLocalPath)) {
   }
 }
 
-if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9997';
+if (!process.env.INK_PORT_BASE) process.env.INK_PORT_BASE = '9997';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;

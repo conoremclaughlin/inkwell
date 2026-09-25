@@ -149,10 +149,10 @@ Agent: {sbSlug}
 **Output (conditional):**
 
 ```
-<pcp-reminder>
+<ink-reminder>
 You have completed ~{count} tool calls this session. Consider using
 `mcp__inkwell__remember` to save a progress snapshot.
-</pcp-reminder>
+</ink-reminder>
 
 <inkmail count="{count}">
 - **{from}**: {content or subject}

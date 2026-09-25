@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
-import { verifyPcpAccessToken } from '../auth/pcp-tokens';
+import { verifyInkAccessToken } from '../auth/ink-tokens';
 
 const mockVerifyAccessToken = vi.fn();
 
@@ -65,8 +65,8 @@ vi.mock('../mini-apps', () => ({
   getMiniAppsInfo: vi.fn(() => []),
 }));
 
-vi.mock('./auth/pcp-auth-provider', () => {
-  class MockPcpAuthProvider {
+vi.mock('./auth/ink-auth-provider', () => {
+  class MockInkAuthProvider {
     verifyAccessToken = mockVerifyAccessToken;
     createPendingAuth = vi.fn(() => 'pending-id');
     handleAuthCallback = vi.fn(async () => ({ error: 'invalid_request' }));
@@ -74,7 +74,7 @@ vi.mock('./auth/pcp-auth-provider', () => {
     exchangeRefreshToken = vi.fn(async () => ({ error: 'invalid_grant' }));
     cleanupExpiredDatabaseTokens = vi.fn();
   }
-  return { PcpAuthProvider: MockPcpAuthProvider };
+  return { InkAuthProvider: MockInkAuthProvider };
 });
 
 vi.mock('../routes/admin', () => {
@@ -180,7 +180,7 @@ function parseSSEResult(body: string): unknown {
   return JSON.parse(match[1]);
 }
 
-/** Encode a PCP context token as a base64url header value. */
+/** Encode a Inkwell context token as a base64url header value. */
 function encodeContextHeader(token: {
   sessionId: string;
   studioId: string;
@@ -544,7 +544,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(body.expires_in).toBe(3600);
 
     const token = body.access_token as string;
-    const payload = verifyPcpAccessToken(token, 'mcp_access');
+    const payload = verifyInkAccessToken(token, 'mcp_access');
     expect(payload?.sub).toBe('user-123');
     expect(payload?.sbSlug).toBe('wren');
     expect(payload?.identityId).toBe('identity-abc');

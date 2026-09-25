@@ -28,7 +28,7 @@ import { handleClientLocalTool, isClientLocalTool } from './context-tools.js';
 
 // ─── Config ─────────────────────────────────────────────────────
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const SEND_TELEGRAM = process.env.SEND_TELEGRAM === 'true';
 // A real chat id is personal data and never belongs in a tracked file: it is
 // supplied by the environment, and Phase 5 skips when it is absent.
@@ -37,26 +37,26 @@ const AGENT_ID = 'myra';
 
 let serverAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
 }
 
-// ─── PcpClient ──────────────────────────────────────────────────
+// ─── InkClient ──────────────────────────────────────────────────
 
-async function createPcpClient() {
-  const { PcpClient } = await import('../lib/pcp-client.js');
+async function createInkClient() {
+  const { InkClient } = await import('../lib/ink-client.js');
   const authPath = join(process.env.HOME || '', '.ink', 'auth.json');
-  return new PcpClient(PCP_URL, authPath);
+  return new InkClient(INK_URL, authPath);
 }
 
 // ─── Phase 1: Bootstrap ─────────────────────────────────────────
 
 describe('Myra simulation: Phase 1 — Bootstrap', () => {
   it.skipIf(!serverAvailable)('bootstraps as Myra with identity and memories', async () => {
-    const pcp = await createPcpClient();
-    const result = await pcp.callTool('bootstrap', { sbSlug: AGENT_ID });
+    const inkClient = await createInkClient();
+    const result = await inkClient.callTool('bootstrap', { sbSlug: AGENT_ID });
     const parsed = result as Record<string, unknown>;
 
     console.log('\n=== Phase 1: Bootstrap as Myra ===');
@@ -91,8 +91,8 @@ describe('Myra simulation: Phase 1 — Bootstrap', () => {
 
 describe('Myra simulation: Phase 2 — Inbox', () => {
   it.skipIf(!serverAvailable)('retrieves inbox messages', async () => {
-    const pcp = await createPcpClient();
-    const result = await pcp.callTool('get_inbox', { sbSlug: AGENT_ID });
+    const inkClient = await createInkClient();
+    const result = await inkClient.callTool('get_inbox', { sbSlug: AGENT_ID });
     const parsed = result as Record<string, unknown>;
 
     console.log('=== Phase 2: Inbox Check ===');
@@ -118,14 +118,14 @@ describe('Myra simulation: Phase 2 — Inbox', () => {
 
 describe('Myra simulation: Phase 3 — Passive Recall', () => {
   it.skipIf(!serverAvailable)('recalls relevant memories for Myra heartbeat topics', async () => {
-    const pcp = await createPcpClient();
+    const inkClient = await createInkClient();
     const ledger = new ContextLedger();
     const registry = new SbHookRegistry();
 
     console.log('=== Phase 3: Passive Recall ===');
 
     const callRecall = async (query: string, limit: number) => {
-      const result = await pcp.callTool('recall', {
+      const result = await inkClient.callTool('recall', {
         query,
         sbSlug: AGENT_ID,
         includeShared: true,
@@ -183,7 +183,7 @@ describe('Myra simulation: Phase 3 — Passive Recall', () => {
 
 describe('Myra simulation: Phase 4 — Context Management', () => {
   it.skipIf(!serverAvailable)('full eviction cycle: fill → warn → evict → verify', async () => {
-    const pcp = await createPcpClient();
+    const inkClient = await createInkClient();
     const ledger = new ContextLedger();
     const registry = new SbHookRegistry();
     const MAX_CONTEXT = 8000; // simulate smaller context for testing
@@ -191,7 +191,7 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
     console.log('=== Phase 4: Context Management ===');
 
     const callRecall = async (query: string, limit: number) => {
-      const result = await pcp.callTool('recall', {
+      const result = await inkClient.callTool('recall', {
         query,
         sbSlug: AGENT_ID,
         includeShared: true,
@@ -312,13 +312,13 @@ describe('Myra simulation: Phase 5 — Telegram Response', () => {
   it.skipIf(!serverAvailable || !SEND_TELEGRAM || !SEND_TELEGRAM_CHAT_ID)(
     'sends a real Telegram message to the configured chat',
     async () => {
-      const pcp = await createPcpClient();
+      const inkClient = await createInkClient();
 
       console.log('=== Phase 5: Telegram Response ===');
 
       // conversationId lookup is still a gap (a user→platform→conversationId
       // mapping would let agents message users without a supplied chat id).
-      const result = await pcp.callTool('send_response', {
+      const result = await inkClient.callTool('send_response', {
         channel: 'telegram',
         conversationId: SEND_TELEGRAM_CHAT_ID,
         content:
@@ -345,12 +345,12 @@ describe('Myra simulation: Phase 5 — Telegram Response', () => {
 
 describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
   it.skipIf(!serverAvailable)('bootstrap → inbox → recall → process → evict → done', async () => {
-    const pcp = await createPcpClient();
+    const inkClient = await createInkClient();
 
     console.log('=== Phase 6: Full Heartbeat Cycle ===');
 
     // 1. Bootstrap
-    const bootstrap = await pcp.callTool('bootstrap', { sbSlug: AGENT_ID });
+    const bootstrap = await inkClient.callTool('bootstrap', { sbSlug: AGENT_ID });
     const bootstrapParsed = bootstrap as Record<string, unknown>;
     expect(bootstrapParsed.user || bootstrapParsed.constitution).toBeTruthy();
     console.log('  1. Bootstrap: OK');
@@ -360,7 +360,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     const registry = new SbHookRegistry();
 
     const callRecall = async (query: string, limit: number) => {
-      const result = await pcp.callTool('recall', {
+      const result = await inkClient.callTool('recall', {
         query,
         sbSlug: AGENT_ID,
         includeShared: true,
@@ -391,7 +391,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     console.log('  2. Context initialized');
 
     // 4. Check inbox
-    const inbox = await pcp.callTool('get_inbox', { sbSlug: AGENT_ID });
+    const inbox = await inkClient.callTool('get_inbox', { sbSlug: AGENT_ID });
     const inboxParsed = inbox as Record<string, unknown>;
     const messages = (inboxParsed.messages as Array<Record<string, unknown>>) || [];
     console.log(`  3. Inbox: ${messages.length} messages`);
@@ -454,17 +454,17 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
  */
 describe('Myra simulation: Phase 7 — Tool Discovery', () => {
   async function discover(args: Record<string, unknown>) {
-    const pcp = await createPcpClient();
+    const inkClient = await createInkClient();
     const { createLocalToolDispatcher } = await import('./tool-dispatch.js');
     const { callPiTool } = await import('./pi-tools.js');
     const dispatch = createLocalToolDispatcher({
       cwd: process.cwd(),
       callPi: callPiTool,
-      callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+      callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
       resolveCredentials: (a) => a,
       audience: 'parent',
     });
-    // No unwrapping: PcpClient.callTool already parsed the MCP envelope, and
+    // No unwrapping: InkClient.callTool already parsed the MCP envelope, and
     // the merge returns the same shape. Reaching for `.content[0].text` here is
     // what proved the first cut of this fix was inert in production.
     return (await dispatch('describe_tool', args, {})) as any;

@@ -227,22 +227,21 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
         }
 
         if (fn === 'reopen_inbox_thread') {
-          // Mirrors migration 20260913083000: the guarded flip and the audit
-          // event happen together or not at all (JS is single-threaded, as
-          // the function is one transaction in Postgres). false = the row
-          // was not closed; nothing written.
-          const kind = args.p_actor_kind;
-          const agent = args.p_actor_agent_id as string | null | undefined;
-          if (kind !== 'sb' && kind !== 'user') {
+          // Mirrors migration 20260913090000 (post-cutover): the actor is a
+          // principal — exactly one of p_actor_sb_id / p_actor_user_id — the
+          // guarded flip and the audit event happen together or not at all
+          // (JS is single-threaded, as the function is one transaction in
+          // Postgres), and the event says system by kind. false = the row was
+          // not closed; nothing written.
+          const sbId = (args.p_actor_sb_id as string | null | undefined) ?? null;
+          const userId = (args.p_actor_user_id as string | null | undefined) ?? null;
+          if ((sbId === null) === (userId === null)) {
             return {
               data: null,
-              error: { message: `reopen_inbox_thread: actor kind must be sb or user, got ${kind}` },
-            };
-          }
-          if (kind === 'sb' && !agent) {
-            return {
-              data: null,
-              error: { message: 'reopen_inbox_thread: an sb actor needs an agent id' },
+              error: {
+                message:
+                  'reopen_inbox_thread: exactly one of p_actor_sb_id, p_actor_user_id must be set',
+              },
             };
           }
           const thread = (tables['inbox_threads'] ?? []).find(
@@ -252,29 +251,36 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
           Object.assign(thread, {
             status: 'open',
             closed_at: null,
-            closed_by_agent_id: null,
+            closed_by_kind: null,
+            closed_by_sb_id: null,
+            closed_by_user_id: null,
             updated_at: new Date().toISOString(),
           });
+          const label = sbId
+            ? (((tables['agent_identities'] ?? []).find((r) => r.id === sbId)?.agent_id as
+                | string
+                | undefined) ?? sbId)
+            : null;
           const messages =
             tables['inbox_thread_messages'] ?? (tables['inbox_thread_messages'] = []);
           messages.push({
             thread_id: args.p_thread_id,
-            sender_agent_id: 'system',
-            content:
-              kind === 'sb'
-                ? `Thread reopened by ${agent}`
-                : 'Thread reopened by the workspace owner',
+            sender_kind: 'system',
+            sender_sb_id: null,
+            sender_user_id: null,
+            sender_agent_id: null,
+            content: sbId ? `Thread reopened by ${label}` : 'Thread reopened by a workspace member',
             message_type: 'system',
-            metadata:
-              kind === 'sb'
-                ? { type: 'thread_reopened', reopenedBy: agent }
-                : { type: 'thread_reopened', reopenedBy: 'user', channel: 'admin-api' },
+            metadata: sbId
+              ? { type: 'thread_reopened', reopenedBySbId: sbId }
+              : { type: 'thread_reopened', reopenedByUserId: userId },
           });
           return { data: true, error: null };
         }
 
         if (fn === 'update_inbox_thread_metadata') {
-          // Mirrors migration 20260916020035: the title/summary write and the
+          // Mirrors migration 20260916020035 as redefined by 20260924071839 for
+          // the post-cutover message columns: the title/summary write and the
           // timeline event happen together or not at all. The real atomicity —
           // a rejected audit rolling the edit back — is pinned against Postgres
           // in thread-metadata.integration.test.ts; this mirror exists so the
@@ -338,7 +344,13 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
             tables['inbox_thread_messages'] ?? (tables['inbox_thread_messages'] = []);
           metaMessages.push({
             thread_id: args.p_thread_id,
-            sender_agent_id: 'system',
+            // Post-cutover principal columns (20260924071839): the system
+            // borrows nobody's identity — kind says system, both ids null,
+            // no slug.
+            sender_kind: 'system',
+            sender_sb_id: null,
+            sender_user_id: null,
+            sender_agent_id: null,
             content: `Thread ${fields.join(' and ')} updated by ${slug}`,
             message_type: 'system',
             metadata: {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { durationLabel, relativeTime, senderName, shortPhase, toolCallLabel } from './format';
+import { durationLabel, relativeTime, shortPhase, toolCallLabel } from './format';
 
 const NOW = Date.parse('2026-08-31T20:00:00Z');
 
@@ -16,20 +16,6 @@ describe('relativeTime', () => {
 
   it('returns empty for garbage instead of NaN artifacts', () => {
     expect(relativeTime('not-a-date', NOW)).toBe('');
-  });
-});
-
-describe('senderName', () => {
-  it('recognizes a human reply by metadata, not by the sender slot', () => {
-    // The server stores human replies with sender 'unknown' — the metadata
-    // flag is the ONLY distinguishing fact. If this stops passing, every
-    // reply the user sends renders as "unknown" in their own thread.
-    expect(senderName('unknown', { sentBy: 'user' })).toEqual({ name: 'You', isUser: true });
-  });
-
-  it('leaves agent senders alone', () => {
-    expect(senderName('wren', null)).toEqual({ name: 'wren', isUser: false });
-    expect(senderName('unknown', {})).toEqual({ name: 'unknown', isUser: false });
   });
 });
 

@@ -155,7 +155,7 @@ sb "fix the bug" → Identity injection (--append-system-prompt)
 InkRunner → ink chat --non-interactive --approval-mode auto-approve
   → ink CLI spawns Claude Code with --allowedTools '' (tools OFF)
   → LLM generates text with ```ink-tool blocks
-  → ink CLI extracts + executes via PCP server HTTP
+  → ink CLI extracts + executes via Inkwell server HTTP
   → Results injected as context → next LLM turn
   → No filesystem access, Inkwell tools only
 ````
@@ -262,7 +262,7 @@ InkRunner spawns: ink chat --non-interactive --approval-mode auto-approve
         ```ink-tool
         {"tool":"recall","args":{"query":"..."}}
         ```
-     └─ ink CLI extracts blocks, executes via PCP server HTTP
+     └─ ink CLI extracts blocks, executes via Inkwell server HTTP
      └─ Results fed back as context for next LLM turn
      └─ Loop repeats (max 5 iterations) until no tool blocks emitted
 ````
@@ -286,7 +286,7 @@ The ink CLI enforces a tool policy system (`ToolPolicyState`) that controls whic
 | `collaborative` | backend    | Everything allowed. No prompts, no restrictions.                         |
 | `full`          | privileged | All tools allowed, policy bypassed entirely.                             |
 
-**Policy decision flow** (`canCallPcpTool`):
+**Policy decision flow** (`canCallInkTool`):
 
 1. Deny list → blocked (not promptable)
 2. Privileged mode → allowed
@@ -296,7 +296,7 @@ The ink CLI enforces a tool policy system (`ToolPolicyState`) that controls whic
 6. Allow-list narrowing → if allowTools is non-empty and tool isn't in it, blocked+promptable
 7. Default → allowed
 
-**Key design property:** `safeTools` (DEFAULT_SAFE_PCP_TOOLS) do NOT create narrowing. Only explicit `allowTools` entries create a whitelist filter. This means profiles like `safe` that have empty `allowSpecs` allow all MCP tools by default — only `promptSpecs` gates specific tools.
+**Key design property:** `safeTools` (DEFAULT_SAFE_INK_TOOLS) do NOT create narrowing. Only explicit `allowTools` entries create a whitelist filter. This means profiles like `safe` that have empty `allowSpecs` allow all MCP tools by default — only `promptSpecs` gates specific tools.
 
 **Tool groups** define logical sets expanded at policy application time:
 
@@ -324,7 +324,7 @@ The ink CLI has a multi-tier approval system for tool calls:
 When `--away` is set, tool calls requiring approval trigger a server-side 2FA flow:
 
 ```
-Agent calls tool → canCallPcpTool returns promptable
+Agent calls tool → canCallInkTool returns promptable
   → CLI creates approval_requests DB record via POST /api/admin/approval-requests
     → Server calls notifyPlatformOfApprovalRequest()
       → Looks up user's trusted_users (Telegram, WhatsApp)

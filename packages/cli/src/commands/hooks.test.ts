@@ -13,7 +13,7 @@ import {
   handleFailedTakeover,
   getBackendByName,
   installHooks,
-  callPcpTool,
+  callInkTool,
   buildIdentityBlock,
   buildMemoriesBlock,
   serverAlreadyInjectedContext,
@@ -115,7 +115,7 @@ describe('installHooks: Claude Code', () => {
     expect(config.hooks).toBeDefined();
   });
 
-  it('should return already-installed when PCP hooks match exactly', () => {
+  it('should return already-installed when Inkwell hooks match exactly', () => {
     // First install
     const first = installHooks(TEST_DIR);
     expect(first.result).toBe('installed');
@@ -125,7 +125,7 @@ describe('installHooks: Claude Code', () => {
     expect(second.result).toBe('already-installed');
   });
 
-  it('should return conflict when non-PCP hooks exist', () => {
+  it('should return conflict when non-Inkwell hooks exist', () => {
     const configDir = join(TEST_DIR, '.claude');
     mkdirSync(configDir, { recursive: true });
     writeFileSync(
@@ -165,26 +165,26 @@ describe('installHooks: Claude Code', () => {
     expect(result).toBe('installed');
 
     const config = JSON.parse(readFileSync(join(configDir, 'settings.local.json'), 'utf-8'));
-    // Should now have PCP hooks, not the custom one
+    // Should now have Inkwell hooks, not the custom one
     expect(config.hooks.Stop[0].hooks[0].command).toContain('hooks on-stop');
   });
 
-  it('should allow re-install over existing PCP hooks without force', () => {
-    // Install PCP hooks
+  it('should allow re-install over existing Inkwell hooks without force', () => {
+    // Install Inkwell hooks
     installHooks(TEST_DIR);
 
     // Manually tweak the hooks slightly (simulate a version mismatch)
     const configPath = join(TEST_DIR, '.claude', 'settings.local.json');
     const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    // Add a new PCP-style hook entry
+    // Add a new Inkwell-style hook entry
     config.hooks.Stop.push({
       hooks: [{ type: 'command', command: 'ink hooks extra' }],
     });
     writeFileSync(configPath, JSON.stringify(config, null, 2));
 
-    // Re-install should work (only PCP hooks present, so no conflict)
+    // Re-install should work (only Inkwell hooks present, so no conflict)
     const { result } = installHooks(TEST_DIR);
-    // It won't match exactly, but all hooks are PCP, so it overwrites
+    // It won't match exactly, but all hooks are Inkwell, so it overwrites
     expect(result).toBe('installed');
   });
 });
@@ -239,7 +239,7 @@ describe('installHooks: Gemini', () => {
     expect(result).toBe('already-installed');
   });
 
-  it('should return conflict when non-PCP hooks exist', () => {
+  it('should return conflict when non-Inkwell hooks exist', () => {
     const configDir = join(TEST_DIR, '.gemini');
     mkdirSync(configDir, { recursive: true });
     writeFileSync(
@@ -280,7 +280,7 @@ describe('installHooks: Codex', () => {
     expect(content).toContain('# ink-managed:hooks:end');
   });
 
-  it('should return already-installed when PCP hooks are already present', () => {
+  it('should return already-installed when Inkwell hooks are already present', () => {
     installHooks(TEST_DIR, { backend: 'codex' });
     const { result } = installHooks(TEST_DIR, { backend: 'codex' });
     expect(result).toBe('already-installed');
@@ -308,7 +308,7 @@ describe('installHooks: Codex', () => {
     expect(content).toContain('# ink-managed:hooks:start');
   });
 
-  it('should return conflict when non-PCP [hooks] exists', () => {
+  it('should return conflict when non-Inkwell [hooks] exists', () => {
     const configDir = join(TEST_DIR, '.codex');
     mkdirSync(configDir, { recursive: true });
     writeFileSync(join(configDir, 'config.toml'), '[hooks]\nsession_start = "other-tool start"\n');
@@ -332,7 +332,7 @@ describe('installHooks: Codex', () => {
     expect(content).toContain('# ink-managed:hooks:start');
   });
 
-  it('should replace PCP section on re-install with force', () => {
+  it('should replace Inkwell section on re-install with force', () => {
     installHooks(TEST_DIR, { backend: 'codex' });
 
     // Force re-install
@@ -392,7 +392,7 @@ describe('installHooks: detection priority', () => {
 });
 
 // ============================================================================
-// callPcpTool auth header regression
+// callInkTool auth header regression
 // ============================================================================
 
 vi.mock('../auth/tokens.js', () => ({
@@ -439,10 +439,10 @@ const TOOL_RESULT_PAYLOAD = {
 };
 
 // ============================================================================
-// callPcpTool: auth header
+// callInkTool: auth header
 // ============================================================================
 
-describe('callPcpTool: auth header', () => {
+describe('callInkTool: auth header', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -462,7 +462,7 @@ describe('callPcpTool: auth header', () => {
   it('should send Authorization header when CLI token is available', async () => {
     mockedGetValidAccessToken.mockResolvedValue('test-jwt-token');
 
-    await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    await callInkTool('bootstrap', { sbSlug: 'wren' });
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [, options] = fetchSpy.mock.calls[0];
@@ -473,7 +473,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidDelegatedAccessToken.mockReturnValue('delegated-jwt-token');
     mockedGetValidAccessToken.mockResolvedValue('fallback-token');
 
-    await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    await callInkTool('bootstrap', { sbSlug: 'wren' });
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [, options] = fetchSpy.mock.calls[0];
@@ -485,7 +485,7 @@ describe('callPcpTool: auth header', () => {
   it('should omit Authorization header when no token is available', async () => {
     mockedGetValidAccessToken.mockResolvedValue(null);
 
-    await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    await callInkTool('bootstrap', { sbSlug: 'wren' });
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [, options] = fetchSpy.mock.calls[0];
@@ -495,7 +495,7 @@ describe('callPcpTool: auth header', () => {
   it('should send correct JSON-RPC payload', async () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
 
-    await callPcpTool('get_inbox', { sbSlug: 'wren', status: 'unread' });
+    await callInkTool('get_inbox', { sbSlug: 'wren', status: 'unread' });
 
     const [url, options] = fetchSpy.mock.calls[0];
     expect(url).toContain('/mcp');
@@ -505,7 +505,7 @@ describe('callPcpTool: auth header', () => {
     expect(body.params.arguments).toEqual({ sbSlug: 'wren', status: 'unread' });
   });
 
-  // ── INK_SESSION_ID propagation through callPcpTool ──
+  // ── INK_SESSION_ID propagation through callInkTool ──
   // This is the most fragile link: hooks must forward INK_SESSION_ID as
   // x-ink-session-id header so the MCP server can resolve studio scope.
 
@@ -513,7 +513,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
     process.env.INK_SESSION_ID = 'session-xyz-789';
 
-    await callPcpTool('get_session', { sessionId: 'session-xyz-789' });
+    await callInkTool('get_session', { sessionId: 'session-xyz-789' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).toHaveProperty('x-ink-session-id', 'session-xyz-789');
@@ -525,7 +525,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
     delete process.env.INK_SESSION_ID;
 
-    await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    await callInkTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).not.toHaveProperty('x-ink-session-id');
@@ -535,7 +535,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
     process.env.INK_SESSION_ID = '  session-with-spaces  ';
 
-    await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    await callInkTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).toHaveProperty('x-ink-session-id', 'session-with-spaces');
@@ -547,7 +547,7 @@ describe('callPcpTool: auth header', () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
     process.env.INK_SESSION_ID = '   ';
 
-    await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    await callInkTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).not.toHaveProperty('x-ink-session-id');
@@ -558,7 +558,7 @@ describe('callPcpTool: auth header', () => {
   it('should send spec-compliant Accept header (both JSON and SSE)', async () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
 
-    await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    await callInkTool('bootstrap', { sbSlug: 'wren' });
 
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers.Accept).toBe('application/json, text/event-stream');
@@ -566,10 +566,10 @@ describe('callPcpTool: auth header', () => {
 });
 
 // ============================================================================
-// callPcpTool: Streamable HTTP response format handling
+// callInkTool: Streamable HTTP response format handling
 // ============================================================================
 
-describe('callPcpTool: Streamable HTTP response formats', () => {
+describe('callInkTool: Streamable HTTP response formats', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -589,7 +589,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     fetchSpy = vi.fn().mockResolvedValue(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
   });
 
@@ -597,7 +597,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     fetchSpy = vi.fn().mockResolvedValue(mockSseResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
   });
 
@@ -617,7 +617,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ final: true });
   });
 
@@ -629,7 +629,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
+    await expect(callInkTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell SSE response contained no data lines'
     );
   });
@@ -643,7 +643,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
+    await expect(callInkTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell call failed (406)'
     );
   });
@@ -658,7 +658,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
+    await expect(callInkTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell tool error (-32001): Authentication required'
     );
   });
@@ -673,7 +673,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
+    await expect(callInkTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell tool error (-32602): Invalid params'
     );
   });
@@ -691,7 +691,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('start_session', { sbSlug: 'wren' })).rejects.toThrow(
+    await expect(callInkTool('start_session', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell tool error: start_session unavailable'
     );
   });
@@ -705,7 +705,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
   });
 
@@ -719,7 +719,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ text: 'plain text result' });
   });
 
@@ -742,7 +742,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
 
@@ -776,7 +776,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
 
@@ -809,7 +809,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
 
-    const result = await callPcpTool('bootstrap', { sbSlug: 'wren' });
+    const result = await callInkTool('bootstrap', { sbSlug: 'wren' });
     expect(result).toEqual({ success: true });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
@@ -824,7 +824,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    await expect(callPcpTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
+    await expect(callInkTool('bootstrap', { sbSlug: 'wren' })).rejects.toThrow(
       'Inkwell call failed (401)'
     );
     expect(fetchSpy).toHaveBeenCalledTimes(1);

@@ -10,7 +10,7 @@
  * 4. Both gates together: final task on periodic boundary → final_review wins
  * 5. Activity stream has the correct event trail
  *
- * Run: PCP_PORT_BASE=9998 npx vitest run packages/api/src/services/strategy-approval-gate.integration.test.ts
+ * Run: INK_PORT_BASE=9998 npx vitest run packages/api/src/services/strategy-approval-gate.integration.test.ts
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
@@ -33,7 +33,7 @@ if (existsSync(envLocalPath)) {
   }
 }
 
-if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9998';
+if (!process.env.INK_PORT_BASE) process.env.INK_PORT_BASE = '9998';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;

@@ -3,7 +3,7 @@
  *
  * Lighter authentication than adminAuthMiddleware:
  * - Validates Supabase JWT via supabase.auth.getUser()
- * - Looks up PCP user by email
+ * - Looks up Inkwell user by email
  * - Attaches req.userId and req.userEmail
  * - Does NOT check trusted_users table (any authenticated user can chat)
  */
@@ -44,21 +44,21 @@ export async function chatAuthMiddleware(
       return;
     }
 
-    // Look up the PCP user by email
-    const { data: pcpUser } = await supabase
+    // Look up the Inkwell user by email
+    const { data: inkUser } = await supabase
       .from('users')
       .select('id')
       .eq('email', user.email)
       .single();
 
-    if (!pcpUser) {
-      res.status(403).json({ error: 'User not found in PCP system' });
+    if (!inkUser) {
+      res.status(403).json({ error: 'User not found in Inkwell system' });
       return;
     }
 
     // Attach user info to request
     const chatReq = req as ChatAuthRequest;
-    chatReq.userId = pcpUser.id;
+    chatReq.userId = inkUser.id;
     chatReq.userEmail = user.email || '';
 
     next();

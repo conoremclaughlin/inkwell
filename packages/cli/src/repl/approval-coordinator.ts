@@ -79,7 +79,7 @@ export interface ApprovalOutcome {
  * while a ticket waited, a sibling's "session" or "always" answer may have
  * settled the same tool, and prompting again would ask the user a question they
  * already answered. The check MUST be non-consuming — see
- * `ToolPolicyState.inspectPcpTool`.
+ * `ToolPolicyState.inspectInkTool`.
  */
 export type ApprovalRecheck = 'allow' | 'deny' | 'prompt';
 

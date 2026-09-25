@@ -18,21 +18,21 @@ describe('deriveClonePolicy', () => {
   it('grants the read-oriented baseline', () => {
     const { policy } = deriveClonePolicy(parentPolicy());
     for (const tool of ['read', 'grep', 'find', 'ls', 'recall', 'get_artifact']) {
-      expect(policy.canCallPcpTool(tool).allowed).toBe(true);
+      expect(policy.canCallInkTool(tool).allowed).toBe(true);
     }
   });
 
   it('refuses the tools a clone must never have, outright', () => {
     const { policy } = deriveClonePolicy(parentPolicy());
     for (const tool of ['remember', 'send_to_inbox', 'bash', 'write', 'spawn_agent']) {
-      const decision = policy.canCallPcpTool(tool);
+      const decision = policy.canCallInkTool(tool);
       expect({ tool, ...decision }).toMatchObject({ tool, allowed: false, promptable: false });
     }
   });
 
   it('escalates an unknown tool rather than silently allowing or hard-denying it', () => {
     const { policy } = deriveClonePolicy(parentPolicy());
-    const decision = policy.canCallPcpTool('save_link');
+    const decision = policy.canCallInkTool('save_link');
     expect(decision.allowed).toBe(false);
     // Promptable — it goes to the parent's coordinator labelled with the clone.
     expect(decision.promptable).toBe(true);
@@ -44,9 +44,9 @@ describe('deriveClonePolicy', () => {
 
     const { policy, narrowedByParent } = deriveClonePolicy(parent);
     expect(narrowedByParent).toContain('grep');
-    expect(policy.canCallPcpTool('grep').allowed).toBe(false);
+    expect(policy.canCallInkTool('grep').allowed).toBe(false);
     // Siblings in the baseline are unaffected.
-    expect(policy.canCallPcpTool('read').allowed).toBe(true);
+    expect(policy.canCallInkTool('read').allowed).toBe(true);
   });
 
   it('does not inherit a baseline tool the parent only holds via a one-use grant', () => {
@@ -56,12 +56,12 @@ describe('deriveClonePolicy', () => {
 
     const { policy, excludedGrantBackedTools } = deriveClonePolicy(parent);
     expect(excludedGrantBackedTools).toContain('read');
-    expect(policy.canCallPcpTool('read').allowed).toBe(false);
+    expect(policy.canCallInkTool('read').allowed).toBe(false);
 
     // And the parent's grant is still intact — deriving an envelope must not
     // spend it.
     expect(parent.listGrants()).toEqual([{ tool: 'read', uses: 1 }]);
-    expect(parent.canCallPcpTool('read').allowed).toBe(true);
+    expect(parent.canCallInkTool('read').allowed).toBe(true);
   });
 
   it('never produces a privileged clone from a privileged parent', () => {
@@ -71,8 +71,8 @@ describe('deriveClonePolicy', () => {
     expect(policy.getMode()).toBe('backend');
     // Privileged mode short-circuits the deny list; clamping is what keeps the
     // envelope meaningful.
-    expect(policy.canCallPcpTool('bash').allowed).toBe(false);
-    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
+    expect(policy.canCallInkTool('bash').allowed).toBe(false);
+    expect(policy.canCallInkTool('send_to_inbox').allowed).toBe(false);
   });
 
   it('stays off when the parent is off', () => {
@@ -88,8 +88,8 @@ describe('deriveClonePolicy', () => {
 
     // Clone A's user answering "always" for a tool must not widen clone B.
     a.allowTool('save_link');
-    expect(a.canCallPcpTool('save_link').allowed).toBe(true);
-    expect(b.canCallPcpTool('save_link').allowed).toBe(false);
+    expect(a.canCallInkTool('save_link').allowed).toBe(true);
+    expect(b.canCallInkTool('save_link').allowed).toBe(false);
 
     // And neither one touches the parent.
     expect(parent.listAllowTools()).not.toContain('save_link');
@@ -122,8 +122,8 @@ describe('deriveClonePolicy', () => {
     parent.denyTool('list_emails');
 
     const { policy } = deriveClonePolicy(parent);
-    expect(policy.canCallPcpTool('list_emails').allowed).toBe(false);
-    expect(policy.canCallPcpTool('list_emails').promptable).toBe(false);
+    expect(policy.canCallInkTool('list_emails').allowed).toBe(false);
+    expect(policy.canCallInkTool('list_emails').promptable).toBe(false);
   });
 
   it('inherits the parent read-path allowlist and grants no write paths', () => {
@@ -143,14 +143,14 @@ describe('deriveClonePolicy', () => {
     const { policy } = deriveClonePolicy(parent, {
       additionalTools: ['save_link', 'list_reminders'],
     });
-    expect(policy.canCallPcpTool('save_link').allowed).toBe(true);
-    expect(policy.canCallPcpTool('list_reminders').allowed).toBe(false);
+    expect(policy.canCallInkTool('save_link').allowed).toBe(true);
+    expect(policy.canCallInkTool('list_reminders').allowed).toBe(false);
   });
 
   it('refuses to widen the envelope through additionalTools', () => {
     const { policy } = deriveClonePolicy(parentPolicy(), { additionalTools: ['bash', 'remember'] });
-    expect(policy.canCallPcpTool('bash').allowed).toBe(false);
-    expect(policy.canCallPcpTool('remember').allowed).toBe(false);
+    expect(policy.canCallInkTool('bash').allowed).toBe(false);
+    expect(policy.canCallInkTool('remember').allowed).toBe(false);
   });
 
   it('recomputes backend gating from the clone envelope, not the parent', () => {
@@ -178,20 +178,20 @@ describe('deriveClonePolicy', () => {
 
     const { policy, narrowedByParent } = deriveClonePolicy(parent);
     expect(narrowedByParent).toContain('read');
-    expect(policy.canCallPcpTool('read').allowed).toBe(false);
+    expect(policy.canCallInkTool('read').allowed).toBe(false);
   });
 
   it('leaves the default safe read-only tools reachable', () => {
-    // DEFAULT_SAFE_PCP_TOOLS bypass allowlist narrowing by design. Every member
+    // DEFAULT_SAFE_INK_TOOLS bypass allowlist narrowing by design. Every member
     // is read-only, so the clone envelope tolerates the union — but a parent
     // denial still wins.
     const parent = parentPolicy();
     const { policy } = deriveClonePolicy(parent);
-    expect(policy.canCallPcpTool('get_inbox').allowed).toBe(true);
+    expect(policy.canCallInkTool('get_inbox').allowed).toBe(true);
 
     parent.denyTool('get_inbox');
     const { policy: narrowed } = deriveClonePolicy(parent);
-    expect(narrowed.canCallPcpTool('get_inbox').allowed).toBe(false);
+    expect(narrowed.canCallInkTool('get_inbox').allowed).toBe(false);
   });
 });
 

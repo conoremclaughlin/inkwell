@@ -29,6 +29,9 @@ import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
 import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
+import { createAlertsRouter } from '../routes/alerts';
+import { AlertDispatchService } from '../services/alerts/alert-dispatch.service';
+import { startStalenessSweep } from '../services/alerts/alert-sweep';
 import {
   ChannelGateway,
   createChannelGateway,
@@ -38,8 +41,9 @@ import {
 import { runWithRequestContext, tokenIdentityContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
-import { PcpAuthProvider } from './auth/pcp-auth-provider';
-import { signPcpAccessToken } from '../auth/pcp-tokens';
+import { getHeartbeatTickHealth } from '../services/heartbeat';
+import { InkAuthProvider } from './auth/ink-auth-provider';
+import { signInkAccessToken } from '../auth/ink-tokens';
 
 export { setWhatsAppListener, getAgentGateway };
 
@@ -73,12 +77,14 @@ export class MCPServer {
   private toolsVersion = 0;
   private channelGateway: ChannelGateway | null = null;
   private config: MCPServerConfig;
-  private authProvider: PcpAuthProvider;
+  private authProvider: InkAuthProvider;
+  /** Staleness sweep ticker; cleared on shutdown so tests and restarts exit. */
+  private alertSweepTimer: NodeJS.Timeout | null = null;
 
   constructor(dataComposer: DataComposer, config: MCPServerConfig = {}) {
     this.dataComposer = dataComposer;
     this.config = config;
-    this.authProvider = new PcpAuthProvider();
+    this.authProvider = new InkAuthProvider();
 
     // Load mini-apps once (shared across all sessions)
     this.miniApps = loadMiniApps();
@@ -445,7 +451,7 @@ export class MCPServer {
 
       // Parse x-ink-context early so we can use it for auth fallback.
       const contextHeader = req.header('x-ink-context')?.trim();
-      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
+      let contextToken: import('@inklabs/shared').InkContextToken | null = null;
       if (contextHeader) {
         const { decodeContextToken } = await import('@inklabs/shared');
         contextToken = decodeContextToken(contextHeader);
@@ -480,7 +486,7 @@ export class MCPServer {
 
       if (shouldChallenge) {
         const challengeParts = [
-          'Bearer realm="pcp"',
+          'Bearer realm="inkwell"',
           'scope="mcp:tools"',
           `authorization_uri="${baseUrl}/authorize"`,
           `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
@@ -695,6 +701,25 @@ export class MCPServer {
         },
       };
 
+      /**
+       * Scheduler liveness, reported from outside the scheduler.
+       *
+       * A heartbeat that stops ticking cannot report itself — the failure IS
+       * the inability to run code on time, so any check scheduled by the thing
+       * under test goes quiet with it. What survives is the timestamp of the
+       * last tick, read by whoever asks. Stale `lastTickAt` with a healthy
+       * process is the signature of a suspended host, and it is invisible in
+       * `uptime` and `startedAt`, both of which count straight through a sleep.
+       *
+       * Advisory only: it never moves the 200/503, which stays the database's
+       * call. A laptop closed overnight is not an unhealthy server.
+       */
+      const tickHealth = getHeartbeatTickHealth();
+      checks.heartbeat = {
+        status: 'ok',
+        details: tickHealth,
+      };
+
       const dbOk = checks.database?.status === 'ok';
       const overallStatus = dbOk ? 'healthy' : 'unhealthy';
 
@@ -717,11 +742,11 @@ export class MCPServer {
     app.post('/register', express.json(), (req, res) => {
       logger.info('MCP /register called', { body: req.body });
 
-      const clientId = req.body.client_id || `pcp-client-${Date.now()}`;
+      const clientId = req.body.client_id || `ink-client-${Date.now()}`;
 
       res.json({
         client_id: clientId,
-        client_secret: 'pcp-local-secret',
+        client_secret: 'ink-local-secret',
         redirect_uris: req.body.redirect_uris || ['http://localhost:3001/callback'],
         token_endpoint_auth_method: 'client_secret_post',
         grant_types: ['authorization_code', 'refresh_token'],
@@ -909,7 +934,7 @@ export class MCPServer {
         return;
       }
 
-      const accessToken = signPcpAccessToken(
+      const accessToken = signInkAccessToken(
         {
           type: 'mcp_access',
           sub: userData.userId,
@@ -1036,6 +1061,13 @@ export class MCPServer {
     app.use('/api/sessions', sessionsRouter);
     logger.info('Session event routes registered at /api/sessions');
 
+    // Alert webhook routes. Registered synchronously and unconditionally —
+    // an alarm path that silently fails to mount is worse than no alarm path,
+    // because the absence is invisible until the outage it was meant to catch.
+    const alertsRouter = createAlertsRouter(this.dataComposer);
+    app.use('/api/alerts', alertsRouter);
+    logger.info('Alert webhook routes registered at /api/alerts');
+
     // Kindle routes (registered below after import)
     import('../routes/kindle.js')
       .then(({ createKindleRouter }) => {
@@ -1106,12 +1138,33 @@ export class MCPServer {
       logger.info(`Graph reconciliation sweep enabled (every ${Math.round(sweepMs / 1000)}s)`);
     }
 
+    this.startAlertStalenessSweep();
+
     // Initialize channel gateway if message handler is configured
     if (this.config.messageHandler) {
       await this.startChannelGateway();
     } else {
       logger.info('ChannelGateway not started (no messageHandler configured)');
     }
+  }
+
+  /**
+   * Schedule the alert staleness sweep.
+   *
+   * Without this the whole liveness half of the alerting schema is inert:
+   * check-ins are stored and GET /sources can *report* a stale verdict when
+   * something asks, but no dead checker ever raises an incident on its own.
+   * A monitor you have to remember to look at is not a monitor (PR #539,
+   * Lumen — sweepStaleSources was written and never scheduled).
+   *
+   * The interval and non-overlap semantics live in alert-sweep.ts so they can
+   * be tested; this is only the wiring.
+   */
+  private startAlertStalenessSweep(): void {
+    this.alertSweepTimer = startStalenessSweep(
+      new AlertDispatchService(this.dataComposer),
+      env.ALERT_STALENESS_SWEEP_SECONDS
+    );
   }
 
   /**
@@ -1198,6 +1251,11 @@ export class MCPServer {
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down MCP server...');
+
+    if (this.alertSweepTimer) {
+      clearInterval(this.alertSweepTimer);
+      this.alertSweepTimer = null;
+    }
 
     // Stop channel gateway first
     if (this.channelGateway) {

@@ -34,13 +34,13 @@ import type { LoginResponse, RefreshResponse, SignupResponse } from './types';
  * Port the Inkwell API listens on, for the tiers that supply only a host.
  *
  * app.config.js reads INK_PORT_BASE — falling back to the legacy
- * PCP_PORT_BASE, matching the server's own resolution in
+ * INK_PORT_BASE, matching the server's own resolution in
  * packages/api/src/config/env.ts — on the machine that started Metro, and
  * publishes it here. So an isolated server (4001, 4801, …) is reached without
  * anyone editing a constant or typing a URL on a phone keyboard. The literal
  * is only the floor for a config that predates the field.
  */
-const PCP_API_PORT = Number(Constants.expoConfig?.extra?.apiPort) || 3001;
+const INK_API_PORT = Number(Constants.expoConfig?.extra?.apiPort) || 3001;
 
 // Which of these Expo populates depends on the runtime, so try them all rather
 // than trusting one and silently landing on loopback.
@@ -59,7 +59,7 @@ const resolved: ResolvedApiUrl = resolveApiUrl({
   lanHost: Constants.expoConfig?.extra?.lanHost as string | null | undefined,
   productionApiUrl: Constants.expoConfig?.extra?.productionApiUrl as string | undefined,
   isDev: __DEV__,
-  port: PCP_API_PORT,
+  port: INK_API_PORT,
 });
 
 export const AUTO_API_BASE_URL = resolved.url;
@@ -126,14 +126,31 @@ async function tryRefresh(): Promise<boolean> {
 }
 
 /**
+ * A request that belongs to one workspace, whichever one is selected by the
+ * time it is sent. Null is the server's default. A query whose cache key
+ * names a workspace binds its requests to it: a poll that fires between a
+ * switch and the next render would otherwise store the new workspace's
+ * page under the old workspace's key (the web dashboard did exactly that,
+ * Lumen, #679).
+ */
+export interface WorkspaceBinding {
+  workspaceId: string | null;
+}
+
+/**
  * Authenticated JSON request. On 401, refreshes once and retries; a second
  * 401 signs the user out — the refresh token is dead and every subsequent
  * call would fail the same way.
  */
-export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+export async function apiFetch<T>(
+  path: string,
+  init?: RequestInit,
+  binding?: WorkspaceBinding
+): Promise<T> {
+  const workspaceFor = (): string | null => (binding ? binding.workspaceId : getWorkspaceId());
   const attempt = async (): Promise<Response> => {
     const { accessToken } = getAuthState();
-    const workspaceId = getWorkspaceId();
+    const workspaceId = workspaceFor();
     return fetch(`${apiBaseUrl()}${path}`, {
       ...init,
       headers: {
@@ -164,14 +181,21 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   // revoked, workspace archived, different account signed in) would otherwise
   // wedge every screen. The middleware answers 403/404 "Workspace not found…"
   // for exactly that; fall back to the default workspace and retry once.
-  if ((res.status === 403 || res.status === 404) && getWorkspaceId()) {
+  //
+  // A bound request is different: it belongs to the workspace that has gone.
+  // Retrying against the default would cache the default's data under that
+  // workspace's key, so it clears the selection only while that workspace is
+  // still the selected one, and fails; the screens re-scope from there.
+  const requested = workspaceFor();
+  if ((res.status === 403 || res.status === 404) && requested) {
     const err = await parseError(res);
-    if (/workspace not found/i.test(err.message)) {
-      await setWorkspaceId(null);
-      res = await attempt();
-    } else {
+    if (!/workspace not found/i.test(err.message)) throw err;
+    if (binding) {
+      if (getWorkspaceId() === requested) await setWorkspaceId(null);
       throw err;
     }
+    await setWorkspaceId(null);
+    res = await attempt();
   }
   if (!res.ok) throw await parseError(res);
   return (await res.json()) as T;
@@ -202,7 +226,7 @@ export async function signup(email: string, password: string): Promise<SignupRes
   return body;
 }
 
-/** Does a PCP server answer at this base URL? Bounded so a dead LAN address fails fast. */
+/** Does a Inkwell server answer at this base URL? Bounded so a dead LAN address fails fast. */
 export async function probeServer(url: string, timeoutMs = 2500): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

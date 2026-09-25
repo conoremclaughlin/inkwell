@@ -8,7 +8,7 @@ describe('runtime session linkage', () => {
   let cwd: string;
 
   beforeEach(() => {
-    cwd = mkdtempSync(join(tmpdir(), 'pcp-runtime-'));
+    cwd = mkdtempSync(join(tmpdir(), 'ink-runtime-'));
   });
 
   afterEach(() => {
@@ -17,21 +17,21 @@ describe('runtime session linkage', () => {
 
   it('preserves runtimeLinkId and accumulates backend session ids', () => {
     upsertRuntimeSession(cwd, {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'codex',
       sbSlug: 'lumen',
       runtimeLinkId: 'link-1',
     });
 
     upsertRuntimeSession(cwd, {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'codex',
       sbSlug: 'lumen',
       backendSessionId: 'backend-a',
     });
 
     upsertRuntimeSession(cwd, {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'codex',
       sbSlug: 'lumen',
       backendSessionId: 'backend-b',
@@ -46,13 +46,13 @@ describe('runtime session linkage', () => {
 
   it('de-duplicates backend session ids when the same id is seen multiple times', () => {
     upsertRuntimeSession(cwd, {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'claude',
       sbSlug: 'lumen',
       backendSessionId: 'sess-1',
     });
     upsertRuntimeSession(cwd, {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'claude',
       sbSlug: 'lumen',
       backendSessionId: 'sess-1',
@@ -66,14 +66,14 @@ describe('runtime session linkage', () => {
 
   it('finds sessions by runtimeLinkId with optional filters', () => {
     upsertRuntimeSession(cwd, {
-      pcpSessionId: 'pcp-1',
+      inkSessionId: 'ink-1',
       backend: 'codex',
       sbSlug: 'lumen',
       studioId: 'studio-a',
       runtimeLinkId: 'link-shared',
     });
     upsertRuntimeSession(cwd, {
-      pcpSessionId: 'pcp-2',
+      inkSessionId: 'ink-2',
       backend: 'gemini',
       sbSlug: 'aster',
       studioId: 'studio-b',
@@ -85,12 +85,12 @@ describe('runtime session linkage', () => {
       sbSlug: 'lumen',
       studioId: 'studio-a',
     });
-    expect(codex?.pcpSessionId).toBe('pcp-1');
+    expect(codex?.inkSessionId).toBe('ink-1');
 
     const gemini = findRuntimeSessionByLinkId(cwd, 'link-shared', {
       backend: 'gemini',
       sbSlug: 'aster',
     });
-    expect(gemini?.pcpSessionId).toBe('pcp-2');
+    expect(gemini?.inkSessionId).toBe('ink-2');
   });
 });

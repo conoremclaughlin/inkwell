@@ -27,6 +27,8 @@ export type RootStackParamList = {
    * read-only — replying into nowhere is how typos become threads.
    */
   Thread: { threadKey: string; title?: string; recipients?: string[]; studioSlug?: string };
+  /** Everything about a thread besides the conversation: title, summary, people, work. */
+  ThreadDetails: { threadKey: string };
   Session: { sessionId: string; title?: string };
   NewThread: undefined;
   Settings: undefined;

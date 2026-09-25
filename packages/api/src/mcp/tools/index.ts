@@ -60,6 +60,12 @@ import {
   releaseClaimSchema,
   recordGateVerdictSchema,
   retryGateSchema,
+  handleRevokeGate,
+  handleSupersedeGate,
+  handleLiftWithdrawal,
+  revokeGateSchema,
+  supersedeGateSchema,
+  liftWithdrawalSchema,
 } from './task-graph-handlers';
 
 import {
@@ -1211,6 +1217,57 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     }
   );
 
+  server.registerTool(
+    'revoke_gate',
+    {
+      description: `Withdraw a PASSED verification gate's authority (spec workflow-graph-revocation). Before any publication consumed the pass: the same candidate is decided again on a fresh attempt and every descendant carries an authority-withdrawn hold — no dispatch, no group completion — until this gate passes the same binding again or an owner lifts the withdrawal. After consumption: the attempt FAILS with reason revoked-after-publication; nothing is undone. Authority: the verdict actor, the assignee, a recorded author, or the owner/an admin. Attempt + gateVersion CAS; reason required.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: revokeGateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRevokeGate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('revoke_gate')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'supersede_gate',
+    {
+      description: `Change what a verification gate decides (spec workflow-graph-revocation §Supersession): a new binding and author set replace the current request under a CAS on attempt, gateVersion and requestRevision (read them via get_task_graph). The old attempt is invalidated — a reviewer's claim is released with reason superseded and their late verdict bounces; from PASSED the old binding is revoked first and its holds placed. Refused already-published once a publication consumed the gate: a new candidate is then a new request.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: supersedeGateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleSupersedeGate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('supersede_gate')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'lift_withdrawal',
+    {
+      description: `Resolve a gate's withdrawal or failed verdict without a new pass (spec workflow-graph-revocation §Eligibility): an owner or admin names the revoked/failed event and a reason; the holds that withdrawal placed are released, and no others. An SB session is refused — this is the human's attributed act.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: liftWithdrawalSchema,
+    },
+    async (args) => {
+      try {
+        return await handleLiftWithdrawal(args, dataComposer);
+      } catch (error) {
+        return graphToolError('lift_withdrawal')(error);
+      }
+    }
+  );
+
   // Register get_task_stats tool
   server.registerTool(
     'get_task_stats',
@@ -1863,7 +1920,7 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
 Use topicKey to categorize memories with structured topic keys following type:identifier convention. This builds the knowledge map loaded at bootstrap.
 
 Common types: project, decision, convention, person, reflection, lesson, beauty, growth, value, family, domain
-Examples: "project:pcp/memory", "decision:jwt-auth", "person:conor", "reflection:session-existence", "lesson:cross-agent-review"
+Examples: "project:inkwell/memory", "decision:jwt-auth", "person:conor", "reflection:session-existence", "lesson:cross-agent-review"
 
 Use summary to provide a one-liner when the full content is long/detailed. The summary is what appears in the bootstrap knowledge summary.
 
@@ -2132,7 +2189,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .guid()
             .optional()
             .describe(
-              'Optional PCP session UUID to use when creating a new session (typically with forceNew=true).'
+              'Optional Inkwell session UUID to use when creating a new session (typically with forceNew=true).'
             ),
           studioId: z
             .string()
@@ -6031,7 +6088,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'add_workspace_member',
     {
       description: `Invite/add a collaborator to a workspace by email.
-Creates a placeholder PCP user if needed, then grants workspace membership.
+Creates a placeholder Inkwell user if needed, then grants workspace membership.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: addWorkspaceMemberSchema,
@@ -6172,7 +6229,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'close_studio',
     {
-      description: `Close a git worktree studio and optionally clean worktree/branch.`,
+      description: `Close a git worktree studio and optionally clean worktree/branch. The session that holds the studio's lease closes it immediately (uncommitted work is rescue-stashed first; the directory you may be standing in is removed, so cd out first). A studio held by ANOTHER live session is deferred: its lease is marked for release at that holder's turn boundary and the call reports it.`,
       inputSchema: studioToolDefinitions[4].schema,
     },
     async (args: Record<string, unknown>) => {

@@ -80,27 +80,27 @@ type: guide
 
 describe('buildMergedMcpConfig', () => {
   let tmpDir: string;
-  let savedPcpSessionId: string | undefined;
-  let savedPcpStudioId: string | undefined;
+  let savedInkSessionId: string | undefined;
+  let savedInkStudioId: string | undefined;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'merged-mcp-'));
     // Isolate INK_SESSION_ID and INK_STUDIO_ID — some tests depend on them being absent
-    savedPcpSessionId = process.env.INK_SESSION_ID;
-    savedPcpStudioId = process.env.INK_STUDIO_ID;
+    savedInkSessionId = process.env.INK_SESSION_ID;
+    savedInkStudioId = process.env.INK_STUDIO_ID;
     delete process.env.INK_SESSION_ID;
     delete process.env.INK_STUDIO_ID;
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
-    if (savedPcpSessionId !== undefined) {
-      process.env.INK_SESSION_ID = savedPcpSessionId;
+    if (savedInkSessionId !== undefined) {
+      process.env.INK_SESSION_ID = savedInkSessionId;
     } else {
       delete process.env.INK_SESSION_ID;
     }
-    if (savedPcpStudioId !== undefined) {
-      process.env.INK_STUDIO_ID = savedPcpStudioId;
+    if (savedInkStudioId !== undefined) {
+      process.env.INK_STUDIO_ID = savedInkStudioId;
     } else {
       delete process.env.INK_STUDIO_ID;
     }
@@ -187,12 +187,12 @@ mcp:
   });
 
   it('does not override existing MCP servers', () => {
-    const skillDir = join(tmpDir, '.ink', 'skills', 'pcp-override');
+    const skillDir = join(tmpDir, '.ink', 'skills', 'ink-override');
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(
       join(skillDir, 'SKILL.md'),
       `---
-name: pcp-override
+name: ink-override
 description: Should not override
 mcp:
   name: inkwell
@@ -225,7 +225,7 @@ mcp:
     }
   });
 
-  // ─── PCP Session Header Injection ───
+  // ─── Inkwell Session Header Injection ───
 
   it('injects x-ink-session-id header when INK_SESSION_ID is set', () => {
     process.env.INK_SESSION_ID = 'abc-123-def';
@@ -329,7 +329,7 @@ mcp:
   });
 
   it('injects header via explicit options even without env var', () => {
-    // Simulates the CLI passing pcpSessionId directly (before setting spawn env)
+    // Simulates the CLI passing inkSessionId directly (before setting spawn env)
     delete process.env.INK_SESSION_ID;
     writeFileSync(
       join(tmpDir, '.mcp.json'),
@@ -341,7 +341,7 @@ mcp:
     );
 
     const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
-      pcpSessionId: 'explicit-session-id',
+      inkSessionId: 'explicit-session-id',
       studioId: 'explicit-studio-id',
     });
     try {
@@ -354,7 +354,7 @@ mcp:
     }
   });
 
-  it('does not inject header when no PCP server entry exists', () => {
+  it('does not inject header when no Inkwell server entry exists', () => {
     process.env.INK_SESSION_ID = 'abc-123';
     writeFileSync(
       join(tmpDir, '.mcp.json'),
@@ -367,7 +367,7 @@ mcp:
 
     const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
     try {
-      // No PCP server to inject into — return original
+      // No Inkwell server to inject into — return original
       expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
     } finally {
       cleanup();

@@ -333,7 +333,7 @@ export class AntigravityRunner implements IRunner {
     }
 
     try {
-      const bridgePath = config.pcpAccessToken ? await this.ensureGlobalMcpConfig() : undefined;
+      const bridgePath = config.inkAccessToken ? await this.ensureGlobalMcpConfig() : undefined;
 
       // The --add-dir grant requires the directory to exist; async so the
       // event loop is never blocked.
@@ -345,7 +345,7 @@ export class AntigravityRunner implements IRunner {
         backendSessionId: backendSessionId || '(new)',
         workingDirectory: config.workingDirectory,
         messageLength: fullMessage.length,
-        hasPcpAccessToken: !!config.pcpAccessToken,
+        hasInkAccessToken: !!config.inkAccessToken,
         identityInPrompt: !isResume && !!(config.appendSystemPrompt || config.systemPrompt),
       });
 
@@ -529,9 +529,9 @@ export class AntigravityRunner implements IRunner {
         ...(bridgePath ? { INK_BRIDGE_PATH: bridgePath } : {}),
         // These are what the stdio bridge reads to build its HTTP headers.
         ...buildSessionEnv({
-          pcpSessionId: config.pcpSessionId,
+          inkSessionId: config.inkSessionId,
           studioId: config.studioId,
-          accessToken: config.pcpAccessToken,
+          accessToken: config.inkAccessToken,
           sbSlug: config.sbSlug,
           runtime: 'antigravity',
           repoRoot: config.repoRoot,

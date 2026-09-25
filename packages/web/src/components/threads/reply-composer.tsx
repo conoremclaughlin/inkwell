@@ -1,9 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { Send } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { useApiPost, useQueryClient } from '@/lib/api';
+import { Composer } from '@/components/conversation/composer';
 
 export interface ReplyResponse {
   success: boolean;
@@ -11,20 +10,7 @@ export interface ReplyResponse {
   threadId: string;
 }
 
-/**
- * Display name for a message sender. A person's reply carries
- * `{ sentBy: 'user' }` in its metadata while its sender slot says 'unknown'
- * (see POST /threads/reply). Until the principal columns of spec
- * inkmail-thread-scope §3 land, this marker is how the page tells a person
- * from a genuinely unattributed sender.
- */
-export function senderLabel(m: {
-  senderSlug: string;
-  metadata?: Record<string, unknown> | null;
-}): string {
-  const sentBy = m.metadata ? (m.metadata as { sentBy?: unknown }).sentBy : undefined;
-  return sentBy === 'user' ? 'You' : m.senderSlug;
-}
+export { senderLabel } from '@inklabs/shared/stories/thread-viewing';
 
 /**
  * A person's way into a thread from the dashboard. Posts through the same
@@ -42,11 +28,30 @@ export function senderLabel(m: {
  * (Lumen, PR #613: without the key, selecting thread B kept thread A's
  * draft in the box.)
  */
-export function ReplyComposer({ threadKey, closed }: { threadKey: string; closed: boolean }) {
-  return <ThreadReplyComposer key={threadKey} threadKey={threadKey} closed={closed} />;
+export function ReplyComposer({
+  threadKey,
+  closed,
+  onSent,
+}: {
+  threadKey: string;
+  closed: boolean;
+  /** The reply landed. Called for the thread it was sent to. */
+  onSent?: (reply: ReplyResponse) => void;
+}) {
+  return (
+    <ThreadReplyComposer key={threadKey} threadKey={threadKey} closed={closed} onSent={onSent} />
+  );
 }
 
-function ThreadReplyComposer({ threadKey, closed }: { threadKey: string; closed: boolean }) {
+function ThreadReplyComposer({
+  threadKey,
+  closed,
+  onSent,
+}: {
+  threadKey: string;
+  closed: boolean;
+  onSent?: (reply: ReplyResponse) => void;
+}) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState('');
   const reply = useApiPost<ReplyResponse, { key: string; content: string }>(
@@ -55,55 +60,37 @@ function ThreadReplyComposer({ threadKey, closed }: { threadKey: string; closed:
       // Hook-level callbacks belong to the mutation, not the observer, so
       // they still run if the person has already moved to another thread
       // by the time the reply lands.
-      onSuccess: () => {
+      onSuccess: (result) => {
         setDraft('');
         // Both the conversation and the spine list changed: a new message,
         // and a new last-activity time on the key.
         void queryClient.invalidateQueries({ queryKey: ['thread-messages', threadKey] });
         void queryClient.invalidateQueries({ queryKey: ['thread-spines'] });
+        onSent?.(result);
       },
     }
   );
 
   const content = draft.trim();
-  const canSend = content.length > 0 && !reply.isPending;
   const send = () => {
-    if (!canSend) return;
+    if (!content || reply.isPending) return;
     reply.mutate({ key: threadKey, content });
   };
 
   return (
-    <div className="flex flex-col gap-2">
-      {closed && (
-        <div className="rounded-md border border-dashed px-3 py-2 text-[11px] text-muted-foreground">
-          This thread is closed. A reply still lands and wakes its participants; it does not reopen
-          the thread. Reopen, next to the status badge, is how you say the work is back on.
-        </div>
-      )}
-      <textarea
-        className="min-h-[72px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-        placeholder={`Reply to ${threadKey}… (⌘↩ to send)`}
-        aria-label={`Reply to ${threadKey}`}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault();
-            send();
-          }
-        }}
-        disabled={reply.isPending}
-      />
-      <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" size="sm" onClick={send} disabled={!canSend}>
-          <Send className="mr-1 h-3 w-3" />
-          {reply.isPending ? 'Sending…' : 'Send'}
-        </Button>
-        <span className="text-[11px] text-muted-foreground">Wakes every participant.</span>
-        {reply.isError && (
-          <span className="text-[11px] text-destructive">{reply.error.message}</span>
-        )}
-      </div>
-    </div>
+    <Composer
+      value={draft}
+      onChange={setDraft}
+      onSubmit={send}
+      sending={reply.isPending}
+      placeholder={`Reply to ${threadKey}…`}
+      ariaLabel={`Reply to ${threadKey}`}
+      error={reply.isError ? reply.error.message : null}
+      notice={
+        closed
+          ? 'This thread is closed. A reply still lands and wakes its participants; it does not reopen the thread — Reopen, in the header, is how you say the work is back on.'
+          : undefined
+      }
+    />
   );
 }

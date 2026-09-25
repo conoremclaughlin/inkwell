@@ -22,7 +22,7 @@
  *   - A missed `prompt` fails toward an UNPROTECTED TURN — the lease
  *     machinery cannot see it. So `open()` retries, then reports `false` —
  *     including when no
- *     PCP session is attached at all — and the caller MUST fail closed for
+ *     Inkwell session is attached at all — and the caller MUST fail closed for
  *     studio-backed work via `turnGateDecision`: no acknowledged marker, no
  *     turn.
  *   - A missed `stop` fails toward HOLDING — the unbounded marker stays open.
@@ -34,7 +34,7 @@
  */
 
 export interface TurnSignalDeps {
-  /** Live ref — the PCP session can attach/rotate after construction. */
+  /** Live ref — the Inkwell session can attach/rotate after construction. */
   getSessionId: () => string | undefined;
   /** Live ref — the worktree studio this REPL runs in, for the lease fence. */
   getStudioId?: () => string | undefined;
@@ -54,7 +54,7 @@ export interface TurnSignal {
   /**
    * Turn is starting. Resolves `true` when protection is established
    * (marker write acknowledged AND the studio lease held); `false` when it
-   * could not be confirmed — including when no PCP session is attached. The
+   * could not be confirmed — including when no Inkwell session is attached. The
    * caller decides via `turnGateDecision` whether the turn may run.
    */
   open(): Promise<boolean>;
@@ -87,7 +87,7 @@ export function turnGateDecision(
     return {
       allow: false,
       reason:
-        'no PCP session is attached, so this worktree’s lease cannot be protected. Restart `ink chat` (or check the server) and resend.',
+        'no Inkwell session is attached, so this worktree’s lease cannot be protected. Restart `ink chat` (or check the server) and resend.',
     };
   }
   if (!opened) {

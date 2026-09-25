@@ -20,6 +20,7 @@ import {
   getRequestContext,
 } from '../../utils/request-context';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import {
   currentWorkAudience,
@@ -359,6 +360,7 @@ const topicsSchema = z
 // Moved to services/memory/knowledge-summary.ts so the ContextBuilder can use
 // the same budgeted renderer. Re-exported here for existing importers.
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
+import { resolveCallerWorkspace } from './caller-principal';
 
 export { buildKnowledgeSummary };
 
@@ -376,7 +378,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Primary structured topic key following type:identifier convention (e.g., "project:pcp/memory", "decision:jwt-auth", "convention:git"). Auto-added to topics array.'
+      'Primary structured topic key following type:identifier convention (e.g., "project:inkwell/memory", "decision:jwt-auth", "convention:git"). Auto-added to topics array.'
     ),
   topicSummary: z
     .string()
@@ -487,7 +489,7 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .guid()
     .optional()
     .describe(
-      'Optional PCP session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
+      'Optional Inkwell session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
     ),
   sbSlug: z
     .string()
@@ -627,7 +629,7 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
   createTask: z
     .boolean()
     .optional()
-    .describe('Create a PCP task for blocked/waiting phases (default: false)'),
+    .describe('Create a Inkwell task for blocked/waiting phases (default: false)'),
   // Session metadata fields (absorbed from update_session_status)
   backendSessionId: z
     .string()
@@ -1794,16 +1796,7 @@ export function shouldStampEndedAt(params: { status?: string; lifecycle?: string
  * these set produces a row that is un-ended and still reads as history
  * everywhere it matters.
  */
-export function isTerminalPhaseMarker(value: string | null | undefined): boolean {
-  const marker = (value || '').trim().toLowerCase();
-  if (!marker) return false;
-  return (
-    marker === 'complete' ||
-    marker.startsWith('complete:') ||
-    marker === 'completed' ||
-    marker.startsWith('completed:')
-  );
-}
+export { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
 
 export function shouldClearEndedAt(params: {
   reopen?: boolean;
@@ -2341,7 +2334,13 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     (params.phase.startsWith('blocked:') || params.phase.startsWith('waiting:'))
   ) {
     try {
-      const projects = await dataComposer.repositories.projects.findAllByUser(user.id, 'active');
+      // The caller's workspace: the bound identity's, else the person's own
+      // (spec inkmail-thread-scope §1b) — a slug is never guessed here.
+      const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+      const projects = await dataComposer.repositories.projects.findAllByWorkspace(
+        workspaceId,
+        'active'
+      );
       if (projects.length > 0) {
         const task = await dataComposer.repositories.tasks.create({
           project_id: projects[0].id,
@@ -2591,7 +2590,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const [projects, focus, activeSessions, dbIdentity, userTimezone, userSkills, siblingIdentities] =
     await Promise.all([
       // Active projects
-      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+      resolveCallerWorkspace(dataComposer.getClient(), user.id).then(({ workspaceId }) =>
+        dataComposer.repositories.projects.findAllByWorkspace(workspaceId, 'active')
+      ),
       // Current focus
       dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
       // All active sessions (filter by sbSlug if provided) — client picks the right one
@@ -2962,7 +2963,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Reflection status - prompt for periodic self-reflection
             reflectionStatus,
 
-            // PCP conventions — messaging best practices, loaded from
+            // Inkwell conventions — messaging best practices, loaded from
             // ~/.ink/shared/CONVENTIONS.md or bundled template fallback
             conventions: conventionsContent || null,
 
@@ -2991,7 +2992,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 /**
  * Compact session logs into memories.
  *
- * This implements the compaction strategy from the PCP spec:
+ * This implements the compaction strategy from the Inkwell spec:
  * 1. Group logs by salience
  * 2. Create summarized memories from high-value logs
  * 3. Optionally clear the original logs

@@ -66,7 +66,7 @@ function formatTimeOfDay(hour: number, minute: number): string {
 
 /**
  * Human-readable description of a cron expression. Covers the common
- * patterns PCP generates; falls back to the raw expression.
+ * patterns Inkwell generates; falls back to the raw expression.
  */
 export function describeCron(cronExpression: string | null): string {
   if (!cronExpression) return 'Once';

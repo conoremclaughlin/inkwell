@@ -136,7 +136,7 @@ const GEMINI: HookCapabilities = {
   supportsPromptHook: true,
 };
 
-interface PcpConfig {
+interface InkUserConfig {
   userId?: string;
   email?: string;
 }
@@ -237,7 +237,7 @@ async function readStdin(): Promise<Record<string, unknown>> {
 // Inkwell Client Helper
 // ============================================================================
 
-function getPcpConfig(): PcpConfig | null {
+function getInkUserConfig(): InkUserConfig | null {
   const configPath = join(homedir(), '.ink', 'config.json');
   if (existsSync(configPath)) {
     try {
@@ -249,17 +249,17 @@ function getPcpConfig(): PcpConfig | null {
   return null;
 }
 
-function getPcpServerUrl(): string {
+function getInkServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
 }
 
 let jsonRpcId = 1;
 
-export async function callPcpTool(
+export async function callInkTool(
   tool: string,
   args: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  const serverUrl = getPcpServerUrl();
+  const serverUrl = getInkServerUrl();
   const url = `${serverUrl}/mcp`;
   const hasInjectedEnvToken = Boolean(process.env.INK_ACCESS_TOKEN?.trim());
   const delegatedSlug =
@@ -269,8 +269,8 @@ export async function callPcpTool(
 
   // Propagate Inkwell session/studio IDs so the server can resolve studio scope and
   // attribute tool calls to the correct session context.
-  const pcpSessionId = process.env.INK_SESSION_ID?.trim() || undefined;
-  const pcpStudioId = process.env.INK_STUDIO_ID?.trim() || undefined;
+  const inkSessionId = process.env.INK_SESSION_ID?.trim() || undefined;
+  const inkStudioId = process.env.INK_STUDIO_ID?.trim() || undefined;
 
   const baseHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -279,8 +279,8 @@ export async function callPcpTool(
     // Forward-looking runtime identity signal for stricter server-side enforcement.
     // Today, effective agent identity is still sourced from JWT claims.
     ...(delegatedSlug ? { 'x-ink-agent-id': delegatedSlug } : {}),
-    ...(pcpSessionId ? { 'x-ink-session-id': pcpSessionId } : {}),
-    ...(pcpStudioId ? { 'x-ink-studio-id': pcpStudioId } : {}),
+    ...(inkSessionId ? { 'x-ink-session-id': inkSessionId } : {}),
+    ...(inkStudioId ? { 'x-ink-studio-id': inkStudioId } : {}),
   };
 
   const callOnce = async (token: string | null): Promise<Response> => {
@@ -480,7 +480,7 @@ function normalizeSessionBackend(backendName: string): string {
   return backendName === 'claude-code' ? 'claude' : backendName;
 }
 
-function resolveActivePcpSessionId(cwd: string): string | undefined {
+function resolveActiveInkSessionId(cwd: string): string | undefined {
   // 1. INK_SESSION_ID env var — canonical, set by all CLI backends at spawn
   const envSessionId = process.env.INK_SESSION_ID?.trim();
   if (envSessionId) return envSessionId;
@@ -498,12 +498,12 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
       sbSlug,
       ...(studioId ? { studioId } : {}),
     });
-    if (linked?.pcpSessionId) return linked.pcpSessionId;
+    if (linked?.inkSessionId) return linked.inkSessionId;
   }
 
   // 3. sessions.json current pointer (CLI-launched sessions)
   const current = getCurrentRuntimeSession(cwd, sessionBackend);
-  if (current?.pcpSessionId) return current.pcpSessionId;
+  if (current?.inkSessionId) return current.inkSessionId;
 
   return undefined;
 }
@@ -541,13 +541,13 @@ function getRuntimeLinkId(): string | undefined {
   return undefined;
 }
 
-async function findPcpSessionByBackendSessionId(
-  config: PcpConfig | null,
+async function findInkSessionByBackendSessionId(
+  config: InkUserConfig | null,
   sbSlug: string,
   sessionBackend: string,
   backendSessionId: string,
   studioId?: string
-): Promise<{ pcpSessionId?: string; threadKey?: string }> {
+): Promise<{ inkSessionId?: string; threadKey?: string }> {
   try {
     const listArgs: Record<string, unknown> = {
       email: config?.email,
@@ -555,7 +555,7 @@ async function findPcpSessionByBackendSessionId(
       limit: 50,
       ...(studioId ? { studioId } : {}),
     };
-    const listed = await callPcpTool('list_sessions', listArgs);
+    const listed = await callInkTool('list_sessions', listArgs);
     const sessions = Array.isArray(listed.sessions)
       ? (listed.sessions as Array<Record<string, unknown>>)
       : [];
@@ -578,7 +578,7 @@ async function findPcpSessionByBackendSessionId(
     if (!matched || typeof matched.id !== 'string') return {};
 
     return {
-      pcpSessionId: matched.id,
+      inkSessionId: matched.id,
       ...(typeof matched.threadKey === 'string' ? { threadKey: matched.threadKey } : {}),
     };
   } catch {
@@ -588,16 +588,16 @@ async function findPcpSessionByBackendSessionId(
 
 async function reconcileBackendSignal(
   cwd: string,
-  config: PcpConfig | null,
+  config: InkUserConfig | null,
   sbSlug: string,
   stdin: Record<string, unknown>,
   options?: {
-    initialPcpSessionId?: string;
+    initialInkSessionId?: string;
     initialThreadKey?: string;
     startedAt?: string;
     hookBackend?: string;
   }
-): Promise<{ pcpSessionId?: string; threadKey?: string; backendSessionId?: string }> {
+): Promise<{ inkSessionId?: string; threadKey?: string; backendSessionId?: string }> {
   const detectedBackend = options?.hookBackend
     ? getBackendByName(options.hookBackend)
     : detectBackend(cwd);
@@ -607,7 +607,7 @@ async function reconcileBackendSignal(
   sbDebugLog('hooks', 'reconcile_start', {
     sessionBackend,
     sbSlug,
-    initialPcpSessionId: options?.initialPcpSessionId || null,
+    initialInkSessionId: options?.initialInkSessionId || null,
     initialThreadKey: options?.initialThreadKey || null,
     extractedBackendSessionId: backendSessionId || null,
     runtimeLinkId: runtimeLinkId || null,
@@ -615,28 +615,28 @@ async function reconcileBackendSignal(
   });
   const { studioId, sbId } = getIdentitySessionContext(cwd);
 
-  let pcpSessionId = options?.initialPcpSessionId || resolveActivePcpSessionId(cwd);
+  let inkSessionId = options?.initialInkSessionId || resolveActiveInkSessionId(cwd);
   let threadKey = options?.initialThreadKey;
 
-  if (!pcpSessionId && runtimeLinkId) {
+  if (!inkSessionId && runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
       backend: sessionBackend,
       sbSlug,
       ...(studioId ? { studioId } : {}),
     });
-    if (linked?.pcpSessionId) {
-      pcpSessionId = linked.pcpSessionId;
+    if (linked?.inkSessionId) {
+      inkSessionId = linked.inkSessionId;
       if (linked.threadKey) threadKey = linked.threadKey;
       sbDebugLog('hooks', 'reconcile_match_runtime_link', {
         sessionBackend,
         runtimeLinkId,
-        matchedPcpSessionId: linked.pcpSessionId,
+        matchedInkSessionId: linked.inkSessionId,
         matchedThreadKey: linked.threadKey || null,
       });
     }
   }
 
-  if (!pcpSessionId && backendSessionId) {
+  if (!inkSessionId && backendSessionId) {
     const linkedByBackendSessionId = listRuntimeSessions(cwd, sessionBackend).find(
       (session) =>
         session.sbSlug === sbSlug &&
@@ -644,23 +644,23 @@ async function reconcileBackendSignal(
         (session.backendSessionId === backendSessionId ||
           session.backendSessionIds?.includes(backendSessionId))
     );
-    if (linkedByBackendSessionId?.pcpSessionId) {
-      pcpSessionId = linkedByBackendSessionId.pcpSessionId;
+    if (linkedByBackendSessionId?.inkSessionId) {
+      inkSessionId = linkedByBackendSessionId.inkSessionId;
       if (linkedByBackendSessionId.threadKey) threadKey = linkedByBackendSessionId.threadKey;
       sbDebugLog('hooks', 'reconcile_match_local_backend_link', {
         sessionBackend,
         backendSessionId,
-        matchedPcpSessionId: linkedByBackendSessionId.pcpSessionId,
+        matchedInkSessionId: linkedByBackendSessionId.inkSessionId,
         matchedThreadKey: linkedByBackendSessionId.threadKey || null,
       });
     }
   }
 
   let hasLocalBackendLink = false;
-  if (backendSessionId && pcpSessionId) {
+  if (backendSessionId && inkSessionId) {
     const local = listRuntimeSessions(cwd, sessionBackend).find(
       (session) =>
-        session.pcpSessionId === pcpSessionId &&
+        session.inkSessionId === inkSessionId &&
         session.sbSlug === sbSlug &&
         (!studioId || session.studioId === studioId)
     );
@@ -672,8 +672,8 @@ async function reconcileBackendSignal(
   }
 
   if (backendSessionId && !hasLocalBackendLink) {
-    // Reconcile mismatched pcpSessionId/backendSessionId by checking existing server-side links first.
-    const matched = await findPcpSessionByBackendSessionId(
+    // Reconcile mismatched inkSessionId/backendSessionId by checking existing server-side links first.
+    const matched = await findInkSessionByBackendSessionId(
       config,
       sbSlug,
       sessionBackend,
@@ -681,22 +681,22 @@ async function reconcileBackendSignal(
       studioId
     );
 
-    if (matched.pcpSessionId) {
-      pcpSessionId = matched.pcpSessionId;
+    if (matched.inkSessionId) {
+      inkSessionId = matched.inkSessionId;
       threadKey = matched.threadKey || threadKey;
       sbDebugLog('hooks', 'reconcile_match_server_backend_link', {
         sessionBackend,
         backendSessionId,
-        matchedPcpSessionId: matched.pcpSessionId,
+        matchedInkSessionId: matched.inkSessionId,
         matchedThreadKey: matched.threadKey || null,
       });
     }
   }
 
-  if (!pcpSessionId) {
+  if (!inkSessionId) {
     sbDebugLog('hooks', 'reconcile_result', {
       sessionBackend,
-      pcpSessionId: null,
+      inkSessionId: null,
       threadKey: threadKey || null,
       backendSessionId: backendSessionId || null,
       studioId: studioId || null,
@@ -709,7 +709,7 @@ async function reconcileBackendSignal(
   }
 
   upsertRuntimeSession(cwd, {
-    pcpSessionId,
+    inkSessionId,
     backend: sessionBackend,
     sbSlug,
     ...(sbId ? { sbId } : {}),
@@ -720,14 +720,14 @@ async function reconcileBackendSignal(
     ...(options?.startedAt ? { startedAt: options.startedAt } : {}),
     updatedAt: new Date().toISOString(),
   });
-  setCurrentRuntimeSession(cwd, pcpSessionId, sessionBackend, {
+  setCurrentRuntimeSession(cwd, inkSessionId, sessionBackend, {
     sbSlug,
     ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
   });
   sbDebugLog('hooks', 'reconcile_result', {
     sessionBackend,
-    pcpSessionId,
+    inkSessionId,
     threadKey: threadKey || null,
     backendSessionId: backendSessionId || null,
     studioId: studioId || null,
@@ -735,7 +735,7 @@ async function reconcileBackendSignal(
   });
 
   return {
-    pcpSessionId,
+    inkSessionId,
     ...(threadKey ? { threadKey } : {}),
     ...(backendSessionId ? { backendSessionId } : {}),
   };
@@ -767,7 +767,7 @@ export interface TakeoverResult {
 
 export async function updateRuntimeGenerationState(
   cwd: string,
-  _config: PcpConfig | null,
+  _config: InkUserConfig | null,
   sbSlug: string,
   lifecycle: 'running' | 'idle' | 'compacting',
   // Which hook fired. Lifecycle values are ambiguous (post-compact and
@@ -811,7 +811,7 @@ export async function updateRuntimeGenerationState(
     studioId?: string;
   }
 ): Promise<TakeoverResult> {
-  const sessionId = resolveActivePcpSessionId(cwd);
+  const sessionId = resolveActiveInkSessionId(cwd);
   if (!sessionId) return { ok: true }; // nothing to take over — vacuously fine
 
   // Three attempts: a prompt event is now a turn-epoch TAKEOVER on the
@@ -823,7 +823,7 @@ export async function updateRuntimeGenerationState(
   // SB, writes the marker, and lets the human decide.
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const serverUrl = getPcpServerUrl();
+      const serverUrl = getInkServerUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       const token = await getValidAccessToken(serverUrl);
       if (token) headers.Authorization = `Bearer ${token}`;
@@ -1334,7 +1334,7 @@ function buildTasksBlock(
 // ============================================================================
 
 /** Marker used to identify Ink-managed hook entries (JSON backends) */
-const PCP_MARKER = 'ink-managed';
+const INK_MARKER = 'ink-managed';
 /** Marker used to identify Ink-managed Codex hook block (TOML) */
 const CODEX_HOOKS_START_MARKER = '# ink-managed:hooks:start';
 const CODEX_HOOKS_END_MARKER = '# ink-managed:hooks:end';
@@ -1462,7 +1462,7 @@ const MANAGED_HOOK_MARKER_RE = /\s#\s?ink-managed\s*$/;
  * called cli.js, or to have a `hooks` subcommand, is someone else's and must
  * survive an install untouched.
  */
-export function isPcpHookCommand(cmd: string | undefined): boolean {
+export function isInkHookCommand(cmd: string | undefined): boolean {
   if (!cmd) return false;
   const words = splitShellWords(cmd);
   const at = words.indexOf('hooks');
@@ -1474,7 +1474,7 @@ export function isPcpHookCommand(cmd: string | undefined): boolean {
 
 type InstallResult = 'installed' | 'already-installed' | 'conflict';
 
-function hasCodexPcpHooks(content: string): boolean {
+function hasCodexInkHooks(content: string): boolean {
   if (!content.trim()) return false;
   return (
     /session_start\s*=\s*".*hooks on-session-start[^"]*"/.test(content) &&
@@ -1595,25 +1595,25 @@ function installClaudeCode(cwd: string, force: boolean): InstallResult {
     }
 
     // Check if any non-Inkwell hooks exist
-    const hasNonPcpHooks = Object.entries(existingHooks).some(([, entries]) => {
+    const hasNonInkHooks = Object.entries(existingHooks).some(([, entries]) => {
       if (!Array.isArray(entries)) return false;
       return entries.some((entry: Record<string, unknown>) => {
         const hooks = entry.hooks as Array<Record<string, unknown>> | undefined;
         if (!hooks) return false;
-        return hooks.some((h) => !isPcpHookCommand(h.command as string | undefined));
+        return hooks.some((h) => !isInkHookCommand(h.command as string | undefined));
       });
     });
 
-    if (hasNonPcpHooks) {
+    if (hasNonInkHooks) {
       return 'conflict';
     }
   }
 
   const sbPath = resolveSbBinaryPath(cwd);
-  const pcpHooks = buildClaudeCodeHooks(sbPath);
+  const inkHooks = buildClaudeCodeHooks(sbPath);
 
   // Merge: keep existing non-hooks settings, replace hooks
-  const merged = { ...existing, ...pcpHooks };
+  const merged = { ...existing, ...inkHooks };
   writeFileSync(configPath, JSON.stringify(merged, null, 2) + '\n');
   return 'installed';
 }
@@ -1633,7 +1633,7 @@ function installGemini(cwd: string, force: boolean): InstallResult {
   }
 
   const sbPath = resolveSbBinaryPath(cwd);
-  const pcpHooks: Record<string, unknown> = {
+  const inkHooks: Record<string, unknown> = {
     // SessionStart: startup matcher only. PreCompress/postCompact disabled —
     // Gemini has no post-compression SessionStart event so lifecycle gets stuck.
     [GEMINI.events.sessionStart!]: [
@@ -1680,23 +1680,23 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     return hooks.some((h) => h && typeof h.command === 'string' && h.command === targetCommand);
   };
 
-  const entryHasNonPcpCommand = (entry: unknown): boolean => {
+  const entryHasNonInkCommand = (entry: unknown): boolean => {
     if (!entry || typeof entry !== 'object') return false;
     const entryObj = entry as Record<string, unknown>;
     if (typeof entryObj.command === 'string') {
-      return !isPcpHookCommand(entryObj.command);
+      return !isInkHookCommand(entryObj.command);
     }
     const hooks = entryObj.hooks as Array<Record<string, unknown>> | undefined;
     if (!Array.isArray(hooks)) return false;
     return hooks.some(
-      (h) => h && typeof h.command === 'string' && !isPcpHookCommand(h.command as string)
+      (h) => h && typeof h.command === 'string' && !isInkHookCommand(h.command as string)
     );
   };
 
   if (existing.hooks && !force) {
     // Check if our hooks are already there
     const hooksObj = existing.hooks as Record<string, unknown>;
-    const allPresent = Object.entries(pcpHooks).every(([event, targetEntries]) => {
+    const allPresent = Object.entries(inkHooks).every(([event, targetEntries]) => {
       const existingEntries = hooksObj[event];
       if (!Array.isArray(existingEntries)) return false;
       // Verify ALL target entries are present (e.g. SessionStart has both compress + startup)
@@ -1713,10 +1713,10 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     }
 
     // Check for any non-Inkwell hooks in these specific events
-    const hasConflict = Object.keys(pcpHooks).some((event) => {
+    const hasConflict = Object.keys(inkHooks).some((event) => {
       const entries = hooksObj[event];
       if (!Array.isArray(entries)) return false;
-      return entries.some((entry) => entryHasNonPcpCommand(entry));
+      return entries.some((entry) => entryHasNonInkCommand(entry));
     });
 
     if (hasConflict) {
@@ -1728,7 +1728,7 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     ...existing,
     hooks: {
       ...((existing.hooks as Record<string, unknown>) || {}),
-      ...pcpHooks,
+      ...inkHooks,
     },
   };
 
@@ -1746,19 +1746,19 @@ function installCodex(cwd: string, force: boolean): InstallResult {
     existingContent = readFileSync(configPath, 'utf-8');
   }
 
-  if (hasCodexPcpHooks(existingContent) && !force) {
+  if (hasCodexInkHooks(existingContent) && !force) {
     return 'already-installed';
   }
 
-  if (existingContent.includes('[hooks]') && !hasCodexPcpHooks(existingContent) && !force) {
+  if (existingContent.includes('[hooks]') && !hasCodexInkHooks(existingContent) && !force) {
     return 'conflict';
   }
 
   // Remove existing Inkwell-managed hooks section if present
-  const cleaned = removePcpTomlSection(existingContent);
+  const cleaned = removeInkTomlSection(existingContent);
 
   const sbPath = resolveSbBinaryPath(cwd);
-  const pcpSection = [
+  const inkSection = [
     '',
     CODEX_HOOKS_START_MARKER,
     '[hooks]',
@@ -1769,11 +1769,11 @@ function installCodex(cwd: string, force: boolean): InstallResult {
     '',
   ].join('\n');
 
-  writeFileSync(configPath, cleaned.trimEnd() + '\n' + pcpSection);
+  writeFileSync(configPath, cleaned.trimEnd() + '\n' + inkSection);
   return 'installed';
 }
 
-function removePcpTomlSection(content: string): string {
+function removeInkTomlSection(content: string): string {
   const markerPairs = [
     [CODEX_HOOKS_START_MARKER, CODEX_HOOKS_END_MARKER],
     [CODEX_LEGACY_HOOKS_START_MARKER, CODEX_LEGACY_HOOKS_END_MARKER],
@@ -1975,8 +1975,8 @@ function uninstallFromDir(targetDir: string, backendName?: string): boolean {
     }
     case 'codex': {
       const content = readFileSync(configPath, 'utf-8');
-      if (!hasCodexPcpHooks(content)) return false;
-      const cleaned = removePcpTomlSection(content);
+      if (!hasCodexInkHooks(content)) return false;
+      const cleaned = removeInkTomlSection(content);
       if (cleaned === content) return false;
       writeFileSync(configPath, cleaned);
       break;
@@ -2062,12 +2062,12 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
                   for (const h of hookList) {
                     const cmd = h.command as string;
                     const matcherSuffix = matcher ? ` (${matcher})` : '';
-                    const icon = isPcpHookCommand(cmd) ? chalk.green('●') : chalk.dim('○');
+                    const icon = isInkHookCommand(cmd) ? chalk.green('●') : chalk.dim('○');
                     console.log(`    ${icon} ${event}${matcherSuffix} → ${cmd}`);
                   }
                 } else if (command) {
                   // Gemini/simpler format
-                  const icon = isPcpHookCommand(command) ? chalk.green('●') : chalk.dim('○');
+                  const icon = isInkHookCommand(command) ? chalk.green('●') : chalk.dim('○');
                   console.log(`    ${icon} ${event} → ${command}`);
                 }
               }
@@ -2080,7 +2080,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
       }
       case 'codex': {
         const content = readFileSync(configPath, 'utf-8');
-        if (hasCodexPcpHooks(content)) {
+        if (hasCodexInkHooks(content)) {
           hasHooks = true;
           console.log(chalk.green('\n  Inkwell hooks installed (TOML)'));
           const sessionStart = content.match(/session_start\s*=\s*"([^"]+)"/)?.[1];
@@ -2123,7 +2123,7 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
   await readStdin(); // consume stdin but we don't need it
 
   const cwd = process.cwd();
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
   const backend = resolveLifecycleBackend(cwd, options?.backend);
 
@@ -2141,7 +2141,7 @@ async function postCompactHandler(): Promise<void> {
   await readStdin();
 
   const cwd = process.cwd();
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
 
   // Reset lifecycle from compacting back to idle. NOT a turn boundary —
@@ -2155,7 +2155,7 @@ async function postCompactHandler(): Promise<void> {
 
   // Bootstrap identity
   try {
-    const bootstrap = await callPcpTool('bootstrap', {
+    const bootstrap = await callInkTool('bootstrap', {
       email: config?.email,
       sbSlug,
       postCompact: true,
@@ -2169,7 +2169,7 @@ async function postCompactHandler(): Promise<void> {
 
   // Check inbox — grab last 10 for orientation context, not delivery
   try {
-    const inbox = await callPcpTool('get_inbox', {
+    const inbox = await callInkTool('get_inbox', {
       email: config?.email,
       sbSlug,
       limit: 10,
@@ -2183,7 +2183,7 @@ async function postCompactHandler(): Promise<void> {
 
   // Load available skills
   try {
-    const skillsResult = await callPcpTool('list_skills', { includeContent: true });
+    const skillsResult = await callInkTool('list_skills', { includeContent: true });
     skillsBlock = buildSkillsBlock(
       skillsResult.skills as Array<Record<string, unknown>> | undefined
     );
@@ -2220,15 +2220,15 @@ function resolveLifecycleBackend(cwd: string, backendOverride?: string): HookCap
  * for exactly the sessions the thread-key surfacing is meant to cover.
  */
 export async function hydrateThreadKeyFromServer(
-  pcpSessionId: string | undefined,
-  pcpThreadKey: string | undefined,
+  inkSessionId: string | undefined,
+  inkThreadKey: string | undefined,
   email?: string
 ): Promise<string | undefined> {
-  if (!pcpSessionId || pcpThreadKey) return pcpThreadKey;
+  if (!inkSessionId || inkThreadKey) return inkThreadKey;
   try {
-    const sessionResult = await callPcpTool('get_session', {
+    const sessionResult = await callInkTool('get_session', {
       email,
-      sessionId: pcpSessionId,
+      sessionId: inkSessionId,
     });
     const session = sessionResult?.session as Record<string, unknown> | undefined;
     if (session) {
@@ -2238,13 +2238,13 @@ export async function hydrateThreadKeyFromServer(
   } catch {
     // Non-fatal
   }
-  return pcpThreadKey;
+  return inkThreadKey;
 }
 
 async function onSessionStartHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
   const resolvedBackend = resolveLifecycleBackend(cwd, options?.backend);
 
@@ -2287,7 +2287,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     };
     if (studioId) bootstrapArgs.studioId = studioId;
 
-    const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
+    const bootstrap = await callInkTool('bootstrap', bootstrapArgs);
     // A server-spawned session already carries the constitution AND the
     // knowledge summary in its first message (the runner sets this). Re-emitting
     // either here duplicates several thousand tokens for no gain. Post-compact
@@ -2326,7 +2326,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
       };
       if (role) createArgs.roleTemplate = role;
 
-      const created = await callPcpTool('create_studio', createArgs);
+      const created = await callInkTool('create_studio', createArgs);
       // create_studio returns { studio: { id, ... } }, not { workspace: ... }
       const ws = (created.studio || created.workspace) as Record<string, unknown> | undefined;
       if (ws && typeof ws.id === 'string') {
@@ -2350,7 +2350,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   // Check inbox — grab last 10 for orientation context, not delivery
   try {
-    const inbox = await callPcpTool('get_inbox', {
+    const inbox = await callInkTool('get_inbox', {
       email: config?.email,
       sbSlug,
       limit: 10,
@@ -2364,7 +2364,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   // Load available skills (guide content included inline)
   try {
-    const skillsResult = await callPcpTool('list_skills', { includeContent: true });
+    const skillsResult = await callInkTool('list_skills', { includeContent: true });
     skillsBlock = buildSkillsBlock(
       skillsResult.skills as Array<Record<string, unknown>> | undefined
     );
@@ -2375,13 +2375,13 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   // Load active task groups owned by this agent + standalone tasks assigned to this agent
   try {
     const [groupsResult, standaloneResult] = await Promise.all([
-      callPcpTool('list_task_groups', {
+      callInkTool('list_task_groups', {
         email: config?.email,
         statuses: ['active', 'paused'],
         ...(sbId ? { sbId } : {}),
         includeTaskCounts: true,
       }),
-      callPcpTool('list_tasks', {
+      callInkTool('list_tasks', {
         email: config?.email,
         activeOnly: true,
       }),
@@ -2406,15 +2406,15 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   // Register Inkwell session with detected backend
   const detectedBackend = resolveLifecycleBackend(cwd, options?.backend);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
-  let pcpSessionId: string | undefined;
-  let pcpThreadKey: string | undefined;
+  let inkSessionId: string | undefined;
+  let inkThreadKey: string | undefined;
   // If provided by sb launcher, prefer that explicit session id.
   if (process.env.INK_SESSION_ID) {
-    pcpSessionId = process.env.INK_SESSION_ID;
+    inkSessionId = process.env.INK_SESSION_ID;
   }
 
   try {
-    if (!pcpSessionId) {
+    if (!inkSessionId) {
       const startArgs: Record<string, unknown> = {
         email: config?.email,
         sbSlug,
@@ -2422,12 +2422,12 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
       };
       if (studioId) startArgs.studioId = studioId;
       if (repoRoot) startArgs.repoRoot = repoRoot;
-      const started = await callPcpTool('start_session', startArgs);
+      const started = await callInkTool('start_session', startArgs);
       const startedSession = started.session as Record<string, unknown> | undefined;
       if (startedSession && typeof startedSession.id === 'string') {
-        pcpSessionId = startedSession.id;
+        inkSessionId = startedSession.id;
         if (typeof startedSession.threadKey === 'string') {
-          pcpThreadKey = startedSession.threadKey;
+          inkThreadKey = startedSession.threadKey;
         }
       }
     }
@@ -2439,35 +2439,35 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   const startedAt = new Date().toISOString();
   const reconciled = await reconcileBackendSignal(cwd, config, sbSlug, stdin, {
-    initialPcpSessionId: pcpSessionId,
-    initialThreadKey: pcpThreadKey,
+    initialInkSessionId: inkSessionId,
+    initialThreadKey: inkThreadKey,
     startedAt,
     hookBackend: detectedBackend.name,
   });
   sbDebugLog('hooks', 'on_session_start_reconciled', {
-    pcpSessionId: reconciled.pcpSessionId || pcpSessionId || null,
-    threadKey: reconciled.threadKey || pcpThreadKey || null,
+    inkSessionId: reconciled.inkSessionId || inkSessionId || null,
+    threadKey: reconciled.threadKey || inkThreadKey || null,
     backendSessionId: reconciled.backendSessionId || null,
   });
-  pcpSessionId = reconciled.pcpSessionId || pcpSessionId;
-  pcpThreadKey = reconciled.threadKey || pcpThreadKey;
+  inkSessionId = reconciled.inkSessionId || inkSessionId;
+  inkThreadKey = reconciled.threadKey || inkThreadKey;
   const backendSessionId = reconciled.backendSessionId;
 
-  pcpThreadKey = await hydrateThreadKeyFromServer(pcpSessionId, pcpThreadKey, config?.email);
+  inkThreadKey = await hydrateThreadKeyFromServer(inkSessionId, inkThreadKey, config?.email);
 
   // Set lifecycle to idle on startup (ready for user input).
-  if (pcpSessionId) {
+  if (inkSessionId) {
     try {
       const updateArgs: Record<string, unknown> = {
         email: config?.email,
         sbSlug,
-        sessionId: pcpSessionId,
+        sessionId: inkSessionId,
         lifecycle: 'idle',
         workingDir: cwd,
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
-      if (pcpThreadKey) updateArgs.activeThreadKey = pcpThreadKey;
-      await callPcpTool('update_session_state', updateArgs);
+      if (inkThreadKey) updateArgs.activeThreadKey = inkThreadKey;
+      await callInkTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
     }
@@ -2475,13 +2475,13 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   // Build session identity block so the agent always has its own IDs in context
   const sessionIdentityParts: string[] = [];
-  if (pcpSessionId) sessionIdentityParts.push(`Inkwell Session: \`${pcpSessionId}\``);
+  if (inkSessionId) sessionIdentityParts.push(`Inkwell Session: \`${inkSessionId}\``);
   if (backendSessionId) sessionIdentityParts.push(`Backend Session: \`${backendSessionId}\``);
   if (studioId) {
     const studioLabel = studioName ? `${studioId} (${studioName})` : studioId;
     sessionIdentityParts.push(`Studio: \`${studioLabel}\``);
   }
-  if (pcpThreadKey) sessionIdentityParts.push(`Thread: \`${pcpThreadKey}\``);
+  if (inkThreadKey) sessionIdentityParts.push(`Thread: \`${inkThreadKey}\``);
   const sessionIdentityBlock =
     sessionIdentityParts.length > 0 ? sessionIdentityParts.map((p) => `- ${p}`).join('\n') : '';
 
@@ -2502,8 +2502,8 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   sbDebugLog('hooks', 'on_session_start_output_emitted', {
     backend: detectedBackend.name,
     backendSessionId: backendSessionId || null,
-    pcpSessionId: pcpSessionId || null,
-    threadKey: pcpThreadKey || null,
+    inkSessionId: inkSessionId || null,
+    threadKey: inkThreadKey || null,
     outputBytes: Buffer.byteLength(output, 'utf-8'),
     outputSha256: createHash('sha256').update(output, 'utf-8').digest('hex'),
     hasRoleBlock: roleBlock.trim().length > 0,
@@ -2601,7 +2601,7 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   hookLog('on_tool_approval_match', { toolName, toolInput: toolInput.substring(0, 200) });
 
   // Create an approval request on the server
-  const serverUrl = getPcpServerUrl();
+  const serverUrl = getInkServerUrl();
   const token = await getValidAccessToken(serverUrl);
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -2721,7 +2721,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     hookBackend: lifecycleBackend.name,
   });
 
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
   hookLog('on_prompt', {
     sbSlug,
@@ -2734,12 +2734,12 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   hookLog('on_prompt_reconciled', {
     sbSlug,
     backend: lifecycleBackend.name,
-    pcpSessionId: reconciled.pcpSessionId || null,
+    inkSessionId: reconciled.inkSessionId || null,
     threadKey: reconciled.threadKey || null,
     backendSessionId: reconciled.backendSessionId || null,
   });
   sbDebugLog('hooks', 'on_prompt_reconciled', {
-    pcpSessionId: reconciled.pcpSessionId || null,
+    inkSessionId: reconciled.inkSessionId || null,
     threadKey: reconciled.threadKey || null,
     backendSessionId: reconciled.backendSessionId || null,
   });
@@ -2768,7 +2768,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         writeFileSync(
           markerPath,
           JSON.stringify({
-            sessionId: resolveActivePcpSessionId(cwd),
+            sessionId: resolveActiveInkSessionId(cwd),
             sbSlug,
             at: new Date().toISOString(),
             // Round 21: a FRESH attempt token — the fence is per attempt,
@@ -2794,7 +2794,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
     // Round 10: persist the claimed epoch so the on-stop hook can identify
     // the turn it is ending — the lease boundary fences on it.
-    const claimedSessionId = resolveActivePcpSessionId(cwd);
+    const claimedSessionId = resolveActiveInkSessionId(cwd);
     if (takeover.turnEpoch && claimedSessionId) {
       const recorded = writeCliTurnEpoch(cwd, {
         sessionId: claimedSessionId,
@@ -2824,12 +2824,12 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // IMPORTANT: headless/autonomous spawns set cliAttached=false in INK_CONTEXT.
   // Respect that — unconditionally setting true blocks all future strategy
   // triggers for the session (they see "CLI-attached" and skip spawn).
-  if (isHeadlessSpawn && reconciled.pcpSessionId) {
+  if (isHeadlessSpawn && reconciled.inkSessionId) {
     // Explicitly clear cli_attached for headless spawns. A previous interactive
-    // session may have set it to true on this same PCP session; if we just skip,
+    // session may have set it to true on this same Inkwell session; if we just skip,
     // the stale flag causes triggers to think a channel plugin is delivering.
     try {
-      const serverUrl = getPcpServerUrl();
+      const serverUrl = getInkServerUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       const token = await getValidAccessToken(serverUrl);
       if (token) headers.Authorization = `Bearer ${token}`;
@@ -2837,7 +2837,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          sessionId: reconciled.pcpSessionId,
+          sessionId: reconciled.inkSessionId,
           cliAttached: false,
         }),
         signal: AbortSignal.timeout(5000),
@@ -2846,13 +2846,13 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         sbSlug,
         backend: lifecycleBackend.name,
         reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
-        sessionId: reconciled.pcpSessionId,
+        sessionId: reconciled.inkSessionId,
       });
     } catch (err) {
       hookLog('cli_attached_clear_failed', {
         sbSlug,
         backend: lifecycleBackend.name,
-        sessionId: reconciled.pcpSessionId,
+        sessionId: reconciled.inkSessionId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -2860,12 +2860,12 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     hookLog('cli_attached_skipped', {
       sbSlug,
       backend: lifecycleBackend.name,
-      reason: 'headless spawn, no pcpSessionId',
+      reason: 'headless spawn, no inkSessionId',
       sessionId: null,
     });
-  } else if (reconciled.pcpSessionId) {
+  } else if (reconciled.inkSessionId) {
     try {
-      const serverUrl = getPcpServerUrl();
+      const serverUrl = getInkServerUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       const token = await getValidAccessToken(serverUrl);
       if (token) headers.Authorization = `Bearer ${token}`;
@@ -2873,7 +2873,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          sessionId: reconciled.pcpSessionId,
+          sessionId: reconciled.inkSessionId,
           cliAttached: true,
         }),
         signal: AbortSignal.timeout(5000),
@@ -2881,7 +2881,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       hookLog('cli_attached_set', {
         sbSlug,
         backend: lifecycleBackend.name,
-        sessionId: reconciled.pcpSessionId,
+        sessionId: reconciled.inkSessionId,
         status: lifecycleResp.status,
         ok: lifecycleResp.ok,
       });
@@ -2889,7 +2889,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       hookLog('cli_attached_failed', {
         sbSlug,
         backend: lifecycleBackend.name,
-        sessionId: reconciled.pcpSessionId,
+        sessionId: reconciled.inkSessionId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -2897,7 +2897,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     hookLog('cli_attached_skipped', {
       sbSlug,
       backend: lifecycleBackend.name,
-      reason: 'no pcpSessionId',
+      reason: 'no inkSessionId',
       backendSessionId: reconciled.backendSessionId || null,
     });
   }
@@ -2942,7 +2942,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   }
 
   try {
-    const inbox = await callPcpTool('get_inbox', {
+    const inbox = await callInkTool('get_inbox', {
       email: config?.email,
       sbSlug,
       since: lastCheck || undefined,
@@ -2966,7 +2966,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
 
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
 
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
   hookLog('on_stop', {
     sbSlug,
@@ -2982,7 +2982,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     hookBackend: lifecycleBackend.name,
   });
   sbDebugLog('hooks', 'on_stop_reconciled', {
-    pcpSessionId: reconciled.pcpSessionId || null,
+    inkSessionId: reconciled.inkSessionId || null,
     threadKey: reconciled.threadKey || null,
     backendSessionId: reconciled.backendSessionId || null,
   });
@@ -2995,7 +2995,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   // (`turnEpochMissing`) rather than masquerading as a legacy sender — the
   // server suppresses destructive boundary releases instead of running them
   // unfenced (fail closed on degraded local state).
-  const stopSessionId = resolveActivePcpSessionId(cwd);
+  const stopSessionId = resolveActiveInkSessionId(cwd);
   const stopGeneration = process.env.INK_RUNTIME_LINK_ID;
   // Round 21: ADJUDICATE our own marker HERE, synchronously — fs.watch
   // delivery is lossy under load and a short turn can end before any
@@ -3136,7 +3136,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
 
   if (shouldCheckInbox) {
     try {
-      const inbox = await callPcpTool('get_inbox', {
+      const inbox = await callInkTool('get_inbox', {
         email: config?.email,
         sbSlug,
         since: lastCheck || undefined,

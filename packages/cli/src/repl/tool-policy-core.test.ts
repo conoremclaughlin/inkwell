@@ -25,8 +25,8 @@ describe('shared tool policy core', () => {
   });
 
   it('expands policy group specs', () => {
-    const expanded = expandPolicySpecs(['group:pcp-comms', 'remember'], {
-      'group:pcp-comms': ['send_to_inbox', 'trigger_agent'],
+    const expanded = expandPolicySpecs(['group:ink-comms', 'remember'], {
+      'group:ink-comms': ['send_to_inbox', 'trigger_agent'],
     });
     expect(expanded).toContain('send_to_inbox');
     expect(expanded).toContain('trigger_agent');
@@ -34,8 +34,8 @@ describe('shared tool policy core', () => {
   });
 
   it('dedupes and ignores empty policy specs', () => {
-    const expanded = expandPolicySpecs(['', 'group:pcp-comms', 'send_to_inbox'], {
-      'group:pcp-comms': ['send_to_inbox', 'trigger_agent'],
+    const expanded = expandPolicySpecs(['', 'group:ink-comms', 'send_to_inbox'], {
+      'group:ink-comms': ['send_to_inbox', 'trigger_agent'],
     });
     expect(expanded).toEqual(['send_to_inbox', 'trigger_agent']);
   });

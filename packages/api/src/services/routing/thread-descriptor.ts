@@ -4,7 +4,7 @@
  * The trigger message is what an SB reads BEFORE deciding whether to act, and
  * for a threaded trigger it carried only the key:
  *
- *   Thread: pcp:thread:legibility-commission
+ *   Thread: inkwell:thread:legibility-commission
  *
  * which says nothing about what the thread is for. The key is a stable
  * identifier by design and therefore a poor description — one thread routinely
@@ -119,14 +119,27 @@ export function formatThreadDescriptorLines(
 /**
  * Load a thread's current title and summary, for a recipient who is on it.
  *
- * `recipientSlug` is not a convenience — it is the access check. `trigger_agent`
+ * `recipientSbId` is not a convenience — it is the access check. `trigger_agent`
  * takes an arbitrary threadKey and does not join the target to that thread, so
- * scoping this read by user and key alone would deliver a thread's description
- * into the prompt of an SB that `get_thread_messages` refuses as "not a
- * participant" (Lumen, #641 review). The membership test is an INNER JOIN on
- * inbox_thread_participants in the same round trip, by slug, exactly as every
- * other reader tests it — and it is a read: a non-participant gets nothing, and
- * is never joined as a side effect of being triggered.
+ * scoping this read by workspace and key alone would deliver a thread's
+ * description into the prompt of an SB that `get_thread_messages` refuses as
+ * "not a participant" (Lumen, #641 review). The membership test is an INNER
+ * JOIN on inbox_thread_participants in the same round trip, by the SB's
+ * canonical id, exactly as `isParticipant` tests it — and it is a read: a
+ * non-participant gets nothing, and is never joined as a side effect of being
+ * triggered.
+ *
+ * A thread is one row per (workspace, key) (spec inkmail-thread-scope §1), so
+ * the scope is the workspace the trigger resolved: with no workspace there is
+ * no thread to describe, and a workspace-less identity gets nothing rather than
+ * a description from somebody else's workspace.
+ *
+ * The embed names its foreign key. The cutover gave participants a second
+ * relationship to threads — the composite (thread_id, workspace_id) key that
+ * pins a participant to the thread's workspace — and PostgREST refuses an
+ * ambiguous embed. That refusal is an error, which this loader swallows, so
+ * without the hint every recipient read as a non-participant and no test
+ * with a fake client could tell (the DB test beside this file did).
  *
  * Best-effort in the other direction: a trigger must still be delivered if this
  * fails, so a query error returns null and the caller omits the lines rather
@@ -136,20 +149,20 @@ export function formatThreadDescriptorLines(
  */
 export async function loadThreadDescriptor(
   supabase: SupabaseClient,
-  userId: string,
+  workspaceId: string | null | undefined,
   threadKey: string,
-  recipientSlug: string
+  recipientSbId: string | null | undefined
 ): Promise<ThreadDescriptor | null> {
-  if (!recipientSlug) return null;
+  if (!workspaceId || !recipientSbId) return null;
   try {
     const { data, error } = await supabase
       .from('inbox_threads')
       .select(
-        'title, summary, title_updated_at, summary_updated_at, created_at, inbox_thread_participants!inner(agent_id)'
+        'title, summary, title_updated_at, summary_updated_at, created_at, inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(sb_id)'
       )
-      .eq('user_id', userId)
+      .eq('workspace_id', workspaceId)
       .eq('thread_key', threadKey)
-      .eq('inbox_thread_participants.agent_id', recipientSlug)
+      .eq('inbox_thread_participants.sb_id', recipientSbId)
       .maybeSingle();
 
     if (error || !data) return null;

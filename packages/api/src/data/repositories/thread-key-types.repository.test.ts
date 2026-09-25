@@ -22,7 +22,7 @@ function chain(result: { data?: unknown; error?: { message: string } | null }) {
 
 const TEMPLATE_PR = {
   id: 't1',
-  user_id: null,
+  workspace_id: null,
   type: 'pr',
   write_intent: 'write',
   studio_policy: 'provision',
@@ -32,7 +32,7 @@ const TEMPLATE_PR = {
 };
 const TEMPLATE_SPEC = {
   id: 't2',
-  user_id: null,
+  workspace_id: null,
   type: 'spec',
   write_intent: 'presence',
   studio_policy: 'reuse-only',
@@ -42,7 +42,7 @@ const TEMPLATE_SPEC = {
 };
 const OVERRIDE_SPEC = {
   id: 'o1',
-  user_id: 'user-1',
+  workspace_id: 'ws-1',
   type: 'spec',
   write_intent: 'write',
   studio_policy: 'provision',
@@ -60,7 +60,7 @@ function repoWith(rows: unknown[]) {
 describe('ThreadKeyTypesRepository.getEffective', () => {
   it('a user override SHADOWS the template for the same type', async () => {
     const repo = repoWith([TEMPLATE_PR, TEMPLATE_SPEC, OVERRIDE_SPEC]);
-    const spec = await repo.getEffective('user-1', 'spec');
+    const spec = await repo.getEffective('ws-1', 'spec');
     expect(spec).toMatchObject({
       writeIntent: 'write',
       studioPolicy: 'provision',
@@ -70,13 +70,13 @@ describe('ThreadKeyTypesRepository.getEffective', () => {
 
   it('falls back to the template when no override exists', async () => {
     const repo = repoWith([TEMPLATE_PR, TEMPLATE_SPEC]);
-    const spec = await repo.getEffective('user-1', 'spec');
+    const spec = await repo.getEffective('ws-1', 'spec');
     expect(spec).toMatchObject({ writeIntent: 'presence', source: 'template' });
   });
 
   it('unknown types resolve to the conservative default: write + reuse-only', async () => {
     const repo = repoWith([TEMPLATE_PR]);
-    const standup = await repo.getEffective('user-1', 'standup');
+    const standup = await repo.getEffective('ws-1', 'standup');
     expect(standup).toMatchObject({
       type: 'standup',
       writeIntent: 'write',
@@ -94,7 +94,7 @@ describe('ThreadKeyTypesRepository.getEffective', () => {
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const repo = new ThreadKeyTypesRepository(client as any);
-    const pr = await repo.getEffective('user-1', 'pr');
+    const pr = await repo.getEffective('ws-1', 'pr');
     expect(pr.writeIntent).toBe('write');
     expect(pr.source).toBe('default');
   });
@@ -103,7 +103,7 @@ describe('ThreadKeyTypesRepository.getEffective', () => {
 describe('ThreadKeyTypesRepository.listEffective', () => {
   it('merges templates and overrides, one row per type, overrides win', async () => {
     const repo = repoWith([TEMPLATE_PR, TEMPLATE_SPEC, OVERRIDE_SPEC]);
-    const list = await repo.listEffective('user-1');
+    const list = await repo.listEffective('ws-1');
     expect(list).toHaveLength(2);
     expect(list.find((t) => t.type === 'pr')).toMatchObject({ source: 'template' });
     expect(list.find((t) => t.type === 'spec')).toMatchObject({

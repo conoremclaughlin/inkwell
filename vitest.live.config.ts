@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 /**
  * Live tests (*.live.test.ts) spawn a real backend CLI (claude, codex, gemini)
- * non-interactively and exercise its ability to talk to a running PCP MCP
+ * non-interactively and exercise its ability to talk to a running Inkwell MCP
  * server. They verify things that unit tests cannot:
  *
  *  - Header injection via .mcp.json / --config
@@ -11,8 +11,8 @@ import { defineConfig } from 'vitest/config';
  *
  * Requirements to run:
  *  - The relevant backend CLI installed on PATH (`claude`, `codex`, `gemini`)
- *  - A running PCP server (defaults to http://localhost:3001) OR the test
- *    brings up its own on PCP_PORT_BASE
+ *  - A running Inkwell server (defaults to http://localhost:3001) OR the test
+ *    brings up its own on INK_PORT_BASE
  *  - Valid auth for the CLI (already logged in)
  *
  * These are slow and stateful — keep them out of the default `yarn test` run.

@@ -12,6 +12,11 @@ import {
 } from './identity-handlers';
 import { createMockSupabaseClient, type MockSupabaseClient } from '../../test/mocks/supabase.mock';
 
+// First-save tests must not seed reminders in the operator's database.
+vi.mock('../../services/heartbeat', () => ({
+  ensureDefaultReminders: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock the user-resolver module
 vi.mock('../../services/user-resolver', () => ({
   userIdentifierBaseSchema: {
@@ -449,6 +454,51 @@ describe('Identity Handlers', () => {
       expect(parsed.count).toBe(2);
       expect(parsed.identities[0].sbSlug).toBe('benson');
       expect(parsed.identities[1].sbSlug).toBe('wren');
+    });
+
+    it('projects the backend column so clients need not guess it', async () => {
+      // The column has always existed; not projecting it meant `ink -a lumen`
+      // had no way to learn Lumen runs on codex and started claude instead.
+      // A null backend stays null — the CLI treats that as "no answer" and
+      // falls through, which is different from an empty string.
+      mockSupabase._setArrayData([
+        {
+          id: 'identity-1',
+          user_id: 'user-123',
+          agent_id: 'lumen',
+          name: 'Lumen',
+          role: 'Development collaborator',
+          description: null,
+          values: [],
+          relationships: {},
+          capabilities: [],
+          backend: 'codex',
+          version: 1,
+          created_at: '2026-01-27T12:00:00Z',
+          updated_at: '2026-01-27T12:00:00Z',
+        },
+        {
+          id: 'identity-2',
+          user_id: 'user-123',
+          agent_id: 'nobackend',
+          name: 'No Backend',
+          role: null,
+          description: null,
+          values: [],
+          relationships: {},
+          capabilities: [],
+          backend: null,
+          version: 1,
+          created_at: '2026-01-27T12:00:00Z',
+          updated_at: '2026-01-27T12:00:00Z',
+        },
+      ]);
+
+      const result = await handleListIdentities({ userId: 'user-123' }, mockDataComposer as never);
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.identities[0].backend).toBe('codex');
+      expect(parsed.identities[1].backend).toBeNull();
     });
 
     it('should return hasHeartbeat and hasSoul flags', async () => {

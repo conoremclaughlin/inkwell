@@ -115,7 +115,7 @@ Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths
    createClient(url, secretKey);
    ```
 
-4. **RLS is NOT our primary security layer.** The existing `auth.uid() = id` policies on the `users` table (and similar policies on `links`, `notes`, `tasks`, etc.) are non-functional because PCP user IDs (`uuid_generate_v4()`) are different from Supabase Auth UIDs (`auth.uid()`). The real security boundary is the API server's authentication middleware and application-level authorization. Some tables have permissive service policies (`USING (true)`) as a safety net — this is intentional.
+4. **RLS is NOT our primary security layer.** The existing `auth.uid() = id` policies on the `users` table (and similar policies on `links`, `notes`, `tasks`, etc.) are non-functional because Inkwell user IDs (`uuid_generate_v4()`) are different from Supabase Auth UIDs (`auth.uid()`). The real security boundary is the API server's authentication middleware and application-level authorization. Some tables have permissive service policies (`USING (true)`) as a safety net — this is intentional.
 
 5. **Never expose the service role key to the client.** It lives in `.env.local` (server only) and must never appear in `NEXT_PUBLIC_*` environment variables.
 
@@ -187,8 +187,8 @@ A workspace contains many studios. A studio belongs to one workspace.
 The primary mechanism for scope resolution is the **`x-ink-context`** header — a base64url-encoded JSON token set by CLI hooks. It carries:
 
 ```typescript
-interface PcpContextToken {
-  sessionId: string; // PCP session ID
+interface InkContextToken {
+  sessionId: string; // Inkwell session ID
   studioId: string; // Studio UUID (or "main" for root repo)
   sbSlug: string; // Agent identity
   cliAttached: boolean; // Whether a human is at the terminal
@@ -289,7 +289,7 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 | `issue:<number>` | Issue triage or debugging                   | `issue:45`                   |
 | `branch:<name>`  | Feature branch coordination                 | `branch:wren/feat/cli-hooks` |
 | `debug:<slug>`   | Collaborative debugging                     | `debug:inbox-latency`        |
-| `task:<id>`      | PCP task coordination                       | `task:abc123`                |
+| `task:<id>`      | Inkwell task coordination                   | `task:abc123`                |
 | `thread:<slug>`  | Multi-step conversation with no natural key | `thread:perf-audit`          |
 
 ### Cross-Project threadKeys (MANDATORY outside Inkwell)
@@ -369,7 +369,7 @@ More specific patterns win: exact > prefix wildcard > catch-all. Patterns are ma
 
 ## Project Overview
 
-Personal Context Protocol (PCP) is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
+Inkwell is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
 
 ## Coding Style & Conventions
 
@@ -478,16 +478,19 @@ ENABLE_TELEGRAM=false \
 ENABLE_WHATSAPP=false \
 ENABLE_DISCORD=false \
 ENABLE_GRAPH_SWEEP=false \
+ALERT_STALENESS_SWEEP_SECONDS=0 \
 INK_PORT_BASE=4001 \
 yarn dev
 
 # Point the CLI at your test server
-PCP_SERVER_URL=http://localhost:4001 ink mission
+INK_SERVER_URL=http://localhost:4001 ink mission
 ```
 
 **Use `INK_PORT_BASE`, not `PCP_PORT_BASE`.** The resolution is `INK_PORT_BASE || PCP_PORT_BASE` (`scripts/dev-concurrently.mjs`), and `INK_PORT_BASE=3001` is exported in the inherited shell environment on this machine — so an explicit `PCP_PORT_BASE=4001` is silently discarded and the "isolated" server starts on the main server's port.
 
-**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, and the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`) should stay `false` on isolated servers — the main server already owns those connections and the sweep's dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
+**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`), and the alert staleness sweep (`ALERT_STALENESS_SWEEP_SECONDS=0`) should stay off on isolated servers — the main server already owns those connections and those sweeps' dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers and duplicate alert notifications). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
+
+Note that the alert sweep is **on by default** — unlike `ENABLE_*` flags, omitting `ALERT_STALENESS_SWEEP_SECONDS` runs it every 300s rather than disabling it. A long-running review server that leaves it unset will emit real alert notifications. Only an explicit `0` turns it off.
 
 **Heartbeats specifically.** Any of `ENABLE_HEARTBEATS`, `ENABLE_REMINDERS`, or `ENABLE_HEARTBEAT_SERVICE` set to a false-like value (`false`, `0`, `off`, `no`) disables reminder processing. A server started from a git worktree also auto-disables, and needs one of those set to `true` to opt back in.
 
@@ -529,7 +532,7 @@ The global link stays where it was. Your studio's build is for you to exercise, 
 
 ## Supabase Project ID
 
-When using MCP Supabase tools (`execute_sql`, `apply_migration`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:
+When using MCP Supabase tools (`execute_sql`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:
 
 ```
 SUPABASE_URL=https://<project_id>.supabase.co
@@ -557,9 +560,7 @@ supabase/migrations/YYYYMMDDHHmmss_short_description.sql
 
    Never use manual numeric prefixes (`001_`, `002_`). Timestamps prevent branch conflicts — two agents can create migrations independently and they merge cleanly as long as the SQL doesn't conflict.
 
-3. **Apply migrations via:**
-   - MCP tool: `mcp__supabase__apply_migration`
-   - Supabase CLI (if installed): `supabase db push` (remote) / `supabase migration up` (local)
+3. **Apply with `yarn db:migrate supabase/migrations/<file>`** from the checkout that holds the file: any worktree, any order, before or after other branches merge. It runs the file and its ledger row in one transaction against the local stack, under the file's own version; `yarn db:migrate:status` shows what is pending. `yarn dev` and `yarn prod:direct` apply whatever is pending from the main checkout before the servers start, in version order, and refuse to start if a file fails (`yarn dev:no-migrations` skips that on purpose). A stop-the-world migration carries `-- db-migrate: window <runbook>` in its first ten lines: startup refuses to auto-apply it and names the runbook, and the operator applies it inside the window with `yarn db:migrate --window <file>`. Do not apply through the MCP `apply_migration` tool (it records the apply time as the version, and the ledger drifts) or `supabase migration up` / `db push` from a branch (they refuse while another branch's applied migration has no file in your checkout). Never `supabase db reset` on the shared local stack. The ledger, the from-scratch order check, and the incident this came from are in `supabase/migrations/README.md`.
 
 4. **After applying, regenerate types:**
    - MCP tool: `mcp__supabase__generate_typescript_types`
@@ -631,7 +632,7 @@ Inkwell uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) —
 
 Skills load from four tiers. When names collide, higher tiers win:
 
-1. **Bundled** — `packages/api/src/skills/builtin/` (shipped with PCP)
+1. **Bundled** — `packages/api/src/skills/builtin/` (shipped with Inkwell)
 2. **Extra dirs** — configurable paths in `~/.ink/config.json` (ClawHub interop, etc.)
 3. **Managed** — `~/.ink/skills/` (user-installed, shared across all SBs)
 4. **Workspace** — `<cwd>/.ink/skills/` (per-worktree, per-SB)
@@ -703,13 +704,13 @@ Optional:
 
 ### Test tiers
 
-| Tier            | What it tests                                    | Server needed? | LLM called? | Example                                   |
-| --------------- | ------------------------------------------------ | -------------- | ----------- | ----------------------------------------- |
-| **Unit**        | Pure logic: scorers, loaders, schemas, repos     | No             | No          | `scorer.test.ts`, `*.repository.test.ts`  |
-| **Integration** | Tool handlers + DB/server round-trips            | Yes (PCP)      | No          | `runner.integration.test.ts`              |
-| **Live**        | End-to-end with an LLM backend generating output | Yes (PCP+LLM)  | **Yes**     | Future: live eval where SB curates recall |
+| Tier            | What it tests                                    | Server needed?    | LLM called? | Example                                   |
+| --------------- | ------------------------------------------------ | ----------------- | ----------- | ----------------------------------------- |
+| **Unit**        | Pure logic: scorers, loaders, schemas, repos     | No                | No          | `scorer.test.ts`, `*.repository.test.ts`  |
+| **Integration** | Tool handlers + DB/server round-trips            | Yes (Inkwell)     | No          | `runner.integration.test.ts`              |
+| **Live**        | End-to-end with an LLM backend generating output | Yes (Inkwell+LLM) | **Yes**     | Future: live eval where SB curates recall |
 
-**Unit tests** use mocks (mock Supabase client, stubbed recall functions) and run in CI with no external dependencies. **Integration tests** hit the running PCP server (default `http://localhost:3001`) and require valid auth (`~/.ink/auth.json`). They skip automatically when the server is unavailable. **Live tests** are the only tier where an LLM actually generates responses — they measure whether the full pipeline (recall → injection → LLM response → curation) produces correct behavior, not just whether individual components work.
+**Unit tests** use mocks (mock Supabase client, stubbed recall functions) and run in CI with no external dependencies. **Integration tests** hit the running Inkwell server (default `http://localhost:3001`) and require valid auth (`~/.ink/auth.json`). They skip automatically when the server is unavailable. **Live tests** are the only tier where an LLM actually generates responses — they measure whether the full pipeline (recall → injection → LLM response → curation) produces correct behavior, not just whether individual components work.
 
 When adding a new feature, write unit tests for the logic and integration tests for the server round-trip. Live tests are reserved for eval harnesses where the LLM's judgment is part of what's being measured.
 
@@ -758,7 +759,7 @@ An empty list is a valid opt-out. A missing one is not.
 npx vitest run
 
 # Run specific test file
-npx vitest run packages/api/src/mcp/auth/pcp-auth-provider.test.ts
+npx vitest run packages/api/src/mcp/auth/ink-auth-provider.test.ts
 
 # Run MCP Inspector (manual testing)
 npx @modelcontextprotocol/inspector packages/api/dist/index.js
@@ -815,7 +816,7 @@ These log files are written regardless of how the server is started (`yarn dev`,
 
 ## Specs & Artifacts
 
-When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored on the Inkwell server and managed via MCP tools. They are NOT local markdown files.
+When we refer to "specs" in this project, we mean **Inkwell artifacts** — versioned documents stored on the Inkwell server and managed via MCP tools. They are NOT local markdown files.
 
 - **Browse**: `list_artifacts(type: "spec")` to discover available specs
 - **Read**: `get_artifact(uri: "ink://specs/cli-session-hooks")` to view a spec by URI

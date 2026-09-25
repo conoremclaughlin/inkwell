@@ -27,7 +27,7 @@ import {
   INTEGRATION_TEST_USER_EMAIL,
   INTEGRATION_TEST_AGENT_ID,
 } from '../../test/integration-fixtures';
-import { signPcpAccessToken } from '../../auth/pcp-tokens';
+import { signInkAccessToken } from '../../auth/ink-tokens';
 import { createMCPServer, type MCPServer } from '../server';
 import { env } from '../../config/env';
 
@@ -36,16 +36,20 @@ describe('Session Identity Chain — HTTP Integration', () => {
   let mcpServer: MCPServer;
   let baseUrl: string;
   let testToken: string;
+  // Threads are workspace rows since the cutover (spec inkmail-thread-scope
+  // §1): echo's sends land in the fixture user's personal workspace.
+  let workspaceId: string;
   const createdSessionIds: string[] = [];
   const createdStudioIds: string[] = [];
   const createdThreadKeys: string[] = [];
 
   beforeAll(async () => {
     dataComposer = await getDataComposer();
-    await ensureEchoIntegrationFixture(dataComposer);
+    const fixture = await ensureEchoIntegrationFixture(dataComposer);
+    workspaceId = fixture.workspaceId;
 
     // Sign a test JWT for the integration test user + echo agent
-    testToken = signPcpAccessToken(
+    testToken = signInkAccessToken(
       {
         type: 'mcp_access',
         sub: INTEGRATION_TEST_USER_ID,
@@ -93,7 +97,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
         .from('inbox_threads' as never)
         .select('id')
         .eq('thread_key', tk)
-        .eq('user_id', INTEGRATION_TEST_USER_ID)
+        .eq('workspace_id', workspaceId)
         .maybeSingle();
 
       if (thread) {
@@ -330,7 +334,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
       .from('inbox_threads' as never)
       .select('id')
       .eq('thread_key', threadKey)
-      .eq('user_id', INTEGRATION_TEST_USER_ID)
+      .eq('workspace_id', workspaceId)
       .maybeSingle();
 
     expect(thread).not.toBeNull();
@@ -348,8 +352,8 @@ describe('Session Identity Chain — HTTP Integration', () => {
 
     const msg = (messages as Array<{ metadata: Record<string, unknown> }>)[0];
     const metadata = msg.metadata as Record<string, unknown>;
-    const pcp = metadata.pcp as Record<string, unknown>;
-    const sender = pcp?.sender as Record<string, unknown>;
+    const inkMeta = metadata.pcp as Record<string, unknown>;
+    const sender = inkMeta?.sender as Record<string, unknown>;
 
     // The sender metadata should have been enriched with session context
     // from the x-ink-session-id header → request context → send_to_inbox handler
@@ -389,7 +393,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
   // ── Codex env_http_headers simulation ──
   // Codex injects headers via `-c mcp_servers.inkwell.env_http_headers.<header>="ENV_VAR"`.
   // This test verifies the server correctly processes those headers on MCP calls,
-  // proving the full chain: env var → Codex → HTTP header → PCP server → request context.
+  // proving the full chain: env var → Codex → HTTP header → Inkwell server → request context.
 
   it('should process session headers as Codex would inject them via env_http_headers', async () => {
     const studioId = await createTestStudio('codex-env-headers');
@@ -426,7 +430,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
       .from('inbox_threads' as never)
       .select('id')
       .eq('thread_key', threadKey)
-      .eq('user_id', INTEGRATION_TEST_USER_ID)
+      .eq('workspace_id', workspaceId)
       .maybeSingle();
 
     expect(thread).not.toBeNull();
@@ -443,8 +447,8 @@ describe('Session Identity Chain — HTTP Integration', () => {
     expect((messages as Array<{ metadata: unknown }>).length).toBeGreaterThan(0);
 
     const msg = (messages as Array<{ metadata: Record<string, unknown> }>)[0];
-    const pcp = msg.metadata.pcp as Record<string, unknown>;
-    const sender = pcp?.sender as Record<string, unknown>;
+    const inkMeta = msg.metadata.pcp as Record<string, unknown>;
+    const sender = inkMeta?.sender as Record<string, unknown>;
 
     // Prove the full chain: HTTP headers → request context → sender metadata
     expect(sender).toBeDefined();
@@ -484,7 +488,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
       .from('inbox_threads' as never)
       .select('id')
       .eq('thread_key', threadKey)
-      .eq('user_id', INTEGRATION_TEST_USER_ID)
+      .eq('workspace_id', workspaceId)
       .maybeSingle();
 
     expect(thread).not.toBeNull();

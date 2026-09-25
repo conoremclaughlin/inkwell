@@ -47,14 +47,36 @@ export interface GraphDependencyFailure {
   sources: Array<{ id: string; title: string; state: string; attempt?: number | null }>;
 }
 
+/**
+ * A node under an unreleased authority hold (spec workflow-graph-revocation
+ * §Holds): never dispatched, however SATISFIES reads its inbound set, with
+ * the provenance of every hold so the cause can be named.
+ */
+export interface GraphHeldNode {
+  id: string;
+  title: string;
+  holds: Array<{
+    id: string;
+    kind: string;
+    sourceGateId: string | null;
+    sourceAttempt: number | null;
+    bindingHash: string | null;
+    causeEventId: string | null;
+    causeOperationId: string | null;
+    placedAt: string;
+  }>;
+}
+
 export interface GraphEvaluation {
   readyWork: GraphNodeRef[];
   openedGates: GraphNodeRef[];
   openGates: GraphNodeRef[];
   scheduledGates: GraphNodeRef[];
   dependencyFailures: GraphDependencyFailure[];
+  /** Absent only from evaluations produced before the revocation migration. */
+  heldNodes?: GraphHeldNode[];
   groupComplete: boolean;
-  counts: { total: number; completed: number; failed: number; skipped: number };
+  counts: { total: number; completed: number; failed: number; skipped: number; held?: number };
 }
 
 export interface GraphClaimRef {
@@ -219,6 +241,7 @@ export class GraphExecutorService {
     await this.logActivity(userId, group, 'graph_execution_started', {
       readyCount: evaluation.readyWork.length,
       openGates: evaluation.openGates.length,
+      heldNodes: evaluation.heldNodes?.length ?? 0,
     });
     const dispatched = await this.dispatchEvaluation(
       userId,

@@ -18,17 +18,31 @@
  * created and the DB trigger pins it.
  */
 
+import { isTerminalPhaseMarker } from '../sessions/phase-markers';
+import type { ThreadLastMessage } from './thread-conversation';
+
 export interface SpineThreadRow {
   threadKey: string;
   keyProject: string | null;
   keyType: string | null;
   keyId: string | null;
   title: string | null;
+  summary: string | null;
   status: string;
   createdBySlug: string;
   updatedAt: string;
   closedAt: string | null;
   participants: string[];
+  /** Newest deliverable message, when the route fetched one. */
+  lastMessage?: ThreadLastMessage | null;
+  /** People on the thread, named for the viewer — never woken, never in `participants`. */
+  people?: SpinePerson[];
+}
+
+export interface SpinePerson {
+  userId: string;
+  name: string;
+  isOwn: boolean;
 }
 
 export interface SpineSessionRow {
@@ -83,10 +97,15 @@ export interface ThreadSpine {
   identity: SpineIdentity | null;
   thread: {
     title: string | null;
+    /** One-line "what is this about", capped at 280 chars by the DB. */
+    summary: string | null;
     status: string;
     createdBySlug: string;
     participants: string[];
+    people: SpinePerson[];
     closedAt: string | null;
+    /** Newest deliverable (non-system) message; null when there is none. */
+    lastMessage: ThreadLastMessage | null;
   } | null;
   sessions: Array<{
     id: string;
@@ -96,6 +115,11 @@ export interface ThreadSpine {
     phase: string | null;
     /** How this session references the key: routing anchor, active focus, or both. */
     relation: 'anchor' | 'active' | 'both';
+    /**
+     * Whether this session is working RIGHT NOW — see isSessionLive. Computed
+     * here so every client agrees; `lifecycle` alone does not answer it.
+     */
+    live: boolean;
     updatedAt: string;
     studioId: string | null;
   }>;
@@ -123,6 +147,67 @@ export interface ThreadSpine {
   lastActivityAt: string;
 }
 
+/**
+ * Lifecycles in which a session is doing something. `idle` is a session that
+ * exists between turns; `interrupted`, `completed` and `failed` are over.
+ * These are the only values the canonical SessionLifecycle union admits —
+ * the dashboard also tested for `generating`, which is not one of them and
+ * therefore never matched anything.
+ */
+const LIVE_LIFECYCLES = new Set(['running', 'compacting']);
+
+/**
+ * How long a session's own last write vouches for it still being alive.
+ *
+ * Nothing reaps abandoned sessions: `ended_at` is NULL on every `running` row
+ * in production, so a session that died mid-turn keeps that lifecycle
+ * forever. Measured 2026-09-17: 73 rows said `running`, 3 had been written
+ * within fifteen minutes, and the oldest had been "running" since March. A
+ * badge that believes the column marks fifty threads as live for one agent
+ * who is working on maybe two, which makes the badge worse than nothing —
+ * the reader learns to ignore it, including on the thread that is real.
+ *
+ * So liveness is a CLAIM WITH AN EXPIRY, not a stored state. Thirty minutes
+ * is deliberately generous: a session waiting on a sibling's review writes
+ * nothing while it waits, and it is still live in the sense the reader cares
+ * about. The observed gap is wide enough that the exact number barely
+ * matters — real sessions had written within ~2 hours, and the next-freshest
+ * abandoned one was ~10 hours stale.
+ */
+export const SESSION_LIVE_WINDOW_MS = 30 * 60 * 1000;
+
+/** The fields liveness depends on — a subset of SpineSessionRow. */
+export interface SessionLivenessFields {
+  lifecycle: string | null;
+  currentPhase: string | null;
+  updatedAt: string;
+}
+
+/**
+ * Whether a session is working right now. Three independent ways to be not-live:
+ *
+ * 1. The lifecycle is not a working one.
+ * 2. The session declared itself finished via its phase but the lifecycle was
+ *    never moved off `running` — a real and common shape, and the phase is the
+ *    more recent statement of the two. "Finished" is isTerminalPhaseMarker's
+ *    call, not a comparison invented here: the fleet already recognises
+ *    `complete`, `completed` and either with a `:<reason>` suffix, and a
+ *    session the CLI's picker treats as history must not be advertised live.
+ * 3. Its last write is older than the window (see above).
+ *
+ * `nowMs` is injected rather than read here so the rule is testable and so a
+ * single request classifies every session against one instant.
+ */
+export function isSessionLive(session: SessionLivenessFields, nowMs: number): boolean {
+  if (!session.lifecycle || !LIVE_LIFECYCLES.has(session.lifecycle)) return false;
+  if (isTerminalPhaseMarker(session.currentPhase)) return false;
+  const updatedMs = Date.parse(session.updatedAt);
+  // An unparseable timestamp is no evidence of life. A future one is clock
+  // skew, not a lie, so it stays live.
+  if (!Number.isFinite(updatedMs)) return false;
+  return nowMs - updatedMs <= SESSION_LIVE_WINDOW_MS;
+}
+
 export interface MergeThreadSpinesInput {
   threads: SpineThreadRow[];
   sessions: SpineSessionRow[];
@@ -137,6 +222,11 @@ export interface MergeThreadSpinesInput {
    * slug set.
    */
   parse: (key: string) => { project: string | null; type: string; id: string } | null;
+  /**
+   * The instant every session is classified against. Injected so one request
+   * cannot call an early session live and a later identical one stale.
+   */
+  nowMs?: number;
 }
 
 /**
@@ -270,6 +360,7 @@ function laterIso(a: string, b: string): string {
 
 export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] {
   const spines = new Map<string, WorkingSpine>();
+  const nowMs = input.nowMs ?? Date.now();
 
   const spineFor = (key: string): WorkingSpine => {
     let spine = spines.get(key);
@@ -294,10 +385,15 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
     const spine = spineFor(t.threadKey);
     spine.thread = {
       title: t.title,
+      summary: t.summary,
       status: t.status,
       createdBySlug: t.createdBySlug,
       participants: t.participants,
+      // Carried through, not merged into `participants`: a person is not an
+      // agent to wake (Lumen, #620 — the merger used to drop this).
+      people: t.people ?? [],
       closedAt: t.closedAt,
+      lastMessage: t.lastMessage ?? null,
     };
     // Pinned identity is authoritative even when all three components are
     // null (a pre-pinning thread awaiting reconciliation stays "unknown",
@@ -314,6 +410,9 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
     const keys = new Map<string, 'anchor' | 'active' | 'both'>();
     if (anchor) keys.set(anchor, 'anchor');
     if (active) keys.set(active, keys.has(active) ? 'both' : 'active');
+    // Classified once, outside the key loop: a session carried by two keys is
+    // one session, and must not be live on one of them and stale on the other.
+    const live = isSessionLive(s, nowMs);
     for (const [key, relation] of keys) {
       const spine = spineFor(key);
       spine.sessions.push({
@@ -323,6 +422,7 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
         status: s.status,
         phase: s.currentPhase,
         relation,
+        live,
         updatedAt: s.updatedAt,
         studioId: s.studioId,
       });

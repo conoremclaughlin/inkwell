@@ -365,7 +365,7 @@ npx prettier --write "path/to/file"
 yarn dev                   # Start API+web with hot reload (default: port 3001)
 yarn prod                  # One-shot: build + migrate + start (alias for prod:up)
 yarn prod:refresh          # Install + build latest code after pull
-yarn prod:migrate          # Apply pending migrations (auto-detects local vs remote)
+yarn prod:migrate          # Apply pending migrations (local: through the wrapper, stack proven; linked: db push; a window migration is refused on both)
 yarn prod:direct           # Run API+web directly in production mode
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
@@ -375,6 +375,10 @@ yarn local:status          # Show local migration status
 yarn linked:status         # Show linked (remote) migration status
 yarn local:migrate         # Apply local migrations
 yarn linked:migrate        # Apply linked (remote) migrations
+yarn db:migrate <file>     # Apply one migration file to the local stack, recorded under the file's version (any worktree)
+yarn db:migrate:status     # Local ledger vs the files in this checkout
+yarn db:migrate:pending    # Apply every pending file in version order (yarn dev runs this first)
+yarn dev:no-migrations     # Start without applying pending migrations, on purpose
 yarn test:integration:db:local   # DB integration suite against isolated local Supabase
 yarn test:integration:runtime    # Runtime/CLI integration suite
 yarn logs:ink              # View Inkwell server logs (structured JSON)
@@ -408,7 +412,99 @@ Notes:
 
 ### Integration tests
 
-`yarn test:integration:db:local` spins up an **isolated, temporary local Supabase stack** with dedicated ports, applies migrations + seed, runs integration tests, then tears it down. This avoids accidental use of remote credentials.
+Local DB integration tests share a **retained, test-only Supabase stack** across
+worktrees. The first run starts it and applies migrations + seed; subsequent runs
+reuse the containers and schema. CI still starts, resets, and tears down a fresh
+stack on each job. Neither path uses an application database.
+
+```bash
+# Focus on the affected integration file rather than repeatedly running everything.
+yarn test:integration:db:local src/auth/ink-tokens.integration.test.ts
+# Rebuild test data/schema after migration/seed changes, or for a clean rerun.
+yarn test:integration:db:local --reset
+# Release the retained containers and their test data when finished.
+yarn test:integration:db:local --stop
+# CI-equivalent lifecycle (stop a retained stack first).
+yarn test:integration:db:local --fresh
+```
+
+**Warm runs clean fixture data before the suite, not on exit.** A reviewed list of
+70 application fixture tables is truncated in one `RESTRICT` transaction and
+restored from a data-only snapshot captured immediately after migrations and seed.
+There is no database/schema drop, implicit `CASCADE`, or container recreation.
+Migration-seeded templates and seed rows are restored too; auth, storage, extensions,
+migration metadata, `pcp_config`, and `permission_definitions` are outside that scope.
+The public-table catalog must exactly match the fixture/exclusion partition.
+Unclassified tables or changed excluded reference rows refuse rather than silently
+carrying data forward. Checksums for all 72 public tables must match the cold
+baseline before the transaction can commit. This does not isolate test files from
+one another within a run, restore excluded non-public data, or repair schema drift.
+Use `--reset` to diagnose schema-dependent failures.
+
+Cleanup requires the **exact** `supabase_db_<integration-project>` container name,
+recorded Docker ID, project label, running/unpaused state, and reserved DB port.
+SQL executes inside that immutable container ID over an explicit local socket,
+never via an inherited connection URL. `current_database() = 'postgres'` is also
+required, but is only a typo guard: application stacks can share that SQL name.
+The additional `_ink_it.stack` row, installed only after a managed reset, must match
+the project, full container ID, fingerprint, and random token **in the same
+transaction** before cleanup. Missing or mismatching identity refuses; do not
+create this marker by hand to force adoption. The restore remains on the `postgres`
+role: transaction-local replication mode suppresses normal triggers/FKs only around
+the trusted baseline load, then returns to origin mode before checksum verification.
+It does not authenticate as `supabase_admin` or persist trigger-state changes. The
+pinned local Supabase image grants this parameter to `postgres`; failure to set it
+refuses cleanup rather than attempting privilege escalation.
+
+The DB marker also records an in-progress run independently of schema readiness.
+It is cleared only by that run after success; failures/interrupts preserve it and
+the dirty database for investigation. `run.json` in the workdir is an additional
+diagnostic during startup/reset, not an ownership lock. The next owner cleans on
+acquire even when the previous run died without cleanup. Baseline SQL stays in the
+private cache, integrity-checked against its recorded hash. Never copy a baseline
+or state file from another stack.
+
+A fingerprint covers migration/seed SQL, config, exclusions, and CLI version; a
+mismatch refuses reuse with an explicit reset/stop instruction rather than silently
+running against another branch's schema. It does not detect arbitrary SQL changes
+made directly to the running database.
+
+The harness takes project/port locks. A competing run or an occupied port prints
+its owner when available and tells the caller to **wait and retry**, without stopping
+that owner's stack. Run DB integration tests sparingly; prefer focused unit tests
+while iterating. Unmanaged/legacy kept stacks are never automatically adopted.
+
+State lives outside the repository at
+`~/.cache/inkwell/integration-db/<project>`. `INTEGRATION_SUPABASE_CACHE_DIR` can
+override the base. Locks remain machine-wide under `~/.cache/inkwell/integration-db-locks` regardless
+of that override. A descendant process may keep a run's lock after its original
+runner exits; the recorded runner PID is not necessarily the current holder.
+The refusal prints `lsof -nP <lockfile>` to find the actual holders. Normally,
+let them finish. For an orphan, verify its PID, command, and parent process first
+(for example, `ps -p <pid> -o pid,ppid,command`). Only terminate that exact PID if
+it is your own abandoned test process; otherwise ask its owner. Retry after all
+holders exit. **Never delete the lock file or cache to clear a lock**, and never
+kill by process-name pattern: deleting a locked inode can allow overlapping runs.
+
+If the DB container disappears externally but other containers survive, `--stop`
+can recover only when every survivor's name and ID matches the recorded ownership
+snapshot. Reuse/reset refuses with that recovery instruction; stop, then rerun to
+recreate the stack. Unknown or replaced containers remain unmanaged and are never
+stopped by this harness. Use the original owner's workdir/cleanup command only
+after verifying ownership; do not delete the state file to force adoption.
+
+Existing `INTEGRATION_SUPABASE_*_PORT` overrides remain supported;
+the six source config port fields must retain their repository defaults, or the
+harness refuses before starting containers. Use the overrides rather than editing
+`supabase/config.toml` to select integration ports.
+Project IDs must be `ink-integration` or `ink-integration-<suffix>`. `--reuse` explicitly
+selects retained mode (including in a CI-marked shell). The legacy
+`INTEGRATION_KEEP_SUPABASE=1` with `--fresh` retains a temporary inspection stack;
+release it with the printed `supabase stop --workdir ... --no-backup` command before
+using the same project again. If that output is lost, inspect `ink-supabase-it-*`
+directories under `INTEGRATION_SUPABASE_WORKDIR_BASE` (or the system temp directory
+when unset). Verify `supabase/config.toml` names your test project before selecting
+a workdir; the prefix alone does not establish ownership.
 
 ## Key Technologies
 

@@ -9,7 +9,7 @@
  * - Directories with manifest.yaml + SKILL.md
  *
  * Loading order (lowest → highest precedence, later overrides by name):
- * 1. Built-in:  packages/api/src/skills/builtin/   (shipped with PCP)
+ * 1. Built-in:  packages/api/src/skills/builtin/   (shipped with Inkwell)
  * 2. Extra dirs: configurable paths                 (ClawHub interop, etc.)
  * 3. Managed:   ~/.ink/skills/                      (user-installed, all SBs)
  * 4. Workspace:  <cwd>/.ink/skills/                 (per-worktree, per-SB)
@@ -118,7 +118,7 @@ function extractOpenClawMetadata(frontmatter: Record<string, unknown>): Partial<
 
 /**
  * Convert frontmatter to SkillManifest.
- * Supports both PCP's flat format and OpenClaw's nested `metadata.openclaw` format.
+ * Supports both Inkwell's flat format and OpenClaw's nested `metadata.openclaw` format.
  */
 function frontmatterToManifest(
   frontmatter: Record<string, unknown>,

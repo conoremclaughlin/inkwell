@@ -356,7 +356,7 @@ function SessionCard({ session }: { session: Session }) {
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-muted-foreground">
                 <div>
-                  <span className="text-muted-foreground/70">PCP Session ID: </span>
+                  <span className="text-muted-foreground/70">Inkwell Session ID: </span>
                   <code className="font-mono select-all">{session.id}</code>
                 </div>
                 {session.backendSessionId && (

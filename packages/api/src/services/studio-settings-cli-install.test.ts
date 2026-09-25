@@ -21,7 +21,7 @@ vi.mock('../utils/logger', () => ({
 }));
 
 import { ensureStudioSettings } from './studio-settings';
-import { installHooks, isPcpHookCommand } from '../../../cli/src/commands/hooks.js';
+import { installHooks, isInkHookCommand } from '../../../cli/src/commands/hooks.js';
 
 const SETTINGS = join('.claude', 'settings.local.json');
 
@@ -62,7 +62,7 @@ describe('server-generated hooks → ink hooks install', () => {
     const generated = hookCommands((await readSettings(worktree)).hooks);
     expect(generated).toHaveLength(6);
     for (const command of generated) {
-      expect(isPcpHookCommand(command), command).toBe(true);
+      expect(isInkHookCommand(command), command).toBe(true);
     }
 
     const { result, backend } = installHooks(worktree);
@@ -90,7 +90,7 @@ describe('server-generated hooks → ink hooks install', () => {
     expect(await ensureStudioSettings(worktree)).toBe(true);
 
     for (const command of hookCommands((await readSettings(worktree)).hooks)) {
-      expect(isPcpHookCommand(command), command).toBe(true);
+      expect(isInkHookCommand(command), command).toBe(true);
     }
     expect(installHooks(worktree).result).toBe('installed');
   });

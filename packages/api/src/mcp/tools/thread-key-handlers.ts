@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { assertWriteRole, resolveCallerWorkspace } from './caller-principal';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import {
   ThreadKeyTypesRepository,
@@ -50,7 +51,10 @@ export async function handleListThreadKeyTypes(args: unknown, dataComposer: Data
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
   const repo = new ThreadKeyTypesRepository(dataComposer.getClient());
-  const effective = await repo.listEffective(user.id);
+  // The registry is workspace-scoped (spec inkmail-thread-scope §1b): the
+  // caller's identity fixes the workspace, else the user's personal one.
+  const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  const effective = await repo.listEffective(workspaceId);
 
   return {
     content: [
@@ -80,10 +84,12 @@ export async function handleSetThreadKeyType(args: unknown, dataComposer: DataCo
   const params = setThreadKeyTypeSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const repo = new ThreadKeyTypesRepository(dataComposer.getClient());
+  const { workspaceId, role } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  assertWriteRole(role, 'change thread-key types');
 
   if (params.reset) {
-    const removed = await repo.clearOverride(user.id, params.type);
-    const effective = await repo.getEffective(user.id, params.type);
+    const removed = await repo.clearOverride(workspaceId, params.type);
+    const effective = await repo.getEffective(workspaceId, params.type);
     return {
       content: [
         {
@@ -128,7 +134,7 @@ export async function handleSetThreadKeyType(args: unknown, dataComposer: DataCo
     .getClient()
     .from('projects')
     .select('slug')
-    .eq('user_id', user.id)
+    .eq('workspace_id', workspaceId)
     .eq('slug', params.type);
   if (slugErr) {
     // Fail closed: cannot prove no collision → refuse the write, never guess.
@@ -141,7 +147,7 @@ export async function handleSetThreadKeyType(args: unknown, dataComposer: DataCo
     );
   }
 
-  const row = await repo.setOverride(user.id, params.type, {
+  const row = await repo.setOverride(workspaceId, params.type, {
     writeIntent: params.writeIntent as WriteIntent,
     studioPolicy: params.studioPolicy as StudioPolicy,
     description: params.description,

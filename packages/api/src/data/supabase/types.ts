@@ -249,18 +249,21 @@ export type Database = {
           {
             foreignKeyName: 'agent_identities_default_session_id_fkey';
             columns: ['default_session_id'];
+            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_identities_user_id_fkey';
             columns: ['user_id'];
+            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_identities_workspace_id_fkey';
             columns: ['workspace_id'];
+            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -538,6 +541,192 @@ export type Database = {
           {
             foreignKeyName: 'agent_sessions_user_id_fkey';
             columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      alert_events: {
+        Row: {
+          created_at: string;
+          dedupe_key: string;
+          delivery: Json;
+          detail: string | null;
+          first_seen_at: string;
+          id: string;
+          last_delivered_severity: string | null;
+          last_notified_at: string | null;
+          last_seen_at: string;
+          metrics: Json;
+          notify_claim_severity: string | null;
+          notify_claim_token: string | null;
+          notify_claimed_at: string | null;
+          occurrence_count: number;
+          resolved_at: string | null;
+          severity: string;
+          source: string;
+          title: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          dedupe_key: string;
+          delivery?: Json;
+          detail?: string | null;
+          first_seen_at?: string;
+          id?: string;
+          last_delivered_severity?: string | null;
+          last_notified_at?: string | null;
+          last_seen_at?: string;
+          metrics?: Json;
+          notify_claim_severity?: string | null;
+          notify_claim_token?: string | null;
+          notify_claimed_at?: string | null;
+          occurrence_count?: number;
+          resolved_at?: string | null;
+          severity: string;
+          source: string;
+          title: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          dedupe_key?: string;
+          delivery?: Json;
+          detail?: string | null;
+          first_seen_at?: string;
+          id?: string;
+          last_delivered_severity?: string | null;
+          last_notified_at?: string | null;
+          last_seen_at?: string;
+          metrics?: Json;
+          notify_claim_severity?: string | null;
+          notify_claim_token?: string | null;
+          notify_claimed_at?: string | null;
+          occurrence_count?: number;
+          resolved_at?: string | null;
+          severity?: string;
+          source?: string;
+          title?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_events_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      alert_sources: {
+        Row: {
+          created_at: string;
+          description: string | null;
+          expected_interval_seconds: number | null;
+          id: string;
+          last_detail: string | null;
+          last_seen_at: string | null;
+          last_status: string | null;
+          source: string;
+          stale_alerted_at: string | null;
+          staleness_grace_factor: number;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          description?: string | null;
+          expected_interval_seconds?: number | null;
+          id?: string;
+          last_detail?: string | null;
+          last_seen_at?: string | null;
+          last_status?: string | null;
+          source: string;
+          stale_alerted_at?: string | null;
+          staleness_grace_factor?: number;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          description?: string | null;
+          expected_interval_seconds?: number | null;
+          id?: string;
+          last_detail?: string | null;
+          last_seen_at?: string | null;
+          last_status?: string | null;
+          source?: string;
+          stale_alerted_at?: string | null;
+          staleness_grace_factor?: number;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_sources_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      alert_webhooks: {
+        Row: {
+          consecutive_failures: number;
+          created_at: string;
+          enabled: boolean;
+          id: string;
+          last_delivery_at: string | null;
+          last_delivery_error: string | null;
+          last_delivery_status: number | null;
+          name: string;
+          secret: string;
+          severities: string[];
+          sources: string[];
+          updated_at: string;
+          url: string;
+          user_id: string;
+        };
+        Insert: {
+          consecutive_failures?: number;
+          created_at?: string;
+          enabled?: boolean;
+          id?: string;
+          last_delivery_at?: string | null;
+          last_delivery_error?: string | null;
+          last_delivery_status?: number | null;
+          name: string;
+          secret: string;
+          severities?: string[];
+          sources?: string[];
+          updated_at?: string;
+          url: string;
+          user_id: string;
+        };
+        Update: {
+          consecutive_failures?: number;
+          created_at?: string;
+          enabled?: boolean;
+          id?: string;
+          last_delivery_at?: string | null;
+          last_delivery_error?: string | null;
+          last_delivery_status?: number | null;
+          name?: string;
+          secret?: string;
+          severities?: string[];
+          sources?: string[];
+          updated_at?: string;
+          url?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_webhooks_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1432,7 +1621,10 @@ export type Database = {
           message_type: string;
           metadata: Json | null;
           priority: string;
-          sender_agent_id: string;
+          sender_agent_id: string | null;
+          sender_kind: string;
+          sender_sb_id: string | null;
+          sender_user_id: string | null;
           thread_id: string;
         };
         Insert: {
@@ -1442,7 +1634,10 @@ export type Database = {
           message_type?: string;
           metadata?: Json | null;
           priority?: string;
-          sender_agent_id: string;
+          sender_agent_id?: string | null;
+          sender_kind: string;
+          sender_sb_id?: string | null;
+          sender_user_id?: string | null;
           thread_id: string;
         };
         Update: {
@@ -1452,13 +1647,17 @@ export type Database = {
           message_type?: string;
           metadata?: Json | null;
           priority?: string;
-          sender_agent_id?: string;
+          sender_agent_id?: string | null;
+          sender_kind?: string;
+          sender_sb_id?: string | null;
+          sender_user_id?: string | null;
           thread_id?: string;
         };
         Relationships: [
           {
             foreignKeyName: 'inbox_thread_messages_thread_id_fkey';
             columns: ['thread_id'];
+            isOneToOne: false;
             referencedRelation: 'inbox_threads';
             referencedColumns: ['id'];
           },
@@ -1466,59 +1665,112 @@ export type Database = {
       };
       inbox_thread_participants: {
         Row: {
-          agent_id: string;
           joined_at: string | null;
+          principal_key: string;
+          sb_id: string | null;
           session_id: string | null;
           thread_id: string;
+          user_id: string | null;
+          workspace_id: string;
         };
         Insert: {
-          agent_id: string;
           joined_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           session_id?: string | null;
           thread_id: string;
+          user_id?: string | null;
+          workspace_id: string;
         };
         Update: {
-          agent_id?: string;
           joined_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           session_id?: string | null;
           thread_id?: string;
+          user_id?: string | null;
+          workspace_id?: string;
         };
         Relationships: [
           {
+            foreignKeyName: 'inbox_thread_participants_sb_workspace_fkey';
+            columns: ['sb_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+          {
             foreignKeyName: 'inbox_thread_participants_session_id_fkey';
             columns: ['session_id'];
+            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'inbox_thread_participants_thread_id_fkey';
             columns: ['thread_id'];
+            isOneToOne: false;
             referencedRelation: 'inbox_threads';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'inbox_thread_participants_thread_workspace_fkey';
+            columns: ['thread_id', 'workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_threads';
+            referencedColumns: ['id', 'workspace_id'];
+          },
+          {
+            foreignKeyName: 'inbox_thread_participants_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
             referencedColumns: ['id'];
           },
         ];
       };
       inbox_thread_read_status: {
         Row: {
-          agent_id: string;
           last_read_at: string | null;
+          principal_key: string;
+          sb_id: string | null;
           thread_id: string;
+          user_id: string | null;
         };
         Insert: {
-          agent_id: string;
           last_read_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           thread_id: string;
+          user_id?: string | null;
         };
         Update: {
-          agent_id?: string;
           last_read_at?: string | null;
+          principal_key?: string;
+          sb_id?: string | null;
           thread_id?: string;
+          user_id?: string | null;
         };
         Relationships: [
           {
+            foreignKeyName: 'inbox_thread_read_status_sb_id_fkey';
+            columns: ['sb_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
             foreignKeyName: 'inbox_thread_read_status_thread_id_fkey';
             columns: ['thread_id'];
+            isOneToOne: false;
             referencedRelation: 'inbox_threads';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'inbox_thread_read_status_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
             referencedColumns: ['id'];
           },
         ];
@@ -1526,9 +1778,13 @@ export type Database = {
       inbox_threads: {
         Row: {
           closed_at: string | null;
-          closed_by_agent_id: string | null;
+          closed_by_kind: string | null;
+          closed_by_sb_id: string | null;
+          closed_by_user_id: string | null;
           created_at: string | null;
-          created_by_agent_id: string;
+          created_by_kind: string;
+          created_by_sb_id: string | null;
+          created_by_user_id: string | null;
           id: string;
           key_id: string | null;
           key_project: string | null;
@@ -1543,13 +1799,17 @@ export type Database = {
           title_updated_at: string | null;
           title_updated_by_sb_id: string | null;
           updated_at: string | null;
-          user_id: string;
+          workspace_id: string;
         };
         Insert: {
           closed_at?: string | null;
-          closed_by_agent_id?: string | null;
+          closed_by_kind?: string | null;
+          closed_by_sb_id?: string | null;
+          closed_by_user_id?: string | null;
           created_at?: string | null;
-          created_by_agent_id: string;
+          created_by_kind: string;
+          created_by_sb_id?: string | null;
+          created_by_user_id?: string | null;
           id?: string;
           key_id?: string | null;
           key_project?: string | null;
@@ -1564,13 +1824,17 @@ export type Database = {
           title_updated_at?: string | null;
           title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
-          user_id: string;
+          workspace_id: string;
         };
         Update: {
           closed_at?: string | null;
-          closed_by_agent_id?: string | null;
+          closed_by_kind?: string | null;
+          closed_by_sb_id?: string | null;
+          closed_by_user_id?: string | null;
           created_at?: string | null;
-          created_by_agent_id?: string;
+          created_by_kind?: string;
+          created_by_sb_id?: string | null;
+          created_by_user_id?: string | null;
           id?: string;
           key_id?: string | null;
           key_project?: string | null;
@@ -1585,7 +1849,7 @@ export type Database = {
           title_updated_at?: string | null;
           title_updated_by_sb_id?: string | null;
           updated_at?: string | null;
-          user_id?: string;
+          workspace_id?: string;
         };
         Relationships: [
           {
@@ -1601,9 +1865,10 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'inbox_threads_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
+            foreignKeyName: 'inbox_threads_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2439,6 +2704,34 @@ export type Database = {
           },
         ];
       };
+      observation_conflicts: {
+        Row: {
+          conflicting: Json;
+          ingested_at: string;
+          operation_id: string;
+          seq: number;
+        };
+        Insert: {
+          conflicting: Json;
+          ingested_at?: string;
+          operation_id: string;
+          seq: number;
+        };
+        Update: {
+          conflicting?: Json;
+          ingested_at?: string;
+          operation_id?: string;
+          seq?: number;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'observation_conflicts_operation_id_fkey';
+            columns: ['operation_id'];
+            referencedRelation: 'publication_operations';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       pcp_config: {
         Row: {
           key: string;
@@ -2487,6 +2780,197 @@ export type Database = {
         };
         Relationships: [];
       };
+      publication_operation_events: {
+        Row: {
+          actor_identity_id: string | null;
+          actor_user_id: string | null;
+          connectivity: string | null;
+          evidence: Json | null;
+          exposure: string | null;
+          ingested_at: string;
+          observed_at: string;
+          operation_id: string;
+          phase: string;
+          refs: string | null;
+          seq: number;
+          server_state_verified: boolean | null;
+          server_watermark: Json | null;
+          source: string;
+        };
+        Insert: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          connectivity?: string | null;
+          evidence?: Json | null;
+          exposure?: string | null;
+          ingested_at?: string;
+          observed_at: string;
+          operation_id: string;
+          phase: string;
+          refs?: string | null;
+          seq: number;
+          server_state_verified?: boolean | null;
+          server_watermark?: Json | null;
+          source: string;
+        };
+        Update: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          connectivity?: string | null;
+          evidence?: Json | null;
+          exposure?: string | null;
+          ingested_at?: string;
+          observed_at?: string;
+          operation_id?: string;
+          phase?: string;
+          refs?: string | null;
+          seq?: number;
+          server_state_verified?: boolean | null;
+          server_watermark?: Json | null;
+          source?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'publication_operation_events_actor_identity_id_fkey';
+            columns: ['actor_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operation_events_actor_user_id_fkey';
+            columns: ['actor_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operation_events_operation_id_fkey';
+            columns: ['operation_id'];
+            referencedRelation: 'publication_operations';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      publication_operations: {
+        Row: {
+          accepts_unverified_server_state: boolean;
+          authority: string;
+          authority_event_id: string | null;
+          authorizer_identity_id: string | null;
+          authorizer_user_id: string | null;
+          binding: Json;
+          executor_identity_id: string | null;
+          executor_session_id: string | null;
+          execution_modes: string[];
+          gate_attempt: number | null;
+          gate_task_id: string | null;
+          id: string;
+          intent_hash: string;
+          policy_ref: Json;
+          prepared_at: string;
+          publish_task_id: string | null;
+          reason: string | null;
+          task_group_id: string | null;
+          user_id: string;
+        };
+        Insert: {
+          accepts_unverified_server_state?: boolean;
+          authority: string;
+          authority_event_id?: string | null;
+          authorizer_identity_id?: string | null;
+          authorizer_user_id?: string | null;
+          binding: Json;
+          executor_identity_id?: string | null;
+          executor_session_id?: string | null;
+          execution_modes?: string[];
+          gate_attempt?: number | null;
+          gate_task_id?: string | null;
+          id: string;
+          intent_hash: string;
+          policy_ref: Json;
+          prepared_at?: string;
+          publish_task_id?: string | null;
+          reason?: string | null;
+          task_group_id?: string | null;
+          user_id: string;
+        };
+        Update: {
+          accepts_unverified_server_state?: boolean;
+          authority?: string;
+          authority_event_id?: string | null;
+          authorizer_identity_id?: string | null;
+          authorizer_user_id?: string | null;
+          binding?: Json;
+          executor_identity_id?: string | null;
+          executor_session_id?: string | null;
+          execution_modes?: string[];
+          gate_attempt?: number | null;
+          gate_task_id?: string | null;
+          id?: string;
+          intent_hash?: string;
+          policy_ref?: Json;
+          prepared_at?: string;
+          publish_task_id?: string | null;
+          reason?: string | null;
+          task_group_id?: string | null;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'publication_operations_authority_event_id_fkey';
+            columns: ['authority_event_id'];
+            referencedRelation: 'task_gate_events';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_authorizer_identity_id_fkey';
+            columns: ['authorizer_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_authorizer_user_id_fkey';
+            columns: ['authorizer_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_executor_identity_id_fkey';
+            columns: ['executor_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_executor_session_id_fkey';
+            columns: ['executor_session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_gate_task_id_fkey';
+            columns: ['gate_task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_publish_task_id_fkey';
+            columns: ['publish_task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_task_group_id_fkey';
+            columns: ['task_group_id'];
+            referencedRelation: 'task_groups';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       project_slug_aliases: {
         Row: {
           alias: string;
@@ -2494,6 +2978,7 @@ export type Database = {
           id: string;
           project_id: string;
           user_id: string;
+          workspace_id: string;
         };
         Insert: {
           alias: string;
@@ -2501,6 +2986,7 @@ export type Database = {
           id?: string;
           project_id: string;
           user_id: string;
+          workspace_id: string;
         };
         Update: {
           alias?: string;
@@ -2508,18 +2994,28 @@ export type Database = {
           id?: string;
           project_id?: string;
           user_id?: string;
+          workspace_id?: string;
         };
         Relationships: [
           {
             foreignKeyName: 'project_slug_aliases_project_id_fkey';
             columns: ['project_id'];
+            isOneToOne: false;
             referencedRelation: 'projects';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'project_slug_aliases_user_id_fkey';
             columns: ['user_id'];
+            isOneToOne: false;
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'project_slug_aliases_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2539,6 +3035,7 @@ export type Database = {
           tech_stack: string[] | null;
           updated_at: string | null;
           user_id: string;
+          workspace_id: string;
         };
         Insert: {
           created_at?: string | null;
@@ -2554,6 +3051,7 @@ export type Database = {
           tech_stack?: string[] | null;
           updated_at?: string | null;
           user_id: string;
+          workspace_id: string;
         };
         Update: {
           created_at?: string | null;
@@ -2569,12 +3067,21 @@ export type Database = {
           tech_stack?: string[] | null;
           updated_at?: string | null;
           user_id?: string;
+          workspace_id?: string;
         };
         Relationships: [
           {
             foreignKeyName: 'projects_user_id_fkey';
             columns: ['user_id'];
+            isOneToOne: false;
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'projects_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -3550,6 +4057,73 @@ export type Database = {
           },
         ];
       };
+      task_authority_holds: {
+        Row: {
+          binding_hash: string | null;
+          cause_event_id: string | null;
+          cause_operation_id: string | null;
+          id: string;
+          kind: string;
+          placed_at: string;
+          released_at: string | null;
+          released_by: Json | null;
+          source_attempt: number | null;
+          source_gate_id: string | null;
+          task_id: string;
+        };
+        Insert: {
+          binding_hash?: string | null;
+          cause_event_id?: string | null;
+          cause_operation_id?: string | null;
+          id?: string;
+          kind: string;
+          placed_at?: string;
+          released_at?: string | null;
+          released_by?: Json | null;
+          source_attempt?: number | null;
+          source_gate_id?: string | null;
+          task_id: string;
+        };
+        Update: {
+          binding_hash?: string | null;
+          cause_event_id?: string | null;
+          cause_operation_id?: string | null;
+          id?: string;
+          kind?: string;
+          placed_at?: string;
+          released_at?: string | null;
+          released_by?: Json | null;
+          source_attempt?: number | null;
+          source_gate_id?: string | null;
+          task_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_authority_holds_cause_event_id_fkey';
+            columns: ['cause_event_id'];
+            referencedRelation: 'task_gate_events';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_authority_holds_cause_operation_id_fkey';
+            columns: ['cause_operation_id'];
+            referencedRelation: 'publication_operations';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_authority_holds_source_gate_id_fkey';
+            columns: ['source_gate_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_authority_holds_task_id_fkey';
+            columns: ['task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       task_comments: {
         Row: {
           content: string;
@@ -3664,6 +4238,7 @@ export type Database = {
           assignee_identity_id: string | null;
           assignee_user_id: string | null;
           attempt: number;
+          binding_hash: string | null;
           claim_token: string | null;
           created_at: string;
           event: string;
@@ -3671,6 +4246,7 @@ export type Database = {
           gate_version: number;
           id: string;
           reason: string | null;
+          resolves_event_id: string | null;
           session_id: string | null;
           task_id: string;
           user_id: string;
@@ -3681,6 +4257,7 @@ export type Database = {
           assignee_identity_id?: string | null;
           assignee_user_id?: string | null;
           attempt: number;
+          binding_hash?: string | null;
           claim_token?: string | null;
           created_at?: string;
           event: string;
@@ -3688,6 +4265,7 @@ export type Database = {
           gate_version: number;
           id?: string;
           reason?: string | null;
+          resolves_event_id?: string | null;
           session_id?: string | null;
           task_id: string;
           user_id: string;
@@ -3698,6 +4276,7 @@ export type Database = {
           assignee_identity_id?: string | null;
           assignee_user_id?: string | null;
           attempt?: number;
+          binding_hash?: string | null;
           claim_token?: string | null;
           created_at?: string;
           event?: string;
@@ -3705,6 +4284,7 @@ export type Database = {
           gate_version?: number;
           id?: string;
           reason?: string | null;
+          resolves_event_id?: string | null;
           session_id?: string | null;
           task_id?: string;
           user_id?: string;
@@ -3732,6 +4312,12 @@ export type Database = {
             foreignKeyName: 'task_gate_events_assignee_user_id_fkey';
             columns: ['assignee_user_id'];
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_resolves_event_id_fkey';
+            columns: ['resolves_event_id'];
+            referencedRelation: 'task_gate_events';
             referencedColumns: ['id'];
           },
           {
@@ -4037,7 +4623,11 @@ export type Database = {
           dwell_started_at: string | null;
           eligible_at: string | null;
           gate_attempt: number;
+          gate_authors: Json | null;
+          gate_binding: Json | null;
+          gate_binding_hash: string | null;
           gate_opened_at: string | null;
+          gate_request_revision: number;
           gate_state: string | null;
           gate_version: number;
           id: string;
@@ -4072,7 +4662,11 @@ export type Database = {
           dwell_started_at?: string | null;
           eligible_at?: string | null;
           gate_attempt?: number;
+          gate_authors?: Json | null;
+          gate_binding?: Json | null;
+          gate_binding_hash?: string | null;
           gate_opened_at?: string | null;
+          gate_request_revision?: number;
           gate_state?: string | null;
           gate_version?: number;
           id?: string;
@@ -4107,7 +4701,11 @@ export type Database = {
           dwell_started_at?: string | null;
           eligible_at?: string | null;
           gate_attempt?: number;
+          gate_authors?: Json | null;
+          gate_binding?: Json | null;
+          gate_binding_hash?: string | null;
           gate_opened_at?: string | null;
+          gate_request_revision?: number;
           gate_state?: string | null;
           gate_version?: number;
           id?: string;
@@ -4174,7 +4772,7 @@ export type Database = {
           studio_policy: string;
           type: string;
           updated_at: string;
-          user_id: string | null;
+          workspace_id: string | null;
           write_intent: string;
         };
         Insert: {
@@ -4184,7 +4782,7 @@ export type Database = {
           studio_policy: string;
           type: string;
           updated_at?: string;
-          user_id?: string | null;
+          workspace_id?: string | null;
           write_intent: string;
         };
         Update: {
@@ -4194,14 +4792,15 @@ export type Database = {
           studio_policy?: string;
           type?: string;
           updated_at?: string;
-          user_id?: string | null;
+          workspace_id?: string | null;
           write_intent?: string;
         };
         Relationships: [
           {
-            foreignKeyName: 'thread_key_types_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
+            foreignKeyName: 'thread_key_types_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -4601,19 +5200,53 @@ export type Database = {
       };
       advance_thread_read_pointer: {
         Args: {
-          p_agent_id: string;
+          p_sb_id: string;
           p_thread_id: string;
           p_through_message_id: string;
+          p_user_id: string;
         };
         Returns: string;
       };
-      reopen_inbox_thread: {
+      alert_severity_rank: { Args: { p_severity: string }; Returns: number };
+      alert_should_claim: {
         Args: {
-          p_thread_id: string;
-          p_actor_kind: string;
-          p_actor_agent_id?: string | null;
+          p_claim_ttl_seconds: number;
+          p_claimed_at: string | null;
+          p_cooldown_seconds: number;
+          p_delivered_severity: string | null;
+          p_last_notified_at: string | null;
+          p_new_severity: string;
+          p_now: string;
+          p_row_severity: string;
         };
         Returns: boolean;
+      };
+      reopen_inbox_thread: {
+        Args: {
+          p_actor_sb_id: string;
+          p_actor_user_id: string;
+          p_thread_id: string;
+        };
+        Returns: boolean;
+      };
+      clear_routing_hold: {
+        Args: {
+          p_agent_id: string;
+          p_routed_since: string;
+          p_thread_id: string;
+          p_workspace_id: string;
+        };
+        Returns: number;
+      };
+      stamp_routing_hold: {
+        Args: {
+          p_agent_id: string;
+          p_attempt_started: string;
+          p_hold: Json;
+          p_thread_id: string;
+          p_workspace_id: string;
+        };
+        Returns: number;
       };
       update_inbox_thread_metadata: {
         Args: {
@@ -4711,15 +5344,8 @@ export type Database = {
         Returns: Json;
       };
       compute_thread_key_pin: {
-        Args: {
-          p_user_id: string;
-          p_key: string;
-        };
-        Returns: {
-          o_project: string | null;
-          o_type: string | null;
-          o_id: string | null;
-        };
+        Args: { p_key: string; p_workspace_id: string };
+        Returns: Record<string, unknown>;
       };
       convert_task_group_to_graph: {
         Args: {
@@ -4733,12 +5359,7 @@ export type Database = {
         Returns: Json;
       };
       get_unread_thread_candidates: {
-        Args: {
-          p_agent_id: string;
-          p_limit?: number;
-          p_session_id?: string;
-          p_user_id: string;
-        };
+        Args: { p_limit?: number; p_sb_id: string; p_session_id?: string };
         Returns: {
           latest_message_at: string;
           thread_id: string;
@@ -4818,6 +5439,27 @@ export type Database = {
           isOneToOne: true;
           isSetofReturn: false;
         };
+      };
+      ingest_alert_event: {
+        Args: {
+          p_claim_ttl_seconds?: number;
+          p_cooldown_seconds?: number;
+          p_dedupe_key: string;
+          p_detail?: string;
+          p_metrics?: Json;
+          p_severity: string;
+          p_source: string;
+          p_title: string;
+          p_user_id: string;
+        };
+        Returns: {
+          claim_token: string | null;
+          event_id: string;
+          first_seen_at: string;
+          is_new: boolean;
+          occurrence_count: number;
+          should_notify: boolean;
+        }[];
       };
       match_artifacts: {
         Args: {
@@ -4969,6 +5611,18 @@ export type Database = {
         Args: { p: string | null };
         Returns: string | null;
       };
+      mark_alert_notified: {
+        Args: { p_claim_token?: string | null; p_event_id: string; p_severity?: string };
+        Returns: undefined;
+      };
+      release_alert_claim: {
+        Args: { p_claim_token?: string | null; p_event_id: string };
+        Returns: undefined;
+      };
+      record_alert_webhook_failure: {
+        Args: { p_error?: string; p_status?: number; p_webhook_id: string };
+        Returns: number;
+      };
       record_gate_verdict: {
         Args: {
           p_user_id: string;
@@ -4982,6 +5636,7 @@ export type Database = {
           p_claim_token?: string | null;
           p_evidence?: Json | null;
           p_reason?: string | null;
+          p_binding_hash?: string | null;
         };
         Returns: Json;
       };
@@ -4996,6 +5651,17 @@ export type Database = {
         };
         Returns: Json;
       };
+      resolve_alert_event: {
+        Args: { p_dedupe_key: string; p_user_id: string };
+        Returns: {
+          event_id: string;
+          first_seen_at: string;
+          occurrence_count: number;
+          severity: string;
+          title: string;
+          was_notified: boolean;
+        }[];
+      };
       retry_gate: {
         Args: {
           p_user_id: string;
@@ -5006,6 +5672,54 @@ export type Database = {
           p_reason?: string | null;
         };
         Returns: Json;
+      };
+      revoke_gate: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_expected_attempt: number;
+          p_expected_gate_version: number;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      supersede_gate: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_expected_attempt: number;
+          p_expected_gate_version: number;
+          p_expected_request_revision: number;
+          p_binding: Json;
+          p_binding_hash: string;
+          p_authors?: Json | null;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_system_actor?: boolean;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      lift_withdrawal: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_withdrawal_event_id: string;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      graph_hold_blocks: {
+        Args: { p_task_id: string };
+        Returns: boolean;
+      };
+      graph_unresolved_withdrawals: {
+        Args: { p_task_id: string; p_binding_hash?: string | null };
+        Returns: string[];
       };
       show_limit: { Args: never; Returns: number };
       show_trgm: { Args: { '': string }; Returns: string[] };

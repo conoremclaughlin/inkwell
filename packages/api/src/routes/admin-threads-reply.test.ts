@@ -8,8 +8,9 @@
  *    the conversation I'm following", never a silent create;
  *  - recipients are the thread's OWN participants, and triggerAll wakes them —
  *    a reply nobody is woken for may never be seen;
- *  - metadata.sentBy = 'user' rides along, because the admin context has no
- *    sbSlug and 'unknown' alone can't be told apart from a real unknown.
+ *  - the person is the sender as a PRINCIPAL, passed as server-side context
+ *    beside the public args (spec inkmail-thread-scope §3): metadata.sentBy
+ *    stays as a display hint, never as authorship.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -23,13 +24,16 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
 }));
 vi.mock('../mcp/tools/thread-handlers', () => ({
   getParticipants: (...args: unknown[]) => mockGetParticipants(...args),
+  // The real helper: the SB participants' slugs, people excluded.
+  participantSlugs: (ps: Array<{ sbId: string | null; sbSlug: string | null }>) =>
+    ps.filter((p) => p.sbId).map((p) => p.sbSlug as string),
 }));
 
-vi.mock('../auth/pcp-tokens', () => ({
-  signPcpAccessToken: vi.fn(),
+vi.mock('../auth/ink-tokens', () => ({
+  signInkAccessToken: vi.fn(),
   createRefreshToken: vi.fn(),
   exchangeRefreshToken: vi.fn(),
-  verifyPcpAccessToken: vi.fn(),
+  verifyInkAccessToken: vi.fn(),
 }));
 
 const mockSupabaseFrom = vi.fn();
@@ -74,10 +78,18 @@ function getReplyHandler(): Handler {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
-function createReq(body: Record<string, unknown>): Request {
-  // pcpUserId is what adminAuthMiddleware attaches; the handler is driven
-  // directly here, so it is injected.
-  return { body, headers: {}, cookies: {}, params: {}, pcpUserId: 'user-1' } as unknown as Request;
+function createReq(body: Record<string, unknown>, role = 'owner'): Request {
+  // inkUserId / inkWorkspaceId / inkWorkspaceRole are what adminAuthMiddleware
+  // attaches; the handler is driven directly here, so they are injected.
+  return {
+    body,
+    headers: {},
+    cookies: {},
+    params: {},
+    inkUserId: 'user-1',
+    inkWorkspaceId: 'ws-1',
+    inkWorkspaceRole: role,
+  } as unknown as Request;
 }
 
 interface MockResponse extends Response {
@@ -99,6 +111,14 @@ function createRes(): MockResponse {
     },
   };
   return res as unknown as MockResponse;
+}
+
+/** A participant row as getParticipants returns it. */
+function sb(sbSlug: string) {
+  return { sbId: `sb-${sbSlug}`, sbSlug, userId: null, sessionId: null, joinedAt: null };
+}
+function person(userId: string) {
+  return { sbId: null, sbSlug: null, userId, sessionId: null, joinedAt: null };
 }
 
 /** inbox_threads chain: select().eq().eq().maybeSingle() → thread row. */
@@ -159,7 +179,7 @@ describe('POST /threads/reply', () => {
 
   it('sends via handleSendToInbox with participants as recipients and triggerAll', async () => {
     mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
-    mockGetParticipants.mockResolvedValue(['wren', 'lumen']);
+    mockGetParticipants.mockResolvedValue([sb('wren'), sb('lumen')]);
     mockHandleSendToInbox.mockResolvedValue(
       sendToInboxResult({ success: true, messageId: 'msg-9', threadId: 'thread-1' })
     );
@@ -184,6 +204,37 @@ describe('POST /threads/reply', () => {
     // path depends on this being absent.
     expect(args.senderSlug).toBeUndefined();
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
+    // The person and their workspace ride as server-side context — the
+    // public tool schema never carries who a person is (spec §3, §6).
+    expect(mockHandleSendToInbox.mock.calls[0][2]).toEqual({
+      sender: { principal: { kind: 'user', userId: 'user-1' }, workspaceId: 'ws-1' },
+    });
+  });
+
+  it('wakes the SB participants only — a person on the thread is never a recipient (§7)', async () => {
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    mockGetParticipants.mockResolvedValue([sb('wren'), person('user-1'), sb('lumen')]);
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({ success: true, messageId: 'msg-12', threadId: 'thread-1' })
+    );
+
+    const res = createRes();
+    await reply(createReq({ key: 'pr:545', content: 'still here' }), res);
+
+    expect(res._status).toBe(200);
+    const args = mockHandleSendToInbox.mock.calls[0][0] as Record<string, unknown>;
+    expect(args.recipients).toEqual(['wren', 'lumen']);
+  });
+
+  it('409s when the only participant is a person — nobody to wake', async () => {
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    mockGetParticipants.mockResolvedValue([person('user-1')]);
+
+    const res = createRes();
+    await reply(createReq({ key: 'pr:545', content: 'anyone?' }), res);
+
+    expect(res._status).toBe(409);
+    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
   });
 
   it('reports success when the message stored even if every trigger failed', async () => {
@@ -192,7 +243,7 @@ describe('POST /threads/reply', () => {
     // because a wake bounced. Observed live: fresh user, both participants'
     // triggers failed, message stored — handler said success:false.
     mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
-    mockGetParticipants.mockResolvedValue(['wren']);
+    mockGetParticipants.mockResolvedValue([sb('wren')]);
     mockHandleSendToInbox.mockResolvedValue(
       sendToInboxResult({ success: false, messageId: 'msg-10', threadId: 'thread-1' })
     );
@@ -213,7 +264,7 @@ describe('POST /threads/reply', () => {
       status: 'closed',
       closed_at: '2026-09-01T00:00:00Z',
     });
-    mockGetParticipants.mockResolvedValue(['wren']);
+    mockGetParticipants.mockResolvedValue([sb('wren')]);
     mockHandleSendToInbox.mockResolvedValue(
       sendToInboxResult({ success: true, messageId: 'msg-11', threadId: 'thread-1' })
     );
@@ -231,7 +282,7 @@ describe('POST /threads/reply', () => {
 
   it('returns a non-2xx when the handler stored nothing — a 200 would clear a draft that never landed', async () => {
     mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545' });
-    mockGetParticipants.mockResolvedValue(['wren']);
+    mockGetParticipants.mockResolvedValue([sb('wren')]);
     mockHandleSendToInbox.mockResolvedValue(
       sendToInboxResult({ success: false, error: 'Unknown recipient: nobody' })
     );
@@ -244,12 +295,31 @@ describe('POST /threads/reply', () => {
 
   it('surfaces the handler failure instead of claiming success', async () => {
     mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
-    mockGetParticipants.mockResolvedValue(['wren']);
+    mockGetParticipants.mockResolvedValue([sb('wren')]);
     mockHandleSendToInbox.mockRejectedValue(new Error('insert failed'));
 
     const res = createRes();
     await reply(createReq({ key: 'pr:545', content: 'hello' }), res);
 
     expect(res._status).toBe(500);
+  });
+
+  it('a viewer or a trusted non-member cannot reply — read is every role, reply is member and up (§1)', async () => {
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    mockGetParticipants.mockResolvedValue([sb('wren')]);
+    for (const role of ['viewer', 'trusted']) {
+      const res = createRes();
+      await reply(createReq({ key: 'pr:545', content: 'hi' }, role), res);
+      expect(res._status).toBe(403);
+      expect(res._json).toMatchObject({ role });
+    }
+    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
+
+    const res = createRes();
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({ success: true, messageId: 'msg-9', threadId: 'thread-1' })
+    );
+    await reply(createReq({ key: 'pr:545', content: 'hi' }, 'member'), res);
+    expect(res._status).toBe(200);
   });
 });

@@ -6,9 +6,12 @@ permissions:
 
 on:
   pull_request:
-    branches: [main]
+    # Integration branches take reviewed slices before their release PR
+    # (spec inkmail-thread-scope §4b); every slice runs the full CI,
+    # including the cutover rehearsal, not only the final release-to-main PR.
+    branches: [main, 'release/**']
   push:
-    branches: [main]
+    branches: [main, 'release/**']
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -35,7 +38,35 @@ jobs:
 
       - run: yarn build
 
+      # pi's grep/find tools shell out to ripgrep and fd, and pi downloads them
+      # from GitHub releases the first time a tool runs if they are not present.
+      # That put an unauthenticated api.github.com call inside the test run,
+      # sharing a rate limit with every other runner on the same egress IP, and
+      # a throttled response surfaced as `pi-tools > grep > searches file
+      # contents` failing — which reads like a regression in whatever PR was
+      # running rather than a flake. Install them up front; PI_OFFLINE below
+      # makes the download path unreachable, so a broken install fails loudly
+      # here instead of silently going back to the network.
+      - name: Install ripgrep and fd for pi coding tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find
+
       - run: yarn test
+        env:
+          PI_OFFLINE: '1'
+
+      # The rename in 01b9047b left both spellings alive in different places,
+      # and the residue read as working code: a header the server no longer
+      # read, two yarn scripts the docs named but did not exist, a backend
+      # match that could never be true. This fails the build on new residue.
+      - name: Ink naming (no pre-rename spellings)
+        run: python3 scripts/check-ink-naming.py
+
+      # The guard has passed for the wrong reason twice — a broken sed
+      # delimiter that stripped nothing, and a case-insensitive allowlist that
+      # swallowed a brand new legacy-spelled env var. These are its positive
+      # and negative controls.
+      - name: Ink naming guard controls
+        run: python3 scripts/check-ink-naming.test.py
 
       # Shell, so it is not collected by vitest and would never run otherwise.
       # Covers the commit-message credential guard and the hook that invokes it.
@@ -51,6 +82,14 @@ jobs:
       - name: Pre-push commit replay
         run: sh scripts/check-push.test.sh
 
+      # The migration wrapper (run a file, record it under the file's own
+      # version; apply the pending set; refuse a window migration), the
+      # startup status parser, and the startup preflight that applies before
+      # the servers start, against stub supabase/psql commands: no Docker, no
+      # database.
+      - name: Migration ledger wrapper, status parser, and startup preflight
+        run: sh scripts/db-migrate.test.sh
+
       # The integration-DB harness's endpoint isolation. Mock-only: synthetic
       # `supabase status` payloads, no Docker and no database. CI has no
       # ambient Supabase env, so the contamination this covers cannot arise
@@ -58,6 +97,12 @@ jobs:
       # rather than by running the harness.
       - name: Integration-DB harness endpoint isolation
         run: sh scripts/test-integration-db-local.test.sh
+
+      - name: Integration stack lifecycle (mock-only)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-stack.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-data.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-log-summary.py
 
       # Every tracked file at HEAD, through the same guard the hooks run: no
       # credential-shaped file, no vendor token, no email address off the
@@ -95,8 +140,52 @@ jobs:
 
       - run: yarn install --immutable
 
-      - name: Run DB integration suite with isolated local Supabase
+      # Explicit retained mode on this disposable runner exercises the cold and
+      # warm paths. Unflagged CI invocations still default to --fresh.
+      - name: Run full DB integration suite from a cold isolated stack
+        run: yarn test:integration:db:local --reuse
+
+      - name: Scoped fixture cleanup and refusal probes (disposable runner only)
+        env:
+          INK_DISPOSABLE_RUNNER_TESTS: '1'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-data-ci.py
+
+      - name: Run full DB integration suite again on the warm stack
+        run: yarn test:integration:db:local --reuse
+
+      - name: Release the runner-owned integration stack
+        if: always()
+        run: yarn test:integration:db:local --stop
+
+  integration-db-cutover-rehearsal:
+    name: Cutover Rehearsal (inkmail thread scope, pre-cutover schema)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+
+      - run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.84.2
+
+      - run: yarn install --immutable
+
+      # The stack comes up at the schema BEFORE the cutover migration; the
+      # cutover suite executes that migration itself, per synthetic fixture,
+      # inside a transaction it rolls back (spec inkmail-thread-scope §4:
+      # rehearsal is mandatory, once through and once per provoked abort).
+      - name: Run the cutover rehearsal suite at the pre-cutover schema
         run: yarn test:integration:db:local
+        env:
+          INTEGRATION_MIGRATIONS_UNTIL: '20260913090000'
+          INTEGRATION_VITEST_ARGS: 'src/data/cutover'
 
   integration-runtime:
     name: Integration Runtime Tests

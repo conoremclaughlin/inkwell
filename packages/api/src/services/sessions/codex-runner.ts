@@ -33,7 +33,7 @@ import {
 
 /** Maximum time (ms) to wait for a Codex CLI subprocess before killing it.
  *  Override with CODEX_PROCESS_TIMEOUT_MS env var. */
-const PROCESS_TIMEOUT_MS =
+export const PROCESS_TIMEOUT_MS =
   parseInt(process.env.CODEX_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
@@ -103,7 +103,7 @@ export class CodexRunner implements IRunner {
         isResume,
         workingDirectory: config.workingDirectory,
         messageLength: fullMessage.length,
-        hasPcpAccessToken: !!config.pcpAccessToken,
+        hasInkAccessToken: !!config.inkAccessToken,
       });
 
       const result = await this.spawnProcess(args, runConfig);
@@ -112,13 +112,20 @@ export class CodexRunner implements IRunner {
       // the Codex event stream, or if we were resuming an existing session.
       const resolvedBackendSessionId = result.sessionId || argsSessionId || undefined;
 
+      // A killed turn is a stopped turn, whatever it managed to emit first —
+      // so any text it left behind is partial and `success` is false. The
+      // responses, usage and tool calls are still returned: the turn spent
+      // those tokens and made those calls, and the caller records them either
+      // way. What changes is that the outcome is now classified rather than
+      // inferred from the absence of a thrown error.
       return {
-        success: true,
+        success: !result.timedOut,
         backendSessionId: resolvedBackendSessionId || null,
         responses: result.responses,
         usage: result.usage,
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
+        ...(result.timedOut ? { error: result.timedOut.message } : {}),
       };
     } catch (error) {
       logger.error('Codex process failed', {
@@ -226,14 +233,20 @@ export class CodexRunner implements IRunner {
     finalTextResponse?: string;
     toolCalls: ToolCall[];
     sessionId?: string;
+    /**
+     * Set when WE killed the process, never when it finished on its own.
+     * `run()` decides `success` from this, so a timeout that resolves without
+     * it is reported as a completed turn. See the timer below.
+     */
+    timedOut?: { kind: 'hard'; message: string };
   }> {
     const codexBin = await resolveBinaryPath('codex');
 
     const runtimeLinkId = randomUUID();
-    if (config.pcpSessionId && config.workingDirectory) {
+    if (config.inkSessionId && config.workingDirectory) {
       writeRuntimeSessionHint(
         config.workingDirectory,
-        config.pcpSessionId,
+        config.inkSessionId,
         config.sbSlug || 'unknown',
         'codex',
         runtimeLinkId,
@@ -252,10 +265,10 @@ export class CodexRunner implements IRunner {
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
-          pcpSessionId: config.pcpSessionId,
-          runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
+          inkSessionId: config.inkSessionId,
+          runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
-          accessToken: config.pcpAccessToken,
+          accessToken: config.inkAccessToken,
           sbSlug: config.sbSlug,
           runtime: 'codex',
           repoRoot: config.repoRoot,
@@ -302,6 +315,19 @@ export class CodexRunner implements IRunner {
             finalTextResponse: finalTextResponse || '[Codex process timed out]',
             toolCalls,
             sessionId: resolvedSessionId,
+            // `timedOut`, not just the marker string. Resolving bare reports a
+            // SIGKILLed turn as a completed one: the session goes idle, a
+            // heartbeat beat records `delivered`, and the marker above is
+            // auto-forwarded to the human as if the agent had written it.
+            // The word "timeout" is load-bearing — classifyError matches on
+            // it, and without it this lands in the non-retryable `unknown`
+            // category. (Same fix Lumen made in antigravity-runner, #507.)
+            timedOut: {
+              kind: 'hard',
+              message: `Codex timeout: exceeded the ${Math.round(
+                PROCESS_TIMEOUT_MS / 1000
+              )}s ceiling, process killed`,
+            },
           });
         }
       }, PROCESS_TIMEOUT_MS);
@@ -519,7 +545,7 @@ export class CodexRunner implements IRunner {
     containerPath?: string;
     cleanup: () => void;
   } {
-    const dir = runtimeDir || mkdtempSync(join(tmpdir(), 'pcp-codex-'));
+    const dir = runtimeDir || mkdtempSync(join(tmpdir(), 'ink-codex-'));
     const filename = `identity-${process.pid}-${Date.now()}.md`;
     const promptPath = join(dir, filename);
     writeFileSync(promptPath, content || 'Follow system identity instructions.');
@@ -555,7 +581,7 @@ export class CodexRunner implements IRunner {
 
     // Fallback: BFS scan for common session ID keys.
     // Only match session/thread IDs — NOT conversationId, which often
-    // contains PCP routing keys (e.g., "trigger:lumen:thread:foo")
+    // contains Inkwell routing keys (e.g., "trigger:lumen:thread:foo")
     // that are unrelated to the backend session.
     const queue: unknown[] = [event];
     const sessionKeys = new Set(['session_id', 'sessionId', 'thread_id', 'threadId']);

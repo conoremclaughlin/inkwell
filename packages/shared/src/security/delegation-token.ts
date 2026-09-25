@@ -38,7 +38,13 @@ export interface VerifyDelegationTokenResult {
   error?: string;
 }
 
-const TOKEN_TYPE = 'PCP-DELEGATION';
+const TOKEN_TYPE = 'Inkwell-DELEGATION';
+// `typ` sits inside the signed header, so a token minted before #659 carries
+// 'PCP-DELEGATION' under a signature that covers that exact string — it cannot
+// be re-spelled on the way in. Rejecting it invalidates every unexpired
+// delegation at deploy time (TTL is 15m by default, 24h at most). Accepted on
+// verify, never minted; removable once a deploy is more than MAX_TTL old.
+const LEGACY_TOKEN_TYPE = 'PCP-DELEGATION';
 const DEFAULT_TTL_SECONDS = 15 * 60;
 const MAX_TTL_SECONDS = 24 * 60 * 60;
 
@@ -123,7 +129,7 @@ export function decodeDelegationToken(token: string): DelegationTokenPayload {
     typ?: string;
     alg?: string;
   };
-  if (header.typ !== TOKEN_TYPE || header.alg !== 'HS256') {
+  if ((header.typ !== TOKEN_TYPE && header.typ !== LEGACY_TOKEN_TYPE) || header.alg !== 'HS256') {
     throw new Error('Unsupported token header');
   }
 

@@ -168,7 +168,7 @@ docs: explain the isolated-server env flags
 
 Set ENABLE_HEARTBEATS and ENABLE_GRAPH_SWEEP to false on a test server. The
 recipe used to say ENABLE_HEARTBEAT_SERVICE=false, which was read by nothing.
-Resolution is INK_PORT_BASE || PCP_PORT_BASE.
+Resolution is INK_PORT_BASE || INK_PORT_BASE.
 EOF
 )
 expect_exit 0 "prose mentioning env var names is allowed" "$f"

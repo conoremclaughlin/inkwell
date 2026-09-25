@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { parsePermissionGrant, applyPermissionGrant, buildPermissionGrantMetadata } from './permission-grant.js';
+import {
+  parsePermissionGrant,
+  applyPermissionGrant,
+  buildPermissionGrantMetadata,
+} from './permission-grant.js';
 import { ToolPolicyState } from './tool-policy.js';
 
 describe('parsePermissionGrant', () => {
@@ -14,21 +18,27 @@ describe('parsePermissionGrant', () => {
   });
 
   it('returns null for invalid action', () => {
-    expect(parsePermissionGrant({
-      permissionGrant: { action: 'invalid', tools: ['remember'] },
-    })).toBeNull();
+    expect(
+      parsePermissionGrant({
+        permissionGrant: { action: 'invalid', tools: ['remember'] },
+      })
+    ).toBeNull();
   });
 
   it('returns null for empty tools array', () => {
-    expect(parsePermissionGrant({
-      permissionGrant: { action: 'allow', tools: [] },
-    })).toBeNull();
+    expect(
+      parsePermissionGrant({
+        permissionGrant: { action: 'allow', tools: [] },
+      })
+    ).toBeNull();
   });
 
   it('returns null for non-array tools', () => {
-    expect(parsePermissionGrant({
-      permissionGrant: { action: 'allow', tools: 'remember' },
-    })).toBeNull();
+    expect(
+      parsePermissionGrant({
+        permissionGrant: { action: 'allow', tools: 'remember' },
+      })
+    ).toBeNull();
   });
 
   it('parses valid allow grant', () => {
@@ -114,7 +124,7 @@ describe('applyPermissionGrant', () => {
     expect(result.summary).toContain('remember');
     expect(result.summary).toContain('always');
 
-    const decision = policy.canCallPcpTool('remember');
+    const decision = policy.canCallInkTool('remember');
     expect(decision.allowed).toBe(true);
   });
 
@@ -126,7 +136,7 @@ describe('applyPermissionGrant', () => {
     expect(result.applied).toBe(true);
     expect(result.summary).toContain('denied');
 
-    const decision = policy.canCallPcpTool('send_email');
+    const decision = policy.canCallInkTool('send_email');
     expect(decision.allowed).toBe(false);
   });
 
@@ -149,7 +159,7 @@ describe('applyPermissionGrant', () => {
     expect(result.summary).toContain('session');
 
     // Session grant should allow the tool
-    const decision = policy.canCallPcpTool('remember', 'test-session-123');
+    const decision = policy.canCallInkTool('remember', 'test-session-123');
     expect(decision.allowed).toBe(true);
   });
 

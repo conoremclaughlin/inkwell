@@ -115,7 +115,7 @@ export function registerPermissionsCommands(parent: Command): void {
       }
       console.log();
       console.log(
-        chalk.yellow('Note: deny rules are Claude Code only. Use --dangerous for Codex/Gemini.')
+        chalk.yellow('Note: deny rules are Claude Code only. Use --yolo for Codex/Gemini.')
       );
     });
 

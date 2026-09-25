@@ -113,6 +113,8 @@ beforeAll(() => {
 
 interface RigOptions {
   planRefusal?: Error;
+  /** A failed (non-refusal) SessionResult from handleMessage, verbatim. */
+  resultFailure?: Record<string, unknown>;
   /** Make the terminal hold-clear throw, the way a network dip does. */
   cleanupThrows?: boolean;
   /** Refuse from handleMessage's own admission, as a structured result. */
@@ -175,8 +177,15 @@ function rig(options: RigOptions = {}) {
           return q;
         },
         eq: () => q,
-        single: () => q.run(),
-        maybeSingle: () => q.run(),
+        one: false,
+        single: () => {
+          q.one = true;
+          return q.run();
+        },
+        maybeSingle: () => {
+          q.one = true;
+          return q.run();
+        },
         then: (a: (v: unknown) => unknown, b?: (e: unknown) => unknown) => q.run().then(a, b),
         async run() {
           if (q.op !== 'select') {
@@ -185,10 +194,16 @@ function rig(options: RigOptions = {}) {
             return { data: null, error: null };
           }
           if (table === 'agent_identities') {
-            return {
-              data: [{ id: 'identity-synthetic', workspace_id: 'workspace-synthetic' }],
-              error: null,
+            // The recipient's identity row: the handler verifies that the
+            // inbox row's recipient_sb_id names the slug the payload targets
+            // (spec inkmail-thread-scope §1a), so the row must carry it.
+            const identity = {
+              id: 'identity-synthetic',
+              agent_id: 'recipient-test',
+              user_id: 'user-synthetic',
+              workspace_id: 'workspace-synthetic',
             };
+            return { data: q.one ? identity : [identity], error: null };
           }
           if (table === 'sessions') {
             return {
@@ -247,6 +262,7 @@ function rig(options: RigOptions = {}) {
           };
         }
         sessionTurns += 1;
+        if (options.resultFailure) return options.resultFailure;
         return { success: true };
       },
       async getSession() {
@@ -258,7 +274,7 @@ function rig(options: RigOptions = {}) {
     // The real loader answers null for a thread nobody has described — which is
     // this synthetic thread — and catches its own query errors rather than
     // throwing, so these stand-ins are the shipping behaviour and not a softened
-    // version of it. They record their arguments because the recipient slug is
+    // version of it. They record their arguments because the recipient's id is
     // the entire membership check on the reading side: a description is written
     // into that SB's prompt, and a trigger may name any thread key.
     loadThreadDescriptor: async (...args: unknown[]) => {
@@ -268,6 +284,15 @@ function rig(options: RigOptions = {}) {
     formatThreadDescriptorLines: (descriptor: { lines: string[] } | null) =>
       descriptor ? descriptor.lines : [],
     getUserFromContext: () => ({ userId: 'user-synthetic' }),
+    // The thread-borne trigger's scope (spec inkmail-thread-scope §1a): the
+    // synthetic thread lives in the synthetic workspace and names its target
+    // by identity. Unreadable threads refuse, but this one is readable.
+    resolveThreadTriggerScope: async (_client: unknown, input: Record<string, unknown>) => ({
+      threadId: (input.threadId as string | undefined) ?? 'thread-synthetic',
+      threadWorkspaceId: 'workspace-synthetic',
+      userId: 'user-synthetic',
+      recipientSbId: 'identity-synthetic',
+    }),
     logInkmail: async () => {},
     assignThreadParticipant: async () => ({ stampPersisted: true }),
     clearRoutingHold: async () => {
@@ -285,6 +310,27 @@ function rig(options: RigOptions = {}) {
     ...loadModule(resolve(API_SRC, '../../shared/src/errors/classify-error.ts'), {}),
     ...retryModule,
   };
+
+  // The listener body lives in services/trigger-failure-listener.ts (#618:
+  // lifted so it can run over a table-backed client); server.ts only wires
+  // it to the scheduler and the activity stream. Load the real module with
+  // the same fakes, and answer the address lookup for the synthetic thread
+  // the way the row above does: one owner for sender and target.
+  const listenerModule = loadModule(resolve(API_SRC, 'services/trigger-failure-listener.ts'), {
+    '@inklabs/shared': { classifyError: (deps as { classifyError: unknown }).classifyError },
+    '../channels/trigger-retry': retryModule,
+    '../utils/logger': { logger: silentLogger },
+    './trigger-failure-notice': { sendTriggerFailureNotice: deps.sendTriggerFailureNotice },
+    './trigger-scope': {
+      resolveFailureNoticeAddress: async (_client: unknown, payload: Record<string, unknown>) => ({
+        threadId: (payload.threadId as string | undefined) ?? 'thread-synthetic',
+        threadWorkspaceId: 'workspace-synthetic',
+        targetOwnerUserId: 'user-synthetic',
+        senderOwnerUserId: 'user-synthetic',
+      }),
+    },
+  });
+  Object.assign(deps, { handleTriggerFailure: listenerModule.handleTriggerFailure });
 
   // The three fragments are re-composed scheduler-first, because `new Function`
   // runs its body top to bottom and the handler closes over the scheduler. In
@@ -500,13 +546,16 @@ describe('the thread describes itself in the prompt the SB actually reads', () =
     await r.gateway.handler!(r.threadPayload);
 
     expect(r.descriptorLoads, 'the descriptor was never loaded').toHaveLength(1);
-    const [, userId, threadKey, recipientSlug] = r.descriptorLoads[0];
-    expect(userId).toBe('user-synthetic');
+    const [, workspaceId, threadKey, recipientSbId] = r.descriptorLoads[0];
+    // The thread's workspace (spec inkmail-thread-scope §1): a thread is one
+    // row per (workspace, key), so this is what makes the key mean one thread.
+    expect(workspaceId).toBe('workspace-synthetic');
     expect(threadKey).toBe('pr:42');
-    // The argument that makes the membership JOIN mean anything. Dropping it
-    // does not leak — the loader refuses a falsy slug — but it silently costs
-    // every thread its description, which no other test in this file would see.
-    expect(recipientSlug).toBe('recipient-test');
+    // The argument that makes the membership JOIN mean anything: the canonical
+    // id of the recipient identity, never its slug. Dropping it does not leak —
+    // the loader refuses a falsy id — but it silently costs every thread its
+    // description, which no other test in this file would see.
+    expect(recipientSbId).toBe('identity-synthetic');
   });
 
   it('says nothing extra when the thread has no description', async () => {
@@ -615,5 +664,113 @@ describe('fan-out cancellation is per recipient', () => {
     for (const t of r.timers) if (!t.cancelled) t.fn();
     expect(r.redispatched).toHaveLength(1);
     expect(r.redispatched[0].toSlug).toBe('other-recipient');
+  });
+});
+
+/**
+ * The retry decision reads the verdict, not the excerpt (Lumen, r3).
+ *
+ * The default handler turns a failed SessionResult into a throw, and the
+ * throw used to carry only `result.error` — a bounded excerpt. So the
+ * listener re-derived a category from whatever survived the cut, and the
+ * excerpt is cut for a human reading an alert.
+ *
+ * Both directions are here, because one of them alone would pass against a
+ * guard that had simply stopped retrying, or one that retried everything.
+ * Each builds its text through the real `describeExitResult` and asserts the
+ * excerpt genuinely disagrees with the verdict first, so neither can be
+ * satisfied by the text happening to contain the answer. The assertion is the
+ * scheduled timer — the actual retry outcome — not a category.
+ */
+describe('a carried verdict decides the retry, not the excerpt', () => {
+  const STACK_FRAMES = Array.from(
+    { length: 40 },
+    (_, i) =>
+      `    at step${i} (/tmp/example.test/node_modules/example-backend/dist/runtime/transport/request-handler.js:100:20)`
+  );
+
+  /** Run one failed turn through the real handler and hand the throw to the listener. */
+  async function failThroughHandler(resultFailure: Record<string, unknown>) {
+    const r = rig({ resultFailure });
+    let thrown: unknown;
+    try {
+      await r.gateway.handler!(r.threadPayload);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(
+      thrown,
+      'the handler must still throw — the failure has to reach the listener'
+    ).toBeTruthy();
+    await r.fail(r.threadPayload, thrown);
+    return r;
+  }
+
+  it('schedules a retry when the verdict is transient and its excerpt is not', async () => {
+    const { describeExitResult, classifyError } = await import('@inklabs/shared');
+    const raw = [
+      'startup one',
+      'startup two',
+      'startup three',
+      'Error: fetch failed',
+      ...STACK_FRAMES,
+    ].join('\n');
+    const failure = describeExitResult({ command: 'ink chat', exitCode: 1, stderr: raw });
+
+    expect(failure.classification.category).toBe('network');
+    expect(failure.classification.retryable).toBe(true);
+    expect(classifyError({ errorText: failure.text }).category).toBe('unknown');
+
+    const r = await failThroughHandler({
+      success: false,
+      admitted: true,
+      error: failure.text,
+      classification: failure.classification,
+    });
+
+    expect(r.timers).toHaveLength(1);
+  });
+
+  it('schedules nothing when the verdict is permanent and its excerpt looks transient', async () => {
+    // The opposite direction, and the expensive one: the excerpt's tail reads
+    // `fetch failed` (network, retryable) while the run actually hit a quota
+    // whose line fell into the elided middle. Retrying that re-dispatches a
+    // message into a backend that will refuse it again, twice, on a ten
+    // minute horizon.
+    const { describeExitResult, classifyError } = await import('@inklabs/shared');
+    const raw = [
+      'startup one',
+      'startup two',
+      'startup three',
+      'Error: quota exceeded',
+      ...STACK_FRAMES,
+      'caused by: fetch failed',
+    ].join('\n');
+    const failure = describeExitResult({ command: 'ink chat', exitCode: 1, stderr: raw });
+
+    expect(failure.classification.category).toBe('quota');
+    expect(failure.classification.retryable).toBe(false);
+    expect(classifyError({ errorText: failure.text }).retryable).toBe(true);
+
+    const r = await failThroughHandler({
+      success: false,
+      admitted: true,
+      error: failure.text,
+      classification: failure.classification,
+    });
+
+    expect(r.timers).toHaveLength(0);
+  });
+
+  it('still classifies the text when the failure carries no verdict', async () => {
+    // A spawn failure or an internal throw has no verdict to carry, and the
+    // fallback is the behaviour that shipped before any of this.
+    const r = await failThroughHandler({
+      success: false,
+      admitted: true,
+      error: 'Error: fetch failed',
+    });
+
+    expect(r.timers).toHaveLength(1);
   });
 });

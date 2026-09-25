@@ -1,7 +1,7 @@
 /**
  * Agent Commands
  *
- * Interact with PCP agents.
+ * Interact with Inkwell agents.
  *
  * Commands:
  *   agent trigger <id>   Trigger an agent to wake up
@@ -18,10 +18,10 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { resolveSlug } from '../backends/identity.js';
 import { getCurrentRuntimeSession } from '../session/runtime.js';
-import { callPcpTool } from '../lib/pcp-mcp.js';
+import { callInkTool } from '../lib/ink-mcp.js';
 import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
-interface PcpConfig {
+interface InkUserConfig {
   userId?: string;
   email?: string;
   agentMapping?: Record<string, string>;
@@ -53,7 +53,7 @@ interface InboxResult {
 // Helpers
 // ============================================================================
 
-function getPcpConfig(): PcpConfig | null {
+function getInkUserConfig(): InkUserConfig | null {
   const configPath = join(homedir(), '.ink', 'config.json');
   if (existsSync(configPath)) {
     try {
@@ -83,7 +83,7 @@ async function triggerAgent(
   const spinner = ora(`Triggering agent: ${sbSlug}`).start();
 
   try {
-    const config = getPcpConfig();
+    const config = getInkUserConfig();
     if (!config?.email) {
       spinner.fail(NOT_SIGNED_IN_MESSAGE);
       process.exit(1);
@@ -93,7 +93,7 @@ async function triggerAgent(
     const currentRuntime = getCurrentRuntimeSession(process.cwd());
     const threadKey = options.threadKey || currentRuntime?.threadKey;
 
-    const result = await callPcpTool<TriggerResult>('send_to_inbox', {
+    const result = await callInkTool<TriggerResult>('send_to_inbox', {
       email: config.email,
       recipientSlug: sbSlug,
       senderSlug: 'cli',
@@ -121,7 +121,7 @@ async function triggerAgent(
 }
 
 async function statusCommand(sbSlug?: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
@@ -133,7 +133,7 @@ async function statusCommand(sbSlug?: string): Promise<void> {
 
   for (const agent of agents) {
     try {
-      const result = await callPcpTool<AgentStatusResult>('get_agent_status', {
+      const result = await callInkTool<AgentStatusResult>('get_agent_status', {
         email: config.email,
         sbSlug: agent,
       });
@@ -164,7 +164,7 @@ async function statusCommand(sbSlug?: string): Promise<void> {
 }
 
 async function inboxCommand(sbSlug?: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = getInkUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
@@ -177,7 +177,7 @@ async function inboxCommand(sbSlug?: string): Promise<void> {
   }
 
   try {
-    const result = await callPcpTool<InboxResult>('get_inbox', {
+    const result = await callInkTool<InboxResult>('get_inbox', {
       email: config.email,
       sbSlug: agent,
       status: 'all',
@@ -250,7 +250,7 @@ function formatTimeAgo(date: Date): string {
 // ============================================================================
 
 export function registerAgentCommands(program: Command): void {
-  const agent = program.command('agent').description('Interact with PCP agents');
+  const agent = program.command('agent').description('Interact with Inkwell agents');
 
   agent
     .command('trigger <id>')

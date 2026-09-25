@@ -9,7 +9,7 @@
  * 4. Resolution: checkApprovalResponse grants the request, polling picks it up
  * 5. Notification: platform notification is dispatched (DB metadata verifies)
  *
- * Requires a running PCP server (yarn dev). Telegram is NOT mocked here —
+ * Requires a running Inkwell server (yarn dev). Telegram is NOT mocked here —
  * the notification fires against the real Telegram API, but we verify via
  * the DB metadata (telegramMessageId is written after send). To suppress
  * real Telegram sends, unset TELEGRAM_BOT_TOKEN on the server.
@@ -25,11 +25,11 @@ import { join } from 'path';
 
 // ─── Config ─────────────────────────────────────────────────────
 
-const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const INK_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 
 let serverAvailable = false;
 try {
-  const result = execSync(`curl -sf -m 2 ${PCP_URL}/health`, { encoding: 'utf-8' });
+  const result = execSync(`curl -sf -m 2 ${INK_URL}/health`, { encoding: 'utf-8' });
   serverAvailable = result.includes('"status":"healthy"');
 } catch {
   serverAvailable = false;
@@ -43,7 +43,7 @@ const TEST_CONTEXT_TOKEN = Buffer.from(
 
 async function getAuthHeaders(): Promise<Record<string, string>> {
   const { getValidAccessToken } = await import('../auth/tokens.js');
-  const token = await getValidAccessToken(PCP_URL);
+  const token = await getValidAccessToken(INK_URL);
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'x-ink-context': TEST_CONTEXT_TOKEN,
@@ -52,19 +52,19 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
   return headers;
 }
 
-async function createPcpClient() {
-  const { PcpClient } = await import('../lib/pcp-client.js');
+async function createInkClient() {
+  const { InkClient } = await import('../lib/ink-client.js');
   const authPath = join(process.env.HOME || '', '.ink', 'auth.json');
-  return new PcpClient(PCP_URL, authPath);
+  return new InkClient(INK_URL, authPath);
 }
 
 /** Clean up approval requests created during tests. */
 async function deleteApprovalRequest(requestId: string, headers: Record<string, string>) {
-  // No delete endpoint — use the PCP client to clean up via direct SQL isn't
+  // No delete endpoint — use the Inkwell client to clean up via direct SQL isn't
   // available from the CLI. The requests expire naturally (5 min default), so
   // test rows are self-cleaning. We resolve them to 'denied' to prevent them
   // from interfering with the real interceptor.
-  await fetch(`${PCP_URL}/api/admin/approval-requests/${requestId}/status`, { headers }).catch(
+  await fetch(`${INK_URL}/api/admin/approval-requests/${requestId}/status`, { headers }).catch(
     () => {}
   );
 }
@@ -81,20 +81,20 @@ describe('2FA Flow Phase 1: Policy Gate', () => {
     policy.setMutationScope('studio');
     applyProfile(policy, 'safe');
 
-    const writeDecision = policy.canCallPcpTool('write');
+    const writeDecision = policy.canCallInkTool('write');
     expect(writeDecision.allowed).toBe(false);
     expect(writeDecision.promptable).toBe(true);
     expect(writeDecision.reason).toContain('confirmation');
 
-    const sendDecision = policy.canCallPcpTool('send_response');
+    const sendDecision = policy.canCallInkTool('send_response');
     expect(sendDecision.allowed).toBe(false);
     expect(sendDecision.promptable).toBe(true);
 
     // MCP tools NOT in prompt/deny lists pass through
-    const emailDecision = policy.canCallPcpTool('list_emails');
+    const emailDecision = policy.canCallInkTool('list_emails');
     expect(emailDecision.allowed).toBe(true);
 
-    const bootstrapDecision = policy.canCallPcpTool('bootstrap');
+    const bootstrapDecision = policy.canCallInkTool('bootstrap');
     expect(bootstrapDecision.allowed).toBe(true);
   });
 });
@@ -170,7 +170,7 @@ describe('2FA Flow Phase 3: Approval Request API', () => {
     const headers = await getAuthHeaders();
 
     // 1. Create the request
-    const createResp = await fetch(`${PCP_URL}/api/admin/approval-requests`, {
+    const createResp = await fetch(`${INK_URL}/api/admin/approval-requests`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -197,7 +197,7 @@ describe('2FA Flow Phase 3: Approval Request API', () => {
 
     // 2. Poll — should be pending
     const pollResp = await fetch(
-      `${PCP_URL}/api/admin/approval-requests/${createBody.requestId}/status`,
+      `${INK_URL}/api/admin/approval-requests/${createBody.requestId}/status`,
       { headers }
     );
     expect(pollResp.status).toBe(200);
@@ -213,7 +213,7 @@ describe('2FA Flow Phase 3: Approval Request API', () => {
       const headers = await getAuthHeaders();
 
       // 1. Create a request
-      const createResp = await fetch(`${PCP_URL}/api/admin/approval-requests`, {
+      const createResp = await fetch(`${INK_URL}/api/admin/approval-requests`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -226,11 +226,11 @@ describe('2FA Flow Phase 3: Approval Request API', () => {
       createdIds.push(requestId);
 
       // 2. Simulate user approving via Telegram (call checkApprovalResponse
-      //    on the server side — we need the PCP client for this)
-      const pcp = await createPcpClient();
+      //    on the server side — we need the Inkwell client for this)
+      const inkClient = await createInkClient();
 
       // Poll — still pending (no approval yet)
-      const poll1 = await fetch(`${PCP_URL}/api/admin/approval-requests/${requestId}/status`, {
+      const poll1 = await fetch(`${INK_URL}/api/admin/approval-requests/${requestId}/status`, {
         headers,
       });
       const poll1Body = (await poll1.json()) as { status: string };
@@ -327,9 +327,9 @@ describe('2FA Flow Phase 4: requestToolApproval client', () => {
       const { checkApprovalResponse } =
         await import('../../../api/dist/channels/approval-interceptor.js');
 
-      // We need the userId. Bootstrap via PCP client to get it.
-      const pcp = await createPcpClient();
-      const bootstrapResult = (await pcp.callTool('bootstrap', { sbSlug: 'test' })) as {
+      // We need the userId. Bootstrap via Inkwell client to get it.
+      const inkClient = await createInkClient();
+      const bootstrapResult = (await inkClient.callTool('bootstrap', { sbSlug: 'test' })) as {
         user?: { id: string };
       };
       const userId = bootstrapResult?.user?.id;
@@ -514,18 +514,18 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
     applyProfile(policy, 'safe');
 
     // write is promptable initially
-    expect(policy.canCallPcpTool('write').promptable).toBe(true);
+    expect(policy.canCallInkTool('write').promptable).toBe(true);
 
     // Simulate grant-agent: persistentGrant removes from promptTools
     // without adding to allowTools (avoids narrowing filter)
     policy.persistentGrant('write');
 
     // Now write should be allowed (no longer in promptTools)
-    const afterGrant = policy.canCallPcpTool('write');
+    const afterGrant = policy.canCallInkTool('write');
     expect(afterGrant.allowed).toBe(true);
 
     // Other tools should NOT be blocked (no narrowing side effect)
-    const otherTool = policy.canCallPcpTool('get_integration_health');
+    const otherTool = policy.canCallInkTool('get_integration_health');
     expect(otherTool.allowed).toBe(true);
   });
 
@@ -541,12 +541,12 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
     const sessionId = 'test-session-123';
 
     // write is promptable initially
-    expect(policy.canCallPcpTool('write').promptable).toBe(true);
+    expect(policy.canCallInkTool('write').promptable).toBe(true);
 
     // Grant for session
     policy.grantToolForSession(sessionId, 'write');
 
-    // Now check — the session grant doesn't change canCallPcpTool directly,
+    // Now check — the session grant doesn't change canCallInkTool directly,
     // it's checked separately in the decision flow. Verify the grant exists.
     const grants = policy.listSessionGrants(sessionId);
     expect(grants.find((g) => g.tool === 'write')).toBeTruthy();
@@ -560,7 +560,7 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
       // Create 3 pending requests
       const requestIds: string[] = [];
       for (const tool of ['write', 'send_response', 'bash']) {
-        const resp = await fetch(`${PCP_URL}/api/admin/approval-requests`, {
+        const resp = await fetch(`${INK_URL}/api/admin/approval-requests`, {
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -580,8 +580,8 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
       const { checkApprovalResponse } =
         await import('../../../api/dist/channels/approval-interceptor.js');
 
-      const pcp = await createPcpClient();
-      const bootstrapResult = (await pcp.callTool('bootstrap', { sbSlug: 'test' })) as {
+      const inkClient = await createInkClient();
+      const bootstrapResult = (await inkClient.callTool('bootstrap', { sbSlug: 'test' })) as {
         user?: { id: string };
       };
       const userId = bootstrapResult?.user?.id;
@@ -608,7 +608,7 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
 
       // Verify all requests are now granted
       for (const reqId of requestIds) {
-        const poll = await fetch(`${PCP_URL}/api/admin/approval-requests/${reqId}/status`, {
+        const poll = await fetch(`${INK_URL}/api/admin/approval-requests/${reqId}/status`, {
           headers,
         });
         const status = (await poll.json()) as { status: string };

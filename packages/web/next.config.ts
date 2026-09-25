@@ -1,7 +1,7 @@
 import type { NextConfig } from 'next';
 
-const pcpPortBase = Number(process.env.INK_PORT_BASE || 3001);
-const apiUrl = process.env.API_URL || `http://localhost:${pcpPortBase}`;
+const inkPortBase = Number(process.env.INK_PORT_BASE || 3001);
+const apiUrl = process.env.API_URL || `http://localhost:${inkPortBase}`;
 
 const nextConfig: NextConfig = {
   // Allow API calls to the backend

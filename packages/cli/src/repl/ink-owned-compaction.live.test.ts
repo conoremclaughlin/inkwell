@@ -139,7 +139,7 @@ function listJsonls(dir: string): Set<string> {
   return new Set(readdirSync(dir).filter((f) => f.endsWith('.jsonl')));
 }
 
-/** Every transcript event for this pcp session, across all its jsonl files, in order. */
+/** Every transcript event for this Inkwell session, across all its jsonl files, in order. */
 function readSessionEvents(cwd: string, sessionId: string): Array<Record<string, unknown>> {
   const replDir = join(cwd, '.ink', 'runtime', 'repl');
   if (!existsSync(replDir)) return [];

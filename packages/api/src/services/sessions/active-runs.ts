@@ -36,6 +36,12 @@
 
 import { logger } from '../../utils/logger.js';
 
+/**
+ * How a settled runner ended, from the point of view of what shutdown may
+ * write onto the session row. See `ActiveRun.settledOutcome`.
+ */
+export type SettledOutcome = 'succeeded' | 'failed' | 'refused';
+
 export interface ActiveRun {
   sessionId: string;
   userId: string;
@@ -63,8 +69,14 @@ export interface ActiveRun {
    * or throw and then have its `failed` write lost the same way (Lumen, PR
    * #563 P1). Shutdown must preserve the intended outcome, not stamp every
    * settled run as a quiet success.
+   *
+   * `refused` is the case where there is NO intended terminal state: the
+   * backend rejected the run before accepting it, so no turn began and nothing
+   * about the target session was observed. Shutdown must leave such a row
+   * alone rather than terminalizing it — the row may belong to a live owner
+   * this process merely failed to resume (Lumen's review of PR #660 P1).
    */
-  settledOutcome?: 'succeeded' | 'failed';
+  settledOutcome?: SettledOutcome;
   /**
    * The turn's ownership generation — the candidate this turn wrote with its
    * `running` write (Lumen, PR #563 round 4). Registry operations and the
@@ -157,8 +169,15 @@ export function widenActiveRunCandidates(sessionId: string, previousEpochs: stri
  * process is gone; what remains is bookkeeping. Deliberately NOT a clear —
  * the run must stay registered until its terminal state durably persists —
  * but it changes what a shutdown may truthfully claim about the run.
+ *
+ * The outcome must be the CLASSIFIED one, because nothing is guaranteed to
+ * revise it afterwards: the entry keeps this value until the run is cleared,
+ * and the finalize write in between can be rejected by the epoch fence or
+ * (on a refusal) deliberately record no outcome. A shutdown during that span
+ * reads whatever was written here, which is how a refused resume terminalized
+ * a live owner (Lumen's review of PR #660 P1).
  */
-export function markRunnerSettled(sessionId: string, outcome: 'succeeded' | 'failed'): void {
+export function markRunnerSettled(sessionId: string, outcome: SettledOutcome): void {
   const run = active.get(sessionId);
   if (run) {
     run.runnerSettledAt = Date.now();
