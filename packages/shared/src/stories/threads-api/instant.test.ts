@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compareInstants } from './instant';
+import { compareInstants } from './instant.js';
 
 describe('compareInstants', () => {
   it('orders microseconds that share a millisecond', () => {

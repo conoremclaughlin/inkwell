@@ -3301,12 +3301,19 @@ __metadata:
   dependencies:
     "@types/jest": "npm:^29.5.11"
     "@types/node": "npm:^20.10.6"
+    "@types/react": "npm:^19.0.0"
     "@typescript-eslint/eslint-plugin": "npm:^6.17.0"
     "@typescript-eslint/parser": "npm:^6.17.0"
     eslint: "npm:^8.56.0"
     jest: "npm:^29.7.0"
     ts-jest: "npm:^29.1.1"
     typescript: "npm:^5.3.3"
+    vitest: "npm:^4.0.18"
+  peerDependencies:
+    react: ">=18.0.0"
+  peerDependenciesMeta:
+    react:
+      optional: true
   languageName: unknown
   linkType: soft
 
@@ -3326,6 +3333,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@inklabs/web@workspace:packages/web"
   dependencies:
+    "@inklabs/shared": "workspace:*"
     "@mantine/core": "npm:^8.2.4"
     "@mantine/hooks": "npm:^8.2.4"
     "@mantine/tiptap": "npm:^8.2.4"

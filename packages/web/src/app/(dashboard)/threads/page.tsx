@@ -9,8 +9,9 @@ import { useReadCursors } from '@/components/threads/read-cursors';
 import { ThreadConversation } from '@/components/threads/thread-conversation';
 import { ThreadDetails } from '@/components/threads/thread-details';
 import { ThreadList } from '@/components/threads/thread-list';
-import { nameLookup } from '@/components/threads/to-conversation';
-import type { ThreadsResponse } from '@/components/threads/thread-types';
+import type { ThreadsResponse } from '@inklabs/shared/stories/threads-api';
+import { isConversation } from '@inklabs/shared/stories/thread-browsing';
+import { nameLookup } from '@inklabs/shared/stories/thread-viewing';
 
 const DETAILS_STORAGE_KEY = 'ink.threads.details-open';
 /** Wide enough for list, conversation, and details side by side (Tailwind's xl). */
@@ -87,7 +88,7 @@ function ThreadsChat() {
   const spines = useMemo(() => data?.spines ?? [], [data]);
   // The list is conversations. A key only a session, studio or task group
   // references has nothing to read yet; it stays reachable by link.
-  const threads = useMemo(() => spines.filter((spine) => spine.thread !== null), [spines]);
+  const threads = useMemo(() => spines.filter(isConversation), [spines]);
   const selected = useMemo(
     () => spines.find((spine) => spine.key === selectedKey) ?? null,
     [spines, selectedKey]

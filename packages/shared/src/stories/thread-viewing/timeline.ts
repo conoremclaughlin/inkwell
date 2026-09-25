@@ -5,9 +5,10 @@
  * here rather than read off a screenshot.
  */
 
-import { formatDayLabel, isSameDay } from './format';
-import { compareInstants } from './instant';
-import type { ConversationMessage } from './types';
+import { compareInstants } from '../threads-api/index.js';
+import { isUnread } from '../thread-read-state/index.js';
+import type { ConversationMessage } from './conversation.js';
+import { formatDayLabel, isSameDay } from './time-labels.js';
 
 /** Consecutive messages from one author within this window share a header. */
 export const GROUP_WINDOW_MS = 5 * 60_000;
@@ -16,19 +17,6 @@ export type TimelineItem =
   | { type: 'day'; key: string; label: string }
   | { type: 'unread'; key: string; count: number }
   | { type: 'message'; key: string; message: ConversationMessage; continuation: boolean };
-
-/**
- * A message the viewer has not seen: newer than their read cursor, and
- * neither their own nor a system event. Nobody leaves their own message
- * unread, and "thread closed" is not news anyone has to catch up on.
- */
-export function isUnread(message: ConversationMessage, unreadAfter: string): boolean {
-  return (
-    !message.author.isOwn &&
-    message.author.kind !== 'system' &&
-    compareInstants(message.createdAt, unreadAfter) > 0
-  );
-}
 
 function sameAuthor(a: ConversationMessage, b: ConversationMessage): boolean {
   return a.author.kind === b.author.kind && a.author.id === b.author.id;

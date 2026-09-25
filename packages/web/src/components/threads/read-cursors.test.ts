@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { createReadCursorStore, hasUnread, READ_CURSORS_STORAGE_KEY } from './read-cursors';
+import { hasUnread } from '@inklabs/shared/stories/thread-read-state';
+import { createReadCursorStore, READ_CURSORS_STORAGE_KEY } from './read-cursors';
 
 function memoryStorage(initial: Record<string, string> = {}) {
   const data = new Map(Object.entries(initial));
@@ -146,18 +147,5 @@ describe('read cursor store', () => {
     const store = createReadCursorStore(memoryStorage(), () => new Date(T0));
     expect(store.cursorFor('constructor')).toBe(T0);
     expect(store.cursorFor('__proto__')).toBe(T0);
-  });
-});
-
-describe('hasUnread', () => {
-  it('counts another person’s message, and never a system event', () => {
-    expect(hasUnread({ createdAt: T2, isOwn: false, senderKind: 'user' }, T0)).toBe(true);
-    expect(hasUnread({ createdAt: T2, isOwn: false, senderKind: 'system' }, T0)).toBe(false);
-  });
-
-  it('never counts the viewer’s own message, or a thread with no messages', () => {
-    expect(hasUnread({ createdAt: T2, isOwn: true, senderKind: 'sb' }, T0)).toBe(false);
-    expect(hasUnread(null, T0)).toBe(false);
-    expect(hasUnread(undefined, T0)).toBe(false);
   });
 });

@@ -8,10 +8,12 @@
  * to end. Until that lands, this store answers the same question locally,
  * behind the same shape (a thread key → the createdAt of the newest message
  * seen), so moving it to the server swaps the storage and nothing else.
+ * What counts as unread against a cursor is the read-state story's
+ * (@inklabs/shared/stories/thread-read-state), shared with every client.
  */
 
 import { useSyncExternalStore } from 'react';
-import { compareInstants } from '@/components/conversation/instant';
+import { compareInstants } from '@inklabs/shared/stories/threads-api';
 
 export const READ_CURSORS_STORAGE_KEY = 'ink.threads.read-cursors.v1';
 
@@ -184,17 +186,4 @@ export function useReadCursors(): ReadCursorStore {
   const store = getBrowserStore();
   useSyncExternalStore(store.subscribe, store.version, () => 0);
   return store;
-}
-
-/**
- * A thread has news for the viewer: its newest message is someone else's —
- * an SB's or another person's — after their cursor. System events are not
- * news, as in the conversation's own divider.
- */
-export function hasUnread(
-  lastMessage: { createdAt: string; isOwn: boolean; senderKind: string } | null | undefined,
-  cursor: string
-): boolean {
-  if (!lastMessage || lastMessage.isOwn || lastMessage.senderKind === 'system') return false;
-  return compareInstants(lastMessage.createdAt, cursor) > 0;
 }

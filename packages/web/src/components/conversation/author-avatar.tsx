@@ -2,7 +2,7 @@
 
 import { Cog, User } from 'lucide-react';
 import { cn, getAgentGradient } from '@/lib/utils';
-import type { ConversationAuthor } from './types';
+import type { ConversationAuthor } from '@inklabs/shared/stories/thread-viewing';
 
 const SIZES = {
   xs: 'h-5 w-5 text-[9px]',
