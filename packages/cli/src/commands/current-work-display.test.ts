@@ -24,7 +24,7 @@ const mappedSession = (over: Record<string, unknown> = {}) => ({
   sbSlug: 'wren',
   lifecycle: 'running',
   currentPhase: 'reviewing',
-  threadKey: 'pcp:pr:652',
+  threadKey: 'inkwell:pr:652',
   currentWork: 'Reviewing PR #652 — the audience gate',
   currentWorkSource: 'headline',
   currentWorkAt: '2026-09-17T21:00:00.000Z',
@@ -38,7 +38,7 @@ const cliSession = (over: Partial<Session> = {}): Session => ({
   sbSlug: 'wren',
   status: 'active',
   currentPhase: 'reviewing',
-  threadKey: 'pcp:pr:652',
+  threadKey: 'inkwell:pr:652',
   startedAt: '2026-09-17T18:00:00.000Z',
   currentWork: 'Reviewing PR #652 — the audience gate',
   currentWorkAgeLabel: '3h ago',
@@ -95,7 +95,7 @@ describe('buildInjectedStartupContext (ink startup injection)', () => {
       activeSessions: [mappedSession({ currentWork: null, currentWorkAgeLabel: null })],
     });
 
-    expect(block).toContain('3f2a1b09 phase=reviewing thread=pcp:pr:652');
+    expect(block).toContain('3f2a1b09 phase=reviewing thread=inkwell:pr:652');
     expect(block).not.toContain('now:');
   });
 });
