@@ -14,7 +14,11 @@ import {
   X,
 } from 'lucide-react';
 import clsx from 'clsx';
-import type { ThreadMessagesResponse, ThreadSpine } from '@inklabs/shared/stories/threads-api';
+import {
+  threadMessagesPath,
+  type ThreadMessagesResponse,
+  type ThreadSpine,
+} from '@inklabs/shared/stories/threads-api';
 import {
   displayTitle,
   isSessionLive,
@@ -26,7 +30,7 @@ import {
   sbAuthor,
   type NameFor,
 } from '@inklabs/shared/stories/thread-viewing';
-import { useApiQuery } from '@/lib/api';
+import { useWorkspaceApiQuery } from '@/lib/api';
 import { AuthorAvatar } from '@/components/conversation/author-avatar';
 import { EvidenceNodeCard, type GraphEvidenceResponse } from './evidence';
 import { TypeChip } from './thread-list';
@@ -51,17 +55,19 @@ export function ThreadDetails({
   onClose?: () => void;
 }) {
   // Same query as the conversation — shared from the cache, not refetched.
-  const { data: messagesData } = useApiQuery<ThreadMessagesResponse>(
-    ['thread-messages', spine.key, workspaceId],
-    `/api/admin/threads/messages?key=${encodeURIComponent(spine.key)}`
+  const { data: messagesData } = useWorkspaceApiQuery<ThreadMessagesResponse>(
+    ['thread-messages', spine.key],
+    threadMessagesPath(spine.key),
+    workspaceId
   );
 
   // The evidence trail behind this key's workflow graphs — verdicts,
   // remediation reasons, and attached artifacts, straight from the
   // gate-event ledger. Groups with no graph answer { groups: [] }.
-  const { data: evidenceData } = useApiQuery<GraphEvidenceResponse>(
+  const { data: evidenceData } = useWorkspaceApiQuery<GraphEvidenceResponse>(
     ['thread-graph-evidence', spine.key],
-    `/api/admin/threads/graph-evidence?key=${encodeURIComponent(spine.key)}`
+    `/api/admin/threads/graph-evidence?key=${encodeURIComponent(spine.key)}`,
+    workspaceId
   );
   const evidenceGroups = (evidenceData?.groups ?? []).filter((group) => group.nodes.length > 0);
 

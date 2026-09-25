@@ -46,7 +46,9 @@ export function useThreadMessages(threadKey: string) {
   const workspaceId = useSyncExternalStore(subscribeWorkspace, getWorkspaceId);
   return useQuery({
     queryKey: ['thread', threadKey, { workspaceId }],
-    queryFn: () => apiFetch<ThreadMessagesResponse>(threadMessagesPath(threadKey)),
+    // Bound as well as keyed: the request asks the workspace in the key.
+    queryFn: () =>
+      apiFetch<ThreadMessagesResponse>(threadMessagesPath(threadKey), undefined, { workspaceId }),
     refetchInterval: THREAD_DETAIL_POLL_MS,
   });
 }

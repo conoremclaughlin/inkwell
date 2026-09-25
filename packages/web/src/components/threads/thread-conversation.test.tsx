@@ -26,7 +26,7 @@ const fake = vi.hoisted(() => ({
 }));
 
 vi.mock('@/lib/api', () => ({
-  useApiQuery: () => ({
+  useWorkspaceApiQuery: () => ({
     data: fake.newest,
     dataUpdatedAt: fake.updatedAt,
     isLoading: fake.newest === undefined,

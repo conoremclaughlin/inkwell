@@ -91,8 +91,11 @@ function ThreadConversation({
   const headerHeight = useHeaderHeight();
 
   const fetchOlder = useCallback(
-    (beforeId: string) => apiFetch<ThreadMessagesResponse>(threadMessagesPath(threadKey, beforeId)),
-    [threadKey]
+    (beforeId: string) =>
+      apiFetch<ThreadMessagesResponse>(threadMessagesPath(threadKey, beforeId), undefined, {
+        workspaceId,
+      }),
+    [threadKey, workspaceId]
   );
   const {
     history,

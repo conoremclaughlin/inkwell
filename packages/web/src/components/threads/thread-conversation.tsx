@@ -20,7 +20,7 @@ import {
   type ConversationMessage,
   type NameFor,
 } from '@inklabs/shared/stories/thread-viewing';
-import { apiGet, useApiQuery } from '@/lib/api';
+import { apiGet, useWorkspaceApiQuery } from '@/lib/api';
 import { AvatarStack } from '@/components/conversation/author-avatar';
 import { ConversationView } from '@/components/conversation/conversation-view';
 import type { ReadCursorStore } from './read-cursors';
@@ -57,12 +57,13 @@ export function ThreadConversation({
   const key = spine.key;
   const hasThread = spine.sources.includes('thread');
 
-  const { data, dataUpdatedAt, isLoading } = useApiQuery<ThreadMessagesResponse>(
-    // Keyed by workspace too, so a switch never serves the previous
-    // workspace's cached page. ['thread-messages', key] stays the prefix
-    // that invalidation matches.
-    ['thread-messages', key, workspaceId],
+  // Bound to the workspace the thread was opened in, in its cache key and on
+  // the request itself, so a refetch racing a switch can never cache
+  // another workspace's page as this one's.
+  const { data, dataUpdatedAt, isLoading } = useWorkspaceApiQuery<ThreadMessagesResponse>(
+    ['thread-messages', key],
     threadMessagesPath(key),
+    workspaceId,
     { refetchInterval: hasThread ? POLL_MS : false }
   );
 
@@ -71,8 +72,9 @@ export function ThreadConversation({
   const [unreadAfter, setUnreadAfter] = useState<string | null>(() => cursors.cursorFor(key));
 
   const fetchOlder = useCallback(
-    (beforeId: string) => apiGet<ThreadMessagesResponse>(threadMessagesPath(key, beforeId)),
-    [key]
+    (beforeId: string) =>
+      apiGet<ThreadMessagesResponse>(threadMessagesPath(key, beforeId), { workspaceId }),
+    [key, workspaceId]
   );
   const {
     history,
