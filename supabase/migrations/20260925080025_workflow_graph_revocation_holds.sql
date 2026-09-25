@@ -68,9 +68,26 @@ ALTER TABLE public.tasks ADD CONSTRAINT gate_request_on_verification CHECK (
   OR (gate_binding IS NULL AND gate_binding_hash IS NULL AND gate_authors IS NULL
       AND gate_request_revision = 0)
 );
-ALTER TABLE public.tasks ADD CONSTRAINT gate_authors_is_array CHECK (
-  gate_authors IS NULL OR jsonb_typeof(gate_authors) = 'array'
-);
+-- Author sets are validated on the way in: an array of {kind, id} with kind in
+-- sb|user and id a UUID. Membership below compares UUID identity, so a
+-- mixed-case id recorded by one client still names the same principal
+-- (Lumen, PR #678: text equality let an uppercase author pass its own gate).
+CREATE OR REPLACE FUNCTION public.graph_authors_valid(p_set jsonb)
+RETURNS boolean
+LANGUAGE sql IMMUTABLE
+SET search_path = public, pg_temp
+AS $$
+  SELECT p_set IS NULL OR (
+    jsonb_typeof(p_set) = 'array'
+    AND NOT EXISTS (
+      SELECT 1 FROM jsonb_array_elements(p_set) a
+      WHERE jsonb_typeof(a) <> 'object'
+         OR a ->> 'kind' IS NULL OR a ->> 'kind' NOT IN ('sb', 'user')
+         OR _graph_safe_uuid(a ->> 'id') IS NULL
+    )
+  );
+$$;
+ALTER TABLE public.tasks ADD CONSTRAINT gate_authors_valid CHECK (graph_authors_valid(gate_authors));
 
 -- ── Event kinds ─────────────────────────────────────────────────────────
 --
@@ -235,16 +252,39 @@ AS $$
   );
 $$;
 
--- Principal membership in a recorded set of {kind: 'sb'|'user', id}.
+-- "A source carrying an unreleased hold does not satisfy new dispatch" (spec
+-- §Interaction with v10 rules). Holds are placed over the closure that exists
+-- when authority is lost; a node attached to a held completed source AFTER
+-- that has no hold of its own, and SATISFIES alone would ready it (Lumen,
+-- PR #678). So readiness reads the inbound set through this predicate: every
+-- source satisfies AND no source is held.
+CREATE OR REPLACE FUNCTION public.graph_inbound_blocked(p_task_id uuid)
+RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = public, pg_temp
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM task_edges e JOIN tasks s ON s.id = e.from_task
+    WHERE e.to_task = p_task_id
+      AND (NOT graph_satisfies(s.task_type, s.status, s.gate_state)
+           OR graph_hold_blocks(s.id))
+  );
+$$;
+
+-- Principal membership in a recorded set of {kind: 'sb'|'user', id}, by UUID
+-- identity: the recorded text is parsed, never compared as text.
 CREATE OR REPLACE FUNCTION public.graph_principal_in(
   p_set jsonb, p_identity_id uuid, p_user_id uuid
 ) RETURNS boolean
 LANGUAGE sql IMMUTABLE
+SET search_path = public, pg_temp
 AS $$
   SELECT p_set IS NOT NULL AND jsonb_typeof(p_set) = 'array' AND EXISTS (
     SELECT 1 FROM jsonb_array_elements(p_set) a
-    WHERE (p_identity_id IS NOT NULL AND a ->> 'kind' = 'sb' AND a ->> 'id' = p_identity_id::text)
-       OR (p_user_id IS NOT NULL AND a ->> 'kind' = 'user' AND a ->> 'id' = p_user_id::text)
+    WHERE (p_identity_id IS NOT NULL AND a ->> 'kind' = 'sb'
+           AND _graph_safe_uuid(a ->> 'id') = p_identity_id)
+       OR (p_user_id IS NOT NULL AND a ->> 'kind' = 'user'
+           AND _graph_safe_uuid(a ->> 'id') = p_user_id)
   );
 $$;
 
@@ -273,7 +313,11 @@ AS $$
       SELECT 1 FROM task_gate_events p
       WHERE p.task_id = p_task_id AND p.event = 'passed'
         AND p.binding_hash IS NOT DISTINCT FROM p_binding_hash
-        AND p.created_at > w.created_at
+        -- "Later" by the gate's own revision, never by wall clock: every
+        -- event carries the gate_version it was written at, and a pass that
+        -- resolves a withdrawal is always at a higher one (the withdrawal
+        -- bumps the version; the re-open bumps it again).
+        AND p.gate_version > w.gate_version
     );
 $$;
 
@@ -385,6 +429,28 @@ AS $$
     )
   );
 $$;
+
+-- Who may change a gate's request (spec §Supersession): the initiating
+-- principal — a recorded author of the candidate, the group's owner, an
+-- owner/admin of the owner's workspaces — or an explicit system actor on a
+-- verified request change. Never the reviewer whose stale result exposed a
+-- mismatch: the assignee as such has no supersession authority.
+CREATE OR REPLACE FUNCTION public._graph_supersession_authority(
+  p_group_user_id uuid, p_authors jsonb,
+  p_actor_identity_id uuid, p_actor_user_id uuid, p_system_actor boolean
+) RETURNS text
+LANGUAGE sql STABLE
+SET search_path = public, pg_temp
+AS $$
+  SELECT CASE
+    WHEN p_system_actor THEN 'system'
+    WHEN graph_principal_in(p_authors, p_actor_identity_id, p_actor_user_id) THEN 'author'
+    WHEN _graph_owner_or_admin(p_group_user_id, p_actor_user_id) THEN
+      CASE WHEN p_actor_user_id = p_group_user_id THEN 'owner' ELSE 'admin' END
+    ELSE NULL
+  END;
+$$;
+
 
 -- ── Hold placement and release ──────────────────────────────────────────
 
@@ -609,11 +675,7 @@ BEGIN
       AND t.task_type = 'verification'
       AND t.gate_state = 'not_ready'
       AND NOT graph_hold_blocks(t.id)
-      AND NOT EXISTS (
-        SELECT 1 FROM task_edges e JOIN tasks s ON s.id = e.from_task
-        WHERE e.to_task = t.id
-          AND NOT graph_satisfies(s.task_type, s.status, s.gate_state)
-      )
+      AND NOT graph_inbound_blocked(t.id)
     ORDER BY t.id
     FOR UPDATE OF t
   LOOP
@@ -649,10 +711,10 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- Ready work: pending, unclaimed, unheld, every inbound source satisfying.
-  -- A held completed source still "satisfies" under SATISFIES — its
-  -- descendants are in the same closure and carry their own holds, which is
-  -- what keeps them out of this list.
+  -- Ready work: pending, unclaimed, unheld, every inbound source satisfying
+  -- and none of them held. A held completed source still "satisfies" under
+  -- SATISFIES; its descendants in the closure carry their own holds, and a
+  -- descendant attached later is caught by the source's hold.
   SELECT coalesce(jsonb_agg(jsonb_build_object(
            'id', w.id, 'title', w.title,
            'assigneeIdentityId', w.assignee_identity_id,
@@ -663,11 +725,7 @@ BEGIN
     AND w.task_type = 'work' AND w.status = 'pending'
     AND w.claimed_by_session_id IS NULL
     AND NOT graph_hold_blocks(w.id)
-    AND NOT EXISTS (
-      SELECT 1 FROM task_edges e JOIN tasks s ON s.id = e.from_task
-      WHERE e.to_task = w.id
-        AND NOT graph_satisfies(s.task_type, s.status, s.gate_state)
-    );
+    AND NOT graph_inbound_blocked(w.id);
 
   -- Open, unclaimed gates: someone is being waited on.
   SELECT coalesce(jsonb_agg(jsonb_build_object(
@@ -840,11 +898,7 @@ BEGIN
       RETURN jsonb_build_object('success', false, 'reason', 'not-claimable',
         'status', v_task.status);
     END IF;
-    IF EXISTS (
-      SELECT 1 FROM task_edges e JOIN tasks s ON s.id = e.from_task
-      WHERE e.to_task = p_task_id
-        AND NOT graph_satisfies(s.task_type, s.status, s.gate_state)
-    ) THEN
+    IF graph_inbound_blocked(p_task_id) THEN
       RETURN jsonb_build_object('success', false, 'reason', 'not-ready');
     END IF;
   ELSE
@@ -1075,11 +1129,7 @@ BEGIN
   -- inbound mutation, so this refusal should be unreachable — but a verdict
   -- deciding a gate whose inbound no longer satisfies must never land on
   -- the strength of a stale opening.
-  IF EXISTS (
-    SELECT 1 FROM task_edges e JOIN tasks s ON s.id = e.from_task
-    WHERE e.to_task = p_task_id
-      AND NOT graph_satisfies(s.task_type, s.status, s.gate_state)
-  ) THEN
+  IF graph_inbound_blocked(p_task_id) THEN
     RETURN jsonb_build_object('success', false, 'reason', 'dependencies-unsatisfied');
   END IF;
   -- Attempt + version CAS: late attempt-1 results never decide attempt 2 —
@@ -1360,6 +1410,7 @@ DECLARE
   v_task record;
   v_group record;
   v_group_id uuid;
+  v_authority text;
   v_new_version bigint;
   v_revoked_event_id uuid;
   v_event_id uuid;
@@ -1373,8 +1424,8 @@ BEGIN
   IF p_binding IS NULL OR p_binding_hash IS NULL OR btrim(p_binding_hash) = '' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'binding-required');
   END IF;
-  IF p_authors IS NOT NULL AND jsonb_typeof(p_authors) <> 'array' THEN
-    RETURN jsonb_build_object('success', false, 'reason', 'authors-not-array');
+  IF NOT graph_authors_valid(p_authors) THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'authors-invalid');
   END IF;
 
   SELECT task_group_id INTO v_group_id FROM tasks
@@ -1429,6 +1480,12 @@ BEGIN
   IF p_binding_hash IS NOT DISTINCT FROM v_task.gate_binding_hash THEN
     RETURN jsonb_build_object('success', false, 'reason', 'binding-unchanged');
   END IF;
+  v_authority := _graph_supersession_authority(
+    v_group.user_id, v_task.gate_authors,
+    p_actor_identity_id, p_actor_user_id, p_system_actor);
+  IF v_authority IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-authorized');
+  END IF;
 
   v_new_version := v_task.gate_version + 1;
 
@@ -1472,6 +1529,7 @@ BEGIN
                              'fromRequestRevision', v_task.gate_request_revision,
                              'toRequestRevision', v_task.gate_request_revision + 1,
                              'fromState', v_task.gate_state,
+                             'authority', v_authority,
                              'systemActor', p_system_actor,
                              'revokedEventId', v_revoked_event_id))
   RETURNING id INTO v_event_id;
@@ -1509,6 +1567,7 @@ BEGIN
 
   RETURN jsonb_build_object('success', true, 'taskId', p_task_id,
     'eventId', v_event_id, 'revokedEventId', v_revoked_event_id,
+    'authority', v_authority,
     'attempt', v_task.gate_attempt + 1, 'gateVersion', v_new_version,
     'requestRevision', v_task.gate_request_revision + 1,
     'holds', v_holds, 'evaluation', v_eval);
@@ -1855,6 +1914,17 @@ CREATE TRIGGER enforce_graph_execution_path
 REVOKE ALL ON FUNCTION public.graph_hold_blocks(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.graph_hold_blocks(uuid) FROM anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.graph_hold_blocks(uuid) TO service_role;
+
+REVOKE ALL ON FUNCTION public.graph_inbound_blocked(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.graph_inbound_blocked(uuid) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.graph_inbound_blocked(uuid) TO service_role;
+
+REVOKE ALL ON FUNCTION public._graph_supersession_authority(uuid, jsonb, uuid, uuid, boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public._graph_supersession_authority(uuid, jsonb, uuid, uuid, boolean) FROM anon, authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.graph_authors_valid(jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.graph_authors_valid(jsonb) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.graph_authors_valid(jsonb) TO service_role;
 
 REVOKE ALL ON FUNCTION public.graph_principal_in(jsonb, uuid, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.graph_principal_in(jsonb, uuid, uuid) FROM anon, authenticated;

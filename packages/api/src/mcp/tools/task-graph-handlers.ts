@@ -722,6 +722,14 @@ export const recordGateVerdictSchema = z.object({
     .optional()
     .describe('Required when you claimed the gate (executable checks)'),
   sessionId: z.string().guid().optional().describe('Resolved from context when omitted'),
+  bindingHash: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      'The candidate (binding hash) the evidence is about; refused binding-mismatch if the gate now decides another'
+    ),
 });
 
 export async function handleRecordGateVerdict(
@@ -744,6 +752,7 @@ export async function handleRecordGateVerdict(
       claimToken: args.claimToken,
       evidence: args.evidence as Record<string, unknown> | undefined,
       reason: args.reason,
+      bindingHash: args.bindingHash,
     });
 
     if (result.success) {

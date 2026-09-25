@@ -408,6 +408,234 @@ d('workflow graph revocation, supersession and holds (real DB)', () => {
     ]);
   });
 
+  it('a descendant attached AFTER the hold never becomes ready through the held completed source (Lumen, PR #678)', async () => {
+    const { group, id } = await buildGraph(
+      'late descendant',
+      [
+        { key: 'G', type: 'gate', binding: 'A' },
+        { key: 'P', type: 'work' },
+      ],
+      [['G', 'P']]
+    );
+    await sweep(group);
+    expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+    await claimAndComplete(id.P, sess1);
+    expect((await revoke(id.G, { identity: reviewer })).success).toBe(true);
+    expect(await openHolds(id.P)).toHaveLength(1);
+
+    // N is authored now — pre-executed nothing, so the fence admits it — and
+    // wired under the held, completed P by the serialized mutation.
+    const n = randomUUID();
+    taskIds.push(n);
+    const { error } = await client
+      .from('tasks')
+      .insert({ id: n, user_id: USER, task_group_id: group, title: 'N late', task_type: 'work' });
+    if (error) throw new Error(error.message);
+    const { data: groupRow } = await client
+      .from('task_groups')
+      .select('graph_version')
+      .eq('id', group)
+      .single();
+    const applied = await groups.applyTaskGraph({
+      userId: USER,
+      taskGroupId: group,
+      expectedVersion: groupRow!.graph_version,
+      edges: [
+        { from: id.G, to: id.P },
+        { from: id.P, to: n },
+      ],
+      systemActor: true,
+    });
+    expect(applied.success).toBe(true);
+    // N carries no hold of its own; P is completed. SATISFIES alone would ready it.
+    expect(await openHolds(n)).toHaveLength(0);
+    expect(evalOf(applied).readyWork.map((w) => w.id)).not.toContain(n);
+    expect(
+      await groups.claimGraphTask({ userId: USER, taskId: n, sessionId: sess1 })
+    ).toMatchObject({
+      success: false,
+      reason: 'not-ready',
+    });
+    // Re-pass on the same binding releases P's hold; N is ready through P.
+    expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+    expect(evalOf(await sweep(group)).readyWork.map((w) => w.id)).toEqual([n]);
+  });
+
+  // ── Lumen's review probes (PR #678 round 1), adopted verbatim where the
+  //    harness allows; the transaction-ordering probe below reaches the
+  //    database over INTEGRATION_DB_URL, which the managed harness exports,
+  //    instead of a docker exec, so it runs in CI.
+
+  it('review: a stranger cannot replace a request or erase its author set', async () => {
+    const { group, id } = await buildGraph(
+      'stranger supersede',
+      [
+        { key: 'G', type: 'gate', binding: 'A', authors: [{ kind: 'sb', id: author }] },
+        { key: 'W', type: 'work' },
+      ],
+      [['G', 'W']]
+    );
+    await sweep(group);
+    const row = await gate(id.G);
+    const result = await groups.supersedeGate({
+      userId: USER,
+      taskId: id.G,
+      expectedAttempt: row.gate_attempt,
+      expectedGateVersion: row.gate_version,
+      expectedRequestRevision: 0,
+      actorIdentityId: stranger,
+      binding: { tuple: 'B' },
+      bindingHash: 'B',
+      authors: [],
+    });
+    expect(result.success, JSON.stringify(result)).toBe(false);
+    expect(result.reason).toBe('not-authorized');
+    expect((await gate(id.G)).gate_binding_hash).toBe('A');
+    expect((await gate(id.G)).gate_authors).toEqual([{ kind: 'sb', id: author }]);
+  });
+
+  for (const type of ['work', 'gate'] as const) {
+    it(`review: attaching a new ${type} to a held completed bridge cannot authorize it`, async () => {
+      const { group, id } = await buildGraph(
+        'attach held bridge',
+        [
+          { key: 'G', type: 'gate', binding: 'A' },
+          { key: 'W', type: 'work' },
+          { key: 'N', type },
+        ],
+        [['G', 'W']]
+      );
+      await sweep(group);
+      expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+      await claimAndComplete(id.W, sess1);
+      expect((await revoke(id.G, { identity: reviewer })).success).toBe(true);
+      expect(await openHolds(id.W)).toHaveLength(1);
+      const result = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: group,
+        expectedVersion: 2,
+        actorIdentityId: author,
+        edges: [
+          { from: id.G, to: id.W },
+          { from: id.W, to: id.N },
+        ],
+      });
+      expect(result.success).toBe(true);
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: id.N, sessionId: sess2 });
+      expect(claim.success, JSON.stringify({ claim, evaluation: result.evaluation })).toBe(false);
+      if (type === 'gate') expect((await gate(id.N)).gate_state).toBe('not_ready');
+    });
+  }
+
+  it('review: retrying a failed descendant does not skip an upstream withdrawal', async () => {
+    const { group, id } = await buildGraph(
+      'retry held bridge',
+      [
+        { key: 'G', type: 'gate', binding: 'A' },
+        { key: 'W', type: 'work' },
+        { key: 'H', type: 'gate' },
+        { key: 'M', type: 'work' },
+      ],
+      [
+        ['G', 'W'],
+        ['W', 'H'],
+        ['H', 'M'],
+      ]
+    );
+    await sweep(group);
+    expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+    await claimAndComplete(id.W, sess1);
+    expect((await verdict(id.H, reviewer, 'failed')).success).toBe(true);
+    expect((await revoke(id.G, { identity: reviewer })).success).toBe(true);
+    expect(await openHolds(id.W)).toHaveLength(1);
+    const retry = await groups.retryGate({
+      userId: USER,
+      taskId: id.H,
+      expectedAttempt: 1,
+      actorIdentityId: reviewer,
+    });
+    expect(retry.success).toBe(true);
+    // The fresh attempt sits behind a held source: never opened, never claimable.
+    expect((await gate(id.H)).gate_state).toBe('not_ready');
+    const claim = await groups.claimGraphTask({ userId: USER, taskId: id.H, sessionId: sess2 });
+    expect(claim.success, JSON.stringify({ claim, evaluation: retry.evaluation })).toBe(false);
+  });
+
+  it('review: a mixed-case UUID in the author set still forbids that author from passing', async () => {
+    const { group, id } = await buildGraph(
+      'uppercase author',
+      [
+        {
+          key: 'G',
+          type: 'gate',
+          binding: 'A',
+          assignee: author,
+          authors: [{ kind: 'sb', id: author.toUpperCase() }],
+        },
+        { key: 'W', type: 'work' },
+      ],
+      [['G', 'W']]
+    );
+    await sweep(group);
+    expect(await verdict(id.G, author, 'passed')).toMatchObject({
+      success: false,
+      reason: 'actor-is-author',
+    });
+    // And a set that is not principals at all never reaches the row.
+    const bad = await client.from('tasks').insert({
+      id: randomUUID(),
+      user_id: USER,
+      title: 'g bad authors',
+      task_type: 'verification',
+      gate_state: 'not_ready',
+      assignee_identity_id: reviewer,
+      gate_authors: [{ kind: 'sb', id: 'not-a-uuid' }],
+    } as never);
+    expect(bad.error?.message).toMatch(/gate_authors_valid/);
+  });
+
+  it('review: a withdrawal transaction begun before a pass cannot be resolved by that older pass', async () => {
+    const dbUrl = process.env.INTEGRATION_DB_URL;
+    if (!dbUrl) throw new Error('INTEGRATION_DB_URL is required: run through the managed harness');
+    const { group, id } = await buildGraph(
+      'transaction time',
+      [
+        { key: 'G', type: 'gate', binding: 'A' },
+        { key: 'W', type: 'work' },
+      ],
+      [['G', 'W']]
+    );
+    await sweep(group);
+    // Connection A begins first, so its now() is earlier than everything that
+    // follows. Connection B (PostgREST) then passes the gate. A withdraws that
+    // committed pass afterwards: the withdrawal's created_at predates the pass
+    // it withdraws, and only the gate's own revision can order them.
+    const { Client } = await import('pg');
+    const a = new Client({ connectionString: dbUrl });
+    await a.connect();
+    try {
+      await a.query('BEGIN');
+      await a.query('SELECT now()');
+      expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+      const row = await gate(id.G);
+      const revoked = await a.query(
+        'SELECT revoke_gate($1::uuid, $2::uuid, $3::int, $4::bigint, $5::uuid, NULL, $6::text) AS r',
+        [USER, id.G, row.gate_attempt, row.gate_version, reviewer, 'test withdrawal']
+      );
+      expect(revoked.rows[0].r).toMatchObject({ success: true });
+      const unresolvedInA = await a.query(
+        'SELECT count(*)::int AS n FROM graph_unresolved_withdrawals($1::uuid, $2::text)',
+        [id.G, 'A']
+      );
+      expect(unresolvedInA.rows[0].n, 'an earlier pass must not resolve the later revocation').toBe(
+        1
+      );
+    } finally {
+      await a.query('ROLLBACK').catch(() => undefined);
+      await a.end();
+    }
+  });
+
   it('case 7 minimal: G → P(completed) → C(pending) — C does not become ready through P while held', async () => {
     const { group, id } = await buildGraph(
       'case 7 minimal',
@@ -844,6 +1072,41 @@ d('workflow graph revocation, supersession and holds (real DB)', () => {
     expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
     expect(await revoke(id.G, { user: USER })).toMatchObject({ success: true, authority: 'owner' });
     expect((await gate(id.G)).gate_attempt).toBe(3);
+
+    // Supersession is the initiating principal's act: a recorded author, the
+    // owner, or an explicit system actor — never the reviewer as such, never a
+    // stranger (Lumen, PR #678).
+    const supersede = (actor: { identity?: string; user?: string; system?: boolean }) =>
+      gate(id.G).then((row) =>
+        groups.supersedeGate({
+          userId: USER,
+          taskId: id.G,
+          expectedAttempt: row.gate_attempt,
+          expectedGateVersion: row.gate_version,
+          expectedRequestRevision: row.gate_request_revision,
+          binding: { tuple: `B${row.gate_request_revision}` },
+          bindingHash: `B${row.gate_request_revision}`,
+          actorIdentityId: actor.identity,
+          actorUserId: actor.user,
+          systemActor: actor.system,
+        })
+      );
+    expect(await supersede({ identity: reviewer })).toMatchObject({
+      success: false,
+      reason: 'not-authorized',
+    });
+    expect(await supersede({ identity: stranger })).toMatchObject({
+      success: false,
+      reason: 'not-authorized',
+    });
+    expect((await gate(id.G)).gate_request_revision).toBe(0);
+    expect(await supersede({ identity: author })).toMatchObject({
+      success: true,
+      authority: 'author',
+    });
+    expect(await supersede({ user: USER })).toMatchObject({ success: true, authority: 'owner' });
+    expect(await supersede({ system: true })).toMatchObject({ success: true, authority: 'system' });
+    expect((await gate(id.G)).gate_request_revision).toBe(3);
   });
 
   it('lift_withdrawal: owner only; names the event; releases only the holds that withdrawal placed; a second lift refuses already-resolved', async () => {
