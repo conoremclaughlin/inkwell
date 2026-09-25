@@ -134,13 +134,17 @@ Architecture and rollout live in the versioned Inkwell artifacts
 
 `src/read-session.ts` provides a read-only local lifecycle for the successor:
 
-- One fixed attachment, including same-document navigation identity; fresh capture
+- One fixed attachment, including exact HTTP(S) origin and same-document navigation identity; fresh capture
   and authoritative grant revalidation for each read, with no snapshot replay.
 - Local Stop rejects pending work without waiting for a network reply. Late
   authorization/capture results cannot revive that stopped instance.
 - Fixed ten-minute/60-read local ceilings (shorter grants win), independent of the
   15-second per-read liveness bound. Verification latency consumes that bound.
   Failed attempts spend the local budget; concurrent reads refuse.
+- Snapshot URLs must match the exact trusted origin, including scheme and port;
+  this does not authenticate a page title or replace adapter document checks.
+- Explicit `status()` calls recheck expiry and may abort pending IO; property
+  inspection alone has no cancellation side effect.
 - Wall and monotonic clocks independently bound lifetime; clock rollback refuses.
   Timers interrupt pending IO, while explicit deadline checks also cover delayed
   timers. These checks do not depend on the server's heartbeat/reaper.

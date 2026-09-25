@@ -9,6 +9,7 @@ export interface ReadTarget {
   tabId: number;
   documentId: string;
   navigationId: string;
+  origin: string;
 }
 
 /** An already authenticated grant; this module is NOT a token verifier. */
@@ -46,8 +47,23 @@ function identity(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 200;
 }
 
+function pageOrigin(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && url.origin === value;
+  } catch {
+    return false;
+  }
+}
+
 function sameTarget(a: ReadTarget, b: ReadTarget): boolean {
-  return a.tabId === b.tabId && a.documentId === b.documentId && a.navigationId === b.navigationId;
+  return (
+    a.tabId === b.tabId &&
+    a.documentId === b.documentId &&
+    a.navigationId === b.navigationId &&
+    a.origin === b.origin
+  );
 }
 
 /** Read-only local lifecycle foundation, intentionally not wired into the prototype.
@@ -89,7 +105,8 @@ export class PageReadSession {
       !Number.isSafeInteger(target.tabId) ||
       target.tabId < 0 ||
       !identity(target.documentId) ||
-      !identity(target.navigationId)
+      !identity(target.navigationId) ||
+      !pageOrigin(target.origin)
     )
       throw new Error('Invalid page-read grant or attachment.');
     this.grant = Object.freeze({
@@ -102,6 +119,7 @@ export class PageReadSession {
       tabId: target.tabId,
       documentId: target.documentId,
       navigationId: target.navigationId,
+      origin: target.origin,
     });
     this.deadline = Math.min(grant.expiresAt, wall + MAX_READ_SESSION_MS);
     this.monotonicDeadline = monotonic + (this.deadline - wall);
@@ -109,7 +127,8 @@ export class PageReadSession {
     this.lastMonotonic = monotonic;
   }
 
-  get status() {
+  /** Rechecks expiry and may abort a pending read; intentionally an explicit method. */
+  status() {
     this.checkClock();
     return {
       state: this.stopped
@@ -218,6 +237,7 @@ export class PageReadSession {
         }
         const snapshot = parseSnapshot(captured.snapshot);
         if (
+          new URL(snapshot.url).origin !== this.target.origin ||
           snapshot.mode !== mode ||
           snapshot.capturedAt < started.wall ||
           snapshot.capturedAt > this.clock.wall()
