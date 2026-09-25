@@ -38,6 +38,7 @@ interface BrowserCompanionGrantRow {
   pairing_code_hash: string | null;
   pairing_code_expires_at: string | null;
   pairing_secret_hash: string | null;
+  revoked_secret_hash: string | null;
   claimed_at: string | null;
   expires_at: string;
   revoked_at: string | null;
@@ -359,25 +360,89 @@ export class BrowserCompanionGrantService {
     };
   }
 
-  /** Idempotent: revoking an already-revoked grant is a success, not an error. */
-  async revokeGrant(grantId: string, reason = 'user_revoked'): Promise<void> {
-    const { error } = await this.client
+  /**
+   * Resolve a pairing secret for revocation only, including one whose grant
+   * is already revoked.
+   *
+   * Revocation retires the secret into `revoked_secret_hash`, so this is the
+   * one lookup that still finds it. Without that, a client whose first revoke
+   * acknowledgement was lost would retry with the same secret and get a 401,
+   * with no way to tell "already revoked" from "never valid". The token path
+   * uses resolveGrantForSecret and never reads the retired column, so a
+   * revoked secret still mints nothing.
+   */
+  async resolveGrantForRevocation(params: {
+    pairingSecret: string;
+    installationId: string;
+  }): Promise<
+    | { ok: true; grantId: string; userId: string; workspaceId: string }
+    | { ok: false; reason: 'invalid_secret' }
+  > {
+    // Safe to interpolate into the filter string: a sha256 hex digest has no
+    // PostgREST filter syntax in it.
+    const secretHash = sha256(params.pairingSecret);
+
+    const { data, error } = await this.client
+      .from('browser_companion_grants')
+      .select('id, user_id, workspace_id')
+      .or(`pairing_secret_hash.eq.${secretHash},revoked_secret_hash.eq.${secretHash}`)
+      .eq('installation_id', params.installationId)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('Browser companion revocation lookup failed', { error: error.message });
+      throw new Error('grant_check_unavailable');
+    }
+
+    const grant = data as Pick<BrowserCompanionGrantRow, 'id' | 'user_id' | 'workspace_id'> | null;
+    if (!grant) return { ok: false, reason: 'invalid_secret' };
+
+    return {
+      ok: true,
+      grantId: grant.id,
+      userId: grant.user_id,
+      workspaceId: grant.workspace_id,
+    };
+  }
+
+  /**
+   * Idempotent: revoking an already-revoked grant is a success, not an error.
+   *
+   * The secret and any pairing code are retired by the
+   * browser_companion_grants_retire_secret trigger, not here, so every revoker
+   * gets that for free. The lifecycle event is recorded only when this call
+   * is the one that revoked, so a retried revoke does not log a second
+   * revocation.
+   *
+   * 'already_revoked' means no unrevoked row matched. The caller has already
+   * proved the grant exists (the router's ownership check), so the only other
+   * way to get it is the row being deleted in between, and a deleted grant
+   * authorises nothing either.
+   */
+  async revokeGrant(
+    grantId: string,
+    reason = 'user_revoked'
+  ): Promise<'revoked' | 'already_revoked'> {
+    const { data, error } = await this.client
       .from('browser_companion_grants')
       .update({
         revoked_at: new Date().toISOString(),
         revoked_reason: reason,
-        pairing_secret_hash: null,
-        pairing_code_hash: null,
       })
       .eq('id', grantId)
-      .is('revoked_at', null);
+      .is('revoked_at', null)
+      .select('id');
 
     if (error) {
       logger.error('Browser companion revoke failed', { grantId, error: error.message });
       throw new Error('grant_revoke_failed');
     }
 
+    const updated = (data ?? []) as Array<Pick<BrowserCompanionGrantRow, 'id'>>;
+    if (updated.length === 0) return 'already_revoked';
+
     await this.recordEvent(grantId, 'revoked', reason);
+    return 'revoked';
   }
 
   async recordEvent(

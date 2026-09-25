@@ -125,7 +125,10 @@ async function resolveRevocationCaller(
     return { ok: false, status: 401, error: 'browser_credential_required' };
   }
 
-  const resolved = await grants.resolveGrantForSecret({ pairingSecret, installationId });
+  // The revocation lookup, not the token one: it also finds a secret that an
+  // earlier revoke retired, so a retry whose first acknowledgement was lost
+  // gets the same 200 rather than a 401 it cannot interpret.
+  const resolved = await grants.resolveGrantForRevocation({ pairingSecret, installationId });
   if (!resolved.ok) return { ok: false, status: 401, error: 'invalid_secret' };
 
   return {
@@ -342,6 +345,10 @@ export function createBrowserCompanionRouter(client: SupabaseClient<Database>): 
   });
 
   // --- POST /auth/revoke ---------------------------------------------------
+  //
+  // Idempotent with either credential: a repeat answers exactly as the first
+  // call did. Whether this call or an earlier one did the revoking is not in
+  // the response. The caller asked for the grant to be dead, and it is.
   router.post('/auth/revoke', async (req: Request, res: Response) => {
     const { browserClient } = req as BrowserCompanionRequest;
     try {

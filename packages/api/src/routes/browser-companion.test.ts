@@ -7,8 +7,11 @@
  * `browser_companion_consume_grant` RPC is NOT executed — it is plpgsql, and
  * running it needs the migration applied and a database. The fake below is a
  * hand-port of its refusal ordering, so these tests prove the router reacts
- * correctly to each outcome, not that the SQL produces them. The SQL's own
- * coverage is an integration-tier job once the migration is applied.
+ * correctly to each outcome, not that the SQL produces them. The fake also
+ * cannot see the retire trigger, so the repeat-revoke semantics are not
+ * evidenced here at all. Both are exercised against a real database, through
+ * this same router, in
+ * services/browser-companion-grant.integration.test.ts.
  */
 
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -125,7 +128,7 @@ function makeFakeClient() {
       tablesRead.push(table);
       const builder: Record<string, unknown> = {};
       const chain = () => builder;
-      for (const method of ['select', 'eq', 'gt', 'is', 'update', 'insert']) {
+      for (const method of ['select', 'eq', 'gt', 'is', 'or', 'update', 'insert']) {
         builder[method] = chain;
       }
       builder.maybeSingle = async () => {

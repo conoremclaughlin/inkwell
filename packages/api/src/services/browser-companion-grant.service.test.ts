@@ -56,6 +56,12 @@ const updatePayloads: Array<{ table: string; payload: Record<string, unknown> }>
  * would pass just as happily with the binding deleted.
  */
 const predicates: Array<{ table: string; op: string; column: string; value: unknown }> = [];
+/**
+ * What an awaited UPDATE … RETURNING hands back. revokeGrant decides whether
+ * it was the call that revoked from this, so it has to be settable: one row
+ * is a revocation, none is an already-revoked grant.
+ */
+let updateReturns: Array<{ id: string }> = [];
 
 function makeRecordingClient() {
   return {
@@ -82,6 +88,10 @@ function makeRecordingClient() {
       builder.eq = record('eq');
       builder.gt = record('gt');
       builder.is = record('is');
+      builder.or = (filter: string) => {
+        predicates.push({ table, op: 'or', column: '', value: filter });
+        return builder;
+      };
       builder.insert = (payload: Record<string, unknown>) => {
         insertPayloads.push({ table, payload });
         return builder;
@@ -100,8 +110,10 @@ function makeRecordingClient() {
         error: null,
       });
       builder.single = builder.maybeSingle;
-      // The insert path awaits the builder directly when it does not .select().
-      builder.then = (resolve: (value: unknown) => unknown) => resolve({ error: null });
+      // Awaited directly by the event insert (no .select()) and by the revoke
+      // UPDATE (.select('id'), no .single()). The insert ignores `data`.
+      builder.then = (resolve: (value: unknown) => unknown) =>
+        resolve({ data: updateReturns, error: null });
       return builder;
     },
   } as unknown as SupabaseClient<Database>;
@@ -115,6 +127,7 @@ describe('browser companion grant storage', () => {
     insertPayloads.length = 0;
     updatePayloads.length = 0;
     predicates.length = 0;
+    updateReturns = [{ id: GRANT_ID }];
     service = new BrowserCompanionGrantService(makeRecordingClient());
   });
 
@@ -131,6 +144,10 @@ describe('browser companion grant storage', () => {
       installationSecret: INSTALLATION_SECRET,
     });
     await service.resolveGrantForSecret({
+      pairingSecret: 'ink-bc-whatever',
+      installationId: INSTALLATION_ID,
+    });
+    await service.resolveGrantForRevocation({
       pairingSecret: 'ink-bc-whatever',
       installationId: INSTALLATION_ID,
     });
@@ -196,13 +213,81 @@ describe('browser companion grant storage', () => {
       );
     });
 
-    it('clears both secrets on revoke', async () => {
+    it('leaves retiring the secrets to the database on revoke', async () => {
+      // The retire trigger moves the secret hash and clears the code hash for
+      // every revoker, and the CHECK refuses a revocation that would leave a
+      // secret live. Clearing them here as well would make two owners of one
+      // rule. The trigger's effect is measured against a real database in
+      // browser-companion-grant.integration.test.ts. It cannot be seen here.
       await service.revokeGrant(GRANT_ID, 'user_revoked');
       const update = updatePayloads.find((p) => p.table === 'browser_companion_grants');
-      expect(update!.payload).toMatchObject({
-        pairing_secret_hash: null,
-        pairing_code_hash: null,
-        revoked_reason: 'user_revoked',
+      expect(Object.keys(update!.payload).sort()).toEqual(['revoked_at', 'revoked_reason']);
+      expect(update!.payload.revoked_reason).toBe('user_revoked');
+    });
+  });
+
+  describe('a revoked secret revokes and does nothing else', () => {
+    const secret = 'ink-bc-a-secret-the-extension-holds';
+    const secretHash = crypto.createHash('sha256').update(secret).digest('hex');
+
+    it('the revocation lookup also matches a retired secret', async () => {
+      await service.resolveGrantForRevocation({
+        pairingSecret: secret,
+        installationId: INSTALLATION_ID,
+      });
+
+      expect(predicates).toContainEqual({
+        table: 'browser_companion_grants',
+        op: 'or',
+        column: '',
+        value: `pairing_secret_hash.eq.${secretHash},revoked_secret_hash.eq.${secretHash}`,
+      });
+      expect(JSON.stringify(predicates)).not.toContain(secret);
+    });
+
+    it('the token lookup never reads the retired column', async () => {
+      // If it did, a revoked secret could mint again. /auth/token's liveness
+      // check would still refuse it, but that is a second rule standing in for
+      // the first, and this lookup is where the separation is supposed to live.
+      await service.resolveGrantForSecret({
+        pairingSecret: secret,
+        installationId: INSTALLATION_ID,
+      });
+
+      expect(JSON.stringify(predicates)).not.toContain('revoked_secret_hash');
+      expect(predicates).toContainEqual({
+        table: 'browser_companion_grants',
+        op: 'eq',
+        column: 'pairing_secret_hash',
+        value: secretHash,
+      });
+    });
+  });
+
+  describe('a repeated revoke is not a second revocation', () => {
+    it('records the revoked event only when this call revoked', async () => {
+      updateReturns = [];
+
+      await expect(service.revokeGrant(GRANT_ID, 'user_revoked')).resolves.toBe('already_revoked');
+      expect(insertPayloads.filter((p) => p.table === 'browser_companion_grant_events')).toEqual(
+        []
+      );
+    });
+
+    it('CONTROL: the call that does revoke records exactly one event', async () => {
+      await expect(service.revokeGrant(GRANT_ID, 'user_revoked')).resolves.toBe('revoked');
+      expect(
+        insertPayloads.filter((p) => p.table === 'browser_companion_grant_events')
+      ).toHaveLength(1);
+    });
+
+    it('only an unrevoked row can match the revoking UPDATE', async () => {
+      await service.revokeGrant(GRANT_ID, 'user_revoked');
+      expect(predicates).toContainEqual({
+        table: 'browser_companion_grants',
+        op: 'is',
+        column: 'revoked_at',
+        value: null,
       });
     });
   });

@@ -55,6 +55,20 @@ CREATE TABLE IF NOT EXISTS public.browser_companion_grants (
   pairing_code_expires_at timestamptz,
   pairing_secret_hash text,
 
+  -- Where pairing_secret_hash goes when the grant is revoked, so a repeated
+  -- revoke with the secret still resolves to its grant.
+  --
+  -- Revocation clears pairing_secret_hash, so the secret mints nothing
+  -- afterwards. Without this column that also made a second revoke with the
+  -- same secret a 401, and a client whose first acknowledgement was lost could
+  -- not tell "already revoked" from "never valid". The move is done by
+  -- browser_companion_grants_retire_secret below, not by any caller.
+  --
+  -- Only the revocation path reads it. The token path looks up
+  -- pairing_secret_hash alone, so this column authenticates exactly one thing:
+  -- a request to revoke a grant that is already revoked.
+  revoked_secret_hash text,
+
   claimed_at timestamptz,
 
   -- Wall-clock ceiling and revocation. A grant is dead when it is past
@@ -83,7 +97,13 @@ CREATE TABLE IF NOT EXISTS public.browser_companion_grants (
 
   last_used_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+
+  -- A revoked grant has no live secret. The retire trigger guarantees it on
+  -- the transition; this refuses any other write that would bring one back.
+  CONSTRAINT browser_companion_grants_revoked_secret_retired CHECK (
+    revoked_at IS NULL OR pairing_secret_hash IS NULL
+  )
 );
 
 -- The claim path looks a grant up by code hash alone, so this must be unique
@@ -97,6 +117,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS browser_companion_grants_pairing_secret_hash_k
   ON public.browser_companion_grants (pairing_secret_hash)
   WHERE pairing_secret_hash IS NOT NULL;
 
+CREATE UNIQUE INDEX IF NOT EXISTS browser_companion_grants_revoked_secret_hash_key
+  ON public.browser_companion_grants (revoked_secret_hash)
+  WHERE revoked_secret_hash IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS browser_companion_grants_user_live_idx
   ON public.browser_companion_grants (user_id, expires_at)
   WHERE revoked_at IS NULL;
@@ -105,10 +129,35 @@ CREATE TRIGGER browser_companion_grants_updated_at
   BEFORE UPDATE ON public.browser_companion_grants
   FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
+-- Revoking a grant retires its secret, whoever does the revoking.
+--
+-- A trigger rather than a column list in the service's UPDATE because
+-- PostgREST cannot set one column from another, and because every revoker
+-- has to do this: the companion's own /auth/revoke today, a dashboard
+-- Disconnect later. A revoker that set only revoked_at would otherwise leave
+-- the secret live, which the CHECK above refuses.
+CREATE OR REPLACE FUNCTION public.browser_companion_grants_retire_secret()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.revoked_secret_hash := OLD.pairing_secret_hash;
+  NEW.pairing_secret_hash := NULL;
+  NEW.pairing_code_hash := NULL;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER browser_companion_grants_retire_secret
+  BEFORE UPDATE OF revoked_at ON public.browser_companion_grants
+  FOR EACH ROW
+  WHEN (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL)
+  EXECUTE FUNCTION public.browser_companion_grants_retire_secret();
+
 -- Grant lifecycle, recorded as FIELDS.
 --
 -- `reason_code` is a machine token ('grant_revoked', 'grant_expired',
--- 'grant_action_cap', 'installation_mismatch', …), never a sentence. A
+-- 'installation_mismatch', …), never a sentence. A
 -- studio_lease_events row has already asserted a cause nobody measured — it
 -- read "tier studio-hint resolved a studio held by X" when the hint had
 -- resolved to undefined, because the sentence was stitched from independent
