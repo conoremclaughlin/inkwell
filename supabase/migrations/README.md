@@ -20,6 +20,7 @@ this section exists to keep that true.
 ```bash
 yarn db:migrate supabase/migrations/20260916024540_memory_embedding_atomic_swap.sql
 yarn db:migrate:status
+yarn db:migrate:pending
 ```
 
 `db:migrate` (`scripts/db-migrate.sh`) runs one psql transaction: an advisory
@@ -62,6 +63,34 @@ parameter, or in keyword/value form, so the connection string is never printed.
 If the stack is not running, start it from the root checkout with
 `supabase start`. Do not reach for `yarn supabase:local:setup` for that: it
 runs `supabase db reset` and discards every row of live data.
+
+`db:migrate:pending` applies every file the ledger lacks, in version order,
+one transaction each, and `yarn dev` and `yarn prod:direct` run it from the
+main checkout before the servers start. The restart is the deploy, and a
+server must not come up on a schema behind its code: on 2026-09-24 the main
+server was restarted on a release whose three migrations had not been applied,
+the startup check printed them as a warning and let it start, and every
+channel poll then failed on a renamed function until the window was run.
+`yarn dev:no-migrations` (`INK_SKIP_MIGRATIONS=1`) skips the step on purpose,
+prints what is pending, and starts anyway. A worktree's server never applies
+anything to the shared stack; it warns, as before. A linked (hosted) target is
+not driven by the wrapper: pending there refuses the start and points at
+`yarn linked:migrate`.
+
+### Window migrations
+
+A migration that needs writers stopped, a snapshot, or a manifest loaded first
+announces itself in its first ten lines:
+
+```sql
+-- db-migrate: window docs/runbooks/<name>.md
+```
+
+`pending`, and so startup, stops in front of such a file with exit 3, names the
+runbook, and applies nothing behind it. `apply` takes it only as
+`yarn db:migrate --window <file>`, which says the operator is inside that
+window. `20260913090000_inkmail_thread_scope_cutover.sql` is the first, and
+its runbook is `docs/runbooks/inkmail-thread-scope-cutover.md`.
 
 Two other ways of applying exist, and both leave the ledger wrong:
 
