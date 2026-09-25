@@ -147,9 +147,10 @@ class DataTests(unittest.TestCase):
         self.assertEqual(names, data.FIXTURE_TABLES)
         self.assertEqual(len(set(names)), len(names))
         # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539).
+        # 73 -> 75 with browser_companion_grants/_grant_events (#671).
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 73)
+        self.assertEqual(len(names), 75)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
@@ -216,47 +217,100 @@ class DataTests(unittest.TestCase):
                                    return_value=result), self.assertRaises(data.Refusal):
                 self.clean()
 
-    def test_windowed_fixture_tables_follow_the_rehearsal_cut(self):
-        window = ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")
+    CUT = "20260913090000"
+    WINDOW = ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")
+    LATE = ("browser_companion_grants", "browser_companion_grant_events")
+
+    def truncated(self, sql):
+        truncate = sql[sql.index("TRUNCATE "):sql.index(" CONTINUE IDENTITY")]
+        return tuple(part.removeprefix("ONLY public.") for part in truncate[9:].split(", "))
+
+    def test_windowed_and_late_fixture_tables_follow_the_rehearsal_cut(self):
+        present = tuple(name for name in data.FIXTURE_TABLES if name not in self.LATE)
+        self.assertEqual(len(present), len(data.FIXTURE_TABLES) - len(self.LATE))
+        # A full-schema stack: the window was dropped, the late tables were created.
         self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES)
-        # The CI rehearsal cut: the creating migration applied, the dropping one withheld.
-        self.assertEqual(data.fixture_tables("20260913090000"), data.FIXTURE_TABLES + window)
-        # Cut at or before the creator (never created), or after the dropper (dropped).
-        for until in ("20260913081634", "20260913081633", "20260913090001", "20270101000000"):
+        # The CI rehearsal cut: the window's creator applied and its dropper
+        # withheld; the late tables' creator withheld with it.
+        self.assertEqual(data.fixture_tables(self.CUT), present + self.WINDOW)
+        # Cut at or before the window's creator, or after its dropper: no window.
+        # Every one of these is still at or before the late creator.
+        for until in ("20260913081634", "20260913081633", "20260913090001", "20260924070106"):
+            with self.subTest(until=until):
+                self.assertEqual(data.fixture_tables(until), present)
+        # Cut after the late creator: it ran, so its tables exist.
+        for until in ("20260924070107", "20270101000000"):
             with self.subTest(until=until):
                 self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES)
-        # The window is part of the policy, so changing it invalidates cached baselines.
-        for name in window:
+        # Both lists are part of the policy, so changing either invalidates cached baselines.
+        for name in self.WINDOW:
             self.assertIn(name, data.POLICY)
+        self.assertIn("|late:20260924070106:", data.POLICY)
+
+    def test_full_schema_stack_classifies_and_truncates_the_late_tables(self):
+        # The catalog a full-schema reset produces at this checkout, written out
+        # rather than read back from FIXTURE_TABLES, so the test can fail when
+        # the classification lags the migrations (PR #671's first CI run:
+        # "2 unclassified, 0 missing").
+        self.catalog = tuple(dict.fromkeys(data.FIXTURE_TABLES + self.LATE)) + data.EXCLUDED_TABLES
+        self.clean()
+        names = self.truncated(self.mutations()[0])
+        for name in self.LATE:
+            self.assertIn(name, names)
+
+    def test_every_late_table_is_a_fixture_table_and_none_is_windowed(self):
+        # A late entry naming a table outside FIXTURE_TABLES withholds nothing,
+        # and the rehearsal it was written for fails as if it were never added.
+        windowed = {name for _, _, names in data.WINDOWED_FIXTURE_TABLES for name in names}
+        for created_by, names in data.LATE_FIXTURE_TABLES:
+            self.assertRegex(created_by, r"^\d{14}$")
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertIn(name, data.FIXTURE_TABLES)
+                    self.assertNotIn(name, windowed)
 
     def test_rehearsal_cut_classifies_and_truncates_the_windowed_tables(self):
-        window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
-        self.catalog = data.FIXTURE_TABLES + window + data.EXCLUDED_TABLES
-        # A full-schema stack must not carry them ...
+        rehearsal = data.fixture_tables(self.CUT)
+        window = tuple(name for name in rehearsal if name not in data.FIXTURE_TABLES)
+        self.assertEqual(window, self.WINDOW)
+        self.catalog = rehearsal + data.EXCLUDED_TABLES
+        # A full-schema stack must not carry the window, and must carry the late tables ...
         with self.assertRaisesRegex(data.Refusal, "classification differs"):
             self.clean()
         self.assertEqual(self.mutations(), [])
-        # ... a rehearsal stack must, and its cleanup truncates them with the rest.
-        self.clean(until="20260913090000")
-        truncate = self.mutations()[0]
-        for name in window:
-            self.assertIn("ONLY public." + name, truncate)
-        # A rehearsal stack without them is refused just the same, before mutation.
+        # ... a rehearsal stack is the reverse, and its cleanup truncates
+        # exactly what it carries.
+        self.clean(until=self.CUT)
+        names = self.truncated(self.mutations()[0])
+        self.assertEqual(names, rehearsal)
+        for name in self.LATE:
+            self.assertNotIn(name, names)
+        # A rehearsal stack without the window is refused just the same, before mutation ...
         self.catalog = data.FIXTURE_TABLES + data.EXCLUDED_TABLES
         self.calls = []
         with self.assertRaisesRegex(data.Refusal, "classification differs"):
-            self.clean(until="20260913090000")
+            self.clean(until=self.CUT)
+        self.assertEqual(self.mutations(), [])
+        # ... and so is one that somehow carries the late tables: a migration
+        # applied past the cut is drift, not a table to clean up quietly.
+        self.catalog = rehearsal + self.LATE + data.EXCLUDED_TABLES
+        with self.assertRaisesRegex(data.Refusal, "classification differs"):
+            self.clean(until=self.CUT)
         self.assertEqual(self.mutations(), [])
 
     def test_cold_capture_under_the_rehearsal_cut_dumps_the_windowed_tables(self):
-        window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
-        self.catalog = data.FIXTURE_TABLES + window + data.EXCLUDED_TABLES
+        rehearsal = data.fixture_tables(self.CUT)
+        self.catalog = rehearsal + data.EXCLUDED_TABLES
         self.checksum_tables = self.catalog
         data.capture_baseline(self.workdir, self.project, self.id, 55422, [7], self.signature, self.run_id,
-                              "20260913090000")
+                              self.CUT)
         dump = next(args for args, _ in self.calls if "pg_dump" in args)
-        for name in window:
+        for name in self.WINDOW:
             self.assertIn("--table=public." + name, dump)
+        # pg_dump --strict-names fails on a named table that does not exist, so
+        # the late tables must stay out of a rehearsal dump.
+        for name in self.LATE:
+            self.assertNotIn("--table=public." + name, dump)
 
     def test_unclassified_or_missing_table_refuses_before_mutation(self):
         for tables in (self.catalog + ("unclassified_fixture",), self.catalog[1:]):

@@ -27,6 +27,7 @@ activity_stream agent_identities agent_identity_history agent_inbox
 agent_inbox_read_status agent_sessions alert_events alert_sources alert_webhooks
 approval_requests artifact_comments
 artifact_history artifact_uri_aliases artifacts audit_log authorized_groups
+browser_companion_grant_events browser_companion_grants
 channel_routes connected_accounts contacts conversations group_challenge_codes
 heartbeat_notifications heartbeat_state inbox_thread_messages
 inbox_thread_participants inbox_thread_read_status inbox_threads integration_health
@@ -51,10 +52,19 @@ WINDOWED_FIXTURE_TABLES = (
     ("20260913081634", "20260913090000",
      ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")),
 )
+# FIXTURE_TABLES created after a rehearsal cut. Every full-schema stack carries
+# them, so they stay in FIXTURE_TABLES; a stack cut at or before their creating
+# migration never ran it, and must not expect them. Entries are (created_by,
+# tables). A table created after the latest cut in CI belongs here as well as
+# in FIXTURE_TABLES, or that rehearsal refuses its catalog as "missing".
+LATE_FIXTURE_TABLES = (
+    ("20260924070106", ("browser_companion_grants", "browser_companion_grant_events")),
+)
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
-POLICY = ("fixture-baseline-v4:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
+POLICY = ("fixture-baseline-v5:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
           ";".join(created + "-" + dropped + ":" + ",".join(tables)
-                   for created, dropped, tables in WINDOWED_FIXTURE_TABLES))
+                   for created, dropped, tables in WINDOWED_FIXTURE_TABLES) + "|late:" +
+          ";".join(created + ":" + ",".join(tables) for created, tables in LATE_FIXTURE_TABLES))
 
 
 def fixture_tables(until=""):
@@ -62,9 +72,14 @@ def fixture_tables(until=""):
 
     Empty means every migration applied. The stack withholds a migration whose
     stamp is >= until (integration-stack.prepare), so a windowed table exists
-    when its creating migration was applied and its dropping one withheld.
+    when its creating migration was applied and its dropping one withheld, and
+    a late table exists only when its creating migration was applied.
     """
     tables = FIXTURE_TABLES
+    if until:
+        withheld = {name for created_by, names in LATE_FIXTURE_TABLES
+                    if until <= created_by for name in names}
+        tables = tuple(name for name in tables if name not in withheld)
     for created_by, dropped_by, names in WINDOWED_FIXTURE_TABLES:
         if until and created_by < until <= dropped_by:
             tables += names
