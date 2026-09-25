@@ -3308,6 +3308,7 @@ __metadata:
     eslint: "npm:^8.56.0"
     jest: "npm:^29.7.0"
     jsdom: "npm:^30.0.1"
+    marked: "npm:^15.0.12"
     react: "npm:^19.0.0"
     react-dom: "npm:^19.0.0"
     ts-jest: "npm:^29.1.1"

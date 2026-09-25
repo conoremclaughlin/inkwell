@@ -39,6 +39,9 @@
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist *.tsbuildinfo"
   },
+  "dependencies": {
+    "marked": "^15.0.12"
+  },
   "peerDependencies": {
     "react": ">=18.0.0"
   },
