@@ -6,9 +6,13 @@ VALUES
   ('550e8400-e29b-41d4-a716-446655440000', 'test@example.com', 'testuser', 'Test', 'User', 123456789, '{"theme": "dark", "notifications": true}')
 ON CONFLICT (id) DO NOTHING;
 
--- Insert canonical integration-test agent identity fixture
+-- Insert canonical integration-test agent identity fixture, in the fixture
+-- user's personal workspace (provisioned by the users AFTER INSERT trigger
+-- above; spec inkmail-thread-scope §1, §3 — a thread principal is an
+-- identity in exactly one workspace).
 INSERT INTO agent_identities (
   user_id,
+  workspace_id,
   agent_id,
   name,
   role,
@@ -21,6 +25,10 @@ INSERT INTO agent_identities (
 )
 VALUES (
   '550e8400-e29b-41d4-a716-446655440000',
+  (SELECT id FROM workspaces
+    WHERE user_id = '550e8400-e29b-41d4-a716-446655440000'
+      AND type = 'personal' AND slug = 'personal' AND archived_at IS NULL
+    LIMIT 1),
   'echo',
   'Echo',
   'Integration test fixture agent',

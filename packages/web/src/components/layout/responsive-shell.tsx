@@ -6,9 +6,9 @@ import { Menu, X } from 'lucide-react';
 import { Sidebar } from './sidebar';
 
 /**
- * Dashboard shell that survives a phone. The sidebar is a fixed 256px
- * column, which on a 390px viewport left main 134px — no page can render
- * there. Desktop keeps the static sidebar; below md it becomes a slide-over
+ * Dashboard shell that survives a phone. The sidebar is a fixed column
+ * (256px at the time), which on a 390px viewport left main 134px — no page
+ * can render there. Desktop keeps the static sidebar; below md it becomes a slide-over
  * drawer behind a top-bar menu button, and the content gets the full width.
  */
 export function ResponsiveShell({ children }: { children: React.ReactNode }) {

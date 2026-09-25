@@ -9,7 +9,7 @@ import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { DataComposer } from '../../data/composer';
-import type { Json, Tables, TablesInsert } from '../../data/supabase/types';
+import type { Json, Tables, TablesInsert, TablesUpdate } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import {
   withWorkspaceFilter,
@@ -63,7 +63,12 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
     .optional()
     .describe('Map of sbSlug to relationship description'),
   capabilities: z.array(z.string()).optional().describe('What this agent can do'),
-  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional flexible data'),
+  metadata: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      'Shallow-merged metadata: omitted keys are preserved; provided keys replace their entire value (including null). runtimeConfig and bridge change only when explicitly provided.'
+    ),
   heartbeat: z
     .string()
     .optional()
@@ -115,7 +120,11 @@ export const getIdentityHistorySchema = userIdentifierBaseSchema.extend({
 export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
   sbSlug: z.string().describe('Agent identifier to restore'),
-  version: z.number().describe('Version number to restore to'),
+  version: z
+    .number()
+    .describe(
+      'Version to restore. Historical metadata is merged; current runtimeConfig and bridge are preserved, not restored.'
+    ),
 });
 
 // =====================================================
@@ -188,6 +197,63 @@ function generateIdentityMarkdown(identity: {
 }
 
 type AgentIdentityRow = Tables<'agent_identities'>;
+
+function metadataObject(value: Json | undefined): Record<string, Json | undefined> {
+  if (value === null || value === undefined) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(
+      'Identity metadata must be an object; refusing to overwrite malformed metadata'
+    );
+  }
+  return value;
+}
+
+/**
+ * A merge from a stale read can still drop an operator's intervening metadata
+ * edit. The archive trigger increments version on every metadata change, so
+ * compare-and-swap the row and rebuild from a fresh snapshot on conflict.
+ * Never retry as an unguarded write, or switch to another identity/scope.
+ */
+async function updateIdentityWithRetry(
+  supabase: ReturnType<DataComposer['getClient']>,
+  initial: AgentIdentityRow,
+  buildFields: (current: AgentIdentityRow) => TablesUpdate<'agent_identities'>
+) {
+  let current = initial;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let update = supabase
+      .from('agent_identities')
+      .update(buildFields(current))
+      .eq('id', initial.id)
+      .eq('user_id', initial.user_id);
+    update =
+      current.version === null ? update.is('version', null) : update.eq('version', current.version);
+    update = initial.workspace_id
+      ? update.eq('workspace_id', initial.workspace_id)
+      : update.is('workspace_id', null);
+    const result = await update.select().single();
+    // The primary-key filter permits at most one row: PGRST116 is a miss.
+    if (result.error?.code !== 'PGRST116') return result;
+    if (attempt === 2) break;
+
+    let lookup = supabase
+      .from('agent_identities')
+      .select('*')
+      .eq('id', initial.id)
+      .eq('user_id', initial.user_id);
+    lookup = initial.workspace_id
+      ? lookup.eq('workspace_id', initial.workspace_id)
+      : lookup.is('workspace_id', null);
+    const refreshed = await lookup.single();
+    if (refreshed.error) {
+      throw new Error(
+        `Failed to reload identity after concurrent update: ${refreshed.error.message}`
+      );
+    }
+    current = refreshed.data;
+  }
+  throw new Error('Identity changed concurrently; retry the operation');
+}
 
 /**
  * The one agent_identities row for (user, agent[, workspace]). Reads EVERY row
@@ -339,7 +405,9 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
       : await findAgentIdentityRow(supabase, user.id, sbSlug, workspaceScope);
 
   // Build the row, preserving existing values for omitted fields
-  const identityFields: TablesInsert<'agent_identities'> = {
+  const buildIdentityFields = (
+    existing: AgentIdentityRow | null
+  ): TablesInsert<'agent_identities'> => ({
     user_id: user.id,
     agent_id: sbSlug,
     name,
@@ -354,9 +422,7 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     capabilities: (capabilities !== undefined
       ? capabilities
       : ((existing?.capabilities as unknown as string[]) ?? [])) as unknown as Json,
-    metadata: (metadata !== undefined
-      ? metadata
-      : ((existing?.metadata as unknown as Record<string, unknown>) ?? {})) as unknown as Json,
+    metadata: { ...metadataObject(existing?.metadata), ...metadata } as Json,
     heartbeat: heartbeat !== undefined ? heartbeat || null : (existing?.heartbeat ?? null),
     soul: soul !== undefined ? soul || null : (existing?.soul ?? null),
     tts_config: (ttsConfig !== undefined
@@ -366,18 +432,13 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     // the existing row's workspace, the (user, workspace, agent) conflict
     // target never matched on NULL, and the upsert inserted an unscoped twin.
     workspace_id: workspaceScope ?? existing?.workspace_id ?? null,
-  };
+  });
 
   // Update the row we found by its id; only a first save inserts. An upsert
   // keyed on a NULL-able column cannot express "update the existing row".
   const { data, error } = existing
-    ? await supabase
-        .from('agent_identities')
-        .update(identityFields)
-        .eq('id', existing.id)
-        .select()
-        .single()
-    : await supabase.from('agent_identities').insert(identityFields).select().single();
+    ? await updateIdentityWithRetry(supabase, existing, buildIdentityFields)
+    : await supabase.from('agent_identities').insert(buildIdentityFields(null)).select().single();
 
   if (error) {
     logger.error('Failed to save identity', { error, sbSlug });
@@ -730,24 +791,25 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
     throw new Error(`Version ${params.version} not found in history for agent: ${params.sbSlug}`);
   }
 
-  // Restore by updating with the historical values
-  const { data, error } = await supabase
-    .from('agent_identities')
-    .update({
-      name: historyEntry.name,
-      role: historyEntry.role,
-      description: historyEntry.description,
-      values: historyEntry.values,
-      relationships: historyEntry.relationships,
-      capabilities: historyEntry.capabilities,
-      metadata: historyEntry.metadata,
-      soul: historyEntry.soul,
-      heartbeat: historyEntry.heartbeat,
-      permissions: (historyEntry as any).permissions ?? {},
-    })
-    .eq('id', current.id)
-    .select()
-    .single();
+  // A document rollback must not revert today's operational settings, nor
+  // resurrect old settings that have since been removed. To change those,
+  // explicitly name them in save_identity's metadata patch instead.
+  const historicalMetadata = { ...metadataObject(historyEntry.metadata) };
+  delete historicalMetadata.runtimeConfig;
+  delete historicalMetadata.bridge;
+
+  const { data, error } = await updateIdentityWithRetry(supabase, current, (latest) => ({
+    name: historyEntry.name,
+    role: historyEntry.role,
+    description: historyEntry.description,
+    values: historyEntry.values,
+    relationships: historyEntry.relationships,
+    capabilities: historyEntry.capabilities,
+    metadata: { ...metadataObject(latest.metadata), ...historicalMetadata },
+    soul: historyEntry.soul,
+    heartbeat: historyEntry.heartbeat,
+    permissions: (historyEntry as any).permissions ?? {},
+  }));
 
   if (error) {
     logger.error('Failed to restore identity', {

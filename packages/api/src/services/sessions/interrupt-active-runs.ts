@@ -19,6 +19,7 @@
 
 import { logger } from '../../utils/logger.js';
 import { sendTriggerFailureNotice } from '../trigger-failure-notice.js';
+import { workspaceOfSb } from '../principals.js';
 import type { ActiveRun } from './active-runs.js';
 
 // Same loose client shape the trigger-failure path already accepts; session
@@ -512,9 +513,29 @@ export async function interruptActiveRuns(
     // to post back to. The logs in transitionSession are the record there.
     if (!run.threadKey) return outcome;
 
+    // The thread is one row per (workspace, key); the session's identity
+    // names the workspace (spec inkmail-thread-scope §1). Without one the
+    // notice takes the legacy lane rather than guessing among namesakes.
+    let workspaceId: string | null = null;
+    try {
+      const { data: sessionRow } = await client
+        .from('sessions')
+        .select('sb_id')
+        .eq('id', run.sessionId)
+        .maybeSingle();
+      const sbId = (sessionRow as { sb_id?: string | null } | null)?.sb_id ?? null;
+      workspaceId = sbId ? await workspaceOfSb(client, sbId) : null;
+    } catch (err) {
+      logger.warn('[Shutdown] Could not resolve the workspace for the interruption notice', {
+        sessionId: run.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     try {
       const result = await sendTriggerFailureNotice(client, {
         userId: run.userId,
+        workspaceId,
         // The notice is FOR whoever asked; absent a sender it still belongs in
         // the thread, where every participant sees it.
         fromSlug: run.senderSlug || run.sbSlug,

@@ -36,19 +36,25 @@ export function messageTime(iso: string, nowMs: number = Date.now()): string {
 }
 
 /**
- * Display name for a message sender. Human replies land with the sender slot
- * 'unknown' and metadata.sentBy = 'user' (see POST /threads/reply); that
- * metadata is the only way to tell a person from a genuinely unattributed
- * sender, so it is checked first.
+ * Display name for a message sender, and whether it is the viewer's own.
+ * The server names every author (spec inkmail-thread-scope §3) and says
+ * which person is the viewer — `isOwn` is compared there against the Inkwell
+ * user, which is not the id this app holds from its auth provider. Only an
+ * own message reads "You" and sits on the right; another person's message
+ * carries their name and sits with the agents'.
  */
-export function senderName(
-  senderSlug: string,
-  metadata: Record<string, unknown> | null | undefined
-): { name: string; isUser: boolean } {
-  if (metadata && (metadata as { sentBy?: unknown }).sentBy === 'user') {
-    return { name: 'You', isUser: true };
-  }
-  return { name: senderSlug, isUser: false };
+export function senderName(message: {
+  senderKind?: 'sb' | 'user' | 'system' | string | null;
+  senderSlug?: string | null;
+  senderName?: string | null;
+  isOwn?: boolean | null;
+}): { name: string; isOwn: boolean } {
+  if (message.isOwn) return { name: 'You', isOwn: true };
+  if (message.senderName) return { name: message.senderName, isOwn: false };
+  // Older payloads name nobody: fall back to what the kind says.
+  if (message.senderKind === 'user') return { name: 'a workspace member', isOwn: false };
+  if (message.senderKind === 'system') return { name: 'system', isOwn: false };
+  return { name: message.senderSlug ?? 'system', isOwn: false };
 }
 
 /** "runtime:idle" → "idle"; "active:implementing" → "implementing". */

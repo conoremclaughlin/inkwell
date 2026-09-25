@@ -389,14 +389,10 @@ await cloudService.publishSkill({
 
 ### Migration
 
-Apply the skills registry migration:
+Apply the skills registry migration like any other (see `supabase/migrations/README.md`):
 
 ```bash
-# Via Supabase CLI
-supabase db push
-
-# Or via MCP tool
-mcp__supabase__apply_migration
+yarn db:migrate supabase/migrations/<version>_<name>.sql
 ```
 
 ## Future (v2)

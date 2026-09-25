@@ -54,10 +54,8 @@ import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/respon
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import {
   TriggerRetryScheduler,
-  TRIGGER_MAX_ATTEMPTS,
   getTriggerAttempt,
   BackendFailureError,
-  carriedClassification,
 } from './channels/trigger-retry';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteSlug } from './services/routing/resolve-route';
@@ -67,8 +65,12 @@ import {
   formatThreadDescriptorLines,
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
-import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
+import { resolveThreadTriggerScope } from './services/trigger-scope';
+import {
+  handleTriggerFailure,
+  type TriggerFailureEvent,
+} from './services/trigger-failure-listener';
 import {
   decideChannelForward,
   applyChannelForward,
@@ -87,7 +89,6 @@ import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
-import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
 import { StudioLeaseService } from './services/studio-lease.service';
 import { StudioOverflowService } from './services/studio-overflow.service';
 import { resolveServerSbSlug } from './config/server-identity';
@@ -903,6 +904,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // is blocked and logged as a security warning.
     let userId: string | undefined;
     let recipientSbId: string | undefined;
+    // The thread's workspace, once a thread-borne payload resolves it: holds
+    // are stamped and cleared against (thread, workspace).
+    let threadWorkspaceId: string | undefined;
 
     const authUser = getUserFromContext();
     const authUserId = authUser?.userId;
@@ -939,72 +943,27 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       userId = inboxMsg?.recipient_user_id;
       recipientSbId = inboxMsg?.recipient_sb_id || undefined;
-    } else if (payload.threadMessageId) {
-      // Thread message: resolve user_id via inbox_thread_messages → inbox_threads
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const supabase = dataComposer!.getClient() as any;
-      const { data: threadMsg, error: tmError } = await supabase
-        .from('inbox_thread_messages')
-        .select('thread_id')
-        .eq('id', payload.threadMessageId)
-        .single();
-      if (tmError) {
-        logger.error('[Trigger] Failed to look up thread message', {
-          threadMessageId: payload.threadMessageId,
-          error: tmError.message,
-        });
-      }
-      if (threadMsg?.thread_id) {
-        const { data: thread, error: threadError } = await supabase
-          .from('inbox_threads')
-          .select('user_id')
-          .eq('id', threadMsg.thread_id)
-          .single();
-        if (threadError) {
-          logger.error('[Trigger] Failed to look up thread from message', {
-            threadId: threadMsg.thread_id,
-            error: threadError.message,
-          });
-        }
-        const threadUserId = thread?.user_id as string | undefined;
-        if (threadUserId && authUserId && threadUserId !== authUserId) {
-          logger.warn('[Trigger] SECURITY: thread owner does not match authenticated user', {
-            threadMessageId: payload.threadMessageId,
-            threadUserId,
-            authUserId,
-            targetSlug,
-            fromSlug: payload.fromSlug,
-          });
-          throw new Error('Trigger denied: thread does not belong to authenticated user');
-        }
-        userId = threadUserId;
-      }
-    } else if (payload.threadId) {
-      // Thread (add_thread_participant): resolve user_id directly from inbox_threads
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: thread, error: threadError } = await (dataComposer!.getClient() as any)
-        .from('inbox_threads')
-        .select('user_id')
-        .eq('id', payload.threadId)
-        .single();
-      if (threadError) {
-        logger.error('[Trigger] Failed to look up thread', {
-          threadId: payload.threadId,
-          error: threadError.message,
-        });
-      }
-      const threadUserId = thread?.user_id as string | undefined;
-      if (threadUserId && authUserId && threadUserId !== authUserId) {
-        logger.warn('[Trigger] SECURITY: thread owner does not match authenticated user', {
-          threadId: payload.threadId,
-          threadUserId,
-          authUserId,
-          targetSlug,
-          fromSlug: payload.fromSlug,
-        });
-        throw new Error('Trigger denied: thread does not belong to authenticated user');
-      }
-      userId = threadUserId;
+    } else if (payload.threadMessageId || payload.threadId) {
+      // Thread-borne trigger (spec inkmail-thread-scope §1a): the target is
+      // the recipient participant's IDENTITY, named canonically by the
+      // dispatcher (toSbId). The runtime owner is that identity's user and
+      // the workspace is the identity's; the thread must live in the same
+      // workspace; and the authenticated sender must be a member of it. The
+      // thread's legacy owner is gone — a member of a shared workspace can
+      // reach an SB another member owns, which is the point. An unreadable
+      // thread REFUSES the trigger; it never degrades to the bare lane
+      // (Lumen, #618).
+      const scope = await resolveThreadTriggerScope(dataComposer!.getClient(), {
+        threadId: payload.threadId,
+        threadMessageId: payload.threadMessageId,
+        toSbId: payload.toSbId,
+        targetSlug,
+        authUserId,
+        fromSlug: payload.fromSlug,
+      });
+      threadWorkspaceId = scope.threadWorkspaceId;
+      if (scope.userId) userId = scope.userId;
+      if (scope.recipientSbId) recipientSbId = scope.recipientSbId;
     }
 
     // Fall back to authenticated user from OAuth context (trigger_agent called directly)
@@ -1127,15 +1086,17 @@ Type: ${payload.triggerType}`;
       // description nobody has touched since the thread opened cannot be read
       // as a current statement of what it is about.
       //
-      // targetSlug is passed because this text is about to be written into that
-      // SB's prompt, and a trigger may name any threadKey: the loader delivers
-      // nothing unless the recipient is a participant.
+      // The recipient's canonical id is passed because this text is about to
+      // be written into that SB's prompt, and a trigger may name any threadKey:
+      // the loader delivers nothing unless that principal is a participant. The
+      // scope is the thread's workspace for a thread-borne trigger, else the
+      // identity's own — a thread is one row per (workspace, key).
       if (dataComposer) {
         const descriptor = await loadThreadDescriptor(
           dataComposer.getClient(),
-          userId,
+          threadWorkspaceId ?? resolvedWorkspaceId,
           payload.threadKey,
-          targetSlug
+          resolvedIdentityId
         );
         for (const line of formatThreadDescriptorLines(descriptor)) {
           triggerMessage += `\n${line}`;
@@ -1213,9 +1174,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // stamp (PR #514 round 2).
     const clearHoldAtTerminal = async (): Promise<void> => {
       if (!payload.threadId || !assignmentLanded) return;
+      if (!threadWorkspaceId) return;
       await clearRoutingHold(dataComposer!.getClient(), {
         threadId: payload.threadId,
-        userId,
+        workspaceId: threadWorkspaceId,
         sbSlug: targetSlug,
         routedSince: routeStartedAt,
       });
@@ -1263,10 +1225,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // is. Goes through the tested routing-hold boundary — this call site
       // previously drifted out of sync with the RPC signature and every
       // refusal went unstamped, with a green suite (Lumen, round 4).
-      if (payload.threadId) {
+      if (payload.threadId && threadWorkspaceId) {
         await stampRoutingHold(dataComposer!.getClient(), {
           threadId: payload.threadId,
-          userId,
+          workspaceId: threadWorkspaceId,
           sbSlug: targetSlug,
           attemptStartedAt: routeStartedAt,
           detail: {
@@ -1329,7 +1291,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         try {
           const assignment = await assignThreadParticipant(dataComposer!.getClient(), {
             threadId: payload.threadId,
-            sbSlug: targetSlug,
+            sbId: resolvedIdentityId,
             candidateSessionId: routedSession.id,
             explicitAnchor: !!payload.explicitRecipientTarget,
             source: 'trigger-handler',
@@ -1681,242 +1643,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   });
 
   // 7c. Listen for trigger failures — transient errors get a delayed retry;
-  // otherwise restore inbox message + notify sender
-  agentGateway.on(
-    'trigger:error',
-    async ({
-      triggerId,
-      payload,
-      error,
-    }: {
-      triggerId: string;
-      payload: AgentTriggerPayload;
-      error: unknown;
-    }) => {
-      const errorText = error instanceof Error ? error.message : String(error);
-      // Prefer the verdict the error is carrying. `errorText` here is whatever
-      // the throw site had — for a runner failure that is a bounded excerpt,
-      // and classifying it re-decides retryability from a display-shaped cut
-      // of the output. A throw with nothing carried (spawn failure, internal
-      // error, routing refusal) still classifies its text, as it always has.
-      const classification = carriedClassification(error) ?? classifyError({ errorText });
-      const attempt = getTriggerAttempt(payload);
-
-      // Log full error text — truncateSummary only keeps the first line,
-      // which loses stderr content that's critical for diagnosis.
-      logger.warn('[TriggerFailure] Processing trigger failure', {
-        triggerId,
-        from: payload.fromSlug,
-        to: payload.toSlug,
-        category: classification.category,
-        retryable: classification.retryable,
-        attempt,
-        inboxMessageId: payload.inboxMessageId,
-        threadKey: payload.threadKey,
-        errorText: errorText.slice(0, 2000),
-      });
-
-      const client = dataComposer?.getClient();
-      if (!client) return;
-
-      // 1. Restore inbox message to unread FIRST — before the retry decision,
-      // and before the sender check, because a crash mid-backoff must leave
-      // the message visible to heartbeat scans. A successful re-dispatch marks
-      // it read again. (only for agent_inbox rows — not thread messages)
-      if (payload.inboxMessageId) {
-        const { error: restoreErr } = await client
-          .from('agent_inbox')
-          .update({ status: 'unread', read_at: null })
-          .eq('id', payload.inboxMessageId)
-          .eq('status', 'read');
-
-        if (restoreErr) {
-          logger.warn('[TriggerFailure] Failed to restore inbox message', {
-            inboxMessageId: payload.inboxMessageId,
-            error: restoreErr.message,
-          });
-        } else {
-          logger.info('[TriggerFailure] Restored inbox message to unread', {
-            inboxMessageId: payload.inboxMessageId,
-          });
-        }
-      }
-
-      // 2. Look up the userId from the original source row. This runs before
-      // the sender check because a retry is scheduled for a senderless trigger
-      // too, and its activity entry needs the user.
-      let recipientUserId: string | undefined;
-      let resolvedThreadId: string | undefined;
-      if (payload.inboxMessageId) {
-        const { data: origMsg } = await client
-          .from('agent_inbox')
-          .select('recipient_user_id')
-          .eq('id', payload.inboxMessageId)
-          .single();
-        recipientUserId = origMsg?.recipient_user_id;
-      } else if (payload.threadMessageId) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: threadMsg } = await (client as any)
-          .from('inbox_thread_messages')
-          .select('thread_id')
-          .eq('id', payload.threadMessageId)
-          .single();
-        if (threadMsg?.thread_id) {
-          resolvedThreadId = threadMsg.thread_id;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const { data: thread } = await (client as any)
-            .from('inbox_threads')
-            .select('user_id')
-            .eq('id', threadMsg.thread_id)
-            .single();
-          recipientUserId = thread?.user_id;
-        }
-      } else if (payload.threadId) {
-        resolvedThreadId = payload.threadId;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: thread } = await (client as any)
-          .from('inbox_threads')
-          .select('user_id')
-          .eq('id', payload.threadId)
-          .single();
-        recipientUserId = thread?.user_id;
-      }
-
-      // Bare trigger_agent (no source row, possibly just a threadKey): fall
-      // back to the user stamped server-side post-auth by handleTriggerAgent.
-      // Row-derived resolution stays preferred; this fallback is what lets a
-      // threadKey-only failure reach thread resolution at all (PR #487).
-      if (!recipientUserId && payload.recipientUserId) {
-        recipientUserId = payload.recipientUserId;
-      }
-
-      // 3. Transient failure → schedule a delayed retry instead of notifying.
-      // Guard: never retry if the spawn already produced a successful session
-      // turn (triggerTurnCompleted is set post-success in the default handler).
-      const turnCompleted = payload.metadata?.triggerTurnCompleted === true;
-      let pendingRetry: { attempt: number; delayMs: number } | undefined;
-      if (!turnCompleted) {
-        const retry = triggerRetryScheduler.scheduleRetry(payload, classification, error);
-        if (retry.scheduled) {
-          logger.warn(
-            `[TriggerRetry] attempt ${retry.attempt} in ${Math.round(retry.delayMs / 1000)}s, category=${classification.category}`,
-            {
-              triggerId,
-              from: payload.fromSlug,
-              to: payload.toSlug,
-              threadKey: payload.threadKey || null,
-              inboxMessageId: payload.inboxMessageId || null,
-            }
-          );
-
-          if (recipientUserId) {
-            try {
-              await dataComposer!.repositories.activityStream.logActivity({
-                userId: recipientUserId,
-                sbSlug: payload.toSlug,
-                type: 'error',
-                subtype: 'trigger_retry',
-                content: `Trigger to ${payload.toSlug} failed (${classification.category}) — retry ${retry.attempt}/${TRIGGER_MAX_ATTEMPTS} in ${Math.round(retry.delayMs / 1000)}s: ${classification.summary}`,
-                correlationId: payload.threadMessageId || payload.inboxMessageId,
-                status: 'pending',
-                payload: {
-                  triggerRetry: true,
-                  triggerId,
-                  attempt: retry.attempt,
-                  maxAttempts: TRIGGER_MAX_ATTEMPTS,
-                  delayMs: retry.delayMs,
-                  errorCategory: classification.category,
-                  errorSummary: classification.summary,
-                  fromSlug: payload.fromSlug,
-                  toSlug: payload.toSlug,
-                  threadKey: payload.threadKey || null,
-                },
-              });
-            } catch (logErr) {
-              logger.warn('[TriggerRetry] Failed to log retry activity', {
-                error: logErr instanceof Error ? logErr.message : String(logErr),
-              });
-            }
-          }
-
-          // Whether the notification may be suppressed depends on whether
-          // anything durable survives this process (Lumen, r2).
-          //
-          // An agent_inbox trigger has been restored to unread above, so the
-          // row IS the fallback: a restart mid-backoff loses the timer and the
-          // message is still sitting there unread for the next heartbeat scan.
-          // Staying quiet costs nothing.
-          //
-          // A thread-borne trigger has no such row. Thread read state is a
-          // monotonic inbox_thread_read_status.last_read_at, and rewinding it
-          // would resurface every message after that point rather than this
-          // one, so there is nothing to restore. Suppressing the notice would
-          // mean a restart during the backoff drops the message with no timer,
-          // no row and nothing said — strictly worse than the behaviour this
-          // PR replaces, which at least always told the sender.
-          //
-          // So a threaded failure still speaks once: on the first failure
-          // (attempt 1) the notice says a retry is pending, and the retry's own
-          // failure stays quiet because the sender has already been told.
-          if (payload.inboxMessageId) return;
-          if (attempt > 1) return;
-          pendingRetry = { attempt: retry.attempt, delayMs: retry.delayMs };
-        }
-      }
-
-      // 4. Notify sender agent (if there is one) — skip if no sender to avoid loops
-      if (!payload.fromSlug) return;
-
-      if (recipientUserId) {
-        await logInkmail('inkmail_fail', payload, recipientUserId, {
-          error: errorText.slice(0, 2000),
-        });
-      }
-
-      if (!recipientUserId) {
-        logger.warn('[TriggerFailure] Cannot notify sender — no userId from inbox message');
-        return;
-      }
-
-      const categoryLabel =
-        classification.category !== 'unknown' ? ` (${classification.category})` : '';
-      const attemptsLabel = attempt > 1 ? ` after ${attempt} attempts` : '';
-      const retryLabel = pendingRetry
-        ? ` — retrying (${pendingRetry.attempt}/${TRIGGER_MAX_ATTEMPTS}) in ${Math.round(pendingRetry.delayMs / 1000)}s`
-        : '';
-      const notificationContent = `Trigger to ${payload.toSlug} failed${attemptsLabel}${categoryLabel}${retryLabel}: ${classification.summary}`;
-
-      // Thread-borne trigger → notice joins the thread (participants and
-      // session stamps already exist; stamped-only delivery lands it in
-      // exactly one session per participant). Threadless → legacy inbox.
-      const noticeResult = await sendTriggerFailureNotice(client, {
-        userId: recipientUserId,
-        fromSlug: payload.fromSlug,
-        toSlug: payload.toSlug,
-        threadId: resolvedThreadId,
-        threadKey: payload.threadKey,
-        subject: `Trigger failed: ${payload.toSlug}`,
-        content: notificationContent,
-        metadata: {
-          triggerFailure: true,
-          triggerId,
-          errorCategory: classification.category,
-          errorSummary: classification.summary,
-          errorDetail: errorText.slice(0, 4000),
-          retryable: classification.retryable,
-          attempts: attempt,
-          retryPending: pendingRetry ? pendingRetry.attempt : null,
-          originalInboxMessageId: payload.inboxMessageId || null,
-        },
-      });
-      if (noticeResult.ok) {
-        logger.info('[TriggerFailure] Sent failure notification to sender', {
-          sender: payload.fromSlug,
-          category: classification.category,
-          via: noticeResult.via,
-        });
-      }
-    }
+  // otherwise restore inbox message + notify sender. The decision lives in
+  // services/trigger-failure-listener.ts so it can run over a table-backed
+  // client (Lumen, #618); the scheduler and the activity stream are handed in.
+  agentGateway.on('trigger:error', (event: TriggerFailureEvent) =>
+    handleTriggerFailure(dataComposer?.getClient(), event, {
+      logInkmailFailure: (payload, userId, extra) =>
+        logInkmail('inkmail_fail', payload, userId, extra),
+      retryScheduler: triggerRetryScheduler,
+      logRetryActivity: (entry) => dataComposer!.repositories.activityStream.logActivity(entry),
+    })
   );
 
   // 8. Print status

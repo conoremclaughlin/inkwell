@@ -53,6 +53,14 @@ vi.mock('../../utils/logger', () => ({
   },
 }));
 
+// The project-name lookup resolves the caller's workspace at the boundary
+// (spec inkmail-thread-scope §1b); mocked so these tests stay about tasks.
+vi.mock('./caller-principal', () => ({
+  resolveCallerWorkspace: vi.fn(async () => ({ workspaceId: 'ws-1', sb: null, role: 'owner' })),
+  resolveCallerSb: vi.fn(),
+  assertWriteRole: vi.fn(),
+}));
+
 // Mock request-context
 vi.mock('../../utils/request-context', () => ({
   setSessionContext: vi.fn(),
@@ -91,7 +99,7 @@ function createMockDataComposer() {
 
   const mockProjectsRepo = {
     findById: vi.fn(),
-    findByUserAndName: vi.fn(),
+    findByWorkspaceAndName: vi.fn(),
   };
 
   const mockMemoryRepo = {
@@ -2429,7 +2437,7 @@ describe('handleListTaskGroups', () => {
   });
 
   it('resolves projectName to projectId for filtering', async () => {
-    dc.repositories.projects.findByUserAndName.mockResolvedValue({
+    dc.repositories.projects.findByWorkspaceAndName.mockResolvedValue({
       id: 'proj-by-name',
       user_id: 'user-123',
       name: 'Inkwell',
@@ -2450,7 +2458,8 @@ describe('handleListTaskGroups', () => {
 
     const data = parseResponse(response);
     expect(data.success).toBe(true);
-    expect(dc.repositories.projects.findByUserAndName).toHaveBeenCalledWith('user-123', 'Inkwell');
+    // Resolved in the caller's workspace, not by owner (spec §1b).
+    expect(dc.repositories.projects.findByWorkspaceAndName).toHaveBeenCalledWith('ws-1', 'Inkwell');
     expect(dc.repositories.taskGroups.listByUser).toHaveBeenCalledWith(
       'user-123',
       expect.objectContaining({ projectId: 'proj-by-name' })
@@ -2458,7 +2467,7 @@ describe('handleListTaskGroups', () => {
   });
 
   it('returns error when projectName does not match any project', async () => {
-    dc.repositories.projects.findByUserAndName.mockResolvedValue(null);
+    dc.repositories.projects.findByWorkspaceAndName.mockResolvedValue(null);
 
     const response = await handleListTaskGroups(
       {

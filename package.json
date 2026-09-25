@@ -19,6 +19,8 @@
     "linked:status": "node ./scripts/migration-status.mjs --linked --workdir .",
     "local:migrate": "./scripts/prod-migrate.sh --local",
     "linked:migrate": "./scripts/prod-migrate.sh --linked",
+    "db:migrate": "sh ./scripts/db-migrate.sh apply",
+    "db:migrate:status": "sh ./scripts/db-migrate.sh status",
     "prod:up": "./scripts/prod-up.sh",
     "prod": "yarn prod:up",
     "logs:ink": "tail -n 200 -f $HOME/.ink/logs/combined.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",

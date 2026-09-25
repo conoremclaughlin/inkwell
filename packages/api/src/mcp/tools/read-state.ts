@@ -25,9 +25,15 @@ interface RpcClient {
   ): PromiseLike<{ data: unknown; error: { message: string } | null }>;
 }
 
+/**
+ * The pointer belongs to a principal — an SB by identity id or a person by
+ * user id — in the ONE read-state table (spec inkmail-thread-scope §3).
+ * Exactly one of `sbId` / `userId` is set.
+ */
 export interface AdvanceReadPointerParams {
   threadId: string;
-  sbSlug: string;
+  sbId?: string | null;
+  userId?: string | null;
   /** The pointer advances through this message's created_at. */
   throughMessageId: string;
   /** Call-site label for logs (e.g. 'get_thread_messages:markRead'). */
@@ -38,17 +44,30 @@ export async function advanceThreadReadPointer(
   supabase: unknown,
   params: AdvanceReadPointerParams
 ): Promise<boolean> {
-  const { threadId, sbSlug, throughMessageId, source } = params;
+  const { threadId, throughMessageId, source } = params;
+  const sbId = params.sbId ?? null;
+  const userId = params.userId ?? null;
+  if ((sbId === null) === (userId === null)) {
+    logger.error('[ReadState] Read pointer needs exactly one principal', {
+      threadId,
+      sbId,
+      userId,
+      source,
+    });
+    return false;
+  }
   try {
     const { error } = await (supabase as RpcClient).rpc('advance_thread_read_pointer', {
       p_thread_id: threadId,
-      p_agent_id: sbSlug,
+      p_sb_id: sbId,
+      p_user_id: userId,
       p_through_message_id: throughMessageId,
     });
     if (error) {
       logger.error('[ReadState] Failed to advance thread read pointer', {
         threadId,
-        sbSlug,
+        sbId,
+        userId,
         throughMessageId,
         source,
         error: error.message,
@@ -59,7 +78,8 @@ export async function advanceThreadReadPointer(
   } catch (err) {
     logger.error('[ReadState] Thread read pointer advance threw', {
       threadId,
-      sbSlug,
+      sbId,
+      userId,
       throughMessageId,
       source,
       error: err instanceof Error ? err.message : String(err),

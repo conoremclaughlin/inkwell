@@ -46,8 +46,8 @@ vi.mock('../../services/studio-settings', () => ({
 // Defaults let the pre-existing bootstrap tests run unchanged: a caller with
 // no identifiable session, and a lease that grants. The provenance suite
 // below overrides per test.
-const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMock } = vi.hoisted(
-  () => ({
+const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMock, callerSbMock } =
+  vi.hoisted(() => ({
     acquireMock: vi.fn(async () => ({ acquired: true, lease: {} })),
     implicitMock: vi.fn(async () => ({ session: null, reason: 'no-session' })),
     callerMock: vi.fn(async () => ({ sbSlug: 'wren', sbId: undefined })),
@@ -58,9 +58,18 @@ const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMoc
       boundVia: 'explicit-anchor',
       stampPersisted: true,
     })),
-  })
-);
+    // The thread home is bound by PRINCIPAL (spec inkmail-thread-scope §3):
+    // the agent's identity in its one workspace, resolved at the boundary.
+    callerSbMock: vi.fn(async () => ({
+      kind: 'sb',
+      sbId: 'sb-1',
+      sbSlug: 'wren',
+      userId: '00000000-0000-0000-0000-000000000001',
+      workspaceId: 'ws-1',
+    })),
+  }));
 vi.mock('./inbox-handlers', () => ({ findOrCreateThread: findOrCreateThreadMock }));
+vi.mock('./caller-principal', () => ({ resolveCallerSb: callerSbMock }));
 vi.mock('../../services/sessions/thread-assignment', () => ({
   assignThreadParticipant: assignMock,
 }));
@@ -229,6 +238,46 @@ describe('close_studio rescues before removal (source order)', () => {
   });
 });
 
+describe('close_studio lets the holder close its own studio (source order, task e7752d29)', () => {
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'studio-handlers.ts'),
+    'utf-8'
+  );
+  const closeAt = source.indexOf('export async function handleCloseStudio(');
+  const releaseAt = source.indexOf('.releaseByStudio(', closeAt);
+  const deferredAt = source.indexOf("releaseOutcome === 'deferred'", releaseAt);
+
+  it('passes the caller session into the release, resolved before it', () => {
+    expect(closeAt).toBeGreaterThan(-1);
+    expect(releaseAt).toBeGreaterThan(closeAt);
+    const call = source.slice(releaseAt, deferredAt);
+    expect(call).toContain('callerSessionId');
+    const resolvedAt = source.lastIndexOf('const callerSessionId', releaseAt);
+    expect(resolvedAt).toBeGreaterThan(closeAt);
+  });
+
+  it('takes that session from the authorized ambient context, never from the typed arguments', () => {
+    // Everything between the handler's start and the release call: the
+    // ambient session is loaded and authorized there, and callerSessionId is
+    // read off that result, not off the parsed arguments.
+    const derivation = source.slice(closeAt, releaseAt);
+    expect(derivation).toContain(
+      'loadAuthorizedAmbientSession(dataComposer, closingUser.id, caller)'
+    );
+    expect(derivation).toContain('const callerSessionId = ambient.session?.id');
+    expect(derivation).not.toContain('parsed.sessionId');
+    // The close schema has no sessionId argument to spoof the holder with.
+    const schemaAt = source.indexOf('const closeStudioSchema');
+    const schema = source.slice(schemaAt, source.indexOf('});', schemaAt));
+    expect(schema).not.toContain('sessionId');
+  });
+
+  it('keeps the deferral for a holder that is a different live session', () => {
+    const refusal = source.slice(deferredAt, source.indexOf('}', deferredAt + 400));
+    expect(refusal).toContain('live session other than this one');
+  });
+});
+
 // ── Provenance: who made a studio, and why (studio-model piece 1) ──
 
 describe('create_studio / adopt_studio provenance', () => {
@@ -371,16 +420,17 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(findOrCreateThreadMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
+        workspaceId: 'ws-1',
         threadKey: 'pr:600',
-        creatorSlug: 'wren',
-        participants: ['wren'],
+        creator: expect.objectContaining({ kind: 'sb', sbId: 'sb-1', sbSlug: 'wren' }),
+        participants: [expect.objectContaining({ sbId: 'sb-1' })],
       })
     );
     expect(assignMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         threadId: 'thread-1',
-        sbSlug: 'wren',
+        sbId: 'sb-1',
         candidateSessionId: 'sess-1',
         explicitAnchor: true,
         source: 'create_studio',
