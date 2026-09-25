@@ -85,3 +85,13 @@ export function PlusIcon({ color, size = 22 }: IconProps) {
     </Svg>
   );
 }
+
+export function InfoIcon({ color, size = 22 }: IconProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Circle cx={12} cy={12} r={8.5} stroke={color} strokeWidth={1.8} />
+      <Path d="M12 11v5.5" stroke={color} strokeWidth={2} strokeLinecap="round" />
+      <Circle cx={12} cy={7.9} r={1.15} fill={color} />
+    </Svg>
+  );
+}

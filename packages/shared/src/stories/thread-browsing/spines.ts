@@ -11,6 +11,18 @@ import type { NameFor } from '../thread-viewing/index.js';
 export type StatusFilter = 'all' | 'unread' | 'active' | 'closed';
 
 /**
+ * A session's relation to a key, in words a reader shouldn't have to decode:
+ * "routed here" = the key is the session's immutable routing anchor (where
+ * inbox triggers landed it); "working now" = the session's mutable current
+ * focus; both when they coincide. These are session facts, not studios.
+ */
+export const SESSION_RELATION_LABELS: Readonly<Record<SpineSession['relation'], string>> = {
+  anchor: 'routed here',
+  active: 'working now',
+  both: 'routed · working',
+};
+
+/**
  * A spine the list shows: one with a conversation. A key that only a
  * session references has nothing to read yet, so it stays out of the list;
  * a direct link to the key still opens it.

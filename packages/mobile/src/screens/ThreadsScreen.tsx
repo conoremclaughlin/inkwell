@@ -2,25 +2,31 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FlatList, RefreshControl, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { isConversation, matchesThreadSearch } from '@inklabs/shared/stories/thread-browsing';
+import { formatShortAgo } from '@inklabs/shared/stories/thread-viewing';
 import { ThreadRow } from '../components/ThreadRow';
 import { useThreads } from '../hooks/useInkwell';
 import { API_URL_HINT } from '../lib/api';
 import type { ThreadSpine } from '../lib/types';
 import type { RootStackParamList } from '../navigation';
-import { relativeTime } from '../ui/format';
 import { colors, spacing, type } from '../ui/theme';
 
+/** The app shows SBs by slug; it loads no identities to name them otherwise. */
+const nameFor = (sbSlug: string) => sbSlug;
+
 /**
- * The thread list — the app's front door. Open threads with recent activity
- * first (the server already orders spines by lastActivityAt); a filter box
- * narrows by key, title, summary, or participant, which doubles as "jump to
- * pr:545" for someone who knows exactly where they're going.
+ * The thread list — the app's front door. Conversations with recent activity
+ * first (the server already orders spines by lastActivityAt). A key that only
+ * a session references has nothing to read, so it stays out of the list; the
+ * shared browsing story decides that, and what the filter box matches: key,
+ * title, summary, the newest message, or a participant. It doubles as "jump
+ * to pr:545" for someone who knows exactly where they're going.
  */
 
 /**
  * How often the relative timestamps ("4m", "3h") are recomputed.
  *
- * The finest bucket relativeTime produces is a minute, so ticking faster
+ * The finest bucket formatShortAgo produces is a minute, so ticking faster
  * cannot change a single label — it would only re-render the list for
  * nothing. Rows are memoised on the finished string, so a tick that changes
  * no label costs one cheap pass over the array and zero row renders.
@@ -57,15 +63,9 @@ export function ThreadsScreen() {
   }, [refetch]);
 
   const spines = useMemo(() => {
-    const all = data?.spines ?? [];
     const needle = filter.trim().toLowerCase();
-    if (!needle) return all;
-    return all.filter(
-      (s) =>
-        s.key.toLowerCase().includes(needle) ||
-        (s.thread?.title ?? '').toLowerCase().includes(needle) ||
-        (s.thread?.summary ?? '').toLowerCase().includes(needle) ||
-        s.participants.some((p) => p.toLowerCase().includes(needle))
+    return (data?.spines ?? []).filter(
+      (spine) => isConversation(spine) && matchesThreadSearch(spine, needle, nameFor)
     );
   }, [data, filter]);
 
@@ -86,7 +86,7 @@ export function ThreadsScreen() {
     ({ item }: { item: ThreadSpine }) => (
       <ThreadRow
         spine={item}
-        timeLabel={relativeTime(item.lastActivityAt, nowMs)}
+        timeLabel={formatShortAgo(item.lastActivityAt, new Date(nowMs))}
         onPress={openThread}
       />
     ),

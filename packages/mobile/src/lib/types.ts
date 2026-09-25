@@ -1,107 +1,26 @@
 /**
  * Response shapes for the admin API endpoints this app consumes, mirroring
- * packages/api/src/routes/admin.ts (and kept in step with the web dashboard's
- * copies in packages/web). Fields the app does not render are omitted on
- * purpose — a missing field here is a smaller failure than a wrong one.
+ * packages/api/src/routes/admin.ts. The threads endpoints' shapes come from
+ * @inklabs/shared, shared with the web dashboard. For the rest, fields the
+ * app does not render are omitted on purpose: a missing field here is a
+ * smaller failure than a wrong one.
  */
 
-// ─── GET /api/admin/threads ───
+// ─── GET /api/admin/threads, GET /api/admin/threads/messages ───
+// Shared with every client: @inklabs/shared/stories/threads-api holds the one
+// copy of these shapes, so the web dashboard and this app cannot drift.
 
-export interface SpineSession {
-  id: string;
-  sbSlug: string | null;
-  lifecycle: string | null;
-  status: string | null;
-  phase: string | null;
-  relation: 'anchor' | 'active' | 'both';
-  /**
-   * Whether this session is working right now. Computed by the server
-   * (isSessionLive in thread-spines.ts) because `lifecycle` alone is not
-   * evidence: nothing reaps abandoned sessions, so rows sit at `running` for
-   * months. Do not re-derive presence here — there is one owner for the rule.
-   */
-  live: boolean;
-  updatedAt: string;
-  studioId: string | null;
-}
-
-export interface SpineStudio {
-  id: string;
-  slug: string | null;
-  branch: string;
-  sbSlug: string;
-  relation: 'affinity' | 'lease' | 'both';
-  leaseSlug: string | null;
-  updatedAt: string;
-}
-
-export interface SpineGroup {
-  id: string;
-  title: string;
-  status: string | null;
-  executionModel: string | null;
-  executionPhase: string | null;
-  updatedAt: string;
-}
-
-export interface ThreadSpine {
-  key: string;
-  thread: {
-    title: string | null;
-    /** One-line "what is this about" (DB-capped at 280 chars); often absent. */
-    summary: string | null;
-    status: string;
-    createdBySlug: string;
-    participants: string[];
-    closedAt: string | null;
-  } | null;
-  sessions: SpineSession[];
-  studios: SpineStudio[];
-  taskGroups: SpineGroup[];
-  participants: string[];
-  sources: Array<'thread' | 'session' | 'studio' | 'group'>;
-  lastActivityAt: string;
-}
-
-export interface ThreadsResponse {
-  spines: ThreadSpine[];
-}
-
-// ─── GET /api/admin/threads/messages?key= ───
-
-export interface ThreadMessage {
-  id: string;
-  /** Who wrote it (spec inkmail-thread-scope §3): an SB, a person, or the system. */
-  senderKind: 'sb' | 'user' | 'system';
-  /** The SB's display slug; the kind for a person or the system. */
-  senderSlug: string | null;
-  senderSbId: string | null;
-  senderUserId: string | null;
-  /** Named on the server: the SB's slug, the person's profile name, or 'system'. */
-  senderName: string;
-  /** The viewer's own message — decided on the server against the Inkwell user, never here. */
-  isOwn: boolean;
-  content: string;
-  messageType: string;
-  priority: string;
-  metadata: Record<string, unknown> | null;
-  createdAt: string;
-}
-
-export interface ThreadMessagesResponse {
-  thread: {
-    threadKey: string;
-    title: string | null;
-    status: string;
-    createdBySlug: string;
-    createdAt: string;
-    closedAt: string | null;
-  } | null;
-  messages: ThreadMessage[];
-  /** The Inkwell user this response was rendered for. */
-  viewerUserId?: string;
-  meta?: { fetched: number; total: number; truncated: boolean };
-}
+export type {
+  SpineGroup,
+  SpineSession,
+  SpineStudio,
+  ThreadLastMessage,
+  ThreadMessage,
+  ThreadMessagesResponse,
+  ThreadPerson,
+  ThreadSpine,
+  ThreadsResponse,
+} from '@inklabs/shared/stories/threads-api';
 
 // ─── POST /api/admin/threads/reopen ───
 

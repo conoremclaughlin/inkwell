@@ -1,9 +1,10 @@
 'use client';
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { MessagesSquare } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
+import { getSelectedWorkspaceId, subscribeSelectedWorkspace } from '@/lib/workspace-selection';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useReadCursors } from '@/components/threads/read-cursors';
 import { ThreadConversation } from '@/components/threads/thread-conversation';
@@ -93,6 +94,13 @@ function ThreadsChat() {
     () => spines.find((spine) => spine.key === selectedKey) ?? null,
     [spines, selectedKey]
   );
+  // The same key can be another thread in another workspace, so an open
+  // conversation belongs to one workspace and starts over on a switch.
+  const workspaceId = useSyncExternalStore(
+    subscribeSelectedWorkspace,
+    getSelectedWorkspaceId,
+    () => null
+  );
 
   const select = useCallback(
     (key: string | null) => {
@@ -158,7 +166,8 @@ function ThreadsChat() {
       >
         {selected ? (
           <ThreadConversation
-            key={selected.key}
+            key={JSON.stringify([workspaceId, selected.key])}
+            workspaceId={workspaceId}
             spine={selected}
             nameFor={nameFor}
             cursors={cursors}
@@ -182,14 +191,19 @@ function ThreadsChat() {
 
       {selected && detailsOpen && detailsAsColumn && (
         <aside className="flex w-[340px] shrink-0 flex-col border-l">
-          <ThreadDetails spine={selected} nameFor={nameFor} onClose={() => setDetailsOpen(false)} />
+          <ThreadDetails
+            spine={selected}
+            workspaceId={workspaceId}
+            nameFor={nameFor}
+            onClose={() => setDetailsOpen(false)}
+          />
         </aside>
       )}
       {selected && !detailsAsColumn && (
         <Sheet open={detailsOpen} onOpenChange={setDetailsOpen}>
           <SheetContent side="right" className="flex w-full max-w-sm flex-col p-0 sm:max-w-sm">
             <SheetTitle className="sr-only">Thread details</SheetTitle>
-            <ThreadDetails spine={selected} nameFor={nameFor} />
+            <ThreadDetails spine={selected} workspaceId={workspaceId} nameFor={nameFor} />
           </SheetContent>
         </Sheet>
       )}

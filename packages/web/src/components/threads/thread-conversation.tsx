@@ -20,7 +20,7 @@ import {
   type ConversationMessage,
   type NameFor,
 } from '@inklabs/shared/stories/thread-viewing';
-import { apiGet, useApiQuery } from '@/lib/api';
+import { apiGet, useWorkspaceApiQuery } from '@/lib/api';
 import { AvatarStack } from '@/components/conversation/author-avatar';
 import { ConversationView } from '@/components/conversation/conversation-view';
 import type { ReadCursorStore } from './read-cursors';
@@ -38,6 +38,7 @@ const POLL_MS = 5_000;
  */
 export function ThreadConversation({
   spine,
+  workspaceId,
   nameFor,
   cursors,
   onBack,
@@ -45,6 +46,8 @@ export function ThreadConversation({
   onToggleDetails,
 }: {
   spine: ThreadSpine;
+  /** The workspace the thread was opened in. The same key can be another thread elsewhere. */
+  workspaceId: string | null;
   nameFor: NameFor;
   cursors: ReadCursorStore;
   onBack: () => void;
@@ -54,9 +57,13 @@ export function ThreadConversation({
   const key = spine.key;
   const hasThread = spine.sources.includes('thread');
 
-  const { data, dataUpdatedAt, isLoading } = useApiQuery<ThreadMessagesResponse>(
+  // Bound to the workspace the thread was opened in, in its cache key and on
+  // the request itself, so a refetch racing a switch can never cache
+  // another workspace's page as this one's.
+  const { data, dataUpdatedAt, isLoading } = useWorkspaceApiQuery<ThreadMessagesResponse>(
     ['thread-messages', key],
     threadMessagesPath(key),
+    workspaceId,
     { refetchInterval: hasThread ? POLL_MS : false }
   );
 
@@ -65,8 +72,9 @@ export function ThreadConversation({
   const [unreadAfter, setUnreadAfter] = useState<string | null>(() => cursors.cursorFor(key));
 
   const fetchOlder = useCallback(
-    (beforeId: string) => apiGet<ThreadMessagesResponse>(threadMessagesPath(key, beforeId)),
-    [key]
+    (beforeId: string) =>
+      apiGet<ThreadMessagesResponse>(threadMessagesPath(key, beforeId), { workspaceId }),
+    [key, workspaceId]
   );
   const {
     history,
@@ -76,6 +84,8 @@ export function ThreadConversation({
     loadOlder,
     abandonCatchUp,
   } = useThreadHistory({
+    threadKey: key,
+    scope: workspaceId,
     newestPage: data,
     newestPageAt: dataUpdatedAt,
     newestPageLoading: isLoading,

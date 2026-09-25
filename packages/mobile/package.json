@@ -4,6 +4,7 @@
   "main": "index.ts",
   "private": true,
   "dependencies": {
+    "@inklabs/shared": "workspace:*",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-navigation/bottom-tabs": "^7.18.14",
     "@react-navigation/elements": "^2.6.3",
@@ -28,11 +29,11 @@
     "vitest": "^4.1.6"
   },
   "scripts": {
-    "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web",
-    "test": "vitest run",
-    "type-check": "tsc --noEmit"
+    "start": "yarn workspace @inklabs/shared build && expo start",
+    "android": "yarn workspace @inklabs/shared build && expo start --android",
+    "ios": "yarn workspace @inklabs/shared build && expo start --ios",
+    "web": "yarn workspace @inklabs/shared build && expo start --web",
+    "test": "yarn workspace @inklabs/shared build && vitest run",
+    "type-check": "yarn workspace @inklabs/shared build && tsc --noEmit"
   }
 }

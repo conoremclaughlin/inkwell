@@ -5,8 +5,19 @@
  * hook only runs the fetches and feeds the pages back in, so every client
  * (web, mobile, the desktop app) gets the same history from the same polls.
  *
- * Mount it once per thread, keyed by the thread's key: the read cursor it
- * opens on and the pages it has loaded belong to one thread.
+ * It holds one visit to one conversation at a time. A visit ends, and the
+ * hook starts over as a fresh mount would, when:
+ * - the thread changes (`threadKey`), or whatever else names it (`scope`,
+ *   such as the workspace: one key can name a different thread in each);
+ * - the host's page source is reset: `newestPage` goes back to undefined
+ *   after a page arrived, which a query library does when its cache is
+ *   reset (a workspace switch resets every query).
+ * Every change the hook makes is tagged with the visit it belongs to and
+ * dropped once that visit is over, so a fetch that finishes late can never
+ * land in another visit's history, even one to the same thread.
+ * (The mobile app hit both: a deep link reused an open thread's screen for
+ * another thread, and a workspace switch kept one workspace's messages under
+ * the same key in the next — Lumen, #679.)
  *
  * React is the only thing it needs from its host. The client owns the poll
  * (its own query library, its own interval) and the fetch (its own auth),
@@ -28,7 +39,19 @@ import {
 } from './history.js';
 
 export interface ThreadHistoryInput {
-  /** The thread's newest page, as the poll last returned it. A new object is a new page. */
+  /** The thread this history is for. */
+  threadKey: string;
+  /**
+   * Whatever else names the conversation besides its key, such as the
+   * workspace: the same key can be a different thread in another one.
+   */
+  scope?: string | null;
+  /**
+   * The thread's newest page, as the poll last returned it. A new object is a
+   * new page. It must be this thread's: a query keyed by the thread key
+   * gives exactly that. Undefined after a page has arrived means the source
+   * was reset, and the history starts over.
+   */
   newestPage: ThreadMessagesResponse | undefined;
   /**
    * When the poll last succeeded, in ms — even one that brought nothing new.
@@ -40,8 +63,9 @@ export interface ThreadHistoryInput {
   /** Fetch the page of messages older than `beforeId`. */
   fetchOlder: (beforeId: string) => Promise<ThreadMessagesResponse>;
   /**
-   * The viewer's read cursor as the thread opened (ISO), or null. Read once:
-   * the history catches up to where the reader was, whatever they read since.
+   * The viewer's read cursor as the thread opened (ISO), or null. Read once
+   * per thread: the history catches up to where the reader was, whatever
+   * they read since.
    */
   openingCursor: string | null;
 }
@@ -66,9 +90,50 @@ export interface ThreadHistoryState {
   abandonCatchUp: () => void;
 }
 
+/** Everything the hook holds for one visit. */
+interface Tracked {
+  /** Which conversation: the key and its scope. */
+  identity: string;
+  /** Which visit to it. Every change names the visit it belongs to. */
+  visit: number;
+  openingCursor: string | null;
+  history: ThreadHistory;
+  /** The newest page already merged in. */
+  absorbed: ThreadMessagesResponse | undefined;
+  loadingOlder: boolean;
+  error: string | null;
+}
+
+function fresh(identity: string, openingCursor: string | null, visit: number): Tracked {
+  return {
+    identity,
+    visit,
+    openingCursor,
+    history: EMPTY_HISTORY,
+    absorbed: undefined,
+    loadingOlder: false,
+    error: null,
+  };
+}
+
+const identityOf = (threadKey: string, scope: string | null | undefined): string =>
+  JSON.stringify([scope ?? null, threadKey]);
+
+const messageOf = (failure: unknown, fallback: string): string =>
+  failure instanceof Error ? failure.message : fallback;
+
 export function useThreadHistory(input: ThreadHistoryInput): ThreadHistoryState {
   const { newestPage, newestPageAt, newestPageLoading } = input;
-  const [openingCursor] = useState(input.openingCursor);
+  const identity = identityOf(input.threadKey, input.scope);
+
+  const [tracked, setTracked] = useState<Tracked>(() => fresh(identity, input.openingCursor, 0));
+  // A change to one visit. Dropped once that visit is over, which is what
+  // keeps a late fetch out of the next visit's history.
+  const update = useCallback(
+    (forVisit: number, change: (state: Tracked) => Tracked) =>
+      setTracked((state) => (state.visit === forVisit ? change(state) : state)),
+    []
+  );
 
   // The latest fetcher, so a caller passing a fresh function each render
   // does not restart a fetch already in flight.
@@ -77,23 +142,33 @@ export function useThreadHistory(input: ThreadHistoryInput): ThreadHistoryState 
     fetchOlderRef.current = input.fetchOlder;
   });
 
+  // Another conversation, or a page source that was reset, starts a new
+  // visit, as a fresh mount would.
+  let current = tracked;
+  const sourceReset = newestPage === undefined && tracked.absorbed !== undefined;
+  if (tracked.identity !== identity || sourceReset) {
+    current = fresh(identity, input.openingCursor, tracked.visit + 1);
+    setTracked(current);
+  }
+  const { visit, history } = current;
+
   // Every newest page is merged into the history in the render it arrives,
   // so no poll ever shows the conversation without rows it had a moment ago.
-  const [history, setHistory] = useState<ThreadHistory>(EMPTY_HISTORY);
-  const [absorbed, setAbsorbed] = useState<ThreadMessagesResponse | undefined>(undefined);
-  if (newestPage && newestPage !== absorbed) {
-    setAbsorbed(newestPage);
-    setHistory((current) => absorbNewest(current, newestPage, openingCursor));
+  if (newestPage && newestPage !== current.absorbed) {
+    update(visit, (state) => ({
+      ...state,
+      absorbed: newestPage,
+      history: absorbNewest(state.history, newestPage, state.openingCursor),
+    }));
   }
-
-  const [loadingOlder, setLoadingOlder] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   // Every successful poll — even one that brought nothing new, which hands
   // back the same page object — is the server answering: retry what failed.
   useEffect(() => {
-    if (newestPageAt) setHistory((current) => unblockGaps(current));
-  }, [newestPageAt]);
+    if (newestPageAt) {
+      update(visit, (state) => ({ ...state, history: unblockGaps(state.history) }));
+    }
+  }, [newestPageAt, visit, update]);
 
   // Work the history's gaps one at a time: the catch-up to the read cursor
   // on open, and any stretch a poll skipped. Paused and blocked gaps wait.
@@ -104,41 +179,56 @@ export function useThreadHistory(input: ThreadHistoryInput): ThreadHistoryState 
     fetchOlderRef
       .current(gap.beforeId)
       .then((page) => {
-        if (!cancelled) setHistory((current) => absorbOlder(current, page, gap));
+        if (cancelled) return;
+        update(visit, (state) => ({
+          ...state,
+          history: absorbOlder(state.history, page, gap),
+        }));
       })
       .catch((failure: unknown) => {
         if (cancelled) return;
-        setError(failure instanceof Error ? failure.message : 'Failed to load messages');
-        setHistory((current) => failGap(current, gap));
+        update(visit, (state) => ({
+          ...state,
+          error: messageOf(failure, 'Failed to load messages'),
+          history: failGap(state.history, gap),
+        }));
       });
     return () => {
       cancelled = true;
     };
-  }, [gap]);
+  }, [gap, visit, update]);
 
   const loadOlder = useCallback(async () => {
     const oldest = history.messages[0];
-    if (loadingOlder || !oldest) return;
+    if (current.loadingOlder || !oldest) return;
     const catchUp = olderGap(history);
-    setLoadingOlder(true);
-    setError(null);
+    update(visit, (state) => ({ ...state, loadingOlder: true, error: null }));
     try {
       const page = await fetchOlderRef.current(catchUp?.beforeId ?? oldest.id);
-      setHistory((current) => absorbOlder(current, page, catchUp));
+      update(visit, (state) => ({
+        ...state,
+        history: absorbOlder(state.history, page, catchUp),
+      }));
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'Failed to load earlier messages');
+      update(visit, (state) => ({
+        ...state,
+        error: messageOf(failure, 'Failed to load earlier messages'),
+      }));
     } finally {
-      setLoadingOlder(false);
+      update(visit, (state) => ({ ...state, loadingOlder: false }));
     }
-  }, [loadingOlder, history]);
+  }, [current.loadingOlder, visit, history, update]);
 
-  const abandonCatchUp = useCallback(() => setHistory((current) => dropCatchUp(current)), []);
+  const abandonCatchUp = useCallback(
+    () => update(visit, (state) => ({ ...state, history: dropCatchUp(state.history) })),
+    [visit, update]
+  );
 
   return {
     history,
     opening: history.started ? !history.ready : newestPageLoading,
-    loadingOlder,
-    error,
+    loadingOlder: current.loadingOlder,
+    error: current.error,
     loadOlder,
     abandonCatchUp,
   };
