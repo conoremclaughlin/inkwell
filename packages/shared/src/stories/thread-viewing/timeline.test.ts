@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildTimeline, type TimelineItem } from './timeline';
-import type { ConversationAuthor, ConversationMessage } from './types';
+import { buildTimeline, type TimelineItem } from './timeline.js';
+import type { ConversationAuthor, ConversationMessage } from './conversation.js';
 
 // Local wall-clock times, so day boundaries mean the same thing wherever the
 // suite runs.

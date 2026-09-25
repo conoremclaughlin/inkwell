@@ -6,15 +6,16 @@
   "description": "Inkwell Admin Dashboard - Manage WhatsApp, trusted users, and groups",
   "scripts": {
     "dev": "BASE_PORT=${INK_PORT_BASE:-3001}; WEB_PORT=${WEB_PORT:-$((BASE_PORT + 1))}; next dev -p $WEB_PORT",
-    "build": "next build",
+    "build": "yarn workspace @inklabs/shared build && next build",
     "start": "BASE_PORT=${INK_PORT_BASE:-3001}; WEB_PORT=${WEB_PORT:-$((BASE_PORT + 1))}; next start -p $WEB_PORT",
-    "lint": "next lint",
-    "type-check": "tsc --noEmit",
-    "test": "vitest run",
+    "lint": "yarn workspace @inklabs/shared build && next lint",
+    "type-check": "yarn workspace @inklabs/shared build && tsc --noEmit",
+    "test": "yarn workspace @inklabs/shared build && vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
+    "@inklabs/shared": "workspace:*",
     "@mantine/core": "^8.2.4",
     "@mantine/hooks": "^8.2.4",
     "@mantine/tiptap": "^8.2.4",

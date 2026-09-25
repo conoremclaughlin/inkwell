@@ -12,8 +12,8 @@ import {
   unblockGaps,
   unreadBeyondLoaded,
   type ThreadHistory,
-} from './thread-history';
-import type { ThreadMessage, ThreadMessagesResponse } from './thread-types';
+} from './history.js';
+import type { ThreadMessage, ThreadMessagesResponse } from '../threads-api/index.js';
 
 const PAGE = 100;
 const at = (i: number) => new Date(Date.UTC(2026, 8, 22, 0, 0, i)).toISOString();

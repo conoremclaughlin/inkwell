@@ -12,8 +12,7 @@ import {
 import { ArrowDown, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { MessageRow } from './message-row';
-import { buildTimeline } from './timeline';
-import type { ConversationMessage } from './types';
+import { buildTimeline, type ConversationMessage } from '@inklabs/shared/stories/thread-viewing';
 
 /** Within this many pixels of the end counts as "at the latest message". */
 const BOTTOM_SLACK_PX = 64;

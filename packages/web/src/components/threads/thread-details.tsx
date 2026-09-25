@@ -14,13 +14,18 @@ import {
   X,
 } from 'lucide-react';
 import clsx from 'clsx';
+import type { ThreadMessagesResponse, ThreadSpine } from '@inklabs/shared/stories/threads-api';
+import { displayTitle, isSessionLive } from '@inklabs/shared/stories/thread-browsing';
+import {
+  creatorLabel,
+  formatRelativeTime,
+  sbAuthor,
+  type NameFor,
+} from '@inklabs/shared/stories/thread-viewing';
 import { useApiQuery } from '@/lib/api';
 import { AuthorAvatar } from '@/components/conversation/author-avatar';
-import { formatRelativeTime } from '@/components/conversation/format';
 import { EvidenceNodeCard, type GraphEvidenceResponse } from './evidence';
-import { creatorLabel, sbAuthor, type NameFor } from './to-conversation';
-import { displayTitle, isSessionLive, TypeChip } from './thread-list';
-import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
+import { TypeChip } from './thread-list';
 
 /**
  * Session→key relations, in words a reader shouldn't have to decode:

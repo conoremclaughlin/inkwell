@@ -2,47 +2,20 @@
 
 import { useMemo, useState } from 'react';
 import { AlertTriangle, MessagesSquare, Search } from 'lucide-react';
+import type { SpineIdentity, ThreadSpine } from '@inklabs/shared/stories/threads-api';
+import {
+  displayTitle,
+  hasLiveSession,
+  matchesThreadSearch,
+  previewLine,
+  spineStatus,
+  type StatusFilter,
+} from '@inklabs/shared/stories/thread-browsing';
+import { hasUnread } from '@inklabs/shared/stories/thread-read-state';
+import { formatShortAgo, sbAuthor, type NameFor } from '@inklabs/shared/stories/thread-viewing';
 import { cn } from '@/lib/utils';
 import { AuthorAvatar } from '@/components/conversation/author-avatar';
-import { formatShortAgo } from '@/components/conversation/format';
-import { hasUnread, type ReadCursorStore } from './read-cursors';
-import { previewLine, sbAuthor, type NameFor } from './to-conversation';
-import type { SpineIdentity, SpineSession, ThreadSpine } from './thread-types';
-
-export type StatusFilter = 'all' | 'unread' | 'active' | 'closed';
-
-/** The server decides liveness (isSessionLive); lifecycle is the fallback for older payloads. */
-export function isSessionLive(session: SpineSession): boolean {
-  return session.live ?? (session.lifecycle === 'running' || session.lifecycle === 'generating');
-}
-
-export function hasLiveSession(spine: ThreadSpine): boolean {
-  return spine.sessions.some(isSessionLive);
-}
-
-/** SBs working on the key right now, each once. */
-export function liveAgentsOf(spine: ThreadSpine): string[] {
-  return [
-    ...new Set(spine.sessions.filter(isSessionLive).flatMap((s) => (s.sbSlug ? [s.sbSlug] : []))),
-  ];
-}
-
-/**
- * Where a spine sits in the work lifecycle:
- * - unannounced: someone is on the key but no thread exists — work begun,
- *   nothing said. The state this page exists to surface.
- * - active: open thread, or any live session on the key.
- * - closed: thread closed and nothing live.
- */
-export function spineStatus(spine: ThreadSpine): 'active' | 'unannounced' | 'closed' {
-  if (!spine.thread) return 'unannounced';
-  if (spine.thread.status === 'closed' && !hasLiveSession(spine)) return 'closed';
-  return 'active';
-}
-
-export function displayTitle(spine: ThreadSpine): string | null {
-  return spine.thread?.title ?? spine.taskGroups[0]?.title ?? null;
-}
+import type { ReadCursorStore } from './read-cursors';
 
 const TYPE_COLORS: Record<string, string> = {
   pr: 'bg-purple-500/15 text-purple-600 dark:text-purple-400',
@@ -183,19 +156,7 @@ export function ThreadList({
     ) {
       return false;
     }
-    if (q) {
-      const haystack = [
-        spine.key,
-        displayTitle(spine) ?? '',
-        spine.thread?.lastMessage?.preview ?? '',
-        ...spine.participants,
-        ...spine.participants.map(nameFor),
-      ]
-        .join(' ')
-        .toLowerCase();
-      if (!haystack.includes(q)) return false;
-    }
-    return true;
+    return matchesThreadSearch(spine, q, nameFor);
   });
 
   const countFor = (value: StatusFilter): number =>

@@ -4,27 +4,13 @@ import { memo, useState } from 'react';
 import { ChevronDown, Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AuthorAvatar } from './author-avatar';
-import { formatClockTime } from './format';
+import {
+  formatClockTime,
+  messageLabel,
+  shouldFold,
+  type ConversationMessage,
+} from '@inklabs/shared/stories/thread-viewing';
 import { MessageMarkdown } from './message-markdown';
-import type { ConversationMessage } from './types';
-
-/** Bodies past either limit start folded; the reader opens what they want. */
-const FOLD_CHARS = 1_600;
-const FOLD_LINES = 28;
-
-const LABELS: Record<string, string> = {
-  task_request: 'task request',
-  notification: 'notification',
-  session_resume: 'resume',
-  permission_grant: 'permission',
-};
-
-function shouldFold(body: string): boolean {
-  if (body.length > FOLD_CHARS) return true;
-  let lines = 1;
-  for (const ch of body) if (ch === '\n' && ++lines > FOLD_LINES) return true;
-  return false;
-}
 
 function FoldableBody({ message }: { message: ConversationMessage }) {
   const foldable = !message.streaming && shouldFold(message.body);
@@ -107,7 +93,7 @@ export const MessageRow = memo(function MessageRow({
     );
   }
 
-  const label = message.label ? (LABELS[message.label] ?? message.label.replace(/_/g, ' ')) : null;
+  const label = message.label ? messageLabel(message.label) : null;
   const urgent = message.priority === 'high' || message.priority === 'urgent';
 
   return (

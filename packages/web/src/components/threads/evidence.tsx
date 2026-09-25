@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { ShieldCheck, Wrench } from 'lucide-react';
 import clsx from 'clsx';
-import { formatClockTime, formatDayLabel } from '@/components/conversation/format';
+import { formatClockTime, formatDayLabel } from '@inklabs/shared/stories/thread-viewing';
 
 // ─── Types mirroring GET /api/admin/threads/graph-evidence ───
 
