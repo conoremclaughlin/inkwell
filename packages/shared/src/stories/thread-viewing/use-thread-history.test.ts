@@ -207,3 +207,69 @@ it('drops an older page that finishes after the thread changed', async () => {
   expect(ids).toEqual(['other-m1', 'other-m2', 'other-m3']);
   expect(view.result.current.loadingOlder).toBe(false);
 });
+
+// ─── Visits: one workspace, then another (Lumen, #679) ─────────────────────
+
+it('starts over when the same key is given another scope, such as a workspace', () => {
+  const input = {
+    threadKey: 'fixture:thread:a',
+    scope: 'workspace-a',
+    newestPage: page(11, 20),
+    newestPageAt: 1,
+    newestPageLoading: false,
+    openingCursor: at(20),
+    fetchOlder: vi.fn(async () => page(1, 10)),
+  };
+  const view = renderHook((props) => useThreadHistory(props), { initialProps: input });
+  expect(view.result.current.history.messages).toHaveLength(10);
+
+  view.rerender({ ...input, scope: 'workspace-b', newestPage: otherThread(1, 2), newestPageAt: 2 });
+  expect(view.result.current.history.messages.map((m) => m.id)).toEqual(['other-m1', 'other-m2']);
+});
+
+it('starts over when its page source is reset, as a workspace switch resets every query', () => {
+  const input = {
+    threadKey: 'fixture:thread:a',
+    newestPage: page(11, 20) as ThreadMessagesResponse | undefined,
+    newestPageAt: 1,
+    newestPageLoading: false,
+    openingCursor: at(20),
+    fetchOlder: vi.fn(async () => page(1, 10)),
+  };
+  const view = renderHook((props) => useThreadHistory(props), { initialProps: input });
+  expect(view.result.current.history.messages).toHaveLength(10);
+
+  // The query was reset: no page, then the other workspace's page.
+  view.rerender({ ...input, newestPage: undefined, newestPageAt: 0, newestPageLoading: true });
+  expect(view.result.current.history.messages).toHaveLength(0);
+  view.rerender({ ...input, newestPage: otherThread(1, 2), newestPageAt: 2 });
+  expect(view.result.current.history.messages.map((m) => m.id)).toEqual(['other-m1', 'other-m2']);
+});
+
+it('drops a failed older page from an earlier visit, even after A -> B -> A', async () => {
+  let reject!: (error: Error) => void;
+  const pending = new Promise<ThreadMessagesResponse>((_, r) => {
+    reject = r;
+  });
+  const input = {
+    threadKey: 'fixture:thread:a',
+    newestPage: page(11, 12),
+    newestPageAt: 1,
+    newestPageLoading: false,
+    openingCursor: null,
+    fetchOlder: () => pending,
+  };
+  const view = renderHook((props) => useThreadHistory(props), { initialProps: input });
+  let loading!: Promise<void>;
+  act(() => {
+    loading = view.result.current.loadOlder();
+  });
+  view.rerender({ ...input, threadKey: 'fixture:thread:b', newestPage: otherThread(1, 2) });
+  view.rerender({ ...input, newestPage: page(11, 12) });
+  await act(async () => {
+    reject(new Error('from the first visit'));
+    await loading;
+  });
+  expect(view.result.current.error).toBeNull();
+  expect(view.result.current.loadingOlder).toBe(false);
+});
