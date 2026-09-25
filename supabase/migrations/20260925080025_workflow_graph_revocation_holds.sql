@@ -496,7 +496,8 @@ $$;
 --                                token fenced, prepared operations invalidated
 --   completed work / passed gate immutable; hold only
 --   failed gate, failed/skipped/archived work: unchanged, no hold
--- Caller holds the group row FOR UPDATE; rows are locked in id order.
+-- Idempotent per (node, cause). Caller holds the group row FOR UPDATE; rows
+-- are locked in id order.
 CREATE OR REPLACE FUNCTION public._graph_place_holds(
   p_user_id uuid,
   p_task_group_id uuid,
@@ -534,6 +535,17 @@ BEGIN
        OR (v_node.task_type = 'work'
            AND (v_node.status = 'archived'
                 OR (v_node.status = 'blocked' AND v_node.outcome IN ('failed', 'skipped')))) THEN
+      CONTINUE;
+    END IF;
+    -- One hold per (node, cause): a node already holding this cause — a
+    -- closure member reached again through a newly inserted edge — is
+    -- left as it is.
+    IF EXISTS (
+      SELECT 1 FROM task_authority_holds h
+      WHERE h.task_id = v_node.id AND h.released_at IS NULL
+        AND h.cause_event_id IS NOT DISTINCT FROM p_cause_event_id
+        AND h.cause_operation_id IS NOT DISTINCT FROM p_cause_operation_id
+    ) THEN
       CONTINUE;
     END IF;
 
@@ -1769,6 +1781,63 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+-- ── Holds travel with edges (Lumen, PR #678 round two) ─────────────────
+--
+-- A hold is placed over the closure that exists when authority is lost.
+-- The graph can change afterwards: an inbound edit can wire a completed,
+-- unheld node beneath a held one, and everything downstream of that bridge
+-- then sees only satisfied, unheld sources. Readiness that inspects
+-- immediate sources cannot preserve the closure; the invariant has to be
+-- maintained by the write that changes it. So every edge insert inherits
+-- the unreleased holds of its source onto its target and the target's
+-- descendants — same kind, cause, source gate, attempt and binding — with
+-- the same per-state effects placement has (an open gate closes with a fresh
+-- window, a claim is released with reason upstream-revoked), and the same
+-- per-cause release lifts them later. A node already holding that cause is
+-- skipped, so a re-added edge is idempotent. The trigger runs inside the
+-- serialized mutation's own transaction, under its group lock, whichever RPC
+-- inserted the edge (apply_task_graph, add_graph_nodes, conversion): the
+-- fence lives in the write, never beside it.
+
+CREATE OR REPLACE FUNCTION public._graph_edge_inherits_holds()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_target record;
+  v_hold record;
+BEGIN
+  SELECT t.user_id, t.task_group_id INTO v_target
+  FROM tasks t WHERE t.id = NEW.to_task;
+  IF NOT FOUND OR v_target.task_group_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+  FOR v_hold IN
+    SELECT h.kind, h.cause_event_id, h.cause_operation_id,
+           h.source_gate_id, h.source_attempt, h.binding_hash
+    FROM task_authority_holds h
+    WHERE h.task_id = NEW.from_task AND h.released_at IS NULL
+    ORDER BY h.placed_at, h.id
+  LOOP
+    PERFORM set_config('app.graph_executor', 'on', true);
+    PERFORM _graph_place_holds(v_target.user_id, v_target.task_group_id, NEW.to_task, true,
+      v_hold.kind, v_hold.cause_event_id, v_hold.cause_operation_id,
+      v_hold.source_gate_id, v_hold.source_attempt, v_hold.binding_hash);
+  END LOOP;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS task_edges_inherit_holds ON public.task_edges;
+CREATE TRIGGER task_edges_inherit_holds
+  AFTER INSERT ON public.task_edges
+  FOR EACH ROW EXECUTE FUNCTION public._graph_edge_inherits_holds();
+
+REVOKE ALL ON FUNCTION public._graph_edge_inherits_holds() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public._graph_edge_inherits_holds() FROM anon, authenticated, service_role;
 
 -- ── The execution-path fence covers the gate's request columns ──────────
 

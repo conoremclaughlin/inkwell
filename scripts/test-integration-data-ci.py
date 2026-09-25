@@ -119,14 +119,14 @@ UPDATE _ink_it.stack SET run_id = '00000000-0000-4000-8000-000000000648';
         assert sql("SELECT value FROM _ink_it.cleanup_probe;").strip() == "must-survive"
         # One comparison across ALL classified public tables, including exclusions,
         # against hashes captured on the cold reset before the first test wrote.
-        data.transaction(container_id, guard + data.checksum_guard(data.FIXTURE_TABLES + data.EXCLUDED_TABLES), fds)
+        data.transaction(container_id, guard + data.checksum_guard(data.fixture_tables() + data.EXCLUDED_TABLES), fds)
         assert sql("SELECT run_id FROM _ink_it.stack;").strip() == run_id
         data.finish_run(project, state["dbId"], ports[1], state["baseline"], fds, state["fingerprint"], run_id)
         assert sql("SELECT run_id IS NULL FROM _ink_it.stack;").strip() == "t"
         # Derived, not written down: the literal said 72 while the checksum
         # actually covered 75, and a diagnostic that drifts from what it
         # describes is worse than no number at all (Lumen, #539).
-        covered = len(data.FIXTURE_TABLES + data.EXCLUDED_TABLES)
+        covered = len(data.fixture_tables() + data.EXCLUDED_TABLES)
         print(f"PASS: cold-baseline row checksums match all {covered} public tables after warm cleanup;")
         print("wrong DB/token, unknown table, excluded drift and rollback controls passed; outside sentinel survived.")
 

@@ -447,17 +447,28 @@ d('workflow graph revocation, supersession and holds (real DB)', () => {
       systemActor: true,
     });
     expect(applied.success).toBe(true);
-    // N carries no hold of its own; P is completed. SATISFIES alone would ready it.
-    expect(await openHolds(n)).toHaveLength(0);
+    // P is completed, so SATISFIES alone would ready N. The edge write
+    // inherited P's hold onto N with its provenance (round two), and the
+    // source-hold predicate would refuse it even without that (round one).
+    const inherited = await openHolds(n);
+    expect(inherited).toHaveLength(1);
+    expect(inherited[0]).toMatchObject({
+      kind: 'authority-withdrawn',
+      source_gate_id: id.G,
+      source_attempt: 1,
+      binding_hash: 'A',
+    });
     expect(evalOf(applied).readyWork.map((w) => w.id)).not.toContain(n);
     expect(
       await groups.claimGraphTask({ userId: USER, taskId: n, sessionId: sess1 })
     ).toMatchObject({
       success: false,
-      reason: 'not-ready',
+      reason: 'held',
     });
-    // Re-pass on the same binding releases P's hold; N is ready through P.
+    // Re-pass on the same binding releases P's hold and the inherited one;
+    // N is ready through P.
     expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+    expect(await openHolds(n)).toHaveLength(0);
     expect(evalOf(await sweep(group)).readyWork.map((w) => w.id)).toEqual([n]);
   });
 
@@ -635,6 +646,69 @@ d('workflow graph revocation, supersession and holds (real DB)', () => {
       await a.end();
     }
   });
+
+  // ── Lumen's round-two probe (PR #678): a completed, unheld bridge wired
+  //    beneath a held source AFTER the hold was placed. Immediate-source
+  //    readiness sees only the bridge; the hold must travel with the edge.
+
+  for (const type of ['work', 'gate'] as const) {
+    it(`round2: connecting an already-completed bridge beneath a held source cannot dispatch ${type} beyond it`, async () => {
+      const { group, id } = await buildGraph(
+        'late completed bridge',
+        [
+          { key: 'G', type: 'gate', binding: 'A' },
+          { key: 'W', type: 'work' },
+          { key: 'X', type: 'work' },
+          { key: 'N', type },
+        ],
+        [
+          ['G', 'W'],
+          ['X', 'N'],
+        ]
+      );
+      await sweep(group);
+      expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+      await claimAndComplete(id.W, sess1);
+      await claimAndComplete(id.X, sess1);
+      expect((await revoke(id.G, { identity: reviewer })).success).toBe(true);
+      expect(await openHolds(id.W)).toHaveLength(1);
+      const changed = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: group,
+        expectedVersion: 2,
+        actorIdentityId: author,
+        edges: [
+          { from: id.G, to: id.W },
+          { from: id.W, to: id.X },
+          { from: id.X, to: id.N },
+        ],
+      });
+      // Refusing this inbound edit is also safe, if the invariant is enforced there.
+      if (!changed.success) return;
+      expect((await gate(id.X)).status).toBe('completed');
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: id.N, sessionId: sess2 });
+      expect(claim.success, JSON.stringify({ claim, evaluation: changed.evaluation })).toBe(false);
+      // The hold travelled with the edge, provenance intact: X and N carry
+      // W's withdrawal, and a re-pass on G releases the whole path.
+      for (const node of [id.X, id.N]) {
+        const holds = await openHolds(node);
+        expect(holds).toHaveLength(1);
+        expect(holds[0]).toMatchObject({
+          kind: 'authority-withdrawn',
+          source_gate_id: id.G,
+          binding_hash: 'A',
+        });
+      }
+      expect((await verdict(id.G, reviewer, 'passed')).success).toBe(true);
+      for (const node of [id.W, id.X, id.N]) expect(await openHolds(node)).toHaveLength(0);
+      const after = evalOf(await sweep(group));
+      if (type === 'work') expect(after.readyWork.map((w) => w.id)).toEqual([id.N]);
+      else
+        expect(
+          after.openedGates.map((g) => g.id).concat(after.openGates.map((g) => g.id))
+        ).toContain(id.N);
+    });
+  }
 
   it('case 7 minimal: G → P(completed) → C(pending) — C does not become ready through P while held', async () => {
     const { group, id } = await buildGraph(
