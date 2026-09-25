@@ -105,7 +105,9 @@ function inlineOf(tokens: Token[] | undefined): MarkdownInline[] {
         });
         break;
       case 'codespan':
-        nodes.push({ kind: 'code', text: decodeEntities((token as Tokens.Codespan).text) });
+        // Code is literal: `&amp;` in backticks is those five characters, as
+        // the web page shows it. The lexer hands it over untouched.
+        nodes.push({ kind: 'code', text: (token as Tokens.Codespan).text });
         break;
       case 'br':
         nodes.push({ kind: 'break' });
@@ -113,10 +115,13 @@ function inlineOf(tokens: Token[] | undefined): MarkdownInline[] {
       case 'link':
       case 'image': {
         const link = token as Tokens.Link | Tokens.Image;
+        // The destination as a browser would read it: `?a=1&amp;b=2` is
+        // `?a=1&b=2`. Decoded BEFORE the scheme check, so an encoded
+        // `javascript&#58;` is judged as what it spells.
+        const href = decodeEntities(link.href).trim();
         const children = inlineOf(link.tokens);
-        const label = children.length ? children : [{ kind: 'text' as const, text: link.href }];
-        if (SAFE_LINK.test(link.href))
-          nodes.push({ kind: 'link', href: link.href, children: label });
+        const label = children.length ? children : [{ kind: 'text' as const, text: href }];
+        if (SAFE_LINK.test(href)) nodes.push({ kind: 'link', href, children: label });
         else nodes.push(...label);
         break;
       }
@@ -226,4 +231,20 @@ export function plainTextOf(nodes: MarkdownInline[]): string {
       }
     })
     .join('');
+}
+
+/**
+ * Each column's widest cell, in characters, header included. A table lines
+ * up only when every row gives a column the same width, so a renderer sizes
+ * each column from this rather than letting each row size its own cells:
+ * characters for a terminal, points on a phone (Lumen, #679).
+ */
+export function tableColumnChars(table: Extract<MarkdownBlock, { kind: 'table' }>): number[] {
+  const widths = table.header.map((cell) => plainTextOf(cell).length);
+  for (const row of table.rows) {
+    row.forEach((cell, index) => {
+      widths[index] = Math.max(widths[index] ?? 0, plainTextOf(cell).length);
+    });
+  }
+  return widths;
 }

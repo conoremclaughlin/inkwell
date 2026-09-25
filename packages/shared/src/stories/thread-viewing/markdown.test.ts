@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { decodeEntities, parseMarkdown, plainTextOf, type MarkdownBlock } from './markdown.js';
+import {
+  decodeEntities,
+  parseMarkdown,
+  plainTextOf,
+  tableColumnChars,
+  type MarkdownBlock,
+} from './markdown.js';
 
 const text = (t: string) => ({ kind: 'text' as const, text: t });
 
@@ -91,6 +97,27 @@ describe('parseMarkdown', () => {
     ]);
   });
 
+  it('keeps inline code literal, entity spellings included (Lumen, #679)', () => {
+    expect(parseMarkdown('`&amp; &#x41; &lt;`')).toEqual([
+      { kind: 'paragraph', inline: [{ kind: 'code', text: '&amp; &#x41; &lt;' }] },
+    ]);
+  });
+
+  it('decodes a link target before opening it, as a browser would (Lumen, #679)', () => {
+    expect(parseMarkdown('[query](https://example.com/?a=1&amp;b=2)')).toEqual([
+      {
+        kind: 'paragraph',
+        inline: [{ kind: 'link', href: 'https://example.com/?a=1&b=2', children: [text('query')] }],
+      },
+    ]);
+  });
+
+  it('judges an entity-spelled scheme by what it spells, and refuses it', () => {
+    expect(parseMarkdown('[a](javascript&#58;alert(1)) [b](&#x6A;avascript:alert(1))')).toEqual([
+      { kind: 'paragraph', inline: [text('a b')] },
+    ]);
+  });
+
   it('shows raw HTML as the text it is', () => {
     expect(parseMarkdown('a <b>bold</b> claim')).toEqual([
       { kind: 'paragraph', inline: [text('a <b>bold</b> claim')] },
@@ -132,5 +159,19 @@ describe('plainTextOf', () => {
     expect(paragraph.kind === 'paragraph' && plainTextOf(paragraph.inline)).toBe(
       'Round 2 — see the PR\nok'
     );
+  });
+});
+
+describe('tableColumnChars', () => {
+  it('gives each column its widest cell, header included, the same for every row', () => {
+    const [table] = parseMarkdown(
+      '| A | Status |\n|---|---|\n| A moderately long first cell | x |'
+    );
+    expect(table.kind === 'table' && tableColumnChars(table)).toEqual([28, 6]);
+  });
+
+  it('measures formatted cells by their text, not their markup', () => {
+    const [table] = parseMarkdown('| a |\n|---|\n| **bold** [link](https://example.com) |');
+    expect(table.kind === 'table' && tableColumnChars(table)).toEqual(['bold link'.length]);
   });
 });

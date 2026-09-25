@@ -2,6 +2,7 @@ import { memo, useMemo, type ReactNode } from 'react';
 import { Linking, ScrollView, StyleSheet, Text, View } from 'react-native';
 import {
   parseMarkdown,
+  tableColumnChars,
   type MarkdownBlock,
   type MarkdownInline,
 } from '@inklabs/shared/stories/thread-viewing';
@@ -16,6 +17,27 @@ import { colors, spacing, type } from '../ui/theme';
  */
 
 type Tone = 'default' | 'muted';
+
+/** Table columns: roughly a body glyph's width, and the bounds a column stays within. */
+const TABLE_CHAR_WIDTH = 8;
+const TABLE_CELL_PADDING = spacing.sm;
+const TABLE_COLUMN_MIN = 72;
+const TABLE_COLUMN_MAX = 240;
+
+/**
+ * One width per column, the same in every row. Left to themselves, cells
+ * size to their own text row by row, and a long cell in one row pushed the
+ * next column away from its heading (Lumen, #679). A cell longer than its
+ * column wraps.
+ */
+function columnWidths(block: Extract<MarkdownBlock, { kind: 'table' }>): number[] {
+  return tableColumnChars(block).map((chars) =>
+    Math.min(
+      TABLE_COLUMN_MAX,
+      Math.max(TABLE_COLUMN_MIN, chars * TABLE_CHAR_WIDTH + 2 * TABLE_CELL_PADDING)
+    )
+  );
+}
 
 function inline(nodes: MarkdownInline[], prefix: string): ReactNode[] {
   return nodes.map((node, index) => {
@@ -132,7 +154,8 @@ function Blocks({ blocks, tone, prefix }: { blocks: MarkdownBlock[]; tone: Tone;
             );
           case 'rule':
             return <View key={key} style={[styles.rule, spaced]} />;
-          case 'table':
+          case 'table': {
+            const widths = columnWidths(block);
             return (
               <ScrollView
                 key={key}
@@ -152,6 +175,11 @@ function Blocks({ blocks, tone, prefix }: { blocks: MarkdownBlock[]; tone: Tone;
                           style={[
                             textStyle,
                             styles.tableCell,
+                            {
+                              width: widths[cellIndex],
+                              minWidth: widths[cellIndex],
+                              maxWidth: widths[cellIndex],
+                            },
                             rowIndex === 0 && styles.strong,
                             { textAlign: block.align[cellIndex] ?? 'left' },
                           ]}
@@ -165,6 +193,7 @@ function Blocks({ blocks, tone, prefix }: { blocks: MarkdownBlock[]; tone: Tone;
                 </View>
               </ScrollView>
             );
+          }
         }
       })}
     </>
@@ -247,5 +276,5 @@ const styles = StyleSheet.create({
     borderTopColor: colors.borderSubtle,
   },
   tableHeaderRow: { borderTopWidth: 0, backgroundColor: colors.surfaceRaised },
-  tableCell: { minWidth: 88, maxWidth: 220, paddingHorizontal: spacing.sm, paddingVertical: 6 },
+  tableCell: { paddingHorizontal: TABLE_CELL_PADDING, paddingVertical: 6 },
 });
