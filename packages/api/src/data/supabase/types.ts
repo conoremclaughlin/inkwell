@@ -2704,6 +2704,34 @@ export type Database = {
           },
         ];
       };
+      observation_conflicts: {
+        Row: {
+          conflicting: Json;
+          ingested_at: string;
+          operation_id: string;
+          seq: number;
+        };
+        Insert: {
+          conflicting: Json;
+          ingested_at?: string;
+          operation_id: string;
+          seq: number;
+        };
+        Update: {
+          conflicting?: Json;
+          ingested_at?: string;
+          operation_id?: string;
+          seq?: number;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'observation_conflicts_operation_id_fkey';
+            columns: ['operation_id'];
+            referencedRelation: 'publication_operations';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       pcp_config: {
         Row: {
           key: string;
@@ -2751,6 +2779,197 @@ export type Database = {
           risk_level?: string;
         };
         Relationships: [];
+      };
+      publication_operation_events: {
+        Row: {
+          actor_identity_id: string | null;
+          actor_user_id: string | null;
+          connectivity: string | null;
+          evidence: Json | null;
+          exposure: string | null;
+          ingested_at: string;
+          observed_at: string;
+          operation_id: string;
+          phase: string;
+          refs: string | null;
+          seq: number;
+          server_state_verified: boolean | null;
+          server_watermark: Json | null;
+          source: string;
+        };
+        Insert: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          connectivity?: string | null;
+          evidence?: Json | null;
+          exposure?: string | null;
+          ingested_at?: string;
+          observed_at: string;
+          operation_id: string;
+          phase: string;
+          refs?: string | null;
+          seq: number;
+          server_state_verified?: boolean | null;
+          server_watermark?: Json | null;
+          source: string;
+        };
+        Update: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          connectivity?: string | null;
+          evidence?: Json | null;
+          exposure?: string | null;
+          ingested_at?: string;
+          observed_at?: string;
+          operation_id?: string;
+          phase?: string;
+          refs?: string | null;
+          seq?: number;
+          server_state_verified?: boolean | null;
+          server_watermark?: Json | null;
+          source?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'publication_operation_events_actor_identity_id_fkey';
+            columns: ['actor_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operation_events_actor_user_id_fkey';
+            columns: ['actor_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operation_events_operation_id_fkey';
+            columns: ['operation_id'];
+            referencedRelation: 'publication_operations';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      publication_operations: {
+        Row: {
+          accepts_unverified_server_state: boolean;
+          authority: string;
+          authority_event_id: string | null;
+          authorizer_identity_id: string | null;
+          authorizer_user_id: string | null;
+          binding: Json;
+          executor_identity_id: string | null;
+          executor_session_id: string | null;
+          execution_modes: string[];
+          gate_attempt: number | null;
+          gate_task_id: string | null;
+          id: string;
+          intent_hash: string;
+          policy_ref: Json;
+          prepared_at: string;
+          publish_task_id: string | null;
+          reason: string | null;
+          task_group_id: string | null;
+          user_id: string;
+        };
+        Insert: {
+          accepts_unverified_server_state?: boolean;
+          authority: string;
+          authority_event_id?: string | null;
+          authorizer_identity_id?: string | null;
+          authorizer_user_id?: string | null;
+          binding: Json;
+          executor_identity_id?: string | null;
+          executor_session_id?: string | null;
+          execution_modes?: string[];
+          gate_attempt?: number | null;
+          gate_task_id?: string | null;
+          id: string;
+          intent_hash: string;
+          policy_ref: Json;
+          prepared_at?: string;
+          publish_task_id?: string | null;
+          reason?: string | null;
+          task_group_id?: string | null;
+          user_id: string;
+        };
+        Update: {
+          accepts_unverified_server_state?: boolean;
+          authority?: string;
+          authority_event_id?: string | null;
+          authorizer_identity_id?: string | null;
+          authorizer_user_id?: string | null;
+          binding?: Json;
+          executor_identity_id?: string | null;
+          executor_session_id?: string | null;
+          execution_modes?: string[];
+          gate_attempt?: number | null;
+          gate_task_id?: string | null;
+          id?: string;
+          intent_hash?: string;
+          policy_ref?: Json;
+          prepared_at?: string;
+          publish_task_id?: string | null;
+          reason?: string | null;
+          task_group_id?: string | null;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'publication_operations_authority_event_id_fkey';
+            columns: ['authority_event_id'];
+            referencedRelation: 'task_gate_events';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_authorizer_identity_id_fkey';
+            columns: ['authorizer_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_authorizer_user_id_fkey';
+            columns: ['authorizer_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_executor_identity_id_fkey';
+            columns: ['executor_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_executor_session_id_fkey';
+            columns: ['executor_session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_gate_task_id_fkey';
+            columns: ['gate_task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_publish_task_id_fkey';
+            columns: ['publish_task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_task_group_id_fkey';
+            columns: ['task_group_id'];
+            referencedRelation: 'task_groups';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'publication_operations_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
       };
       project_slug_aliases: {
         Row: {
@@ -3829,6 +4048,73 @@ export type Database = {
           },
         ];
       };
+      task_authority_holds: {
+        Row: {
+          binding_hash: string | null;
+          cause_event_id: string | null;
+          cause_operation_id: string | null;
+          id: string;
+          kind: string;
+          placed_at: string;
+          released_at: string | null;
+          released_by: Json | null;
+          source_attempt: number | null;
+          source_gate_id: string | null;
+          task_id: string;
+        };
+        Insert: {
+          binding_hash?: string | null;
+          cause_event_id?: string | null;
+          cause_operation_id?: string | null;
+          id?: string;
+          kind: string;
+          placed_at?: string;
+          released_at?: string | null;
+          released_by?: Json | null;
+          source_attempt?: number | null;
+          source_gate_id?: string | null;
+          task_id: string;
+        };
+        Update: {
+          binding_hash?: string | null;
+          cause_event_id?: string | null;
+          cause_operation_id?: string | null;
+          id?: string;
+          kind?: string;
+          placed_at?: string;
+          released_at?: string | null;
+          released_by?: Json | null;
+          source_attempt?: number | null;
+          source_gate_id?: string | null;
+          task_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_authority_holds_cause_event_id_fkey';
+            columns: ['cause_event_id'];
+            referencedRelation: 'task_gate_events';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_authority_holds_cause_operation_id_fkey';
+            columns: ['cause_operation_id'];
+            referencedRelation: 'publication_operations';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_authority_holds_source_gate_id_fkey';
+            columns: ['source_gate_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_authority_holds_task_id_fkey';
+            columns: ['task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       task_comments: {
         Row: {
           content: string;
@@ -3943,6 +4229,7 @@ export type Database = {
           assignee_identity_id: string | null;
           assignee_user_id: string | null;
           attempt: number;
+          binding_hash: string | null;
           claim_token: string | null;
           created_at: string;
           event: string;
@@ -3950,6 +4237,7 @@ export type Database = {
           gate_version: number;
           id: string;
           reason: string | null;
+          resolves_event_id: string | null;
           session_id: string | null;
           task_id: string;
           user_id: string;
@@ -3960,6 +4248,7 @@ export type Database = {
           assignee_identity_id?: string | null;
           assignee_user_id?: string | null;
           attempt: number;
+          binding_hash?: string | null;
           claim_token?: string | null;
           created_at?: string;
           event: string;
@@ -3967,6 +4256,7 @@ export type Database = {
           gate_version: number;
           id?: string;
           reason?: string | null;
+          resolves_event_id?: string | null;
           session_id?: string | null;
           task_id: string;
           user_id: string;
@@ -3977,6 +4267,7 @@ export type Database = {
           assignee_identity_id?: string | null;
           assignee_user_id?: string | null;
           attempt?: number;
+          binding_hash?: string | null;
           claim_token?: string | null;
           created_at?: string;
           event?: string;
@@ -3984,6 +4275,7 @@ export type Database = {
           gate_version?: number;
           id?: string;
           reason?: string | null;
+          resolves_event_id?: string | null;
           session_id?: string | null;
           task_id?: string;
           user_id?: string;
@@ -4011,6 +4303,12 @@ export type Database = {
             foreignKeyName: 'task_gate_events_assignee_user_id_fkey';
             columns: ['assignee_user_id'];
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_resolves_event_id_fkey';
+            columns: ['resolves_event_id'];
+            referencedRelation: 'task_gate_events';
             referencedColumns: ['id'];
           },
           {
@@ -4316,7 +4614,11 @@ export type Database = {
           dwell_started_at: string | null;
           eligible_at: string | null;
           gate_attempt: number;
+          gate_authors: Json | null;
+          gate_binding: Json | null;
+          gate_binding_hash: string | null;
           gate_opened_at: string | null;
+          gate_request_revision: number;
           gate_state: string | null;
           gate_version: number;
           id: string;
@@ -4351,7 +4653,11 @@ export type Database = {
           dwell_started_at?: string | null;
           eligible_at?: string | null;
           gate_attempt?: number;
+          gate_authors?: Json | null;
+          gate_binding?: Json | null;
+          gate_binding_hash?: string | null;
           gate_opened_at?: string | null;
+          gate_request_revision?: number;
           gate_state?: string | null;
           gate_version?: number;
           id?: string;
@@ -4386,7 +4692,11 @@ export type Database = {
           dwell_started_at?: string | null;
           eligible_at?: string | null;
           gate_attempt?: number;
+          gate_authors?: Json | null;
+          gate_binding?: Json | null;
+          gate_binding_hash?: string | null;
           gate_opened_at?: string | null;
+          gate_request_revision?: number;
           gate_state?: string | null;
           gate_version?: number;
           id?: string;
@@ -5317,6 +5627,7 @@ export type Database = {
           p_claim_token?: string | null;
           p_evidence?: Json | null;
           p_reason?: string | null;
+          p_binding_hash?: string | null;
         };
         Returns: Json;
       };
@@ -5352,6 +5663,54 @@ export type Database = {
           p_reason?: string | null;
         };
         Returns: Json;
+      };
+      revoke_gate: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_expected_attempt: number;
+          p_expected_gate_version: number;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      supersede_gate: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_expected_attempt: number;
+          p_expected_gate_version: number;
+          p_expected_request_revision: number;
+          p_binding: Json;
+          p_binding_hash: string;
+          p_authors?: Json | null;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_system_actor?: boolean;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      lift_withdrawal: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_withdrawal_event_id: string;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      graph_hold_blocks: {
+        Args: { p_task_id: string };
+        Returns: boolean;
+      };
+      graph_unresolved_withdrawals: {
+        Args: { p_task_id: string; p_binding_hash?: string | null };
+        Returns: string[];
       };
       show_limit: { Args: never; Returns: number };
       show_trgm: { Args: { '': string }; Returns: string[] };

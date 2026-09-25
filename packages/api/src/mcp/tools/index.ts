@@ -60,6 +60,12 @@ import {
   releaseClaimSchema,
   recordGateVerdictSchema,
   retryGateSchema,
+  handleRevokeGate,
+  handleSupersedeGate,
+  handleLiftWithdrawal,
+  revokeGateSchema,
+  supersedeGateSchema,
+  liftWithdrawalSchema,
 } from './task-graph-handlers';
 
 import {
@@ -1207,6 +1213,57 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleRetryGate(args, dataComposer);
       } catch (error) {
         return graphToolError('retry_gate')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'revoke_gate',
+    {
+      description: `Withdraw a PASSED verification gate's authority (spec workflow-graph-revocation). Before any publication consumed the pass: the same candidate is decided again on a fresh attempt and every descendant carries an authority-withdrawn hold — no dispatch, no group completion — until this gate passes the same binding again or an owner lifts the withdrawal. After consumption: the attempt FAILS with reason revoked-after-publication; nothing is undone. Authority: the verdict actor, the assignee, a recorded author, or the owner/an admin. Attempt + gateVersion CAS; reason required.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: revokeGateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRevokeGate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('revoke_gate')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'supersede_gate',
+    {
+      description: `Change what a verification gate decides (spec workflow-graph-revocation §Supersession): a new binding and author set replace the current request under a CAS on attempt, gateVersion and requestRevision (read them via get_task_graph). The old attempt is invalidated — a reviewer's claim is released with reason superseded and their late verdict bounces; from PASSED the old binding is revoked first and its holds placed. Refused already-published once a publication consumed the gate: a new candidate is then a new request.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: supersedeGateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleSupersedeGate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('supersede_gate')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'lift_withdrawal',
+    {
+      description: `Resolve a gate's withdrawal or failed verdict without a new pass (spec workflow-graph-revocation §Eligibility): an owner or admin names the revoked/failed event and a reason; the holds that withdrawal placed are released, and no others. An SB session is refused — this is the human's attributed act.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: liftWithdrawalSchema,
+    },
+    async (args) => {
+      try {
+        return await handleLiftWithdrawal(args, dataComposer);
+      } catch (error) {
+        return graphToolError('lift_withdrawal')(error);
       }
     }
   );

@@ -38,7 +38,9 @@ class DataTests(unittest.TestCase):
         self.calls = []
         self.database = "postgres"
         self.failed_tool = None
-        self.catalog = data.FIXTURE_TABLES + data.EXCLUDED_TABLES
+        # The full-schema stack: every migration applied, so the open-window
+        # tables are present and the dropped-window ones are not.
+        self.catalog = data.fixture_tables("") + data.EXCLUDED_TABLES
         self.checksum_tables = self.catalog
         patch = mock.patch.object(data.subprocess, "run", self.run_command)
         patch.start()
@@ -144,12 +146,15 @@ class DataTests(unittest.TestCase):
         sql = self.mutations()[0]
         truncate = sql[sql.index("TRUNCATE "):sql.index(" CONTINUE IDENTITY")]
         names = tuple(part.removeprefix("ONLY public.") for part in truncate[9:].split(", "))
-        self.assertEqual(names, data.FIXTURE_TABLES)
+        self.assertEqual(names, data.fixture_tables(""))
+        self.assertEqual(len(data.FIXTURE_TABLES), 73)
         self.assertEqual(len(set(names)), len(names))
-        # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539).
+        # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539); the
+        # revocation amendment's four tables (#678) join through a created-at
+        # window, not this base list, so a rehearsal cut before them is exact.
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 73)
+        self.assertEqual(len(names), 77)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
@@ -165,7 +170,7 @@ class DataTests(unittest.TestCase):
         for flag in ("--data-only", "--strict-names", "--no-blobs"):
             self.assertIn(flag, command)
         self.assertEqual([s[8:] for s in command if s.startswith("--table=")],
-                         ["public." + t for t in data.FIXTURE_TABLES])
+                         ["public." + t for t in data.fixture_tables("")])
         self.assertNotIn("--disable-triggers", command)
         self.assertNotIn("--clean", command)
         self.assertNotIn("--create", command)
@@ -218,25 +223,39 @@ class DataTests(unittest.TestCase):
 
     def test_windowed_fixture_tables_follow_the_rehearsal_cut(self):
         window = ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")
-        self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES)
-        # The CI rehearsal cut: the creating migration applied, the dropping one withheld.
+        created = ("observation_conflicts", "publication_operation_events", "publication_operations",
+                   "task_authority_holds")
+        # Every migration applied: the dropped window is absent, the open one present.
+        self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES + created)
+        # The CI rehearsal cut: the attestations' creator applied and dropper withheld;
+        # the revocation tables' creator withheld.
         self.assertEqual(data.fixture_tables("20260913090000"), data.FIXTURE_TABLES + window)
-        # Cut at or before the creator (never created), or after the dropper (dropped).
-        for until in ("20260913081634", "20260913081633", "20260913090001", "20270101000000"):
+        # Cut at or before the attestations' creator (never created), or after the
+        # dropper (dropped) but before the revocation tables' creator.
+        for until in ("20260913081634", "20260913081633", "20260913090001", "20260925080025"):
             with self.subTest(until=until):
                 self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES)
-        # The window is part of the policy, so changing it invalidates cached baselines.
-        for name in window:
+        # A cut past the revocation tables' creator carries them, without the attestations.
+        for until in ("20260925080026", "20270101000000"):
+            with self.subTest(until=until):
+                self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES + created)
+        # Both windows are part of the policy, so changing either invalidates cached baselines.
+        for name in window + created:
             self.assertIn(name, data.POLICY)
+        self.assertIn("20260925080025-:", data.POLICY)
 
     def test_rehearsal_cut_classifies_and_truncates_the_windowed_tables(self):
         window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
-        self.catalog = data.FIXTURE_TABLES + window + data.EXCLUDED_TABLES
+        self.catalog = data.fixture_tables("") + window + data.EXCLUDED_TABLES
         # A full-schema stack must not carry them ...
         with self.assertRaisesRegex(data.Refusal, "classification differs"):
             self.clean()
         self.assertEqual(self.mutations(), [])
-        # ... a rehearsal stack must, and its cleanup truncates them with the rest.
+        # ... a rehearsal stack must — and, cut before the revocation migration,
+        # carries none of the open-window tables — and its cleanup truncates
+        # them with the rest.
+        self.catalog = data.FIXTURE_TABLES + window + data.EXCLUDED_TABLES
+        self.calls = []
         self.clean(until="20260913090000")
         truncate = self.mutations()[0]
         for name in window:
@@ -247,6 +266,33 @@ class DataTests(unittest.TestCase):
         with self.assertRaisesRegex(data.Refusal, "classification differs"):
             self.clean(until="20260913090000")
         self.assertEqual(self.mutations(), [])
+
+    def test_created_window_tables_are_missing_only_before_their_migration(self):
+        created = data.fixture_tables("")[len(data.FIXTURE_TABLES):]
+        self.assertEqual(len(created), 4)
+        # A full-schema stack carries them and cleanup truncates them ...
+        self.clean()
+        truncate = self.mutations()[0]
+        for name in created:
+            self.assertIn("ONLY public." + name, truncate)
+        # ... a full-schema stack WITHOUT them is refused (the PR #678 mirror case).
+        self.catalog = data.FIXTURE_TABLES + data.EXCLUDED_TABLES
+        self.calls = []
+        with self.assertRaisesRegex(data.Refusal, "classification differs"):
+            self.clean()
+        self.assertEqual(self.mutations(), [])
+        # A rehearsal stack cut before their migration must not carry them: the
+        # catalog that lacks them is exact, and one that has them is refused.
+        window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
+        self.catalog = data.FIXTURE_TABLES + window + data.EXCLUDED_TABLES
+        self.calls = []
+        self.clean(until="20260913090000")
+        for name in created:
+            self.assertNotIn("ONLY public." + name, self.mutations()[0])
+        self.catalog = data.FIXTURE_TABLES + window + created + data.EXCLUDED_TABLES
+        self.calls = []
+        with self.assertRaisesRegex(data.Refusal, "classification differs"):
+            self.clean(until="20260913090000")
 
     def test_cold_capture_under_the_rehearsal_cut_dumps_the_windowed_tables(self):
         window = data.fixture_tables("20260913090000")[len(data.FIXTURE_TABLES):]
@@ -291,7 +337,7 @@ class DataTests(unittest.TestCase):
         sql = self.mutations()[0]
         before, after = sql.split("TRUNCATE ", 1)
         self.assertIn(data.checksum_guard(data.EXCLUDED_TABLES), before)
-        self.assertTrue(after.endswith(data.checksum_guard(data.FIXTURE_TABLES + data.EXCLUDED_TABLES)))
+        self.assertTrue(after.endswith(data.checksum_guard(data.fixture_tables("") + data.EXCLUDED_TABLES)))
 
     def test_cold_capture_initializes_database_marker_before_returning(self):
         result = data.capture_baseline(self.workdir, self.project, self.id, 55422, [7], self.signature, self.run_id)

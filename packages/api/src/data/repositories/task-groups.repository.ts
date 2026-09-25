@@ -611,6 +611,8 @@ export class TaskGroupsRepository {
     claimToken?: string;
     evidence?: Record<string, unknown>;
     reason?: string;
+    /** The binding the evidence is about; refused `binding-mismatch` if it is not the gate's current one. */
+    bindingHash?: string;
   }): Promise<Record<string, unknown>> {
     const { data, error } = await this.client.rpc('record_gate_verdict', {
       p_user_id: params.userId,
@@ -624,6 +626,7 @@ export class TaskGroupsRepository {
       p_claim_token: params.claimToken ?? null,
       p_evidence: (params.evidence ?? null) as Json,
       p_reason: params.reason ?? null,
+      p_binding_hash: params.bindingHash ?? null,
     });
     if (error) throw new Error(`record_gate_verdict failed: ${error.message}`);
     return data as Record<string, unknown>;
@@ -647,6 +650,103 @@ export class TaskGroupsRepository {
       p_reason: params.reason ?? null,
     });
     if (error) throw new Error(`retry_gate failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * Withdraw a PASSED gate's authority (spec workflow-graph-revocation
+   * §Revocation). Before any publication consumed the pass: the same
+   * candidate is decided again on a fresh attempt, and every descendant
+   * carries an authority-withdrawn hold until this gate passes that binding
+   * again or an owner lifts the withdrawal. After consumption: the attempt
+   * FAILS with reason revoked-after-publication and nothing is undone.
+   * Authority: the verdict actor, the assignee, a recorded author, or the
+   * owner/an admin — enumerated in SQL, validated there.
+   */
+  async revokeGate(params: {
+    userId: string;
+    taskId: string;
+    expectedAttempt: number;
+    expectedGateVersion: number;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    reason: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('revoke_gate', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_expected_attempt: params.expectedAttempt,
+      p_expected_gate_version: params.expectedGateVersion,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_reason: params.reason,
+    });
+    if (error) throw new Error(`revoke_gate failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * An authorized request change (spec §Supersession): the gate's binding
+   * and recorded author set are replaced under a CAS on attempt, version and
+   * request revision; the old attempt is invalidated (claims released with
+   * reason `superseded`, prepared operations invalidated; from PASSED, the
+   * old binding is revoked first and its holds placed). Refused
+   * `already-published` once any operation on the gate was consumed.
+   */
+  async supersedeGate(params: {
+    userId: string;
+    taskId: string;
+    expectedAttempt: number;
+    expectedGateVersion: number;
+    expectedRequestRevision: number;
+    binding: Record<string, unknown>;
+    bindingHash: string;
+    authors?: Array<{ kind: 'sb' | 'user'; id: string }>;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    systemActor?: boolean;
+    reason?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('supersede_gate', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_expected_attempt: params.expectedAttempt,
+      p_expected_gate_version: params.expectedGateVersion,
+      p_expected_request_revision: params.expectedRequestRevision,
+      p_binding: params.binding as Json,
+      p_binding_hash: params.bindingHash,
+      p_authors: (params.authors ?? null) as Json,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_system_actor: params.systemActor ?? false,
+      p_reason: params.reason ?? null,
+    });
+    if (error) throw new Error(`supersede_gate failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * The only non-verdict resolution of a withdrawal or failure (spec
+   * §Eligibility): an owner or admin, with a reason, names the event it
+   * resolves; the holds that withdrawal placed are released, and no others.
+   */
+  async liftWithdrawal(params: {
+    userId: string;
+    taskId: string;
+    withdrawalEventId: string;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    reason: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('lift_withdrawal', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_withdrawal_event_id: params.withdrawalEventId,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_reason: params.reason,
+    });
+    if (error) throw new Error(`lift_withdrawal failed: ${error.message}`);
     return data as Record<string, unknown>;
   }
 

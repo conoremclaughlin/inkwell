@@ -42,17 +42,25 @@ trusted_users user_identity user_identity_history user_permissions users
 workspace_members workspaces
 """.split())
 # Fixture tables that exist only in a window of the migration sequence: created
-# by one migration and dropped by a later one. A rehearsal stack cut between the
-# two (INTEGRATION_MIGRATIONS_UNTIL, spec inkmail-thread-scope §4) carries them
-# and the rehearsal suite writes to them, so for that stack they are fixture
-# tables; for every other stack they are absent, and the catalog check expects
-# exactly that in both directions. Entries are (created_by, dropped_by, tables).
+# by one migration and, when the second stamp is set, dropped by a later one. A
+# rehearsal stack cut between the two (INTEGRATION_MIGRATIONS_UNTIL, spec
+# inkmail-thread-scope §4) carries the attestation tables and the rehearsal
+# suite writes to them, so for that stack they are fixture tables; for every
+# other stack they are absent. A table created by a migration and never dropped
+# is the mirror image: present on every stack whose cut is past its creating
+# migration, absent on a rehearsal cut before it (the revocation tables, PR
+# #678, failed the rehearsal job as "4 missing" while listed unconditionally).
+# The catalog check expects exactly that in both directions. Entries are
+# (created_by, dropped_by or "", tables).
 WINDOWED_FIXTURE_TABLES = (
     ("20260913081634", "20260913090000",
      ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")),
+    ("20260925080025", "",
+     ("observation_conflicts", "publication_operation_events", "publication_operations",
+      "task_authority_holds")),
 )
 EXCLUDED_TABLES = ("pcp_config", "permission_definitions")
-POLICY = ("fixture-baseline-v4:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
+POLICY = ("fixture-baseline-v5:" + ",".join(FIXTURE_TABLES + EXCLUDED_TABLES) + "|window:" +
           ";".join(created + "-" + dropped + ":" + ",".join(tables)
                    for created, dropped, tables in WINDOWED_FIXTURE_TABLES))
 
@@ -62,11 +70,14 @@ def fixture_tables(until=""):
 
     Empty means every migration applied. The stack withholds a migration whose
     stamp is >= until (integration-stack.prepare), so a windowed table exists
-    when its creating migration was applied and its dropping one withheld.
+    when its creating migration was applied and its dropping one, if any, was
+    withheld.
     """
     tables = FIXTURE_TABLES
     for created_by, dropped_by, names in WINDOWED_FIXTURE_TABLES:
-        if until and created_by < until <= dropped_by:
+        created = not until or created_by < until
+        dropped = bool(dropped_by) and (not until or dropped_by < until)
+        if created and not dropped:
             tables += names
     return tables
 DATABASE_GUARD = """DO $guard$ BEGIN
