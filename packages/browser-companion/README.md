@@ -162,3 +162,56 @@ browser-restricted execution/egress contracts. A privacy marker in a prompt does
 not contain an unrestricted coding backend with shell/network access. Unit tests
 use synthetic snapshots, injected clocks and fake adapters, not native Chrome or
 an actual authenticated SB roundtrip.
+
+## Sidebar conversation view (not enabled)
+
+`src/chat-panel.ts` and `src/chat-panel.css` provide the next conversation view,
+without changing the installed prototype or adding network access. The view
+accepts a trusted, typed state snapshot plus injected send/Stop/subscription
+callbacks; these are UI contracts, not server API schemas or authorization.
+
+- The selected SB, thread, attached page, sharing and connection states stay
+  visible. Messages render as bounded plain text, never HTML or executable links.
+- Snapshot rows are oldest-first. Within the newest 100 supplied rows, duplicate
+  IDs use the last occurrence's complete fields and position. Rendering and
+  delivery reconciliation consume that same canonical snapshot; older history is
+  not scanned to backfill rows removed by deduplication.
+- Storage, queueing, active execution, completion, rejection and uncertain
+  delivery remain distinct. A successful HTTP request is not a read receipt.
+  Adapters must explicitly map server statuses to the closed `ChatDeliveryState`
+  set. Unmapped values count as `unknown` evidence, not an absent echo; repeating
+  an unmapped status cannot reconcile an uncertain send.
+- One send is pending at a time. Editing remains possible; an older receipt
+  cannot erase a newer draft. Thread/account/SB/controller/grant/document changes
+  fence late callbacks and discard drafts rather than carry them to a new target.
+- Stop calls the local revoker synchronously, even during pending IO. It does not
+  claim remote cancellation or undo effects already started.
+- An ambiguous send blocks resubmission until the adapter reconciles its exact
+  operation ID in the same account/workspace, thread and SB. Navigation, regrant,
+  page detach, or switching away and back does not clear that guard. This bounded
+  in-memory tracking is **not durable idempotency**; the adapter must reconcile
+  after a view reload and provide ordered, authenticated snapshots.
+- While a send is pending, the newest same-conversation echo takes precedence
+  over retained evidence, including in a snapshot that changes the page binding.
+  An observed `unknown` remains evidence, not an absent echo: it also overrides
+  an unversioned send callback, even after the row leaves the visible window.
+  Callback status is fallback only when there is no observed echo. A later
+  authoritative adapter snapshot can reconcile the guard without resubmitting.
+  Once reconciled, a later `unknown` row does not automatically re-lock this view;
+  the adapter must distinguish admission evidence from execution uncertainty and
+  own durable retry gating independently of the rendered history window.
+- Echoed local messages stay retired when the supplied history window slides;
+  they do not reappear below newer replies. Echo tracking shares the bounded
+  local-message buffer rather than accumulating an unbounded ID set.
+- Keyed transcript updates preserve unchanged rows/body nodes during appended
+  replies and status ticks, as well as draft typing and unchanged refreshes.
+  Text is only reassigned when changed; screen-reader behavior still needs native
+  acceptance testing. Switching views cannot revive the last locally stopped
+  read-session identity; a new read session remains distinct.
+- Destroy removes listeners, clears visible data and aborts local
+  pending delivery, but is not a remote grant-revocation operation.
+
+Production entrypoints do not import this view yet. Pairing, thread-scoped API,
+page-grant admission, browser-restricted runtime/egress, real Chrome targeting,
+and authenticated multi-turn acceptance remain necessary before enabling live
+page-aware chat. Unit tests use synthetic state and fake callbacks, not an SB.

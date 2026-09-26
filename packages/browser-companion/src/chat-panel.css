@@ -1,0 +1,128 @@
+/* Scoped successor view; importing this does not enable chat or page authority. */
+.ink-chat-panel {
+  color: #172e32;
+  background: #f5f2e9;
+  font:
+    14px/1.5 system-ui,
+    sans-serif;
+  padding: 18px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ink-chat-panel * {
+  box-sizing: border-box;
+}
+
+.ink-chat-panel > h2 {
+  font:
+    normal 28px/1.2 Georgia,
+    serif;
+  margin: 0 0 14px;
+}
+
+.ink-chat-panel > p {
+  margin: 7px 0;
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.ink-chat-panel [role='log'] {
+  margin: 18px 0;
+  padding: 0;
+  border: 0;
+}
+
+.ink-chat-panel [role='log'] > p {
+  color: #536365;
+  font-size: 11px;
+}
+
+.ink-chat-panel ol {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.ink-chat-panel li {
+  background: #fffef9;
+  border: 1px solid #d6d6c9;
+  border-radius: 8px;
+  padding: 12px;
+  margin: 10px 0;
+}
+
+.ink-chat-panel li strong {
+  font-size: 12px;
+  color: #123e40;
+}
+
+.ink-chat-panel li pre {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: transparent;
+  margin: 8px 0;
+  padding: 0;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.ink-chat-panel li p,
+.ink-chat-panel form > p {
+  font-size: 11px;
+  color: #536365;
+  margin: 8px 0;
+}
+
+.ink-chat-panel form {
+  border-top: 1px solid #c6a567;
+  padding-top: 16px;
+}
+
+.ink-chat-panel label {
+  display: block;
+  font-weight: 600;
+}
+
+.ink-chat-panel textarea {
+  display: block;
+  width: 100%;
+  resize: vertical;
+  min-height: 100px;
+  padding: 10px;
+  margin: 8px 0;
+  border: 1px solid #acb8b4;
+  border-radius: 6px;
+  color: #172e32;
+  background: white;
+  font: inherit;
+}
+
+.ink-chat-panel button {
+  padding: 10px 14px;
+  margin: 4px 8px 4px 0;
+  border: 1px solid #123e40;
+  border-radius: 6px;
+  background: #123e40;
+  color: white;
+  font:
+    600 13px/1.4 system-ui,
+    sans-serif;
+  cursor: pointer;
+}
+
+.ink-chat-panel button[type='button'] {
+  color: #123e40;
+  background: transparent;
+}
+
+.ink-chat-panel button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ink-chat-panel :focus-visible {
+  outline: 3px solid #a96c26;
+  outline-offset: 3px;
+}
