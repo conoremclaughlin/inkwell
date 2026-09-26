@@ -180,11 +180,19 @@ callbacks; these are UI contracts, not server API schemas or authorization.
 - Stop calls the local revoker synchronously, even during pending IO. It does not
   claim remote cancellation or undo effects already started.
 - An ambiguous send blocks resubmission until the adapter reconciles its exact
-  operation ID. Switching away and back does not clear that guard. This bounded
+  operation ID in the same account/workspace, thread and SB. Navigation, regrant,
+  page detach, or switching away and back does not clear that guard. This bounded
   in-memory tracking is **not durable idempotency**; the adapter must reconcile
   after a view reload and provide ordered, authenticated snapshots.
-- Draft typing and unchanged-history refreshes preserve transcript nodes and
-  selection. Destroy removes listeners, clears visible data and aborts local
+- Echoed local messages stay retired when the supplied history window slides;
+  they do not reappear below newer replies. Echo tracking shares the bounded
+  local-message buffer rather than accumulating an unbounded ID set.
+- Keyed transcript updates preserve unchanged rows/body nodes during appended
+  replies and status ticks, as well as draft typing and unchanged refreshes.
+  Text is only reassigned when changed; screen-reader behavior still needs native
+  acceptance testing. Switching views cannot revive the last locally stopped
+  read-session identity; a new read session remains distinct.
+- Destroy removes listeners, clears visible data and aborts local
   pending delivery, but is not a remote grant-revocation operation.
 
 Production entrypoints do not import this view yet. Pairing, thread-scoped API,

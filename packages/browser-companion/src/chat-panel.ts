@@ -100,6 +100,14 @@ const identity = (value: string) =>
   value.length > 0 && value.length <= CHAT_PANEL_LIMITS.identityChars;
 const clip = (value: string, limit: number) =>
   value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+// Delivery belongs to a conversation, not the page that happened to be attached.
+// Keep the full targetKey below for draft discard and in-flight callback fencing.
+const conversationKey = (state: ChatPanelViewState) =>
+  JSON.stringify([
+    state.conversation?.scopeId,
+    state.conversation?.threadKey,
+    state.conversation?.sbSlug,
+  ]);
 const targetKey = (state: ChatPanelViewState) => {
   const conversation = state.conversation;
   const binding = state.page?.binding;
@@ -189,7 +197,8 @@ function snapshot(state: ChatPanelViewState): ChatPanelViewState {
  * No network, capture, persistence, credentials, HTML/Markdown interpretation or retry.
  * Same-target updates preserve the draft; changing scope/thread/SB/page/controller discards it instead
  * of carrying potentially private text to another recipient. An unknown send locks
- * further sends to that target until an adapter update reconciles its operationId.
+ * further sends to that conversation until an adapter update reconciles its operationId,
+ * even after navigation, regrant or page detach changes the request binding.
  * This bounded in-memory guard survives view switches, not destroy/reload. The adapter
  * must retain/reconcile ambiguous deliveries durably; UI IDs do not ensure exactly-once.
  * Destroy removes this view, not remote work: the owner must also end page-read grants.
@@ -204,6 +213,9 @@ export function createChatPanel(
     const node = doc.createElement(tag);
     node.textContent = text;
     return node;
+  };
+  const setText = (node: HTMLElement, text: string) => {
+    if (node.textContent !== text) node.textContent = text;
   };
   const root = element('section');
   root.className = 'ink-chat-panel';
@@ -252,14 +264,19 @@ export function createChatPanel(
   type LocalMessage = Omit<ChatPanelMessage, 'status'> & {
     status: ChatDeliveryState | 'sending';
     draftRevision: number;
+    /** Sticky within this bounded local row: do not revive it after server-window eviction. */
+    echoed?: boolean;
   };
   let local: LocalMessage[] = [];
   const unresolved = new Map<string, string>();
   type Operation = { id: string; key: string; revision: number; abort: AbortController };
   let pending: Operation | undefined;
-  let renderedMessages: readonly (ChatPanelMessage | LocalMessage)[] = [];
+  const renderedRows = new Map<
+    string,
+    { row: HTMLLIElement; author: HTMLElement; body: HTMLPreElement; status: HTMLParagraphElement }
+  >();
 
-  const uncertain = () => unresolved.has(targetKey(state));
+  const uncertain = () => unresolved.has(conversationKey(state));
   const activeRead = () =>
     state.sharing.state === 'active' && state.sharing.sessionId !== stoppedReadSession
       ? state.sharing.sessionId
@@ -278,12 +295,15 @@ export function createChatPanel(
     if (destroyed) return;
     send.disabled = !canSend();
     stop.disabled = !pending && !activeRead();
-    count.textContent = `${composer.value.length}/${CHAT_PANEL_LIMITS.draftChars} characters`;
-    guard.textContent = uncertain()
-      ? 'Delivery is uncertain. No automatic retry. Check the thread to reconcile before sending again.'
-      : unresolved.size >= CHAT_PANEL_LIMITS.unresolvedTargets
-        ? 'Too many unresolved deliveries. Reconcile earlier sends before sending again.'
-        : '';
+    setText(count, `${composer.value.length}/${CHAT_PANEL_LIMITS.draftChars} characters`);
+    setText(
+      guard,
+      uncertain()
+        ? 'Delivery is uncertain. No automatic retry. Check the thread to reconcile before sending again.'
+        : unresolved.size >= CHAT_PANEL_LIMITS.unresolvedTargets
+          ? 'Too many unresolved deliveries. Reconcile earlier sends before sending again.'
+          : ''
+    );
     const busy = String(!!pending);
     if (log.getAttribute('aria-busy') !== busy) log.setAttribute('aria-busy', busy);
   }
@@ -291,54 +311,65 @@ export function createChatPanel(
   function render() {
     if (destroyed) return;
     renderControls();
-    heading.textContent = state.conversation ? `With ${state.conversation.sbName}` : 'Choose an SB';
-    thread.textContent = state.conversation
-      ? `Thread: ${state.conversation.threadKey}`
-      : 'No thread selected';
-    page.textContent = state.page
-      ? `Attached page: ${state.page.title}\n${state.page.url}`
-      : 'No page attached';
-    sharing.textContent = activeRead()
-      ? 'Page sharing active'
-      : state.sharing.state === 'expired'
-        ? 'Page sharing expired'
-        : state.sharing.state === 'active'
-          ? 'Page sharing stop requested'
-          : state.sharing.state === 'stopped'
-            ? 'Page sharing stopped locally'
-            : 'Page not shared';
-    connection.textContent = connectionLabels[state.connection];
+    setText(heading, state.conversation ? `With ${state.conversation.sbName}` : 'Choose an SB');
+    setText(
+      thread,
+      state.conversation ? `Thread: ${state.conversation.threadKey}` : 'No thread selected'
+    );
+    setText(
+      page,
+      state.page ? `Attached page: ${state.page.title}\n${state.page.url}` : 'No page attached'
+    );
+    setText(
+      sharing,
+      activeRead()
+        ? 'Page sharing active'
+        : state.sharing.state === 'expired'
+          ? 'Page sharing expired'
+          : state.sharing.state === 'active'
+            ? 'Page sharing stop requested'
+            : state.sharing.state === 'stopped'
+              ? 'Page sharing stopped locally'
+              : 'Page not shared'
+    );
+    setText(connection, connectionLabels[state.connection]);
     const suppliedIds = new Set(state.messages.map((message) => message.id));
-    const all = [...state.messages, ...local.filter((message) => !suppliedIds.has(message.id))];
+    const all = [
+      ...state.messages,
+      ...local.filter((message) => !message.echoed && !suppliedIds.has(message.id)),
+    ];
     const visible = all.slice(-CHAT_PANEL_LIMITS.messages);
-    if (
-      visible.length === renderedMessages.length &&
-      visible.every((message, index) => {
-        const previous = renderedMessages[index]!;
-        return (
-          message.id === previous.id &&
-          message.body === previous.body &&
-          message.author === previous.author &&
-          message.status === previous.status
-        );
-      })
-    )
-      return;
-    renderedMessages = visible;
-    messages.replaceChildren();
+    const visibleIds = new Set(visible.map((message) => message.id));
+    for (const [id, nodes] of renderedRows) {
+      if (visibleIds.has(id)) continue;
+      nodes.row.remove();
+      renderedRows.delete(id);
+    }
+    // Only insert, move or update the affected row. In particular, appending a
+    // reply or changing a status must not replace selected text/scroll containers.
+    let position = messages.firstElementChild;
     for (const message of visible) {
-      const row = element('li');
-      row.append(
-        element('strong', message.author),
-        element('pre', message.body),
-        element(
-          'p',
-          message.status === 'sending'
-            ? 'Sending — delivery unconfirmed'
-            : deliveryLabels[message.status]
-        )
+      let nodes = renderedRows.get(message.id);
+      if (!nodes) {
+        nodes = {
+          row: element('li'),
+          author: element('strong'),
+          body: element('pre'),
+          status: element('p'),
+        };
+        nodes.row.append(nodes.author, nodes.body, nodes.status);
+        renderedRows.set(message.id, nodes);
+      }
+      setText(nodes.author, message.author);
+      setText(nodes.body, message.body);
+      setText(
+        nodes.status,
+        message.status === 'sending'
+          ? 'Sending — delivery unconfirmed'
+          : deliveryLabels[message.status]
       );
-      messages.append(row);
+      if (nodes.row === position) position = position.nextElementSibling;
+      else messages.insertBefore(nodes.row, position);
     }
   }
 
@@ -346,7 +377,11 @@ export function createChatPanel(
     if (destroyed || pending !== operation) return;
     pending = undefined;
     const supplied = state.messages.find((message) => message.id === operation.id);
-    const verified = supplied && supplied.status !== 'unknown' ? supplied.status : status;
+    // The authoritative echo may already have slid out of the visible window.
+    const echoed = local.find((message) => message.id === operation.id && message.echoed);
+    const observed = supplied?.status ?? echoed?.status;
+    const verified =
+      observed && observed !== 'unknown' && observed !== 'sending' ? observed : status;
     if (verified === 'unknown') unresolved.set(operation.key, operation.id);
     else unresolved.delete(operation.key);
     local = local.map((message) =>
@@ -372,7 +407,7 @@ export function createChatPanel(
     if (!canSend() || !state.conversation) return;
     const operation: Operation = {
       id: crypto.randomUUID(),
-      key: targetKey(state),
+      key: conversationKey(state),
       revision,
       abort: new AbortController(),
     };
@@ -445,7 +480,7 @@ export function createChatPanel(
       local = [];
       composer.value = '';
       revision++;
-      stoppedReadSession = undefined;
+      // Stop is bound to its read-session identity, not the selected view.
       notice.textContent =
         'Conversation or page binding changed. Drafts are not carried to another target.';
       state = copy;
@@ -454,9 +489,9 @@ export function createChatPanel(
       state = copy;
     }
     const updates = new Map(state.messages.map((message) => [message.id, message.status]));
-    const unresolvedId = unresolved.get(targetKey(state));
+    const unresolvedId = unresolved.get(conversationKey(state));
     if (unresolvedId && updates.has(unresolvedId) && updates.get(unresolvedId) !== 'unknown')
-      unresolved.delete(targetKey(state));
+      unresolved.delete(conversationKey(state));
     local = local.map((message) => {
       const status = updates.get(message.id) ?? message.status;
       if (message.status === 'unknown' && status !== 'unknown' && status !== 'sending') {
@@ -466,7 +501,7 @@ export function createChatPanel(
           revision++;
         }
       }
-      return { ...message, status };
+      return { ...message, status, echoed: message.echoed || updates.has(message.id) };
     });
     render();
   }
@@ -477,7 +512,7 @@ export function createChatPanel(
     const operation = pending;
     pending = undefined;
     local = [];
-    renderedMessages = [];
+    renderedRows.clear();
     unresolved.clear();
     state = {
       conversation: null,

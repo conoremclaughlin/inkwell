@@ -495,7 +495,8 @@ describe('send receipts and draft fencing', () => {
       await Promise.resolve();
       expect(p.composer.value).toBe('New binding question');
       expect(p.rows()).toHaveLength(0);
-      expect(p.sendButton.disabled).toBe(false);
+      // A new page binding is not a new conversation; the old send is still ambiguous.
+      expect(p.sendButton.disabled).toBe(true);
     }
   );
 
@@ -704,4 +705,206 @@ describe('local Stop and cleanup', () => {
     ).toThrow('Conversation subscription failed.');
     expect(host.childElementCount).toBe(0);
   });
+});
+
+describe('review regressions: conversation receipts and keyed history', () => {
+  it.each(['navigation', 'grant', 'detach'] as const)(
+    'keeps uncertainty conversation-scoped after %s and reconciles on the new binding',
+    async (change) => {
+      const p = setup();
+      p.input('Uncertain original question');
+      p.submit();
+      const id = p.send.mock.calls[0]![0].operationId;
+      p.result.resolve({ status: 'unknown' });
+      await Promise.resolve();
+      expect(p.sendButton.disabled).toBe(true);
+      const next = view();
+      if (change === 'navigation') next.page!.binding.navigationId = 'synthetic-navigation-2';
+      if (change === 'grant') next.page!.binding.grantId = 'synthetic-grant-2';
+      if (change === 'detach') next.page = null;
+      p.panel.setState(next);
+      p.input('New binding draft');
+      p.submit();
+      expect(p.sendButton.disabled).toBe(true);
+      expect(p.send).toHaveBeenCalledTimes(1);
+      p.panel.setState({ ...next, messages: [message('unrelated-receipt', 'completed')] });
+      expect(p.sendButton.disabled).toBe(true);
+      p.panel.setState({ ...next, messages: [message(id, 'unknown')] });
+      expect(p.sendButton.disabled).toBe(true);
+      p.panel.setState({ ...next, messages: [message(id, 'stored')] });
+      expect(p.sendButton.disabled).toBe(false);
+      expect(p.composer.value).toBe('New binding draft');
+      expect(p.send).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('navigation churn cannot create many ambiguous sends to one conversation', async () => {
+    const p = setup();
+    p.send.mockResolvedValue({ status: 'unknown' });
+    for (let index = 0; index <= CHAT_PANEL_LIMITS.unresolvedTargets; index++) {
+      const next = view();
+      next.page!.binding.navigationId = `synthetic-navigation-${index}`;
+      p.panel.setState(next);
+      p.input('Question');
+      p.submit();
+      await Promise.resolve();
+    }
+    expect(p.send).toHaveBeenCalledTimes(1);
+    expect(p.host.textContent).toContain('Delivery is uncertain');
+    expect(p.host.textContent).not.toContain('Too many unresolved');
+    const other = view();
+    other.conversation!.threadKey = 'thread:synthetic-other';
+    p.panel.setState(other);
+    p.input('Other conversation question');
+    expect(p.sendButton.disabled).toBe(false);
+    p.submit();
+    expect(p.send).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['before', 'after'] as const)(
+    'never resurrects an echoed local row when its receipt arrives %s the history slides',
+    async (timing) => {
+      const p = setup();
+      p.input('Old question');
+      p.submit();
+      const id = p.send.mock.calls[0]![0].operationId;
+      if (timing === 'before') {
+        p.result.resolve({ status: 'stored' });
+        await Promise.resolve();
+      }
+      p.panel.setState(view({ messages: [message(id, 'completed', 'Old question')] }));
+      expect(p.rows()).toHaveLength(1);
+      const newer = Array.from({ length: CHAT_PANEL_LIMITS.messages }, (_, index) =>
+        message(`newer-${index}`, 'completed', `Newer ${index}`)
+      );
+      p.panel.setState(view({ messages: [message(id, 'completed', 'Old question'), ...newer] }));
+      expect(p.rows()).toHaveLength(CHAT_PANEL_LIMITS.messages);
+      expect(p.rows().at(-1)).toContain('Newer 99');
+      expect(p.host.textContent).not.toContain('Old question');
+      if (timing === 'after') {
+        // A lost direct acknowledgment cannot override an earlier authoritative echo.
+        p.result.resolve({ status: 'unknown' });
+        await Promise.resolve();
+      }
+      p.input('Next question');
+      expect(p.sendButton.disabled).toBe(false);
+      expect(p.host.textContent).not.toContain('Old question');
+      expect(p.rows().at(-1)).toContain('Newer 99');
+    }
+  );
+
+  it('keeps an unechoed local row visible until the adapter supplies it', async () => {
+    const p = setup();
+    p.input('Unobserved local question');
+    p.submit();
+    p.result.resolve({ status: 'stored' });
+    await Promise.resolve();
+    p.panel.setState(view({ messages: [message('reply', 'completed', 'Other message')] }));
+    expect(p.rows().at(-1)).toContain('Unobserved local question');
+  });
+
+  it('preserves selected text, row and body identity and scroll across append and status ticks', () => {
+    const first = message('first', 'stored', 'Selected answer');
+    const p = setup(view({ messages: [first] }));
+    const row = p.host.querySelector('li')!;
+    const body = row.querySelector('pre')!;
+    body.scrollTop = 37;
+    body.scrollLeft = 11;
+    const selection = document.getSelection()!;
+    selection.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(body);
+    selection.addRange(range);
+    expect(selection.toString()).toBe('Selected answer');
+    const observer = new MutationObserver(() => {});
+    observer.observe(body, { subtree: true, childList: true, characterData: true });
+    const reply = message('reply', 'completed', 'Appended reply');
+    p.panel.setState(view({ messages: [first, reply] }));
+    p.panel.setState(view({ messages: [{ ...first, status: 'completed' }, reply] }));
+    expect(p.host.querySelector('li')).toBe(row);
+    expect(row.querySelector('pre')).toBe(body);
+    expect(row.textContent).toContain('Completed');
+    expect(body.scrollTop).toBe(37);
+    expect(body.scrollLeft).toBe(11);
+    expect(selection.toString()).toBe('Selected answer');
+    expect(observer.takeRecords()).toHaveLength(0);
+    observer.disconnect();
+    selection.removeAllRanges();
+  });
+
+  it('preserves existing history while a local send is added, echoed and acknowledged', async () => {
+    const first = message('history', 'completed', 'Existing answer');
+    const p = setup(view({ messages: [first] }));
+    const historyRow = p.host.querySelector('li')!;
+    p.input('Question');
+    p.submit();
+    const id = p.send.mock.calls[0]![0].operationId;
+    const localRow = p.host.querySelector('li:last-child')!;
+    expect(p.host.querySelector('li')).toBe(historyRow);
+    p.panel.setState(view({ messages: [first, message(id, 'queued', 'Question')] }));
+    expect(p.host.querySelector('li:last-child')).toBe(localRow);
+    p.result.resolve({ status: 'stored' });
+    await Promise.resolve();
+    expect(p.host.querySelector('li')).toBe(historyRow);
+    expect(p.host.querySelector('li:last-child')).toBe(localRow);
+    expect(localRow.textContent).toContain('Queued');
+  });
+
+  it('removes only evicted rows and preserves adapter order on replacement and reorder', () => {
+    const a = message('a', 'stored', 'Alpha');
+    const b = message('b', 'stored', 'Beta');
+    const c = message('c', 'stored', 'Gamma');
+    const p = setup(view({ messages: [a, b] }));
+    const oldRows = [...p.host.querySelectorAll('li')];
+    p.panel.setState(view({ messages: [b, c] }));
+    expect(oldRows[0]!.isConnected).toBe(false);
+    expect(p.host.querySelector('li')).toBe(oldRows[1]);
+    const cRow = p.host.querySelector('li:last-child');
+    p.panel.setState(view({ messages: [c, { ...b, body: 'Updated Beta' }] }));
+    expect(p.host.querySelector('li')).toBe(cRow);
+    expect(p.host.querySelector('li:last-child')).toBe(oldRows[1]);
+    expect([...p.host.querySelectorAll('pre')].map((node) => node.textContent)).toEqual([
+      'Gamma',
+      'Updated Beta',
+    ]);
+  });
+
+  it('does not rewrite unchanged live-region text on typing or refresh', async () => {
+    const p = setup();
+    p.input('Question');
+    p.submit();
+    p.result.resolve({ status: 'unknown' });
+    await Promise.resolve();
+    expect(p.host.textContent).toContain('Delivery is uncertain');
+    const observer = new MutationObserver(() => {});
+    for (const node of p.host.querySelectorAll('[role="status"]'))
+      observer.observe(node, { childList: true, subtree: true, characterData: true });
+    p.input('Updated question');
+    p.panel.setState(view());
+    expect(observer.takeRecords()).toHaveLength(0);
+    observer.disconnect();
+  });
+
+  it.each(['thread', 'page'] as const)(
+    'cannot revive the same stopped read session after switching %s bindings',
+    (kind) => {
+      const p = setup();
+      p.stopButton.click();
+      expect(p.host.textContent).toContain('Page sharing stop requested');
+      const next = view();
+      if (kind === 'thread') next.conversation!.threadKey = 'thread:synthetic-other';
+      else next.page!.binding.navigationId = 'synthetic-new-navigation';
+      p.panel.setState(next);
+      expect(p.host.textContent).not.toContain('Page sharing active');
+      expect(p.stopButton.disabled).toBe(true);
+      p.panel.setState(view());
+      expect(p.host.textContent).not.toContain('Page sharing active');
+      p.panel.setState({
+        ...next,
+        sharing: { state: 'active', sessionId: 'synthetic-fresh-read' },
+      });
+      expect(p.host.textContent).toContain('Page sharing active');
+      expect(p.stopButton.disabled).toBe(false);
+    }
+  );
 });
