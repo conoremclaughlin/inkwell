@@ -1,4 +1,7 @@
-/** View-only contracts, not server wire formats or authorization decisions. */
+/** View-only contracts, not server wire formats or authorization decisions.
+ * Adapters must map server statuses to this closed set; unmapped values become
+ * unknown evidence, not an absent echo or proof of successful delivery.
+ */
 export type ChatDeliveryState =
   | 'stored'
   | 'queued'

@@ -178,6 +178,9 @@ callbacks; these are UI contracts, not server API schemas or authorization.
   not scanned to backfill rows removed by deduplication.
 - Storage, queueing, active execution, completion, rejection and uncertain
   delivery remain distinct. A successful HTTP request is not a read receipt.
+  Adapters must explicitly map server statuses to the closed `ChatDeliveryState`
+  set. Unmapped values count as `unknown` evidence, not an absent echo; repeating
+  an unmapped status cannot reconcile an uncertain send.
 - One send is pending at a time. Editing remains possible; an older receipt
   cannot erase a newer draft. Thread/account/SB/controller/grant/document changes
   fence late callbacks and discard drafts rather than carry them to a new target.
