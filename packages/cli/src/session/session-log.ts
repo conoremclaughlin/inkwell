@@ -57,9 +57,11 @@ export interface SessionLogOptions {
   /** Defaults to the synchronous JSONL file at `path`. */
   sink?: SessionLogSink;
   /**
-   * Live mirror for projection entries. The entry it receives IS the appended
-   * ledger entry, delivered only after its write succeeds; consumers must
-   * preserve the eid and never mint their own.
+   * Live mirror for projection entries, delivered only after the entry's write
+   * succeeds. From a synchronous sink it receives the appended ledger entry
+   * itself; from an asynchronous one, the record parsed back from the line
+   * that was written (see `mirror`). Consumers must preserve the eid and never
+   * mint their own.
    */
   onProjection?: (entry: Record<string, unknown>) => void;
 }
@@ -122,7 +124,8 @@ export class SessionLog {
    * behind it are not written. A silent gap in the log would be worse.
    *
    * Either way, a projection entry reaches the observer only once its own write
-   * has succeeded, so an observer never sees an event that replay will not.
+   * has succeeded, and as it was written, so an observer never sees an event
+   * that replay will not.
    */
   append(event: Record<string, unknown>): number {
     if (this.failure) throw this.failure.error;
@@ -140,11 +143,12 @@ export class SessionLog {
           if (this.failure) throw this.failure.error;
           return this.sink.write(line);
         }),
-        entry
+        entry,
+        line
       );
     } else {
       const written = this.sink.write(line);
-      if (isPromiseLike(written)) this.enqueue(Promise.resolve(written), entry);
+      if (isPromiseLike(written)) this.enqueue(Promise.resolve(written), entry, line);
       else this.mirror(entry);
     }
     return entry.eid as number;
@@ -167,10 +171,10 @@ export class SessionLog {
     await this.flush();
   }
 
-  private enqueue(write: Promise<void>, entry: Record<string, unknown>): void {
+  private enqueue(write: Promise<void>, entry: Record<string, unknown>, line: string): void {
     const settled: Promise<void> = write
       .then(
-        () => this.mirror(entry),
+        () => this.mirror(entry, line),
         (error: unknown) => {
           this.failure ??= { error };
         }
@@ -181,11 +185,20 @@ export class SessionLog {
     this.pending = settled;
   }
 
-  private mirror(entry: Record<string, unknown>): void {
+  /**
+   * Deliver a projection entry to the observer. `written` is the line an
+   * asynchronous write persisted. The entry is a shallow copy of the caller's
+   * event, so its nested values are still the caller's objects, and by the time
+   * that write settles the caller may have changed them. The observer gets the
+   * record parsed back from the line instead, which is what replay will read.
+   */
+  private mirror(entry: Record<string, unknown>, written?: string): void {
     if (!this.onProjection) return;
     if (typeof entry.type !== 'string' || !OBS_PROJECTION_TYPES.has(entry.type)) return;
     try {
-      this.onProjection(entry);
+      this.onProjection(
+        written === undefined ? entry : (JSON.parse(written) as Record<string, unknown>)
+      );
     } catch {
       // The live mirror must never break the ledger write path.
     }

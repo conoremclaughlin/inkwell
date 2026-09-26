@@ -236,6 +236,44 @@ describe('SessionLog — asynchronous sinks', () => {
     expect(observed).toEqual([1]);
   });
 
+  // The entry is built by a shallow spread, so its nested values are still the
+  // caller's objects. The line is serialized at append time; the mirror fires
+  // when the write settles, and by then the caller may have changed them.
+  it.each([
+    ['the first write, in flight', false],
+    ['a write queued behind another', true],
+  ])(
+    'mirrors the record as written, not as the caller later mutated it: %s',
+    async (_label, queued) => {
+      const { sink, calls } = controlledSink();
+      const observed: unknown[] = [];
+      const log = new SessionLog({
+        path: 'unused',
+        sink,
+        // Copy on receipt: what the observer saw when it was delivered.
+        onProjection: (e) => observed.push(JSON.parse(JSON.stringify(e))),
+      });
+
+      if (queued) log.append({ type: 'backend_turn' });
+      const args = { labels: ['at-append'] };
+      log.append({ type: 'local_tool_call', args });
+      args.labels.push('after-append');
+
+      calls[0]!.resolve();
+      if (queued) {
+        await drain();
+        calls[1]!.resolve();
+      }
+      await log.flush();
+
+      const projectedOnDisk = calls
+        .map((c) => JSON.parse(c.line) as Record<string, unknown>)
+        .filter((l) => l.type === 'local_tool_call');
+      expect(projectedOnDisk).toHaveLength(1);
+      expect(observed).toEqual(projectedOnDisk);
+    }
+  );
+
   it('a failed write stops the log: later appends throw, flush rejects, queued entries are dropped', async () => {
     const { sink, calls } = controlledSink();
     const observed: unknown[] = [];
