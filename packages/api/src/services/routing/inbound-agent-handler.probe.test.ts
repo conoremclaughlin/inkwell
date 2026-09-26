@@ -547,6 +547,7 @@ describe('reply admission, through session routing', () => {
       tables,
       repo,
       runner,
+      service,
       placed,
       ensureOverflowStudio,
       send: () =>
@@ -619,5 +620,74 @@ describe('reply admission, through session routing', () => {
     expect(r.placed.map((s) => s.studioId)).not.toContain('studio-old');
     expect(r.repo.create.mock.calls.some(([data]) => data.studioId === 'studio-old')).toBe(false);
     expect(r.placed.map((s) => s.id)).toEqual(['newer']);
+  });
+
+  it('a reply declined at dequeue waits for the turn already running in its fallback session', async () => {
+    // Lumen, PR #682 r2. The reply queues behind its authoring session's turn,
+    // which then ends that session. At dequeue its anchor is declined and it
+    // resolves to the newer session, which has a turn of its own running.
+    const r = rig();
+    const gates = new Map<string, () => void>();
+    const running = new Map<string, number>();
+    const peak = new Map<string, number>();
+    const entered: string[] = [];
+    vi.spyOn(
+      r.service as unknown as { processMessage: (...a: unknown[]) => Promise<unknown> },
+      'processMessage'
+    ).mockImplementation(async (request, session) => {
+      const { id } = session as Session;
+      const turn = `${id}:${(request as { content: string }).content}`;
+      entered.push(turn);
+      running.set(id, (running.get(id) ?? 0) + 1);
+      peak.set(id, Math.max(peak.get(id) ?? 0, running.get(id)!));
+      await new Promise<void>((resolve) => gates.set(turn, resolve));
+      running.set(id, running.get(id)! - 1);
+      return { success: true, sessionId: id, responses: [] };
+    });
+    const turnIn = (sessionId: string) =>
+      r.service.handleMessage({
+        userId: 'user-1',
+        sbSlug: 'wren',
+        channel: 'telegram',
+        conversationId: CHAT,
+        sender: { id: 'sender-1', name: 'Sender' },
+        content: 'existing turn',
+        metadata: { recipientSessionId: sessionId },
+      } as never);
+    const pendingQueues = (r.service as unknown as { pendingQueues: Map<string, unknown[]> })
+      .pendingQueues;
+
+    const olderTurn = turnIn('older');
+    await vi.waitFor(() => expect(gates.has('older:existing turn')).toBe(true));
+    const newerTurn = turnIn('newer');
+    await vi.waitFor(() => expect(gates.has('newer:existing turn')).toBe(true));
+    const reply = r.send();
+    await vi.waitFor(() => expect(pendingQueues.get('wren:older')).toHaveLength(1));
+
+    r.older.endedAt = new Date();
+    r.tables.sessions[0].ended_at = r.older.endedAt.toISOString();
+    r.tables.studios[0].status = 'closed';
+    gates.get('older:existing turn')!();
+    // Either the reply runs now, beside the newer session's turn, or it has
+    // moved to that session's queue.
+    await vi.waitFor(() =>
+      expect(
+        gates.has('newer:continue the work') || pendingQueues.get('wren:newer')?.length === 1
+      ).toBe(true)
+    );
+    expect(peak.get('newer')).toBe(1);
+    await olderTurn;
+
+    gates.get('newer:existing turn')!();
+    await vi.waitFor(() => expect(gates.has('newer:continue the work')).toBe(true));
+    gates.get('newer:continue the work')!();
+    await Promise.all([newerTurn, reply]);
+
+    expect(peak.get('newer')).toBe(1);
+    expect(entered).toEqual([
+      'older:existing turn',
+      'newer:existing turn',
+      'newer:continue the work',
+    ]);
   });
 });

@@ -1239,6 +1239,130 @@ describe('SessionService', () => {
       expect(dequeued).not.toBe(firstArrival);
     });
 
+    describe('a queued message that re-resolves to a different session', () => {
+      // Re-resolution at dequeue can choose a session other than the one the
+      // message queued behind: a reply's anchor declined because its session
+      // ended while the reply waited, or general reuse moving on. The lock it
+      // waited on serializes turns in the session it names, and in no other.
+      function rerouteRig() {
+        const sessions: Record<string, Session> = {
+          'session-a': createMockSession({ id: 'session-a', backendSessionId: 'backend-a' }),
+          'session-b': createMockSession({ id: 'session-b', backendSessionId: 'backend-b' }),
+        };
+        // 'moves' resolves to A on arrival and to B at dequeue.
+        let movesResolved = 0;
+        vi.spyOn(sessionService, 'getOrCreateSession').mockImplementation(
+          async (_userId, _sbSlug, options) => {
+            const target = options?.recipientSessionId;
+            if (target === 'moves')
+              return sessions[movesResolved++ === 0 ? 'session-a' : 'session-b'];
+            return sessions[target!];
+          }
+        );
+
+        // Every turn parks until its gate opens, and each backend's peak
+        // number of simultaneous turns is recorded.
+        const gates = new Map<string, () => void>();
+        const running = new Map<string, number>();
+        const peak = new Map<string, number>();
+        const started: string[] = [];
+        vi.mocked(mockClaudeRunner.run).mockImplementation(async (message: string, config) => {
+          const backend = (config as { backendSessionId: string }).backendSessionId;
+          const turn = /turn-\w+/.exec(message)![0];
+          started.push(turn);
+          running.set(backend, (running.get(backend) ?? 0) + 1);
+          peak.set(backend, Math.max(peak.get(backend) ?? 0, running.get(backend)!));
+          await new Promise<void>((resolve) => gates.set(turn, resolve));
+          running.set(backend, running.get(backend)! - 1);
+          return createMockClaudeResult({ backendSessionId: backend });
+        });
+
+        const internals = sessionService as unknown as {
+          pendingQueues: Map<string, unknown[]>;
+          processingLocks: Set<string>;
+        };
+        return {
+          gates,
+          peak,
+          started,
+          queued: (lockKey: string) => internals.pendingQueues.get(lockKey)?.length ?? 0,
+          locks: () => [...internals.processingLocks].sort(),
+          send: (recipientSessionId: string, turn: string) =>
+            sessionService.handleMessage(
+              createMockRequest({ content: turn, metadata: { recipientSessionId } })
+            ),
+        };
+      }
+
+      it("waits for the new session's running turn, and frees the old session's lock", async () => {
+        const { gates, peak, started, queued, locks, send } = rerouteRig();
+        const first = send('session-a', 'turn-a');
+        await vi.waitFor(() => expect(gates.has('turn-a')).toBe(true));
+        const running = send('session-b', 'turn-b');
+        await vi.waitFor(() => expect(gates.has('turn-b')).toBe(true));
+        const moved = send('moves', 'turn-moved');
+        await vi.waitFor(() => expect(queued('myra:session-a')).toBe(1));
+
+        gates.get('turn-a')!();
+        // Either it runs now, beside B's turn, or it has joined B's queue.
+        await vi.waitFor(() =>
+          expect(gates.has('turn-moved') || queued('myra:session-b') === 1).toBe(true)
+        );
+        expect(peak.get('backend-b')).toBe(1);
+        // A's lock is free, and A's first message settles without waiting on B.
+        await vi.waitFor(() => expect(locks()).toEqual(['myra:session-b']));
+        await first;
+
+        gates.get('turn-b')!();
+        await vi.waitFor(() => expect(gates.has('turn-moved')).toBe(true));
+        gates.get('turn-moved')!();
+        const [, movedResult] = await Promise.all([running, moved]);
+
+        expect(movedResult).toMatchObject({
+          success: true,
+          sessionId: 'session-b',
+          admitted: true,
+        });
+        expect(started).toEqual(['turn-a', 'turn-b', 'turn-moved']);
+        expect(peak.get('backend-b')).toBe(1);
+        expect(locks()).toEqual([]);
+      });
+
+      it("takes the new session's lock when it is idle, so the next message there queues", async () => {
+        const { gates, peak, started, queued, locks, send } = rerouteRig();
+        const first = send('session-a', 'turn-a');
+        await vi.waitFor(() => expect(gates.has('turn-a')).toBe(true));
+        const moved = send('moves', 'turn-moved');
+        await vi.waitFor(() => expect(queued('myra:session-a')).toBe(1));
+
+        gates.get('turn-a')!();
+        await vi.waitFor(() => expect(gates.has('turn-moved')).toBe(true));
+        // It runs under B's lock, and A's is free.
+        await vi.waitFor(() => expect(locks()).toEqual(['myra:session-b']));
+        await first;
+
+        const next = send('session-b', 'turn-next');
+        // Either it runs now, beside the moved turn, or it queues behind it.
+        await vi.waitFor(() =>
+          expect(gates.has('turn-next') || queued('myra:session-b') === 1).toBe(true)
+        );
+        expect(peak.get('backend-b')).toBe(1);
+
+        gates.get('turn-moved')!();
+        await vi.waitFor(() => expect(gates.has('turn-next')).toBe(true));
+        gates.get('turn-next')!();
+        const [movedResult] = await Promise.all([moved, next]);
+
+        expect(movedResult).toMatchObject({
+          success: true,
+          sessionId: 'session-b',
+          admitted: true,
+        });
+        expect(started).toEqual(['turn-a', 'turn-moved', 'turn-next']);
+        expect(locks()).toEqual([]);
+      });
+    });
+
     it('should queue heartbeat when telegram message is processing (race condition fix)', async () => {
       // This tests the exact bug scenario: telegram message and heartbeat arrive simultaneously
       // Both target the same agent (myra) and thus the same Claude session

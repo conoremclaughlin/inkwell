@@ -1410,10 +1410,20 @@ describe('turn-epoch candidate threading (round 9)', () => {
     const dequeueRoute = source.indexOf(
       'sessionRoutingOptions(pending.request, pending.turnEpochCandidate)'
     );
-    const dequeueRun = source.indexOf('pending.turnEpochCandidate\n        )');
+    // A dequeued message runs in runQueuedTurn, whether it stayed on its lock
+    // or moved to the lock of the session it re-resolved to.
+    const runner = source.indexOf('private async runQueuedTurn(');
+    const dequeueRun =
+      runner +
+      source
+        .slice(runner)
+        .search(
+          /this\.processMessage\(\s*pending\.request,\s*session,\s*pending\.turnEpochCandidate\s*\)/
+        );
     expect(queued).toBeGreaterThan(-1);
     expect(dequeueRoute).toBeGreaterThan(-1);
-    expect(dequeueRun).toBeGreaterThan(dequeueRoute);
+    expect(runner).toBeGreaterThan(dequeueRoute);
+    expect(dequeueRun).toBeGreaterThan(runner);
   });
 
   it('BOTH lease acquisitions in withStudioLease stamp the candidate', () => {

@@ -1489,44 +1489,114 @@ export class SessionService implements ISessionService {
         this.pendingQueues.delete(lockKey);
       }
 
+      let session: Session;
       try {
         // Get session again (may have changed). Same options as the direct
         // path, with the candidate minted at THIS message's handleMessage
         // entry — its pre-queue resolution already stamped leases with it.
-        const session = await this.getOrCreateSession(
+        session = await this.getOrCreateSession(
           pending.request.userId,
           pending.request.sbSlug,
           sessionRoutingOptions(pending.request, pending.turnEpochCandidate)
         );
-
-        const result = await this.processMessage(
-          pending.request,
-          session,
-          pending.turnEpochCandidate
-        );
-        // Same admission evidence as the direct path: resolution succeeded
-        // just above, so whatever the turn did, routing admitted it.
-        pending.resolve({ ...result, admitted: true });
-        // Flush on non-retryable success:false results (e.g. InkRunner session limit)
-        if (!result.success && result.error) {
-          this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
-        }
       } catch (error) {
-        pending.reject(error instanceof Error ? error : new Error(String(error)));
-        this.flushQueueOnNonRetryableError(
-          lockKey,
-          error instanceof Error ? error.message : String(error)
-        );
-      } finally {
-        // Continue processing queue (if not flushed above)
+        this.rejectQueuedTurn(lockKey, pending, error);
         await this.processQueueOrReleaseLock(lockKey);
+        return;
       }
+
+      // The lock this message waited on serializes turns in the session it
+      // names, and in no other. When re-resolution chose a different session
+      // (a reply whose anchor was declined because its session ended while it
+      // waited, or general reuse moving on), running it here would start a
+      // second turn beside one that session may already be running (Lumen,
+      // PR #682 r2). It moves to that session's lock instead, and nothing on
+      // this chain waits for it, so two queues handing messages to each other
+      // cannot deadlock.
+      const targetKey = `${pending.request.sbSlug}:${session.id}`;
+      if (targetKey !== lockKey) {
+        this.handOffQueuedTurn(lockKey, targetKey, pending, session);
+        await this.processQueueOrReleaseLock(lockKey);
+        return;
+      }
+
+      await this.runQueuedTurn(lockKey, pending, session);
     } else {
       // Queue empty, release lock
       this.processingLocks.delete(lockKey);
       this.pendingQueues.delete(lockKey);
       logger.debug('Released processing lock', { lockKey });
     }
+  }
+
+  /**
+   * Run a dequeued message under `lockKey`, which the caller holds, then
+   * continue that lock's queue.
+   */
+  private async runQueuedTurn(
+    lockKey: string,
+    pending: PendingMessage,
+    session: Session
+  ): Promise<void> {
+    try {
+      const result = await this.processMessage(
+        pending.request,
+        session,
+        pending.turnEpochCandidate
+      );
+      // Same admission evidence as the direct path: resolution succeeded
+      // before this turn ran, so whatever the turn did, routing admitted it.
+      pending.resolve({ ...result, admitted: true });
+      // Flush on non-retryable success:false results (e.g. InkRunner session limit)
+      if (!result.success && result.error) {
+        this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
+      }
+    } catch (error) {
+      this.rejectQueuedTurn(lockKey, pending, error);
+    } finally {
+      // Continue processing queue (if not flushed above)
+      await this.processQueueOrReleaseLock(lockKey);
+    }
+  }
+
+  private rejectQueuedTurn(lockKey: string, pending: PendingMessage, error: unknown): void {
+    pending.reject(error instanceof Error ? error : new Error(String(error)));
+    this.flushQueueOnNonRetryableError(
+      lockKey,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+
+  /**
+   * Move a dequeued message to the lock of the session it re-resolved to: to
+   * the back of that session's queue while a turn runs there, or straight into
+   * a turn of its own when the session is idle. The turn is not awaited.
+   */
+  private handOffQueuedTurn(
+    fromLockKey: string,
+    toLockKey: string,
+    pending: PendingMessage,
+    session: Session
+  ): void {
+    logger.info('Queued message re-resolved to another session; moving to its lock', {
+      fromLockKey,
+      toLockKey,
+      channel: pending.request.channel,
+    });
+    if (this.processingLocks.has(toLockKey)) {
+      const queue = this.pendingQueues.get(toLockKey) || [];
+      queue.push(pending);
+      this.pendingQueues.set(toLockKey, queue);
+      return;
+    }
+    this.processingLocks.add(toLockKey);
+    logger.debug('Acquired processing lock', { lockKey: toLockKey });
+    this.runQueuedTurn(toLockKey, pending, session).catch((error) => {
+      logger.error('Handed-off queued turn failed outside its own handling', {
+        lockKey: toLockKey,
+        error: serializeError(error),
+      });
+    });
   }
 
   /**
