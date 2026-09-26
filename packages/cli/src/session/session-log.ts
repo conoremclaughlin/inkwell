@@ -83,6 +83,8 @@ export class SessionLog {
   private readonly sink: SessionLogSink;
   private readonly onProjection?: (entry: Record<string, unknown>) => void;
   private lastEid = 0;
+  private appended = false;
+  private closed = false;
   /** Tail of the async write queue; undefined while nothing is in flight. */
   private pending: Promise<void> | undefined;
   /** The first async write failure. Once set, nothing more is written. */
@@ -95,11 +97,16 @@ export class SessionLog {
   }
 
   /**
-   * Continue the eid sequence from an existing log (reattach). Never lowers it:
-   * eids reference events across reattach (context_evict), so reusing one
-   * would make two events answer to the same reference.
+   * Continue the eid sequence from an existing log (reattach). Eids reference
+   * events across reattach (context_evict), so reusing one would make two
+   * events answer to the same reference. That is why a seed must come before
+   * the first append, which would already have taken an eid the existing log
+   * may hold, and why it never lowers the sequence.
    */
   seed(maxSeen: number): void {
+    if (this.appended) {
+      throw new Error(`session log seeded after its first append: ${this.path}`);
+    }
     if (maxSeen > this.lastEid) this.lastEid = maxSeen;
   }
 
@@ -119,6 +126,8 @@ export class SessionLog {
    */
   append(event: Record<string, unknown>): number {
     if (this.failure) throw this.failure.error;
+    if (this.closed) throw new Error(`session log closed: ${this.path}`);
+    this.appended = true;
     const eid = this.lastEid + 1;
     this.lastEid = eid;
     const entry: Record<string, unknown> = { ts: new Date().toISOString(), eid, ...event };
@@ -145,6 +154,17 @@ export class SessionLog {
   async flush(): Promise<void> {
     while (this.pending) await this.pending;
     if (this.failure) throw this.failure.error;
+  }
+
+  /**
+   * Stop accepting entries and drain what is queued. Affects this session's
+   * log only. Queued writes are finished rather than dropped: their eids were
+   * returned to callers when they were appended, and a caller may already
+   * have referenced one.
+   */
+  async close(): Promise<void> {
+    this.closed = true;
+    await this.flush();
   }
 
   private enqueue(write: Promise<void>, entry: Record<string, unknown>): void {

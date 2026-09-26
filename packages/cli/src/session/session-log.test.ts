@@ -126,9 +126,19 @@ describe('SessionLog — the ledger and its live mirror agree (spec:observer-att
     setup();
     const log = new SessionLog({ path: join(dir, 'session.jsonl') });
     log.seed(41);
-    expect(log.append({ type: 'user' })).toBe(42);
     log.seed(10);
-    expect(log.append({ type: 'user' })).toBe(43);
+    expect(log.append({ type: 'user' })).toBe(42);
+  });
+
+  it('a seed after the first append is refused: that append already took an eid the old log may hold', () => {
+    setup();
+    const path = join(dir, 'session.jsonl');
+    const log = new SessionLog({ path });
+    log.append({ type: 'user' });
+
+    expect(() => log.seed(41)).toThrow('seeded after its first append');
+    // Refused, not half-applied: the sequence carries on from the append.
+    expect(log.append({ type: 'user' })).toBe(2);
   });
 });
 
@@ -180,10 +190,11 @@ describe('SessionLog — two sessions in one process stay apart', () => {
     const b = new SessionLog({ path: join(dir, 'b.jsonl') });
 
     expect(a.append({ type: 'user' })).toBe(1);
-    expect(b.append({ type: 'user' })).toBe(1);
+    // b reattaches while a is already writing.
     b.seed(100);
     expect(a.append({ type: 'user' })).toBe(2);
     expect(b.append({ type: 'user' })).toBe(101);
+    expect(a.append({ type: 'user' })).toBe(3);
   });
 });
 
@@ -239,6 +250,52 @@ describe('SessionLog — asynchronous sinks', () => {
     expect(calls).toHaveLength(1);
     expect(observed).toEqual([]);
     expect(() => log.append({ type: 'user', content: 'after' })).toThrow('disk full');
+  });
+
+  it('a failed write nobody flushes raises no unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const { sink, calls } = controlledSink();
+      const log = new SessionLog({ path: 'unused', sink });
+      log.append({ type: 'user', content: 'fails' });
+      log.append({ type: 'user', content: 'queued behind it' });
+      calls[0]!.reject(new Error('disk full'));
+      // Unhandled rejections are reported after the microtask queue drains.
+      await drain();
+      await drain();
+      expect(unhandled).toEqual([]);
+      // The failure is still there for whoever asks.
+      expect(() => log.append({ type: 'user' })).toThrow('disk full');
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('close drains queued writes, then refuses new ones, and leaves other logs open', async () => {
+    const { sink, calls } = controlledSink();
+    const log = new SessionLog({ path: 'closing', sink });
+    const other = new SessionLog({ path: 'other', sink: { write: () => {} } });
+
+    log.append({ type: 'user', content: 'first' });
+    log.append({ type: 'user', content: 'second' });
+    let closed = false;
+    const closing = log.close().then(() => {
+      closed = true;
+    });
+
+    // Appends are refused as soon as close is called, not once it resolves.
+    expect(() => log.append({ type: 'user', content: 'late' })).toThrow('session log closed');
+    calls[0]!.resolve();
+    await drain();
+    expect(closed).toBe(false);
+    calls[1]!.resolve();
+    await closing;
+
+    // Both queued entries were written: their eids had already been handed out.
+    expect(calls.map((c) => JSON.parse(c.line).content)).toEqual(['first', 'second']);
+    expect(other.append({ type: 'user' })).toBe(1);
   });
 
   it('the async JSONL sink writes the same file the synchronous one does', async () => {
