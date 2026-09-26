@@ -708,6 +708,139 @@ describe('local Stop and cleanup', () => {
 });
 
 describe('review regressions: conversation receipts and keyed history', () => {
+  it('normalizes duplicate IDs to the last row and its position before rendering', () => {
+    const p = setup(
+      view({
+        messages: [
+          message('repeat', 'stored', 'Old body'),
+          message('middle', 'completed', 'Middle body'),
+          { ...message('repeat', 'unknown', 'Latest body'), author: 'Latest author' },
+        ],
+      })
+    );
+    expect(p.rows()).toHaveLength(2);
+    expect([...p.host.querySelectorAll('li pre')].map((node) => node.textContent)).toEqual([
+      'Middle body',
+      'Latest body',
+    ]);
+    expect(p.rows()[1]).toContain('Latest author');
+    expect(p.rows()[1]).toContain('Outcome unknown');
+    expect(p.host.textContent).not.toContain('Old body');
+    const rows = [...p.host.querySelectorAll('li')];
+    p.panel.setState(
+      view({
+        messages: [
+          message('repeat', 'unknown', 'Old body'),
+          message('middle', 'completed', 'Middle body'),
+          message('repeat', 'stored', 'Resolved body'),
+        ],
+      })
+    );
+    expect(p.host.querySelector('li')).toBe(rows[0]);
+    expect(p.host.querySelector('li:last-child')).toBe(rows[1]);
+    expect(p.rows()[1]).toContain('Resolved body');
+    expect(p.rows()[1]).toContain('Stored');
+  });
+
+  it('deduplicates within the bounded tail without backfilling older history', () => {
+    const older = Array.from({ length: CHAT_PANEL_LIMITS.messages }, (_, index) =>
+      message(`older-${index}`, 'completed')
+    );
+    const p = setup(
+      view({
+        messages: [
+          ...older,
+          message('repeat', 'stored', 'Old duplicate'),
+          message('middle', 'completed'),
+          message('repeat', 'unknown', 'New duplicate'),
+        ],
+      })
+    );
+    expect(p.rows()).toHaveLength(CHAT_PANEL_LIMITS.messages - 1);
+    expect(p.host.querySelector('li pre')?.textContent).toBe('older-3');
+    expect(p.host.querySelector('li:last-child pre')?.textContent).toBe('New duplicate');
+    expect(p.rows().at(-1)).toContain('Outcome unknown');
+  });
+
+  describe.each(['stored', 'unknown'] as const)('newest duplicate is %s', (status) => {
+    it.each(['navigation', 'grant', 'detach'] as const)(
+      'uses the same canonical row for the guard and rendering on %s',
+      (change) => {
+        const p = setup();
+        p.input('Question');
+        p.submit();
+        const id = p.send.mock.calls[0]![0].operationId;
+        p.panel.setState(view({ messages: [message(id, 'stored')] }));
+        const next = view({
+          messages: [
+            message(id, status === 'stored' ? 'unknown' : 'stored', 'Old body'),
+            message(id, status, 'Latest body'),
+          ],
+        });
+        if (change === 'navigation') next.page!.binding.navigationId = 'synthetic-navigation-2';
+        if (change === 'grant') next.page!.binding.grantId = 'synthetic-grant-2';
+        if (change === 'detach') next.page = null;
+        p.panel.setState(next);
+        p.input('Next question');
+        expect(p.sendButton.disabled).toBe(status === 'unknown');
+        expect(p.host.textContent?.includes('Delivery is uncertain')).toBe(status === 'unknown');
+        expect(p.rows()).toHaveLength(1);
+        expect(p.host.querySelector('li pre')?.textContent).toBe('Latest body');
+        expect(p.rows()[0]).toContain(status === 'unknown' ? 'Outcome unknown' : 'Stored');
+        expect(p.send).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    it.each(['stored', 'unknown'] as const)(
+      'uses the canonical echo rather than the later %s callback',
+      async (callback) => {
+        const p = setup();
+        p.input('Question');
+        p.submit();
+        const id = p.send.mock.calls[0]![0].operationId;
+        p.panel.setState(
+          view({
+            messages: [
+              message(id, status === 'stored' ? 'unknown' : 'stored', 'Old body'),
+              message(id, status, 'Latest body'),
+            ],
+          })
+        );
+        p.result.resolve({ status: callback });
+        await Promise.resolve();
+        expect(p.composer.value).toBe(status === 'unknown' ? 'Question' : '');
+        p.input('Next question');
+        expect(p.sendButton.disabled).toBe(status === 'unknown');
+        expect(p.host.textContent?.includes('Delivery is uncertain')).toBe(status === 'unknown');
+        expect(p.rows()).toHaveLength(1);
+        expect(p.rows()[0]).toContain(status === 'unknown' ? 'Outcome unknown' : 'Stored');
+        expect(p.send).toHaveBeenCalledTimes(1);
+      }
+    );
+  });
+
+  it.each(['visible', 'evicted'] as const)(
+    'does not treat a unique %s unknown echo as absent evidence on callback completion',
+    async (position) => {
+      const p = setup();
+      p.input('Question');
+      p.submit();
+      const id = p.send.mock.calls[0]![0].operationId;
+      p.panel.setState(view({ messages: [message(id, 'unknown')] }));
+      if (position === 'evicted') p.panel.setState(view());
+      p.result.resolve({ status: 'stored' });
+      await Promise.resolve();
+      expect(p.composer.value).toBe('Question');
+      p.input('Next question');
+      expect(p.sendButton.disabled).toBe(true);
+      p.submit();
+      expect(p.send).toHaveBeenCalledTimes(1);
+      p.panel.setState(view({ messages: [message(id, 'stored')] }));
+      expect(p.sendButton.disabled).toBe(false);
+      expect(p.composer.value).toBe('Next question');
+    }
+  );
+
   it.each(['navigation', 'grant', 'detach'] as const)(
     'locks when the %s snapshot itself changes a pending echo to unknown',
     async (change) => {

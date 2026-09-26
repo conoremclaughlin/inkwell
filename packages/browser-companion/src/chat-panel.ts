@@ -17,7 +17,7 @@ export interface ChatConversation {
 }
 
 export interface ChatPanelMessage {
-  /** Stable UI identity. Echo a send's operationId here to reconcile its local row. */
+  /** Stable identity within a conversation. Echo a send's operationId to reconcile its local row. */
   id: string;
   author: string;
   body: string;
@@ -40,7 +40,9 @@ export interface ChatPanelViewState {
   page: { title: string; url: string; binding: ChatPageBinding } | null;
   connection: ChatConnectionState;
   sharing: { state: 'active'; sessionId: string } | { state: 'off' | 'stopped' | 'expired' };
-  /** Oldest first, with statuses established by the adapter, not inferred from HTTP success. */
+  /** Oldest first, with adapter-established statuses. Within the bounded tail,
+   * duplicate IDs use their last occurrence's fields and position.
+   */
   messages: readonly ChatPanelMessage[];
 }
 
@@ -135,6 +137,19 @@ const receiptStatus = (receipt: unknown): ChatDeliveryState => {
 function snapshot(state: ChatPanelViewState): ChatPanelViewState {
   const conversation = state.conversation;
   const binding = state.page?.binding;
+  // One canonical row per identity for rendering AND receipt reconciliation.
+  // Bound work before deduplicating; do not backfill from discarded history.
+  const messages = new Map<string, ChatPanelMessage>();
+  for (const message of state.messages.slice(-CHAT_PANEL_LIMITS.messages)) {
+    if (!identity(message.id)) continue;
+    messages.delete(message.id);
+    messages.set(message.id, {
+      id: message.id,
+      author: clip(message.author, CHAT_PANEL_LIMITS.labelChars),
+      body: clip(message.body, CHAT_PANEL_LIMITS.messageChars),
+      status: receiptStatus(message),
+    });
+  }
   const pageValid =
     !state.page ||
     (binding &&
@@ -181,15 +196,7 @@ function snapshot(state: ChatPanelViewState): ChatPanelViewState {
           ? { state: 'active', sessionId: state.sharing.sessionId }
           : { state: 'expired' }
         : { state: state.sharing.state },
-    messages: state.messages
-      .slice(-CHAT_PANEL_LIMITS.messages)
-      .filter((message) => identity(message.id))
-      .map((message) => ({
-        id: message.id,
-        author: clip(message.author, CHAT_PANEL_LIMITS.labelChars),
-        body: clip(message.body, CHAT_PANEL_LIMITS.messageChars),
-        status: receiptStatus(message),
-      })),
+    messages: [...messages.values()],
   };
 }
 
@@ -373,18 +380,18 @@ export function createChatPanel(
     }
   }
 
-  /** Newest supplied echo first; retain evidence when it slides out of the window. */
-  function confirmedStatus(id: string, messages: readonly ChatPanelMessage[]) {
+  /** Unknown is observed evidence too; only an absent echo permits callback fallback. */
+  function observedStatus(id: string, messages: readonly ChatPanelMessage[]) {
     const observed =
       messages.find((message) => message.id === id)?.status ??
       local.find((message) => message.id === id && message.echoed)?.status;
-    return observed && observed !== 'unknown' && observed !== 'sending' ? observed : undefined;
+    return observed === 'sending' ? undefined : observed;
   }
 
   function finish(operation: Operation, status: ChatDeliveryState) {
     if (destroyed || pending !== operation) return;
     pending = undefined;
-    const verified = confirmedStatus(operation.id, state.messages) ?? status;
+    const verified = observedStatus(operation.id, state.messages) ?? status;
     if (verified === 'unknown') unresolved.set(operation.key, operation.id);
     else unresolved.delete(operation.key);
     local = local.map((message) =>
@@ -480,7 +487,8 @@ export function createChatPanel(
       const operation = pending;
       // Only the same conversation's newest snapshot can supersede retained evidence.
       const supplied = conversationKey(copy) === operation?.key ? copy.messages : [];
-      if (operation && !confirmedStatus(operation.id, supplied))
+      const observed = operation && observedStatus(operation.id, supplied);
+      if (operation && (observed === undefined || observed === 'unknown'))
         unresolved.set(operation.key, operation.id);
       pending = undefined;
       local = [];

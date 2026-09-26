@@ -172,6 +172,10 @@ callbacks; these are UI contracts, not server API schemas or authorization.
 
 - The selected SB, thread, attached page, sharing and connection states stay
   visible. Messages render as bounded plain text, never HTML or executable links.
+- Snapshot rows are oldest-first. Within the newest 100 supplied rows, duplicate
+  IDs use the last occurrence's complete fields and position. Rendering and
+  delivery reconciliation consume that same canonical snapshot; older history is
+  not scanned to backfill rows removed by deduplication.
 - Storage, queueing, active execution, completion, rejection and uncertain
   delivery remain distinct. A successful HTTP request is not a read receipt.
 - One send is pending at a time. Editing remains possible; an older receipt
@@ -186,6 +190,10 @@ callbacks; these are UI contracts, not server API schemas or authorization.
   after a view reload and provide ordered, authenticated snapshots.
 - While a send is pending, the newest same-conversation echo takes precedence
   over retained evidence, including in a snapshot that changes the page binding.
+  An observed `unknown` remains evidence, not an absent echo: it also overrides
+  an unversioned send callback, even after the row leaves the visible window.
+  Callback status is fallback only when there is no observed echo. A later
+  authoritative adapter snapshot can reconcile the guard without resubmitting.
   Once reconciled, a later `unknown` row does not automatically re-lock this view;
   the adapter must distinguish admission evidence from execution uncertainty and
   own durable retry gating independently of the rendered history window.
