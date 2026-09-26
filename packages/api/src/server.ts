@@ -1294,6 +1294,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // invisible. Wake dispatches tolerate it (the wake surfaces the
       // message and the next dispatch retries the stamp).
       let assignmentFailure: string | null = null;
+      // The session the durable participant stamp names after assignment (and
+      // any repair). Inline delivery is real only when this is the delivery
+      // session: under stamped-only polling a CLI sees a thread only through
+      // its own stamp (Lumen, #681 round 3).
+      let stampedSessionId: string | null = null;
       if (payload.threadId && routedSession.id) {
         try {
           const assignment = await assignThreadParticipant(dataComposer!.getClient(), {
@@ -1305,6 +1310,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           });
           if (!assignment.stampPersisted) {
             assignmentFailure = `participant stamp not persisted (boundVia=${assignment.boundVia})`;
+          } else {
+            stampedSessionId = assignment.sessionId;
           }
           if (assignment.rerouted) {
             // A concurrent dispatch (or an existing live binding) won — deliver
@@ -1340,14 +1347,20 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                 );
               }
             } else if (winner) {
+              // A CAS on the rejected winner, not a retarget (round 3): a
+              // stamp that moved while we validated belongs to whoever moved
+              // it. That newer winner is validated in turn — once; a second
+              // repair would be two writers repairing each other.
               const repaired = await assignThreadParticipant(dataComposer!.getClient(), {
                 threadId: payload.threadId,
                 sbId: resolvedIdentityId,
                 candidateSessionId: routedSession.id,
-                explicitAnchor: true,
+                explicitAnchor: false,
+                supersedeSessionId: winner.id,
                 source: 'trigger-handler',
               });
               if (repaired.stampPersisted && repaired.sessionId === routedSession.id) {
+                stampedSessionId = routedSession.id;
                 logger.warn(
                   '[Trigger] Repaired participant stamp — winner was outside the thread project repo',
                   {
@@ -1360,7 +1373,35 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                     studioId: routedSession.studioId ?? null,
                   }
                 );
+              } else if (repaired.rerouted && repaired.sessionId !== winner.id) {
+                stampedSessionId = repaired.sessionId;
+                const newer = await sessionService!.getSession(repaired.sessionId);
+                const newerAllowed = newer
+                  ? await sessionService!.sessionAllowedForThread(
+                      userId,
+                      resolvedIdentityId,
+                      payload.threadKey,
+                      newer
+                    )
+                  : false;
+                if (newer && newerAllowed) {
+                  deliverySession = newer;
+                  logger.info(
+                    '[Trigger] Repair lost to a newer compatible stamp — delivering there',
+                    {
+                      threadId: payload.threadId,
+                      threadKey: payload.threadKey,
+                      sessionId: newer.id,
+                      studioId: newer.studioId ?? null,
+                    }
+                  );
+                } else {
+                  assignmentFailure =
+                    `participant stamp moved to ${repaired.sessionId} during repair and that ` +
+                    `session is also outside the thread project repo`;
+                }
               } else {
+                if (repaired.stampPersisted) stampedSessionId = repaired.sessionId;
                 assignmentFailure =
                   `participant stamp names a session outside the thread project repo ` +
                   `and could not be repaired (boundVia=${repaired.boundVia})`;
@@ -1469,6 +1510,32 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const delivery = decideDelivery({ forceSpawn, pollRow, attachedRow });
 
       if (delivery.mode === 'inline') {
+        // Stamped-only polling: the CLI on the delivery session sees this
+        // thread only if the durable stamp names that session. Reporting
+        // "delivered inline" on any other stamp is a lie the sender cannot
+        // detect, so a thread-bearing inline delivery requires a landed,
+        // compatible stamp — otherwise fail visibly and let the retry
+        // scheduler and the failure notice do their jobs (Lumen, #681 r3).
+        if (payload.threadId && stampedSessionId !== deliverySession.id) {
+          logger.error(
+            '[Trigger] Inline delivery refused — participant stamp names another session',
+            {
+              targetSlug,
+              threadKey: payload.threadKey,
+              threadId: payload.threadId,
+              deliverySessionId: deliverySession.id,
+              stampedSessionId,
+              assignmentFailure,
+            }
+          );
+          const refused = new Error(
+            `inline delivery for ${targetSlug} refused: the participant stamp names ` +
+              `${stampedSessionId ?? 'no session'}, not the delivery session ${deliverySession.id}` +
+              (assignmentFailure ? ` (${assignmentFailure})` : '')
+          ) as Error & { code?: string };
+          refused.code = 'INLINE_STAMP_MISMATCH';
+          throw refused;
+        }
         // Terminal for inline: the delivery decision is made and the channel
         // plugin owns it from here — no admission remains that could refuse.
         await clearHoldAtTerminal();
@@ -1531,6 +1598,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // Nothing is spawned: the throw exits the handler before handleMessage.
         throw err;
       }
+
+      // An inline refusal is a delivery decision, not a resolution failure:
+      // spawning would put a second process on a live CLI session, the very
+      // thing the inline path exists to avoid. Surface it.
+      if ((err as { code?: string })?.code === 'INLINE_STAMP_MISMATCH') throw err;
 
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {

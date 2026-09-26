@@ -266,6 +266,7 @@ function makeWorld() {
     }
   );
 
+  const logInkmail = vi.fn(async () => undefined);
   const handler = makeTriggerHandler({
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     dataComposer: { getClient: () => supabase },
@@ -282,7 +283,7 @@ function makeWorld() {
       recipientSbId: SB_ID,
       threadWorkspaceId: 'ws-probe',
     })),
-    logInkmail: vi.fn(async () => undefined),
+    logInkmail,
     loadThreadDescriptor: vi.fn(async () => null),
     formatThreadDescriptorLines: vi.fn(() => [] as string[]),
     assignThreadParticipant: assignment,
@@ -319,7 +320,27 @@ function makeWorld() {
     (handleMessage.mock.calls[0]?.[0] as { metadata: Record<string, unknown> } | undefined)
       ?.metadata;
 
-  return { tables, repository, assignment, handleMessage, trigger, stamp, admitted, requested };
+  /** A live CLI session of this agent on the thread, in the project studio: routing reuses it as the candidate, and delivery to it is inline. */
+  const addCorrectCli = () =>
+    tables.sessions.push({
+      ...tables.sessions[0],
+      id: 'correct-cli',
+      studio_id: 'studio-correct',
+      cli_poll_at: new Date().toISOString(),
+    });
+
+  return {
+    tables,
+    repository,
+    assignment,
+    handleMessage,
+    logInkmail,
+    trigger,
+    stamp,
+    admitted,
+    requested,
+    addCorrectCli,
+  };
 }
 
 describe('thread assignment cannot undo project-safe placement (Lumen, #681 round 2)', () => {
@@ -345,11 +366,16 @@ describe('thread assignment cannot undo project-safe placement (Lumen, #681 roun
       expect.anything(),
       expect.objectContaining({ candidateSessionId: candidate.id, explicitAnchor: false })
     );
-    // … and the handler repaired it: the stamp now names the candidate.
+    // … and the handler repaired it as a CAS on the rejected winner (round 3:
+    // never a retarget): the stamp now names the candidate.
     expect(w.assignment).toHaveBeenNthCalledWith(
       2,
       expect.anything(),
-      expect.objectContaining({ candidateSessionId: candidate.id, explicitAnchor: true })
+      expect.objectContaining({
+        candidateSessionId: candidate.id,
+        explicitAnchor: false,
+        supersedeSessionId: 'old-session',
+      })
     );
     expect(w.stamp()).toBe(candidate.id);
 
@@ -387,5 +413,98 @@ describe('thread assignment cannot undo project-safe placement (Lumen, #681 roun
     expect(w.assignment).toHaveBeenCalledTimes(1);
     expect(w.stamp()).toBe('old-session');
     expect(w.requested()?.recipientSessionId).toBe('old-session');
+  });
+});
+
+describe('repair is a CAS, and inline delivery needs the stamp (Lumen, #681 round 3)', () => {
+  beforeEach(() => {
+    resetActiveRuns();
+    resetPendingFinalizations();
+  });
+
+  it('does not overwrite a concurrent valid stamp while repairing a rejected winner', async () => {
+    const w = makeWorld();
+    let injected = false;
+    w.assignment.mockImplementation(async (client, params) => {
+      if (params.supersedeSessionId) {
+        // An independent dispatch lands between the winner's rejection and
+        // this repair, stamping a session that IS in the project repo.
+        injected = true;
+        w.tables.sessions.push({
+          ...w.tables.sessions[0],
+          id: 'concurrent-session',
+          studio_id: 'studio-correct',
+        });
+        w.tables.inbox_thread_participants[0].session_id = 'concurrent-session';
+      }
+      return assignThreadParticipant(client, params);
+    });
+
+    const error = await w.trigger();
+    expect(error).toBeNull();
+    expect(injected).toBe(true);
+    // The newer stamp survives, and delivery follows it — the repair was a
+    // CAS on the rejected winner, never a retarget.
+    expect(w.stamp()).toBe('concurrent-session');
+    expect(w.requested()?.recipientSessionId).toBe('concurrent-session');
+  });
+
+  it('fails visibly instead of reporting inline delivery when the repair write does not land', async () => {
+    const w = makeWorld();
+    w.addCorrectCli();
+    let writeFaulted = false;
+    w.assignment.mockImplementation(async (client, params) => {
+      if (!params.supersedeSessionId) return assignThreadParticipant(client, params);
+      const faulty = {
+        from(table: string) {
+          const delegate = client.from(table);
+          if (table !== 'inbox_thread_participants') return delegate;
+          return {
+            ...delegate,
+            update() {
+              writeFaulted = true;
+              const q = {
+                eq: () => q,
+                select: async () => ({ data: null, error: { message: 'synthetic write fault' } }),
+              };
+              return q;
+            },
+          };
+        },
+      };
+      return assignThreadParticipant(faulty as never, params);
+    });
+
+    const error = await w.trigger();
+    expect(writeFaulted).toBe(true);
+    expect(w.stamp()).toBe('old-session');
+    // Stamped-only polling: the correct CLI cannot see a thread stamped to
+    // another session, so "delivered inline" would be a lie. The handler
+    // refuses, loudly, and nothing claims success.
+    expect(error).not.toBeNull();
+    expect(String((error as Error).message)).toMatch(/stamp/);
+    expect(w.handleMessage).not.toHaveBeenCalled();
+    expect(w.logInkmail).not.toHaveBeenCalledWith(
+      'inkmail_deliver',
+      expect.anything(),
+      expect.anything(),
+      expect.anything()
+    );
+  });
+
+  it('control: inline delivery proceeds when the repair lands on the CLI session', async () => {
+    const w = makeWorld();
+    w.addCorrectCli();
+    const error = await w.trigger();
+    expect(error).toBeNull();
+    expect(w.stamp()).toBe('correct-cli');
+    // Inline: the channel plugin owns delivery, no spawn.
+    expect(w.handleMessage).not.toHaveBeenCalled();
+    expect(w.logInkmail).toHaveBeenCalledWith(
+      'inkmail_deliver',
+      expect.anything(),
+      USER,
+      expect.objectContaining({ sessionId: 'correct-cli' })
+    );
   });
 });
