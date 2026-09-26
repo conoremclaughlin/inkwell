@@ -1,16 +1,18 @@
 'use client';
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { MessagesSquare } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
+import { getSelectedWorkspaceId, subscribeSelectedWorkspace } from '@/lib/workspace-selection';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useReadCursors } from '@/components/threads/read-cursors';
 import { ThreadConversation } from '@/components/threads/thread-conversation';
 import { ThreadDetails } from '@/components/threads/thread-details';
 import { ThreadList } from '@/components/threads/thread-list';
-import { nameLookup } from '@/components/threads/to-conversation';
-import type { ThreadsResponse } from '@/components/threads/thread-types';
+import type { ThreadsResponse } from '@inklabs/shared/stories/threads-api';
+import { isConversation } from '@inklabs/shared/stories/thread-browsing';
+import { nameLookup } from '@inklabs/shared/stories/thread-viewing';
 
 const DETAILS_STORAGE_KEY = 'ink.threads.details-open';
 /** Wide enough for list, conversation, and details side by side (Tailwind's xl). */
@@ -87,10 +89,17 @@ function ThreadsChat() {
   const spines = useMemo(() => data?.spines ?? [], [data]);
   // The list is conversations. A key only a session, studio or task group
   // references has nothing to read yet; it stays reachable by link.
-  const threads = useMemo(() => spines.filter((spine) => spine.thread !== null), [spines]);
+  const threads = useMemo(() => spines.filter(isConversation), [spines]);
   const selected = useMemo(
     () => spines.find((spine) => spine.key === selectedKey) ?? null,
     [spines, selectedKey]
+  );
+  // The same key can be another thread in another workspace, so an open
+  // conversation belongs to one workspace and starts over on a switch.
+  const workspaceId = useSyncExternalStore(
+    subscribeSelectedWorkspace,
+    getSelectedWorkspaceId,
+    () => null
   );
 
   const select = useCallback(
@@ -157,7 +166,8 @@ function ThreadsChat() {
       >
         {selected ? (
           <ThreadConversation
-            key={selected.key}
+            key={JSON.stringify([workspaceId, selected.key])}
+            workspaceId={workspaceId}
             spine={selected}
             nameFor={nameFor}
             cursors={cursors}
@@ -181,14 +191,19 @@ function ThreadsChat() {
 
       {selected && detailsOpen && detailsAsColumn && (
         <aside className="flex w-[340px] shrink-0 flex-col border-l">
-          <ThreadDetails spine={selected} nameFor={nameFor} onClose={() => setDetailsOpen(false)} />
+          <ThreadDetails
+            spine={selected}
+            workspaceId={workspaceId}
+            nameFor={nameFor}
+            onClose={() => setDetailsOpen(false)}
+          />
         </aside>
       )}
       {selected && !detailsAsColumn && (
         <Sheet open={detailsOpen} onOpenChange={setDetailsOpen}>
           <SheetContent side="right" className="flex w-full max-w-sm flex-col p-0 sm:max-w-sm">
             <SheetTitle className="sr-only">Thread details</SheetTitle>
-            <ThreadDetails spine={selected} nameFor={nameFor} />
+            <ThreadDetails spine={selected} workspaceId={workspaceId} nameFor={nameFor} />
           </SheetContent>
         </Sheet>
       )}

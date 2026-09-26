@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createReadCursorStore } from './read-cursors';
-import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
+import type { ThreadMessagesResponse, ThreadSpine } from '@inklabs/shared/stories/threads-api';
 
 const fake = vi.hoisted(() => ({
   page: undefined as unknown,
@@ -19,7 +19,7 @@ const fake = vi.hoisted(() => ({
   updated: 1,
 }));
 vi.mock('@/lib/api', () => ({
-  useApiQuery: () => ({
+  useWorkspaceApiQuery: () => ({
     data: fake.page,
     dataUpdatedAt: fake.updated,
     isLoading: fake.page === undefined,
@@ -101,6 +101,7 @@ function mount(cursorAt: string) {
   const ui = () => (
     <ThreadConversation
       spine={spine}
+      workspaceId={null}
       nameFor={(s) => s}
       cursors={cursors}
       onBack={() => {}}

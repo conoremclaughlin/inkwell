@@ -308,6 +308,8 @@ Within the Inkwell repo, the project prefix is optional — `pr:389` is unambigu
 
 The project goes in the **prefix slot, never the identifier**: `inktrade:pr:42`, not `pr:inktrade-42` or `pr:inktrade-supabase-auth`. Baking the project into the identifier defeats pattern matching and prefix-based routing.
 
+**The prefix decides the repository.** A project-prefixed thread is placed in the project's `repo_root` (`save_project(name, repoRoot: "/absolute/path")`), whatever repo the sender happens to be in; the sender's repo is not consulted. A registered project with no `repo_root` holds the message with a reason that names the fix. On 2026-09-24 an `inktrade:pr:1` review was routed by the sender's repo and checked out inkwell's PR #1 instead — that path no longer exists.
+
 Each repo's AGENTS.md should carry this threadKey section so agents working there natively derive project-prefixed keys.
 
 ### Sender Rules
@@ -560,7 +562,7 @@ supabase/migrations/YYYYMMDDHHmmss_short_description.sql
 
    Never use manual numeric prefixes (`001_`, `002_`). Timestamps prevent branch conflicts — two agents can create migrations independently and they merge cleanly as long as the SQL doesn't conflict.
 
-3. **Apply with `yarn db:migrate supabase/migrations/<file>`** from the checkout that holds the file: any worktree, any order, before or after other branches merge. It runs the file and its ledger row in one transaction against the local stack, under the file's own version; `yarn db:migrate:status` shows what is pending. Do not apply through the MCP `apply_migration` tool (it records the apply time as the version, and the ledger drifts) or `supabase migration up` / `db push` from a branch (they refuse while another branch's applied migration has no file in your checkout). Never `supabase db reset` on the shared local stack. The ledger, the from-scratch order check, and the incident this came from are in `supabase/migrations/README.md`.
+3. **Apply with `yarn db:migrate supabase/migrations/<file>`** from the checkout that holds the file: any worktree, any order, before or after other branches merge. It runs the file and its ledger row in one transaction against the local stack, under the file's own version; `yarn db:migrate:status` shows what is pending. `yarn dev` and `yarn prod:direct` apply whatever is pending from the main checkout before the servers start, in version order, and refuse to start if a file fails (`yarn dev:no-migrations` skips that on purpose). A stop-the-world migration carries `-- db-migrate: window <runbook>` in its first ten lines: startup refuses to auto-apply it and names the runbook, and the operator applies it inside the window with `yarn db:migrate --window <file>`. Do not apply through the MCP `apply_migration` tool (it records the apply time as the version, and the ledger drifts) or `supabase migration up` / `db push` from a branch (they refuse while another branch's applied migration has no file in your checkout). Never `supabase db reset` on the shared local stack. The ledger, the from-scratch order check, and the incident this came from are in `supabase/migrations/README.md`.
 
 4. **After applying, regenerate types:**
    - MCP tool: `mcp__supabase__generate_typescript_types`

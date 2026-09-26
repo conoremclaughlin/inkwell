@@ -1,13 +1,22 @@
 import { memo } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
+import {
+  displayTitle,
+  liveAgentsOf,
+  previewLine,
+  spineStatus,
+} from '@inklabs/shared/stories/thread-browsing';
 import type { ThreadSpine } from '../lib/types';
 import { agentColor, colors, spacing, type } from '../ui/theme';
 
+/** The app shows SBs by slug; it loads no identities to name them otherwise. */
+const nameFor = (sbSlug: string) => sbSlug;
+
 /**
- * One thread in the list. The row answers three glance-questions: what is
- * this (key + title + summary), who's in it (participant dots), and is
- * anything HAPPENING right now (live pulse) — that last one is the whole
- * point of following along from a phone.
+ * One thread in the list, read like a chat app's: what it is (title, or the
+ * key when it has none), what was said last and by whom, and whether anyone
+ * is working on it RIGHT NOW. That last one is the whole point of following
+ * along from a phone.
  *
  * Memoised, because the list polls every 20s and re-rendering every row on
  * each poll is what produced RN's "large list is slow to update" warning
@@ -22,7 +31,6 @@ import { agentColor, colors, spacing, type } from '../ui/theme';
  * row only when its label actually changes — so a row sitting at "3h"
  * re-renders once an hour instead of every tick.
  */
-
 export const ThreadRow = memo(function ThreadRow({
   spine,
   timeLabel,
@@ -32,11 +40,14 @@ export const ThreadRow = memo(function ThreadRow({
   timeLabel: string;
   onPress: (spine: ThreadSpine) => void;
 }) {
-  // Presence is the server's verdict (isSessionLive), not a lifecycle check
-  // repeated here. A client-side `lifecycle === 'running'` test marked ~50
-  // threads as "wren live" for sessions abandoned as long ago as March.
-  const live = spine.sessions.filter((s) => s.live);
-  const closed = spine.thread?.status === 'closed' || !!spine.thread?.closedAt;
+  // Presence is the server's verdict (isSessionLive), shared with the web
+  // list. A client-side `lifecycle === 'running'` test marked ~50 threads as
+  // "wren live" for sessions abandoned as long ago as March.
+  const live = liveAgentsOf(spine);
+  const closed = spineStatus(spine) === 'closed';
+  const title = displayTitle(spine);
+  const lastMessage = spine.thread?.lastMessage;
+  const preview = lastMessage ? previewLine(lastMessage, nameFor) : null;
   const participants = spine.participants.slice(0, 5);
 
   return (
@@ -44,35 +55,36 @@ export const ThreadRow = memo(function ThreadRow({
       onPress={() => onPress(spine)}
       style={({ pressed }) => [styles.row, pressed && { backgroundColor: colors.surface }]}
       accessibilityRole="button"
-      accessibilityLabel={`Thread ${spine.key}`}
+      accessibilityLabel={`Thread ${title ?? spine.key}`}
     >
       <View style={styles.topLine}>
-        <Text style={[styles.key, closed && styles.closedText]} numberOfLines={1}>
-          {spine.key}
+        <Text style={[styles.title, closed && styles.closedText]} numberOfLines={1}>
+          {title ?? spine.key}
         </Text>
         <Text style={styles.time}>{timeLabel}</Text>
       </View>
 
-      {spine.thread?.title ? (
-        <Text style={[styles.title, closed && styles.closedText]} numberOfLines={2}>
-          {spine.thread.title}
+      {preview ? (
+        <Text style={[styles.preview, closed && styles.closedText]} numberOfLines={2}>
+          <Text style={[styles.previewSender, closed && styles.closedText]}>
+            {preview.sender}:{' '}
+          </Text>
+          {preview.text}
         </Text>
-      ) : null}
-
-      {spine.thread?.summary ? (
-        <Text style={[styles.summary, closed && styles.closedText]} numberOfLines={2}>
+      ) : spine.thread?.summary ? (
+        <Text style={[styles.preview, closed && styles.closedText]} numberOfLines={2}>
           {spine.thread.summary}
         </Text>
       ) : null}
 
       <View style={styles.bottomLine}>
-        <View style={styles.dots}>
+        <View style={styles.meta}>
           {participants.map((p) => (
             <View key={p} style={[styles.dot, { backgroundColor: agentColor(p) }]} />
           ))}
-          {participants.length > 0 ? (
-            <Text style={styles.participants} numberOfLines={1}>
-              {participants.join(' · ')}
+          {title ? (
+            <Text style={styles.key} numberOfLines={1}>
+              {spine.key}
             </Text>
           ) : null}
         </View>
@@ -80,7 +92,7 @@ export const ThreadRow = memo(function ThreadRow({
           <View style={styles.liveBadge}>
             <View style={styles.liveDot} />
             <Text style={styles.liveText}>
-              {live.length === 1 ? `${live[0].sbSlug ?? 'agent'} live` : `${live.length} live`}
+              {live.length === 1 ? `${live[0]} live` : `${live.length} live`}
             </Text>
           </View>
         ) : closed ? (
@@ -100,19 +112,19 @@ const styles = StyleSheet.create({
     gap: spacing.xs,
   },
   topLine: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  key: { ...type.title, color: colors.textPrimary, flex: 1 },
+  title: { ...type.title, fontSize: 16, color: colors.textPrimary, flex: 1 },
   time: { ...type.caption, color: colors.textMuted },
-  title: { ...type.body, color: colors.textSecondary },
-  summary: { ...type.caption, color: colors.textMuted },
+  preview: { ...type.body, fontSize: 14, color: colors.textSecondary, lineHeight: 19 },
+  previewSender: { color: colors.textPrimary, fontWeight: '600' },
   bottomLine: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: spacing.sm,
   },
-  dots: { flexDirection: 'row', alignItems: 'center', gap: 5, flexShrink: 1 },
+  meta: { flexDirection: 'row', alignItems: 'center', gap: 5, flexShrink: 1 },
   dot: { width: 7, height: 7, borderRadius: 4 },
-  participants: { ...type.caption, color: colors.textMuted, marginLeft: 3 },
+  key: { ...type.mono, fontSize: 11, color: colors.textMuted, marginLeft: 3, flexShrink: 1 },
   liveBadge: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   liveDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: colors.positive },
   liveText: { ...type.label, color: colors.positive },

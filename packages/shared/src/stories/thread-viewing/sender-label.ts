@@ -7,7 +7,8 @@
  * message reads "You"; another person's message carries their name.
  */
 export interface SenderLike {
-  senderKind?: 'sb' | 'user' | 'system' | string | null;
+  /** 'sb', 'user' or 'system'; any other value reads as an SB's slug. */
+  senderKind?: string | null;
   senderSlug?: string | null;
   senderName?: string | null;
   isOwn?: boolean | null;

@@ -21,11 +21,11 @@
  * answering again. Dropping either would leave a hole nothing could find later
  * (Lumen, #670 round 2).
  *
- * Pure: the component runs the fetches and feeds the pages back in.
+ * Pure: useThreadHistory runs the fetches and feeds the pages back in.
  */
 
-import { compareInstants } from '@/components/conversation/instant';
-import type { ThreadMessage, ThreadMessagesResponse } from './thread-types';
+import { compareInstants } from '../threads-api/index.js';
+import type { ThreadMessage, ThreadMessagesResponse } from '../threads-api/index.js';
 
 /** Older pages fetched on open, toward the read cursor, before the thread shows. */
 export const MAX_CATCH_UP_PAGES = 5;

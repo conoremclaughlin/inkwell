@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { durationLabel, relativeTime, senderName, shortPhase, toolCallLabel } from './format';
+import { durationLabel, relativeTime, shortPhase, toolCallLabel } from './format';
 
 const NOW = Date.parse('2026-08-31T20:00:00Z');
 
@@ -19,67 +19,6 @@ describe('relativeTime', () => {
   });
 });
 
-describe('senderName', () => {
-  // Two people on one thread, as each of them sees it: "You" is the
-  // viewer's own message only, and the other person keeps their name.
-  const fromA = { senderKind: 'user', senderSlug: null, senderName: 'Conor', isOwn: true };
-  const fromB = { senderKind: 'user', senderSlug: null, senderName: 'second', isOwn: false };
-
-  it('the viewer reads their own message as "You" and the other person by name', () => {
-    expect(senderName(fromA)).toEqual({ name: 'You', isOwn: true });
-    expect(senderName(fromB)).toEqual({ name: 'second', isOwn: false });
-  });
-
-  it('the same two messages read the other way round to the other person', () => {
-    expect(senderName({ ...fromA, isOwn: false })).toEqual({ name: 'Conor', isOwn: false });
-    expect(senderName({ ...fromB, isOwn: true })).toEqual({ name: 'You', isOwn: true });
-  });
-
-  it('names an SB by its slug and the system as system, neither ever own', () => {
-    expect(
-      senderName({ senderKind: 'sb', senderSlug: 'wren', senderName: 'wren', isOwn: false })
-    ).toEqual({
-      name: 'wren',
-      isOwn: false,
-    });
-    expect(
-      senderName({ senderKind: 'system', senderSlug: null, senderName: 'system', isOwn: false })
-    ).toEqual({
-      name: 'system',
-      isOwn: false,
-    });
-  });
-
-  it('a person the server could not name is still a person, never "You" to a stranger', () => {
-    expect(
-      senderName({
-        senderKind: 'user',
-        senderSlug: null,
-        senderName: 'a workspace member',
-        isOwn: false,
-      })
-    ).toEqual({
-      name: 'a workspace member',
-      isOwn: false,
-    });
-    // An unnamed payload (no senderName at all) falls back to the kind.
-    expect(senderName({ senderKind: 'user', senderSlug: null })).toEqual({
-      name: 'a workspace member',
-      isOwn: false,
-    });
-  });
-
-  it('ignores the retired metadata hint even when it is supplied', () => {
-    const withHint = {
-      senderKind: 'sb',
-      senderSlug: 'wren',
-      senderName: 'wren',
-      isOwn: false,
-      metadata: { sentBy: 'user' },
-    };
-    expect(senderName(withHint)).toEqual({ name: 'wren', isOwn: false });
-  });
-});
 describe('shortPhase', () => {
   it('drops the namespace prefix', () => {
     expect(shortPhase('runtime:idle')).toBe('idle');

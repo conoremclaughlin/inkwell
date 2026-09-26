@@ -126,14 +126,31 @@ async function tryRefresh(): Promise<boolean> {
 }
 
 /**
+ * A request that belongs to one workspace, whichever one is selected by the
+ * time it is sent. Null is the server's default. A query whose cache key
+ * names a workspace binds its requests to it: a poll that fires between a
+ * switch and the next render would otherwise store the new workspace's
+ * page under the old workspace's key (the web dashboard did exactly that,
+ * Lumen, #679).
+ */
+export interface WorkspaceBinding {
+  workspaceId: string | null;
+}
+
+/**
  * Authenticated JSON request. On 401, refreshes once and retries; a second
  * 401 signs the user out — the refresh token is dead and every subsequent
  * call would fail the same way.
  */
-export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+export async function apiFetch<T>(
+  path: string,
+  init?: RequestInit,
+  binding?: WorkspaceBinding
+): Promise<T> {
+  const workspaceFor = (): string | null => (binding ? binding.workspaceId : getWorkspaceId());
   const attempt = async (): Promise<Response> => {
     const { accessToken } = getAuthState();
-    const workspaceId = getWorkspaceId();
+    const workspaceId = workspaceFor();
     return fetch(`${apiBaseUrl()}${path}`, {
       ...init,
       headers: {
@@ -164,14 +181,21 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   // revoked, workspace archived, different account signed in) would otherwise
   // wedge every screen. The middleware answers 403/404 "Workspace not found…"
   // for exactly that; fall back to the default workspace and retry once.
-  if ((res.status === 403 || res.status === 404) && getWorkspaceId()) {
+  //
+  // A bound request is different: it belongs to the workspace that has gone.
+  // Retrying against the default would cache the default's data under that
+  // workspace's key, so it clears the selection only while that workspace is
+  // still the selected one, and fails; the screens re-scope from there.
+  const requested = workspaceFor();
+  if ((res.status === 403 || res.status === 404) && requested) {
     const err = await parseError(res);
-    if (/workspace not found/i.test(err.message)) {
-      await setWorkspaceId(null);
-      res = await attempt();
-    } else {
+    if (!/workspace not found/i.test(err.message)) throw err;
+    if (binding) {
+      if (getWorkspaceId() === requested) await setWorkspaceId(null);
       throw err;
     }
+    await setWorkspaceId(null);
+    res = await attempt();
   }
   if (!res.ok) throw await parseError(res);
   return (await res.json()) as T;

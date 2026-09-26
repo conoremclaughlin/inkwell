@@ -128,3 +128,42 @@ describe('apiFetch token refresh', () => {
     expect(headerOf(2, 'Authorization')).toBe('Bearer access-2');
   });
 });
+
+describe('apiFetch bound to a workspace (Lumen, #679)', () => {
+  it('asks its own workspace, whatever is selected', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse(200, { ok: true }));
+    await setWorkspaceId('ws-b');
+
+    await apiFetch('/api/admin/threads/messages?key=pr:1', undefined, { workspaceId: 'ws-a' });
+    await apiFetch('/api/admin/threads/messages?key=pr:1', undefined, { workspaceId: null });
+
+    expect(headerOf(0, 'x-ink-workspace-id')).toBe('ws-a');
+    expect(headerOf(1, 'x-ink-workspace-id')).toBeUndefined();
+  });
+
+  it('fails rather than retrying a vanished workspace against the default', async () => {
+    await setWorkspaceId('ws-gone');
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(403, { error: 'Workspace not found or not accessible' })
+    );
+
+    await expect(
+      apiFetch('/api/admin/threads/messages?key=pr:1', undefined, { workspaceId: 'ws-gone' })
+    ).rejects.toThrow(/workspace not found/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // It was still the selected workspace, so the selection falls back.
+    expect(getWorkspaceId()).toBeNull();
+  });
+
+  it('leaves the selection alone when the vanished workspace is no longer selected', async () => {
+    await setWorkspaceId('ws-b');
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(404, { error: 'Workspace not found or not accessible' })
+    );
+
+    await expect(
+      apiFetch('/api/admin/threads/messages?key=pr:1', undefined, { workspaceId: 'ws-gone' })
+    ).rejects.toThrow(/workspace not found/i);
+    expect(getWorkspaceId()).toBe('ws-b');
+  });
+});

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { nameLookup, plainPreview, toConversationMessage } from './to-conversation';
-import type { ThreadMessage } from './thread-types';
+import type { ThreadMessage } from '../threads-api/index.js';
+import { nameLookup, toConversationMessage } from './authors.js';
 
 const names = nameLookup([
   { sbSlug: 'wren', name: 'Wren' },
@@ -75,26 +75,29 @@ describe('toConversationMessage', () => {
     expect(sam.id).not.toBe(kim.id);
   });
 
+  it('names a person the server could not name as a person, never "You" to a stranger', () => {
+    const author = toConversationMessage(
+      message({
+        senderKind: 'user',
+        senderSlug: 'user',
+        senderUserId: 'u2',
+        senderName: undefined,
+      }),
+      names
+    ).author;
+    expect(author).toMatchObject({ kind: 'user', name: 'a workspace member', isOwn: false });
+  });
+
+  it('ignores the retired metadata hint that once marked a person’s reply', () => {
+    expect(
+      toConversationMessage(message({ metadata: { sentBy: 'user' } }), names).author
+    ).toMatchObject({ kind: 'sb', id: 'wren', name: 'Wren', isOwn: false });
+  });
+
   it('drops a priority it does not recognise instead of passing it through', () => {
     expect(
       toConversationMessage(message({ priority: 'whenever' }), names).priority
     ).toBeUndefined();
     expect(toConversationMessage(message({ priority: 'urgent' }), names).priority).toBe('urgent');
-  });
-});
-
-describe('plainPreview', () => {
-  it('keeps the words and drops the markdown around them', () => {
-    expect(plainPreview('## Round 2\n\n**approve** — see [the diff](https://example.com/d)')).toBe(
-      'Round 2 approve — see the diff'
-    );
-    expect(plainPreview('> quoted `code` and _emphasis_.')).toBe('quoted code and emphasis.');
-  });
-
-  it('leaves snake_case and paths alone', () => {
-    expect(plainPreview('set thread_key on inbox_thread_messages')).toBe(
-      'set thread_key on inbox_thread_messages'
-    );
-    expect(plainPreview('2 * 3 = 6')).toBe('2 * 3 = 6');
   });
 });

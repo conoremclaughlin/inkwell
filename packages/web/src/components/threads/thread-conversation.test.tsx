@@ -10,10 +10,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createReadCursorStore } from './read-cursors';
-import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
+import type { ThreadMessagesResponse, ThreadSpine } from '@inklabs/shared/stories/threads-api';
 
 const fake = vi.hoisted(() => ({
   newest: undefined as unknown,
+  /** When the poll last succeeded; a new value with the same page is a quiet poll. */
+  updatedAt: 0,
   apiGet: vi.fn(),
   viewProps: [] as Array<{
     loading: boolean;
@@ -24,7 +26,11 @@ const fake = vi.hoisted(() => ({
 }));
 
 vi.mock('@/lib/api', () => ({
-  useApiQuery: () => ({ data: fake.newest, isLoading: fake.newest === undefined }),
+  useWorkspaceApiQuery: () => ({
+    data: fake.newest,
+    dataUpdatedAt: fake.updatedAt,
+    isLoading: fake.newest === undefined,
+  }),
   apiGet: (path: string) => fake.apiGet(path) as Promise<unknown>,
 }));
 vi.mock('./reply-composer', () => ({ ReplyComposer: () => null }));
@@ -96,9 +102,11 @@ const spine = {
 
 function mount(cursorAt: string) {
   const cursors = createReadCursorStore(null, () => new Date(cursorAt));
+  let workspaceId: string | null = null;
   const ui = () => (
     <ThreadConversation
       spine={spine}
+      workspaceId={workspaceId}
       nameFor={(s) => s}
       cursors={cursors}
       onBack={() => {}}
@@ -107,12 +115,19 @@ function mount(cursorAt: string) {
     />
   );
   const rendered = render(ui());
-  return { rerender: () => rendered.rerender(ui()) };
+  return {
+    rerender: () => rendered.rerender(ui()),
+    switchWorkspace: (id: string) => {
+      workspaceId = id;
+      rendered.rerender(ui());
+    },
+  };
 }
 
 afterEach(() => {
   cleanup();
   fake.apiGet.mockReset();
+  fake.updatedAt = 0;
   fake.viewProps = [];
 });
 
@@ -147,6 +162,44 @@ describe('ThreadConversation', () => {
     for (const n of [101, 200, 201, 250, 251, 350]) {
       expect(screen.queryByTestId(`m${n}`), `m${n}`).not.toBeNull();
     }
+  });
+
+  it('starts over when the workspace changes under an open thread (Lumen, #679)', () => {
+    // The same key names another thread in the other workspace.
+    const inOther = (page: ThreadMessagesResponse): ThreadMessagesResponse => ({
+      ...page,
+      messages: page.messages.map((m) => ({ ...m, id: `other-${m.id}` })),
+    });
+    fake.newest = pageOf(1, 3);
+    const view = mount(at(3));
+    expect(screen.getByTestId('m1')).toBeTruthy();
+
+    fake.newest = inOther(pageOf(1, 2));
+    view.switchWorkspace('fixture-workspace-b');
+    expect(screen.getByTestId('other-m1')).toBeTruthy();
+    expect(screen.queryByTestId('m1'), 'the first workspace’s message must not stay').toBeNull();
+  });
+
+  it('retries a failed fill once a poll succeeds, even a poll that brought nothing new', async () => {
+    fake.newest = pageOf(1, 200);
+    fake.updatedAt = 1;
+    let down = true;
+    fake.apiGet.mockImplementation((path: string) =>
+      down ? Promise.reject(new Error('network down')) : Promise.resolve(pageOf(1, olderThan(path)))
+    );
+    const view = mount(at(200));
+
+    fake.newest = pageOf(1, 350);
+    fake.updatedAt = 2;
+    view.rerender();
+    await waitFor(() => expect(screen.getByText('network down')).toBeTruthy());
+    expect(screen.queryByTestId('m225')).toBeNull();
+
+    // The server answers again, and the poll hands back the same page.
+    down = false;
+    fake.updatedAt = 3;
+    view.rerender();
+    await waitFor(() => expect(screen.getByTestId('m225')).toBeTruthy());
   });
 
   /**

@@ -20,6 +20,7 @@ this section exists to keep that true.
 ```bash
 yarn db:migrate supabase/migrations/20260916024540_memory_embedding_atomic_swap.sql
 yarn db:migrate:status
+yarn db:migrate:pending
 ```
 
 `db:migrate` (`scripts/db-migrate.sh`) runs one psql transaction: an advisory
@@ -62,6 +63,63 @@ parameter, or in keyword/value form, so the connection string is never printed.
 If the stack is not running, start it from the root checkout with
 `supabase start`. Do not reach for `yarn supabase:local:setup` for that: it
 runs `supabase db reset` and discards every row of live data.
+
+`db:migrate:pending` applies every file the ledger lacks, in version order,
+one transaction each, and `yarn dev` and `yarn prod:direct` run it from the
+main checkout before the servers start. The restart is the deploy, and a
+server must not come up on a schema behind its code: on 2026-09-24 the main
+server was restarted on a release whose three migrations had not been applied,
+the startup check printed them as a warning and let it start, and every
+channel poll then failed on a renamed function until the window was run.
+`yarn dev:no-migrations` (`INK_SKIP_MIGRATIONS=1`) skips the step on purpose,
+prints what is pending, and starts anyway. A worktree's server never applies
+anything to the shared stack; it warns, as before. A linked (hosted) target is
+not driven by the wrapper: pending there refuses the start and points at
+`yarn linked:migrate`.
+
+Before an automatic apply the stack is proven, and the connection is bound to
+the proof. The preflight resolves the runtime's effective `SUPABASE_URL`
+through the runtime's own env loader (`scripts/lib/runtime-env.mjs`: the
+process environment, then `.env.local`, then `.env.{NODE_ENV}` or its
+`.env.dev`/`.env.prod` alias, then `.env`, exactly as
+`packages/api/src/config/env.ts` layers them; `LOCAL_SUPABASE_URL` is nothing
+to the runtime and nothing here) and hands it to `pending --for <url>`. The
+wrapper takes one `supabase status` answer, requires its `API_URL` to be that
+URL's origin (scheme, host, port; loopback spellings unified), and sends the
+transaction to the `DB_URL` of that same answer. `DB_MIGRATE_URL` is refused
+under `--for`: an automatic apply cannot take its connection from anywhere the
+proof did not cover. A runtime pointed at a second local stack on another
+port is refused, not migrated by proxy. Refusals name origins only, as the
+URL parser defines them (so a password that itself contains `@` is still
+userinfo), never path, query or fragment; a runtime URL the parser rejects is
+a refusal that shows nothing. `yarn prod:direct` and `yarn prod:up` force
+`NODE_ENV=production` before any migration decision, whatever the caller's
+shell says, because that is the mode their servers are started under: one
+mode for the proof and for the runtime. `yarn prod:migrate` on its own
+defaults to production the same way. The listing is judged whole before any row
+is acted on, the same contract as `migration-status.mjs`: no header, or one
+row the parser does not recognise, is a refusal, never "nothing pending".
+`yarn prod:migrate` (what `yarn prod:up` runs) reads one validated listing,
+refuses a pending window migration on either target before `db push` is
+reached, goes through the same wrapper for the local target, and treats a
+file it cannot judge as a refusal.
+
+### Window migrations
+
+A migration that needs writers stopped, a snapshot, or a manifest loaded first
+announces itself in its first ten lines:
+
+```sql
+-- db-migrate: window docs/runbooks/<name>.md
+```
+
+`pending`, and so startup and `yarn prod:migrate`, stops in front of such a
+file with exit 3, names the runbook, and applies nothing behind it. `apply`
+takes it only as `yarn db:migrate --window <file>`, which says the operator is
+inside that window. `sh scripts/db-migrate.sh is-window <file>` answers the
+question for other scripts (exit 0 and the runbook on stdout, 1 otherwise) so
+the marker has one definition. `20260913090000_inkmail_thread_scope_cutover.sql`
+is the first, and its runbook is `docs/runbooks/inkmail-thread-scope-cutover.md`.
 
 Two other ways of applying exist, and both leave the ledger wrong:
 

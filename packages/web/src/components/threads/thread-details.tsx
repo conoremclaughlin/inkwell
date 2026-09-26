@@ -14,25 +14,26 @@ import {
   X,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useApiQuery } from '@/lib/api';
+import {
+  threadMessagesPath,
+  type ThreadMessagesResponse,
+  type ThreadSpine,
+} from '@inklabs/shared/stories/threads-api';
+import {
+  displayTitle,
+  isSessionLive,
+  SESSION_RELATION_LABELS,
+} from '@inklabs/shared/stories/thread-browsing';
+import {
+  creatorLabel,
+  formatRelativeTime,
+  sbAuthor,
+  type NameFor,
+} from '@inklabs/shared/stories/thread-viewing';
+import { useWorkspaceApiQuery } from '@/lib/api';
 import { AuthorAvatar } from '@/components/conversation/author-avatar';
-import { formatRelativeTime } from '@/components/conversation/format';
 import { EvidenceNodeCard, type GraphEvidenceResponse } from './evidence';
-import { creatorLabel, sbAuthor, type NameFor } from './to-conversation';
-import { displayTitle, isSessionLive, TypeChip } from './thread-list';
-import type { ThreadMessagesResponse, ThreadSpine } from './thread-types';
-
-/**
- * Session→key relations, in words a reader shouldn't have to decode:
- * "routed here" = this key is the session's immutable routing anchor (where
- * inbox triggers landed it); "working now" = the session's mutable current
- * focus; both when they coincide. These are session facts, not studios.
- */
-const RELATION_LABELS: Record<'anchor' | 'active' | 'both', string> = {
-  anchor: 'routed here',
-  active: 'working now',
-  both: 'routed · working',
-};
+import { TypeChip } from './thread-list';
 
 const RELATION_TOOLTIP =
   'Session relation to this key — "routed here": the key this session was originally routed/spawned for; "working now": the session\'s current focus (its activeThreadKey)';
@@ -43,25 +44,30 @@ const RELATION_TOOLTIP =
  */
 export function ThreadDetails({
   spine,
+  workspaceId,
   nameFor,
   onClose,
 }: {
   spine: ThreadSpine;
+  /** The workspace the thread was opened in; shares the conversation's cached query. */
+  workspaceId: string | null;
   nameFor: NameFor;
   onClose?: () => void;
 }) {
   // Same query as the conversation — shared from the cache, not refetched.
-  const { data: messagesData } = useApiQuery<ThreadMessagesResponse>(
+  const { data: messagesData } = useWorkspaceApiQuery<ThreadMessagesResponse>(
     ['thread-messages', spine.key],
-    `/api/admin/threads/messages?key=${encodeURIComponent(spine.key)}`
+    threadMessagesPath(spine.key),
+    workspaceId
   );
 
   // The evidence trail behind this key's workflow graphs — verdicts,
   // remediation reasons, and attached artifacts, straight from the
   // gate-event ledger. Groups with no graph answer { groups: [] }.
-  const { data: evidenceData } = useApiQuery<GraphEvidenceResponse>(
+  const { data: evidenceData } = useWorkspaceApiQuery<GraphEvidenceResponse>(
     ['thread-graph-evidence', spine.key],
-    `/api/admin/threads/graph-evidence?key=${encodeURIComponent(spine.key)}`
+    `/api/admin/threads/graph-evidence?key=${encodeURIComponent(spine.key)}`,
+    workspaceId
   );
   const evidenceGroups = (evidenceData?.groups ?? []).filter((group) => group.nodes.length > 0);
 
@@ -238,7 +244,7 @@ export function ThreadDetails({
                     className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px]"
                     title={RELATION_TOOLTIP}
                   >
-                    {RELATION_LABELS[s.relation]}
+                    {SESSION_RELATION_LABELS[s.relation]}
                   </span>
                   <span className="ml-auto shrink-0 text-muted-foreground">
                     {formatRelativeTime(s.updatedAt)}

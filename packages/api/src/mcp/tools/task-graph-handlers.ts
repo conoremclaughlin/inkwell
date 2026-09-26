@@ -202,12 +202,42 @@ export async function handleGetTaskGraph(
     const { data: tasks, error } = await client
       .from('tasks')
       .select(
-        'id, title, status, outcome, task_type, node_slug, gate_state, gate_attempt, gate_version, gate_opened_at, dwell_started_at, eligible_at, claimed_by_session_id, claimed_at, assignee_identity_id, assignee_user_id, verification'
+        'id, title, status, outcome, task_type, node_slug, gate_state, gate_attempt, gate_version, gate_request_revision, gate_binding_hash, gate_authors, gate_opened_at, dwell_started_at, eligible_at, claimed_by_session_id, claimed_at, assignee_identity_id, assignee_user_id, verification'
       )
       .eq('task_group_id', args.taskGroupId)
       .order('created_at', { ascending: true });
     if (error) throw new Error(`Failed to read group tasks: ${error.message}`);
     const edges = await groups.getEdges(args.taskGroupId);
+    // Unreleased holds, with provenance: a node that carries one never
+    // dispatches, whatever SATISFIES says (spec workflow-graph-revocation
+    // §Holds). Read here so a caller can see WHY a node is not ready.
+    const taskIds = (tasks ?? []).map((t) => t.id);
+    const holdsByTask = new Map<string, Array<Record<string, unknown>>>();
+    if (taskIds.length > 0) {
+      const { data: holds, error: holdsError } = await client
+        .from('task_authority_holds')
+        .select(
+          'id, task_id, kind, source_gate_id, source_attempt, binding_hash, cause_event_id, cause_operation_id, placed_at'
+        )
+        .in('task_id', taskIds)
+        .is('released_at', null)
+        .order('placed_at', { ascending: true });
+      if (holdsError) throw new Error(`Failed to read authority holds: ${holdsError.message}`);
+      for (const h of holds ?? []) {
+        const list = holdsByTask.get(h.task_id) ?? [];
+        list.push({
+          id: h.id,
+          kind: h.kind,
+          sourceGateId: h.source_gate_id,
+          sourceAttempt: h.source_attempt,
+          bindingHash: h.binding_hash,
+          causeEventId: h.cause_event_id,
+          causeOperationId: h.cause_operation_id,
+          placedAt: h.placed_at,
+        });
+        holdsByTask.set(h.task_id, list);
+      }
+    }
 
     return mcpResponse({
       success: true,
@@ -230,6 +260,9 @@ export async function handleGetTaskGraph(
         gateState: t.gate_state,
         gateAttempt: t.gate_attempt,
         gateVersion: t.gate_version,
+        requestRevision: t.gate_request_revision,
+        bindingHash: t.gate_binding_hash,
+        authors: t.gate_authors,
         gateOpenedAt: t.gate_opened_at,
         dwellStartedAt: t.dwell_started_at,
         eligibleAt: t.eligible_at,
@@ -238,6 +271,7 @@ export async function handleGetTaskGraph(
         assigneeIdentityId: t.assignee_identity_id,
         assigneeUserId: t.assignee_user_id,
         verification: t.verification,
+        holds: holdsByTask.get(t.id) ?? [],
       })),
       edges: edges.map((e) => ({ from: e.from_task, to: e.to_task })),
     });
@@ -688,6 +722,14 @@ export const recordGateVerdictSchema = z.object({
     .optional()
     .describe('Required when you claimed the gate (executable checks)'),
   sessionId: z.string().guid().optional().describe('Resolved from context when omitted'),
+  bindingHash: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      'The candidate (binding hash) the evidence is about; refused binding-mismatch if the gate now decides another'
+    ),
 });
 
 export async function handleRecordGateVerdict(
@@ -710,6 +752,7 @@ export async function handleRecordGateVerdict(
       claimToken: args.claimToken,
       evidence: args.evidence as Record<string, unknown> | undefined,
       reason: args.reason,
+      bindingHash: args.bindingHash,
     });
 
     if (result.success) {
@@ -767,6 +810,195 @@ export async function handleRetryGate(
   } catch (error) {
     return mcpResponse(
       { success: false, error: error instanceof Error ? error.message : 'retry failed' },
+      true
+    );
+  }
+}
+
+// ============================================================================
+// AUTHORITY — revocation, supersession, lift
+// (spec: ink://specs/workflow-graph-revocation v10 — the authority family)
+// ============================================================================
+//
+// Every rule lives in the RPCs: who may revoke (enumerated, validated in
+// SQL), the CAS on attempt / version / request revision, the holds placed
+// over the closure and released per cause, and the group-completion
+// invariant. These handlers resolve the actor from context — an SB acts as
+// its identity, a human as the user — and hand the evaluation to dispatch.
+
+const principalSchema = z.object({
+  kind: z.enum(['sb', 'user']),
+  id: z.string().guid(),
+});
+
+export const revokeGateSchema = z.object({
+  ...userIdentifierSchema.shape,
+  taskId: z.string().guid().describe('PASSED verification gate whose authority is withdrawn'),
+  expectedAttempt: z
+    .number()
+    .int()
+    .min(1)
+    .describe('Current gate_attempt (CAS — read via get_task_graph)'),
+  expectedGateVersion: z
+    .number()
+    .int()
+    .min(0)
+    .describe('Current gate_version (CAS — read via get_task_graph)'),
+  reason: z.string().min(1).max(2000).describe('Required: why the pass is withdrawn'),
+});
+
+export async function handleRevokeGate(
+  args: z.infer<typeof revokeGateSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) return mcpResponse({ success: false, error: 'User not found' }, true);
+
+    const actorIdentityId = resolveActorIdentityId();
+    const result = await dataComposer.repositories.taskGroups.revokeGate({
+      userId: resolved.user.id,
+      taskId: args.taskId,
+      expectedAttempt: args.expectedAttempt,
+      expectedGateVersion: args.expectedGateVersion,
+      ...(actorIdentityId ? { actorIdentityId } : { actorUserId: resolved.user.id }),
+      reason: args.reason,
+    });
+
+    if (result.success) {
+      const task = await dataComposer.repositories.tasks.findById(args.taskId);
+      await dispatchAfterMutation(
+        dataComposer,
+        resolved.user.id,
+        task?.task_group_id,
+        result.evaluation
+      );
+    }
+    return mcpResponse(result, result.success === false);
+  } catch (error) {
+    return mcpResponse(
+      { success: false, error: error instanceof Error ? error.message : 'revoke failed' },
+      true
+    );
+  }
+}
+
+export const supersedeGateSchema = z.object({
+  ...userIdentifierSchema.shape,
+  taskId: z.string().guid().describe('Verification gate whose request changes'),
+  expectedAttempt: z
+    .number()
+    .int()
+    .min(1)
+    .describe('Current gate_attempt (CAS — read via get_task_graph)'),
+  expectedGateVersion: z
+    .number()
+    .int()
+    .min(0)
+    .describe('Current gate_version (CAS — read via get_task_graph)'),
+  expectedRequestRevision: z
+    .number()
+    .int()
+    .min(0)
+    .describe('Current requestRevision (CAS — read via get_task_graph)'),
+  binding: z
+    .record(z.string(), z.unknown())
+    .describe('The new candidate the gate decides, e.g. the publication tuple'),
+  bindingHash: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe('Hash of the new binding; refused binding-unchanged when it equals the current one'),
+  authors: z
+    .array(principalSchema)
+    .max(64)
+    .optional()
+    .describe('Recorded author set of the new candidate, from session identity — never from git'),
+  reason: z.string().max(2000).optional().describe('What changed'),
+});
+
+export async function handleSupersedeGate(
+  args: z.infer<typeof supersedeGateSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) return mcpResponse({ success: false, error: 'User not found' }, true);
+
+    const actorIdentityId = resolveActorIdentityId();
+    const result = await dataComposer.repositories.taskGroups.supersedeGate({
+      userId: resolved.user.id,
+      taskId: args.taskId,
+      expectedAttempt: args.expectedAttempt,
+      expectedGateVersion: args.expectedGateVersion,
+      expectedRequestRevision: args.expectedRequestRevision,
+      binding: args.binding,
+      bindingHash: args.bindingHash,
+      authors: args.authors,
+      ...(actorIdentityId ? { actorIdentityId } : { actorUserId: resolved.user.id }),
+      reason: args.reason,
+    });
+
+    if (result.success) {
+      const task = await dataComposer.repositories.tasks.findById(args.taskId);
+      await dispatchAfterMutation(
+        dataComposer,
+        resolved.user.id,
+        task?.task_group_id,
+        result.evaluation
+      );
+    }
+    return mcpResponse(result, result.success === false);
+  } catch (error) {
+    return mcpResponse(
+      { success: false, error: error instanceof Error ? error.message : 'supersede failed' },
+      true
+    );
+  }
+}
+
+export const liftWithdrawalSchema = z.object({
+  ...userIdentifierSchema.shape,
+  taskId: z.string().guid().describe('Verification gate carrying the withdrawal'),
+  withdrawalEventId: z
+    .string()
+    .guid()
+    .describe('The revoked or failed gate event being resolved (from the gate event log)'),
+  reason: z.string().min(1).max(2000).describe('Required: the basis for lifting it'),
+});
+
+export async function handleLiftWithdrawal(
+  args: z.infer<typeof liftWithdrawalSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) return mcpResponse({ success: false, error: 'User not found' }, true);
+
+    // The RPC admits an owner or admin only. An SB session acts as its
+    // identity and is refused there; a human acts as the user.
+    const actorIdentityId = resolveActorIdentityId();
+    const result = await dataComposer.repositories.taskGroups.liftWithdrawal({
+      userId: resolved.user.id,
+      taskId: args.taskId,
+      withdrawalEventId: args.withdrawalEventId,
+      ...(actorIdentityId ? { actorIdentityId } : { actorUserId: resolved.user.id }),
+      reason: args.reason,
+    });
+
+    if (result.success) {
+      const task = await dataComposer.repositories.tasks.findById(args.taskId);
+      await dispatchAfterMutation(
+        dataComposer,
+        resolved.user.id,
+        task?.task_group_id,
+        result.evaluation
+      );
+    }
+    return mcpResponse(result, result.success === false);
+  } catch (error) {
+    return mcpResponse(
+      { success: false, error: error instanceof Error ? error.message : 'lift failed' },
       true
     );
   }

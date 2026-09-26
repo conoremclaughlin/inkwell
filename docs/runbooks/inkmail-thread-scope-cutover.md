@@ -25,7 +25,9 @@ closer, and attesting one aborts).
 
 ## Before the window (any time; read-only)
 
-1. Apply `20260913081634` (staging + preflight). It changes no live table.
+1. Apply `20260913081634` (staging + preflight) with
+   `yarn db:migrate supabase/migrations/20260913081634_inkmail_cutover_manifests.sql`.
+   It changes no live table.
 2. Draft the manifests from the suggestion functions and review them by hand:
 
    ```sql
@@ -76,10 +78,15 @@ closer, and attesting one aborts).
    plugins riding on them. Hold auto-restart. The new binary is already built
    and its tests have passed.
 2. **Snapshot** the database.
-3. **Apply** `20260913090000` with `supabase db push` — one transaction per
-   migration file. It runs the preflight first and aborts with the first 50
-   findings if anything is left; an abort leaves the pre-cutover schema
-   intact and the old binary can start against it.
+3. **Apply** `20260913090000` with
+   `yarn db:migrate --window supabase/migrations/20260913090000_inkmail_thread_scope_cutover.sql`
+   — one transaction for the file and its ledger row. (`supabase db push`
+   refuses while the ledger holds a version with no file in the checkout,
+   which it does; the wrapper does not care.) The file runs its preflight
+   first and aborts with the first 50 findings if anything is left; an abort
+   leaves the pre-cutover schema intact and the old binary can start against
+   it. Without `--window` the wrapper refuses the file, and `yarn dev` refuses
+   to start while it is pending: that refusal is the point.
 4. **Regenerate types**, **deploy** the new binary, **start** the server, run
    the whole-path checks of spec §4b.
 

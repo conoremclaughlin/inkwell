@@ -19,4 +19,23 @@ config.resolver.nodeModulesPaths = [
   path.resolve(workspaceRoot, 'node_modules'),
 ];
 
+// 3. One React. This app pins its own react (Expo's version) in its own
+//    node_modules, while the repo root hoists the web dashboard's. A file in
+//    @inklabs/shared (a shared hook such as useThreadHistory) would resolve
+//    `react` from where IT lives, and find the root's copy: two Reacts in
+//    one bundle, and every shared hook fails with "Invalid hook call".
+//    Resolving react as if from this package keeps the whole bundle on the
+//    app's copy.
+const appOrigin = path.join(projectRoot, 'index.ts');
+config.resolver.resolveRequest = (context, moduleName, platform) => {
+  if (moduleName === 'react' || moduleName.startsWith('react/')) {
+    return context.resolveRequest(
+      { ...context, originModulePath: appOrigin },
+      moduleName,
+      platform
+    );
+  }
+  return context.resolveRequest(context, moduleName, platform);
+};
+
 module.exports = config;
