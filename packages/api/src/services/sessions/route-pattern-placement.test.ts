@@ -366,7 +366,16 @@ async function makeWorld(bPatterns: string[], dPatterns: string[] = [], dFirst =
 
   const tables: Record<string, Row[]> = {
     agent_identities: [
-      { id: SB_ID, user_id: USER, agent_id: SLUG, workspace_id: null, default_session_id: null },
+      // Every identity lives in a workspace since the thread-scope cutover; a
+      // workspace-less row makes the thread-behaviour lookup THROW, which now
+      // holds a key that may carry a project prefix (#681) instead of routing.
+      {
+        id: SB_ID,
+        user_id: USER,
+        agent_id: SLUG,
+        workspace_id: 'ws-probe',
+        default_session_id: null,
+      },
     ],
     studios: dFirst ? [...studioD, studioB, studioC] : [studioB, studioC, ...studioD],
     sessions: [],

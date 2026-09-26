@@ -5830,6 +5830,8 @@ describe('SessionService', () => {
         continuity?: { studioId: string; repoRoot: string };
         /** Studios carrying route patterns, with the repo each lives in. */
         patternStudios?: Array<{ id: string; route_patterns: string[]; repo_root: string }>;
+        /** Repo of a studio looked up by id (the continuity / reuse repo check). */
+        studioRepos?: Record<string, string>;
       }) {
         const queries: Array<{ table: string; calls: RecordedCall[] }> = [];
         const from = vi.fn().mockImplementation((table: string) => {
@@ -5885,6 +5887,8 @@ describe('SessionService', () => {
               if (opts.continuity && has(c, 'id', opts.continuity.studioId)) {
                 return { data: { repo_root: opts.continuity.repoRoot } };
               }
+              const byId = Object.entries(opts.studioRepos ?? {}).find(([id]) => has(c, 'id', id));
+              if (byId) return { data: { repo_root: byId[1] } };
               const selected = String(c.find((call) => call.method === 'select')?.args[0] ?? '');
               // The occupancy read — every candidate is free.
               if (selected.includes('lease')) {
@@ -6146,6 +6150,120 @@ describe('SessionService', () => {
             }),
           })
         );
+      });
+
+      /*
+       * The thread-key REUSE rung (Lumen, #681 round 1). It runs after
+       * routing, and when routing produced no studio — a deferred D1 create,
+       * or a refusal — it runs unscoped: any live session on the thread
+       * qualifies. For a project-pinned thread that is the incident's own
+       * session, bound to the wrong-repo overflow, reselected before the
+       * create boundary could provision in the project repo or the refusal
+       * could hold. The rung must apply the same repo test as continuity.
+       */
+      function serviceWithRepo(mockSupabase: unknown, oldSession: Record<string, unknown>) {
+        const repository = {
+          ...mockRepository,
+          findByThreadKey: vi.fn(async (_u: string, _s: string, key: string, studio?: string) =>
+            key === 'inktrade:pr:1' && (!studio || studio === oldSession.studioId)
+              ? oldSession
+              : null
+          ),
+        };
+        const service = new SessionService(
+          repository as never,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+          mockCodexRunner,
+          mockSupabase as never
+        );
+        return { service, repository };
+      }
+      const oldSessionIn = (studioId: string) => ({
+        id: 'old-session',
+        userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        studioId,
+        threadKey: 'inktrade:pr:1',
+        endedAt: null,
+      });
+
+      it('does not reuse an old session in another repo while the D1 parent is still deferred', async () => {
+        const parentSpy = vi
+          .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+          .mockResolvedValue({ id: 'studio-inktrade-new', slug: 'inktrade--wren' } as never);
+        try {
+          const { supabase } = projectRoutingSupabase({
+            project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+            studiosByRepo: { '/repos/inkwell': 'studio-inkwell-wren' },
+            studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+          });
+          const { service, repository } = serviceWithRepo(
+            supabase,
+            oldSessionIn('studio-wrong-repo')
+          );
+
+          const session = await service.getOrCreateSession('user-456', 'wren', {
+            threadKey: 'inktrade:pr:1',
+            callerStudioId: 'sender-studio-1',
+            callerSessionId: 'sender-session-1',
+          });
+
+          expect(repository.findByThreadKey).toHaveBeenCalled();
+          expect(session.id).not.toBe('old-session');
+          expect(parentSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ repoRoot: '/repos/inktrade' })
+          );
+          expect(mockRepository.create).toHaveBeenCalledWith(
+            expect.objectContaining({
+              studioId: 'studio-inktrade-new',
+              metadata: expect.objectContaining({
+                routing_decision: expect.objectContaining({ tier: 'project-repo-created' }),
+              }),
+            })
+          );
+        } finally {
+          parentSpy.mockRestore();
+        }
+      });
+
+      it('holds a project without a repo even when an old session exists on the thread', async () => {
+        const { supabase } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: null },
+          studiosByRepo: { '/repos/inkwell': 'studio-inkwell-wren' },
+          studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+        });
+        const { service } = serviceWithRepo(supabase, oldSessionIn('studio-wrong-repo'));
+
+        await expect(
+          service.getOrCreateSession('user-456', 'wren', { threadKey: 'inktrade:pr:1' })
+        ).rejects.toMatchObject({
+          code: 'ROUTING_REFUSED',
+          detail: { reason: 'project-without-repo', project: { slug: 'inktrade', cause: 'unset' } },
+        });
+        expect(mockRepository.create).not.toHaveBeenCalled();
+      });
+
+      it('still reuses an old session whose studio IS in the project repo', async () => {
+        // Control for the two above: the rung is gated on the repo, not
+        // removed. Routing resolves the project studio, and the reuse lookup
+        // is scoped to it, so the old session lives there.
+        const { supabase } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+          studiosByRepo: { '/repos/inktrade': 'studio-inktrade-wren' },
+          studioRepos: { 'studio-inktrade-wren': '/repos/inktrade' },
+        });
+        const { service } = serviceWithRepo(supabase, oldSessionIn('studio-inktrade-wren'));
+
+        const session = await service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'inktrade:pr:1',
+        });
+
+        expect(session.id).toBe('old-session');
+        expect(mockRepository.create).not.toHaveBeenCalled();
       });
     });
   });

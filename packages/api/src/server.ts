@@ -1206,12 +1206,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         triedCallerRepo: refusal.detail.triedCallerRepo,
         callerRepoRoot: refusal.detail.callerRepoRoot || null,
         ...(refusal.detail.occupied ? { occupied: refusal.detail.occupied } : {}),
+        ...(refusal.detail.project ? { project: refusal.detail.project } : {}),
         recovery:
           refusal.detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
             : refusal.detail.reason === 'ambiguous-identity'
               ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
-              : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+              : refusal.detail.reason === 'project-without-repo'
+                ? "set the project's repo_root — save_project(name, repoRoot) — then re-send; the sender's repo was not consulted"
+                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
       });
 
       await logInkmail('inkmail_fail', payload, userId, {
@@ -1233,6 +1236,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             callerRepoRoot: refusal.detail.callerRepoRoot ?? null,
             reason: refusal.detail.reason,
             occupied: refusal.detail.occupied ?? null,
+            // The pinned project a project-without-repo refusal names; this
+            // hand-built copy is where it went missing (Lumen, #681 round 1).
+            project: refusal.detail.project ?? null,
           },
         });
       }

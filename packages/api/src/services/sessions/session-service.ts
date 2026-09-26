@@ -1248,16 +1248,20 @@ export class SessionService implements ISessionService {
     if (!this.supabase) return fallback;
     // The registry and the thread are workspace-scoped (§1b): the identity's
     // workspace when the session has one, the user's personal workspace
-    // otherwise. No workspace means no thread row could have been pinned in
-    // one, so this stays the pre-existing degrade rather than a hold — the
-    // hold below is for a row that exists and cannot be read.
+    // otherwise. A positive "no workspace" answer means no thread row could
+    // have been pinned in one, so that stays the pre-existing degrade; a
+    // lookup that FAILS answers nothing and holds a key that may carry a
+    // prefix, like an unreadable row.
     let workspaceId: string | null;
     try {
       workspaceId = sbId
         ? await workspaceOfSb(this.supabase, sbId)
         : await personalWorkspaceOf(this.supabase, userId);
     } catch {
-      return fallback;
+      // A failed scope lookup is not proof that a pin cannot exist (Lumen,
+      // #681 round 1): one transient exception here must not route a
+      // prefixed key by the sender's repo.
+      return { ...fallback, project: unreadable() };
     }
     if (!workspaceId) return fallback;
     try {
@@ -1327,6 +1331,36 @@ export class SessionService implements ISessionService {
    * read is skipped too: unverifiable is not the same as verified, and the
    * rungs below decide from the project's repo.
    */
+  /**
+   * The thread-key REUSE rung runs after routing, and when routing produced
+   * no studio — a deferred D1 create, or a refusal — its lookup is unscoped:
+   * any live session on the thread qualifies. For a project-pinned thread
+   * that is the incident's own session, bound to the wrong-repo overflow,
+   * reselected before the create boundary could provision in the project
+   * repo or the refusal could hold (Lumen, #681 round 1). Same test as
+   * continuity: a pinned thread reuses a session only when its studio is in
+   * the project's repo; a project with no repo reuses nothing and holds.
+   */
+  private async threadMatchAllowed(
+    userId: string,
+    match: Session,
+    projectRepo: ThreadProjectRepo | null | undefined,
+    threadKey: string
+  ): Promise<boolean> {
+    if (!projectRepo) return true;
+    if (!projectRepo.repoRoot || !match.studioId) {
+      logger.warn('[StudioResolve] Thread-key reuse refused — pinned project repo unverifiable', {
+        threadKey,
+        sessionId: match.id,
+        studioId: match.studioId ?? null,
+        project: projectRepo.slug,
+        projectRepoRoot: projectRepo.repoRoot,
+      });
+      return false;
+    }
+    return this.continuityStudioAllowed(userId, match.studioId, { threadKey, projectRepo });
+  }
+
   private async continuityStudioAllowed(
     userId: string,
     studioId: string,
@@ -3054,7 +3088,10 @@ export class SessionService implements ISessionService {
           // See findByAlias — canonical identity, not the ambiguous slug.
           identitySbId
         );
-        if (threadMatch) {
+        if (
+          threadMatch &&
+          (await this.threadMatchAllowed(userId, threadMatch, projectRepo, options.threadKey))
+        ) {
           this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
           return this.withStudioLease(threadMatch, routing, leaseCtx);
         }

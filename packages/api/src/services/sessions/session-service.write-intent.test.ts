@@ -49,6 +49,7 @@ vi.mock('../../utils/logger.js', () => ({
 
 import { SessionService } from './session-service.js';
 import type { Session } from './types.js';
+import { workspaceOfSb } from '../principals.js';
 
 function threadChain(result: { data?: unknown; error?: { message: string } | null }) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -339,6 +340,35 @@ describe('resolveThreadBehavior — the pinned project and its repo (task b5c71b
       studioPolicy: 'reuse-only',
       project: null,
     });
+  });
+
+  it('a workspace lookup THROW holds a key that may carry a prefix; a null workspace keeps the degrade', async () => {
+    // A failed scope lookup is not proof that a pin cannot exist (Lumen,
+    // #681 round 1): one transient exception must not route `inktrade:pr:1`
+    // by the sender's repo. An identity with NO workspace is a positive
+    // answer — no thread row can have been pinned in one — and degrades.
+    vi.mocked(workspaceOfSb).mockRejectedValueOnce(new Error('transient lookup failure'));
+    const { service: thrown } = serviceWithTables({
+      inbox_threads: { data: { key_type: 'pr', key_project: 'inktrade' } },
+      projects: { data: { slug: 'inktrade', repo_root: '/repos/inktrade' } },
+    });
+    await expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (thrown as any).resolveThreadBehavior('user-1', 'sb-1', 'inktrade:pr:1')
+    ).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+      project: { slug: 'inktrade', repoRoot: null, cause: 'unreadable' },
+    });
+
+    vi.mocked(workspaceOfSb).mockResolvedValueOnce(null);
+    const { service: none } = serviceWithTables({
+      inbox_threads: { data: { key_type: 'pr', key_project: 'inktrade' } },
+    });
+    await expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (none as any).resolveThreadBehavior('user-1', 'sb-1', 'inktrade:pr:1')
+    ).resolves.toEqual({ writeIntent: 'write', studioPolicy: 'reuse-only', project: null });
   });
 
   it('a registry THROW degrades intent and policy but keeps the readable pin', async () => {
