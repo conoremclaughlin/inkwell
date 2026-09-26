@@ -1192,6 +1192,60 @@ describe('MemoryRepository', () => {
       expect(updateCall.status).toBe('resumable');
     });
 
+    // -------------------------------------------------------------------
+    // Displayed text always carries an age.
+    //
+    // `context`/`headline` and their stamps used to be independent optional
+    // params, so the invariant lived in the one handler that remembered to
+    // pass both. A caller writing the text alone would store something that
+    // renders ageless, which is the exact failure the stamp columns exist to
+    // prevent. The stamp is now applied wherever the text moves.
+    // -------------------------------------------------------------------
+    const updateArg = () =>
+      (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+
+    it('stamps context_updated_at even when the caller does not pass one', async () => {
+      mockSupabase._setReturnData({ ...mockSessionRow, context: 'Working on the thing' });
+
+      await repo.updateSession('session-123', { context: 'Working on the thing' });
+
+      expect(updateArg().context).toBe('Working on the thing');
+      expect(updateArg().context_updated_at).toEqual(expect.any(String));
+    });
+
+    it('stamps headline_updated_at even when the caller does not pass one', async () => {
+      mockSupabase._setReturnData({ ...mockSessionRow, headline: 'One line' });
+
+      await repo.updateSession('session-123', { headline: 'One line' });
+
+      expect(updateArg().headline).toBe('One line');
+      expect(updateArg().headline_updated_at).toEqual(expect.any(String));
+    });
+
+    it('honours an explicit stamp rather than overwriting it with now', async () => {
+      // Control: the auto-stamp must not clobber a caller that does supply one,
+      // or the test above would pass against an implementation that ignores the
+      // parameter entirely.
+      const explicit = new Date('2026-09-11T12:00:00Z');
+      mockSupabase._setReturnData({ ...mockSessionRow, context: 'Round five' });
+
+      await repo.updateSession('session-123', {
+        context: 'Round five',
+        contextUpdatedAt: explicit,
+      });
+
+      expect(updateArg().context_updated_at).toBe(explicit.toISOString());
+    });
+
+    it('leaves both stamps alone when neither text field is written', async () => {
+      mockSupabase._setReturnData({ ...mockSessionRow, status: 'resumable' });
+
+      await repo.updateSession('session-123', { status: 'resumable' });
+
+      expect(updateArg()).not.toHaveProperty('context_updated_at');
+      expect(updateArg()).not.toHaveProperty('headline_updated_at');
+    });
+
     // Without this mapping, handleUpdateSessionPhase can compute an endedAt and
     // have it silently dropped here — which is how `ended_at` stayed NULL on
     // every completed session and made findByThreadKey's `ended_at IS NULL`

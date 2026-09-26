@@ -17,6 +17,7 @@
 
 import type { DataComposer } from '../../data/composer';
 import type { Session } from '../../data/models/memory';
+import type { CurrentWorkAudience } from '../../services/sessions/current-work';
 import { logger } from '../../utils/logger';
 import { getPinnedSlug, getRequestContext, getSessionContext } from '../../utils/request-context';
 
@@ -156,6 +157,24 @@ export function isSessionAuthorized(
   if (!isIdentityAuthorized(session, userId, caller)) return false;
   if (!caller.agentBound) return true;
   return (session.contactId ?? null) === (caller.contactId ?? null);
+}
+
+/**
+ * Which disclosure tier `caller` gets for `session`'s current work.
+ *
+ * A function rather than a ternary at each call site, because the ternary was
+ * the bug. Four surfaces each wrote `authorized ? 'owner' : 'peer'`, which reads
+ * as a local display choice and is actually a policy decision about what crosses
+ * an identity boundary — so the wrong answer was written four times and every
+ * new surface would have copied it from its neighbour. Here, the mapping from
+ * authorization to disclosure is one edit away from the rule it depends on.
+ */
+export function currentWorkAudience(
+  session: Session,
+  userId: string,
+  caller: CallerIdentity
+): CurrentWorkAudience {
+  return isSessionAuthorized(session, userId, caller) ? 'owner' : 'none';
 }
 
 /** Why the ambient session could not be used. */

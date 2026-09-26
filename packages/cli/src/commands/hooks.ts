@@ -36,6 +36,7 @@ import {
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
+import { formatCurrentWork } from '../lib/current-work.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1209,7 +1210,7 @@ export function buildMemoriesBlock(bootstrapResult: Record<string, unknown>): st
   return lines.join('\n');
 }
 
-function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined): string {
+export function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined): string {
   if (!sessions || sessions.length === 0) return '';
   const lines = ['### Active Sessions'];
   for (const s of sessions) {
@@ -1218,6 +1219,12 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
     const phase = s.currentPhase ? ` — phase: ${s.currentPhase}` : '';
     const lifecycle = s.lifecycle ? ` [${s.lifecycle}]` : '';
     lines.push(`- ${id}${agent}${lifecycle}${phase}`);
+    // What the session says it is working on, dated. This is the line that
+    // makes the block answer "who is doing what" without a tool call.
+    const work = formatCurrentWork(s);
+    if (work) {
+      lines.push(`  > Now: ${work}`);
+    }
     if (s.context) {
       lines.push(`  > Context: ${s.context}`);
     }

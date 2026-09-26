@@ -28,6 +28,7 @@ import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
 import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
+import { formatCurrentWork } from '../lib/current-work.js';
 import {
   getCurrentRuntimeSession,
   listRuntimeSessions,
@@ -448,7 +449,7 @@ function truncateForStartupContext(value: string, maxChars: number): string {
   return `${value.slice(0, maxChars)}\n\n...[truncated]`;
 }
 
-function buildInjectedStartupContext(
+export function buildInjectedStartupContext(
   bootstrap: BootstrapContextResult,
   sessionIds?: { inkSessionId?: string; studioId?: string; studioName?: string }
 ): string {
@@ -521,7 +522,11 @@ function buildInjectedStartupContext(
         typeof session.threadKey === 'string' && session.threadKey.length > 0
           ? session.threadKey
           : '-';
-      return `- ${id} phase=${phase} thread=${thread}`;
+      // Dated current work, on its own line so a long headline cannot push the
+      // id/phase/thread triple out of alignment.
+      const work = formatCurrentWork(session);
+      const now = work ? `\n  now: ${work}` : '';
+      return `- ${id} phase=${phase} thread=${thread}${now}`;
     });
     sections.push(`### ACTIVE SESSIONS\n${sessionLines.join('\n')}`);
   }
