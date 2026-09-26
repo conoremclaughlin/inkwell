@@ -29,6 +29,7 @@ import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
 import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
+import { createBrowserCompanionRouter } from '../routes/browser-companion';
 import { createAlertsRouter } from '../routes/alerts';
 import { AlertDispatchService } from '../services/alerts/alert-dispatch.service';
 import { startStalenessSweep } from '../services/alerts/alert-sweep';
@@ -993,6 +994,12 @@ export class MCPServer {
     const hookLifecycleRouter = createHookLifecycleRouter(this.dataComposer);
     app.use('/api/hooks', hookLifecycleRouter);
     logger.info('Hook lifecycle routes registered at /api/hooks');
+
+    // The only surface a `browser_client` credential can reach. Its own
+    // middleware denies by default, so mounting it does not widen anything
+    // that is not on its allowlist.
+    app.use('/api/browser-companion', createBrowserCompanionRouter(this.dataComposer.getClient()));
+    logger.info('Browser companion routes registered at /api/browser-companion');
 
     if (this.config.getSessionService) {
       const chatRouter = createChatRouter(this.config.getSessionService);
