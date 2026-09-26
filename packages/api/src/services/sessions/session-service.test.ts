@@ -2635,6 +2635,12 @@ describe('SessionService', () => {
       expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
     });
 
+    it('declines a session belonging to another identity of the same slug', async () => {
+      const { service } = replyFixture({ authoring: { sbId: 'sb-other-wren' } });
+
+      expect((await reply(service)).id).toBe('home');
+    });
+
     describe('per-sender isolation, in both directions, as general reuse applies it', () => {
       it("declines an owner session for a contact's reply", async () => {
         const { service } = replyFixture();
@@ -2781,7 +2787,13 @@ describe('SessionService', () => {
       });
     });
 
-    it('checks again at dequeue: a queued reply does not resume a session that ended meanwhile', async () => {
+    /**
+     * A reply that queues behind its own session's running turn is admitted
+     * twice. Both outcomes are pinned: the dequeue check must be able to say
+     * yes as well as no, or a check that always declined would pass the
+     * second case alone.
+     */
+    async function queueTwoReplies(opts: { endWhileQueued: boolean }) {
       const { service, authoring } = replyFixture();
       let release!: () => void;
       const parked = new Promise<void>((resolve) => (release = resolve));
@@ -2801,15 +2813,27 @@ describe('SessionService', () => {
           (service as unknown as { pendingQueues: Map<string, unknown[]> }).pendingQueues.size
         ).toBe(1)
       );
-      // Admitted on arrival (it queued behind its own session), then the
-      // session ends while the message waits.
-      authoring.endedAt = new Date();
+      // Admitted on arrival: it queued behind its own session.
+      if (opts.endWhileQueued) authoring.endedAt = new Date();
       release();
       const [, queued] = await Promise.all([first, second]);
 
       const resumed = vi
         .mocked(mockClaudeRunner.run)
         .mock.calls.map(([, config]) => (config as { backendSessionId?: string }).backendSessionId);
+      return { resumed, queued };
+    }
+
+    it('checks again at dequeue: a queued reply still resumes a session that can take it', async () => {
+      const { resumed, queued } = await queueTwoReplies({ endWhileQueued: false });
+
+      expect(resumed).toEqual(['backend-authoring', 'backend-authoring']);
+      expect(queued.sessionId).toBe('authoring');
+    });
+
+    it('checks again at dequeue: a queued reply does not resume a session that ended meanwhile', async () => {
+      const { resumed, queued } = await queueTwoReplies({ endWhileQueued: true });
+
       expect(resumed).toEqual(['backend-authoring', 'backend-home']);
       expect(queued.sessionId).toBe('home');
     });
