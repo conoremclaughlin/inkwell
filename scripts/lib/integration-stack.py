@@ -117,9 +117,13 @@ def port_preflight(ports):
                 elif field.startswith("c"):
                     owners.append(field[1:] + " (PID " + pid + ")")
         unavailable = bool(owners)
-        # REUSEADDR avoids treating a completed client's TIME_WAIT socket as
-        # a server. On macOS a wildcard bind can coexist with a loopback bind,
-        # so probe each exact loopback as well as the wildcard listeners.
+        # On macOS, REUSEADDR lets this probe bind past a client socket that
+        # holds the port, open or in TIME_WAIT. On Linux it does not: a client
+        # whose ephemeral local port is ours refuses the probe in both states,
+        # with no listener for lsof to name ("owner unavailable"). CI reserves
+        # the ports from the ephemeral range for that reason (ci.yml). On macOS
+        # a wildcard bind can coexist with a loopback bind, so probe each exact
+        # loopback as well as the wildcard listeners.
         for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET, "0.0.0.0"),
                              (socket.AF_INET6, "::1"), (socket.AF_INET6, "::")):
             if unavailable:
