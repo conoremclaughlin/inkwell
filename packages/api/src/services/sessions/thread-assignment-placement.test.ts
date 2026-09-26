@@ -492,6 +492,57 @@ describe('repair is a CAS, and inline delivery needs the stamp (Lumen, #681 roun
     );
   });
 
+  it('a route-only dispatch whose repair does not land fails visibly — never a spawn', async () => {
+    // routeOnly is "assign, do not wake". Its assignment failure was thrown
+    // as a plain Error inside the plan block, whose catch falls through to
+    // handleMessage: a no-wake dispatch became a spawn (Lumen, #681 round 4).
+    const w = makeWorld();
+    let writeFaulted = false;
+    w.assignment.mockImplementation(async (client, params) => {
+      if (!params.supersedeSessionId) return assignThreadParticipant(client, params);
+      const faulty = {
+        from(table: string) {
+          const delegate = client.from(table);
+          if (table !== 'inbox_thread_participants') return delegate;
+          return {
+            ...delegate,
+            update() {
+              writeFaulted = true;
+              const q = {
+                eq: () => q,
+                select: async () => ({ data: null, error: { message: 'synthetic write fault' } }),
+              };
+              return q;
+            },
+          };
+        },
+      };
+      return assignThreadParticipant(faulty as never, params);
+    });
+
+    const error = await w.trigger({ routeOnly: true });
+    expect(writeFaulted).toBe(true);
+    expect(w.stamp()).toBe('old-session');
+    expect(error).not.toBeNull();
+    expect(String((error as Error).message)).toMatch(/routeOnly/);
+    expect(w.handleMessage).not.toHaveBeenCalled();
+  });
+
+  it('control: a route-only dispatch whose repair lands is assignment only, no wake', async () => {
+    const w = makeWorld();
+    const error = await w.trigger({ routeOnly: true });
+    expect(error).toBeNull();
+    const candidate = (await w.repository.create.mock.results[0].value) as Session;
+    expect(w.stamp()).toBe(candidate.id);
+    expect(w.handleMessage).not.toHaveBeenCalled();
+    expect(w.logInkmail).toHaveBeenCalledWith(
+      'inkmail_deliver',
+      expect.anything(),
+      USER,
+      expect.objectContaining({ deliveryMethod: 'route_only' })
+    );
+  });
+
   it('control: inline delivery proceeds when the repair lands on the CLI session', async () => {
     const w = makeWorld();
     w.addCorrectCli();

@@ -1443,7 +1443,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             threadId: payload.threadId,
             error: assignmentFailure,
           });
-          throw new Error(`routeOnly assignment failed for ${targetSlug}: ${assignmentFailure}`);
+          // Coded so the plan block's catch below rethrows it: routeOnly is
+          // "assign, do not wake", and a swallowed failure fell through to
+          // handleMessage — a no-wake dispatch turned into a spawn (Lumen,
+          // #681 round 4).
+          const failed = new Error(
+            `routeOnly assignment failed for ${targetSlug}: ${assignmentFailure}`
+          ) as Error & { code?: string };
+          failed.code = 'ROUTE_ONLY_ASSIGNMENT_FAILED';
+          throw failed;
         }
         // Terminal for routeOnly: assignment is the whole job and it landed.
         await clearHoldAtTerminal();
@@ -1599,10 +1607,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         throw err;
       }
 
-      // An inline refusal is a delivery decision, not a resolution failure:
-      // spawning would put a second process on a live CLI session, the very
-      // thing the inline path exists to avoid. Surface it.
-      if ((err as { code?: string })?.code === 'INLINE_STAMP_MISMATCH') throw err;
+      // Delivery decisions are not resolution failures, and must not fall
+      // through to a spawn: an inline refusal (spawning would put a second
+      // process on a live CLI session) and a routeOnly failure (no-wake must
+      // never become a wake). Surface both.
+      const code = (err as { code?: string })?.code;
+      if (code === 'INLINE_STAMP_MISMATCH' || code === 'ROUTE_ONLY_ASSIGNMENT_FAILED') throw err;
 
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
