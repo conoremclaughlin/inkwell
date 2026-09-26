@@ -1191,12 +1191,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // routingHold stamp.
     const refuseAndHold = async (refusal: {
       threadKey: string;
-      detail: {
-        triedCallerRepo: boolean;
-        callerRepoRoot?: string;
-        reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
-        occupied?: { studioId: string; holderThreadKey: string };
-      };
+      // The refusal's own detail shape, so a new reason (project-without-repo,
+      // task b5c71bc3) reaches the hold instead of being narrowed away here.
+      detail: RoutingRefusedError['detail'];
       message: string;
     }): Promise<void> => {
       // ERROR, not warn. processTrigger converts the failure into a
@@ -1209,12 +1206,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         triedCallerRepo: refusal.detail.triedCallerRepo,
         callerRepoRoot: refusal.detail.callerRepoRoot || null,
         ...(refusal.detail.occupied ? { occupied: refusal.detail.occupied } : {}),
+        ...(refusal.detail.project ? { project: refusal.detail.project } : {}),
         recovery:
           refusal.detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
             : refusal.detail.reason === 'ambiguous-identity'
               ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
-              : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+              : refusal.detail.reason === 'project-without-repo'
+                ? "set the project's repo_root — save_project(name, repoRoot) — then re-send; the sender's repo was not consulted"
+                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
       });
 
       await logInkmail('inkmail_fail', payload, userId, {
@@ -1236,6 +1236,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             callerRepoRoot: refusal.detail.callerRepoRoot ?? null,
             reason: refusal.detail.reason,
             occupied: refusal.detail.occupied ?? null,
+            // The pinned project a project-without-repo refusal names; this
+            // hand-built copy is where it went missing (Lumen, #681 round 1).
+            project: refusal.detail.project ?? null,
           },
         });
       }
@@ -1258,6 +1261,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        // Only a CALLER-named recipientSessionId is addressing; one inferred
+        // from thread history / the participant stamp is a continuity hint
+        // that routing tests against the thread's project repo (#681 r2).
+        recipientSessionExplicit: !!payload.explicitRecipientTarget,
         repoRoot:
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
@@ -1287,6 +1294,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // invisible. Wake dispatches tolerate it (the wake surfaces the
       // message and the next dispatch retries the stamp).
       let assignmentFailure: string | null = null;
+      // The session the durable participant stamp names after assignment (and
+      // any repair). Inline delivery is real only when this is the delivery
+      // session: under stamped-only polling a CLI sees a thread only through
+      // its own stamp (Lumen, #681 round 3).
+      let stampedSessionId: string | null = null;
       if (payload.threadId && routedSession.id) {
         try {
           const assignment = await assignThreadParticipant(dataComposer!.getClient(), {
@@ -1298,13 +1310,31 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           });
           if (!assignment.stampPersisted) {
             assignmentFailure = `participant stamp not persisted (boundVia=${assignment.boundVia})`;
+          } else {
+            stampedSessionId = assignment.sessionId;
           }
           if (assignment.rerouted) {
             // A concurrent dispatch (or an existing live binding) won — deliver
             // to the winner, and archive our freshly-created loser candidate so
             // it doesn't linger as an empty routable session.
             const winner = await sessionService!.getSession(assignment.sessionId);
-            if (winner) {
+            // The stamp is continuity, not an address (spec §3b.1) — and on a
+            // project-pinned thread the 2026-09-24 mis-route left a stamp
+            // naming a session in the WRONG repo. Promoting that winner
+            // discarded routing's correct answer one boundary later (Lumen,
+            // #681 r2). A winner outside the thread's project repo is
+            // repaired to the routed candidate under an explicit anchor; if
+            // the repair does not land, delivery still follows the candidate
+            // and the failure is recorded — never the incompatible winner.
+            const winnerAllowed = winner
+              ? await sessionService!.sessionAllowedForThread(
+                  userId,
+                  resolvedIdentityId,
+                  payload.threadKey,
+                  winner
+                )
+              : false;
+            if (winner && winnerAllowed) {
               deliverySession = winner;
               const candidateIsFresh =
                 routedSession.messageCount === 0 && !routedSession.backendSessionId;
@@ -1315,6 +1345,66 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                     error: e instanceof Error ? e.message : String(e),
                   })
                 );
+              }
+            } else if (winner) {
+              // A CAS on the rejected winner, not a retarget (round 3): a
+              // stamp that moved while we validated belongs to whoever moved
+              // it. That newer winner is validated in turn — once; a second
+              // repair would be two writers repairing each other.
+              const repaired = await assignThreadParticipant(dataComposer!.getClient(), {
+                threadId: payload.threadId,
+                sbId: resolvedIdentityId,
+                candidateSessionId: routedSession.id,
+                explicitAnchor: false,
+                supersedeSessionId: winner.id,
+                source: 'trigger-handler',
+              });
+              if (repaired.stampPersisted && repaired.sessionId === routedSession.id) {
+                stampedSessionId = routedSession.id;
+                logger.warn(
+                  '[Trigger] Repaired participant stamp — winner was outside the thread project repo',
+                  {
+                    threadId: payload.threadId,
+                    threadKey: payload.threadKey,
+                    sbSlug: targetSlug,
+                    previousSessionId: winner.id,
+                    previousStudioId: winner.studioId ?? null,
+                    sessionId: routedSession.id,
+                    studioId: routedSession.studioId ?? null,
+                  }
+                );
+              } else if (repaired.rerouted && repaired.sessionId !== winner.id) {
+                stampedSessionId = repaired.sessionId;
+                const newer = await sessionService!.getSession(repaired.sessionId);
+                const newerAllowed = newer
+                  ? await sessionService!.sessionAllowedForThread(
+                      userId,
+                      resolvedIdentityId,
+                      payload.threadKey,
+                      newer
+                    )
+                  : false;
+                if (newer && newerAllowed) {
+                  deliverySession = newer;
+                  logger.info(
+                    '[Trigger] Repair lost to a newer compatible stamp — delivering there',
+                    {
+                      threadId: payload.threadId,
+                      threadKey: payload.threadKey,
+                      sessionId: newer.id,
+                      studioId: newer.studioId ?? null,
+                    }
+                  );
+                } else {
+                  assignmentFailure =
+                    `participant stamp moved to ${repaired.sessionId} during repair and that ` +
+                    `session is also outside the thread project repo`;
+                }
+              } else {
+                if (repaired.stampPersisted) stampedSessionId = repaired.sessionId;
+                assignmentFailure =
+                  `participant stamp names a session outside the thread project repo ` +
+                  `and could not be repaired (boundVia=${repaired.boundVia})`;
               }
             }
           }
@@ -1353,7 +1443,15 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             threadId: payload.threadId,
             error: assignmentFailure,
           });
-          throw new Error(`routeOnly assignment failed for ${targetSlug}: ${assignmentFailure}`);
+          // Coded so the plan block's catch below rethrows it: routeOnly is
+          // "assign, do not wake", and a swallowed failure fell through to
+          // handleMessage — a no-wake dispatch turned into a spawn (Lumen,
+          // #681 round 4).
+          const failed = new Error(
+            `routeOnly assignment failed for ${targetSlug}: ${assignmentFailure}`
+          ) as Error & { code?: string };
+          failed.code = 'ROUTE_ONLY_ASSIGNMENT_FAILED';
+          throw failed;
         }
         // Terminal for routeOnly: assignment is the whole job and it landed.
         await clearHoldAtTerminal();
@@ -1420,6 +1518,32 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const delivery = decideDelivery({ forceSpawn, pollRow, attachedRow });
 
       if (delivery.mode === 'inline') {
+        // Stamped-only polling: the CLI on the delivery session sees this
+        // thread only if the durable stamp names that session. Reporting
+        // "delivered inline" on any other stamp is a lie the sender cannot
+        // detect, so a thread-bearing inline delivery requires a landed,
+        // compatible stamp — otherwise fail visibly and let the retry
+        // scheduler and the failure notice do their jobs (Lumen, #681 r3).
+        if (payload.threadId && stampedSessionId !== deliverySession.id) {
+          logger.error(
+            '[Trigger] Inline delivery refused — participant stamp names another session',
+            {
+              targetSlug,
+              threadKey: payload.threadKey,
+              threadId: payload.threadId,
+              deliverySessionId: deliverySession.id,
+              stampedSessionId,
+              assignmentFailure,
+            }
+          );
+          const refused = new Error(
+            `inline delivery for ${targetSlug} refused: the participant stamp names ` +
+              `${stampedSessionId ?? 'no session'}, not the delivery session ${deliverySession.id}` +
+              (assignmentFailure ? ` (${assignmentFailure})` : '')
+          ) as Error & { code?: string };
+          refused.code = 'INLINE_STAMP_MISMATCH';
+          throw refused;
+        }
         // Terminal for inline: the delivery decision is made and the channel
         // plugin owns it from here — no admission remains that could refuse.
         await clearHoldAtTerminal();
@@ -1457,6 +1581,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       request.metadata = {
         ...request.metadata,
         recipientSessionId: deliverySession.id,
+        // Provenance travels with the anchor (Lumen, #681 r2): a caller-named
+        // target stays addressing through admission; a routed or repaired
+        // candidate is promoted as the continuity hint it is, and admission
+        // re-checks it against the thread's project repo.
+        recipientSessionExplicit: !!payload.explicitRecipientTarget,
       };
     } catch (err) {
       // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
@@ -1477,6 +1606,13 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // Nothing is spawned: the throw exits the handler before handleMessage.
         throw err;
       }
+
+      // Delivery decisions are not resolution failures, and must not fall
+      // through to a spawn: an inline refusal (spawning would put a second
+      // process on a live CLI session) and a routeOnly failure (no-wake must
+      // never become a wake). Surface both.
+      const code = (err as { code?: string })?.code;
+      if (code === 'INLINE_STAMP_MISMATCH' || code === 'ROUTE_ONLY_ASSIGNMENT_FAILED') throw err;
 
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {

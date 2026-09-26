@@ -235,6 +235,65 @@ describe('assignThreadParticipant', () => {
     expect(r.stampPersisted).toBe(false);
   });
 
+  /*
+   * Project repair (PR #681 round 3). The trigger handler replaces a stamp
+   * that names a session outside the thread's project repo with the routed
+   * candidate. That write is a CAS on the REJECTED stamp, never a retarget:
+   * a stamp that moved meanwhile belongs to whoever moved it.
+   */
+  it('supersede replaces exactly the rejected stamp (CAS on session_id)', async () => {
+    const db = mockDb({ currentStamp: 's-wrong', updateAffects: 1 });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-candidate',
+      explicitAnchor: false,
+      supersedeSessionId: 's-wrong',
+    });
+    expect(r).toEqual({
+      sessionId: 's-candidate',
+      rerouted: false,
+      boundVia: 'project-repair',
+      stampPersisted: true,
+    });
+    expect(db.getUpdates()).toEqual([{ session_id: 's-candidate' }]);
+    // The guard: the UPDATE was filtered on the stamp being replaced.
+    const participantEqCalls = db.from.mock.results
+      .map((res) => res.value as { eq: { mock: { calls: unknown[][] } } })
+      .flatMap((chain) => chain.eq?.mock?.calls ?? []);
+    expect(participantEqCalls).toContainEqual(['session_id', 's-wrong']);
+  });
+
+  it('supersede that loses to a newer stamp reroutes to it — never overwrites', async () => {
+    const db = mockDb({ currentStamp: 's-wrong', updateAffects: 0, stampAfterRace: 's-newer' });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-candidate',
+      explicitAnchor: false,
+      supersedeSessionId: 's-wrong',
+    });
+    expect(r).toEqual({
+      sessionId: 's-newer',
+      rerouted: true,
+      boundVia: 'continuity',
+      stampPersisted: true,
+    });
+  });
+
+  it('FAIL-SAFE: a supersede write ERROR never claims the candidate is stamped', async () => {
+    const db = mockDb({ currentStamp: 's-wrong', updateAffects: 0, updateError: true });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-candidate',
+      explicitAnchor: false,
+      supersedeSessionId: 's-wrong',
+    });
+    // Recovery reread the durable stamp: still the rejected one, so delivery
+    // must not believe the repair landed.
+    expect(r.sessionId).toBe('s-wrong');
+    expect(r.rerouted).toBe(true);
+    expect(r.stampPersisted).toBe(true);
+  });
+
   it('no-ops when already bound to the candidate', async () => {
     const db = mockDb({ currentStamp: 's-same', updateAffects: 0 });
     const r = await assignThreadParticipant(db, {
