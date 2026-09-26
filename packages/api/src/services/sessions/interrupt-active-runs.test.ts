@@ -1381,7 +1381,7 @@ describe('turn-epoch candidate threading (round 9)', () => {
   it('handleMessage mints the candidate BEFORE routing and threads it into both consumers', () => {
     const handle = source.indexOf('async handleMessage(');
     const mint = source.indexOf('const turnEpochCandidate = randomUUID();', handle);
-    const routed = source.indexOf('turnEpochCandidate,', mint);
+    const routed = source.indexOf('sessionRoutingOptions(request, turnEpochCandidate)', mint);
     const processed = source.indexOf(
       'this.processMessage(request, session, turnEpochCandidate)',
       mint
@@ -1392,15 +1392,38 @@ describe('turn-epoch candidate threading (round 9)', () => {
     expect(processed).toBeGreaterThan(mint); // and into the turn itself
   });
 
+  it('the routing options builder forwards the candidate it is given', () => {
+    // Both resolutions (arrival and dequeue) build their options here, so a
+    // builder that dropped the candidate would unfence every lease it stamps.
+    const builder = source.indexOf('\nfunction sessionRoutingOptions(');
+    const end = source.indexOf('\n}\n', builder);
+    const forwarded = source.indexOf('    turnEpochCandidate,\n', builder);
+    expect(builder).toBeGreaterThan(-1);
+    expect(forwarded).toBeGreaterThan(builder);
+    expect(forwarded).toBeLessThan(end);
+  });
+
   it('a QUEUED message keeps ITS candidate — dequeue re-routes and runs under the same value', () => {
     // The pre-queue resolution already stamped leases with this candidate;
     // reminting at dequeue would orphan those stamps.
     const queued = source.indexOf('queue.push({ request, resolve, reject, turnEpochCandidate })');
-    const dequeueRoute = source.indexOf('turnEpochCandidate: pending.turnEpochCandidate');
-    const dequeueRun = source.indexOf('pending.turnEpochCandidate\n        )');
+    const dequeueRoute = source.indexOf(
+      'sessionRoutingOptions(pending.request, pending.turnEpochCandidate)'
+    );
+    // A dequeued message runs in runQueuedTurn, whether it stayed on its lock
+    // or moved to the lock of the session it re-resolved to.
+    const runner = source.indexOf('private async runQueuedTurn(');
+    const dequeueRun =
+      runner +
+      source
+        .slice(runner)
+        .search(
+          /this\.processMessage\(\s*pending\.request,\s*session,\s*pending\.turnEpochCandidate\s*\)/
+        );
     expect(queued).toBeGreaterThan(-1);
     expect(dequeueRoute).toBeGreaterThan(-1);
-    expect(dequeueRun).toBeGreaterThan(dequeueRoute);
+    expect(runner).toBeGreaterThan(dequeueRoute);
+    expect(dequeueRun).toBeGreaterThan(runner);
   });
 
   it('BOTH lease acquisitions in withStudioLease stamp the candidate', () => {
