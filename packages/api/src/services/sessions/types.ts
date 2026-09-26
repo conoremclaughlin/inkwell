@@ -241,6 +241,13 @@ export interface SessionRequest {
     contactId?: string;
     // Recipient session to inherit studio scope from
     recipientSessionId?: string;
+    /**
+     * True only when the CALLER named recipientSessionId. A value inferred
+     * from thread history or the participant stamp is a continuity hint and,
+     * on a project-pinned thread, must pass the project repo test (task
+     * b5c71bc3, Lumen #681 r2).
+     */
+    recipientSessionExplicit?: boolean;
     // The session that wrote the message this one replies to. A preference,
     // unlike recipientSessionId: honoured only while that session can safely
     // take the turn, otherwise the message routes unanchored.
@@ -349,10 +356,12 @@ export interface SessionResult {
     detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
       anchor?: 'studio' | 'session';
       occupied?: { studioId: string; holderThreadKey: string };
       policy?: 'reuse-only';
+      /** The thread's pinned project, when the decision was made by it (task b5c71bc3). */
+      project?: { slug: string; cause?: 'unset' | 'unresolved' | 'unreadable'; repoRoot?: string };
     };
   };
 }
