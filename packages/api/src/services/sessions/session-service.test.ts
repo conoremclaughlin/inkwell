@@ -2480,6 +2480,104 @@ describe('SessionService', () => {
       // Falls through to normal creation
       expect(mockRepository.create).toHaveBeenCalled();
     });
+
+    /**
+     * Telegram replies anchor to the session that wrote the message, and the
+     * channel handler also passes the sender's contact for per-sender agents.
+     * They are the first caller to pass both, so the anchor now has to respect
+     * contact isolation the way every reuse rung already does.
+     */
+    describe('contact isolation', () => {
+      it('never lands a contact-scoped request in a session outside that contact', async () => {
+        // A contact replies to a message the OWNER's session sent into their
+        // chat. The contact's own session is the plausible fallback: if the
+        // guard leaks, resolution returns the owner's session instead.
+        const ownerSession = createMockSession({ id: 'owner-session', sbSlug: 'benson' });
+        const contactSession = createMockSession({
+          id: 'contact-session',
+          sbSlug: 'benson',
+          contactId: 'contact-1',
+        });
+        vi.mocked(mockRepository.findById).mockResolvedValue(ownerSession);
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(contactSession);
+
+        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
+          recipientSessionId: 'owner-session',
+          contactId: 'contact-1',
+        });
+
+        expect(session.id).toBe('contact-session');
+        expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+          'user-456',
+          'benson',
+          expect.objectContaining({ contactId: 'contact-1' })
+        );
+      });
+
+      it("refuses another contact's session as an anchor, too", async () => {
+        const otherContact = createMockSession({
+          id: 'other-contact-session',
+          sbSlug: 'benson',
+          contactId: 'contact-2',
+        });
+        const contactSession = createMockSession({
+          id: 'contact-session',
+          sbSlug: 'benson',
+          contactId: 'contact-1',
+        });
+        vi.mocked(mockRepository.findById).mockResolvedValue(otherContact);
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(contactSession);
+
+        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
+          recipientSessionId: 'other-contact-session',
+          contactId: 'contact-1',
+        });
+
+        expect(session.id).toBe('contact-session');
+      });
+
+      it("routes a contact's reply into that contact's own session", async () => {
+        const contactSession = createMockSession({
+          id: 'authoring-contact-session',
+          sbSlug: 'benson',
+          contactId: 'contact-1',
+        });
+        const newer = createMockSession({
+          id: 'newer-contact-session',
+          sbSlug: 'benson',
+          contactId: 'contact-1',
+        });
+        vi.mocked(mockRepository.findById).mockResolvedValue(contactSession);
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(newer);
+
+        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
+          recipientSessionId: 'authoring-contact-session',
+          contactId: 'contact-1',
+        });
+
+        expect(session.id).toBe('authoring-contact-session');
+      });
+
+      it('leaves an owner-scoped anchor to a contact session as it was', async () => {
+        // One direction only: the owner naming a contact session is not the
+        // leak this guards, and the trigger path relies on anchors it plans.
+        const contactSession = createMockSession({
+          id: 'contact-session',
+          sbSlug: 'benson',
+          contactId: 'contact-1',
+        });
+        vi.mocked(mockRepository.findById).mockResolvedValue(contactSession);
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+          createMockSession({ id: 'owner-session', sbSlug: 'benson' })
+        );
+
+        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
+          recipientSessionId: 'contact-session',
+        });
+
+        expect(session.id).toBe('contact-session');
+      });
+    });
   });
 
   // ============================================================================

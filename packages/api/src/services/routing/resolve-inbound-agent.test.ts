@@ -33,8 +33,15 @@ interface ActivityRow {
   platform_chat_id: string | null;
   agent_id: string | null;
   sb_id: string | null;
+  session_id: string | null;
   payload: Record<string, unknown> | null;
   created_at: string;
+}
+
+interface SessionRow {
+  id: string;
+  user_id: string;
+  ended_at: string | null;
 }
 
 function attributedRow(overrides: Partial<ActivityRow> = {}): ActivityRow {
@@ -46,17 +53,25 @@ function attributedRow(overrides: Partial<ActivityRow> = {}): ActivityRow {
     platform_chat_id: CHAT,
     agent_id: 'wren',
     sb_id: 'sb-wren',
+    session_id: 'session-wren',
     payload: { authorship: 'session' },
     created_at: '2026-09-15T10:00:00Z',
     ...overrides,
   };
 }
 
+const OPEN_SESSION: SessionRow = { id: 'session-wren', user_id: 'user-1', ended_at: null };
+
 /** Filter-applying double, so the real resolver runs against a real query shape. */
-function mockClient(rows: ActivityRow[]) {
+function mockClient(rows: ActivityRow[], sessions: SessionRow[] = [OPEN_SESSION]) {
+  const tables: Record<string, unknown[]> = { activity_stream: rows, sessions };
   const client = {
-    from() {
+    from(table: string) {
       const predicates: Array<(row: Record<string, unknown>) => boolean> = [];
+      const matched = () =>
+        (tables[table] ?? []).filter((row) =>
+          predicates.every((p) => p(row as Record<string, unknown>))
+        );
       const builder = {
         select: () => builder,
         eq(column: string, value: unknown) {
@@ -69,10 +84,10 @@ function mockClient(rows: ActivityRow[]) {
         },
         order: () => builder,
         limit(n: number) {
-          const matched = rows.filter((row) =>
-            predicates.every((p) => p(row as unknown as Record<string, unknown>))
-          );
-          return Promise.resolve({ data: matched.slice(0, n), error: null });
+          return Promise.resolve({ data: matched().slice(0, n), error: null });
+        },
+        maybeSingle() {
+          return Promise.resolve({ data: matched()[0] ?? null, error: null });
         },
       };
       return builder;
@@ -95,12 +110,13 @@ function route(overrides: Record<string, unknown> = {}) {
 
 function resolve(options: {
   rows?: ActivityRow[];
+  sessions?: SessionRow[];
   isGroupChat?: boolean;
   conversationId?: string;
   replyToMessageId?: string;
 }) {
   return resolveInboundAgent({
-    supabase: mockClient(options.rows ?? []),
+    supabase: mockClient(options.rows ?? [], options.sessions),
     userId: 'user-1',
     defaultSlug: DEFAULT_SLUG,
     platform: 'telegram',
@@ -149,7 +165,7 @@ describe('resolveInboundAgent', () => {
       expect(result.source).toBe('reply');
       // The old cascade let the route win here while still reporting the reply
       // as resolved — a wrong recipient wearing a correct-looking explanation.
-      expect(result.replyRouting).toEqual({ resolved: true });
+      expect(result.replyRouting).toEqual({ resolved: true, session: 'authoring' });
       expect(result.routeId).toBeNull();
     });
 
@@ -170,6 +186,50 @@ describe('resolveInboundAgent', () => {
 
       expect(result.sbSlug).toBe('wren');
       expect(result.replyRouting).toBeUndefined();
+      // The mentioned SB did not write the message, so the author's session
+      // is no anchor for it.
+      expect(result.recipientSessionId).toBeUndefined();
+    });
+  });
+
+  describe('the session a reply resumes', () => {
+    it('anchors a reply to the open session that wrote the message', async () => {
+      const result = await resolve({ rows: [attributedRow()], replyToMessageId: '4242' });
+
+      expect(result).toMatchObject({
+        sbSlug: 'wren',
+        source: 'reply',
+        recipientSessionId: 'session-wren',
+        replyRouting: { resolved: true, session: 'authoring' },
+      });
+    });
+
+    it('withholds the anchor once that session has ended, and records why', async () => {
+      const result = await resolve({
+        rows: [attributedRow()],
+        sessions: [{ ...OPEN_SESSION, ended_at: '2026-09-20T12:00:00Z' }],
+        replyToMessageId: '4242',
+      });
+
+      // The author still takes it. Only the session is lost, and it says so.
+      expect(result).toMatchObject({
+        sbSlug: 'wren',
+        source: 'reply',
+        replyRouting: { resolved: true, session: 'session_ended' },
+      });
+      expect(result.recipientSessionId).toBeUndefined();
+    });
+
+    it('carries no anchor when the reply fell through to the channel route', async () => {
+      vi.mocked(resolveRouteSlug).mockResolvedValue(route());
+
+      const result = await resolve({
+        rows: [attributedRow({ payload: {} })],
+        replyToMessageId: '4242',
+      });
+
+      expect(result.source).toBe('channel_route');
+      expect(result.recipientSessionId).toBeUndefined();
     });
   });
 

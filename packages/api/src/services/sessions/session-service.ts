@@ -2699,6 +2699,27 @@ export class SessionService implements ISessionService {
           });
         }
         authorizedRecipientSessionId = undefined;
+      } else if (
+        candidate &&
+        options.contactId &&
+        (candidate.contactId ?? null) !== options.contactId
+      ) {
+        // Per-sender isolation. A contact-scoped request runs only in that
+        // contact's sessions; every reuse rung below filters by contact, and
+        // this anchor must too. Until Telegram replies carried their authoring
+        // session, no caller passed both a contact and an anchor, so nothing
+        // had to ask. Now one does: a contact replying to a message the
+        // owner's session sent into their chat would otherwise land in the
+        // owner's session, with the owner's context and tools.
+        //
+        // One direction only. An owner-scoped request (no contactId) keeps
+        // reaching a contact session it names, as before.
+        logger.warn('[SessionRouting] Refusing recipientSessionId — another contact', {
+          recipientSessionId: options.recipientSessionId,
+          sessionContactId: candidate.contactId ?? null,
+          requestedContactId: options.contactId,
+        });
+        authorizedRecipientSessionId = undefined;
       }
     }
 

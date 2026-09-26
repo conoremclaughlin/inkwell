@@ -56,11 +56,13 @@ const compiled = ts.transpileModule(`const handler = ${extractMessageHandler()};
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 
+// `channelGateway` is injected as undefined: it ends the handler after
+// session routing, before the channel-forwarding steps this probe does not model.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const makeHandler = (deps: Record<string, unknown>): any =>
   new Function(
     'deps',
-    `const { sbSlug, dataComposer, logger, resolveInboundAgent, sessionService } = deps;
+    `const { sbSlug, dataComposer, logger, resolveInboundAgent, sessionService, channelGateway } = deps;
      ${compiled}
      return handler;`
   )(deps);
@@ -78,16 +80,21 @@ function attributedRow(overrides: ActivityRow = {}): ActivityRow {
     platform_chat_id: CHAT,
     agent_id: 'wren',
     sb_id: 'sb-wren',
+    session_id: 'session-wren',
     payload: { authorship: 'session' },
     created_at: '2026-09-15T10:00:00Z',
     ...overrides,
   };
 }
 
-function clientFor(rows: ActivityRow[]) {
+const OPEN_SESSION = { id: 'session-wren', user_id: 'user-1', ended_at: null };
+
+function clientFor(rows: ActivityRow[], sessions: ActivityRow[] = [OPEN_SESSION]) {
+  const tables: Record<string, ActivityRow[]> = { activity_stream: rows, sessions };
   return {
     from(table: string) {
       const predicates: Array<(row: ActivityRow) => boolean> = [];
+      const matched = () => (tables[table] ?? []).filter((row) => predicates.every((p) => p(row)));
       const builder = {
         select: () => builder,
         eq(column: string, value: unknown) {
@@ -100,8 +107,11 @@ function clientFor(rows: ActivityRow[]) {
         },
         order: () => builder,
         limit(n: number) {
-          const matched = rows.filter((row) => predicates.every((p) => p(row)));
-          return Promise.resolve({ data: matched.slice(0, n), error: null });
+          return Promise.resolve({ data: matched().slice(0, n), error: null });
+        },
+        maybeSingle() {
+          if (table !== 'sessions') throw new Error(`unexpected maybeSingle() on ${table}`);
+          return Promise.resolve({ data: matched()[0] ?? null, error: null });
         },
         single() {
           if (table !== 'agent_identities') throw new Error(`unexpected single() on ${table}`);
@@ -116,6 +126,7 @@ function clientFor(rows: ActivityRow[]) {
 /** Run the real handler and capture the SessionRequest it would have dispatched. */
 async function route(options: {
   rows?: ActivityRow[];
+  sessions?: ActivityRow[];
   mention?: { sbSlug: string; sbId: string } | null;
   channelRoute?: { sbSlug: string; sbId: string } | null;
   chatType?: string;
@@ -138,7 +149,7 @@ async function route(options: {
 
   const handler = makeHandler({
     sbSlug: DEFAULT_SLUG,
-    dataComposer: { getClient: () => clientFor(options.rows ?? []) },
+    dataComposer: { getClient: () => clientFor(options.rows ?? [], options.sessions) },
     logger: { info() {}, warn() {}, error() {}, debug() {} },
     resolveInboundAgent,
     sessionService: {
@@ -147,6 +158,7 @@ async function route(options: {
         throw stop;
       },
     },
+    channelGateway: undefined,
   });
 
   await expect(
@@ -188,13 +200,89 @@ describe('the production message handler', () => {
     });
 
     expect(result.sbSlug).toBe(DEFAULT_SLUG);
-    expect(result.metadata.replyRouting).toEqual({ resolved: true });
+    expect(result.metadata.replyRouting).toEqual({ resolved: true, session: 'authoring' });
   });
 
   it('still routes a reply to its author when nothing else matches', async () => {
     const result = await route({ rows: [attributedRow()] });
 
     expect(result.sbSlug).toBe('wren');
-    expect(result.metadata.replyRouting).toEqual({ resolved: true });
+    expect(result.metadata.replyRouting).toEqual({ resolved: true, session: 'authoring' });
+  });
+
+  it('hands session routing the session that wrote the message', async () => {
+    // The cascade can resolve the session and the handler can still drop it on
+    // the way to handleMessage. Only this probe sees the request as dispatched.
+    const result = await route({ rows: [attributedRow()] });
+
+    expect(result.metadata.recipientSessionId).toBe('session-wren');
+  });
+
+  it('dispatches no anchor when the authoring session has ended', async () => {
+    const result = await route({
+      rows: [attributedRow()],
+      sessions: [{ ...OPEN_SESSION, ended_at: '2026-09-20T12:00:00Z' }],
+    });
+
+    expect(result.sbSlug).toBe('wren');
+    expect(result.metadata).not.toHaveProperty('recipientSessionId');
+    expect(result.metadata.replyRouting).toEqual({ resolved: true, session: 'session_ended' });
+  });
+
+  it('says so when an anchored reply lands in a different session', async () => {
+    // Authorization can drop the anchor (another contact or identity), and the
+    // session can end between lookup and routing. Either way the delivery
+    // succeeds, so without this line nothing records that the reply missed.
+    const warn = vi.fn();
+    const handler = makeHandler({
+      sbSlug: DEFAULT_SLUG,
+      dataComposer: { getClient: () => clientFor([attributedRow()]) },
+      logger: { info() {}, warn, error() {}, debug() {} },
+      resolveInboundAgent,
+      sessionService: {
+        handleMessage: async () => ({
+          success: true,
+          sessionId: 'session-elsewhere',
+          responses: [],
+        }),
+      },
+      channelGateway: undefined,
+    });
+
+    await handler('telegram', CHAT, { id: 'sender-1', name: 'Sender' }, 'a reply', {
+      userId: 'user-1',
+      replyToMessageId: '4242',
+      chatType: 'direct',
+    });
+
+    expect(warn).toHaveBeenCalledWith(
+      '[Route] Reply was anchored to its authoring session but landed elsewhere',
+      expect.objectContaining({
+        authoringSessionId: 'session-wren',
+        routedSessionId: 'session-elsewhere',
+      })
+    );
+  });
+
+  it('stays quiet when the anchored reply lands where it was aimed', async () => {
+    const warn = vi.fn();
+    const handler = makeHandler({
+      sbSlug: DEFAULT_SLUG,
+      dataComposer: { getClient: () => clientFor([attributedRow()]) },
+      logger: { info() {}, warn, error() {}, debug() {} },
+      resolveInboundAgent,
+      sessionService: {
+        handleMessage: async () => ({ success: true, sessionId: 'session-wren', responses: [] }),
+      },
+      channelGateway: undefined,
+    });
+
+    await handler('telegram', CHAT, { id: 'sender-1', name: 'Sender' }, 'a reply', {
+      userId: 'user-1',
+      replyToMessageId: '4242',
+      chatType: 'direct',
+    });
+
+    expect(warn).not.toHaveBeenCalled();
   });
 });

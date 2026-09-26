@@ -20,6 +20,14 @@
  * A mention wins because it is a deliberate address written in the new message;
  * a reply is a strong signal but a older one.
  *
+ * The author is a SESSION, not only an SB. An SB runs many sessions at once, one
+ * per thread or studio, and the reply is an answer to the one that wrote the
+ * message. Handing it to "the SB" lets general reuse pick whichever of that SB's
+ * sessions started most recently, and that session has never seen the message.
+ * So the row's `session_id` is resolved too. It is routable only while the
+ * session is open. Once it has ended, the reply goes to the SB's ordinary
+ * unaddressed destination (its home session), with the reason recorded.
+ *
  * Never guesses. Every non-resolving path returns an explicit reason, because a
  * silent fall back to the channel owner is the behaviour this replaces — and it
  * is invisible precisely because it always produces a plausible recipient.
@@ -41,9 +49,31 @@ export type ReplyAuthorshipFailure =
   /** The lookup itself failed. Distinct from "nothing found". */
   | 'lookup_failed';
 
+/** Why the authoring SESSION cannot take the reply, though its SB is known. */
+export type ReplySessionFailure =
+  /** The session that wrote the message has ended. */
+  | 'session_ended'
+  /** The row names no session that still exists (deletion nulls the column). */
+  | 'session_missing'
+  /** Reading the session failed. Distinct from "it is gone". */
+  | 'session_lookup_failed';
+
+/** Whether the reply can be delivered into the session that wrote the message. */
+export type ReplySession =
+  | { routable: true; sessionId: string }
+  | { routable: false; reason: ReplySessionFailure; sessionId: string | null };
+
 export type ReplyAuthorshipResult =
-  | { resolved: true; sbSlug: string; sbId: string | null }
+  | { resolved: true; sbSlug: string; sbId: string | null; session: ReplySession }
   | { resolved: false; reason: ReplyAuthorshipFailure };
+
+/** The columns of a `message_out` row this module reads. */
+interface OutboundRow {
+  agent_id: string | null;
+  sb_id: string | null;
+  session_id: string | null;
+  payload: unknown;
+}
 
 /**
  * Every shape the same chat can be written in, on either side of the lookup.
@@ -92,7 +122,7 @@ export async function resolveReplyAuthorship(
 
   const { data, error } = await supabase
     .from('activity_stream')
-    .select('agent_id, sb_id, payload')
+    .select('agent_id, sb_id, session_id, payload')
     .eq('user_id', userId)
     .eq('type', 'message_out')
     .eq('platform', platform)
@@ -115,7 +145,7 @@ export async function resolveReplyAuthorship(
     return { resolved: false, reason: 'lookup_failed' };
   }
 
-  const row = data?.[0];
+  const row = data?.[0] as OutboundRow | undefined;
   if (!row) {
     return { resolved: false, reason: 'no_matching_message' };
   }
@@ -133,5 +163,51 @@ export async function resolveReplyAuthorship(
     return { resolved: false, reason: 'unattributed_author' };
   }
 
-  return { resolved: true, sbSlug: row.agent_id, sbId: row.sb_id ?? null };
+  const session = await resolveAuthoringSession(supabase, userId, row.session_id ?? null);
+  return { resolved: true, sbSlug: row.agent_id, sbId: row.sb_id ?? null, session };
+}
+
+/**
+ * Is the session that wrote the message still open to take the reply?
+ *
+ * An `authorship: 'session'` row always had a session when it was written: the
+ * author was read from it. A null here means the session row has since been
+ * deleted (the foreign key sets the column to null), so it reads as missing.
+ *
+ * Only liveness is decided here, on a read scoped to the user. Whether the
+ * session belongs to the routed identity and the sender's contact is checked
+ * where every session anchor is authorized, in SessionService.getOrCreateSession,
+ * so those checks exist in one place only.
+ */
+async function resolveAuthoringSession(
+  supabase: SupabaseClient,
+  userId: string,
+  sessionId: string | null
+): Promise<ReplySession> {
+  if (!sessionId) {
+    return { routable: false, reason: 'session_missing', sessionId: null };
+  }
+
+  const { data, error } = (await supabase
+    .from('sessions')
+    .select('id, ended_at')
+    .eq('id', sessionId)
+    .eq('user_id', userId)
+    .maybeSingle()) as { data: { id: string; ended_at: string | null } | null; error: unknown };
+
+  if (error) {
+    logger.error('[ReplyRoute] Failed to read the authoring session of a reply', {
+      error,
+      userId,
+      sessionId,
+    });
+    return { routable: false, reason: 'session_lookup_failed', sessionId };
+  }
+  if (!data) {
+    return { routable: false, reason: 'session_missing', sessionId };
+  }
+  if (data.ended_at) {
+    return { routable: false, reason: 'session_ended', sessionId };
+  }
+  return { routable: true, sessionId };
 }

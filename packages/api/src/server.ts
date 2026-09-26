@@ -239,6 +239,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     const routeStudioHint = resolution.studioHint;
     const resolvedRouteId = resolution.routeId;
     const replyRouting = resolution.replyRouting;
+    // A reply answers one conversation, and this is the session that held it.
+    // It rides as recipientSessionId, the anchor getOrCreateSession authorizes
+    // (user, identity, contact) before it will route there.
+    const replySessionId = resolution.recipientSessionId;
 
     // Resolve contact for per-sender session isolation (only when agent has session_scope: 'per_sender')
     let contactId: string | undefined;
@@ -319,6 +323,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         triggerType: 'message',
         ...(routeStudioHint ? { studioHint: routeStudioHint } : {}),
         ...(contactId ? { contactId } : {}),
+        ...(replySessionId ? { recipientSessionId: replySessionId } : {}),
         // Carried so a misroute is diagnosable after the fact. Without it, a
         // reply that fell through to the channel owner is indistinguishable
         // from one that was never a reply at all. The cascade withholds this
@@ -329,6 +334,20 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Process through SessionService
     const result = await sessionService!.handleMessage(request);
+
+    // The anchor is a request, not a guarantee: authorization can drop it (a
+    // different contact or identity), and the session can end between the
+    // reply lookup and routing. Say so when it happens, because the result
+    // still looks like an ordinary delivery.
+    if (replySessionId && result.sessionId && result.sessionId !== replySessionId) {
+      logger.warn('[Route] Reply was anchored to its authoring session but landed elsewhere', {
+        channel,
+        conversationId,
+        sbSlug: routedSlug,
+        authoringSessionId: replySessionId,
+        routedSessionId: result.sessionId,
+      });
+    }
 
     // Stamp active session on the channel route so we can verify where
     // messages and heartbeats are landing. Fire-and-forget — don't block response.
