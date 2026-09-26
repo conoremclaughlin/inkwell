@@ -2785,6 +2785,31 @@ describe('SessionService', () => {
         expect((await reply(service, { planOnly: true })).id).toBe('authoring');
         expect(tables.studios[0].lease).toBeNull();
       });
+
+      describe('a studio-bound session with no thread, which has no contract to meet', () => {
+        it('declines while another session holds the studio', async () => {
+          const { service, tables } = replyFixture({
+            authoring: { studioId: 'studio-pr' },
+            lease: foreignLease(),
+          });
+
+          expect((await reply(service)).id).toBe('home');
+          expect(tables.studios[0].lease).toMatchObject({ sessionId: 'another-writer' });
+        });
+
+        it('declines while the studio is free, since no lease can be taken for it', async () => {
+          const { service, tables } = replyFixture({ authoring: { studioId: 'studio-pr' } });
+
+          expect((await reply(service)).id).toBe('home');
+          expect(tables.studios[0].lease).toBeNull();
+        });
+
+        it('declines on a plan resolution too: it is a decision, not an acquisition', async () => {
+          const { service } = replyFixture({ authoring: { studioId: 'studio-pr' } });
+
+          expect((await reply(service, { planOnly: true })).id).toBe('home');
+        });
+      });
     });
 
     /**

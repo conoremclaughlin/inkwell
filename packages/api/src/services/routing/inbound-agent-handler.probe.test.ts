@@ -359,6 +359,8 @@ describe('reply admission, through session routing', () => {
       occupied?: boolean;
       /** The authoring session and its studio close after the reply lookup. */
       endBeforeAdmission?: boolean;
+      /** The authoring session is bound to its studio without a thread. */
+      threadless?: boolean;
     } = {}
   ) {
     const now = new Date().toISOString();
@@ -366,7 +368,7 @@ describe('reply admission, through session routing', () => {
     // would never pick it: landing there can only be the anchor's doing.
     const older = makeSession('older', {
       studioId: 'studio-old',
-      threadKey: 'pr:900001',
+      threadKey: opts.threadless ? undefined : 'pr:900001',
       cliAttached: opts.attached === true,
     });
     const newer = makeSession('newer', { studioId: 'studio-home' });
@@ -596,6 +598,18 @@ describe('reply admission, through session routing', () => {
     expect(r.tables.studios[0].status).toBe('active');
     expect(r.older.studioId).toBe('studio-old');
     expect(r.ensureOverflowStudio).not.toHaveBeenCalled();
+  });
+
+  it('does not enter an occupied studio through a session bound to it without a thread', async () => {
+    // Lumen, PR #682 r2: the lease step ran only for a session with a thread,
+    // so the same occupied studio was open to a threadless session in it.
+    const r = rig({ occupied: true, threadless: true });
+    await r.send();
+
+    expect(r.placed.map((s) => s.studioId)).not.toContain('studio-old');
+    expect(r.placed.map((s) => s.id)).toEqual(['newer']);
+    expect(r.tables.studios[0].lease).toMatchObject({ sessionId: 'another-writer' });
+    expect(r.tables.studios[0].status).toBe('active');
   });
 
   it('does not bind anything to a studio that closed after the reply lookup', async () => {

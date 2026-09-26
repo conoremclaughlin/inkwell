@@ -2681,6 +2681,16 @@ export class SessionService implements ISessionService {
     // Resuming this session is a preference, and neither a new worktree nor a
     // held message is worth it. A plan resolution never acquires; the spawn
     // path's own resolution does.
+    //
+    // A session bound to a studio with no thread has no contract to meet: no
+    // thread says whether a turn there writes, and a lease is only ever taken
+    // under a thread. It declines, on a plan resolution too (Lumen, PR #682
+    // r2). An unthreaded message reaching such a session through general
+    // reuse enters unchecked, as it always has, but that is the newest session.
+    // An anchor would open an older one, whoever holds its studio now.
+    if (session.studioId && !session.threadKey) {
+      return decline('studio_without_thread', { studioId: session.studioId });
+    }
     const leases = this.getLeaseService();
     if (leases && session.studioId && session.threadKey && !ctx.planOnly) {
       const { writeIntent } = await this.resolveThreadBehavior(
