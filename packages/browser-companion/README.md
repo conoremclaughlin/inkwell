@@ -184,6 +184,11 @@ callbacks; these are UI contracts, not server API schemas or authorization.
   page detach, or switching away and back does not clear that guard. This bounded
   in-memory tracking is **not durable idempotency**; the adapter must reconcile
   after a view reload and provide ordered, authenticated snapshots.
+- While a send is pending, the newest same-conversation echo takes precedence
+  over retained evidence, including in a snapshot that changes the page binding.
+  Once reconciled, a later `unknown` row does not automatically re-lock this view;
+  the adapter must distinguish admission evidence from execution uncertainty and
+  own durable retry gating independently of the rendered history window.
 - Echoed local messages stay retired when the supplied history window slides;
   they do not reappear below newer replies. Echo tracking shares the bounded
   local-message buffer rather than accumulating an unbounded ID set.
