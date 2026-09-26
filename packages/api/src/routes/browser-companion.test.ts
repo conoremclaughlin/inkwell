@@ -61,6 +61,8 @@ function liveGrant(overrides: Partial<GrantFixture> = {}): GrantFixture {
 
 let grant: GrantFixture | null = liveGrant();
 let rpcThrows = false;
+/** Fails the `browser_companion_grants` read, which is the pairing-secret lookup. */
+let grantReadThrows = false;
 const rpcCalls: Array<Record<string, unknown>> = [];
 /** Every table `.from()` is opened against, so a read can be asserted absent. */
 const tablesRead: string[] = [];
@@ -134,6 +136,7 @@ function makeFakeClient() {
       builder.maybeSingle = async () => {
         if (table === 'users') return { data: { email: 'companion@example.com' }, error: null };
         if (table === 'browser_companion_grants') {
+          if (grantReadThrows) return { data: null, error: { message: 'connection refused' } };
           // Serves both the pairing-secret lookup and the claim UPDATE; each
           // test sets whichever it exercises.
           return { data: claimResult ?? knownSecretHashRow, error: null };
@@ -181,6 +184,7 @@ describe('browser companion router', () => {
   beforeEach(() => {
     grant = liveGrant();
     rpcThrows = false;
+    grantReadThrows = false;
     rpcCalls.length = 0;
     tablesRead.length = 0;
     knownSecretHashRow = null;
@@ -497,6 +501,71 @@ describe('browser companion router', () => {
       const res = await post('/auth/revoke', {});
       expect(res.status).toBe(401);
       expect(await res.json()).toEqual({ error: 'browser_credential_required' });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  //
+  // Each database read on the revoke path, failed in turn. Express 4 sends
+  // nothing when an async middleware rejects, so the failure these guard
+  // against is a request that never answers. The bounded fetch turns that
+  // into a quick, readable failure instead of the suite's timeout.
+  describe('an outage on the revoke path is a 503, never a refusal', () => {
+    const revoke = (body: unknown, token?: string) =>
+      fetch(`${baseUrl}/auth/revoke`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(2_000),
+      });
+
+    it('answers a failed pairing-secret lookup with 503 and goes no further', async () => {
+      knownSecretHashRow = { id: GRANT_ID, user_id: USER_ID, workspace_id: WORKSPACE_ID };
+      grantReadThrows = true;
+      const res = await revoke({
+        pairingSecret: 'ink-bc-anything',
+        installationId: INSTALLATION_ID,
+      });
+      // Not 401 `invalid_secret`: that would tell the client to discard a
+      // secret that is still good.
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: 'grant_check_unavailable' });
+      // Stopped at the lookup: no ownership check, and no revoke write.
+      expect(rpcCalls).toHaveLength(0);
+      expect(tablesRead).toEqual(['browser_companion_grants']);
+    });
+
+    it('answers a failed ownership check after a pairing-secret lookup with 503', async () => {
+      knownSecretHashRow = { id: GRANT_ID, user_id: USER_ID, workspace_id: WORKSPACE_ID };
+      rpcThrows = true;
+      const res = await revoke({
+        pairingSecret: 'ink-bc-anything',
+        installationId: INSTALLATION_ID,
+      });
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: 'grant_check_unavailable' });
+    });
+
+    it('answers a failed ownership check for a bearer token with 503', async () => {
+      rpcThrows = true;
+      const res = await revoke({}, browserToken());
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: 'grant_check_unavailable' });
+    });
+
+    it('CONTROL: with no outage the same pairing-secret revoke succeeds', async () => {
+      // Without this, the 503s above could be a harness that fails every
+      // secret revoke.
+      knownSecretHashRow = { id: GRANT_ID, user_id: USER_ID, workspace_id: WORKSPACE_ID };
+      const res = await revoke({
+        pairingSecret: 'ink-bc-anything',
+        installationId: INSTALLATION_ID,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ revoked: true, grantId: GRANT_ID });
     });
   });
 

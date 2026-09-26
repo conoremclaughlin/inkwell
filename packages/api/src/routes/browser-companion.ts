@@ -183,7 +183,19 @@ export function createBrowserCompanionRouter(client: SupabaseClient<Database>): 
     // that handler writes `revoked_at` and returns an acknowledgement, and
     // `/session` — the only route that reports anything — is not on it.
     if (route.credential === 'revocation') {
-      const payload = await resolveRevocationCaller(req, grants);
+      // Both awaits on this branch read the database, so both need the catch.
+      // This is Express 4: a rejection escaping an async middleware sends no
+      // response at all, and the caller waits on a socket that never answers.
+      // A failed secret lookup is an outage, the same 503 as a failed ownership
+      // check, and never an `invalid_secret` that would tell the client to
+      // forget a secret that is still good.
+      let payload: RevocationCaller;
+      try {
+        payload = await resolveRevocationCaller(req, grants);
+      } catch {
+        res.status(503).json({ error: 'grant_check_unavailable' });
+        return;
+      }
       if (!payload.ok) {
         res.status(payload.status).json({ error: payload.error });
         return;
