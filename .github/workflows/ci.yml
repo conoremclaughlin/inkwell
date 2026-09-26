@@ -124,7 +124,9 @@ jobs:
       # refuses with "owner unavailable" (exit 75) before a test runs: 6224599b
       # on main and 6b87c0a1 on the release branch, both on 55424. Reserving the
       # ports stops the kernel handing them out; explicit binds still succeed.
-      # First step, so none of this job's own connections can predate it.
+      # First step, so it runs before checkout and every later step. It cannot
+      # cover sockets opened before any step runs: the runner's own, and the
+      # action-package downloads made during "Set up job".
       - name: Reserve the integration stack's ports from the ephemeral range
         run: |
           sudo sysctl -w net.ipv4.ip_local_reserved_ports=55421-55426
