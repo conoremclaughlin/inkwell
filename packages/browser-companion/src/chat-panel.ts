@@ -373,15 +373,18 @@ export function createChatPanel(
     }
   }
 
+  /** Newest supplied echo first; retain evidence when it slides out of the window. */
+  function confirmedStatus(id: string, messages: readonly ChatPanelMessage[]) {
+    const observed =
+      messages.find((message) => message.id === id)?.status ??
+      local.find((message) => message.id === id && message.echoed)?.status;
+    return observed && observed !== 'unknown' && observed !== 'sending' ? observed : undefined;
+  }
+
   function finish(operation: Operation, status: ChatDeliveryState) {
     if (destroyed || pending !== operation) return;
     pending = undefined;
-    const supplied = state.messages.find((message) => message.id === operation.id);
-    // The authoritative echo may already have slid out of the visible window.
-    const echoed = local.find((message) => message.id === operation.id && message.echoed);
-    const observed = supplied?.status ?? echoed?.status;
-    const verified =
-      observed && observed !== 'unknown' && observed !== 'sending' ? observed : status;
+    const verified = confirmedStatus(operation.id, state.messages) ?? status;
     if (verified === 'unknown') unresolved.set(operation.key, operation.id);
     else unresolved.delete(operation.key);
     local = local.map((message) =>
@@ -475,11 +478,10 @@ export function createChatPanel(
     const copy = snapshot(next);
     if (targetKey(state) !== targetKey(copy)) {
       const operation = pending;
-      // An evicted echo still resolves delivery, even while send() is pending.
-      const confirmed = local.some(
-        (message) => message.id === operation?.id && message.echoed && message.status !== 'unknown'
-      );
-      if (operation && !confirmed) unresolved.set(operation.key, operation.id);
+      // Only the same conversation's newest snapshot can supersede retained evidence.
+      const supplied = conversationKey(copy) === operation?.key ? copy.messages : [];
+      if (operation && !confirmedStatus(operation.id, supplied))
+        unresolved.set(operation.key, operation.id);
       pending = undefined;
       local = [];
       composer.value = '';

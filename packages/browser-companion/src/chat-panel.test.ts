@@ -708,6 +708,62 @@ describe('local Stop and cleanup', () => {
 });
 
 describe('review regressions: conversation receipts and keyed history', () => {
+  it.each(['navigation', 'grant', 'detach'] as const)(
+    'locks when the %s snapshot itself changes a pending echo to unknown',
+    async (change) => {
+      const p = setup();
+      p.input('Original question');
+      p.submit();
+      const [request, signal] = p.send.mock.calls[0]!;
+      p.panel.setState(view({ messages: [message(request.operationId, 'stored')] }));
+      const next = view({ messages: [message(request.operationId, 'unknown')] });
+      if (change === 'navigation') next.page!.binding.navigationId = 'synthetic-navigation-2';
+      if (change === 'grant') next.page!.binding.grantId = 'synthetic-grant-2';
+      if (change === 'detach') next.page = null;
+      p.panel.setState(next);
+      p.input('Next question');
+      expect(signal.aborted).toBe(true);
+      expect(p.sendButton.disabled).toBe(true);
+      expect(p.host.textContent).toContain('Delivery is uncertain');
+      p.submit();
+      expect(p.send).toHaveBeenCalledTimes(1);
+      // A stale callback cannot undo the newer snapshot after the binding changed.
+      p.result.resolve({ status: 'stored' });
+      await Promise.resolve();
+      expect(p.sendButton.disabled).toBe(true);
+      p.panel.setState({ ...next, messages: [message(request.operationId, 'queued')] });
+      expect(p.sendButton.disabled).toBe(false);
+      expect(p.composer.value).toBe('Next question');
+      expect(p.send).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  describe.each(['threadKey', 'scopeId', 'sbSlug'] as const)(
+    'echo evidence cannot cross a %s change',
+    (field) => {
+      it.each(['stored', 'unknown'] as const)(
+        'preserves the original %s evidence despite an opposite-status same-ID row elsewhere',
+        (status) => {
+          const p = setup();
+          p.input('Original question');
+          p.submit();
+          const id = p.send.mock.calls[0]![0].operationId;
+          p.panel.setState(view({ messages: [message(id, status)] }));
+          const other = view({
+            messages: [message(id, status === 'stored' ? 'unknown' : 'stored')],
+          });
+          other.conversation![field] = `synthetic-other-${field}`;
+          p.panel.setState(other);
+          p.panel.setState(view());
+          p.input('Returned question');
+          expect(p.sendButton.disabled).toBe(status === 'unknown');
+          expect(p.host.textContent?.includes('Delivery is uncertain')).toBe(status === 'unknown');
+          expect(p.send).toHaveBeenCalledTimes(1);
+        }
+      );
+    }
+  );
+
   describe.each(['navigation', 'grant', 'detach'] as const)(
     'retained echo evidence after %s',
     (change) => {
