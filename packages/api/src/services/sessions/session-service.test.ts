@@ -3116,6 +3116,174 @@ describe('SessionService', () => {
   // reject. The flush semantics are unchanged; only the transport of
   // the failure to the caller moved.
   // ═══════════════════════════════════════════════════════════════
+  describe('Home session routing — one session per bridge SB', () => {
+    // 2026-09-10 06:52Z: Myra's home session (88b728cb, the identity's
+    // default_session_id) sat in lifecycle `failed` after a broken ink build
+    // crashed four heartbeat turns. A Telegram message arrived unthreaded,
+    // general-active skipped the failed row, and a twin (64e1eb49) was born.
+    // For fifteen days reminders fired in one session and threads in the
+    // other. These pin the three rules that close that path.
+    // One terminal per table, shaped the way each reader expects it: an
+    // awaited chain yields rows (an object becomes a one-row list, so the
+    // identity scope settles on its `id`), maybeSingle/single yield the row.
+    function chain(terminal: { data?: unknown; error?: unknown }) {
+      const data = terminal.data;
+      const rows = Array.isArray(data) || data == null ? (data ?? null) : [data];
+      const row = Array.isArray(data) ? (data[0] ?? null) : (data ?? null);
+      const error = terminal.error ?? null;
+      const c: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'or', 'in', 'order', 'limit']) {
+        c[m] = vi.fn().mockReturnValue(c);
+      }
+      c.maybeSingle = vi.fn().mockResolvedValue({ data: row, error });
+      c.single = vi.fn().mockResolvedValue({ data: row, error });
+      c.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: rows, error }).then(resolve);
+      return c;
+    }
+    function serviceWith(tables: Record<string, unknown>) {
+      const from = vi.fn((table: string) => chain(tables[table] ?? { data: null, error: null }));
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        { from } as never
+      );
+      return { service, from };
+    }
+    const sibling = { id: 'older-home', lifecycle: 'failed', started_at: '2026-08-04T00:30:52Z' };
+
+    it('an unthreaded request goes to the identity default session, not the newest active one', async () => {
+      const home = createMockSession({ id: 'home-session', sbId: 'sb-myra' });
+      const newerTwin = createMockSession({ id: 'newer-twin' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(home);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(newerTwin);
+      const { service } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
+      });
+
+      const session = await service.getOrCreateSession('user-456', 'myra', {});
+
+      expect(session.id).toBe('home-session');
+      expect(mockRepository.findById).toHaveBeenCalledWith('home-session');
+      // The rung answered before general-active could prefer the twin.
+      expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('an ended default session falls through to general-active', async () => {
+      const ended = createMockSession({ id: 'home-session', endedAt: new Date() });
+      const current = createMockSession({ id: 'current-home' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(ended);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(current);
+      const { service } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
+      });
+
+      const session = await service.getOrCreateSession('user-456', 'myra', {});
+
+      expect(session.id).toBe('current-home');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it("a contact-scoped request never lands in the owner's default session", async () => {
+      const home = createMockSession({ id: 'home-session', sbId: 'sb-myra' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(home);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      const { service } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: 'home-session', metadata: {} },
+        },
+      });
+
+      await service.getOrCreateSession('user-456', 'myra', { contactId: 'contact-9' });
+
+      expect(mockRepository.findById).not.toHaveBeenCalledWith('home-session');
+      expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        expect.objectContaining({ contactId: 'contact-9' })
+      );
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ contactId: 'contact-9' })
+      );
+    });
+
+    it('general-active reuses a crashed home session instead of creating a twin', async () => {
+      const crashedHome = createMockSession({ id: 'crashed-home', lifecycle: 'failed' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(crashedHome);
+
+      // No supabase → no default session; the rung under test is general-active.
+      const session = await sessionService.getOrCreateSession('user-456', 'myra', {});
+
+      expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        expect.objectContaining({ type: 'primary', includeFailed: true })
+      );
+      expect(session.id).toBe('crashed-home');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('a second home for a bridge is born labelled, and the log says so at error level', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      const { service, from } = serviceWith({
+        agent_identities: {
+          data: { id: 'sb-myra', default_session_id: null, metadata: { bridge: true } },
+        },
+        sessions: { data: [sibling], error: null },
+      });
+      const { logger } = await import('../../utils/logger.js');
+
+      const created = await service.getOrCreateSession('user-456', 'myra', {});
+
+      expect(from).toHaveBeenCalledWith('sessions');
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            routing_decision: expect.objectContaining({ homeSiblings: ['older-home'] }),
+          }),
+        })
+      );
+      const report = vi
+        .mocked(logger.error)
+        .mock.calls.find((c) => String(c[0]).includes('more than one home session'));
+      expect(report).toBeDefined();
+      const detail = report?.[1] as Record<string, unknown>;
+      expect(detail.createdSessionId).toBe(created.id);
+      expect(detail.siblings).toEqual([
+        { id: 'older-home', lifecycle: 'failed', startedAt: '2026-08-04T00:30:52Z' },
+      ]);
+    });
+
+    it('a non-bridge identity is never checked for home siblings', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      const { service, from } = serviceWith({
+        agent_identities: { data: { id: 'sb-wren', default_session_id: null, metadata: {} } },
+        sessions: { data: [sibling], error: null },
+      });
+      const { logger } = await import('../../utils/logger.js');
+
+      await service.getOrCreateSession('user-456', 'wren', {});
+
+      expect(from).not.toHaveBeenCalledWith('sessions');
+      const createArg = vi.mocked(mockRepository.create).mock.calls[0][0] as {
+        metadata: { routing_decision: Record<string, unknown> };
+      };
+      expect(createArg.metadata.routing_decision).not.toHaveProperty('homeSiblings');
+      expect(
+        vi.mocked(logger.error).mock.calls.some((c) => String(c[0]).includes('more than one home'))
+      ).toBe(false);
+    });
+  });
+
   describe('Queue flush on non-retryable errors', () => {
     it('should flush remaining queue when a queued message hits a quota error', async () => {
       const session = createMockSession();

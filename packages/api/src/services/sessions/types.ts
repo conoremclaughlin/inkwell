@@ -556,6 +556,13 @@ export interface ISessionRepository {
       contactId?: string;
       /** Canonical identity UUID — preferred over the ambiguous slug. */
       sbId?: string | null;
+      /**
+       * Return the newest unended session even when its lifecycle is
+       * `failed`. Routing reuse wants this: a crashed home session is still
+       * the session its agent resumes next, and skipping it is how a twin
+       * gets created. Session pickers and liveness readers do not.
+       */
+      includeFailed?: boolean;
     }
   ): Promise<Session | null>;
 
