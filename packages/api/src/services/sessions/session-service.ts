@@ -188,6 +188,32 @@ function routePatternSpecificity(pattern: string): number {
 }
 
 /**
+ * The routing options a message resolves its session with.
+ *
+ * A message resolves twice when it queues behind a running turn: once on
+ * arrival, and again when the queue reaches it. The two calls used to build
+ * their options separately, and the queued one never gained contactId, alias
+ * or repoRoot when each was added to the first. A queued per-sender message
+ * therefore re-resolved into the OWNER's session. One builder keeps them equal.
+ */
+function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: string) {
+  const { metadata } = request;
+  return {
+    type: metadata?.sessionType || 'primary',
+    taskDescription: metadata?.taskDescription,
+    parentSessionId: metadata?.parentSessionId,
+    threadKey: metadata?.threadKey,
+    alias: metadata?.sessionAlias,
+    studioId: metadata?.studioId,
+    studioHint: metadata?.studioHint,
+    recipientSessionId: metadata?.recipientSessionId,
+    contactId: metadata?.contactId,
+    repoRoot: metadata?.repoRoot,
+    turnEpochCandidate,
+  };
+}
+
+/**
  * Parse an identity's dashboard runtime config (agent_identities.metadata
  * .runtimeConfig) into the spawn-relevant fields. Fails CLOSED: absent or
  * malformed input yields toolRouting 'local' (ink-owned, provider withheld)
@@ -1246,19 +1272,11 @@ export class SessionService implements ISessionService {
 
     try {
       // 1. Get or create session (needed to determine lock key)
-      const session = await this.getOrCreateSession(userId, sbSlug, {
-        type: metadata?.sessionType || 'primary',
-        taskDescription: metadata?.taskDescription,
-        parentSessionId: metadata?.parentSessionId,
-        threadKey: metadata?.threadKey,
-        alias: metadata?.sessionAlias,
-        studioId: metadata?.studioId,
-        studioHint: metadata?.studioHint,
-        recipientSessionId: metadata?.recipientSessionId,
-        contactId: metadata?.contactId,
-        repoRoot: metadata?.repoRoot,
-        turnEpochCandidate,
-      });
+      const session = await this.getOrCreateSession(
+        userId,
+        sbSlug,
+        sessionRoutingOptions(request, turnEpochCandidate)
+      );
       admitted = true;
 
       // Backfill mission linkage now that routing resolved: a check-in that
@@ -1464,22 +1482,13 @@ export class SessionService implements ISessionService {
       }
 
       try {
-        // Get session again (may have changed)
+        // Get session again (may have changed). Same options as the direct
+        // path, with the candidate minted at THIS message's handleMessage
+        // entry — its pre-queue resolution already stamped leases with it.
         const session = await this.getOrCreateSession(
           pending.request.userId,
           pending.request.sbSlug,
-          {
-            type: pending.request.metadata?.sessionType || 'primary',
-            taskDescription: pending.request.metadata?.taskDescription,
-            parentSessionId: pending.request.metadata?.parentSessionId,
-            threadKey: pending.request.metadata?.threadKey,
-            studioId: pending.request.metadata?.studioId,
-            studioHint: pending.request.metadata?.studioHint,
-            recipientSessionId: pending.request.metadata?.recipientSessionId,
-            // The candidate minted at THIS message's handleMessage entry —
-            // its pre-queue resolution already stamped leases with it.
-            turnEpochCandidate: pending.turnEpochCandidate,
-          }
+          sessionRoutingOptions(pending.request, pending.turnEpochCandidate)
         );
 
         const result = await this.processMessage(

@@ -1178,6 +1178,64 @@ describe('SessionService', () => {
       expect(processedContents).toEqual(['Message 1', 'Message 2', 'Message 3']);
     });
 
+    it('re-resolves a queued message with the routing options it arrived with', async () => {
+      // A queued message resolves twice: on arrival, and when the queue reaches
+      // it. contactId, alias and repoRoot were each added to the first call
+      // only, so a queued per-sender message re-resolved into the OWNER's
+      // session, and a queued anchored reply lost its contact on the way.
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let release!: () => void;
+      const parked = new Promise<void>((resolve) => (release = resolve));
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        await parked;
+        return createMockClaudeResult();
+      });
+
+      const resolveSpy = vi.spyOn(sessionService, 'getOrCreateSession');
+      const metadata = {
+        contactId: 'contact-1',
+        sessionAlias: 'main',
+        repoRoot: '/repo',
+        recipientSessionId: 'session-123',
+      };
+
+      const first = sessionService.handleMessage(createMockRequest({ metadata }));
+      await vi.waitFor(() => expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1));
+      const second = sessionService.handleMessage(
+        createMockRequest({ content: 'second', metadata })
+      );
+      // Released only once the second message is actually queued; releasing
+      // earlier lets it take the free lock and skip the re-resolution.
+      await vi.waitFor(() =>
+        expect(
+          (sessionService as unknown as { pendingQueues: Map<string, unknown[]> }).pendingQueues
+            .size
+        ).toBe(1)
+      );
+      release();
+      await Promise.all([first, second]);
+
+      // Arrival of each message, then the queued re-resolution.
+      expect(resolveSpy).toHaveBeenCalledTimes(3);
+      for (const [, , options] of resolveSpy.mock.calls) {
+        expect(options).toMatchObject({
+          contactId: 'contact-1',
+          alias: 'main',
+          repoRoot: '/repo',
+          recipientSessionId: 'session-123',
+        });
+      }
+      // The re-resolution runs under the SECOND message's own candidate, the
+      // one its arrival resolution already stamped leases with.
+      const [firstArrival, secondArrival, dequeued] = resolveSpy.mock.calls.map(
+        ([, , options]) => options?.turnEpochCandidate
+      );
+      expect(dequeued).toBe(secondArrival);
+      expect(dequeued).not.toBe(firstArrival);
+    });
+
     it('should queue heartbeat when telegram message is processing (race condition fix)', async () => {
       // This tests the exact bug scenario: telegram message and heartbeat arrive simultaneously
       // Both target the same agent (myra) and thus the same Claude session
