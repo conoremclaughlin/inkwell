@@ -241,6 +241,10 @@ export interface SessionRequest {
     contactId?: string;
     // Recipient session to inherit studio scope from
     recipientSessionId?: string;
+    // The session that wrote the message this one replies to. A preference,
+    // unlike recipientSessionId: honoured only while that session can safely
+    // take the turn, otherwise the message routes unanchored.
+    replyToSessionId?: string;
     // Target a session by alias (e.g., "main", "review")
     sessionAlias?: string;
     // For task sessions

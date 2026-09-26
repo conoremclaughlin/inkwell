@@ -188,7 +188,7 @@ describe('resolveInboundAgent', () => {
       expect(result.replyRouting).toBeUndefined();
       // The mentioned SB did not write the message, so the author's session
       // is no anchor for it.
-      expect(result.recipientSessionId).toBeUndefined();
+      expect(result.replyToSessionId).toBeUndefined();
     });
   });
 
@@ -199,7 +199,7 @@ describe('resolveInboundAgent', () => {
       expect(result).toMatchObject({
         sbSlug: 'wren',
         source: 'reply',
-        recipientSessionId: 'session-wren',
+        replyToSessionId: 'session-wren',
         replyRouting: { resolved: true, session: 'authoring' },
       });
     });
@@ -217,7 +217,7 @@ describe('resolveInboundAgent', () => {
         source: 'reply',
         replyRouting: { resolved: true, session: 'session_ended' },
       });
-      expect(result.recipientSessionId).toBeUndefined();
+      expect(result.replyToSessionId).toBeUndefined();
     });
 
     it('carries no anchor when the reply fell through to the channel route', async () => {
@@ -229,7 +229,7 @@ describe('resolveInboundAgent', () => {
       });
 
       expect(result.source).toBe('channel_route');
-      expect(result.recipientSessionId).toBeUndefined();
+      expect(result.replyToSessionId).toBeUndefined();
     });
   });
 

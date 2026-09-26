@@ -1182,7 +1182,8 @@ describe('SessionService', () => {
       // A queued message resolves twice: on arrival, and when the queue reaches
       // it. contactId, alias and repoRoot were each added to the first call
       // only, so a queued per-sender message re-resolved into the OWNER's
-      // session, and a queued anchored reply lost its contact on the way.
+      // session. A queued reply must also keep its anchor, because dequeue is
+      // where its admission is checked a second time.
       const session = createMockSession();
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
@@ -1199,6 +1200,7 @@ describe('SessionService', () => {
         sessionAlias: 'main',
         repoRoot: '/repo',
         recipientSessionId: 'session-123',
+        replyToSessionId: 'session-456',
       };
 
       const first = sessionService.handleMessage(createMockRequest({ metadata }));
@@ -1225,6 +1227,7 @@ describe('SessionService', () => {
           alias: 'main',
           repoRoot: '/repo',
           recipientSessionId: 'session-123',
+          replyToSessionId: 'session-456',
         });
       }
       // The re-resolution runs under the SECOND message's own candidate, the
@@ -2480,103 +2483,335 @@ describe('SessionService', () => {
       // Falls through to normal creation
       expect(mockRepository.create).toHaveBeenCalled();
     });
+  });
 
-    /**
-     * Telegram replies anchor to the session that wrote the message, and the
-     * channel handler also passes the sender's contact for per-sender agents.
-     * They are the first caller to pass both, so the anchor now has to respect
-     * contact isolation the way every reuse rung already does.
-     */
-    describe('contact isolation', () => {
-      it('never lands a contact-scoped request in a session outside that contact', async () => {
-        // A contact replies to a message the OWNER's session sent into their
-        // chat. The contact's own session is the plausible fallback: if the
-        // guard leaks, resolution returns the owner's session instead.
-        const ownerSession = createMockSession({ id: 'owner-session', sbSlug: 'benson' });
-        const contactSession = createMockSession({
-          id: 'contact-session',
-          sbSlug: 'benson',
-          contactId: 'contact-1',
-        });
-        vi.mocked(mockRepository.findById).mockResolvedValue(ownerSession);
-        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(contactSession);
+  /**
+   * A Telegram reply anchors to the session that wrote the message it answers
+   * (replyToSessionId). Nothing upstream has planned delivery to that session,
+   * so admitReplyAnchor checks it on every resolution and declines it, routing
+   * the reply unanchored, whenever it cannot safely take the turn (Lumen,
+   * PR #682). These run over the fake database and the real lease service:
+   * two of the checks ARE the trigger path's delivery decision and the lease
+   * service's acquire, and a mock of either would only restate the code.
+   */
+  describe('Reply anchors — replyToSessionId', () => {
+    const stamp = (msAgo = 0) => new Date(Date.now() - msAgo).toISOString();
 
-        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
-          recipientSessionId: 'owner-session',
-          contactId: 'contact-1',
-        });
+    function foreignLease(overrides: Row = {}): Row {
+      return {
+        sessionId: 'another-writer',
+        threadKey: 'pr:900002',
+        threadKeys: ['pr:900002'],
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        acquiredAt: stamp(),
+        heartbeatAt: stamp(),
+        ...overrides,
+      };
+    }
 
-        expect(session.id).toBe('contact-session');
+    function replyFixture(
+      opts: {
+        authoring?: Partial<Session>;
+        /** Overrides on the authoring session's DB row (attachment columns). */
+        authoringRow?: Row;
+        lease?: Row | null;
+      } = {}
+    ) {
+      const authoring = createMockSession({
+        id: 'authoring',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        backendSessionId: 'backend-authoring',
+        ...opts.authoring,
+      });
+      const home = createMockSession({
+        id: 'home',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        backendSessionId: 'backend-home',
+      });
+      vi.mocked(mockRepository.findById).mockImplementation(async (id: string) =>
+        id === authoring.id ? authoring : id === home.id ? home : null
+      );
+      // General reuse: what an unanchored reply lands in.
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(home);
+
+      const tables: Record<string, Row[]> = {
+        agent_identities: [
+          {
+            id: 'sb-wren',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            workspace_id: 'ws-1',
+            updated_at: stamp(),
+          },
+        ],
+        sessions: [
+          {
+            id: 'authoring',
+            user_id: 'user-456',
+            sb_id: 'sb-wren',
+            agent_id: 'wren',
+            studio_id: authoring.studioId ?? null,
+            ended_at: null,
+            cli_attached: false,
+            cli_poll_at: null,
+            updated_at: stamp(),
+            ...opts.authoringRow,
+          },
+        ],
+        studios: [
+          {
+            id: 'studio-pr',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            sb_id: 'sb-wren',
+            status: 'active',
+            route_patterns: [],
+            ephemeral: false,
+            worktree_path: tmpdir(),
+            lease: opts.lease ?? null,
+          },
+        ],
+        inbox_threads: [
+          { id: 'thread-pr', workspace_id: 'ws-1', thread_key: 'pr:900001', key_type: 'pr' },
+          {
+            id: 'thread-talk',
+            workspace_id: 'ws-1',
+            thread_key: 'thread:talk',
+            key_type: 'thread',
+          },
+        ],
+        thread_key_types: [
+          {
+            id: 'tkt-pr',
+            workspace_id: null,
+            type: 'pr',
+            write_intent: 'write',
+            studio_policy: 'provision',
+            description: null,
+            created_at: stamp(),
+            updated_at: stamp(),
+          },
+          {
+            id: 'tkt-thread',
+            workspace_id: null,
+            type: 'thread',
+            write_intent: 'presence',
+            studio_policy: 'reuse-only',
+            description: null,
+            created_at: stamp(),
+            updated_at: stamp(),
+          },
+        ],
+        studio_lease_events: [],
+      };
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        makeFakeSupabase(tables) as never
+      );
+      return { service, tables, authoring };
+    }
+
+    /** The studio-bound PR session a reply most often answers. */
+    const inPrStudio = { studioId: 'studio-pr', threadKey: 'pr:900001' };
+
+    const reply = (service: SessionService, options: Record<string, unknown> = {}) =>
+      service.getOrCreateSession('user-456', 'wren', { replyToSessionId: 'authoring', ...options });
+
+    it('resumes the open session that wrote the message', async () => {
+      const { service } = replyFixture();
+
+      const session = await reply(service);
+
+      expect(session.id).toBe('authoring');
+      // Chosen by the anchor: general reuse was never asked.
+      expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
+    });
+
+    describe('per-sender isolation, in both directions, as general reuse applies it', () => {
+      it("declines an owner session for a contact's reply", async () => {
+        const { service } = replyFixture();
+
+        const session = await reply(service, { contactId: 'contact-1' });
+
+        expect(session.id).toBe('home');
         expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
           'user-456',
-          'benson',
+          'wren',
           expect.objectContaining({ contactId: 'contact-1' })
         );
       });
 
-      it("refuses another contact's session as an anchor, too", async () => {
-        const otherContact = createMockSession({
-          id: 'other-contact-session',
-          sbSlug: 'benson',
-          contactId: 'contact-2',
-        });
-        const contactSession = createMockSession({
-          id: 'contact-session',
-          sbSlug: 'benson',
-          contactId: 'contact-1',
-        });
-        vi.mocked(mockRepository.findById).mockResolvedValue(otherContact);
-        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(contactSession);
+      it("declines another contact's session", async () => {
+        const { service } = replyFixture({ authoring: { contactId: 'contact-2' } });
 
-        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
-          recipientSessionId: 'other-contact-session',
-          contactId: 'contact-1',
-        });
-
-        expect(session.id).toBe('contact-session');
+        expect((await reply(service, { contactId: 'contact-1' })).id).toBe('home');
       });
 
-      it("routes a contact's reply into that contact's own session", async () => {
-        const contactSession = createMockSession({
-          id: 'authoring-contact-session',
-          sbSlug: 'benson',
-          contactId: 'contact-1',
-        });
-        const newer = createMockSession({
-          id: 'newer-contact-session',
-          sbSlug: 'benson',
-          contactId: 'contact-1',
-        });
-        vi.mocked(mockRepository.findById).mockResolvedValue(contactSession);
-        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(newer);
+      it("resumes the contact's own session", async () => {
+        const { service } = replyFixture({ authoring: { contactId: 'contact-1' } });
 
-        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
-          recipientSessionId: 'authoring-contact-session',
-          contactId: 'contact-1',
-        });
-
-        expect(session.id).toBe('authoring-contact-session');
+        expect((await reply(service, { contactId: 'contact-1' })).id).toBe('authoring');
       });
 
-      it('leaves an owner-scoped anchor to a contact session as it was', async () => {
-        // One direction only: the owner naming a contact session is not the
-        // leak this guards, and the trigger path relies on anchors it plans.
-        const contactSession = createMockSession({
-          id: 'contact-session',
-          sbSlug: 'benson',
-          contactId: 'contact-1',
-        });
-        vi.mocked(mockRepository.findById).mockResolvedValue(contactSession);
-        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
-          createMockSession({ id: 'owner-session', sbSlug: 'benson' })
-        );
+      it('declines a contact session for an owner-scoped reply', async () => {
+        // General reuse would never pick a contact's session for an owner
+        // request, so the anchor may not either.
+        const { service } = replyFixture({ authoring: { contactId: 'contact-1' } });
 
-        const session = await sessionService.getOrCreateSession('user-456', 'benson', {
-          recipientSessionId: 'contact-session',
-        });
-
-        expect(session.id).toBe('contact-session');
+        expect((await reply(service)).id).toBe('home');
       });
+    });
+
+    it('declines a session that ended after the reply lookup, and routes without its studio', async () => {
+      // Finding 3 of the review, at the unit: no reuse match, so the reply
+      // creates. The anchor used to pin its studio first, and the new session
+      // was created inside it.
+      const { service } = replyFixture({ authoring: { ...inPrStudio, endedAt: new Date() } });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      const session = await reply(service);
+
+      expect(session.id).not.toBe('authoring');
+      expect(mockRepository.create).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(mockRepository.create).mock.calls[0][0].studioId).not.toBe('studio-pr');
+      expect(vi.mocked(mockRepository.findByUserAndAgent).mock.calls[0][2]).not.toMatchObject({
+        studioId: 'studio-pr',
+      });
+    });
+
+    describe("a live terminal on the session, by the trigger path's delivery decision", () => {
+      it('declines while a CLI is polling it', async () => {
+        const { service } = replyFixture({ authoringRow: { cli_poll_at: stamp() } });
+
+        expect((await reply(service)).id).toBe('home');
+      });
+
+      it('declines while it is attached and recently updated', async () => {
+        const { service } = replyFixture({
+          authoringRow: { cli_attached: true, updated_at: stamp() },
+        });
+
+        expect((await reply(service)).id).toBe('home');
+      });
+
+      it('resumes it once the attachment has gone stale, as the trigger path would spawn', async () => {
+        const { service } = replyFixture({
+          authoringRow: { cli_attached: true, updated_at: stamp(11 * 60 * 1000) },
+        });
+
+        expect((await reply(service)).id).toBe('authoring');
+      });
+
+      it('declines when the attachment cannot be read', async () => {
+        const { service, tables } = replyFixture();
+        tables.sessions = [];
+
+        expect((await reply(service)).id).toBe('home');
+      });
+    });
+
+    describe("its studio, under its own thread's contract", () => {
+      it('takes the write lease when the studio is free, stamped with the turn', async () => {
+        const { service, tables } = replyFixture({ authoring: inPrStudio });
+
+        const session = await reply(service, { turnEpochCandidate: 'epoch-1' });
+
+        expect(session.id).toBe('authoring');
+        expect(tables.studios[0].lease).toMatchObject({
+          sessionId: 'authoring',
+          threadKey: 'pr:900001',
+          turnEpoch: 'epoch-1',
+        });
+      });
+
+      it('declines, without diverting or holding, while another session holds it', async () => {
+        const { service, tables, authoring } = replyFixture({
+          authoring: inPrStudio,
+          lease: foreignLease(),
+        });
+        const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+
+        const session = await reply(service);
+
+        expect(session.id).toBe('home');
+        expect(tables.studios[0].lease).toMatchObject({ sessionId: 'another-writer' });
+        expect(tables.studios[0].status).toBe('active');
+        expect(authoring.studioId).toBe('studio-pr');
+        expect(mockRepository.update).not.toHaveBeenCalled();
+        expect(overflowSpy).not.toHaveBeenCalled();
+        overflowSpy.mockRestore();
+      });
+
+      it('resumes a session that holds the lease itself', async () => {
+        const { service } = replyFixture({
+          authoring: inPrStudio,
+          lease: foreignLease({
+            sessionId: 'authoring',
+            threadKey: 'pr:900001',
+            threadKeys: ['pr:900001'],
+          }),
+        });
+
+        expect((await reply(service)).id).toBe('authoring');
+      });
+
+      it('binds a presence thread without the lease, whoever holds it', async () => {
+        const { service, tables } = replyFixture({
+          authoring: { studioId: 'studio-pr', threadKey: 'thread:talk' },
+          lease: foreignLease(),
+        });
+
+        expect((await reply(service)).id).toBe('authoring');
+        expect(tables.studios[0].lease).toMatchObject({ sessionId: 'another-writer' });
+      });
+
+      it('acquires nothing on a plan resolution', async () => {
+        const { service, tables } = replyFixture({ authoring: inPrStudio });
+
+        expect((await reply(service, { planOnly: true })).id).toBe('authoring');
+        expect(tables.studios[0].lease).toBeNull();
+      });
+    });
+
+    it('checks again at dequeue: a queued reply does not resume a session that ended meanwhile', async () => {
+      const { service, authoring } = replyFixture();
+      let release!: () => void;
+      const parked = new Promise<void>((resolve) => (release = resolve));
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        await parked;
+        return createMockClaudeResult();
+      });
+      const metadata = { replyToSessionId: 'authoring' };
+
+      const first = service.handleMessage(createMockRequest({ sbSlug: 'wren', metadata }));
+      await vi.waitFor(() => expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1));
+      const second = service.handleMessage(
+        createMockRequest({ sbSlug: 'wren', content: 'second', metadata })
+      );
+      await vi.waitFor(() =>
+        expect(
+          (service as unknown as { pendingQueues: Map<string, unknown[]> }).pendingQueues.size
+        ).toBe(1)
+      );
+      // Admitted on arrival (it queued behind its own session), then the
+      // session ends while the message waits.
+      authoring.endedAt = new Date();
+      release();
+      const [, queued] = await Promise.all([first, second]);
+
+      const resumed = vi
+        .mocked(mockClaudeRunner.run)
+        .mock.calls.map(([, config]) => (config as { backendSessionId?: string }).backendSessionId);
+      expect(resumed).toEqual(['backend-authoring', 'backend-home']);
+      expect(queued.sessionId).toBe('home');
     });
   });
 

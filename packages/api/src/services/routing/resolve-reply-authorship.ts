@@ -28,6 +28,12 @@
  * session is open. Once it has ended, the reply goes to the SB's ordinary
  * unaddressed destination (its home session), with the reason recorded.
  *
+ * That check is a snapshot taken before contact resolution and any queue
+ * wait, so it only saves anchoring a session already known to have ended.
+ * Whether the session can take the turn when the reply is actually placed is
+ * decided by session routing (SessionService.admitReplyAnchor), which checks
+ * again and is the check that counts.
+ *
  * Never guesses. Every non-resolving path returns an explicit reason, because a
  * silent fall back to the channel owner is the behaviour this replaces — and it
  * is invisible precisely because it always produces a plausible recipient.
@@ -174,10 +180,10 @@ export async function resolveReplyAuthorship(
  * author was read from it. A null here means the session row has since been
  * deleted (the foreign key sets the column to null), so it reads as missing.
  *
- * Only liveness is decided here, on a read scoped to the user. Whether the
- * session belongs to the routed identity and the sender's contact is checked
- * where every session anchor is authorized, in SessionService.getOrCreateSession,
- * so those checks exist in one place only.
+ * Only liveness is looked at here, on a read scoped to the user, and only as a
+ * snapshot. Identity, contact, terminal attachment and the studio lease are
+ * all decided at admission, in SessionService.admitReplyAnchor, alongside a
+ * fresh liveness check, so those rules exist in one place only.
  */
 async function resolveAuthoringSession(
   supabase: SupabaseClient,

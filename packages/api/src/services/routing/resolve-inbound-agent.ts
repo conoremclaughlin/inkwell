@@ -40,11 +40,12 @@ export interface InboundAgentResolution {
   studioHint: string | null;
   routeId: string | null;
   /**
-   * The open session that wrote the message being replied to. Session routing
-   * takes it as its highest-priority anchor, so the reply resumes the
-   * conversation it answers rather than whichever session of the SB is newest.
+   * The open session that wrote the message being replied to, so the reply
+   * resumes the conversation it answers rather than whichever session of the
+   * SB is newest. Open when looked up here; session routing admits it again
+   * when the message is actually placed, because it may not be by then.
    */
-  recipientSessionId?: string;
+  replyToSessionId?: string;
   /**
    * Present only when the message was a reply, so a misroute stays diagnosable.
    * `session` says whether the reply was anchored to its authoring session or,
@@ -145,7 +146,7 @@ export async function resolveInboundAgent(
       source: 'reply',
       studioHint: null,
       routeId: null,
-      ...(session.routable ? { recipientSessionId: session.sessionId } : {}),
+      ...(session.routable ? { replyToSessionId: session.sessionId } : {}),
       replyRouting: { resolved: true, session: session.routable ? 'authoring' : session.reason },
     };
   }

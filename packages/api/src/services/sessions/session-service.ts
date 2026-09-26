@@ -59,7 +59,13 @@ import { classifyError, isPreAcceptanceRefusal, type ErrorClassification } from 
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
-import { StudioLeaseService, isLeaseStale, leaseThreadKeys } from '../studio-lease.service.js';
+import {
+  StudioLeaseService,
+  isLeaseStale,
+  leaseThreadKeys,
+  type AcquireResult,
+} from '../studio-lease.service.js';
+import { decideDelivery } from './trigger-delivery.js';
 import { ThreadKeyService } from '../thread-key/thread-key.service.js';
 import type {
   StudioPolicy,
@@ -207,6 +213,7 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     studioId: metadata?.studioId,
     studioHint: metadata?.studioHint,
     recipientSessionId: metadata?.recipientSessionId,
+    replyToSessionId: metadata?.replyToSessionId,
     contactId: metadata?.contactId,
     repoRoot: metadata?.repoRoot,
     turnEpochCandidate,
@@ -887,6 +894,7 @@ export class SessionService implements ISessionService {
   private logRungMatch(
     rung:
       | 'recipient-session'
+      | 'reply-anchor'
       | 'alias'
       | 'thread-key'
       | 'default-session'
@@ -2563,6 +2571,156 @@ export class SessionService implements ISessionService {
     });
   }
 
+  /**
+   * May a channel reply resume the session that wrote the message it answers?
+   *
+   * A reply anchor is a preference, not an address. recipientSessionId names
+   * a session its caller has already planned delivery to: the trigger path
+   * checks it for a live terminal before spawning, and passes its thread so
+   * the lease gate runs. A reply names whichever session wrote the message,
+   * possibly days ago, and nothing has checked that session since. So it is
+   * checked here, on every resolution (on arrival, and again when a queued
+   * message is dequeued), and any failed check declines it. A declined reply
+   * routes as an unanchored message would, which is where every reply went
+   * before replies carried their session.
+   *
+   * The anchor never reaches resolveStudioId. That tier pins the studio of any
+   * session it is given, ended or not, so an anchor that ended after the reply
+   * lookup left general reuse and creation scoped to its old studio, closed or
+   * not (Lumen, PR #682). A declined anchor must leave no trace in routing.
+   *
+   * Returns the session to resume, or null to route unanchored.
+   */
+  private async admitReplyAnchor(
+    sessionId: string,
+    ctx: {
+      userId: string;
+      sbSlug: string;
+      sbId: string | null;
+      contactId?: string;
+      /** getOrCreateSession's identity authorization for explicit anchors. */
+      belongsToTarget: (row: Session) => boolean;
+      planOnly: boolean;
+      turnEpochCandidate?: string;
+    }
+  ): Promise<Session | null> {
+    const decline = (reason: string, detail: Record<string, unknown> = {}): null => {
+      logger.warn(
+        '[SessionRouting] Reply cannot resume its authoring session; routing unanchored',
+        {
+          replyToSessionId: sessionId,
+          reason,
+          ...detail,
+        }
+      );
+      return null;
+    };
+
+    let session: Session | null;
+    try {
+      session = await this.repository.findById(sessionId);
+    } catch (err) {
+      return decline('lookup_failed', { error: serializeError(err) });
+    }
+    if (!session) return decline('missing');
+    if (!ctx.belongsToTarget(session)) return decline('other_identity');
+
+    // Per-sender isolation, in both directions, exactly as general reuse
+    // applies it: a contact's message runs only in that contact's sessions,
+    // and an owner-scoped one only in owner sessions. A reply may change
+    // WHICH eligible session resumes. It never widens who is eligible.
+    if ((session.contactId ?? null) !== (ctx.contactId ?? null)) {
+      return decline('other_contact', {
+        sessionContactId: session.contactId ?? null,
+        requestContactId: ctx.contactId ?? null,
+      });
+    }
+
+    if (session.endedAt) return decline('ended');
+
+    // A live terminal, judged by the trigger path's own delivery decision on
+    // the same columns. The trigger path would deliver inline to it, but
+    // channel messages have no inline delivery yet. Resuming it headless runs
+    // a second process on the terminal's backend session, and that turn's
+    // finalize then clears the terminal's attachment flag. A read that cannot
+    // rule a terminal out counts as one: declining costs the reply its
+    // conversation, while resuming could cost the terminal its turn.
+    if (!this.supabase) return decline('terminal_unverified');
+    const { data: attachment, error: attachmentError } = await this.supabase
+      .from('sessions')
+      .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
+      .eq('id', session.id)
+      .eq('user_id', ctx.userId)
+      .maybeSingle();
+    if (attachmentError || !attachment) {
+      return decline('terminal_unverified', {
+        error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+      });
+    }
+    const delivery = decideDelivery({
+      forceSpawn: false,
+      pollRow: attachment,
+      attachedRow: {
+        cli_attached: attachment.cli_attached === true,
+        // A row with no update stamp cannot be shown stale, so a set
+        // attachment flag on it stands.
+        updated_at: attachment.updated_at ?? new Date().toISOString(),
+      },
+    });
+    if (delivery.mode === 'inline') {
+      return decline('terminal_attached', { source: delivery.source });
+    }
+
+    // The lease gate runs only for a request that carries a threadKey, and a
+    // reply carries none, so on its own a reply would enter the anchor's
+    // studio while another session holds the lease. A turn there is a turn
+    // under the anchor's thread, so that thread's stored contract applies,
+    // as a message on the thread would meet it: a write thread takes the
+    // studio's lease, and a presence thread binds without one. Where that
+    // message would divert to overflow or hold, the reply declines instead.
+    // Resuming this session is a preference, and neither a new worktree nor a
+    // held message is worth it. A plan resolution never acquires; the spawn
+    // path's own resolution does.
+    const leases = this.getLeaseService();
+    if (leases && session.studioId && session.threadKey && !ctx.planOnly) {
+      const { writeIntent } = await this.resolveThreadBehavior(
+        ctx.userId,
+        ctx.sbId,
+        session.threadKey
+      );
+      if (writeIntent !== 'presence') {
+        let lease: AcquireResult;
+        try {
+          lease = await leases.acquire({
+            studioId: session.studioId,
+            sessionId: session.id,
+            threadKey: session.threadKey,
+            sbSlug: ctx.sbSlug,
+            ...(ctx.sbId ? { sbId: ctx.sbId } : {}),
+            userId: ctx.userId,
+            reason: 'reply-anchor',
+            turnEpoch: ctx.turnEpochCandidate,
+          });
+        } catch (err) {
+          return decline('studio_unverified', {
+            studioId: session.studioId,
+            error: serializeError(err),
+          });
+        }
+        if (!lease.acquired) {
+          return decline('studio_unavailable', {
+            studioId: session.studioId,
+            threadKey: session.threadKey,
+            holderSessionId: lease.holder?.sessionId ?? null,
+            holderThreadKey: lease.holder?.threadKey ?? null,
+          });
+        }
+      }
+    }
+
+    return session;
+  }
+
   async getOrCreateSession(
     userId: string,
     sbSlug: string,
@@ -2575,6 +2733,13 @@ export class SessionService implements ISessionService {
       studioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
+      /**
+       * The session that wrote the message a channel reply answers. Tried
+       * after recipientSessionId and before every other rung, but only
+       * admitted while it can safely take the turn — see admitReplyAnchor.
+       * It never reaches studio resolution.
+       */
+      replyToSessionId?: string;
       contactId?: string;
       repoRoot?: string;
       /** Server-derived sender studio — see resolveCallerRepoRoot. */
@@ -2699,27 +2864,6 @@ export class SessionService implements ISessionService {
           });
         }
         authorizedRecipientSessionId = undefined;
-      } else if (
-        candidate &&
-        options.contactId &&
-        (candidate.contactId ?? null) !== options.contactId
-      ) {
-        // Per-sender isolation. A contact-scoped request runs only in that
-        // contact's sessions; every reuse rung below filters by contact, and
-        // this anchor must too. Until Telegram replies carried their authoring
-        // session, no caller passed both a contact and an anchor, so nothing
-        // had to ask. Now one does: a contact replying to a message the
-        // owner's session sent into their chat would otherwise land in the
-        // owner's session, with the owner's context and tools.
-        //
-        // One direction only. An owner-scoped request (no contactId) keeps
-        // reaching a contact session it names, as before.
-        logger.warn('[SessionRouting] Refusing recipientSessionId — another contact', {
-          recipientSessionId: options.recipientSessionId,
-          sessionContactId: candidate.contactId ?? null,
-          requestedContactId: options.contactId,
-        });
-        authorizedRecipientSessionId = undefined;
       }
     }
 
@@ -2809,6 +2953,25 @@ export class SessionService implements ISessionService {
         if (recipientSession && !recipientSession.endedAt) {
           this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);
           return this.withStudioLease(recipientSession, routing, leaseCtx);
+        }
+      }
+
+      // A channel reply resumes the session that wrote the message it
+      // answers, when that session can safely take it. Admission (and any
+      // lease it needs) is decided inside, so a match is returned as is.
+      if (options?.replyToSessionId) {
+        const replyAnchor = await this.admitReplyAnchor(options.replyToSessionId, {
+          userId,
+          sbSlug,
+          sbId: identitySbId,
+          contactId: options.contactId,
+          belongsToTarget: anchorBelongsToTarget,
+          planOnly: options.planOnly === true,
+          turnEpochCandidate: options.turnEpochCandidate,
+        });
+        if (replyAnchor) {
+          this.logRungMatch('reply-anchor', replyAnchor, routing, options.threadKey);
+          return replyAnchor;
         }
       }
 
