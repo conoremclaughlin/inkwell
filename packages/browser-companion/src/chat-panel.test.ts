@@ -841,6 +841,42 @@ describe('review regressions: conversation receipts and keyed history', () => {
     }
   );
 
+  it('keeps an unmapped echo uncertain until a mapped receipt reconciles it', async () => {
+    const p = setup();
+    p.input('Question');
+    p.submit();
+    const id = p.send.mock.calls[0]![0].operationId;
+    // Simulate an adapter forwarding a server-only status without mapping it.
+    const unmapped = {
+      ...message(id, 'stored', 'Question'),
+      status: 'delivered' as ChatDeliveryState,
+    };
+    p.panel.setState(view({ messages: [unmapped] }));
+    p.result.resolve({ status: 'stored' });
+    await Promise.resolve();
+    p.input('Next question');
+    expect(p.sendButton.disabled).toBe(true);
+    expect(p.host.textContent).toContain('Delivery is uncertain');
+    expect(p.rows()).toHaveLength(1);
+    expect(p.rows()[0]).toContain('Outcome unknown');
+    p.submit();
+    expect(p.send).toHaveBeenCalledTimes(1);
+
+    p.panel.setState(view({ messages: [unmapped] }));
+    expect(p.sendButton.disabled).toBe(true);
+    expect(p.host.textContent).toContain('Delivery is uncertain');
+    expect(p.rows()[0]).toContain('Outcome unknown');
+    p.submit();
+    expect(p.send).toHaveBeenCalledTimes(1);
+
+    p.panel.setState(view({ messages: [message(id, 'stored', 'Question')] }));
+    expect(p.sendButton.disabled).toBe(false);
+    expect(p.host.textContent).not.toContain('Delivery is uncertain');
+    expect(p.rows()[0]).toContain('Stored — not confirmed read');
+    expect(p.composer.value).toBe('Next question');
+    expect(p.send).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['navigation', 'grant', 'detach'] as const)(
     'locks when the %s snapshot itself changes a pending echo to unknown',
     async (change) => {
