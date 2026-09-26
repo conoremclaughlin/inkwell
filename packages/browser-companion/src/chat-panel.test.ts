@@ -708,6 +708,88 @@ describe('local Stop and cleanup', () => {
 });
 
 describe('review regressions: conversation receipts and keyed history', () => {
+  describe.each(['navigation', 'grant', 'detach'] as const)(
+    'retained echo evidence after %s',
+    (change) => {
+      it.each<ChatDeliveryState | 'never-echoed'>([
+        'stored',
+        'queued',
+        'active',
+        'completed',
+        'rejected',
+        'unknown',
+        'never-echoed',
+      ])('uses %s evidence even after the history window slides', (status) => {
+        const p = setup();
+        p.input('Original question');
+        p.submit();
+        const [request, signal] = p.send.mock.calls[0]!;
+        if (status !== 'never-echoed') {
+          p.panel.setState(view({ messages: [message(request.operationId, status)] }));
+        }
+        const newer = Array.from({ length: CHAT_PANEL_LIMITS.messages }, (_, index) =>
+          message(`newer-${index}`, 'completed')
+        );
+        p.panel.setState(view({ messages: newer }));
+        const next = view({ messages: newer });
+        if (change === 'navigation') next.page!.binding.navigationId = 'synthetic-navigation-2';
+        if (change === 'grant') next.page!.binding.grantId = 'synthetic-grant-2';
+        if (change === 'detach') next.page = null;
+        p.panel.setState(next);
+        expect(signal.aborted).toBe(true);
+        expect(p.composer.value).toBe('');
+        p.input('Next question');
+        const mustLock = status === 'unknown' || status === 'never-echoed';
+        expect(p.sendButton.disabled).toBe(mustLock);
+        expect(p.host.textContent?.includes('Delivery is uncertain')).toBe(mustLock);
+        expect(p.send).toHaveBeenCalledTimes(1);
+        expect(p.rows()).toHaveLength(CHAT_PANEL_LIMITS.messages);
+      });
+    }
+  );
+
+  it('keeps the latest unknown echo locked even after an earlier positive echo', () => {
+    const p = setup();
+    p.input('Question');
+    p.submit();
+    const id = p.send.mock.calls[0]![0].operationId;
+    p.panel.setState(view({ messages: [message(id, 'stored')] }));
+    p.panel.setState(view({ messages: [message(id, 'unknown')] }));
+    p.panel.setState(view());
+    p.panel.setState(view({ page: null }));
+    p.input('Next question');
+    expect(p.sendButton.disabled).toBe(true);
+    p.submit();
+    expect(p.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('fences a late callback after navigating with an evicted positive echo', async () => {
+    const p = setup();
+    p.input('Original question');
+    p.submit();
+    const id = p.send.mock.calls[0]![0].operationId;
+    p.panel.setState(view({ messages: [message(id, 'stored')] }));
+    p.panel.setState(view());
+    p.panel.setState(view({ page: null }));
+    p.input('New question');
+    expect(p.sendButton.disabled).toBe(false);
+    const next = deferred<{ status: ChatDeliveryState }>();
+    p.send.mockReturnValueOnce(next.promise);
+    p.submit();
+    expect(p.send).toHaveBeenCalledTimes(2);
+    p.result.resolve({ status: 'unknown' });
+    await Promise.resolve();
+    expect(p.composer.value).toBe('New question');
+    expect(p.rows()).toHaveLength(1);
+    expect(p.rows()[0]).toContain('Sending — delivery unconfirmed');
+    expect(p.host.textContent).not.toContain('Delivery is uncertain');
+    next.resolve({ status: 'stored' });
+    await Promise.resolve();
+    expect(p.composer.value).toBe('');
+    p.input('Another question');
+    expect(p.sendButton.disabled).toBe(false);
+  });
+
   it.each(['navigation', 'grant', 'detach'] as const)(
     'keeps uncertainty conversation-scoped after %s and reconciles on the new binding',
     async (change) => {
