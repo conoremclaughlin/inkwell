@@ -5832,6 +5832,8 @@ describe('SessionService', () => {
         patternStudios?: Array<{ id: string; route_patterns: string[]; repo_root: string }>;
         /** Repo of a studio looked up by id (the continuity / reuse repo check). */
         studioRepos?: Record<string, string>;
+        /** Studio of a session looked up by id (the recipient-session anchor tier). */
+        sessionStudios?: Record<string, string>;
       }) {
         const queries: Array<{ table: string; calls: RecordedCall[] }> = [];
         const from = vi.fn().mockImplementation((table: string) => {
@@ -5843,6 +5845,10 @@ describe('SessionService', () => {
               if (has(c, 'id', 'sender-session-1')) {
                 return { data: { studio_id: 'sender-studio-1' } };
               }
+              const anchor = Object.entries(opts.sessionStudios ?? {}).find(([id]) =>
+                has(c, 'id', id)
+              );
+              if (anchor) return { data: { studio_id: anchor[1] } };
               // Tier 2 continuity: the live session already on this thread.
               if (opts.continuity && has(c, 'thread_key') && !has(c, 'studio_id')) {
                 return {
@@ -5888,7 +5894,19 @@ describe('SessionService', () => {
                 return { data: { repo_root: opts.continuity.repoRoot } };
               }
               const byId = Object.entries(opts.studioRepos ?? {}).find(([id]) => has(c, 'id', id));
-              if (byId) return { data: { repo_root: byId[1] } };
+              // A superset row: the repo for the continuity / reuse check, and
+              // the ownership columns an explicit studio anchor authorizes on.
+              if (byId) {
+                return {
+                  data: {
+                    repo_root: byId[1],
+                    user_id: 'user-456',
+                    agent_id: 'wren',
+                    sb_id: 'sb-wren',
+                    status: 'active',
+                  },
+                };
+              }
               const selected = String(c.find((call) => call.method === 'select')?.args[0] ?? '');
               // The occupancy read — every candidate is free.
               if (selected.includes('lease')) {
@@ -6263,6 +6281,87 @@ describe('SessionService', () => {
         });
 
         expect(session.id).toBe('old-session');
+        expect(mockRepository.create).not.toHaveBeenCalled();
+      });
+
+      it('keeps continuity in a caller-named studio even outside the project repo (Lumen, #681 r2)', async () => {
+        // An explicit studioId is addressing, and the reuse lookup is already
+        // scoped to it. Rejecting the live match there created a NEW session
+        // in the very same studio — the escape hatch lost its continuity, not
+        // its placement. Both project states: repo set, and repo unset.
+        for (const repo_root of ['/repos/inktrade', null] as const) {
+          mockRepository.create.mockClear();
+          const { supabase } = projectRoutingSupabase({
+            project: { slug: 'inktrade', repo_root },
+            studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+          });
+          const { service, repository } = serviceWithRepo(
+            supabase,
+            oldSessionIn('studio-wrong-repo')
+          );
+
+          const session = await service.getOrCreateSession('user-456', 'wren', {
+            threadKey: 'inktrade:pr:1',
+            studioId: 'studio-wrong-repo',
+          });
+
+          expect(repository.findByThreadKey).toHaveBeenCalledWith(
+            'user-456',
+            'wren',
+            'inktrade:pr:1',
+            'studio-wrong-repo',
+            undefined,
+            'sb-wren'
+          );
+          expect(session.id).toBe('old-session');
+          expect(mockRepository.create).not.toHaveBeenCalled();
+        }
+      });
+
+      it('drops an INFERRED recipient-session hint outside the project repo, keeps a caller-explicit one', async () => {
+        // The trigger path passes a recipientSessionId inferred from thread
+        // history or the participant stamp with no caller provenance
+        // (Lumen, #681 r2). For a pinned thread that hint is the incident's
+        // own session; it is a continuity hint, never an address. A
+        // caller-explicit one is addressing and wins as before.
+        const old = oldSessionIn('studio-wrong-repo');
+        const world = () => {
+          const { supabase } = projectRoutingSupabase({
+            project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+            studiosByRepo: { '/repos/inktrade': 'studio-inktrade-wren' },
+            studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+            sessionStudios: { 'old-session': 'studio-wrong-repo' },
+          });
+          const built = serviceWithRepo(supabase, old);
+          built.repository.findById = vi.fn(async (id: string) =>
+            id === 'old-session' ? old : null
+          );
+          return built;
+        };
+
+        const { service: inferredService } = world();
+        const inferred = await inferredService.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'inktrade:pr:1',
+          recipientSessionId: 'old-session',
+        });
+        expect(inferred.id).not.toBe('old-session');
+        expect(mockRepository.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studioId: 'studio-inktrade-wren',
+            metadata: expect.objectContaining({
+              routing_decision: expect.objectContaining({ tier: 'project-repo-reuse' }),
+            }),
+          })
+        );
+
+        mockRepository.create.mockClear();
+        const { service: explicitService } = world();
+        const explicit = await explicitService.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'inktrade:pr:1',
+          recipientSessionId: 'old-session',
+          recipientSessionExplicit: true,
+        });
+        expect(explicit.id).toBe('old-session');
         expect(mockRepository.create).not.toHaveBeenCalled();
       });
     });

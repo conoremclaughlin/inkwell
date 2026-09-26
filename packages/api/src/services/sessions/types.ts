@@ -241,6 +241,13 @@ export interface SessionRequest {
     contactId?: string;
     // Recipient session to inherit studio scope from
     recipientSessionId?: string;
+    /**
+     * True only when the CALLER named recipientSessionId. A value inferred
+     * from thread history or the participant stamp is a continuity hint and,
+     * on a project-pinned thread, must pass the project repo test (task
+     * b5c71bc3, Lumen #681 r2).
+     */
+    recipientSessionExplicit?: boolean;
     // Target a session by alias (e.g., "main", "review")
     sessionAlias?: string;
     // For task sessions

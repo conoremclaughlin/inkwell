@@ -1341,6 +1341,44 @@ export class SessionService implements ISessionService {
    * continuity: a pinned thread reuses a session only when its studio is in
    * the project's repo; a project with no repo reuses nothing and holds.
    */
+  /**
+   * Whether a session may carry this thread, by the thread's pinned project
+   * (task b5c71bc3). The trigger handler asks this about an assignment
+   * WINNER — an existing participant stamp that beat the routed candidate —
+   * before promoting it to the delivery session (Lumen, #681 r2). True for a
+   * thread with no pin, or no key at all.
+   */
+  async sessionAllowedForThread(
+    userId: string,
+    sbId: string | null,
+    threadKey: string | undefined,
+    session: Session
+  ): Promise<boolean> {
+    if (!threadKey) return true;
+    const { project } = await this.resolveThreadBehavior(userId, sbId, threadKey);
+    return this.threadMatchAllowed(userId, session, project, threadKey);
+  }
+
+  /**
+   * A live thread match inside the studio the CALLER named is continuity in
+   * an address, not a guess: the reuse lookup was scoped to that studio, so
+   * rejecting the match there would mint a new session in the very same
+   * studio — the explicit escape hatch losing its continuity while keeping
+   * its placement (Lumen, #681 r2). Only the two caller-named tiers qualify;
+   * an unresolved "main" or an inferred tier keeps the repo test.
+   */
+  private matchInCallerNamedStudio(
+    routing: StudioRoutingDecision,
+    resolvedStudioId: string | undefined,
+    match: Session
+  ): boolean {
+    return (
+      (routing.tier === 'explicit' || routing.tier === 'studio-hint') &&
+      !!resolvedStudioId &&
+      match.studioId === resolvedStudioId
+    );
+  }
+
   private async threadMatchAllowed(
     userId: string,
     match: Session,
@@ -1467,6 +1505,7 @@ export class SessionService implements ISessionService {
         studioId: metadata?.studioId,
         studioHint: metadata?.studioHint,
         recipientSessionId: metadata?.recipientSessionId,
+        recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
         turnEpochCandidate,
@@ -1688,6 +1727,7 @@ export class SessionService implements ISessionService {
             studioId: pending.request.metadata?.studioId,
             studioHint: pending.request.metadata?.studioHint,
             recipientSessionId: pending.request.metadata?.recipientSessionId,
+            recipientSessionExplicit: pending.request.metadata?.recipientSessionExplicit === true,
             // The candidate minted at THIS message's handleMessage entry —
             // its pre-queue resolution already stamped leases with it.
             turnEpochCandidate: pending.turnEpochCandidate,
@@ -2778,6 +2818,13 @@ export class SessionService implements ISessionService {
       studioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
+      /**
+       * The caller named recipientSessionId (addressing). Absent for a value
+       * inferred from thread history or the participant stamp — a continuity
+       * hint that, on a project-pinned thread, must pass the project repo test
+       * or is dropped (Lumen, #681 r2).
+       */
+      recipientSessionExplicit?: boolean;
       contactId?: string;
       repoRoot?: string;
       /** Server-derived sender studio — see resolveCallerRepoRoot. */
@@ -2874,10 +2921,12 @@ export class SessionService implements ISessionService {
     // later once its studio has already been consumed.
     let authorizedRecipientSessionId = options?.recipientSessionId;
     let anchorLookupFailed = false;
+    let recipientCandidate: Session | null = null;
     if (options?.recipientSessionId) {
       let candidate: Session | null = null;
       try {
         candidate = await this.repository.findById(options.recipientSessionId);
+        recipientCandidate = candidate;
       } catch (err) {
         // FAIL CLOSED (Lumen, PR #514 round 7). Swallowing this turned a
         // database failure into "no such session", so an EXACT anchor the
@@ -2928,6 +2977,34 @@ export class SessionService implements ISessionService {
     } = options?.threadKey
       ? await this.resolveThreadBehavior(userId, identitySbId, options.threadKey)
       : ({ writeIntent: 'write', studioPolicy: 'provision', project: null } as const);
+
+    // Provenance (Lumen, #681 r2). The trigger path passes a recipientSessionId
+    // inferred from thread history or the participant stamp — a continuity
+    // hint with no caller behind it (spec §3b.1). On a project-pinned thread
+    // that hint is the incident's own session, and as an anchor it outranked
+    // every repo-scoped rung. Only a caller-explicit anchor is addressing; an
+    // inferred one takes the same repo test as continuity, or is dropped and
+    // the ladder decides.
+    if (
+      authorizedRecipientSessionId &&
+      recipientCandidate &&
+      options?.recipientSessionExplicit !== true &&
+      projectRepo &&
+      options?.threadKey &&
+      !(await this.threadMatchAllowed(userId, recipientCandidate, projectRepo, options.threadKey))
+    ) {
+      logger.warn(
+        '[SessionRouting] Dropping inferred recipientSessionId — outside the project repo',
+        {
+          recipientSessionId: authorizedRecipientSessionId,
+          studioId: recipientCandidate.studioId ?? null,
+          threadKey: options.threadKey,
+          project: projectRepo.slug,
+          projectRepoRoot: projectRepo.repoRoot,
+        }
+      );
+      authorizedRecipientSessionId = undefined;
+    }
 
     let routing = await this.resolveStudioId(userId, sbSlug, {
       threadKey: options?.threadKey,
@@ -3090,7 +3167,8 @@ export class SessionService implements ISessionService {
         );
         if (
           threadMatch &&
-          (await this.threadMatchAllowed(userId, threadMatch, projectRepo, options.threadKey))
+          (this.matchInCallerNamedStudio(routing, resolvedStudioId, threadMatch) ||
+            (await this.threadMatchAllowed(userId, threadMatch, projectRepo, options.threadKey)))
         ) {
           this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
           return this.withStudioLease(threadMatch, routing, leaseCtx);
