@@ -3,7 +3,6 @@ import chalk from 'chalk';
 import { createInterface } from 'readline/promises';
 import { stdin as input, stdout as output } from 'process';
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -50,6 +49,7 @@ import {
 } from '../repl/spawn-agent.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
+import { SessionLog } from '../session/session-log.js';
 import {
   ensureBackendAuthReady,
   isBackendAuthBackend,
@@ -329,7 +329,8 @@ interface ChatRuntime {
   eventPolling: boolean;
   autoRunInbox: boolean;
   awayMode: boolean;
-  transcriptPath: string;
+  /** This session's event log; its path is the ledger location in session_meta. */
+  log: SessionLog;
   activeSkills: SkillInstruction[];
   bootstrapContext?: string;
   strictTools: boolean;
@@ -1312,75 +1313,6 @@ async function tailTranscript(target: string): Promise<void> {
     };
     process.on('SIGINT', stop);
   });
-}
-
-// Per-transcript monotonic event id counters. Every appended event gets an
-// `eid` so persistent operations (context_evict) can reference events
-// precisely across reattach. Seeded from the file's max eid on hydration.
-const transcriptEidCounters = new Map<string, number>();
-
-export function seedTranscriptEidCounter(path: string, maxSeen: number): void {
-  const current = transcriptEidCounters.get(path) ?? 0;
-  if (maxSeen > current) transcriptEidCounters.set(path, maxSeen);
-}
-
-/**
- * The observer projection (spec:observer-attach §4.1) — ledger entry types
- * that are ALSO mirrored to stdout as `obs` lines for live observers. Must
- * stay in sync with OBSERVER_PROJECTION_TYPES in the server's
- * session-event-bus.ts: every projection append is emitted from ONE place
- * (below) so the live view can never diverge from replay.
- */
-const OBS_PROJECTION_TYPES = new Set([
-  'user',
-  'system_turn',
-  'auto_turn',
-  'assistant',
-  'inbox',
-  'backend_tool',
-  'backend_text',
-  'local_tool_call',
-  'pcp_tool',
-  'backend_session',
-  'compaction',
-  'session_pause',
-  'session_end',
-]);
-
-/**
- * Live mirror for projection appends — set by runChat to its stream emitter
- * (non-interactive stdout NDJSON). The wire event IS the appended ledger
- * entry, emitted only after the append succeeds; consumers must preserve the
- * eid and never mint their own.
- */
-let transcriptObsEmitter: ((entry: Record<string, unknown>) => void) | null = null;
-
-export function setTranscriptObsEmitter(
-  emitter: ((entry: Record<string, unknown>) => void) | null
-): void {
-  transcriptObsEmitter = emitter;
-}
-
-function appendTranscriptEntry(
-  path: string,
-  event: Record<string, unknown>
-): Record<string, unknown> {
-  const eid = (transcriptEidCounters.get(path) ?? 0) + 1;
-  transcriptEidCounters.set(path, eid);
-  const entry: Record<string, unknown> = { ts: new Date().toISOString(), eid, ...event };
-  appendFileSync(path, JSON.stringify(entry) + '\n');
-  if (typeof entry.type === 'string' && OBS_PROJECTION_TYPES.has(entry.type)) {
-    try {
-      transcriptObsEmitter?.(entry);
-    } catch {
-      // The live mirror must never break the ledger write path.
-    }
-  }
-  return entry;
-}
-
-function appendTranscript(path: string, event: Record<string, unknown>): number {
-  return appendTranscriptEntry(path, event).eid as number;
 }
 
 function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): string {
@@ -2957,7 +2889,7 @@ export function applyModelSelection(
 ): void {
   runtime.model = next;
   runtime.detectedModel = undefined;
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: 'model_detection_reset',
     backend: runtime.backend,
   });
@@ -2988,7 +2920,7 @@ export function applyDetectedModel(
   contextBudgetAuto: boolean
 ): { windowChanged: boolean } {
   runtime.detectedModel = model;
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: 'model_detected',
     backend: runtime.backend,
     model,
@@ -3011,7 +2943,7 @@ function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
   const previous = runtime.maxContextTokens;
   runtime.maxContextTokens = defaultContextBudget(window, promptTransportFor(runtime.backend));
   if (runtime.maxContextTokens !== previous) {
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'context_budget_changed',
       from: previous,
       to: runtime.maxContextTokens,
@@ -3634,7 +3566,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     eventPolling: true,
     autoRunInbox: options.autoRun ?? false,
     awayMode: options.away ?? false,
-    transcriptPath: ensureRuntimeTranscriptPath(),
+    // Replaced once the session is known (below); nothing appends before then.
+    log: new SessionLog({ path: ensureRuntimeTranscriptPath() }),
     systemPromptOverride: readSystemPromptFile(options.systemPromptFile),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
@@ -4062,14 +3995,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  // Register the live obs mirror: EVERY projection-type ledger append (user,
-  // system turns, inkClient/local tools, assistant results, backend events, session
-  // markers) is emitted as an `obs` line from inside appendTranscriptEntry —
-  // one place, all paths, so the live view can never diverge from replay
-  // (spec:observer-attach §4.2; the e2e caught exactly this gap when only
-  // backend events were mirrored).
-  setTranscriptObsEmitter((entry) => emitStreamEvent({ type: 'obs', entry }));
-
   // ── Live paragraph streaming (Ink TUI only) ──
   // Assistant text renders as it flows: partial-message deltas accumulate in a
   // fence-aware paragraph buffer and each completed paragraph is appended to
@@ -4133,7 +4058,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     renderStreamedLines(streamRenderer.endSpawn());
     const held = previewGuard.endSpawn();
     if (held.trim()) {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_text',
         preview: compactForLedger(held, 200),
       });
@@ -4240,7 +4165,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Surface the call in the live feed as the agent's own — one dim line,
       // same shape as the replay's 🛠 rows.
       printEvent(chalk.dim(`🛠 ${sbSlug} · ${evt.name} …`));
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_tool',
         name: evt.name,
         status: 'running',
@@ -4256,7 +4181,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'tool-result') {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_tool',
         status: evt.isError ? 'error' : 'done',
         ...(evt.id ? { toolUseId: evt.id } : {}),
@@ -4273,7 +4198,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // nothing is lost, only not republished.
       const guarded = previewGuard.onBlock(evt.text);
       if (guarded.publish.trim() || guarded.imitationDiscarded) {
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'backend_text',
           preview: compactForLedger(guarded.publish, 200),
           ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
@@ -4400,8 +4325,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // live it hides the previous sample, and replay must not resurrect it
     // (Lumen, round 3).
     const parts = usage.contextParts;
-    appendTranscript(
-      runtime.transcriptPath,
+    runtime.log.append(
       usage.contextTokens !== undefined && usage.contextTokens > 0
         ? {
             type: 'provider_sample',
@@ -4756,13 +4680,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
     runtime.sessionId && attachedToExistingSession
       ? findLatestTranscriptForSession(runtime.sessionId)
       : undefined;
-  runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
+  // The live obs mirror: EVERY projection-type ledger append (user, system
+  // turns, inkClient/local tools, assistant results, backend events, session
+  // markers) is emitted as an `obs` line from inside SessionLog.append — one
+  // place, all paths, so the live view can never diverge from replay
+  // (spec:observer-attach §4.2; the e2e caught exactly this gap when only
+  // backend events were mirrored). It belongs to this session's log alone:
+  // a clone's log has no observer.
+  runtime.log = new SessionLog({
+    path: existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId),
+    onProjection: (entry) => emitStreamEvent({ type: 'obs', entry }),
+  });
 
   // Announce the ledger's absolute location to the server (session_meta) so
   // observer replay has a server-owned locator (spec:observer-attach §4.3).
   // The runtime is the authority on where it writes — the server validates
   // shape but never derives paths from its own cwd or caller input.
-  emitStreamEvent({ type: 'session_meta', transcriptPath: runtime.transcriptPath });
+  emitStreamEvent({ type: 'session_meta', transcriptPath: runtime.log.path });
 
   // ── Provider session reuse (claude only) — Stage 2 ──
   // One provider-native session id per ink session, reused across turns AND
@@ -4821,7 +4755,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
    */
   const rollProviderSession = (reason: string, note: string): void => {
     if (activeBackendSessionId !== undefined) {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_session_invalidated',
         id: activeBackendSessionId,
         reason,
@@ -4890,7 +4824,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     // Continue the event-id sequence from where the file left off
-    seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
+    runtime.log.seed(hydrated.maxEid);
     sessionEvictedEntries.push(...hydrated.evictedEntries);
     // Replayed tool calls populate the inspector's Tool Calls section so
     // Ctrl+T shows the receipts behind prior turns, not just this session's
@@ -4931,7 +4865,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   }
 
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: attachedToExistingSession ? 'session_attach' : 'session_start',
     sbSlug,
     backend: runtime.backend,
@@ -5244,7 +5178,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }>
   ): void => {
     if (refs.length === 0) return;
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'context_evict',
       actor,
       reason,
@@ -5297,7 +5231,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const note = `Trimmed ${trim.removedEntries.length} entries (~${trim.removedTokens} tok) to ${targetPercent}% budget (${reason}).`;
     console.log(chalk.yellow(note));
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'context_trim',
       reason,
       targetPercent,
@@ -5399,7 +5333,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               : turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`,
           };
         },
-        persist: (event) => appendTranscript(runtime.transcriptPath, event),
+        persist: (event) => runtime.log.append(event),
         recordUsage: recordRunUsage,
         hardTrim: (reason) => trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, reason),
         log: (line) => printEvent(chalk.yellow(`  ⛁ ${line}`)),
@@ -5673,7 +5607,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })
         );
       }
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'permission_grant',
         messageId: msg.id,
         action,
@@ -5702,7 +5636,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         const heading = msg.subject ? `${from} — ${msg.subject}` : from;
         const rendered = `📥 ${heading}: ${msg.content}`.trim();
         ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'inbox',
           messageId: msg.id,
           rendered,
@@ -5755,7 +5689,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       const rendered = `📥 ${heading}${delegationLabel}: ${msg.content}`.trim();
       ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'inbox',
         messageId: msg.id,
         rendered,
@@ -5898,7 +5832,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // backend turn lifecycle) are dim event lines; everything else stays
       // a ⚡ activity block.
       const plan = classifyActivity(activity, sbSlug);
-      const activityEid = appendTranscript(runtime.transcriptPath, {
+      const activityEid = runtime.log.append({
         type: 'activity',
         activityId: activity.id,
         activityType: activity.type || null,
@@ -6043,6 +5977,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       cloneId: record.id,
       cloneLabel: record.label,
     };
+    // Its own log, with its own eid sequence and no observer: a clone's entries
+    // never reach the parent's live stream, whatever their type.
+    const cloneLog = new SessionLog({ path: record.transcriptPath });
 
     /**
      * Snapshot the provider at launch.
@@ -6162,7 +6099,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })();
       cloneGenerationAtReport = generationBeforeSpawn;
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
-      appendTranscript(record.transcriptPath, {
+      cloneLog.append({
         type: 'backend_turn',
         continuation: turnCtx.isContinuation,
         success: result.success,
@@ -6186,7 +6123,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     };
 
     try {
-      appendTranscript(record.transcriptPath, {
+      cloneLog.append({
         type: 'clone_start',
         id: record.id,
         label: record.label,
@@ -6230,10 +6167,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ui: {
             // A clone's progress belongs to the clone, not the parent's
             // scrollback — the parent gets one summary, which is the point.
-            printLine: (text) =>
-              appendTranscript(record.transcriptPath, { type: 'clone_line', text }),
-            printEvent: (text) =>
-              appendTranscript(record.transcriptPath, { type: 'clone_event', text }),
+            printLine: (text) => cloneLog.append({ type: 'clone_line', text }),
+            printEvent: (text) => cloneLog.append({ type: 'clone_event', text }),
             startWaiting: () => () => {},
           },
           tools: {
@@ -6249,7 +6184,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 policy: clonePolicy,
                 origin: cloneOrigin,
                 signal: execCtx.signal,
-                transcriptPath: record.transcriptPath,
+                log: cloneLog,
                 signalSink: cloneSignal,
               });
             },
@@ -6260,7 +6195,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       const fullText = result.assistantDisplayText || result.responseText;
       const summary = boundSummary(fullText);
-      appendTranscript(record.transcriptPath, {
+      cloneLog.append({
         type: 'clone_end',
         stopReason: result.stopReason,
         iterations: result.iterations,
@@ -6289,7 +6224,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      appendTranscript(record.transcriptPath, { type: 'clone_error', error: message });
+      cloneLog.append({ type: 'clone_error', error: message });
       cloneRegistry.update(record.id, { status: 'failed', error: message });
       logCloneActivity(record.id, 'failed', { error: message });
     }
@@ -6346,7 +6281,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       policy: ToolPolicyState;
       origin: ApprovalOriginInfo;
       signal?: AbortSignal;
-      transcriptPath: string;
+      log: SessionLog;
       signalSink: SignalSink;
     }
   ): Promise<ToolResultRecord[]> => {
@@ -6399,7 +6334,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               return handleClientLocalTool(
                 tool,
                 args,
-                cloneLedgerFor(opts.transcriptPath),
+                cloneLedgerFor(opts.log.path),
                 opts.signalSink
               );
             }
@@ -6427,7 +6362,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // detail has to hold for the caller reading it, not just the parent.
           const resultJson =
             result.result === undefined ? undefined : JSON.stringify(result.result);
-          appendTranscript(opts.transcriptPath, {
+          opts.log.append({
             type: 'clone_tool_call',
             tool: result.tool,
             args: result.args,
@@ -6508,7 +6443,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         label: task.label,
         prompt: task.prompt,
         parentSessionId: runtime.sessionId,
-        transcriptPath: runtime.transcriptPath.replace(/\.jsonl$/, `.${id}.jsonl`),
+        transcriptPath: runtime.log.path.replace(/\.jsonl$/, `.${id}.jsonl`),
       });
     });
 
@@ -6696,7 +6631,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         compactForLedger(rendered, MAX_CLONE_SUMMARY_CHARS),
         'shadow-clone'
       );
-      appendTranscript(runtime.transcriptPath, { type: 'clone_fanout', outcomes: fresh });
+      runtime.log.append({ type: 'clone_fanout', outcomes: fresh });
     }
 
     return {
@@ -6805,7 +6740,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             printEvent(
               chalk.yellow(`🛠 ${sbSlug} · ${result.tool} (${result.status}) — ${result.reason}`)
             );
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'local_tool_call',
               tool: result.tool,
               args: result.args,
@@ -6888,7 +6823,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 )
               );
             }
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'local_tool_call',
               tool: result.tool,
               args: result.args,
@@ -6925,7 +6860,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 `🛠 ${sbSlug} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
               )
             );
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'local_tool_call',
               tool: result.tool,
               args: result.args,
@@ -6981,17 +6916,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // with the turn.
     if (source === 'user') {
       ledger.addEntry('user', raw, 'repl');
-      appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+      runtime.log.append({ type: 'user', content: raw });
     } else if (source === 'system') {
       // Synthetic turn input: heartbeat triggers, server-delivered messages,
       // continuation prompts. Recorded as system (not "you") so transcripts
       // distinguish harness prompts from the human's words.
       const label = displayLabel || 'system';
       ledger.addEntry('system', raw, label);
-      appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
+      runtime.log.append({ type: 'system_turn', content: raw, label });
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${raw}`, 500), 'auto-run');
-      appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
+      runtime.log.append({ type: 'auto_turn', content: raw });
     }
 
     if (runtime.sessionId && !options.nonInteractive) {
@@ -7039,7 +6974,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Persist hook-injected entries to transcript so they survive reattach
     if (promptHookResult.injectedEntries.length > 0) {
       for (const entry of promptHookResult.injectedEntries) {
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'hook_injection',
           role: entry.role,
           content: entry.content,
@@ -7152,7 +7087,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // and RESUMES this native session instead of fragmenting into a new jsonl.
       // routing rides along so cross-process recovery can refuse a session
       // seeded under the other instruction envelope.
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_session',
         id: seedProviderSessionId,
         routing: runtime.toolRouting,
@@ -7449,7 +7384,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const reseedId = randomUUID();
           activeBackendSessionId = reseedId;
           activeBackendSessionShape = currentEnvelopeShape;
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'backend_session',
             id: reseedId,
             routing: runtime.toolRouting,
@@ -7590,7 +7525,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // shape made the NEXT turn roll this session again — the very
         // fragmentation this fix exists to stop (Lumen, PR #577).
         activeBackendSessionShape = envelopeShapeKey(runtime);
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'backend_session',
           id: decision.id,
           routing: runtime.toolRouting,
@@ -7715,7 +7650,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // the fact, and not enough to reconstruct what the agent had acted
             // on without the provider's transcript (#569).
             recordProtocolViolation: (violation) => {
-              appendTranscript(runtime.transcriptPath, {
+              runtime.log.append({
                 type: 'protocol_violation',
                 kind: violation.kind,
                 phase: violation.phase,
@@ -7754,7 +7689,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (isAbortedTurn) {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'assistant',
         backend: runtime.backend,
         model: runtime.model || null,
@@ -7768,7 +7703,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     } else {
       ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'assistant',
         backend: runtime.backend,
         model: runtime.model || null,
@@ -7826,7 +7761,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // ledger on replay, and without this the gap had no explanation
         // (Lumen, PR #584).
         const tombstone = autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS);
-        const noteEid = appendTranscript(runtime.transcriptPath, {
+        const noteEid = runtime.log.append({
           type: 'context_note',
           source: AUTO_EVICT_TOMBSTONE_SOURCE,
           content: tombstone,
@@ -7866,7 +7801,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // Persist hook-injected entries to transcript so they survive reattach
         if (hookResult.injectedEntries.length > 0) {
           for (const entry of hookResult.injectedEntries) {
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'hook_injection',
               role: entry.role,
               content: entry.content,
@@ -8261,7 +8196,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         })
         .catch(() => undefined);
     }
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'session_pause',
       sessionId: runtime.sessionId || null,
       summary,
@@ -9203,7 +9138,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               .catch((error) => ({ error: String(error) }));
             const rendered = JSON.stringify(result, null, 2);
             ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'ink');
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'pcp_tool',
               tool,
               args: inkArgs,
@@ -9324,7 +9259,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             .catch((error) => ({ error: String(error) }));
           const rendered = JSON.stringify(result, null, 2);
           ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'ink');
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'pcp_tool',
             tool,
             args: inkArgs,
@@ -9504,7 +9439,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
           const summary = `Delegation token minted: ${payload.iss} -> ${payload.sub} scopes=${payload.scopes.join(',')} exp=${new Date(payload.exp * 1000).toISOString()}`;
           ledger.addEntry('system', summary, 'delegation');
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'delegation_create',
             payload,
             token,
@@ -9626,7 +9561,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const result = await inkClient
             .callTool('send_to_inbox', inboxArgs)
             .catch((error) => ({ error: String(error) }));
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'delegation_send',
             toAgent,
             scopes,
@@ -9724,7 +9659,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               })
               .catch(() => undefined);
           }
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'context_eject',
             bookmarkId: result.bookmark.id,
             bookmarkLabel: result.bookmark.label,
@@ -9900,7 +9835,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .callTool('end_session', { sbSlug, sessionId: runtime.sessionId, summary })
       .catch(() => undefined);
   }
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: 'session_end',
     sessionId: runtime.sessionId || null,
     summary,
