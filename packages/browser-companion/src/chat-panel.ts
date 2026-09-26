@@ -475,7 +475,11 @@ export function createChatPanel(
     const copy = snapshot(next);
     if (targetKey(state) !== targetKey(copy)) {
       const operation = pending;
-      if (operation) unresolved.set(operation.key, operation.id);
+      // An evicted echo still resolves delivery, even while send() is pending.
+      const confirmed = local.some(
+        (message) => message.id === operation?.id && message.echoed && message.status !== 'unknown'
+      );
+      if (operation && !confirmed) unresolved.set(operation.key, operation.id);
       pending = undefined;
       local = [];
       composer.value = '';
