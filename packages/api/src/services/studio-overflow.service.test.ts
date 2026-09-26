@@ -1703,7 +1703,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
 
 describe('StudioOverflowService — the parent must be in the thread’s project repo (task b5c71bc3)', () => {
   /*
-   * Thread `inktrade:pr:1` routed to a PCP studio, and this service minted
+   * Thread `inktrade:pr:1` routed to an Inkwell studio, and this service minted
    * its checkout from that parent's repo — detached at inkwell's
    * refs/pull/1/head, the wrong repository's PR #1. Routing now resolves the
    * project's repo and passes it here as `expectedRepoRoot`; a parent in any

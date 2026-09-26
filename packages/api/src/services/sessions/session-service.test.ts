@@ -5799,7 +5799,7 @@ describe('SessionService', () => {
     });
     describe('project-pinned threads route by the project repo, never the sender repo (task b5c71bc3)', () => {
       /*
-       * Thread `inktrade:pr:1` (2026-09-24) routed to a PCP studio through the
+       * Thread `inktrade:pr:1` (2026-09-24) routed to an Inkwell studio through the
        * caller-repo tier — the sender was in the inkwell checkout — and the
        * overflow service then minted the review checkout from that parent's
        * repo, detached at inkwell's refs/pull/1/head: the wrong repository's

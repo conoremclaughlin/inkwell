@@ -412,7 +412,7 @@ export class StudioOverflowService {
   /**
    * A project-pinned thread names its repo — routing resolves it from the
    * thread's pinned project — and the parent this service mints from must be
-   * in that repo. On 2026-09-24 `inktrade:pr:1` was routed to a PCP studio
+   * in that repo. On 2026-09-24 `inktrade:pr:1` was routed to an Inkwell studio
    * and the checkout minted here was detached at inkwell's refs/pull/1/head:
    * the wrong repository's PR #1, handed to a reviewer as an inktrade review
    * (task b5c71bc3). A mismatch is refused before a slug is read or a
