@@ -119,6 +119,11 @@ jobs:
       - name: Integration-DB harness endpoint isolation
         run: sh scripts/test-integration-db-local.test.sh
 
+      # The harness turns off Kong's upstream keepalive in the isolated stack
+      # (task 388ae17e). Mock-only: a stub docker on PATH, no container.
+      - name: Integration-DB harness Kong keepalive step
+        run: sh scripts/test-disable-kong-upstream-keepalive.test.sh
+
       - name: Integration stack lifecycle (mock-only)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-integration-stack.py
