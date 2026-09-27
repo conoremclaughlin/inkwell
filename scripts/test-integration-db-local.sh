@@ -82,6 +82,17 @@ if [[ "${PROBE_STATUS}" != "200" ]]; then
   exit 1
 fi
 
+# Kong must not pool connections to PostgREST: a pooled connection PostgREST
+# has just closed turns a POST or PATCH into a 502, which was every captured
+# "invalid response from the upstream server" failure (task 388ae17e). Before
+# the steady-answer wait below, so that wait covers the reload too. A failure
+# here leaves the old flake possible, not the suite wrong, so it warns.
+# shellcheck source=lib/disable-kong-upstream-keepalive.sh
+source "${ROOT_DIR}/scripts/lib/disable-kong-upstream-keepalive.sh"
+if ! disable_kong_upstream_keepalive "supabase_kong_${PROJECT_ID}"; then
+  echo "[integration-db] Continuing with Kong upstream keepalive on: expect the occasional POST/PATCH 502." >&2
+fi
+
 # One 200 proved the key. `db reset` also makes PostgREST reload its schema
 # cache, and the gateway can still answer a request badly for a moment after
 # that; ask for three clean answers a second apart before starting the suite.
@@ -125,6 +136,9 @@ dump_stack_diagnostics() {
     id="$(docker inspect --format '{{.Id}}' "${name}" 2>/dev/null)" || continue
     echo "[integration-db] --- ${service} invocation diagnostics ---"
     docker inspect --format 'status={{.State.Status}} restarts={{.RestartCount}} oomKilled={{.State.OOMKilled}}' "${id}" 2>/dev/null || true
+    if [[ "${service}" == "kong" ]]; then
+      echo "upstream_keepalive_pool_size=$(kong_upstream_keepalive_pool_size "${name}" || true)"
+    fi
     if ! python3 "${ROOT_DIR}/scripts/lib/integration-log-summary.py" \
       "${service}" "${id}" "${DIAGNOSTICS_SINCE}"; then
       echo "[integration-db] ${service} log summary incomplete (capture or parser failed)." >&2
