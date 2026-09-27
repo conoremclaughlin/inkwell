@@ -18,6 +18,7 @@ function makeDeps(overrides: Partial<TurnSignalDeps> = {}) {
   const deps: TurnSignalDeps = {
     getSessionId: () => 'sess-1',
     sbSlug: 'wren',
+    cliAttached: true,
     getServerUrl: () => 'http://localhost:3001/',
     getToken: async () => 'tok-abc',
     workingDir: '/work/tree',
@@ -148,6 +149,47 @@ describe('createTurnSignal', () => {
     await createTurnSignal(deps).open();
     const init = fetchImpl.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
+  });
+});
+
+/**
+ * PR #685 r3 (Lumen): a headless chat's provider children no longer write
+ * the attachment, so the owner must. It declares cliAttached:false in the
+ * same request that opens the turn, never in a separate detach.
+ */
+describe('the owner declares its attachment when it opens a turn', () => {
+  it('a headless owner declares cliAttached:false in its prompt request', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false });
+    await expect(createTurnSignal(deps).open()).resolves.toBe(true);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(bodyOf(fetchImpl)).toEqual({
+      sessionId: 'sess-1',
+      lifecycle: 'running',
+      event: 'prompt',
+      sbSlug: 'wren',
+      workingDir: '/work/tree',
+      cliAttached: false,
+    });
+  });
+
+  it('an attached owner writes no attachment when it opens (its children still do)', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: true });
+    await createTurnSignal(deps).open();
+    expect(bodyOf(fetchImpl)).not.toHaveProperty('cliAttached');
+  });
+
+  it('a headless owner declares it at every open and never on its stop', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false });
+    const signal = createTurnSignal(deps);
+    await signal.open();
+    await signal.close();
+    await signal.open();
+
+    expect(bodyOf(fetchImpl, 0)).toMatchObject({ event: 'prompt', cliAttached: false });
+    expect(bodyOf(fetchImpl, 1).event).toBe('stop');
+    expect(bodyOf(fetchImpl, 1)).not.toHaveProperty('cliAttached');
+    expect(bodyOf(fetchImpl, 2)).toMatchObject({ event: 'prompt', cliAttached: false });
   });
 });
 

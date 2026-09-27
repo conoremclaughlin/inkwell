@@ -15,6 +15,12 @@
  * (Lumen, PR #685 r2). So a child spawned by chat declares that its parent
  * owns the turn, and its on-prompt hook leaves the attachment alone.
  *
+ * The attachment is then the parent's to write. A headless chat declares
+ * `cliAttached:false` in the prompt request that opens each turn
+ * (repl/turn-signal.ts). A prompt request stamps the marker whatever else it
+ * carries, so the false clears an attachment a crashed interactive process
+ * left behind without detaching the turn (Lumen, PR #685 r3).
+ *
  * Carried in the environment and not in INK_CONTEXT, so that hooks built from
  * any checkout can read it without a rebuild of @inklabs/shared.
  */
@@ -35,7 +41,7 @@ export function parentOwnsTurn(env: NodeJS.ProcessEnv = process.env): boolean {
  * The `cli_attached` value a backend's on-prompt hook writes to its session:
  * true for an interactive process, false for a server spawn (it clears an
  * attachment a crashed interactive process left behind), and null, meaning
- * no write, for a headless child of `ink chat`.
+ * no write, for a headless child of `ink chat`, whose parent declares it.
  */
 export function promptAttachmentWrite(
   headless: boolean,

@@ -7935,6 +7935,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     getSessionId: () => runtime.sessionId,
     getStudioId: () => currentInkStudioId(),
     sbSlug,
+    cliAttached,
     getServerUrl: async () => (await import('../lib/ink-mcp.js')).getInkServerUrl(),
     getToken: async (serverUrl) =>
       (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),
