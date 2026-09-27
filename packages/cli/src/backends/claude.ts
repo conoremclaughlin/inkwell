@@ -17,7 +17,7 @@ import {
 import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
-import { encodeContextToken } from '@inklabs/shared';
+import { encodeContextToken, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { buildIdentityPrompt } from './identity.js';
 import { buildMergedMcpConfig } from '../lib/skill-mcp.js';
 import type { BackendAdapter, BackendConfig, PreparedBackend, TurnMedia } from './types.js';
@@ -211,7 +211,8 @@ export class ClaudeAdapter implements BackendAdapter {
     // transcripts can exceed the OS argv limit (~256KB on macOS), which
     // makes spawn fail with E2BIG. `claude -p` reads the prompt from piped
     // stdin when no positional prompt is given.
-    if (config.prompt) {
+    const printMode = Boolean(config.prompt);
+    if (printMode) {
       args.push('-p');
     }
 
@@ -376,6 +377,10 @@ export class ClaudeAdapter implements BackendAdapter {
         INK_CONTEXT: contextToken,
         ...(config.inkSessionId ? { INK_SESSION_ID: config.inkSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
+        // `-p` cannot show a channel notification, so the inkmail plugin must
+        // not poll here: it would ack messages the model never saw. The
+        // config may still load it — the pass-through path is not strict.
+        ...(printMode ? PRINT_MODE_CHANNEL_ENV : {}),
       },
       cleanup: mcpCleanup,
       ...(stdinData ? { stdinData } : {}),

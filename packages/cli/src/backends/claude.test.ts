@@ -3,6 +3,7 @@ import { execSync } from 'child_process';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import {
   ClaudeAdapter,
   classifyMedia,
@@ -224,6 +225,43 @@ describe('ClaudeAdapter prepare — tool routing', () => {
       expect(Object.keys(servers).sort()).toEqual(['github', 'inkmail', 'inkwell']);
     } finally {
       prepared.cleanup();
+    }
+  });
+
+  // Task 2f892701: `-p` cannot show a channel notification, and both routings
+  // can still load the inkmail plugin (local keeps the bridge; backend is not
+  // strict). Every print-mode spawn must tell the plugin to stay inert, and an
+  // interactive one must not, or live CLIs lose channel delivery.
+  it('declares print mode to the channel plugin on every -p spawn, and only there', () => {
+    const adapter = new ClaudeAdapter();
+    for (const toolRouting of ['local', undefined] as const) {
+      const printed = adapter.prepare({
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        ...(toolRouting ? { toolRouting } : {}),
+      });
+      try {
+        expect(printed.args).toContain('-p');
+        expect(printed.env).toMatchObject(PRINT_MODE_CHANNEL_ENV);
+      } finally {
+        printed.cleanup();
+      }
+    }
+
+    const interactive = adapter.prepare({
+      sbSlug: 'wren',
+      prompt: '',
+      promptParts: [],
+      passthroughArgs: [],
+    });
+    try {
+      expect(interactive.args).not.toContain('-p');
+      expect(interactive.args).toContain('--dangerously-load-development-channels');
+      expect(interactive.env).not.toHaveProperty('INK_CHANNEL_HOST');
+    } finally {
+      interactive.cleanup();
     }
   });
 });
