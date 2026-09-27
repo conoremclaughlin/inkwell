@@ -247,6 +247,60 @@ describe('attached REPL thread delivery', () => {
     expect(acks).toEqual([]);
   });
 
+  it('retries a message whose intake stopped part-way, and acks it once intake completes', async () => {
+    // The first render throws after intake has already written the ledger
+    // and transcript, and before the auto-run queue. The retry must deliver
+    // it again: a partial intake is not a skip.
+    const { acks } = threadServer(threadRow('tm-6', 'RETRY-ME'));
+    let renderFailures = 0;
+    logSpy.mockImplementation((...args: unknown[]) => {
+      if (renderFailures === 0 && args.some((a) => String(a).includes('RETRY-ME'))) {
+        renderFailures += 1;
+        throw new Error('terminal write failed');
+      }
+    });
+    testState.inputs = [
+      async () => {
+        expect(acks).toEqual([]);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.waitFor(() => expect(testState.runBackendImpl).toHaveBeenCalledTimes(1));
+        return '/quit';
+      },
+    ];
+
+    await runChat({ agent: 'myra', backend: 'claude', pollSeconds: '5', autoRun: true });
+
+    expect(renderFailures).toBe(1);
+    expect(acks).toEqual([
+      expect.objectContaining({ threadKey: THREAD, throughMessageId: 'tm-6' }),
+    ]);
+    const prompt = (testState.runBackendImpl.mock.calls[0][0] as { prompt: string }).prompt;
+    expect(prompt).toContain('RETRY-ME');
+  });
+
+  it('a permission grant sent on a thread is applied, not delivered as chat', async () => {
+    const grant = {
+      ...threadRow('tm-7', 'GRANT-BODY'),
+      messageType: 'permission_grant',
+      metadata: { permissionGrant: { action: 'allow', tools: ['web_fetch'] } },
+    };
+    const { acks } = threadServer(grant);
+    testState.inputs = ['hello', '/quit'];
+
+    await runChat({ agent: 'myra', backend: 'claude', pollSeconds: '999', autoRun: true });
+
+    expect(acks).toEqual([
+      expect.objectContaining({ threadKey: THREAD, throughMessageId: 'tm-7' }),
+    ]);
+    const printed = logSpy.mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+    expect(printed).toContain('granted');
+    expect(printed).not.toContain('GRANT-BODY');
+    // Not auto-run and not in the ledger: the only turn is the user's.
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const prompt = (testState.runBackendImpl.mock.calls[0][0] as { prompt: string }).prompt;
+    expect(prompt).not.toContain('GRANT-BODY');
+  });
+
   it('a headless run does not drain: its message comes through --message', async () => {
     threadServer(threadRow('tm-5', 'already delivered as --message'));
 

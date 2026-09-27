@@ -5519,12 +5519,99 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const inboxPollGate = createPollGate();
   const activityPollGate = createPollGate();
 
+  // The session-visibility policy, applied to legacy and thread rows alike.
+  const inboxMessageAllowedByPolicy = (msg: InboxMessage): boolean =>
+    toolPolicy.canAccessSession({
+      action: 'inbox',
+      requester: {
+        sessionId: runtime.sessionId,
+        threadKey: runtime.threadKey,
+        studioId: runtime.studioId,
+        sbSlug,
+      },
+      target: {
+        sessionId: msg.relatedSessionId,
+        threadKey: msg.threadKey,
+        studioId: msg.recipientStudioId,
+        sbSlug,
+      },
+    }).allowed;
+
+  // A permission grant modifies local policy; it is not chat. Legacy and
+  // thread rows both come through here, so a grant sent on a thread is
+  // applied, not rendered as a message.
+  const intakePermissionGrant = (msg: InboxMessage): void => {
+    seenInboxIds.add(msg.id);
+    const grant = parsePermissionGrant(msg.metadata);
+    if (!grant) {
+      printLine(
+        chalk.yellow(
+          `Received malformed permission grant from ${msg.from || 'unknown'} — ignoring.`
+        )
+      );
+      return;
+    }
+    const result = applyPermissionGrant({
+      policy: toolPolicy,
+      grant,
+      sessionId: runtime.sessionId,
+    });
+
+    // Resolve pending approval requests if this grant matches
+    if (grant.requestId && approvalManager.hasPending(grant.requestId)) {
+      const decision = grant.action === 'deny' ? 'denied' : 'approved';
+      approvalManager.resolve(grant.requestId, decision, msg.from);
+    } else {
+      // Try matching by tool name for grants without explicit requestId
+      for (const tool of grant.tools) {
+        const pending = approvalManager.findPendingForTool(tool);
+        if (pending) {
+          const decision = grant.action === 'deny' ? 'denied' : 'approved';
+          approvalManager.resolve(pending.id, decision, msg.from);
+        }
+      }
+    }
+
+    const from = msg.from || 'remote';
+    const action = grant.action;
+    const label =
+      action === 'deny' ? '🚫 denied' : action === 'revoke' ? '↩ revoked' : '✅ granted';
+    if (inkRepl) {
+      inkRepl.addMessage('grant', result.summary, {
+        label,
+        time: formatHumanTime(msg.createdAt, runtime.userTimezone),
+        trailingMeta: `from ${from}`,
+      });
+    } else {
+      printLine('');
+      printLine(
+        renderMessageLine('grant', result.summary, {
+          label,
+          timezone: runtime.userTimezone,
+          ts: msg.createdAt,
+          trailingMeta: `from ${from}`,
+        })
+      );
+    }
+    runtime.log.append({
+      type: 'permission_grant',
+      messageId: msg.id,
+      action,
+      tools: grant.tools,
+      summary: result.summary,
+      from,
+      createdAt: msg.createdAt || null,
+      ...(msg.threadKey ? { threadKey: msg.threadKey } : {}),
+    });
+  };
+
   // One intake for every message the REPL delivers — legacy inbox rows and
   // thread rows alike — so each reaches the ledger, the transcript and the
   // screen the same way, under the same auto-run policy. Throws if any step
-  // does: the thread drain acks a message only after intake returned.
+  // does: the thread drain acks a message only after intake returned. The
+  // seen-set entry is the last step, so it never records a message whose
+  // intake stopped part-way.
   const intakeInboxMessage = (msg: InboxMessage, autoRunMessages: InboxMessage[]): void => {
-    seenInboxIds.add(msg.id);
     if (!runtime.threadKey && msg.threadKey) {
       runtime.threadKey = msg.threadKey;
     }
@@ -5590,6 +5677,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (eligibleForAutoRun) {
       autoRunMessages.push(msg);
     }
+    seenInboxIds.add(msg.id);
   };
 
   // Thread delivery for an attached REPL. Once the REPL's session is
@@ -5629,7 +5717,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         notify: async (content, _meta, row) => {
           const msg = row ? extractInboxMessages({ messages: [row] })[0] : undefined;
           if (msg) {
-            intakeInboxMessage(msg, autoRunMessages);
+            // The drain has already skipped own-studio self messages. The
+            // legacy thread-binding filter (inboxMessageMatchesSessionScope)
+            // is not applied: the server stamped this thread to this
+            // session, and a row refused here would be acked unread. The
+            // visibility policy still applies. A refused row is acked
+            // without rendering, as the legacy path consumes at fetch.
+            if (!inboxMessageAllowedByPolicy(msg)) {
+              sbDebugLog('chat', 'thread_drain_policy_refused', {
+                messageId: msg.id,
+                threadKey: msg.threadKey,
+              });
+              return;
+            }
+            if (msg.messageType === 'permission_grant') intakePermissionGrant(msg);
+            else intakeInboxMessage(msg, autoRunMessages);
             return;
           }
           // The drain's own notice (the cold-start summary) carries no row.
@@ -5665,24 +5767,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const fresh = messages
       .filter((msg) => !seenInboxIds.has(msg.id))
       .filter((msg) => inboxMessageMatchesSessionScope(runtime, msg))
-      .filter(
-        (msg) =>
-          toolPolicy.canAccessSession({
-            action: 'inbox',
-            requester: {
-              sessionId: runtime.sessionId,
-              threadKey: runtime.threadKey,
-              studioId: runtime.studioId,
-              sbSlug,
-            },
-            target: {
-              sessionId: msg.relatedSessionId,
-              threadKey: msg.threadKey,
-              studioId: msg.recipientStudioId,
-              sbSlug,
-            },
-          }).allowed
-      )
+      .filter(inboxMessageAllowedByPolicy)
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
     const autoRunMessages: InboxMessage[] = [];
 
@@ -5690,67 +5775,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const permissionGrants = fresh.filter((msg) => msg.messageType === 'permission_grant');
     const nonGrantMessages = fresh.filter((msg) => msg.messageType !== 'permission_grant');
     for (const msg of permissionGrants) {
-      seenInboxIds.add(msg.id);
-      const grant = parsePermissionGrant(msg.metadata);
-      if (!grant) {
-        printLine(
-          chalk.yellow(
-            `Received malformed permission grant from ${msg.from || 'unknown'} — ignoring.`
-          )
-        );
-        continue;
-      }
-      const result = applyPermissionGrant({
-        policy: toolPolicy,
-        grant,
-        sessionId: runtime.sessionId,
-      });
-
-      // Resolve pending approval requests if this grant matches
-      if (grant.requestId && approvalManager.hasPending(grant.requestId)) {
-        const decision = grant.action === 'deny' ? 'denied' : 'approved';
-        approvalManager.resolve(grant.requestId, decision, msg.from);
-      } else {
-        // Try matching by tool name for grants without explicit requestId
-        for (const tool of grant.tools) {
-          const pending = approvalManager.findPendingForTool(tool);
-          if (pending) {
-            const decision = grant.action === 'deny' ? 'denied' : 'approved';
-            approvalManager.resolve(pending.id, decision, msg.from);
-          }
-        }
-      }
-
-      const from = msg.from || 'remote';
-      const action = grant.action;
-      const label =
-        action === 'deny' ? '🚫 denied' : action === 'revoke' ? '↩ revoked' : '✅ granted';
-      if (inkRepl) {
-        inkRepl.addMessage('grant', result.summary, {
-          label,
-          time: formatHumanTime(msg.createdAt, runtime.userTimezone),
-          trailingMeta: `from ${from}`,
-        });
-      } else {
-        printLine('');
-        printLine(
-          renderMessageLine('grant', result.summary, {
-            label,
-            timezone: runtime.userTimezone,
-            ts: msg.createdAt,
-            trailingMeta: `from ${from}`,
-          })
-        );
-      }
-      runtime.log.append({
-        type: 'permission_grant',
-        messageId: msg.id,
-        action,
-        tools: grant.tools,
-        summary: result.summary,
-        from,
-        createdAt: msg.createdAt || null,
-      });
+      intakePermissionGrant(msg);
     }
 
     // Partition non-grant messages into collapsed (old) and expanded (recent).
