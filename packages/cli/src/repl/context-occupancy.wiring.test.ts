@@ -248,6 +248,7 @@ describe('PR 639 resume-not-found recovery seed', () => {
       handleBackendEvent: () => {},
       sessionAttachmentDirs: [] as string[],
       turnMedia: [] as unknown[],
+      cliAttached: false,
       printEvent: () => {},
       chalk: { yellow: (s: string) => s },
       beginSpawn: () => {},
