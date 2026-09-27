@@ -12,11 +12,24 @@
  * (`threadsWithUnread`) and get_thread_messages. Unlike
  * chat.integration.test.ts, this file is in the CI include list.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { mintDelegationToken } from '@inklabs/shared';
+
+// This file's own HOME, set before any module computes a path from it. A
+// write that escapes the per-test paths lands here, where afterEach sees it,
+// instead of in the developer's real ~/.ink.
+const sentinel = await vi.hoisted(async () => {
+  const fs = await import('fs');
+  const os = await import('os');
+  const path = await import('path');
+  const originalHome = process.env.HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ink-chat-threads-home-'));
+  process.env.HOME = home;
+  return { home, originalHome };
+});
 
 const testState = vi.hoisted(() => ({
   // A deferred input holds the prompt until it resolves. Scripted strings
@@ -220,6 +233,18 @@ describe('attached REPL thread delivery', () => {
     logSpy.mockRestore();
     process.chdir(originalCwd);
     rmSync(testCwd, { recursive: true, force: true });
+    // Cleared before the assertion, so a leak is charged to the test that
+    // made it and not to every test after.
+    const inkHome = join(sentinel.home, '.ink');
+    const leaked = existsSync(inkHome) ? readdirSync(inkHome, { recursive: true }) : [];
+    rmSync(inkHome, { recursive: true, force: true });
+    expect(leaked).toEqual([]);
+  });
+
+  afterAll(() => {
+    if (sentinel.originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = sentinel.originalHome;
+    rmSync(sentinel.home, { recursive: true, force: true });
   });
 
   const threadPolls = () =>
