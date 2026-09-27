@@ -55,6 +55,8 @@ workspace_members workspaces
 WINDOWED_FIXTURE_TABLES = (
     ("20260913081634", "20260913090000",
      ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")),
+    ("20260924070106", "",
+     ("browser_companion_grant_events", "browser_companion_grants")),
     ("20260925080025", "",
      ("observation_conflicts", "publication_operation_events", "publication_operations",
       "task_authority_holds")),
