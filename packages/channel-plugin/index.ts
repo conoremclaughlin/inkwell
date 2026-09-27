@@ -27,7 +27,13 @@ import { Server } from '@modelcontextprotocol/server';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { createThreadDrainState, drainThreads, drainLegacyInbox } from './poll-core.js';
+// By source path, not `@inklabs/shared`: this process runs from source under
+// tsx, and a `dist` import would fail between a pull and the next build.
+import {
+  createThreadDrainState,
+  drainThreads,
+  drainLegacyInbox,
+} from '../shared/src/inkmail/drain.js';
 import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
@@ -234,7 +240,8 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // ─── Polling Loop ───────────────────────────────────────────
 
 // Thread cursors, dedup, and cold-start skip accounting live in the drain
-// state (poll-core.ts owns the delivery semantics; unit-tested there).
+// state (shared/src/inkmail/drain.ts owns the delivery semantics, for this
+// plugin and the ink chat REPL alike; unit-tested there).
 const drainState = createThreadDrainState();
 
 // NO takeover claimant here (PR #563 round 26). Pending-takeover markers are
@@ -330,7 +337,7 @@ async function pollInbox(): Promise<void> {
       const totalUnread = (result.totalUnreadCount as number) || 0;
       log('debug', 'Poll result', { threadCount, msgCount, totalUnread });
 
-      // Drain thread messages through poll-core (unit-tested): always-on
+      // Drain thread messages through the shared drain (unit-tested): always-on
       // 100/poll budget with budget-bounded per-request limits, cold fetches
       // markRead:false + exact-id ack after injection, skip accounting with
       // one drain-time summary per process.
@@ -362,7 +369,7 @@ async function pollInbox(): Promise<void> {
         log('info', 'Thread drain result', { ...drained });
       }
 
-      // Legacy inbox messages (non-threaded), drained through poll-core
+      // Legacy inbox messages (non-threaded), drained through the shared drain
       // (unit-tested) under the same exact-id ack contract as threads: the
       // mark_inbox_read throughMessageId ack after the batch is the ONLY
       // consumption, so what this caller injects is what gets consumed —
