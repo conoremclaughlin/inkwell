@@ -209,7 +209,9 @@ export {
 } from '../repl/agent-loop.js';
 import {
   classifyError,
+  createThreadDrainState,
   decodeDelegationToken,
+  drainThreads,
   encodeContextToken,
   mintDelegationToken,
   verifyDelegationToken,
@@ -5517,6 +5519,139 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const inboxPollGate = createPollGate();
   const activityPollGate = createPollGate();
 
+  // One intake for every message the REPL delivers — legacy inbox rows and
+  // thread rows alike — so each reaches the ledger, the transcript and the
+  // screen the same way, under the same auto-run policy. Throws if any step
+  // does: the thread drain acks a message only after intake returned.
+  const intakeInboxMessage = (msg: InboxMessage, autoRunMessages: InboxMessage[]): void => {
+    seenInboxIds.add(msg.id);
+    if (!runtime.threadKey && msg.threadKey) {
+      runtime.threadKey = msg.threadKey;
+    }
+    const from = msg.from || 'unknown';
+    const heading = msg.subject ? `${from} — ${msg.subject}` : from;
+    let delegationLabel = '';
+    if (msg.delegationToken) {
+      const secret = getDelegationSecret();
+      if (!secret) {
+        delegationLabel = ' [delegation:unverified:no-secret]';
+      } else {
+        const verified = verifyDelegationToken(msg.delegationToken, secret, {
+          expectedDelegateeSlug: sbSlug,
+          expectedThreadKey: runtime.threadKey ?? undefined,
+        });
+        if (verified.valid && verified.payload) {
+          const scopes = verified.payload.scopes.join(',');
+          delegationLabel = ` [delegation:${verified.payload.iss}->${verified.payload.sub}:${scopes}]`;
+        } else {
+          delegationLabel = ` [delegation:invalid:${verified.error}]`;
+        }
+      }
+    }
+    const rendered = `📥 ${heading}${delegationLabel}: ${msg.content}`.trim();
+    ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
+    runtime.log.append({
+      type: 'inbox',
+      messageId: msg.id,
+      rendered,
+      createdAt: msg.createdAt || null,
+      delegationToken: msg.delegationToken || null,
+      messageType: msg.messageType || null,
+      relatedSessionId: msg.relatedSessionId || null,
+      ...(msg.threadKey ? { threadKey: msg.threadKey } : {}),
+    });
+    if (inkRepl) {
+      // Emoji in label, clean content without emoji prefix
+      const inboxContent = `${heading}${delegationLabel}: ${msg.content}`.trim();
+      inkRepl.addMessage('inbox', inboxContent, {
+        label: '📬 inbox',
+        time: formatHumanTime(msg.createdAt, runtime.userTimezone),
+      });
+    } else {
+      printLine('');
+      printLine(separator());
+      printLine(
+        renderMessageLine('inbox', rendered, {
+          timezone: runtime.userTimezone,
+          ts: msg.createdAt,
+        })
+      );
+      printLine(separator());
+    }
+
+    const eligibleForAutoRun =
+      runtime.autoRunInbox &&
+      readyForAutoRun &&
+      enqueueAutoRunFromInbox &&
+      (msg.from || '').toLowerCase() !== sbSlug.toLowerCase() &&
+      msg.messageType !== 'notification' &&
+      msg.content.trim().length > 0;
+
+    if (eligibleForAutoRun) {
+      autoRunMessages.push(msg);
+    }
+  };
+
+  // Thread delivery for an attached REPL. Once the REPL's session is
+  // attached, the trigger handler delivers inline and spawns nothing, so the
+  // REPL is the only reader of threads stamped to its session. It drains
+  // them under the channel plugin's contract (shared/src/inkmail/drain.ts):
+  // fetch with markRead:false, intake, then ack the exact last id, only
+  // after intake returned. A headless run gets its message through
+  // --message and does not drain, or it would take that message twice.
+  const threadDrainState = createThreadDrainState();
+  const drainsThreads = !options.nonInteractive && !options.message;
+  const drainSessionThreads = async (autoRunMessages: InboxMessage[]): Promise<number> => {
+    // channelPoll scopes to the session named in x-ink-context and fails
+    // closed without one.
+    if (!drainsThreads || !runtime.sessionId) return 0;
+    const poll = (await inkClient
+      .callTool('get_inbox', {
+        sbSlug,
+        status: 'unread',
+        markRead: false,
+        limit: 20,
+        channelPoll: true,
+      })
+      .catch(() => null)) as Record<string, unknown> | null;
+    if (!poll || poll.success === false) return 0;
+    const threads = Array.isArray(poll.threadsWithUnread)
+      ? (poll.threadsWithUnread as Array<Record<string, unknown>>)
+      : [];
+    if (threads.length === 0) return 0;
+    const drained = await drainThreads(
+      {
+        callInk: async (tool, args) =>
+          (await inkClient.callTool(tool, args).catch(() => null)) as Record<
+            string,
+            unknown
+          > | null,
+        notify: async (content, _meta, row) => {
+          const msg = row ? extractInboxMessages({ messages: [row] })[0] : undefined;
+          if (msg) {
+            intakeInboxMessage(msg, autoRunMessages);
+            return;
+          }
+          // The drain's own notice (the cold-start summary) carries no row.
+          ledger.addEntry('inbox', compactForLedger(content), 'inkmail');
+          if (inkRepl) inkRepl.addMessage('system', content);
+          else printLine(chalk.dim(content));
+        },
+        log: (level, message, data) =>
+          sbDebugLog('chat', 'thread_drain', { level, message, ...(data ?? {}) }),
+        sbSlug,
+        studioId: currentInkStudioId(),
+      },
+      threadDrainState,
+      threads,
+      {
+        moreThreadsPending: poll.unreadThreadsTruncated === true,
+        pollIncomplete: poll.channelPollIncomplete === true,
+      }
+    );
+    return drained.injected;
+  };
+
   // Phase 1 (gated): fetch + render + collect auto-run candidates. Must not
   // await backend turns — those run in pollInbox phase 2, after the gate
   // releases, so grant delivery keeps flowing during a turn.
@@ -5663,74 +5798,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     for (const msg of recentMessages) {
-      seenInboxIds.add(msg.id);
-      if (!runtime.threadKey && msg.threadKey) {
-        runtime.threadKey = msg.threadKey;
-      }
-      const from = msg.from || 'unknown';
-      const heading = msg.subject ? `${from} — ${msg.subject}` : from;
-      let delegationLabel = '';
-      if (msg.delegationToken) {
-        const secret = getDelegationSecret();
-        if (!secret) {
-          delegationLabel = ' [delegation:unverified:no-secret]';
-        } else {
-          const verified = verifyDelegationToken(msg.delegationToken, secret, {
-            expectedDelegateeSlug: sbSlug,
-            expectedThreadKey: runtime.threadKey ?? undefined,
-          });
-          if (verified.valid && verified.payload) {
-            const scopes = verified.payload.scopes.join(',');
-            delegationLabel = ` [delegation:${verified.payload.iss}->${verified.payload.sub}:${scopes}]`;
-          } else {
-            delegationLabel = ` [delegation:invalid:${verified.error}]`;
-          }
-        }
-      }
-      const rendered = `📥 ${heading}${delegationLabel}: ${msg.content}`.trim();
-      ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-      runtime.log.append({
-        type: 'inbox',
-        messageId: msg.id,
-        rendered,
-        createdAt: msg.createdAt || null,
-        delegationToken: msg.delegationToken || null,
-        messageType: msg.messageType || null,
-        relatedSessionId: msg.relatedSessionId || null,
-      });
-      if (inkRepl) {
-        // Emoji in label, clean content without emoji prefix
-        const inboxContent = `${heading}${delegationLabel}: ${msg.content}`.trim();
-        inkRepl.addMessage('inbox', inboxContent, {
-          label: '📬 inbox',
-          time: formatHumanTime(msg.createdAt, runtime.userTimezone),
-        });
-      } else {
-        printLine('');
-        printLine(separator());
-        printLine(
-          renderMessageLine('inbox', rendered, {
-            timezone: runtime.userTimezone,
-            ts: msg.createdAt,
-          })
-        );
-        printLine(separator());
-      }
-
-      const eligibleForAutoRun =
-        runtime.autoRunInbox &&
-        readyForAutoRun &&
-        enqueueAutoRunFromInbox &&
-        (msg.from || '').toLowerCase() !== sbSlug.toLowerCase() &&
-        msg.messageType !== 'notification' &&
-        msg.content.trim().length > 0;
-
-      if (eligibleForAutoRun) {
-        autoRunMessages.push(msg);
-      }
+      intakeInboxMessage(msg, autoRunMessages);
     }
 
-    if (force && fresh.length === 0) {
+    const threadMessages = await drainSessionThreads(autoRunMessages);
+    const freshCount = fresh.length + threadMessages;
+
+    if (force && freshCount === 0) {
       if (inkRepl) {
         inkRepl.setCommandOutput(['No new inbox messages.']);
       } else {
@@ -5738,7 +5812,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     emitStatusLaneIfChanged();
-    return { freshCount: fresh.length, autoRunMessages };
+    return { freshCount, autoRunMessages };
   };
 
   const pollInbox = async (force = false): Promise<number> => {
