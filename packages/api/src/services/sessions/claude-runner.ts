@@ -25,6 +25,7 @@ import {
   writeRuntimeSessionHint,
   resolveSpawnTarget,
   CONTAINER_RUNNER_FILES,
+  PRINT_MODE_CHANNEL_ENV,
 } from '@inklabs/shared';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -504,6 +505,10 @@ export class ClaudeRunner implements IRunner {
           runtime: 'claude',
           repoRoot: config.repoRoot,
         }),
+        // buildArgs always passes --print, which cannot show a channel
+        // notification. The project config still loads the inkmail plugin;
+        // this keeps it from acking messages that arrive during the turn.
+        ...PRINT_MODE_CHANNEL_ENV,
       };
 
       // Route through container or host — resolveSpawnTarget handles the

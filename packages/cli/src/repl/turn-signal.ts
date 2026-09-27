@@ -12,7 +12,8 @@
  * degrades to presence heuristics for the whole turn (PR #506 P1, Lumen).
  *
  * The server route (`/api/hooks/lifecycle`) stays the single writer:
- *   - `open()`   → `event: 'prompt'` — sets `cli_turn_at`, renews the lease
+ *   - `open()`   → `event: 'prompt'` — sets `cli_turn_at`, renews the lease;
+ *     a headless owner adds `cliAttached: false` to the same request
  *   - `close()`  → `event: 'stop'`   — clears it and runs the lease boundary,
  *     which is what completes a release the turn itself requested
  *   - `detach()` → `cliAttached: false` — process-proof that this process
@@ -39,6 +40,18 @@ export interface TurnSignalDeps {
   /** Live ref — the worktree studio this REPL runs in, for the lease fence. */
   getStudioId?: () => string | undefined;
   sbSlug: string;
+  /**
+   * Whether this process is an attached CLI: an interactive REPL, not a
+   * one-shot `--message`/`--non-interactive` run. A headless owner declares
+   * `cliAttached:false` in the same request that opens each turn. Its
+   * provider children leave the attachment alone (lib/turn-owner.ts), and
+   * without this a `cli_attached:true` left by a crashed interactive process
+   * stays on the session. Every prompt refreshes `updated_at`, so delivery
+   * keeps reading that flag as a live inline consumer, and nothing here
+   * consumes inline messages (PR #685 r3, Lumen). A prompt request stamps
+   * the marker whatever else it carries, so this is not a detach.
+   */
+  cliAttached: boolean;
   /** Resolved per post so config changes and lazy imports stay cheap. */
   getServerUrl: () => Promise<string> | string;
   getToken: (serverUrl: string) => Promise<string | null | undefined>;
@@ -192,6 +205,9 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       const body: PostBody = {
         ...lifecycleBody('prompt', sessionId),
         ...(studioId ? { studioId } : {}),
+        // Rides the prompt's claim: the route writes it fenced on the epoch
+        // this open claims, so a refused takeover declares nothing.
+        ...(deps.cliAttached ? {} : { cliAttached: false }),
       };
       return post('open', body, ackedAndHeld);
     },

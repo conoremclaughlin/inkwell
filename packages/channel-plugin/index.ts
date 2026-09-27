@@ -21,6 +21,7 @@
  *   INK_PLUGIN_LOG_LEVEL — debug | info | warn | error (default: info)
  *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
  *   INK_PLUGIN_LOG_RETENTION_DAYS — sweep dead processes' logs older than this (default: 7)
+ *   INK_CHANNEL_HOST — `print` when the host is `claude -p`; the plugin then stays inert
  */
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { Server } from '@modelcontextprotocol/server';
@@ -73,6 +74,16 @@ import { resolveSlug } from './identity';
 
 const INK_SERVER_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 10);
+
+// A print-mode host (`claude -p`) accepts a channel notification and never
+// shows it to the model: the notify promise resolves, the transcript records
+// nothing. Measured 2026-09-27 with two pushes into a `claude -p` turn — the
+// model reported none — against an interactive control, which rendered both
+// mid-turn. Polling there made this plugin ack messages nobody read, and its
+// cli_poll_at stamp steered the server to inline delivery rather than a queued
+// turn (task 2f892701). The spawner declares print mode through
+// PRINT_MODE_CHANNEL_ENV (@inklabs/shared); this package cannot import it.
+const hostRendersChannel = process.env.INK_CHANNEL_HOST !== 'print';
 
 function resolveEmail(): string | undefined {
   const configPath = join(homedir(), '.ink', 'config.json');
@@ -143,6 +154,7 @@ log('info', 'Channel plugin starting', {
   sessionId: sessionId || '(none)',
   server: INK_SERVER_URL,
   pollIntervalMs: POLL_INTERVAL_MS,
+  hostRendersChannel,
 });
 
 async function callInk(
@@ -220,7 +232,8 @@ const mcp = new Server(
         // 'claude/channel/permission': {},
       },
     },
-    instructions: `Messages from other SBs (AI agents) arrive as <channel source="inkmail" ...> tags.
+    instructions: hostRendersChannel
+      ? `Messages from other SBs (AI agents) arrive as <channel source="inkmail" ...> tags.
 
 These are real-time notifications from the Ink inbox — thread replies, task requests, review feedback, etc.
 
@@ -229,7 +242,8 @@ When you receive a channel message:
 - If it requires action, act on it
 - To reply, use the existing send_to_inbox tool (from the inkwell MCP server) with the thread_key from the channel tag metadata
 
-Do NOT ignore channel messages — they are from your teammates and deserve timely responses.`,
+Do NOT ignore channel messages — they are from your teammates and deserve timely responses.`
+      : `InkMail push is off in this process: it runs in print mode, which cannot show channel messages. Messages that arrive during this turn stay unread and are delivered separately.`,
   }
 );
 
@@ -486,6 +500,23 @@ async function main(): Promise<void> {
 
   log('info', 'Connecting MCP stdio transport');
   await mcp.connect(new StdioServerTransport());
+
+  if (!hostRendersChannel) {
+    // Inert: no poll, no cli_poll_at stamp, no ack, and no detach on exit. A
+    // print-mode process never attached, and the lifecycle route reads
+    // cliAttached:false as process proof that the session's turn is over — it
+    // clears cli_turn_at, the marker an interactive `ink chat` REPL holds open
+    // across every backend spawn of its turn. The MCP connection stays up so
+    // the host's handshake succeeds.
+    log('info', 'Print-mode host — InkMail delivery off; unread messages stay unread');
+    const exitQuietly = () => {
+      logger.flush().finally(() => process.exit(0));
+    };
+    process.on('SIGTERM', exitQuietly);
+    process.on('SIGINT', exitQuietly);
+    process.stdin.on('close', exitQuietly);
+    return;
+  }
   log('info', 'MCP connected, starting poll loop');
 
   // Fire detach cleanup when the host process exits (stdio pipe breaks).

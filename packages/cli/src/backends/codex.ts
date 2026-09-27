@@ -146,7 +146,7 @@ export class CodexAdapter implements BackendAdapter {
       sessionId: config.inkSessionId || '',
       studioId: config.studioId || '',
       sbSlug: config.sbSlug,
-      cliAttached: true,
+      cliAttached: config.cliAttached ?? true,
       runtime: 'codex',
     });
 

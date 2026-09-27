@@ -1,9 +1,12 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import { PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { tmpdir } from 'os';
 import {
   buildBackendSessionOwnerIndex,
+  detachPrintModeExit,
   extractClaudeHistorySessionsForProject,
   extractBackendSessionOverrideId,
   extractLatestPreviewFromClaudeSessionJsonl,
@@ -1654,5 +1657,89 @@ describe('buildBackendSessionOwnerIndex', () => {
       ]
     );
     expect(owners.size).toBe(0);
+  });
+});
+
+// The inkmail plugin used to detach on its way out of every Claude it ran in.
+// Under a print-mode host it stays inert, so the one-shot wrapper takes that
+// exit over; without it, the attachment the child's prompt hook set outlives
+// the process and triggers are delivered inline to nobody (PR #685).
+describe('detachPrintModeExit', () => {
+  const deps = (fetchImpl: typeof fetch) => ({
+    fetchImpl,
+    getServerUrl: () => 'http://ink.test',
+    getToken: async () => 'tok',
+  });
+
+  it('detaches the session when a print-mode child exits', async () => {
+    const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
+    const ok = await detachPrintModeExit(
+      { ...PRINT_MODE_CHANNEL_ENV, SB_SLUG: 'wren' },
+      'sess-1',
+      'wren',
+      deps(fetchImpl as unknown as typeof fetch)
+    );
+    expect(ok).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('http://ink.test/api/hooks/lifecycle');
+    expect(JSON.parse(String(init.body))).toEqual({
+      sessionId: 'sess-1',
+      cliAttached: false,
+      sbSlug: 'wren',
+    });
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok');
+  });
+
+  it('leaves an interactive child alone: its plugin still detaches itself', async () => {
+    const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
+    const ok = await detachPrintModeExit(
+      { SB_SLUG: 'wren' },
+      'sess-1',
+      'wren',
+      deps(fetchImpl as unknown as typeof fetch)
+    );
+    expect(ok).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('does nothing without a session, and never throws on a failed post', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('ECONNREFUSED');
+    });
+    expect(
+      await detachPrintModeExit(
+        { ...PRINT_MODE_CHANNEL_ENV },
+        undefined,
+        'wren',
+        deps(fetchImpl as unknown as typeof fetch)
+      )
+    ).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(
+      await detachPrintModeExit(
+        { ...PRINT_MODE_CHANNEL_ENV },
+        'sess-1',
+        'wren',
+        deps(fetchImpl as unknown as typeof fetch)
+      )
+    ).toBe(false);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  // runClaude and runClaudeInteractive spawn and exit a real process, and
+  // their harness (claude.integration.test.ts) is not in CI. Pin the wiring
+  // where CI can see it: every child close handler in the file detaches.
+  it('is called from every spawned child’s close handler', () => {
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), 'claude.ts'),
+      'utf-8'
+    );
+    const handlers = source.split("child.on('close', async (code) => {").slice(1);
+    expect(handlers.length).toBe(2);
+    for (const body of handlers) {
+      const head = body.split('\n').slice(0, 5).join('\n');
+      expect(head).toContain('await detachPrintModeExit(prepared.env,');
+    }
   });
 });

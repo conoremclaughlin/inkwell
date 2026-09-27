@@ -35,6 +35,7 @@ import {
 } from '../session/runtime.js';
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
+import { promptAttachmentWrite } from '../lib/turn-owner.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -2817,7 +2818,18 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // IMPORTANT: headless/autonomous spawns set cliAttached=false in INK_CONTEXT.
   // Respect that — unconditionally setting true blocks all future strategy
   // triggers for the session (they see "CLI-attached" and skip spawn).
-  if (isHeadlessSpawn && reconciled.inkSessionId) {
+  //
+  // A headless child of `ink chat` writes neither value. Its parent owns the
+  // turn and the attachment, and a false here would clear the turn marker
+  // the parent opened while the parent is still running (lib/turn-owner.ts).
+  if (promptAttachmentWrite(isHeadlessSpawn) === null) {
+    hookLog('cli_attached_skipped', {
+      sbSlug,
+      backend: lifecycleBackend.name,
+      reason: 'headless child of ink chat; the parent owns the turn',
+      sessionId: reconciled.inkSessionId ?? null,
+    });
+  } else if (isHeadlessSpawn && reconciled.inkSessionId) {
     // Explicitly clear cli_attached for headless spawns. A previous interactive
     // session may have set it to true on this same Inkwell session; if we just skip,
     // the stale flag causes triggers to think a channel plugin is delivering.

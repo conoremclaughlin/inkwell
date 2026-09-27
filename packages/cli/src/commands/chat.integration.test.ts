@@ -217,6 +217,34 @@ describe('runChat integration', () => {
     expect(testState.inkCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
 
+  // Each backend child inherits this process's INK_SESSION_ID, and its
+  // on-prompt hook writes the declared attachment onto that session. A server
+  // run that declared itself attached had every trigger during it delivered
+  // inline to nobody (PR #685, Lumen) — Myra's session carried 2,057 such
+  // writes. Only the interactive REPL is attached.
+  it.each([
+    ['interactive REPL', true, { inputs: ['hello from test', '/quit'] }],
+    ['--non-interactive --message', false, { nonInteractive: true, message: 'heartbeat pulse' }],
+    ['--message alone', false, { message: 'one shot' }],
+  ] as const)(
+    '%s declares cliAttached=%s on every backend spawn',
+    async (_mode, expected, opts) => {
+      if ('inputs' in opts) testState.inputs = [...opts.inputs];
+      await runChat({
+        agent: 'myra',
+        backend: 'claude',
+        pollSeconds: '999',
+        ...('nonInteractive' in opts ? { nonInteractive: opts.nonInteractive } : {}),
+        ...('message' in opts ? { message: opts.message } : {}),
+      });
+
+      expect(testState.runBackendImpl).toHaveBeenCalled();
+      for (const [request] of testState.runBackendImpl.mock.calls) {
+        expect((request as { cliAttached?: boolean }).cliAttached).toBe(expected);
+      }
+    }
+  );
+
   /**
    * One ink run invokes the provider repeatedly — once per outer turn, again
    * for local tool-loop subprocesses. Reporting the LAST result as the run's

@@ -678,6 +678,35 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  // A headless `ink chat` hands its children its own INK_SESSION_ID, and each
+  // child's on-prompt hook writes the token's cliAttached onto that session.
+  // An adapter that asserts attachment regardless marks a headless run
+  // attached, and every trigger during it is delivered inline to nobody
+  // (PR #685, Lumen). The spawner's declaration must reach the token as given.
+  it.each([
+    ['claude', () => new ClaudeAdapter(), ['hello']],
+    ['codex', () => new CodexAdapter(), ['exec', 'hello']],
+    ['gemini', () => new GeminiAdapter(), ['hello']],
+  ] as const)(
+    '%s adapter carries the spawner’s cliAttached into INK_CONTEXT',
+    (_name, make, promptParts) => {
+      for (const cliAttached of [false, true]) {
+        const prepared = make().prepare({
+          sbSlug: 'myra',
+          prompt: 'hello',
+          promptParts: [...promptParts],
+          passthroughArgs: [],
+          cliAttached,
+        });
+        try {
+          expect(decodeContextToken(prepared.env.INK_CONTEXT)?.cliAttached).toBe(cliAttached);
+        } finally {
+          prepared.cleanup();
+        }
+      }
+    }
+  );
+
   it('gemini adapter generates settings.json with auth + context headers', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
