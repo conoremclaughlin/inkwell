@@ -1174,7 +1174,7 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('📥 wren — PR #50: please re-review');
+    expect(logText).toContain('📥 wren (thread pr:50) — PR #50: please re-review');
     expect(logText).toContain('8:03:04 PM');
     expect(logText).toContain('thread=pr:50');
   });
