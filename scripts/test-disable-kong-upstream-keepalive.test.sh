@@ -271,7 +271,7 @@ echo ""
 echo "SCOPE (only an integration stack's Kong)"
 
 # Controls first: the names the harness actually produces are accepted.
-for name in supabase_kong_ink-integration supabase_kong_ink-integration-wren671 supabase_kong_pcp-integration; do
+for name in supabase_kong_ink-integration supabase_kong_ink-integration-wren671; do
   run "$name" 0 0 0
   [ "$rc" -eq 0 ] && ok "accepts $name" || bad "accepts $name" "rc=$rc: $out"
 done

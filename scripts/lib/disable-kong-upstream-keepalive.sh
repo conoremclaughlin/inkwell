@@ -83,8 +83,10 @@ disable_kong_upstream_keepalive() {
   # Only ever the disposable integration stack's gateway. The harness's parent
   # already refuses any other project ID; this is the one step that
   # reconfigures a running container, and the shared stack's Kong is a single
-  # name away, so it checks again rather than trusting its caller.
-  if [[ ! "$container" =~ ^supabase_kong_(ink|pcp)-integration(-[a-zA-Z0-9_-]+)?$ ]]; then
+  # name away, so it checks again rather than trusting its caller. Only the
+  # current project prefix: the harness runs a pre-rename project for --stop
+  # alone, which never reaches this step.
+  if [[ ! "$container" =~ ^supabase_kong_ink-integration(-[a-zA-Z0-9_-]+)?$ ]]; then
     echo "[integration-db] Not reconfiguring ${container}: not an integration stack's Kong." >&2
     return 1
   fi
