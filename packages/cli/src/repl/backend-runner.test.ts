@@ -108,6 +108,19 @@ describe('runBackendTurn', () => {
     }
   });
 
+  // The child's on-prompt hook reads this. Without it, a headless child's
+  // cliAttached:false is a detach, and the route clears the turn marker the
+  // chat process opened while that process is still running (PR #685 r2).
+  it('marks every child as a turn owned by the parent chat process', async () => {
+    for (const cliAttached of [false, true]) {
+      spawnMock.mockReset();
+      spawnMock.mockImplementation(() => createMockChild(0));
+      await runBackendTurn({ backend: 'claude', sbSlug: 'myra', prompt: 'ping', cliAttached });
+      const env = (spawnMock.mock.calls[0]?.[2] as { env?: Record<string, string> })?.env;
+      expect(env?.INK_TURN_OWNER).toBe('parent');
+    }
+  });
+
   it('default hard backstop is the 4h runaway ceiling, not the old 20-minute cap', async () => {
     vi.useFakeTimers();
     try {

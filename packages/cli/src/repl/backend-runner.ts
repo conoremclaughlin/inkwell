@@ -1,5 +1,6 @@
 import { spawnBackend } from '@inklabs/shared';
 import { getBackend } from '../backends/index.js';
+import { PARENT_OWNED_TURN_ENV } from '../lib/turn-owner.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import type { TurnMedia } from '../backends/types.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
@@ -157,7 +158,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const { child, result } = spawnBackend({
     binary: prepared.binary,
     args: prepared.args,
-    env: prepared.env,
+    // Every caller is `ink chat`, which owns the logical turn of the session
+    // this child inherits (lib/turn-owner.ts).
+    env: { ...prepared.env, ...PARENT_OWNED_TURN_ENV },
     stdinData: prepared.stdinData,
     timeoutMs: request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS,
     idleTimeoutMs: request.idleTimeoutMs,
