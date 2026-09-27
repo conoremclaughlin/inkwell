@@ -57,15 +57,25 @@
 # migration-status.mjs: unrecognized output is a refusal, never "nothing
 # pending".
 #
+# `scan` is the judgement `apply` makes before it connects (the name shape,
+# top-level transaction control, psql meta-commands) with no database behind
+# it. CI runs it over every file in supabase/migrations except the two that
+# predate the wrapper and were applied without it, so a file `apply` would
+# refuse cannot merge. It exists because on 2026-09-27 a top-level
+# BEGIN/COMMIT pair in 20260924070106 stopped the main server's restart at
+# its preflight, three days after passing CI: the integration-DB job applies
+# files with `supabase db reset`, which tolerates the pair.
+#
 # Usage:
 #   sh scripts/db-migrate.sh apply [--window] supabase/migrations/<version>_<name>.sql [...]
 #   sh scripts/db-migrate.sh pending [--dry-run] [--for <SUPABASE_URL>]
 #   sh scripts/db-migrate.sh status
+#   sh scripts/db-migrate.sh scan supabase/migrations/<file>.sql [...]
 #   sh scripts/db-migrate.sh is-window supabase/migrations/<file>.sql
 #   sh scripts/db-migrate.sh safe-origin <url>
 #
 # `--for`, `safe-origin` and `is-window` need node on the PATH (the URL
-# parser); `apply` and `status` do not.
+# parser); `apply`, `status` and `scan` do not.
 #
 # DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
 # exists for the integration test (a disposable database) and for a stack
@@ -84,6 +94,7 @@ usage() {
 usage: sh scripts/db-migrate.sh apply [--window] <supabase/migrations/FILE.sql> [...]
        sh scripts/db-migrate.sh pending [--dry-run] [--for <SUPABASE_URL>]
        sh scripts/db-migrate.sh status
+       sh scripts/db-migrate.sh scan <supabase/migrations/FILE.sql> [...]
        sh scripts/db-migrate.sh is-window <supabase/migrations/FILE.sql>
        sh scripts/db-migrate.sh safe-origin <url>
 USAGE
@@ -262,20 +273,54 @@ status_value() {
 
 allow_window=0
 
+# A migration file's name is its version and its ledger name:
+# <YYYYMMDDHHmmss>_<name>.sql, the name part letters, digits and underscores.
+# Prints what is wrong with the base name given and returns 1; silent and 0
+# when it conforms.
+name_problem() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_*.sql) ;;
+    *)
+      printf 'migration files are named <YYYYMMDDHHmmss>_<name>.sql (date -u +%%Y%%m%%d%%H%%M%%S); got %s\n' "$1"
+      return 1
+      ;;
+  esac
+  n=${1#*_}
+  n=${n%.sql}
+  case "$n" in
+    *[!A-Za-z0-9_]*)
+      printf 'the name part of %s may only use letters, digits and underscores\n' "$1"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# The content judgement `apply` makes before it connects, shared with `scan`
+# so the two cannot drift. Byte-wise, in the C locale, on every machine: see
+# the guard's header. Silent and 0 when the file is clean; prints the
+# findings and returns 1 when it carries top-level transaction control or a
+# psql meta-command; dies when the file could not be scanned.
+judge_transaction_control() { # file base
+  findings=$(LC_ALL=C awk -f "$guard" "$1" 2>&1)
+  case $? in
+    0) return 0 ;;
+    1)
+      printf 'db-migrate: %s carries its own transaction control or a psql meta-command; remove it:\n%s\n' "$2" "$findings" >&2
+      return 1
+      ;;
+    *) die "could not scan $2 for transaction control: $findings" ;;
+  esac
+}
+
 apply_one() {
   file=$1
   [ -f "$file" ] || die "no such file: $file"
   base=$(basename "$file")
-  case "$base" in
-    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_*.sql) ;;
-    *) die "migration files are named <YYYYMMDDHHmmss>_<name>.sql (date -u +%Y%m%d%H%M%S); got $base" ;;
-  esac
+  problem=$(name_problem "$base") || die "$problem"
   version=${base%%_*}
   name=${base#*_}
   name=${name%.sql}
-  case "$name" in
-    *[!A-Za-z0-9_]*) die "the name part of $base may only use letters, digits and underscores" ;;
-  esac
   dir=$(cd "$(dirname "$file")" && pwd -P) || die "cannot enter $(dirname "$file")"
   [ "$dir" = "$checkout/supabase/migrations" ] ||
     die "$base must live in $checkout/supabase/migrations (found it in $dir)"
@@ -289,16 +334,8 @@ apply_one() {
     printf 'db-migrate: %s is a window migration; --window given, so writers are stopped and the snapshot is taken%s\n' \
       "$base" "${runbook:+ (runbook: $runbook)}"
   fi
-  # Byte-wise, in the C locale, on every machine: see the guard's header.
-  findings=$(LC_ALL=C awk -f "$guard" "$file" 2>&1)
-  case $? in
-    0) ;;
-    1)
-      printf 'db-migrate: %s carries its own transaction control or a psql meta-command; remove it:\n%s\n' "$base" "$findings" >&2
-      die "the wrapper runs the file inside one transaction with its ledger row, and psql's single-transaction mode does not cover transaction-control statements, so an inner COMMIT would record the row and commit a partial file (a BEGIN/COMMIT pair is also redundant here)"
-      ;;
-    *) die "could not scan $base for transaction control: $findings" ;;
-  esac
+  judge_transaction_control "$file" "$base" ||
+    die "the wrapper runs the file inside one transaction with its ledger row, and psql's single-transaction mode does not cover transaction-control statements, so an inner COMMIT would record the row and commit a partial file (a BEGIN/COMMIT pair is also redundant here)"
 
   count=$(recorded_count "$version") || die "could not read the ledger (refusing to apply without it; the endpoint is not shown because it can carry a password)"
   case "$count" in
@@ -436,6 +473,28 @@ case "$mode" in
         printf "db-migrate: %d recorded, %d pending in this checkout, %d applied from another checkout\n", both, pending, elsewhere
         if (pending) print "db-migrate: apply pending files with: yarn db:migrate supabase/migrations/<file>"
       }'
+    ;;
+  scan)
+    [ "$#" -ge 1 ] || usage
+    refused=0
+    for f in "$@"; do
+      if [ ! -f "$f" ]; then
+        printf 'db-migrate: no such file: %s\n' "$f" >&2
+        refused=1
+        continue
+      fi
+      base=$(basename "$f")
+      if ! problem=$(name_problem "$base"); then
+        printf 'db-migrate: %s\n' "$problem" >&2
+        refused=1
+        continue
+      fi
+      judge_transaction_control "$f" "$base" || refused=1
+    done
+    [ "$refused" -eq 0 ] ||
+      die "apply would refuse the file(s) above, so neither yarn db:migrate nor the startup preflight (yarn dev, yarn prod:direct) can apply them; fix the file, never the wrapper (supabase/migrations/README.md)"
+    printf 'db-migrate: scanned %d file(s): every name conforms, no top-level transaction control, no psql meta-command\n' "$#"
+    exit 0
     ;;
   *) usage ;;
 esac
