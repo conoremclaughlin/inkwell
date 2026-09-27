@@ -97,6 +97,7 @@ describe('PR 639 recovery advice', () => {
         toolRouting: 'local',
         strictTools: false,
         activeSkills: [],
+        log: { path: '/dev/null/synthetic', append: () => 0 },
       };
       // The measurement the block must pick up. It exists only because an
       // earlier spawn in this turn was sampled — which is the whole reason the
@@ -113,7 +114,6 @@ describe('PR 639 recovery advice', () => {
         ledger,
         sbSlug: 'review-fixture',
         envelopeShapeKey: () => 'synthetic-shape',
-        appendTranscript: () => {},
         printEvent: () => {},
         chalk: { dim: (s: string) => s },
         turnDialogue: [],
@@ -223,7 +223,7 @@ describe('PR 639 resume-not-found recovery seed', () => {
       systemPromptOverride: undefined,
       backendTurnTimeoutMs: 1000,
       backendIdleTimeoutMs: 1000,
-      transcriptPath: '/dev/null/synthetic',
+      log: { path: '/dev/null/synthetic', append: () => 0 },
       maxContextTokens: 2000,
       // Nonzero deliberately: a zeroed bootstrap leaves the fixed bucket empty,
       // and an empty bucket cannot disagree with anything.
@@ -248,7 +248,6 @@ describe('PR 639 resume-not-found recovery seed', () => {
       handleBackendEvent: () => {},
       sessionAttachmentDirs: [] as string[],
       turnMedia: [] as unknown[],
-      appendTranscript: () => {},
       printEvent: () => {},
       chalk: { yellow: (s: string) => s },
       beginSpawn: () => {},

@@ -46,6 +46,24 @@ vi.mock('../repl/skills.js', () => ({
     testState.loadSkillInstructionImpl(skill, maxChars),
 }));
 
+// The turn lease signal is a direct fetch to /api/hooks/lifecycle, outside
+// InkClient. Unmocked, these tests posted turn markers to whatever server the
+// machine's config names, with its stored token; that server refused the
+// synthetic session, the studio-backed turn gate refused every turn, and the
+// backend was never reached. The gate's decision stays real; only the
+// acknowledgement is stubbed.
+vi.mock('../repl/turn-signal.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../repl/turn-signal.js')>();
+  return {
+    ...original,
+    createTurnSignal: () => ({
+      open: async () => true,
+      close: async () => true,
+      detach: async () => true,
+    }),
+  };
+});
+
 vi.mock('../repl/ink/index.js', () => ({
   renderInkChat: async () => null,
   InkExitSignal: class InkExitSignal extends Error {},
