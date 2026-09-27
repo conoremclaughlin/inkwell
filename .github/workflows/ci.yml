@@ -116,6 +116,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # The stack publishes 55421-55426 (scripts/lib/integration-stack.py),
+      # inside Linux's ephemeral range. Any outbound connection this job makes
+      # (checkout, yarn install, image pulls) can be handed one of them as its
+      # local port, and on Linux that socket blocks the harness's bind probe
+      # while it is open AND while it sits in TIME_WAIT. The preflight then
+      # refuses with "owner unavailable" (exit 75) before a test runs: 6224599b
+      # on main and 6b87c0a1 on the release branch, both on 55424. Reserving the
+      # ports stops the kernel handing them out; explicit binds still succeed.
+      # First step, so it runs before checkout and every later step. It cannot
+      # cover sockets opened before any step runs: the runner's own, and the
+      # action-package downloads made during "Set up job".
+      - name: Reserve the integration stack's ports from the ephemeral range
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=55421-55426
+          sysctl net.ipv4.ip_local_port_range
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -162,6 +178,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Same stack, same ports: see the first step of integration-db-local.
+      - name: Reserve the integration stack's ports from the ephemeral range
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=55421-55426
+          sysctl net.ipv4.ip_local_port_range
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4

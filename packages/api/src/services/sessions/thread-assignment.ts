@@ -26,7 +26,8 @@ export type BoundVia =
   | 'explicit-retarget'
   | 'continuity'
   | 'claim'
-  | 'rebind-dead-session';
+  | 'rebind-dead-session'
+  | 'project-repair';
 
 export interface AssignParams {
   threadId: string;
@@ -36,6 +37,14 @@ export interface AssignParams {
   candidateSessionId: string;
   /** Caller passed recipientSessionId/sessionAlias — authorized overwrite. */
   explicitAnchor: boolean;
+  /**
+   * Project repair (PR #681 round 3): replace ONLY this stamp — the winner
+   * the trigger handler rejected because its session sits outside the
+   * thread's project repo. The write is a CAS on it; a stamp that moved
+   * meanwhile belongs to whoever moved it and is reported as the winner.
+   * Never combined with explicitAnchor: a repair is not a caller retarget.
+   */
+  supersedeSessionId?: string;
   /** Call-site label for logs. */
   source: string;
 }
@@ -131,6 +140,78 @@ export async function assignThreadParticipant(
     .maybeSingle();
 
   const currentStamp: string | null = existing?.session_id ?? null;
+
+  // Project repair: a CAS on the rejected stamp. Zero rows means the stamp
+  // moved (or was cleared) between the handler's validation and this write —
+  // reread it and hand it back as the winner; the handler validates THAT one.
+  if (params.supersedeSessionId) {
+    if (currentStamp === candidateSessionId) {
+      return {
+        sessionId: candidateSessionId,
+        rerouted: false,
+        boundVia: 'already-bound',
+        stampPersisted: true,
+      };
+    }
+    const { data: replaced, error: replaceErr } = await supabase
+      .from('inbox_thread_participants')
+      .update({ session_id: candidateSessionId })
+      .eq('thread_id', threadId)
+      .eq('sb_id', sbId)
+      .eq('session_id', params.supersedeSessionId)
+      .select('session_id');
+    if (replaceErr) {
+      logger.error('[Assign] Project repair failed', {
+        threadId,
+        sbId,
+        supersedeSessionId: params.supersedeSessionId,
+        candidateSessionId,
+        source,
+        error: replaceErr.message,
+      });
+      return recoverFromWriteFailure(supabase, params, 'project-repair');
+    }
+    if (!replaced || replaced.length === 0) {
+      const { data: after } = await supabase
+        .from('inbox_thread_participants')
+        .select('session_id')
+        .eq('thread_id', threadId)
+        .eq('sb_id', sbId)
+        .maybeSingle();
+      const current: string | null = after?.session_id ?? null;
+      if (current && current !== candidateSessionId) {
+        logger.info('[Assign] Project repair lost to a newer stamp — rerouting to it', {
+          threadId,
+          sbId,
+          supersedeSessionId: params.supersedeSessionId,
+          newerSessionId: current,
+          candidateSessionId,
+          source,
+        });
+        return { sessionId: current, rerouted: true, boundVia: 'continuity', stampPersisted: true };
+      }
+      return {
+        sessionId: candidateSessionId,
+        rerouted: false,
+        boundVia: 'project-repair',
+        stampPersisted: current === candidateSessionId,
+      };
+    }
+    logger.info('[Assign] Thread participant bound', {
+      threadId,
+      sbId,
+      sessionId: candidateSessionId,
+      previousSessionId: params.supersedeSessionId,
+      boundVia: 'project-repair',
+      source,
+    });
+    return {
+      sessionId: candidateSessionId,
+      rerouted: false,
+      boundVia: 'project-repair',
+      stampPersisted: true,
+    };
+  }
 
   // Explicit anchor: authorized overwrite (deliberate retarget when a live
   // stamp exists, plain anchor otherwise).

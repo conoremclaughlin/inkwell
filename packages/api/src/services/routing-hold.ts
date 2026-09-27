@@ -28,8 +28,14 @@ export interface RoutingHoldDetail {
    * routing configuration at all: no route pattern would have helped, because
    * none was consulted.
    */
-  reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+  reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
   occupied?: { studioId: string; holderThreadKey: string } | null;
+  /**
+   * The thread's pinned project, when the decision was made by it (task
+   * b5c71bc3): `project-without-repo` holds carry the slug and why it names
+   * no repo; a `no-route` hold on a project repo carries the repo too.
+   */
+  project?: { slug: string; cause?: string; repoRoot?: string } | null;
 }
 
 export interface StampHoldArgs {
@@ -80,13 +86,16 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
         attemptStartedAt,
         triedCallerRepo: detail.triedCallerRepo,
         callerRepoRoot: detail.callerRepoRoot ?? null,
+        project: detail.project ?? null,
         heldAt: args.now ?? new Date().toISOString(),
         recovery:
           detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
             : detail.reason === 'ambiguous-identity'
               ? 'de-duplicate the agent slug in agent_identities — routing config is not the cause'
-              : 'route pattern, studioHint, or project affinity',
+              : detail.reason === 'project-without-repo'
+                ? "set the project's repo_root (save_project with repoRoot), then re-send"
+                : 'route pattern, studioHint, or project affinity',
         occupied: detail.occupied ?? null,
       },
     });

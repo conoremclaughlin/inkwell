@@ -69,6 +69,7 @@ import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
+import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
 
 /**
  * Configuration for SessionService.
@@ -291,6 +292,32 @@ export function parseRuntimeConfig(metadata: unknown): {
  * session records why it landed where it did (spec:trigger-studio-routing
  * §Visibility, carried from studio-routing-rules §Routing Observability).
  */
+/** Which server-derived repo a repo-scoped rung ran against. */
+export type RepoSource = 'caller' | 'project';
+
+/** Why a pinned project yields no repo to route into. */
+export type ProjectRepoCause = 'unset' | 'unresolved' | 'unreadable';
+
+/**
+ * The project a thread's key was pinned to (inbox_threads.key_project,
+ * thread-key-grammar v4) and the repo that project names. Read from the
+ * thread row and the projects table — never re-parsed from the key string.
+ */
+export interface ThreadProjectRepo {
+  slug: string;
+  repoRoot: string | null;
+  /** Set when repoRoot is null: what stopped the project from naming one. */
+  cause?: ProjectRepoCause;
+}
+
+/** The pinned project, as a refusal reports it. */
+export interface ThreadProjectRefusal {
+  slug: string;
+  cause?: ProjectRepoCause;
+  /** The repo the project names, when it has one but nothing could be placed there. */
+  repoRoot?: string;
+}
+
 export interface StudioRoutingDecision {
   studioId?: string;
   tier:
@@ -302,6 +329,8 @@ export interface StudioRoutingDecision {
     | 'repo-root-main'
     | 'caller-repo-reuse'
     | 'caller-repo-created'
+    | 'project-repo-reuse'
+    | 'project-repo-created'
     | 'main-fallback'
     | 'refused'
     | 'none';
@@ -337,7 +366,7 @@ export interface StudioRoutingDecision {
    * (alias, default_session_id) can still win without a worktree being built
    * and abandoned first.
    */
-  deferredCreate?: { repoRoot: string; sbId?: string | null };
+  deferredCreate?: { repoRoot: string; sbId?: string | null; source: RepoSource };
   refusal?: {
     /**
      * `no-route`  — no tier could place the thread at all.
@@ -346,8 +375,11 @@ export interface StudioRoutingDecision {
      *               because the recovery is different: no-route needs an
      *               address, occupied needs the holder to finish or the
      *               overflow failure to be fixed.
+     * `project-without-repo` — the thread is pinned to a project that names
+     *               no repo (unset, unresolved, or unreadable). Nothing was
+     *               guessed; the recovery is the project's repo_root.
      */
-    reason: 'no-route' | 'occupied';
+    reason: 'no-route' | 'occupied' | 'project-without-repo';
     threadKey: string;
     triedCallerRepo: boolean;
     callerRepoRoot?: string;
@@ -360,6 +392,8 @@ export interface StudioRoutingDecision {
      * (no-route) — there is no overflow failure to go fix in the logs.
      */
     policy?: 'reuse-only';
+    /** The thread's pinned project, when the decision was made by it. */
+    project?: ThreadProjectRefusal;
   };
 }
 
@@ -406,7 +440,7 @@ export class RoutingRefusedError extends Error {
     readonly detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+      reason?: 'no-route' | 'occupied' | 'ambiguous-identity' | 'project-without-repo';
       /**
        * The caller named an exact studio/session and THAT is what we refused.
        * Without this the message recommends naming one — advice the caller has
@@ -416,6 +450,8 @@ export class RoutingRefusedError extends Error {
       occupied?: { studioId: string; holderThreadKey: string };
       /** The hold is the thread type's studio_policy deciding, not a failure. */
       policy?: 'reuse-only';
+      /** The thread's pinned project, when the decision was made by it. */
+      project?: ThreadProjectRefusal;
     }
   ) {
     super(RoutingRefusedError.describe(threadKey, sbSlug, detail));
@@ -450,6 +486,43 @@ export class RoutingRefusedError extends Error {
         `nothing the sender can pass works around it — naming a studio or session ` +
         `hits this same check, and recipientSlug resolves slugs only, so a ` +
         `recipient's identity UUID resolves to no agent at all.`
+      );
+    }
+    // A pinned project decided this, so the generic advice below — add a
+    // route pattern, send from the target repo — is wrong: the sender's repo
+    // was deliberately not consulted (task b5c71bc3). Name the project and
+    // the one field that fixes it.
+    if (detail.reason === 'project-without-repo') {
+      const slug = detail.project?.slug ?? 'unknown';
+      const why =
+        detail.project?.cause === 'unresolved'
+          ? `no project with slug "${slug}" exists in the thread's workspace any more`
+          : detail.project?.cause === 'unreadable'
+            ? `the thread's project pin or the project row could not be read`
+            : `project "${slug}" has no repo_root`;
+      return (
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": the thread is pinned to ` +
+        `project "${slug}" and ${why}, so there is no repository to place it in. Project ` +
+        `work is never placed in another project's checkout, and the sender's repo was ` +
+        `not consulted. Message held. Set the project's repo root — save_project(name, ` +
+        `repoRoot: "/absolute/path/to/checkout") — then re-send, or name a studio explicitly.`
+      );
+    }
+    if (detail.project?.repoRoot && detail.policy === 'reuse-only') {
+      return (
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": the thread is pinned to ` +
+        `project "${detail.project.slug}" (${detail.project.repoRoot}), that repo has no ` +
+        `studio for this agent, and this thread type's policy is reuse-only, so routing ` +
+        `will not create one automatically. Message held. Create a studio for that repo ` +
+        `explicitly, or register the thread type as provision.`
+      );
+    }
+    if (detail.project?.repoRoot) {
+      return (
+        `Refusing to route "${threadKey}" for agent "${sbSlug}": the thread is pinned to ` +
+        `project "${detail.project.slug}" (${detail.project.repoRoot}), and no studio for ` +
+        `this agent could be resolved or created there. Message held. Create a studio for ` +
+        `that repo explicitly, or resolve the provisioning failure in the logs.`
       );
     }
     if (detail.reason === 'occupied' && detail.policy === 'reuse-only') {
@@ -596,6 +669,8 @@ export class SessionService implements ISessionService {
       identityAbsent?: boolean;
       /** v18 S3: decision-only resolution — never mint an overflow worktree. */
       planOnly?: boolean;
+      /** The pinned project's repo — overflow is refused off a parent elsewhere. */
+      projectRepoRoot?: string;
     }
   ): Promise<StudioRoutingDecision> {
     const leases = this.getLeaseService();
@@ -887,7 +962,7 @@ export class SessionService implements ISessionService {
    */
   private async findExistingOverflow(
     parentStudioId: string,
-    ctx: { userId: string; sbSlug: string; threadKey?: string }
+    ctx: { userId: string; sbSlug: string; threadKey?: string; projectRepoRoot?: string }
   ): Promise<Studio | null> {
     const overflowService = this.getOverflowService();
     const studios = this.getStudiosRepo();
@@ -898,12 +973,13 @@ export class SessionService implements ISessionService {
       userId: ctx.userId,
       parentStudio: parent,
       threadKey: ctx.threadKey,
+      expectedRepoRoot: ctx.projectRepoRoot,
     });
   }
 
   private async divertToOverflow(
     parentStudioId: string,
-    ctx: { userId: string; sbSlug: string; threadKey?: string }
+    ctx: { userId: string; sbSlug: string; threadKey?: string; projectRepoRoot?: string }
   ): Promise<Studio | null> {
     const overflowService = this.getOverflowService();
     const studios = this.getStudiosRepo();
@@ -926,6 +1002,7 @@ export class SessionService implements ISessionService {
       sbSlug: ctx.sbSlug,
       parentStudio: parent,
       threadKey: ctx.threadKey,
+      expectedRepoRoot: ctx.projectRepoRoot,
     });
   }
 
@@ -954,6 +1031,8 @@ export class SessionService implements ISessionService {
       planOnly?: boolean;
       /** Round 9: stamped onto acquired leases as the turn's generation. */
       turnEpochCandidate?: string;
+      /** The pinned project's repo — overflow is refused off a parent elsewhere. */
+      projectRepoRoot?: string;
     }
   ): Promise<Session> {
     const leases = this.getLeaseService();
@@ -1149,30 +1228,201 @@ export class SessionService implements ISessionService {
     userId: string,
     sbId: string | null,
     threadKey: string
-  ): Promise<{ writeIntent: WriteIntent; studioPolicy: StudioPolicy }> {
-    const fallback = { writeIntent: 'write', studioPolicy: 'reuse-only' } as const;
+  ): Promise<{
+    writeIntent: WriteIntent;
+    studioPolicy: StudioPolicy;
+    /** The pinned project and its repo — null for an unprefixed key. */
+    project: ThreadProjectRepo | null;
+  }> {
+    const fallback = { writeIntent: 'write', studioPolicy: 'reuse-only', project: null } as const;
+    // A thread row that cannot be read may still be pinned to a project, and
+    // routing such a key by the sender's repo is the mis-repo outcome this
+    // exists to prevent (task b5c71bc3). A key with room for a prefix
+    // therefore holds until the row can be read; a two-segment key has no
+    // prefix to lose and keeps today's degrade. The structural precheck is
+    // not a parse: it decides only that a pin MAY exist, never what it is.
+    const unreadable = (): ThreadProjectRepo | null =>
+      mayHaveProjectPrefix(threadKey)
+        ? { slug: threadKey.split(':')[0], repoRoot: null, cause: 'unreadable' }
+        : null;
     if (!this.supabase) return fallback;
+    // The registry and the thread are workspace-scoped (§1b): the identity's
+    // workspace when the session has one, the user's personal workspace
+    // otherwise. A positive "no workspace" answer means no thread row could
+    // have been pinned in one, so that stays the pre-existing degrade; a
+    // lookup that FAILS answers nothing and holds a key that may carry a
+    // prefix, like an unreadable row.
+    let workspaceId: string | null;
     try {
-      // The registry and the thread are workspace-scoped (§1b): the
-      // identity's workspace when the session has one, the user's personal
-      // workspace otherwise.
-      const workspaceId = sbId
+      workspaceId = sbId
         ? await workspaceOfSb(this.supabase, sbId)
         : await personalWorkspaceOf(this.supabase, userId);
-      if (!workspaceId) return fallback;
+    } catch {
+      // A failed scope lookup is not proof that a pin cannot exist (Lumen,
+      // #681 round 1): one transient exception here must not route a
+      // prefixed key by the sender's repo.
+      return { ...fallback, project: unreadable() };
+    }
+    if (!workspaceId) return fallback;
+    try {
       const { data, error } = await this.supabase
         .from('inbox_threads')
-        .select('key_type')
+        .select('key_type, key_project')
         .eq('workspace_id', workspaceId)
         .eq('thread_key', threadKey)
         .maybeSingle();
-      if (error) return fallback;
-      const service = new ThreadKeyService(this.supabase);
-      const behavior = await service.typeBehavior(workspaceId, data?.key_type ?? null);
-      return { writeIntent: behavior.writeIntent, studioPolicy: behavior.studioPolicy };
+      if (error) return { ...fallback, project: unreadable() };
+      // The pin is the database's (thread-key-grammar v4): the project the
+      // key resolved to when the thread was created, canonical slug, never
+      // re-derived from the string. It names the repo every inferred tier
+      // routes into. Resolved BEFORE the registry so a registry failure
+      // degrades the behaviour (below) without losing a readable pin.
+      const project = data?.key_project
+        ? await this.resolveProjectRepo(workspaceId, data.key_project)
+        : null;
+      try {
+        const service = new ThreadKeyService(this.supabase);
+        const behavior = await service.typeBehavior(workspaceId, data?.key_type ?? null);
+        return { writeIntent: behavior.writeIntent, studioPolicy: behavior.studioPolicy, project };
+      } catch {
+        // The row was read; only the registry failed. Same degrade as before
+        // for intent and policy — the project is known and stays.
+        return { ...fallback, project };
+      }
     } catch {
-      return fallback;
+      // The thread row read itself threw.
+      return { ...fallback, project: unreadable() };
     }
+  }
+
+  /**
+   * The repo a pinned project names, by (workspace_id, slug) — the pin is
+   * the canonical slug, so aliases never enter here. Every failure yields a
+   * project WITHOUT a repo, and routing holds on it: a missing row
+   * (`unresolved`), a read error (`unreadable`), or a row whose repo_root is
+   * not set (`unset`). None of them means "use the sender's repo instead".
+   */
+  private async resolveProjectRepo(workspaceId: string, slug: string): Promise<ThreadProjectRepo> {
+    if (!this.supabase) return { slug, repoRoot: null, cause: 'unreadable' };
+    const { data, error } = await this.supabase
+      .from('projects')
+      .select('slug, repo_root')
+      .eq('workspace_id', workspaceId)
+      .eq('slug', slug)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[StudioResolve] Pinned project could not be read', {
+        slug,
+        error: error.message,
+      });
+      return { slug, repoRoot: null, cause: 'unreadable' };
+    }
+    if (!data) return { slug, repoRoot: null, cause: 'unresolved' };
+    return data.repo_root
+      ? { slug, repoRoot: data.repo_root }
+      : { slug, repoRoot: null, cause: 'unset' };
+  }
+
+  /**
+   * Continuity is evidence only inside the thread's project repo. The
+   * sessions that put `inktrade:pr:1` in an inkwell checkout are still on
+   * that thread, and following them would keep the mis-route alive for as
+   * long as the thread does (task b5c71bc3). A studio whose repo cannot be
+   * read is skipped too: unverifiable is not the same as verified, and the
+   * rungs below decide from the project's repo.
+   */
+  /**
+   * The thread-key REUSE rung runs after routing, and when routing produced
+   * no studio — a deferred D1 create, or a refusal — its lookup is unscoped:
+   * any live session on the thread qualifies. For a project-pinned thread
+   * that is the incident's own session, bound to the wrong-repo overflow,
+   * reselected before the create boundary could provision in the project
+   * repo or the refusal could hold (Lumen, #681 round 1). Same test as
+   * continuity: a pinned thread reuses a session only when its studio is in
+   * the project's repo; a project with no repo reuses nothing and holds.
+   */
+  /**
+   * Whether a session may carry this thread, by the thread's pinned project
+   * (task b5c71bc3). The trigger handler asks this about an assignment
+   * WINNER — an existing participant stamp that beat the routed candidate —
+   * before promoting it to the delivery session (Lumen, #681 r2). True for a
+   * thread with no pin, or no key at all.
+   */
+  async sessionAllowedForThread(
+    userId: string,
+    sbId: string | null,
+    threadKey: string | undefined,
+    session: Session
+  ): Promise<boolean> {
+    if (!threadKey) return true;
+    const { project } = await this.resolveThreadBehavior(userId, sbId, threadKey);
+    return this.threadMatchAllowed(userId, session, project, threadKey);
+  }
+
+  /**
+   * A live thread match inside the studio the CALLER named is continuity in
+   * an address, not a guess: the reuse lookup was scoped to that studio, so
+   * rejecting the match there would mint a new session in the very same
+   * studio — the explicit escape hatch losing its continuity while keeping
+   * its placement (Lumen, #681 r2). Only the two caller-named tiers qualify;
+   * an unresolved "main" or an inferred tier keeps the repo test.
+   */
+  private matchInCallerNamedStudio(
+    routing: StudioRoutingDecision,
+    resolvedStudioId: string | undefined,
+    match: Session
+  ): boolean {
+    return (
+      (routing.tier === 'explicit' || routing.tier === 'studio-hint') &&
+      !!resolvedStudioId &&
+      match.studioId === resolvedStudioId
+    );
+  }
+
+  private async threadMatchAllowed(
+    userId: string,
+    match: Session,
+    projectRepo: ThreadProjectRepo | null | undefined,
+    threadKey: string
+  ): Promise<boolean> {
+    if (!projectRepo) return true;
+    if (!projectRepo.repoRoot || !match.studioId) {
+      logger.warn('[StudioResolve] Thread-key reuse refused — pinned project repo unverifiable', {
+        threadKey,
+        sessionId: match.id,
+        studioId: match.studioId ?? null,
+        project: projectRepo.slug,
+        projectRepoRoot: projectRepo.repoRoot,
+      });
+      return false;
+    }
+    return this.continuityStudioAllowed(userId, match.studioId, { threadKey, projectRepo });
+  }
+
+  private async continuityStudioAllowed(
+    userId: string,
+    studioId: string,
+    options: { threadKey?: string; projectRepo?: ThreadProjectRepo }
+  ): Promise<boolean> {
+    const expected = options.projectRepo?.repoRoot;
+    if (!expected || !this.supabase) return true;
+    const { data, error } = await this.supabase
+      .from('studios')
+      .select('repo_root')
+      .eq('id', studioId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error || !data || data.repo_root !== expected) {
+      logger.warn('[StudioResolve] Thread continuity points outside the project repo; skipping', {
+        threadKey: options.threadKey,
+        studioId,
+        studioRepoRoot: data?.repo_root ?? null,
+        projectRepoRoot: expected,
+        ...(error ? { error: error.message } : {}),
+      });
+      return false;
+    }
+    return true;
   }
 
   async handleMessage(request: SessionRequest): Promise<SessionResult> {
@@ -1255,6 +1505,7 @@ export class SessionService implements ISessionService {
         studioId: metadata?.studioId,
         studioHint: metadata?.studioHint,
         recipientSessionId: metadata?.recipientSessionId,
+        recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
         turnEpochCandidate,
@@ -1476,6 +1727,7 @@ export class SessionService implements ISessionService {
             studioId: pending.request.metadata?.studioId,
             studioHint: pending.request.metadata?.studioHint,
             recipientSessionId: pending.request.metadata?.recipientSessionId,
+            recipientSessionExplicit: pending.request.metadata?.recipientSessionExplicit === true,
             // The candidate minted at THIS message's handleMessage entry —
             // its pre-queue resolution already stamped leases with it.
             turnEpochCandidate: pending.turnEpochCandidate,
@@ -2566,6 +2818,13 @@ export class SessionService implements ISessionService {
       studioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
+      /**
+       * The caller named recipientSessionId (addressing). Absent for a value
+       * inferred from thread history or the participant stamp — a continuity
+       * hint that, on a project-pinned thread, must pass the project repo test
+       * or is dropped (Lumen, #681 r2).
+       */
+      recipientSessionExplicit?: boolean;
       contactId?: string;
       repoRoot?: string;
       /** Server-derived sender studio — see resolveCallerRepoRoot. */
@@ -2662,10 +2921,12 @@ export class SessionService implements ISessionService {
     // later once its studio has already been consumed.
     let authorizedRecipientSessionId = options?.recipientSessionId;
     let anchorLookupFailed = false;
+    let recipientCandidate: Session | null = null;
     if (options?.recipientSessionId) {
       let candidate: Session | null = null;
       try {
         candidate = await this.repository.findById(options.recipientSessionId);
+        recipientCandidate = candidate;
       } catch (err) {
         // FAIL CLOSED (Lumen, PR #514 round 7). Swallowing this turned a
         // database failure into "no such session", so an EXACT anchor the
@@ -2709,14 +2970,47 @@ export class SessionService implements ISessionService {
     // routing may CREATE a worktree for this thread is decided here, once,
     // and both overflow entry points consult it. Without a threadKey neither
     // gate runs at all, so the values are inert.
-    const { writeIntent, studioPolicy } = options?.threadKey
+    const {
+      writeIntent,
+      studioPolicy,
+      project: projectRepo,
+    } = options?.threadKey
       ? await this.resolveThreadBehavior(userId, identitySbId, options.threadKey)
-      : ({ writeIntent: 'write', studioPolicy: 'provision' } as const);
+      : ({ writeIntent: 'write', studioPolicy: 'provision', project: null } as const);
+
+    // Provenance (Lumen, #681 r2). The trigger path passes a recipientSessionId
+    // inferred from thread history or the participant stamp — a continuity
+    // hint with no caller behind it (spec §3b.1). On a project-pinned thread
+    // that hint is the incident's own session, and as an anchor it outranked
+    // every repo-scoped rung. Only a caller-explicit anchor is addressing; an
+    // inferred one takes the same repo test as continuity, or is dropped and
+    // the ladder decides.
+    if (
+      authorizedRecipientSessionId &&
+      recipientCandidate &&
+      options?.recipientSessionExplicit !== true &&
+      projectRepo &&
+      options?.threadKey &&
+      !(await this.threadMatchAllowed(userId, recipientCandidate, projectRepo, options.threadKey))
+    ) {
+      logger.warn(
+        '[SessionRouting] Dropping inferred recipientSessionId — outside the project repo',
+        {
+          recipientSessionId: authorizedRecipientSessionId,
+          studioId: recipientCandidate.studioId ?? null,
+          threadKey: options.threadKey,
+          project: projectRepo.slug,
+          projectRepoRoot: projectRepo.repoRoot,
+        }
+      );
+      authorizedRecipientSessionId = undefined;
+    }
 
     let routing = await this.resolveStudioId(userId, sbSlug, {
       threadKey: options?.threadKey,
       writeIntent,
       studioPolicy,
+      projectRepo: projectRepo ?? undefined,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
       recipientSessionId: authorizedRecipientSessionId,
@@ -2752,6 +3046,9 @@ export class SessionService implements ISessionService {
       threadKey: options?.threadKey,
       writeIntent,
       studioPolicy,
+      // The pinned project's repo: admission-time overflow must mint from a
+      // parent in it, never from wherever the session happens to sit.
+      projectRepoRoot: projectRepo?.repoRoot ?? undefined,
       // v18 S2: the occupancy gate's same-holder pass-through matches on
       // canonical identity — resolved once, up top, like every tier.
       sbId: identitySbId,
@@ -2868,7 +3165,11 @@ export class SessionService implements ISessionService {
           // See findByAlias — canonical identity, not the ambiguous slug.
           identitySbId
         );
-        if (threadMatch) {
+        if (
+          threadMatch &&
+          (this.matchInCallerNamedStudio(routing, resolvedStudioId, threadMatch) ||
+            (await this.threadMatchAllowed(userId, threadMatch, projectRepo, options.threadKey)))
+        ) {
           this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
           return this.withStudioLease(threadMatch, routing, leaseCtx);
         }
@@ -2988,22 +3289,35 @@ export class SessionService implements ISessionService {
       //     a studio explicitly (create_studio) when one is needed.
       //   write    — a writer with nowhere safe to write holds; deploy and
       //     unknown types land here.
+      const deferred = routing.deferredCreate;
+      // The refusal names the repo that had no studio. For a project-pinned
+      // thread that is the PROJECT's repo, and the sender's was never tried.
+      const deferredRefusal = {
+        triedCallerRepo: deferred.source === 'caller',
+        callerRepoRoot: deferred.repoRoot,
+        ...(deferred.source === 'project' && projectRepo
+          ? { project: { slug: projectRepo.slug, repoRoot: deferred.repoRoot } }
+          : {}),
+      };
       if (writeIntent === 'presence') {
         logger.info(
-          '[StudioResolve] Caller repo has no studio; presence thread proceeds studioless',
+          `[StudioResolve] ${deferred.source} repo has no studio; presence thread proceeds studioless`,
           {
             threadKey: options?.threadKey,
             sbSlug,
-            repoRoot: routing.deferredCreate.repoRoot,
+            repoRoot: deferred.repoRoot,
           }
         );
         routing = { ...routing, deferredCreate: undefined };
       } else {
-        logger.info('[StudioResolve] Caller repo has no studio and type is reuse-only; holding', {
-          threadKey: options?.threadKey,
-          sbSlug,
-          repoRoot: routing.deferredCreate.repoRoot,
-        });
+        logger.info(
+          `[StudioResolve] ${deferred.source} repo has no studio and type is reuse-only; holding`,
+          {
+            threadKey: options?.threadKey,
+            sbSlug,
+            repoRoot: deferred.repoRoot,
+          }
+        );
         routing = {
           studioId: undefined,
           tier: 'refused',
@@ -3011,21 +3325,25 @@ export class SessionService implements ISessionService {
           refusal: {
             reason: 'no-route',
             threadKey: options?.threadKey || '',
-            triedCallerRepo: true,
-            callerRepoRoot: routing.deferredCreate.repoRoot,
+            ...deferredRefusal,
             policy: 'reuse-only',
           },
         };
       }
     } else if (routing.deferredCreate && !resolvedStudioId) {
+      const deferred = routing.deferredCreate;
       const createdStudioId = await this.createParentStudio(
         userId,
         sbSlug,
-        routing.deferredCreate.repoRoot,
-        routing.deferredCreate.sbId ?? identitySbId
+        deferred.repoRoot,
+        deferred.sbId ?? identitySbId
       );
       if (createdStudioId) {
-        routing = await this.gateOccupancy(createdStudioId, 'caller-repo-created', leaseCtx);
+        routing = await this.gateOccupancy(
+          createdStudioId,
+          deferred.source === 'project' ? 'project-repo-created' : 'caller-repo-created',
+          leaseCtx
+        );
         resolvedStudioId = routing.studioId;
       } else {
         // Provisioning failed — fail closed to a hold rather than to a guess.
@@ -3036,8 +3354,11 @@ export class SessionService implements ISessionService {
           refusal: {
             reason: 'no-route',
             threadKey: options?.threadKey || '',
-            triedCallerRepo: true,
-            callerRepoRoot: routing.deferredCreate.repoRoot,
+            triedCallerRepo: deferred.source === 'caller',
+            callerRepoRoot: deferred.repoRoot,
+            ...(deferred.source === 'project' && projectRepo
+              ? { project: { slug: projectRepo.slug, repoRoot: deferred.repoRoot } }
+              : {}),
           },
         };
       }
@@ -3052,6 +3373,7 @@ export class SessionService implements ISessionService {
           : {}),
         ...(routing.refusal.occupied ? { occupied: routing.refusal.occupied } : {}),
         ...(routing.refusal.policy ? { policy: routing.refusal.policy } : {}),
+        ...(routing.refusal.project ? { project: routing.refusal.project } : {}),
       });
     }
 
@@ -3144,6 +3466,13 @@ export class SessionService implements ISessionService {
       identityAbsent?: boolean;
       /** v18 S3: decision-only resolution — the gate never mints overflow. */
       planOnly?: boolean;
+      /**
+       * The project the thread's key was pinned to, and its repo — resolved
+       * server-side from the thread row (task b5c71bc3). With a repo, every
+       * inferred rung is scoped to it and the caller-repo tier does not run;
+       * without one, inferred placement is refused.
+       */
+      projectRepo?: ThreadProjectRepo;
     }
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = {
@@ -3152,6 +3481,7 @@ export class SessionService implements ISessionService {
       threadKey: options.threadKey,
       writeIntent: options.writeIntent,
       studioPolicy: options.studioPolicy,
+      projectRepoRoot: options.projectRepo?.repoRoot ?? undefined,
       // v18 S2: the occupancy gate's same-holder pass-through matches on
       // canonical identity — same resolution every tier below uses.
       sbId: options.sbId ?? null,
@@ -3175,6 +3505,10 @@ export class SessionService implements ISessionService {
       ambiguous: options.identityAmbiguous === true,
     };
     const scopedSbId = identityScope.id ?? null;
+    // The repo a repo-scoped rung runs against. A pinned project's repo is
+    // server-derived and wins over `options.repoRoot`, which is caller
+    // metadata (spec v5 trust boundary) and keeps only its narrower job.
+    const targetRepoRoot = options.projectRepo?.repoRoot ?? options.repoRoot;
     // Returns the same builder type so the rest of each chain keeps working;
     // PostgrestFilterBuilder's generics are not expressible in a constraint
     // here without pinning the whole Database type per call.
@@ -3199,7 +3533,7 @@ export class SessionService implements ISessionService {
     if (options.explicitStudioId) {
       if (isMainStudio(options.explicitStudioId)) {
         return {
-          studioId: await this.resolveMainStudioId(userId, options.repoRoot, sbSlug, scopedSbId),
+          studioId: await this.resolveMainStudioId(userId, targetRepoRoot, sbSlug, scopedSbId),
           tier: 'explicit',
           occupancyChecked: false,
         };
@@ -3280,7 +3614,7 @@ export class SessionService implements ISessionService {
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
     if (isMainStudio(options.studioHint)) {
       return {
-        studioId: await this.resolveMainStudioId(userId, options.repoRoot, sbSlug, scopedSbId),
+        studioId: await this.resolveMainStudioId(userId, targetRepoRoot, sbSlug, scopedSbId),
         tier: 'studio-hint',
         occupancyChecked: false,
       };
@@ -3329,6 +3663,30 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // A thread pinned to a project that names no repo has nowhere to be
+    // placed by inference. The explicit anchors above are addressing and keep
+    // working; from here down every rung would guess, and on 2026-09-24 the
+    // guess was the sender's repo (task b5c71bc3). Hold, and say what to set.
+    if (options.threadKey && options.projectRepo && !options.projectRepo.repoRoot) {
+      logger.warn('[StudioResolve] Refusing to route — pinned project names no repo', {
+        threadKey: options.threadKey,
+        sbSlug,
+        project: options.projectRepo.slug,
+        cause: options.projectRepo.cause ?? 'unset',
+      });
+      return {
+        studioId: undefined,
+        tier: 'refused',
+        occupancyChecked: false,
+        refusal: {
+          reason: 'project-without-repo',
+          threadKey: options.threadKey,
+          triedCallerRepo: false,
+          project: { slug: options.projectRepo.slug, cause: options.projectRepo.cause ?? 'unset' },
+        },
+      };
+    }
+
     // 2) Thread-key scoped continuity (no caller-side studio lookup needed)
     if (options.threadKey) {
       const { data: activeThreadSession } = await scopeBy(
@@ -3342,7 +3700,10 @@ export class SessionService implements ISessionService {
         .maybeSingle();
 
       const activeThreadStudio = activeThreadSession?.studio_id || undefined;
-      if (activeThreadStudio) {
+      if (
+        activeThreadStudio &&
+        (await this.continuityStudioAllowed(userId, activeThreadStudio, options))
+      ) {
         return { studioId: activeThreadStudio, tier: 'thread-continuity', occupancyChecked: false };
       }
 
@@ -3357,7 +3718,10 @@ export class SessionService implements ISessionService {
         .maybeSingle();
 
       const endedThreadStudio = endedThreadSession?.studio_id || undefined;
-      if (endedThreadStudio) {
+      if (
+        endedThreadStudio &&
+        (await this.continuityStudioAllowed(userId, endedThreadStudio, options))
+      ) {
         return { studioId: endedThreadStudio, tier: 'thread-continuity', occupancyChecked: false };
       }
     }
@@ -3373,8 +3737,8 @@ export class SessionService implements ISessionService {
       )
         .in('status', ['active', 'idle'])
         .not('route_patterns', 'eq', '{}');
-      if (options.repoRoot) {
-        patternQuery = patternQuery.eq('repo_root', options.repoRoot);
+      if (targetRepoRoot) {
+        patternQuery = patternQuery.eq('repo_root', targetRepoRoot);
       }
       const { data: patternStudios } = (await patternQuery) as unknown as {
         data: Array<{ id: string; route_patterns: string[] }> | null;
@@ -3437,16 +3801,16 @@ export class SessionService implements ISessionService {
     //    (e.g., strategy triggers with cross-project repoRoot), resolve to the
     //    main studio for that repo before falling through to the generic
     //    "agent's most recent studio" which may belong to a different project.
-    if (options.repoRoot) {
+    if (targetRepoRoot) {
       const repoRootStudioId = await this.resolveMainStudioId(
         userId,
-        options.repoRoot,
+        targetRepoRoot,
         sbSlug,
         scopedSbId
       );
       if (repoRootStudioId) {
         logger.debug('[StudioResolve] Resolved studio via repoRoot', {
-          repoRoot: options.repoRoot,
+          repoRoot: targetRepoRoot,
           sbSlug,
           studioId: repoRootStudioId,
         });
@@ -3473,6 +3837,42 @@ export class SessionService implements ISessionService {
     //     resolved to whatever the server happened to be running in. The main
     //     studio is still reachable below, but only scoped to a repo we
     //     actually resolved.
+    // Project-repo resolution (task b5c71bc3). A thread pinned to a project
+    // is placed by THAT project's repo: the same ladder as the caller-repo
+    // tier below, run against a repo the server resolved from the thread row
+    // — and the sender's ambient repo is not consulted at all. It is what put
+    // an inktrade review in an inkwell checkout, detached at the wrong
+    // repository's PR #1.
+    const projectRepoRoot = options.projectRepo?.repoRoot;
+    if (options.threadKey && options.projectRepo && projectRepoRoot) {
+      const byProject = await this.resolveStudioForRepo(
+        userId,
+        sbSlug,
+        projectRepoRoot,
+        leaseCtx,
+        scopedSbId,
+        'project'
+      );
+      if (byProject) return byProject;
+      logger.warn('[StudioResolve] Refusing to route — pinned project repo yielded no studio', {
+        threadKey: options.threadKey,
+        sbSlug,
+        project: options.projectRepo.slug,
+        repoRoot: projectRepoRoot,
+      });
+      return {
+        studioId: undefined,
+        tier: 'refused',
+        occupancyChecked: false,
+        refusal: {
+          reason: 'no-route',
+          threadKey: options.threadKey,
+          triedCallerRepo: false,
+          project: { slug: options.projectRepo.slug, repoRoot: projectRepoRoot },
+        },
+      };
+    }
+
     const callerRepoRoot = await this.resolveCallerRepoRoot(userId, options);
     if (callerRepoRoot) {
       const byRepo = await this.resolveStudioForRepo(
@@ -3649,7 +4049,9 @@ export class SessionService implements ISessionService {
       writeIntent?: WriteIntent;
       studioPolicy?: StudioPolicy;
     },
-    knownSbId?: string | null
+    knownSbId?: string | null,
+    /** Which server-derived repo this is — the tier labels say which decided. */
+    source: RepoSource = 'caller'
   ): Promise<StudioRoutingDecision | null> {
     if (!this.supabase) return null;
 
@@ -3683,12 +4085,16 @@ export class SessionService implements ISessionService {
     }
 
     if (existing?.id) {
-      logger.debug('[StudioResolve] Reused studio for caller repo', {
+      logger.debug(`[StudioResolve] Reused studio for ${source} repo`, {
         repoRoot,
         sbSlug,
         studioId: existing.id,
       });
-      return this.gateOccupancy(existing.id, 'caller-repo-reuse', leaseCtx);
+      return this.gateOccupancy(
+        existing.id,
+        source === 'project' ? 'project-repo-reuse' : 'caller-repo-reuse',
+        leaseCtx
+      );
     }
 
     // The repo-scoped main studio — this is the re-scoped former tier 8. It
@@ -3714,9 +4120,9 @@ export class SessionService implements ISessionService {
     // about to create a session.
     return {
       studioId: undefined,
-      tier: 'caller-repo-created',
+      tier: source === 'project' ? 'project-repo-created' : 'caller-repo-created',
       occupancyChecked: false,
-      deferredCreate: { repoRoot, sbId: sbId ?? null },
+      deferredCreate: { repoRoot, sbId: sbId ?? null, source },
     };
   }
 
@@ -3838,7 +4244,7 @@ export class SessionService implements ISessionService {
         sbId: knownSbId ?? (await this.resolveSbId(userId, sbSlug)),
       });
       if (!parent) return undefined;
-      logger.info('[StudioResolve] Created parent studio for caller repo (D1)', {
+      logger.info('[StudioResolve] Created parent studio for the resolved repo (D1)', {
         studioId: parent.id,
         slug: parent.slug,
         repoRoot,
