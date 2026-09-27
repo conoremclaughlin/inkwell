@@ -137,7 +137,7 @@ dump_stack_diagnostics() {
     echo "[integration-db] --- ${service} invocation diagnostics ---"
     docker inspect --format 'status={{.State.Status}} restarts={{.RestartCount}} oomKilled={{.State.OOMKilled}}' "${id}" 2>/dev/null || true
     if [[ "${service}" == "kong" ]]; then
-      echo "upstream_keepalive_pool_size=$(kong_upstream_keepalive_pool_size "${name}" || true)"
+      echo "upstream_keepalive_pool_size=$(kong_upstream_keepalive_pool_size "${name}" || true) (running worker)"
     fi
     if ! python3 "${ROOT_DIR}/scripts/lib/integration-log-summary.py" \
       "${service}" "${id}" "${DIAGNOSTICS_SINCE}"; then
