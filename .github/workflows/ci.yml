@@ -90,6 +90,27 @@ jobs:
       - name: Migration ledger wrapper, status parser, and startup preflight
         run: sh scripts/db-migrate.test.sh
 
+      # Every migration file must pass the judgement `apply` makes before it
+      # connects. `yarn dev` applies the pending set through the wrapper, so a
+      # merged file it refuses stops the main server's restart on the
+      # operator's machine. The integration-DB job cannot catch this: its stack
+      # applies files with `supabase db reset`, which tolerates a top-level
+      # BEGIN/COMMIT pair (2026-09-27, 20260924070106). The two files excluded
+      # here predate the wrapper and were applied without it; nothing else is
+      # exempt.
+      - name: Migration files pass the wrapper's scan
+        run: |
+          set -eu
+          set --
+          for f in supabase/migrations/*.sql; do
+            case "$f" in
+              */20260507235413_rename_identity_id_to_sb_id.sql) ;;
+              */20260923010634_tasks_priority_status_vocabulary.sql) ;;
+              *) set -- "$@" "$f" ;;
+            esac
+          done
+          sh scripts/db-migrate.sh scan "$@"
+
       # The integration-DB harness's endpoint isolation. Mock-only: synthetic
       # `supabase status` payloads, no Docker and no database. CI has no
       # ambient Supabase env, so the contamination this covers cannot arise

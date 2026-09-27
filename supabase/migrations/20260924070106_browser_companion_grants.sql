@@ -19,8 +19,6 @@
 --
 -- Nothing the extension holds is ever written to mcp_tokens.
 
-BEGIN;
-
 CREATE TABLE IF NOT EXISTS public.browser_companion_grants (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
@@ -274,5 +272,3 @@ BEGIN
   RETURN QUERY SELECT 'allowed'::text, NULL::text, v_grant.expires_at, v_grant.revoked_at;
 END;
 $$;
-
-COMMIT;

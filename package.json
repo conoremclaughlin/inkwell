@@ -23,6 +23,7 @@
     "db:migrate": "sh ./scripts/db-migrate.sh apply",
     "db:migrate:status": "sh ./scripts/db-migrate.sh status",
     "db:migrate:pending": "sh ./scripts/db-migrate.sh pending",
+    "db:migrate:scan": "sh ./scripts/db-migrate.sh scan",
     "prod:up": "./scripts/prod-up.sh",
     "prod": "yarn prod:up",
     "logs:ink": "tail -n 200 -f $HOME/.ink/logs/combined.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",
