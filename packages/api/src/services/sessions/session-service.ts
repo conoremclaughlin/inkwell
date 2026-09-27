@@ -59,7 +59,13 @@ import { classifyError, isPreAcceptanceRefusal, type ErrorClassification } from 
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
-import { StudioLeaseService, isLeaseStale, leaseThreadKeys } from '../studio-lease.service.js';
+import {
+  StudioLeaseService,
+  isLeaseStale,
+  leaseThreadKeys,
+  type AcquireResult,
+} from '../studio-lease.service.js';
+import { decideDelivery } from './trigger-delivery.js';
 import { ThreadKeyService } from '../thread-key/thread-key.service.js';
 import type {
   StudioPolicy,
@@ -186,6 +192,34 @@ function routePatternSpecificity(pattern: string): number {
   const literalPrefix = pattern.split('*')[0];
   if (literalPrefix.length > 0) return 2; // prefix wildcard
   return 1; // bare wildcard '*'
+}
+
+/**
+ * The routing options a message resolves its session with.
+ *
+ * A message resolves twice when it queues behind a running turn: once on
+ * arrival, and again when the queue reaches it. The two calls used to build
+ * their options separately, and the queued one never gained contactId, alias
+ * or repoRoot when each was added to the first. A queued per-sender message
+ * therefore re-resolved into the OWNER's session. One builder keeps them equal.
+ */
+function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: string) {
+  const { metadata } = request;
+  return {
+    type: metadata?.sessionType || 'primary',
+    taskDescription: metadata?.taskDescription,
+    parentSessionId: metadata?.parentSessionId,
+    threadKey: metadata?.threadKey,
+    alias: metadata?.sessionAlias,
+    studioId: metadata?.studioId,
+    studioHint: metadata?.studioHint,
+    recipientSessionId: metadata?.recipientSessionId,
+    recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
+    replyToSessionId: metadata?.replyToSessionId,
+    contactId: metadata?.contactId,
+    repoRoot: metadata?.repoRoot,
+    turnEpochCandidate,
+  };
 }
 
 /**
@@ -936,6 +970,7 @@ export class SessionService implements ISessionService {
   private logRungMatch(
     rung:
       | 'recipient-session'
+      | 'reply-anchor'
       | 'alias'
       | 'thread-key'
       | 'default-session'
@@ -1496,20 +1531,11 @@ export class SessionService implements ISessionService {
 
     try {
       // 1. Get or create session (needed to determine lock key)
-      const session = await this.getOrCreateSession(userId, sbSlug, {
-        type: metadata?.sessionType || 'primary',
-        taskDescription: metadata?.taskDescription,
-        parentSessionId: metadata?.parentSessionId,
-        threadKey: metadata?.threadKey,
-        alias: metadata?.sessionAlias,
-        studioId: metadata?.studioId,
-        studioHint: metadata?.studioHint,
-        recipientSessionId: metadata?.recipientSessionId,
-        recipientSessionExplicit: metadata?.recipientSessionExplicit === true,
-        contactId: metadata?.contactId,
-        repoRoot: metadata?.repoRoot,
-        turnEpochCandidate,
-      });
+      const session = await this.getOrCreateSession(
+        userId,
+        sbSlug,
+        sessionRoutingOptions(request, turnEpochCandidate)
+      );
       admitted = true;
 
       // Backfill mission linkage now that routing resolved: a check-in that
@@ -1714,54 +1740,114 @@ export class SessionService implements ISessionService {
         this.pendingQueues.delete(lockKey);
       }
 
+      let session: Session;
       try {
-        // Get session again (may have changed)
-        const session = await this.getOrCreateSession(
+        // Get session again (may have changed). Same options as the direct
+        // path, with the candidate minted at THIS message's handleMessage
+        // entry — its pre-queue resolution already stamped leases with it.
+        session = await this.getOrCreateSession(
           pending.request.userId,
           pending.request.sbSlug,
-          {
-            type: pending.request.metadata?.sessionType || 'primary',
-            taskDescription: pending.request.metadata?.taskDescription,
-            parentSessionId: pending.request.metadata?.parentSessionId,
-            threadKey: pending.request.metadata?.threadKey,
-            studioId: pending.request.metadata?.studioId,
-            studioHint: pending.request.metadata?.studioHint,
-            recipientSessionId: pending.request.metadata?.recipientSessionId,
-            recipientSessionExplicit: pending.request.metadata?.recipientSessionExplicit === true,
-            // The candidate minted at THIS message's handleMessage entry —
-            // its pre-queue resolution already stamped leases with it.
-            turnEpochCandidate: pending.turnEpochCandidate,
-          }
+          sessionRoutingOptions(pending.request, pending.turnEpochCandidate)
         );
-
-        const result = await this.processMessage(
-          pending.request,
-          session,
-          pending.turnEpochCandidate
-        );
-        // Same admission evidence as the direct path: resolution succeeded
-        // just above, so whatever the turn did, routing admitted it.
-        pending.resolve({ ...result, admitted: true });
-        // Flush on non-retryable success:false results (e.g. InkRunner session limit)
-        if (!result.success && result.error) {
-          this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
-        }
       } catch (error) {
-        pending.reject(error instanceof Error ? error : new Error(String(error)));
-        this.flushQueueOnNonRetryableError(
-          lockKey,
-          error instanceof Error ? error.message : String(error)
-        );
-      } finally {
-        // Continue processing queue (if not flushed above)
+        this.rejectQueuedTurn(lockKey, pending, error);
         await this.processQueueOrReleaseLock(lockKey);
+        return;
       }
+
+      // The lock this message waited on serializes turns in the session it
+      // names, and in no other. When re-resolution chose a different session
+      // (a reply whose anchor was declined because its session ended while it
+      // waited, or general reuse moving on), running it here would start a
+      // second turn beside one that session may already be running (Lumen,
+      // PR #682 r2). It moves to that session's lock instead, and nothing on
+      // this chain waits for it, so two queues handing messages to each other
+      // cannot deadlock.
+      const targetKey = `${pending.request.sbSlug}:${session.id}`;
+      if (targetKey !== lockKey) {
+        this.handOffQueuedTurn(lockKey, targetKey, pending, session);
+        await this.processQueueOrReleaseLock(lockKey);
+        return;
+      }
+
+      await this.runQueuedTurn(lockKey, pending, session);
     } else {
       // Queue empty, release lock
       this.processingLocks.delete(lockKey);
       this.pendingQueues.delete(lockKey);
       logger.debug('Released processing lock', { lockKey });
     }
+  }
+
+  /**
+   * Run a dequeued message under `lockKey`, which the caller holds, then
+   * continue that lock's queue.
+   */
+  private async runQueuedTurn(
+    lockKey: string,
+    pending: PendingMessage,
+    session: Session
+  ): Promise<void> {
+    try {
+      const result = await this.processMessage(
+        pending.request,
+        session,
+        pending.turnEpochCandidate
+      );
+      // Same admission evidence as the direct path: resolution succeeded
+      // before this turn ran, so whatever the turn did, routing admitted it.
+      pending.resolve({ ...result, admitted: true });
+      // Flush on non-retryable success:false results (e.g. InkRunner session limit)
+      if (!result.success && result.error) {
+        this.flushQueueOnNonRetryableError(lockKey, result.error, result.classification);
+      }
+    } catch (error) {
+      this.rejectQueuedTurn(lockKey, pending, error);
+    } finally {
+      // Continue processing queue (if not flushed above)
+      await this.processQueueOrReleaseLock(lockKey);
+    }
+  }
+
+  private rejectQueuedTurn(lockKey: string, pending: PendingMessage, error: unknown): void {
+    pending.reject(error instanceof Error ? error : new Error(String(error)));
+    this.flushQueueOnNonRetryableError(
+      lockKey,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+
+  /**
+   * Move a dequeued message to the lock of the session it re-resolved to: to
+   * the back of that session's queue while a turn runs there, or straight into
+   * a turn of its own when the session is idle. The turn is not awaited.
+   */
+  private handOffQueuedTurn(
+    fromLockKey: string,
+    toLockKey: string,
+    pending: PendingMessage,
+    session: Session
+  ): void {
+    logger.info('Queued message re-resolved to another session; moving to its lock', {
+      fromLockKey,
+      toLockKey,
+      channel: pending.request.channel,
+    });
+    if (this.processingLocks.has(toLockKey)) {
+      const queue = this.pendingQueues.get(toLockKey) || [];
+      queue.push(pending);
+      this.pendingQueues.set(toLockKey, queue);
+      return;
+    }
+    this.processingLocks.add(toLockKey);
+    logger.debug('Acquired processing lock', { lockKey: toLockKey });
+    this.runQueuedTurn(toLockKey, pending, session).catch((error) => {
+      logger.error('Handed-off queued turn failed outside its own handling', {
+        lockKey: toLockKey,
+        error: serializeError(error),
+      });
+    });
   }
 
   /**
@@ -2806,6 +2892,166 @@ export class SessionService implements ISessionService {
     });
   }
 
+  /**
+   * May a channel reply resume the session that wrote the message it answers?
+   *
+   * A reply anchor is a preference, not an address. recipientSessionId names
+   * a session its caller has already planned delivery to: the trigger path
+   * checks it for a live terminal before spawning, and passes its thread so
+   * the lease gate runs. A reply names whichever session wrote the message,
+   * possibly days ago, and nothing has checked that session since. So it is
+   * checked here, on every resolution (on arrival, and again when a queued
+   * message is dequeued), and any failed check declines it. A declined reply
+   * routes as an unanchored message would, which is where every reply went
+   * before replies carried their session.
+   *
+   * The anchor never reaches resolveStudioId. That tier pins the studio of any
+   * session it is given, ended or not, so an anchor that ended after the reply
+   * lookup left general reuse and creation scoped to its old studio, closed or
+   * not (Lumen, PR #682). A declined anchor must leave no trace in routing.
+   *
+   * Returns the session to resume, or null to route unanchored.
+   */
+  private async admitReplyAnchor(
+    sessionId: string,
+    ctx: {
+      userId: string;
+      sbSlug: string;
+      sbId: string | null;
+      contactId?: string;
+      /** getOrCreateSession's identity authorization for explicit anchors. */
+      belongsToTarget: (row: Session) => boolean;
+      planOnly: boolean;
+      turnEpochCandidate?: string;
+    }
+  ): Promise<Session | null> {
+    const decline = (reason: string, detail: Record<string, unknown> = {}): null => {
+      logger.warn(
+        '[SessionRouting] Reply cannot resume its authoring session; routing unanchored',
+        {
+          replyToSessionId: sessionId,
+          reason,
+          ...detail,
+        }
+      );
+      return null;
+    };
+
+    let session: Session | null;
+    try {
+      session = await this.repository.findById(sessionId);
+    } catch (err) {
+      return decline('lookup_failed', { error: serializeError(err) });
+    }
+    if (!session) return decline('missing');
+    if (!ctx.belongsToTarget(session)) return decline('other_identity');
+
+    // Per-sender isolation, in both directions, exactly as general reuse
+    // applies it: a contact's message runs only in that contact's sessions,
+    // and an owner-scoped one only in owner sessions. A reply may change
+    // WHICH eligible session resumes. It never widens who is eligible.
+    if ((session.contactId ?? null) !== (ctx.contactId ?? null)) {
+      return decline('other_contact', {
+        sessionContactId: session.contactId ?? null,
+        requestContactId: ctx.contactId ?? null,
+      });
+    }
+
+    if (session.endedAt) return decline('ended');
+
+    // A live terminal, judged by the trigger path's own delivery decision on
+    // the same columns. The trigger path would deliver inline to it, but
+    // channel messages have no inline delivery yet. Resuming it headless runs
+    // a second process on the terminal's backend session, and that turn's
+    // finalize then clears the terminal's attachment flag. A read that cannot
+    // rule a terminal out counts as one: declining costs the reply its
+    // conversation, while resuming could cost the terminal its turn.
+    if (!this.supabase) return decline('terminal_unverified');
+    const { data: attachment, error: attachmentError } = await this.supabase
+      .from('sessions')
+      .select('id, studio_id, cli_poll_at, cli_attached, updated_at')
+      .eq('id', session.id)
+      .eq('user_id', ctx.userId)
+      .maybeSingle();
+    if (attachmentError || !attachment) {
+      return decline('terminal_unverified', {
+        error: attachmentError ? serializeError(attachmentError) : 'session row not readable',
+      });
+    }
+    const delivery = decideDelivery({
+      forceSpawn: false,
+      pollRow: attachment,
+      attachedRow: {
+        cli_attached: attachment.cli_attached === true,
+        // A row with no update stamp cannot be shown stale, so a set
+        // attachment flag on it stands.
+        updated_at: attachment.updated_at ?? new Date().toISOString(),
+      },
+    });
+    if (delivery.mode === 'inline') {
+      return decline('terminal_attached', { source: delivery.source });
+    }
+
+    // The lease gate runs only for a request that carries a threadKey, and a
+    // reply carries none, so on its own a reply would enter the anchor's
+    // studio while another session holds the lease. A turn there is a turn
+    // under the anchor's thread, so that thread's stored contract applies,
+    // as a message on the thread would meet it: a write thread takes the
+    // studio's lease, and a presence thread binds without one. Where that
+    // message would divert to overflow or hold, the reply declines instead.
+    // Resuming this session is a preference, and neither a new worktree nor a
+    // held message is worth it. A plan resolution never acquires; the spawn
+    // path's own resolution does.
+    //
+    // A session bound to a studio with no thread has no contract to meet: no
+    // thread says whether a turn there writes, and a lease is only ever taken
+    // under a thread. It declines, on a plan resolution too (Lumen, PR #682
+    // r2). An unthreaded message reaching such a session through general
+    // reuse enters unchecked, as it always has, but that is the newest session.
+    // An anchor would open an older one, whoever holds its studio now.
+    if (session.studioId && !session.threadKey) {
+      return decline('studio_without_thread', { studioId: session.studioId });
+    }
+    const leases = this.getLeaseService();
+    if (leases && session.studioId && session.threadKey && !ctx.planOnly) {
+      const { writeIntent } = await this.resolveThreadBehavior(
+        ctx.userId,
+        ctx.sbId,
+        session.threadKey
+      );
+      if (writeIntent !== 'presence') {
+        let lease: AcquireResult;
+        try {
+          lease = await leases.acquire({
+            studioId: session.studioId,
+            sessionId: session.id,
+            threadKey: session.threadKey,
+            sbSlug: ctx.sbSlug,
+            ...(ctx.sbId ? { sbId: ctx.sbId } : {}),
+            userId: ctx.userId,
+            reason: 'reply-anchor',
+            turnEpoch: ctx.turnEpochCandidate,
+          });
+        } catch (err) {
+          return decline('studio_unverified', {
+            studioId: session.studioId,
+            error: serializeError(err),
+          });
+        }
+        if (!lease.acquired) {
+          return decline('studio_unavailable', {
+            studioId: session.studioId,
+            threadKey: session.threadKey,
+            holderSessionId: lease.holder?.sessionId ?? null,
+            holderThreadKey: lease.holder?.threadKey ?? null,
+          });
+        }
+      }
+    }
+
+    return session;
+  }
+
   async getOrCreateSession(
     userId: string,
     sbSlug: string,
@@ -2825,6 +3071,13 @@ export class SessionService implements ISessionService {
        * or is dropped (Lumen, #681 r2).
        */
       recipientSessionExplicit?: boolean;
+      /**
+       * The session that wrote the message a channel reply answers. Tried
+       * after recipientSessionId and before every other rung, but only
+       * admitted while it can safely take the turn — see admitReplyAnchor.
+       * It never reaches studio resolution.
+       */
+      replyToSessionId?: string;
       contactId?: string;
       repoRoot?: string;
       /** Server-derived sender studio — see resolveCallerRepoRoot. */
@@ -3076,6 +3329,25 @@ export class SessionService implements ISessionService {
         if (recipientSession && !recipientSession.endedAt) {
           this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);
           return this.withStudioLease(recipientSession, routing, leaseCtx);
+        }
+      }
+
+      // A channel reply resumes the session that wrote the message it
+      // answers, when that session can safely take it. Admission (and any
+      // lease it needs) is decided inside, so a match is returned as is.
+      if (options?.replyToSessionId) {
+        const replyAnchor = await this.admitReplyAnchor(options.replyToSessionId, {
+          userId,
+          sbSlug,
+          sbId: identitySbId,
+          contactId: options.contactId,
+          belongsToTarget: anchorBelongsToTarget,
+          planOnly: options.planOnly === true,
+          turnEpochCandidate: options.turnEpochCandidate,
+        });
+        if (replyAnchor) {
+          this.logRungMatch('reply-anchor', replyAnchor, routing, options.threadKey);
+          return replyAnchor;
         }
       }
 
