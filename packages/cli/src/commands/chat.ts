@@ -5520,7 +5520,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const activityPollGate = createPollGate();
 
   // The session-visibility policy, applied to legacy and thread rows alike.
-  const inboxMessageAllowedByPolicy = (msg: InboxMessage): boolean =>
+  const inboxTargetAllowedByPolicy = (target: {
+    sessionId?: string;
+    threadKey?: string;
+    studioId?: string;
+  }): boolean =>
     toolPolicy.canAccessSession({
       action: 'inbox',
       requester: {
@@ -5529,13 +5533,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
         studioId: runtime.studioId,
         sbSlug,
       },
-      target: {
-        sessionId: msg.relatedSessionId,
-        threadKey: msg.threadKey,
-        studioId: msg.recipientStudioId,
-        sbSlug,
-      },
+      target: { ...target, sbSlug },
     }).allowed;
+  const inboxMessageAllowedByPolicy = (msg: InboxMessage): boolean =>
+    inboxTargetAllowedByPolicy({
+      sessionId: msg.relatedSessionId,
+      threadKey: msg.threadKey,
+      studioId: msg.recipientStudioId,
+    });
+  // A thread row carries no relatedSessionId or recipientStudioId. The server
+  // found it through a poll scoped to this session, so the session and studio
+  // it is addressed to are this REPL's own. Judging it on the absent fields
+  // refused every thread row under /session-visibility self or studio, and a
+  // refused row is acked unread (Lumen, PR #686).
+  const threadRowAllowedByPolicy = (msg: InboxMessage): boolean =>
+    inboxTargetAllowedByPolicy({
+      sessionId: runtime.sessionId,
+      threadKey: msg.threadKey,
+      studioId: runtime.studioId,
+    });
 
   // A permission grant modifies local policy; it is not chat. Legacy and
   // thread rows both come through here, so a grant sent on a thread is
@@ -5608,24 +5624,34 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // One intake for every message the REPL delivers — legacy inbox rows and
   // thread rows alike — so each reaches the ledger, the transcript and the
   // screen the same way, under the same auto-run policy. Throws if any step
-  // does: the thread drain acks a message only after intake returned. The
-  // seen-set entry is the last step, so it never records a message whose
-  // intake stopped part-way.
-  const intakeInboxMessage = (msg: InboxMessage, autoRunMessages: InboxMessage[]): void => {
+  // does: the thread drain acks a message only after intake returned. An
+  // eligible message is accepted into the turn queue here, so the ack follows
+  // acceptance; the turn's completion goes into `autoRunTurns` for the caller
+  // to await outside the poll gate. The seen-set entry is the last step, so
+  // it never records a message whose intake stopped part-way.
+  const intakeInboxMessage = (msg: InboxMessage, autoRunTurns: Array<Promise<void>>): void => {
     if (!runtime.threadKey && msg.threadKey) {
       runtime.threadKey = msg.threadKey;
     }
     const from = msg.from || 'unknown';
-    const heading = msg.subject ? `${from} — ${msg.subject}` : from;
+    // Each message names its own thread. The REPL binds to the first thread it
+    // sees, and a session can be stamped with several, so the envelope's
+    // thread is not this message's (Lumen, PR #686). At the front, because
+    // compactForLedger cuts the tail.
+    const sender = msg.threadKey ? `${from} (thread ${msg.threadKey})` : from;
+    const heading = msg.subject ? `${sender} — ${msg.subject}` : sender;
     let delegationLabel = '';
     if (msg.delegationToken) {
       const secret = getDelegationSecret();
       if (!secret) {
         delegationLabel = ' [delegation:unverified:no-secret]';
       } else {
+        // Verified against the thread the message was sent on. Checking the
+        // REPL's bound thread instead would pass a token minted for that
+        // thread on a message from another one.
         const verified = verifyDelegationToken(msg.delegationToken, secret, {
           expectedDelegateeSlug: sbSlug,
-          expectedThreadKey: runtime.threadKey ?? undefined,
+          expectedThreadKey: msg.threadKey ?? runtime.threadKey ?? undefined,
         });
         if (verified.valid && verified.payload) {
           const scopes = verified.payload.scopes.join(',');
@@ -5666,16 +5692,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
       printLine(separator());
     }
 
+    const enqueueAutoRun = enqueueAutoRunFromInbox;
     const eligibleForAutoRun =
       runtime.autoRunInbox &&
       readyForAutoRun &&
-      enqueueAutoRunFromInbox &&
       (msg.from || '').toLowerCase() !== sbSlug.toLowerCase() &&
       msg.messageType !== 'notification' &&
       msg.content.trim().length > 0;
 
-    if (eligibleForAutoRun) {
-      autoRunMessages.push(msg);
+    if (eligibleForAutoRun && enqueueAutoRun) {
+      autoRunTurns.push(enqueueAutoRun(msg));
     }
     seenInboxIds.add(msg.id);
   };
@@ -5689,7 +5715,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // --message and does not drain, or it would take that message twice.
   const threadDrainState = createThreadDrainState();
   const drainsThreads = !options.nonInteractive && !options.message;
-  const drainSessionThreads = async (autoRunMessages: InboxMessage[]): Promise<number> => {
+  const drainSessionThreads = async (autoRunTurns: Array<Promise<void>>): Promise<number> => {
     // channelPoll scopes to the session named in x-ink-context and fails
     // closed without one.
     if (!drainsThreads || !runtime.sessionId) return 0;
@@ -5706,7 +5732,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const threads = Array.isArray(poll.threadsWithUnread)
       ? (poll.threadsWithUnread as Array<Record<string, unknown>>)
       : [];
-    if (threads.length === 0) return 0;
+    // An empty page still goes to the drain, as the plugin's does: a
+    // cold-start summary deferred by an earlier full batch is reported on the
+    // first quiet poll (Lumen, PR #686).
     const drained = await drainThreads(
       {
         callInk: async (tool, args) =>
@@ -5715,23 +5743,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
             unknown
           > | null,
         notify: async (content, _meta, row) => {
-          const msg = row ? extractInboxMessages({ messages: [row] })[0] : undefined;
-          if (msg) {
+          if (row) {
+            const msg = extractInboxMessages({ messages: [row] })[0];
+            // Without an id there is nothing to take in or to ack past.
+            if (!msg) return;
             // The drain has already skipped own-studio self messages. The
             // legacy thread-binding filter (inboxMessageMatchesSessionScope)
             // is not applied: the server stamped this thread to this
             // session, and a row refused here would be acked unread. The
             // visibility policy still applies. A refused row is acked
             // without rendering, as the legacy path consumes at fetch.
-            if (!inboxMessageAllowedByPolicy(msg)) {
+            if (!threadRowAllowedByPolicy(msg)) {
               sbDebugLog('chat', 'thread_drain_policy_refused', {
                 messageId: msg.id,
                 threadKey: msg.threadKey,
               });
               return;
             }
+            // Only a row typed permission_grant is a grant. The type is the
+            // server's gate (send_to_inbox refuses it from an SB); a grant
+            // shape in the metadata of any other row is chat.
             if (msg.messageType === 'permission_grant') intakePermissionGrant(msg);
-            else intakeInboxMessage(msg, autoRunMessages);
+            else intakeInboxMessage(msg, autoRunTurns);
             return;
           }
           // The drain's own notice (the cold-start summary) carries no row.
@@ -5754,12 +5787,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return drained.injected;
   };
 
-  // Phase 1 (gated): fetch + render + collect auto-run candidates. Must not
-  // await backend turns — those run in pollInbox phase 2, after the gate
-  // releases, so grant delivery keeps flowing during a turn.
+  // Phase 1 (gated): fetch + render + accept auto-run turns into the queue.
+  // Must not await backend turns — pollInbox phase 2 awaits them, after the
+  // gate releases, so grant delivery keeps flowing during a turn.
   const collectInbox = async (
     force: boolean
-  ): Promise<{ freshCount: number; autoRunMessages: InboxMessage[] }> => {
+  ): Promise<{ freshCount: number; autoRunTurns: Array<Promise<void>> }> => {
     const inboxResult = (await inkClient
       .callTool('get_inbox', { sbSlug, status: 'unread', limit: 10 })
       .catch(() => null)) as Record<string, unknown> | null;
@@ -5769,7 +5802,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .filter((msg) => inboxMessageMatchesSessionScope(runtime, msg))
       .filter(inboxMessageAllowedByPolicy)
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
-    const autoRunMessages: InboxMessage[] = [];
+    const autoRunTurns: Array<Promise<void>> = [];
 
     // Process permission grants separately — they modify local policy, not chat flow.
     const permissionGrants = fresh.filter((msg) => msg.messageType === 'permission_grant');
@@ -5823,10 +5856,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     for (const msg of recentMessages) {
-      intakeInboxMessage(msg, autoRunMessages);
+      intakeInboxMessage(msg, autoRunTurns);
     }
 
-    const threadMessages = await drainSessionThreads(autoRunMessages);
+    const threadMessages = await drainSessionThreads(autoRunTurns);
     const freshCount = fresh.length + threadMessages;
 
     if (force && freshCount === 0) {
@@ -5837,7 +5870,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     emitStatusLaneIfChanged();
-    return { freshCount, autoRunMessages };
+    return { freshCount, autoRunTurns };
   };
 
   const pollInbox = async (force = false): Promise<number> => {
@@ -5847,12 +5880,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // interval polling — and the permission-grant delivery a remote approval
     // depends on — continues while a turn is in flight.
     let autoRuns = 0;
-    const autoRunHandler = enqueueAutoRunFromInbox;
-    if (autoRunHandler) {
-      for (const msg of collected.autoRunMessages) {
-        await autoRunHandler(msg);
-        autoRuns += 1;
-      }
+    for (const turn of collected.autoRunTurns) {
+      await turn;
+      autoRuns += 1;
     }
     if (autoRuns > 0) {
       printLine(
@@ -8114,10 +8144,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return turnQueue;
   };
 
-  enqueueAutoRunFromInbox = async (message: InboxMessage) => {
-    const prompt = buildAutoRunPromptFromInbox(runtime, message);
-    await enqueueTurn(prompt, 'inbox-auto');
-  };
+  // Not async: the turn is in the queue when this returns, and a failure to
+  // put it there throws into the caller's intake instead of rejecting later,
+  // after the message was acked. The promise is the turn's completion.
+  enqueueAutoRunFromInbox = (message: InboxMessage) =>
+    enqueueTurn(buildAutoRunPromptFromInbox(runtime, message), 'inbox-auto');
   readyForAutoRun = true;
 
   // Prime with current unread queue only after auto-run pipeline is ready.
