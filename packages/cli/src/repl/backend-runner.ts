@@ -75,6 +75,13 @@ export interface BackendRunRequest {
   media?: TurnMedia[];
   /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
   deliverMedia?: boolean;
+  /**
+   * Whether the chat process that owns this turn is attached — an
+   * interactive REPL, not `--non-interactive`/`--message`. Required: the
+   * spawned backend inherits the parent's INK_SESSION_ID, and its hooks
+   * write this value onto that session (see BackendConfig.cliAttached).
+   */
+  cliAttached: boolean;
 }
 
 export interface BackendRunResult {
@@ -123,6 +130,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     toolRouting: request.toolRouting,
     media: request.media,
     deliverMedia: request.deliverMedia,
+    cliAttached: request.cliAttached,
   });
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;

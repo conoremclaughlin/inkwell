@@ -3,7 +3,7 @@ import { execSync } from 'child_process';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
+import { decodeContextToken, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import {
   ClaudeAdapter,
   classifyMedia,
@@ -260,6 +260,66 @@ describe('ClaudeAdapter prepare — tool routing', () => {
       expect(interactive.args).not.toContain('-p');
       expect(interactive.args).toContain('--dangerously-load-development-channels');
       expect(interactive.env).not.toHaveProperty('INK_CHANNEL_HOST');
+    } finally {
+      interactive.cleanup();
+    }
+  });
+
+  // `ink -b claude -p hello` parses to no prompt and passthrough
+  // ['-p', 'hello']: the flag is unknown to extractArgs and takes the next
+  // word as its value. The Claude it launches is print mode, so the plugin
+  // must go inert there too (PR #685, Lumen).
+  it.each([[['-p', 'hello']], [['--print', 'hello']], [['--model', 'sonnet', '-p']]])(
+    'treats a print flag in passthrough %j as print mode',
+    (passthroughArgs) => {
+      const prepared = new ClaudeAdapter().prepare({
+        sbSlug: 'wren',
+        promptParts: [],
+        passthroughArgs: [...passthroughArgs],
+      });
+      try {
+        expect(prepared.env).toMatchObject(PRINT_MODE_CHANNEL_ENV);
+        // The user's flag is the only one: nothing is added in front of it.
+        const printFlags = prepared.args.filter((a) => a === '-p' || a === '--print');
+        expect(printFlags).toHaveLength(1);
+      } finally {
+        prepared.cleanup();
+      }
+    }
+  );
+
+  // Two separate questions: can this host render a channel message (never,
+  // in print mode), and does the spawner own an attached session (its call).
+  // An attached `ink chat` REPL's children keep the plugin inert, and a
+  // headless run's children declare themselves unattached. The default stays
+  // attached: an attached prompt is what claims the turn epoch and renews the
+  // studio lease for a human's one-shot `ink "…"`.
+  it('keeps print-mode attachment the spawner’s call, and the plugin inert either way', () => {
+    const adapter = new ClaudeAdapter();
+    const cases = [
+      { cliAttached: undefined, expected: true },
+      { cliAttached: true, expected: true },
+      { cliAttached: false, expected: false },
+    ];
+    for (const { cliAttached, expected } of cases) {
+      const prepared = adapter.prepare({
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        ...(cliAttached !== undefined ? { cliAttached } : {}),
+      });
+      try {
+        expect(decodeContextToken(prepared.env.INK_CONTEXT)?.cliAttached).toBe(expected);
+        expect(prepared.env).toMatchObject(PRINT_MODE_CHANNEL_ENV);
+      } finally {
+        prepared.cleanup();
+      }
+    }
+
+    const interactive = adapter.prepare({ sbSlug: 'wren', promptParts: [], passthroughArgs: [] });
+    try {
+      expect(decodeContextToken(interactive.env.INK_CONTEXT)?.cliAttached).toBe(true);
     } finally {
       interactive.cleanup();
     }

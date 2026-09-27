@@ -3493,7 +3493,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // cross-studio attach) and a stale header would suppress server-side
   // correction. cliAttached is false for ANY one-shot mode: --message runs
   // headless even without --non-interactive, and persisting cliAttached=true
-  // from such a run would wrongly suppress concurrent trigger spawns.
+  // from such a run would wrongly suppress concurrent trigger spawns. Every
+  // backend spawn carries the same value: its hooks write it onto this
+  // session through the INK_SESSION_ID the child inherits.
+  const cliAttached = !options.nonInteractive && !options.message;
   let currentInkSessionId: () => string | undefined = () => undefined;
   let currentInkStudioId: () => string | undefined = () => identity?.studioId;
   const inkClient = new InkClient(undefined, undefined, {
@@ -3502,7 +3505,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: currentInkSessionId() || '',
         studioId: currentInkStudioId() || 'main',
         sbSlug,
-        cliAttached: !options.nonInteractive && !options.message,
+        cliAttached,
         runtime: 'ink',
       }),
   });
@@ -5316,6 +5319,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               : undefined,
             idleTimeoutMs: runtime.backendIdleTimeoutMs,
             stream: true,
+            cliAttached,
           });
           const onAbort = (): void => summarizer.abort();
           signal?.addEventListener('abort', onAbort, { once: true });
@@ -6043,6 +6047,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       idleTimeoutMs: runtime.backendIdleTimeoutMs,
       stream: true,
       toolRouting: cloneRouting,
+      cliAttached,
       ...sessionArgs,
     });
 
@@ -7291,6 +7296,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // stateless adapters re-attach from `media` regardless.
       media: turnMedia.length > 0 ? turnMedia : undefined,
       ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
+      cliAttached,
       // The session argument is the DECISION's, never derived from the live id:
       // a seed assigns the minted id before spawning, and deriving from it sent
       // a resume of a session that did not exist yet (Lumen, PR #577).
@@ -7351,6 +7357,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ...(resumeProviderSession && activeBackendSessionId
             ? { backendSessionId: activeBackendSessionId }
             : {}),
+          cliAttached,
         });
         currentTurnAbort = turn.abort;
 
@@ -7425,6 +7432,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             media: turnMedia.length > 0 ? turnMedia : undefined,
             ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
             backendSessionSeedId: reseedId,
+            cliAttached,
           });
           currentTurnAbort = reseedTurn.abort;
           runResult = await reseedTurn.result.finally(() => {

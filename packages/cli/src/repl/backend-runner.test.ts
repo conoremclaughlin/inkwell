@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
   prepareCalls: [] as Array<{ backend: string; promptParts: string[] }>,
+  prepareConfigs: [] as Array<Record<string, unknown>>,
 }));
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -13,6 +14,7 @@ vi.mock('../backends/index.js', () => ({
     binary: 'mock-backend',
     prepare: (config: { promptParts: string[] }) => {
       state.prepareCalls.push({ backend, promptParts: [...config.promptParts] });
+      state.prepareConfigs.push({ ...config });
       return {
         binary: 'mock-backend',
         args: [...config.promptParts],
@@ -92,6 +94,18 @@ describe('runBackendTurn', () => {
       ['ping'],
       expect.objectContaining({ stdio: ['ignore', 'pipe', 'pipe'] })
     );
+  });
+
+  // The adapter writes this into the child's INK_CONTEXT, and the child's
+  // hooks write it onto the chat's session. Dropped here, every adapter falls
+  // back to its own default and a headless run marks itself attached.
+  it('passes the chat process attachment through to the adapter', async () => {
+    spawnMock.mockImplementation(() => createMockChild(0));
+    for (const cliAttached of [false, true]) {
+      state.prepareConfigs = [];
+      await runBackendTurn({ backend: 'claude', sbSlug: 'myra', prompt: 'ping', cliAttached });
+      expect(state.prepareConfigs[0]?.cliAttached).toBe(cliAttached);
+    }
   });
 
   it('default hard backstop is the 4h runaway ceiling, not the old 20-minute cap', async () => {
