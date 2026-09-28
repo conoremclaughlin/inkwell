@@ -25,8 +25,14 @@
  *   (canReleaseNow). Client testimony never authorizes early completion —
  *   six PR #506 review rounds of proof schemes each leaked at an ownership
  *   boundary. Accepted residual: an idle holder with an open terminal keeps
- *   its pendingRelease deferred (bounded delay: next stop, or staleness
- *   after the terminal closes) — delayed, never premature.
+ *   its pendingRelease deferred until its next real stop, and a MID-TURN
+ *   holder has no wall-clock expiry at all (isSessionLive: an open turn is
+ *   live until the real stop), so a stop that arrives without its epoch
+ *   leaves the turn — and the lease — open until a later stop from the same
+ *   owner carries one. Delayed, never premature; the days-long pins of
+ *   task c07f35c8 were stops stranded that way by a sibling's prompt
+ *   overwriting the CLI's shared epoch record, fixed on the CLI side by
+ *   keeping that record per (session, wrapper generation).
  *   ONE deliberate exception (PR #673, task e7752d29): close_studio from the
  *   HOLDER'S OWN session releases at once. The caller session is the request
  *   context's session, loaded and authorized as the calling identity's own

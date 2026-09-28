@@ -204,7 +204,14 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // record is missing. Only a LEGACY stop (neither field) still performs
       // the unfenced idle + marker-clear + tombstone write below — modern
       // stops go through the epoch CAS, and a modern stop with a lost record
-      // writes nothing (fail closed; the detach boundary and sweep recover).
+      // writes nothing (fail closed). Nothing recovers that open turn by
+      // wall-clock: the lease sweep treats an open cli_turn_at as live and
+      // renews the holder (task c07f35c8: pr:498/499 stayed pinned for days),
+      // and the detach boundary only fires for a terminal that closes. It
+      // closes when a later stop from the SAME owner carries its epoch, or
+      // the session ends. Since c07f35c8 the CLI keeps the record per
+      // (session, wrapper generation), so a sibling's prompt in the same
+      // checkout no longer erases the epoch a stop is about to send.
       const stopEpoch = isStopEvent && typeof turnEpoch === 'string' ? turnEpoch : undefined;
       const stopEpochMissing = isStopEvent && !stopEpoch && turnEpochMissing === true;
       if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();

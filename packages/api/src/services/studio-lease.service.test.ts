@@ -1846,6 +1846,51 @@ describe('sweep pendingRelease backstop', () => {
     expect(tables.studios[0].lease).not.toBeNull();
   });
 
+  /**
+   * Task c07f35c8 (Lumen's review of the proposal): there is NO wall-clock
+   * expiry for a mid-turn holder, and this pins that nothing here adds one.
+   * A quiet no-plugin turn can run for hours with cli_poll_at null and no
+   * run registered on THIS server while the process is still writing in the
+   * tree. Age proves nothing; only the owner's real stop, carrying its
+   * epoch, ends the turn. What ends the days-long pins is the CLI keeping
+   * its epoch evidence per owner so that stop can carry it.
+   */
+  it('an aged pendingRelease over an arbitrarily old open turn, with no poll and no registered run, stays held', async () => {
+    resetActiveRuns();
+    const threeDays = 3 * 24 * 60 * 60 * 1000;
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-aged', threadKey: 'pr:498' }),
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date(Date.now() - threeDays).toISOString(),
+      },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-aged', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-aged',
+          user_id: 'u',
+          ended_at: null,
+          cli_attached: true,
+          cli_poll_at: null,
+          cli_turn_at: new Date(Date.now() - threeDays).toISOString(),
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(0);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+
   it('leaves a pendingRelease lease alone while the holder is still live', async () => {
     resetActiveRuns();
     registerActiveRun({

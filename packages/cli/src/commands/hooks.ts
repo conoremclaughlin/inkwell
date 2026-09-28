@@ -3040,7 +3040,12 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   } catch {
     // No marker (the normal case) or unreadable — nothing to adjudicate.
   }
-  const epochRecord = readCliTurnEpoch(cwd);
+  // Task c07f35c8: read OUR owner's record (session + generation); a sibling
+  // session's or another generation's evidence in the same checkout is
+  // neither seen nor sent.
+  const epochRecord = stopSessionId
+    ? readCliTurnEpoch(cwd, { sessionId: stopSessionId, wrapperGeneration: stopGeneration })
+    : null;
   // Round 19: the record must belong to OUR session AND OUR wrapper
   // generation — a stale backend's on-stop must not send (and then clear) a
   // successor generation's epoch. Generation-less pairs still match (legacy).

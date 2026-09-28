@@ -17,7 +17,8 @@
  * nothing may claim after it.
  */
 
-import { mkdirSync, readFileSync, rmSync, watch, writeFileSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { mkdirSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from 'fs';
 import { join } from 'path';
 
 export const TAKEOVER_MARKER_MAX_AGE_MS = 10 * 60 * 1000;
@@ -46,9 +47,44 @@ export function takeoverMarkerPath(cwd: string, generation?: string): string {
  * wrapper watcher, for reclaims) writes this file; the on-stop hook reads
  * its OWN session's record, sends the epoch with the stop event, and clears
  * the file. A foreign session's record is never sent or cleared.
+ *
+ * OWNERSHIP (task c07f35c8). One file per (sessionId, wrapperGeneration):
+ * `.ink/cli-turn-epoch.<sessionId>[.<generation>].json`. Every session in a
+ * checkout, and every wrapper generation of one session, keeps its own
+ * evidence; nothing reads another owner's. Before this there was ONE file
+ * per checkout, so a sibling's prompt replaced the record a stop was about
+ * to send: the stop reported turnEpochMissing, the server (fail closed) left
+ * the turn open, and the lease sweep, which treats an open turn as live,
+ * renewed that studio's lease for days after its PR had merged (pr:498,
+ * pr:499). Same-session collisions were the fork/resume case: two wrapper
+ * generations of one session, a delayed write from the older one erasing the
+ * successor's evidence — hence the generation in the key, as for the marker.
+ *
+ * The generation-less path `.ink/cli-turn-epoch.json` is the LEGACY single
+ * file. It is still read, but only by its exact owner — same session, same
+ * generation, a generation-less pair matching only a generation-less pair —
+ * and it is never written, never imported into an owner file, and deleted
+ * only by that exact owner's compare-and-delete. An owner file, when present,
+ * wins over it.
+ *
+ * Writes replace atomically (temp file + rename) so a reader never sees a
+ * partial record. That is all the atomicity there is: read/check/unlink is
+ * not a cross-process CAS; ownership is what keeps two processes off one
+ * file.
  */
-export function cliTurnEpochPath(cwd: string): string {
-  return join(cwd, '.ink', 'cli-turn-epoch.json');
+export interface TurnEpochOwner {
+  sessionId: string;
+  wrapperGeneration?: string;
+}
+
+export function cliTurnEpochPath(cwd: string, owner?: TurnEpochOwner): string {
+  if (!owner) return join(cwd, '.ink', 'cli-turn-epoch.json');
+  // Both parts are UUIDs in practice; encoding keeps any other value inside
+  // one file name (a slash or a dot sequence cannot leave `.ink/`).
+  const session = encodeURIComponent(owner.sessionId);
+  const generation =
+    owner.wrapperGeneration === undefined ? '' : `.${encodeURIComponent(owner.wrapperGeneration)}`;
+  return join(cwd, '.ink', `cli-turn-epoch.${session}${generation}.json`);
 }
 
 export interface CliTurnEpochRecord {
@@ -59,16 +95,36 @@ export interface CliTurnEpochRecord {
   wrapperGeneration?: string;
 }
 
+function readRecordFile(path: string): CliTurnEpochRecord | null {
+  try {
+    return JSON.parse(readFileSync(path, 'utf-8')) as CliTurnEpochRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Exact ownership: the session AND the generation, generation-less only with generation-less. */
+function ownedBy(
+  record: CliTurnEpochRecord | null,
+  owner: TurnEpochOwner
+): record is CliTurnEpochRecord {
+  return (
+    record !== null &&
+    record.sessionId === owner.sessionId &&
+    (record.wrapperGeneration ?? undefined) === (owner.wrapperGeneration ?? undefined)
+  );
+}
+
 export function writeCliTurnEpoch(
   cwd: string,
   record: { sessionId: string; turnEpoch: string; wrapperGeneration?: string }
 ): boolean {
   try {
     mkdirSync(join(cwd, '.ink'), { recursive: true });
-    writeFileSync(
-      cliTurnEpochPath(cwd),
-      JSON.stringify({ ...record, at: new Date().toISOString() })
-    );
+    const target = cliTurnEpochPath(cwd, record);
+    const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temp, JSON.stringify({ ...record, at: new Date().toISOString() }));
+    renameSync(temp, target);
     return true;
   } catch {
     // Round 11: NOT silently best-effort — the caller must know. A lost
@@ -79,41 +135,40 @@ export function writeCliTurnEpoch(
   }
 }
 
-export function readCliTurnEpoch(cwd: string): CliTurnEpochRecord | null {
-  try {
-    return JSON.parse(readFileSync(cliTurnEpochPath(cwd), 'utf-8')) as CliTurnEpochRecord;
-  } catch {
-    return null;
-  }
+/**
+ * The owner's record: its own file first, else the legacy single file when
+ * that file is exactly the owner's. Never another owner's, from either place.
+ */
+export function readCliTurnEpoch(cwd: string, owner: TurnEpochOwner): CliTurnEpochRecord | null {
+  const own = readRecordFile(cliTurnEpochPath(cwd, owner));
+  if (ownedBy(own, owner)) return own;
+  const legacy = readRecordFile(cliTurnEpochPath(cwd));
+  return ownedBy(legacy, owner) ? legacy : null;
 }
 
 /**
- * Clear the record only when it belongs to the given session — and, when
- * `expected` fields are provided, only when they still match (round 19:
- * compare-and-delete; a record replaced by a successor generation during an
- * awaited request must not be deleted by the stale reader).
+ * Clear the record only when it belongs to the given owner — the session and
+ * the generation named in `expected` (a generation-less caller owns only the
+ * generation-less record) — and, when `expected.turnEpoch` is given, only
+ * when it still matches (round 19: compare-and-delete; a record replaced by
+ * a successor during an awaited request must not be deleted by the stale
+ * reader). The owner file and the legacy file are each judged on their own.
  */
 export function clearCliTurnEpoch(
   cwd: string,
   sessionId: string,
   expected?: { turnEpoch?: string; wrapperGeneration?: string }
 ): void {
-  const record = readCliTurnEpoch(cwd);
-  if (record?.sessionId !== sessionId) return;
-  if (expected?.turnEpoch !== undefined && record.turnEpoch !== expected.turnEpoch) return;
-  if (
-    expected !== undefined &&
-    'wrapperGeneration' in expected &&
-    (record.wrapperGeneration ?? undefined) !== (expected.wrapperGeneration ?? undefined) &&
-    record.wrapperGeneration !== undefined &&
-    expected.wrapperGeneration !== undefined
-  ) {
-    return;
-  }
-  try {
-    rmSync(cliTurnEpochPath(cwd), { force: true });
-  } catch {
-    // Best-effort.
+  const owner: TurnEpochOwner = { sessionId, wrapperGeneration: expected?.wrapperGeneration };
+  for (const path of [cliTurnEpochPath(cwd, owner), cliTurnEpochPath(cwd)]) {
+    const record = readRecordFile(path);
+    if (!ownedBy(record, owner)) continue;
+    if (expected?.turnEpoch !== undefined && record.turnEpoch !== expected.turnEpoch) continue;
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // Best-effort.
+    }
   }
 }
 
@@ -329,13 +384,14 @@ export function startTakeoverWatcher(opts: {
       await tickOnce();
       let finalized = !opts.finalizeScope;
       if (opts.finalizeScope) {
-        const record = readCliTurnEpoch(opts.cwd);
-        const ownRecord =
-          record?.sessionId === opts.expectedSessionId &&
-          (opts.generation === undefined ||
-            record.wrapperGeneration === undefined ||
-            record.wrapperGeneration === opts.generation);
-        const claimedEpoch = ownRecord ? record?.turnEpoch : undefined;
+        // Task c07f35c8: the read is by OWNER (session and this wrapper's
+        // generation, exactly), so a sibling session's or a successor
+        // generation's record is never mistaken for ours.
+        const record = readCliTurnEpoch(opts.cwd, {
+          sessionId: opts.expectedSessionId,
+          wrapperGeneration: opts.generation,
+        });
+        const claimedEpoch = record?.turnEpoch;
         // A generation that never attempted a claim has nothing parked in
         // the server — and its tombstone could wrongly refuse a successor
         // wrapper's reclaim of an OLDER marker (round 18).
