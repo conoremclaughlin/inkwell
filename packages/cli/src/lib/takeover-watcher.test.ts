@@ -210,8 +210,10 @@ describe('CLI turn-epoch record (round 10)', () => {
     clearCliTurnEpoch(dir, 's2');
     expect(existsSync(cliTurnEpochPath(dir, { sessionId: 's1' }))).toBe(true);
 
+    // Retirement leaves a tombstone in the owner's namespace (PR #691
+    // round 3): the file stays, the record reads as none.
     clearCliTurnEpoch(dir, 's1');
-    expect(existsSync(cliTurnEpochPath(dir, { sessionId: 's1' }))).toBe(false);
+    expect(existsSync(cliTurnEpochPath(dir, { sessionId: 's1' }))).toBe(true);
     expect(readCliTurnEpoch(dir, { sessionId: 's1' })).toBeNull();
   });
 });

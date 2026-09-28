@@ -69,13 +69,17 @@ export function takeoverMarkerPath(cwd: string, generation?: string): string {
  * file is SHARED, so the new writer never deletes it: an unlink can fail or
  * be lost to a crash, and another owner's old-format writer can replace the
  * file between a read and the unlink, which would delete their evidence.
- * Instead the owner's namespace shadows it durably. When an owner clears a
- * live record while a legacy record of its own still exists, the clear
- * leaves a RETIRED tombstone in the owner file rather than deleting it, so
- * the older epoch can never be read back and finalized (which would retire
- * the marker without fencing a later attempt). The tombstone lasts until
+ * Instead the owner's namespace shadows it durably. EVERY clear retires in
+ * the owner's own file: a live record is replaced by a RETIRED tombstone,
+ * never deleted, and a legacy-only record is retired by creating that
+ * tombstone (exclusively, so a newer owner-format record that appeared
+ * meanwhile is never overwritten). The decision never consults the shared
+ * file for permission (round 3): a read failure there, or an old-format
+ * writer publishing this owner's old epoch AFTER the cleanup, must not
+ * reopen the fallback, so the tombstone is unconditional and lasts until
  * the owner's next live write replaces it. Nobody writes the legacy file,
- * imports it into an owner file, or deletes another owner's record.
+ * imports it into an owner file, or deletes anything from it — it is only
+ * ever read, and only by an owner with no file of its own.
  *
  * Writes replace atomically (temp file + rename) so a reader never sees a
  * partial record. That is all the atomicity there is: read/check/unlink is
@@ -183,10 +187,11 @@ export function readCliTurnEpoch(cwd: string, owner: TurnEpochOwner): CliTurnEpo
  * generation-less record) — and, when `expected.turnEpoch` is given, only
  * when it still matches (round 19: compare-and-delete; a record replaced by
  * a successor during an awaited request must not be deleted by the stale
- * reader). The legacy file is consulted only when the owner has no file of
- * its own, the same rule as readCliTurnEpoch. Clearing an owner file while
- * a legacy record of the same owner still exists leaves a retired tombstone
- * in its place, so that record is never read again (see the header).
+ * reader). Retirement is unconditional and lives in the owner's own file:
+ * a live owner record becomes a tombstone; a legacy-only record (the owner
+ * has no file yet) is retired by creating the tombstone exclusively, so a
+ * newer owner-format record is never overwritten and the shared legacy
+ * file is never touched (see the header).
  */
 export function clearCliTurnEpoch(
   cwd: string,
@@ -195,26 +200,35 @@ export function clearCliTurnEpoch(
 ): void {
   const owner: TurnEpochOwner = { sessionId, wrapperGeneration: expected?.wrapperGeneration };
   const ownPath = cliTurnEpochPath(cwd, owner);
-  const legacyPath = cliTurnEpochPath(cwd);
-  const path = existsSync(ownPath) ? ownPath : legacyPath;
-  const record = readRecordFile(path);
-  if (!ownedBy(record, owner) || !isLive(record)) return;
-  if (expected?.turnEpoch !== undefined && record.turnEpoch !== expected.turnEpoch) return;
-  try {
-    if (path === ownPath && ownedBy(readRecordFile(legacyPath), owner)) {
-      writeAtomic(ownPath, {
-        sessionId,
-        ...(owner.wrapperGeneration !== undefined
-          ? { wrapperGeneration: owner.wrapperGeneration }
-          : {}),
-        retired: true,
-        at: new Date().toISOString(),
-      });
-      return;
+  const tombstone = {
+    sessionId,
+    ...(owner.wrapperGeneration !== undefined
+      ? { wrapperGeneration: owner.wrapperGeneration }
+      : {}),
+    retired: true,
+    at: new Date().toISOString(),
+  };
+  const matches = (record: CliTurnEpochRecord | null): boolean =>
+    ownedBy(record, owner) &&
+    isLive(record) &&
+    (expected?.turnEpoch === undefined || record.turnEpoch === expected.turnEpoch);
+
+  if (existsSync(ownPath)) {
+    if (!matches(readRecordFile(ownPath))) return;
+    try {
+      writeAtomic(ownPath, tombstone);
+    } catch {
+      // Best-effort: an unretired live record is re-sent by a later stop.
     }
-    rmSync(path, { force: true });
+    return;
+  }
+  if (!matches(readRecordFile(cliTurnEpochPath(cwd)))) return;
+  try {
+    // Exclusive create: if an owner-format record appeared meanwhile it is
+    // newer than the legacy one being retired, and it wins.
+    writeFileSync(ownPath, JSON.stringify(tombstone), { flag: 'wx' });
   } catch {
-    // Best-effort.
+    // Best-effort, or a newer owner record exists.
   }
 }
 
