@@ -308,6 +308,8 @@ Within the Inkwell repo, the project prefix is optional — `pr:389` is unambigu
 
 The project goes in the **prefix slot, never the identifier**: `inktrade:pr:42`, not `pr:inktrade-42` or `pr:inktrade-supabase-auth`. Baking the project into the identifier defeats pattern matching and prefix-based routing.
 
+**The prefix decides the repository.** A project-prefixed thread is placed in the project's `repo_root` (`save_project(name, repoRoot: "/absolute/path")`), whatever repo the sender happens to be in; the sender's repo is not consulted. A registered project with no `repo_root` holds the message with a reason that names the fix. On 2026-09-24 an `inktrade:pr:1` review was routed by the sender's repo and checked out inkwell's PR #1 instead — that path no longer exists.
+
 Each repo's AGENTS.md should carry this threadKey section so agents working there natively derive project-prefixed keys.
 
 ### Sender Rules

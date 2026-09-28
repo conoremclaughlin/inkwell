@@ -769,8 +769,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // On 2026-09-11 a trigger woke a session with "Fetch the thread using
   // get_thread_messages(threadKey: ...)". Between the spawn and that call, the
   // session's OWN channel plugin pushed the same message inline and acked it
-  // (poll-core.ts) — a correct ack, after a real render. So the instructed
-  // fetch returned [], correctly by its own rules, and read as an empty thread.
+  // (the inkmail drain, now shared/src/inkmail/drain.ts) — a correct ack,
+  // after a real render. So the instructed fetch returned [], correctly by its
+  // own rules, and read as an empty thread.
   // The recipient went to Postgres to find a message that had been delivered to
   // it a second earlier.
   //

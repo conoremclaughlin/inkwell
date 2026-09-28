@@ -150,11 +150,12 @@ class DataTests(unittest.TestCase):
         self.assertEqual(len(data.FIXTURE_TABLES), 73)
         self.assertEqual(len(set(names)), len(names))
         # 70 -> 73 with alert_events/alert_sources/alert_webhooks (#539); the
-        # revocation amendment's four tables (#678) join through a created-at
-        # window, not this base list, so a rehearsal cut before them is exact.
+        # revocation amendment's four tables (#678) and the browser companion's
+        # two (#671) join through created-at windows, not this base list, so a
+        # rehearsal cut before them is exact.
         # This literal exists so a new table cannot join the truncate set
         # without someone saying so in a diff.
-        self.assertEqual(len(names), 77)
+        self.assertEqual(len(names), 79)
         for excluded in ("pcp_config", "permission_definitions", "auth.users", "storage.objects",
                          "supabase_migrations.schema_migrations"):
             self.assertNotIn(excluded, names)
@@ -223,25 +224,32 @@ class DataTests(unittest.TestCase):
 
     def test_windowed_fixture_tables_follow_the_rehearsal_cut(self):
         window = ("inkmail_cutover_principal_attestations", "inkmail_cutover_thread_attestations")
-        created = ("observation_conflicts", "publication_operation_events", "publication_operations",
-                   "task_authority_holds")
-        # Every migration applied: the dropped window is absent, the open one present.
+        companion = ("browser_companion_grant_events", "browser_companion_grants")
+        revocation = ("observation_conflicts", "publication_operation_events", "publication_operations",
+                      "task_authority_holds")
+        created = companion + revocation
+        # Every migration applied: the dropped window is absent, the open ones present.
         self.assertEqual(data.fixture_tables(""), data.FIXTURE_TABLES + created)
         # The CI rehearsal cut: the attestations' creator applied and dropper withheld;
-        # the revocation tables' creator withheld.
+        # both open windows' creators withheld.
         self.assertEqual(data.fixture_tables("20260913090000"), data.FIXTURE_TABLES + window)
         # Cut at or before the attestations' creator (never created), or after the
-        # dropper (dropped) but before the revocation tables' creator.
-        for until in ("20260913081634", "20260913081633", "20260913090001", "20260925080025"):
+        # dropper (dropped) but at or before the companion tables' creator.
+        for until in ("20260913081634", "20260913081633", "20260913090001", "20260924070106"):
             with self.subTest(until=until):
                 self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES)
-        # A cut past the revocation tables' creator carries them, without the attestations.
+        # Past the companion tables' creator and at or before the revocation tables'.
+        for until in ("20260924070107", "20260925080025"):
+            with self.subTest(until=until):
+                self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES + companion)
+        # A cut past both creators carries both, without the attestations.
         for until in ("20260925080026", "20270101000000"):
             with self.subTest(until=until):
                 self.assertEqual(data.fixture_tables(until), data.FIXTURE_TABLES + created)
-        # Both windows are part of the policy, so changing either invalidates cached baselines.
+        # Every window is part of the policy, so changing any invalidates cached baselines.
         for name in window + created:
             self.assertIn(name, data.POLICY)
+        self.assertIn("20260924070106-:", data.POLICY)
         self.assertIn("20260925080025-:", data.POLICY)
 
     def test_rehearsal_cut_classifies_and_truncates_the_windowed_tables(self):
@@ -269,7 +277,7 @@ class DataTests(unittest.TestCase):
 
     def test_created_window_tables_are_missing_only_before_their_migration(self):
         created = data.fixture_tables("")[len(data.FIXTURE_TABLES):]
-        self.assertEqual(len(created), 4)
+        self.assertEqual(len(created), 6)
         # A full-schema stack carries them and cleanup truncates them ...
         self.clean()
         truncate = self.mutations()[0]
@@ -303,6 +311,10 @@ class DataTests(unittest.TestCase):
         dump = next(args for args, _ in self.calls if "pg_dump" in args)
         for name in window:
             self.assertIn("--table=public." + name, dump)
+        # pg_dump --strict-names fails on a named table that does not exist, so
+        # an open window's tables stay out of a dump cut before their creator.
+        for name in data.fixture_tables("")[len(data.FIXTURE_TABLES):]:
+            self.assertNotIn("--table=public." + name, dump)
 
     def test_unclassified_or_missing_table_refuses_before_mutation(self):
         for tables in (self.catalog + ("unclassified_fixture",), self.catalog[1:]):

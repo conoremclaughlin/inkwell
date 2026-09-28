@@ -14,6 +14,7 @@ export {
   buildSessionEnv,
   encodeContextToken,
   decodeContextToken,
+  PRINT_MODE_CHANNEL_ENV,
   type InjectSessionHeadersOptions,
   type InjectSessionHeadersResult,
   type InkContextToken,

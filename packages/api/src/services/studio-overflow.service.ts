@@ -117,9 +117,13 @@ export function overflowSlug(parentStudio: Studio, threadKey: string, variant?: 
  * Commits reachable from a remote-tracking ref already live on the remote, so
  * the teardown rescue (`captureWorktreeState`) leaves them alone.
  *
- * Grammar: `pr:<n>` or `<project>:pr:<n>`; only the trailing two segments
- * matter, so no project-slug lookup is needed here. A mis-detection costs one
- * failed fetch and falls back to the base branch — never a wrong checkout.
+ * Grammar: `pr:<n>` or `<project>:pr:<n>`. The project prefix decides WHICH
+ * repository's PR this is, and that decision is made upstream: routing
+ * resolves the thread's pinned project to its repo and hands this service a
+ * parent in that repo (`expectedRepoRoot`, task b5c71bc3). Here only the
+ * trailing two segments matter, because `refs/pull/<n>/head` is fetched from
+ * the parent's own origin. A mis-detection costs one failed fetch and falls
+ * back to the base branch — never a wrong checkout.
  */
 export interface PullRequestDetachTarget {
   number: number;
@@ -395,11 +399,38 @@ export class StudioOverflowService {
     userId: string;
     parentStudio: Studio;
     threadKey: string;
+    /** The thread's project repo; a parent elsewhere yields no placement. */
+    expectedRepoRoot?: string;
   }): Promise<Studio | null> {
     const { userId, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    if (!this.parentInExpectedRepo(parentStudio, opts.expectedRepoRoot, threadKey)) return null;
     const states = await this.loadVariantStates(userId, parentStudio, threadKey);
     return this.firstLiveMatch(states, threadKey);
+  }
+
+  /**
+   * A project-pinned thread names its repo — routing resolves it from the
+   * thread's pinned project — and the parent this service mints from must be
+   * in that repo. On 2026-09-24 `inktrade:pr:1` was routed to an Inkwell studio
+   * and the checkout minted here was detached at inkwell's refs/pull/1/head:
+   * the wrong repository's PR #1, handed to a reviewer as an inktrade review
+   * (task b5c71bc3). A mismatch is refused before a slug is read or a
+   * worktree is touched; null is the caller's "hold the message" outcome.
+   */
+  private parentInExpectedRepo(
+    parentStudio: Studio,
+    expectedRepoRoot: string | undefined,
+    threadKey: string
+  ): boolean {
+    if (!expectedRepoRoot || parentStudio.repoRoot === expectedRepoRoot) return true;
+    logger.error("[StudioOverflow] Parent studio is not in the thread's project repo; refusing", {
+      threadKey,
+      parentStudioId: parentStudio.id,
+      parentRepoRoot: parentStudio.repoRoot,
+      expectedRepoRoot,
+    });
+    return false;
   }
 
   /**
@@ -413,9 +444,12 @@ export class StudioOverflowService {
     sbSlug: string;
     parentStudio: Studio;
     threadKey: string;
+    /** The thread's project repo; a parent elsewhere is refused, never minted from. */
+    expectedRepoRoot?: string;
   }): Promise<Studio | null> {
     const { userId, sbSlug, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    if (!this.parentInExpectedRepo(parentStudio, opts.expectedRepoRoot, threadKey)) return null;
     // Same-thread ensures in this process take turns END TO END — preflight,
     // worktree, setup (up to the dependency install), row — so the second
     // arrival finds the first's row at preflight and reuses it. Racing them

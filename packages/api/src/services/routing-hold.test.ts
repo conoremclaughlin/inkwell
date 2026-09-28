@@ -53,6 +53,7 @@ describe('stampRoutingHold', () => {
         attemptStartedAt: '2026-08-19T02:00:00.000Z',
         triedCallerRepo: true,
         callerRepoRoot: '/repos/inkwell',
+        project: null,
         heldAt: '2026-08-19T02:00:05.000Z',
         recovery: 'route pattern, studioHint, or project affinity',
         occupied: null,

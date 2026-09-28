@@ -104,8 +104,11 @@ class LogSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'scripts/lib').mkdir(parents=True)
+            # Every library the harness sources: a missing one ends it before
+            # the first docker call. The fake docker answers `exec` with
+            # nothing, so the Kong keepalive step warns and the run continues.
             for name in ('derive-isolated-supabase-env.sh', 'assert-isolated-supabase-url.sh',
-                         'integration-log-summary.py'):
+                         'disable-kong-upstream-keepalive.sh', 'integration-log-summary.py'):
                 source = MODULE_PATH if name == 'integration-log-summary.py' else ROOT / 'lib' / name
                 shutil.copy(source, root / 'scripts/lib' / name)
             source = Path(os.environ.get('INTEGRATION_HARNESS_UNDER_TEST', ROOT / 'test-integration-db-local.sh'))

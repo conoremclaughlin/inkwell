@@ -46,6 +46,24 @@ vi.mock('../repl/skills.js', () => ({
     testState.loadSkillInstructionImpl(skill, maxChars),
 }));
 
+// The turn lease signal is a direct fetch to /api/hooks/lifecycle, outside
+// InkClient. Unmocked, these tests posted turn markers to whatever server the
+// machine's config names, with its stored token; that server refused the
+// synthetic session, the studio-backed turn gate refused every turn, and the
+// backend was never reached. The gate's decision stays real; only the
+// acknowledgement is stubbed.
+vi.mock('../repl/turn-signal.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../repl/turn-signal.js')>();
+  return {
+    ...original,
+    createTurnSignal: () => ({
+      open: async () => true,
+      close: async () => true,
+      detach: async () => true,
+    }),
+  };
+});
+
 vi.mock('../repl/ink/index.js', () => ({
   renderInkChat: async () => null,
   InkExitSignal: class InkExitSignal extends Error {},
@@ -198,6 +216,34 @@ describe('runChat integration', () => {
     // Non-interactive sessions are left resumable (update_session_state, not end_session).
     expect(testState.inkCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
+
+  // Each backend child inherits this process's INK_SESSION_ID, and its
+  // on-prompt hook writes the declared attachment onto that session. A server
+  // run that declared itself attached had every trigger during it delivered
+  // inline to nobody (PR #685, Lumen) — Myra's session carried 2,057 such
+  // writes. Only the interactive REPL is attached.
+  it.each([
+    ['interactive REPL', true, { inputs: ['hello from test', '/quit'] }],
+    ['--non-interactive --message', false, { nonInteractive: true, message: 'heartbeat pulse' }],
+    ['--message alone', false, { message: 'one shot' }],
+  ] as const)(
+    '%s declares cliAttached=%s on every backend spawn',
+    async (_mode, expected, opts) => {
+      if ('inputs' in opts) testState.inputs = [...opts.inputs];
+      await runChat({
+        agent: 'myra',
+        backend: 'claude',
+        pollSeconds: '999',
+        ...('nonInteractive' in opts ? { nonInteractive: opts.nonInteractive } : {}),
+        ...('message' in opts ? { message: opts.message } : {}),
+      });
+
+      expect(testState.runBackendImpl).toHaveBeenCalled();
+      for (const [request] of testState.runBackendImpl.mock.calls) {
+        expect((request as { cliAttached?: boolean }).cliAttached).toBe(expected);
+      }
+    }
+  );
 
   /**
    * One ink run invokes the provider repeatedly — once per outer turn, again
@@ -1128,7 +1174,7 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('📥 wren — PR #50: please re-review');
+    expect(logText).toContain('📥 wren (thread pr:50) — PR #50: please re-review');
     expect(logText).toContain('8:03:04 PM');
     expect(logText).toContain('thread=pr:50');
   });

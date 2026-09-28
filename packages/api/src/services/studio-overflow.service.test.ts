@@ -1700,3 +1700,115 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
     }
   });
 });
+
+describe('StudioOverflowService — the parent must be in the thread’s project repo (task b5c71bc3)', () => {
+  /*
+   * Thread `inktrade:pr:1` routed to an Inkwell studio, and this service minted
+   * its checkout from that parent's repo — detached at inkwell's
+   * refs/pull/1/head, the wrong repository's PR #1. Routing now resolves the
+   * project's repo and passes it here as `expectedRepoRoot`; a parent in any
+   * other repo is refused outright, before a slug is read or a worktree is
+   * touched. Null is the documented "hold the message" outcome.
+   */
+  function doubles() {
+    const studios = {
+      findBySlug: vi.fn(),
+      findById: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    return { studios, leases };
+  }
+
+  it('ensureOverflowStudio refuses a parent outside the expected repo without reading or minting anything', async () => {
+    const { studios, leases } = doubles();
+    const service = new StudioOverflowService(studios, leases);
+
+    const result = await service.ensureOverflowStudio({
+      userId: 'user-1',
+      sbSlug: 'lumen',
+      parentStudio: makeStudio({ repoRoot: '/ws/pcp/inkwell' }),
+      threadKey: 'inktrade:pr:1',
+      expectedRepoRoot: '/ws/inktrade',
+    });
+
+    expect(result).toBeNull();
+    expect(studios.findBySlug).not.toHaveBeenCalled();
+    expect(studios.create).not.toHaveBeenCalled();
+    expect(studios.update).not.toHaveBeenCalled();
+    expect(leases.logEvent).not.toHaveBeenCalled();
+  });
+
+  it('ensureOverflowStudio proceeds when the parent is in the expected repo', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-project-'));
+    try {
+      const existing = makeStudio({
+        id: 'eph-inktrade-1',
+        slug: 'review-inktrade--inktrade-pr-1',
+        repoRoot: '/ws/inktrade',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'inktrade:pr:1',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const { studios, leases } = doubles();
+      (studios.findBySlug as ReturnType<typeof vi.fn>).mockResolvedValue(existing);
+      const service = new StudioOverflowService(studios, leases);
+
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ slug: 'review-inktrade', repoRoot: '/ws/inktrade' }),
+        threadKey: 'inktrade:pr:1',
+        expectedRepoRoot: '/ws/inktrade',
+      });
+
+      expect(result?.id).toBe('eph-inktrade-1');
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  it('findOverflowStudio never hands back an overflow hanging off a parent in another repo', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-project-find-'));
+    try {
+      // The mis-repo overflow row from the incident: live, matching thread,
+      // parent in inkwell. Without the guard it is "the placement" and the
+      // reviewer lands in inkwell PR #1 again.
+      const wrongRepo = makeStudio({
+        id: 'eph-wrong-repo',
+        slug: 'lumen-review--inktrade-pr-1',
+        repoRoot: '/ws/pcp/inkwell',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'inktrade:pr:1',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const { studios, leases } = doubles();
+      (studios.findBySlug as ReturnType<typeof vi.fn>).mockResolvedValue(wrongRepo);
+      const service = new StudioOverflowService(studios, leases);
+
+      const unguarded = await service.findOverflowStudio({
+        userId: 'user-1',
+        parentStudio: makeStudio({ repoRoot: '/ws/pcp/inkwell' }),
+        threadKey: 'inktrade:pr:1',
+      });
+      // Control: the same row IS found when no repo is expected, so the null
+      // below is the guard and not a fixture that matches nothing.
+      expect(unguarded?.id).toBe('eph-wrong-repo');
+
+      const guarded = await service.findOverflowStudio({
+        userId: 'user-1',
+        parentStudio: makeStudio({ repoRoot: '/ws/pcp/inkwell' }),
+        threadKey: 'inktrade:pr:1',
+        expectedRepoRoot: '/ws/inktrade',
+      });
+      expect(guarded).toBeNull();
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+});

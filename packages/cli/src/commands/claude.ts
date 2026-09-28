@@ -22,7 +22,7 @@ import {
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveSlug } from '../backends/index.js';
-import { classifyError } from '@inklabs/shared';
+import { classifyError, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
 import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
@@ -3508,6 +3508,53 @@ async function ensureInkSessionContext(
 }
 
 /**
+ * Detach the session when a print-mode Claude this wrapper spawned exits.
+ *
+ * The inkmail plugin used to post this detach on its way out of every Claude
+ * it ran in. Under a print-mode host it now stays inert (PRINT_MODE_CHANNEL_ENV)
+ * and posts nothing, so the attachment the child's on-prompt hook set would
+ * outlive the process: the trigger handler reads it as a live CLI and delivers
+ * inline to nobody until the flag goes stale ten minutes later. The wrapper is
+ * the process that watches the child exit, so the detach moves here. An
+ * interactive Claude keeps its plugin, which still detaches itself.
+ *
+ * Best-effort, like the plugin's: a failed post leaves the staleness sweep as
+ * the backstop. Resolves true only when the server acknowledged the detach.
+ */
+export async function detachPrintModeExit(
+  spawnEnv: Record<string, string>,
+  inkSessionId: string | undefined,
+  sbSlug: string,
+  deps: {
+    fetchImpl?: typeof fetch;
+    getServerUrl?: () => string;
+    getToken?: (serverUrl: string) => Promise<string | null | undefined>;
+  } = {}
+): Promise<boolean> {
+  if (spawnEnv.INK_CHANNEL_HOST !== PRINT_MODE_CHANNEL_ENV.INK_CHANNEL_HOST) return false;
+  if (!inkSessionId) return false;
+  try {
+    const serverUrl = (deps.getServerUrl ?? getInkServerUrl)();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const token = await (deps.getToken ?? getValidAccessToken)(serverUrl);
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const resp = await (deps.fetchImpl ?? fetch)(`${serverUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ sessionId: inkSessionId, cliAttached: false, sbSlug }),
+      signal: AbortSignal.timeout(3000),
+    });
+    return resp.ok;
+  } catch (error) {
+    sbDebugLog('claude', 'print_mode_detach_failed', {
+      inkSessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+/**
  * PR #563 rounds 9–10: codex/gemini prompt hooks cannot block and run no
  * channel plugin, so the `ink` wrapper — the session's long-lived process —
  * is the pending-takeover marker's consumer. claude-code joined once its
@@ -3839,6 +3886,7 @@ export async function runClaude(
 
   child.on('close', async (code) => {
     await takeoverWatcher?.stop();
+    await detachPrintModeExit(prepared.env, sessionContext.inkSessionId, sbSlug);
     ensureCleanup();
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
@@ -4022,6 +4070,8 @@ export async function runClaudeInteractive(
 
       child.on('close', async (code) => {
         prepared.cleanup();
+        // `ink -b claude -p …` reaches here with the print flag in passthrough.
+        await detachPrintModeExit(prepared.env, sessionContext.inkSessionId, sbSlug);
         finalCapturedBackendSessionId = await resolveCapturedBackendSessionIdWithRetry({
           backend: options.backend,
           inkSessionId: sessionContext.inkSessionId,

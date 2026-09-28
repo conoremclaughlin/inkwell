@@ -3,7 +3,6 @@ import chalk from 'chalk';
 import { createInterface } from 'readline/promises';
 import { stdin as input, stdout as output } from 'process';
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -50,6 +49,7 @@ import {
 } from '../repl/spawn-agent.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
+import { SessionLog } from '../session/session-log.js';
 import {
   ensureBackendAuthReady,
   isBackendAuthBackend,
@@ -209,7 +209,9 @@ export {
 } from '../repl/agent-loop.js';
 import {
   classifyError,
+  createThreadDrainState,
   decodeDelegationToken,
+  drainThreads,
   encodeContextToken,
   mintDelegationToken,
   verifyDelegationToken,
@@ -329,7 +331,8 @@ interface ChatRuntime {
   eventPolling: boolean;
   autoRunInbox: boolean;
   awayMode: boolean;
-  transcriptPath: string;
+  /** This session's event log; its path is the ledger location in session_meta. */
+  log: SessionLog;
   activeSkills: SkillInstruction[];
   bootstrapContext?: string;
   strictTools: boolean;
@@ -1312,75 +1315,6 @@ async function tailTranscript(target: string): Promise<void> {
     };
     process.on('SIGINT', stop);
   });
-}
-
-// Per-transcript monotonic event id counters. Every appended event gets an
-// `eid` so persistent operations (context_evict) can reference events
-// precisely across reattach. Seeded from the file's max eid on hydration.
-const transcriptEidCounters = new Map<string, number>();
-
-export function seedTranscriptEidCounter(path: string, maxSeen: number): void {
-  const current = transcriptEidCounters.get(path) ?? 0;
-  if (maxSeen > current) transcriptEidCounters.set(path, maxSeen);
-}
-
-/**
- * The observer projection (spec:observer-attach §4.1) — ledger entry types
- * that are ALSO mirrored to stdout as `obs` lines for live observers. Must
- * stay in sync with OBSERVER_PROJECTION_TYPES in the server's
- * session-event-bus.ts: every projection append is emitted from ONE place
- * (below) so the live view can never diverge from replay.
- */
-const OBS_PROJECTION_TYPES = new Set([
-  'user',
-  'system_turn',
-  'auto_turn',
-  'assistant',
-  'inbox',
-  'backend_tool',
-  'backend_text',
-  'local_tool_call',
-  'pcp_tool',
-  'backend_session',
-  'compaction',
-  'session_pause',
-  'session_end',
-]);
-
-/**
- * Live mirror for projection appends — set by runChat to its stream emitter
- * (non-interactive stdout NDJSON). The wire event IS the appended ledger
- * entry, emitted only after the append succeeds; consumers must preserve the
- * eid and never mint their own.
- */
-let transcriptObsEmitter: ((entry: Record<string, unknown>) => void) | null = null;
-
-export function setTranscriptObsEmitter(
-  emitter: ((entry: Record<string, unknown>) => void) | null
-): void {
-  transcriptObsEmitter = emitter;
-}
-
-function appendTranscriptEntry(
-  path: string,
-  event: Record<string, unknown>
-): Record<string, unknown> {
-  const eid = (transcriptEidCounters.get(path) ?? 0) + 1;
-  transcriptEidCounters.set(path, eid);
-  const entry: Record<string, unknown> = { ts: new Date().toISOString(), eid, ...event };
-  appendFileSync(path, JSON.stringify(entry) + '\n');
-  if (typeof entry.type === 'string' && OBS_PROJECTION_TYPES.has(entry.type)) {
-    try {
-      transcriptObsEmitter?.(entry);
-    } catch {
-      // The live mirror must never break the ledger write path.
-    }
-  }
-  return entry;
-}
-
-function appendTranscript(path: string, event: Record<string, unknown>): number {
-  return appendTranscriptEntry(path, event).eid as number;
 }
 
 function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): string {
@@ -2957,7 +2891,7 @@ export function applyModelSelection(
 ): void {
   runtime.model = next;
   runtime.detectedModel = undefined;
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: 'model_detection_reset',
     backend: runtime.backend,
   });
@@ -2988,7 +2922,7 @@ export function applyDetectedModel(
   contextBudgetAuto: boolean
 ): { windowChanged: boolean } {
   runtime.detectedModel = model;
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: 'model_detected',
     backend: runtime.backend,
     model,
@@ -3011,7 +2945,7 @@ function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
   const previous = runtime.maxContextTokens;
   runtime.maxContextTokens = defaultContextBudget(window, promptTransportFor(runtime.backend));
   if (runtime.maxContextTokens !== previous) {
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'context_budget_changed',
       from: previous,
       to: runtime.maxContextTokens,
@@ -3561,7 +3495,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // cross-studio attach) and a stale header would suppress server-side
   // correction. cliAttached is false for ANY one-shot mode: --message runs
   // headless even without --non-interactive, and persisting cliAttached=true
-  // from such a run would wrongly suppress concurrent trigger spawns.
+  // from such a run would wrongly suppress concurrent trigger spawns. Every
+  // backend spawn carries the same value: its hooks write it onto this
+  // session through the INK_SESSION_ID the child inherits.
+  const cliAttached = !options.nonInteractive && !options.message;
   let currentInkSessionId: () => string | undefined = () => undefined;
   let currentInkStudioId: () => string | undefined = () => identity?.studioId;
   const inkClient = new InkClient(undefined, undefined, {
@@ -3570,7 +3507,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: currentInkSessionId() || '',
         studioId: currentInkStudioId() || 'main',
         sbSlug,
-        cliAttached: !options.nonInteractive && !options.message,
+        cliAttached,
         runtime: 'ink',
       }),
   });
@@ -3634,7 +3571,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     eventPolling: true,
     autoRunInbox: options.autoRun ?? false,
     awayMode: options.away ?? false,
-    transcriptPath: ensureRuntimeTranscriptPath(),
+    // Replaced once the session is known (below); nothing appends before then.
+    log: new SessionLog({ path: ensureRuntimeTranscriptPath() }),
     systemPromptOverride: readSystemPromptFile(options.systemPromptFile),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
@@ -4062,14 +4000,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  // Register the live obs mirror: EVERY projection-type ledger append (user,
-  // system turns, inkClient/local tools, assistant results, backend events, session
-  // markers) is emitted as an `obs` line from inside appendTranscriptEntry —
-  // one place, all paths, so the live view can never diverge from replay
-  // (spec:observer-attach §4.2; the e2e caught exactly this gap when only
-  // backend events were mirrored).
-  setTranscriptObsEmitter((entry) => emitStreamEvent({ type: 'obs', entry }));
-
   // ── Live paragraph streaming (Ink TUI only) ──
   // Assistant text renders as it flows: partial-message deltas accumulate in a
   // fence-aware paragraph buffer and each completed paragraph is appended to
@@ -4133,7 +4063,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     renderStreamedLines(streamRenderer.endSpawn());
     const held = previewGuard.endSpawn();
     if (held.trim()) {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_text',
         preview: compactForLedger(held, 200),
       });
@@ -4240,7 +4170,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Surface the call in the live feed as the agent's own — one dim line,
       // same shape as the replay's 🛠 rows.
       printEvent(chalk.dim(`🛠 ${sbSlug} · ${evt.name} …`));
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_tool',
         name: evt.name,
         status: 'running',
@@ -4256,7 +4186,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'tool-result') {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_tool',
         status: evt.isError ? 'error' : 'done',
         ...(evt.id ? { toolUseId: evt.id } : {}),
@@ -4273,7 +4203,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // nothing is lost, only not republished.
       const guarded = previewGuard.onBlock(evt.text);
       if (guarded.publish.trim() || guarded.imitationDiscarded) {
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'backend_text',
           preview: compactForLedger(guarded.publish, 200),
           ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
@@ -4400,8 +4330,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // live it hides the previous sample, and replay must not resurrect it
     // (Lumen, round 3).
     const parts = usage.contextParts;
-    appendTranscript(
-      runtime.transcriptPath,
+    runtime.log.append(
       usage.contextTokens !== undefined && usage.contextTokens > 0
         ? {
             type: 'provider_sample',
@@ -4756,13 +4685,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
     runtime.sessionId && attachedToExistingSession
       ? findLatestTranscriptForSession(runtime.sessionId)
       : undefined;
-  runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
+  // The live obs mirror: EVERY projection-type ledger append (user, system
+  // turns, inkClient/local tools, assistant results, backend events, session
+  // markers) is emitted as an `obs` line from inside SessionLog.append — one
+  // place, all paths, so the live view can never diverge from replay
+  // (spec:observer-attach §4.2; the e2e caught exactly this gap when only
+  // backend events were mirrored). It belongs to this session's log alone:
+  // a clone's log has no observer.
+  runtime.log = new SessionLog({
+    path: existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId),
+    onProjection: (entry) => emitStreamEvent({ type: 'obs', entry }),
+  });
 
   // Announce the ledger's absolute location to the server (session_meta) so
   // observer replay has a server-owned locator (spec:observer-attach §4.3).
   // The runtime is the authority on where it writes — the server validates
   // shape but never derives paths from its own cwd or caller input.
-  emitStreamEvent({ type: 'session_meta', transcriptPath: runtime.transcriptPath });
+  emitStreamEvent({ type: 'session_meta', transcriptPath: runtime.log.path });
 
   // ── Provider session reuse (claude only) — Stage 2 ──
   // One provider-native session id per ink session, reused across turns AND
@@ -4821,7 +4760,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
    */
   const rollProviderSession = (reason: string, note: string): void => {
     if (activeBackendSessionId !== undefined) {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_session_invalidated',
         id: activeBackendSessionId,
         reason,
@@ -4890,7 +4829,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     // Continue the event-id sequence from where the file left off
-    seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
+    runtime.log.seed(hydrated.maxEid);
     sessionEvictedEntries.push(...hydrated.evictedEntries);
     // Replayed tool calls populate the inspector's Tool Calls section so
     // Ctrl+T shows the receipts behind prior turns, not just this session's
@@ -4931,7 +4870,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   }
 
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: attachedToExistingSession ? 'session_attach' : 'session_start',
     sbSlug,
     backend: runtime.backend,
@@ -5244,7 +5183,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }>
   ): void => {
     if (refs.length === 0) return;
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'context_evict',
       actor,
       reason,
@@ -5297,7 +5236,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const note = `Trimmed ${trim.removedEntries.length} entries (~${trim.removedTokens} tok) to ${targetPercent}% budget (${reason}).`;
     console.log(chalk.yellow(note));
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'context_trim',
       reason,
       targetPercent,
@@ -5382,6 +5321,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               : undefined,
             idleTimeoutMs: runtime.backendIdleTimeoutMs,
             stream: true,
+            cliAttached,
           });
           const onAbort = (): void => summarizer.abort();
           signal?.addEventListener('abort', onAbort, { once: true });
@@ -5399,7 +5339,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               : turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`,
           };
         },
-        persist: (event) => appendTranscript(runtime.transcriptPath, event),
+        persist: (event) => runtime.log.append(event),
         recordUsage: recordRunUsage,
         hardTrim: (reason) => trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, reason),
         log: (line) => printEvent(chalk.yellow(`  ⛁ ${line}`)),
@@ -5583,12 +5523,280 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const inboxPollGate = createPollGate();
   const activityPollGate = createPollGate();
 
-  // Phase 1 (gated): fetch + render + collect auto-run candidates. Must not
-  // await backend turns — those run in pollInbox phase 2, after the gate
-  // releases, so grant delivery keeps flowing during a turn.
+  // The session-visibility policy, applied to legacy and thread rows alike.
+  const inboxTargetAllowedByPolicy = (target: {
+    sessionId?: string;
+    threadKey?: string;
+    studioId?: string;
+  }): boolean =>
+    toolPolicy.canAccessSession({
+      action: 'inbox',
+      requester: {
+        sessionId: runtime.sessionId,
+        threadKey: runtime.threadKey,
+        studioId: runtime.studioId,
+        sbSlug,
+      },
+      target: { ...target, sbSlug },
+    }).allowed;
+  const inboxMessageAllowedByPolicy = (msg: InboxMessage): boolean =>
+    inboxTargetAllowedByPolicy({
+      sessionId: msg.relatedSessionId,
+      threadKey: msg.threadKey,
+      studioId: msg.recipientStudioId,
+    });
+  // A thread row carries no relatedSessionId or recipientStudioId. The server
+  // found it through a poll scoped to this session, so the session and studio
+  // it is addressed to are this REPL's own. Judging it on the absent fields
+  // refused every thread row under /session-visibility self or studio, and a
+  // refused row is acked unread (Lumen, PR #686).
+  const threadRowAllowedByPolicy = (msg: InboxMessage): boolean =>
+    inboxTargetAllowedByPolicy({
+      sessionId: runtime.sessionId,
+      threadKey: msg.threadKey,
+      studioId: runtime.studioId,
+    });
+
+  // A permission grant modifies local policy; it is not chat. Legacy and
+  // thread rows both come through here, so a grant sent on a thread is
+  // applied, not rendered as a message.
+  const intakePermissionGrant = (msg: InboxMessage): void => {
+    seenInboxIds.add(msg.id);
+    const grant = parsePermissionGrant(msg.metadata);
+    if (!grant) {
+      printLine(
+        chalk.yellow(
+          `Received malformed permission grant from ${msg.from || 'unknown'} — ignoring.`
+        )
+      );
+      return;
+    }
+    const result = applyPermissionGrant({
+      policy: toolPolicy,
+      grant,
+      sessionId: runtime.sessionId,
+    });
+
+    // Resolve pending approval requests if this grant matches
+    if (grant.requestId && approvalManager.hasPending(grant.requestId)) {
+      const decision = grant.action === 'deny' ? 'denied' : 'approved';
+      approvalManager.resolve(grant.requestId, decision, msg.from);
+    } else {
+      // Try matching by tool name for grants without explicit requestId
+      for (const tool of grant.tools) {
+        const pending = approvalManager.findPendingForTool(tool);
+        if (pending) {
+          const decision = grant.action === 'deny' ? 'denied' : 'approved';
+          approvalManager.resolve(pending.id, decision, msg.from);
+        }
+      }
+    }
+
+    const from = msg.from || 'remote';
+    const action = grant.action;
+    const label =
+      action === 'deny' ? '🚫 denied' : action === 'revoke' ? '↩ revoked' : '✅ granted';
+    if (inkRepl) {
+      inkRepl.addMessage('grant', result.summary, {
+        label,
+        time: formatHumanTime(msg.createdAt, runtime.userTimezone),
+        trailingMeta: `from ${from}`,
+      });
+    } else {
+      printLine('');
+      printLine(
+        renderMessageLine('grant', result.summary, {
+          label,
+          timezone: runtime.userTimezone,
+          ts: msg.createdAt,
+          trailingMeta: `from ${from}`,
+        })
+      );
+    }
+    runtime.log.append({
+      type: 'permission_grant',
+      messageId: msg.id,
+      action,
+      tools: grant.tools,
+      summary: result.summary,
+      from,
+      createdAt: msg.createdAt || null,
+      ...(msg.threadKey ? { threadKey: msg.threadKey } : {}),
+    });
+  };
+
+  // One intake for every message the REPL delivers — legacy inbox rows and
+  // thread rows alike — so each reaches the ledger, the transcript and the
+  // screen the same way, under the same auto-run policy. Throws if any step
+  // does: the thread drain acks a message only after intake returned. An
+  // eligible message is accepted into the turn queue here, so the ack follows
+  // acceptance; the turn's completion goes into `autoRunTurns` for the caller
+  // to await outside the poll gate. The seen-set entry is the last step, so
+  // it never records a message whose intake stopped part-way.
+  const intakeInboxMessage = (msg: InboxMessage, autoRunTurns: Array<Promise<void>>): void => {
+    if (!runtime.threadKey && msg.threadKey) {
+      runtime.threadKey = msg.threadKey;
+    }
+    const from = msg.from || 'unknown';
+    // Each message names its own thread. The REPL binds to the first thread it
+    // sees, and a session can be stamped with several, so the envelope's
+    // thread is not this message's (Lumen, PR #686). At the front, because
+    // compactForLedger cuts the tail.
+    const sender = msg.threadKey ? `${from} (thread ${msg.threadKey})` : from;
+    const heading = msg.subject ? `${sender} — ${msg.subject}` : sender;
+    let delegationLabel = '';
+    if (msg.delegationToken) {
+      const secret = getDelegationSecret();
+      if (!secret) {
+        delegationLabel = ' [delegation:unverified:no-secret]';
+      } else {
+        // Verified against the thread the message was sent on. Checking the
+        // REPL's bound thread instead would pass a token minted for that
+        // thread on a message from another one.
+        const verified = verifyDelegationToken(msg.delegationToken, secret, {
+          expectedDelegateeSlug: sbSlug,
+          expectedThreadKey: msg.threadKey ?? runtime.threadKey ?? undefined,
+        });
+        if (verified.valid && verified.payload) {
+          const scopes = verified.payload.scopes.join(',');
+          delegationLabel = ` [delegation:${verified.payload.iss}->${verified.payload.sub}:${scopes}]`;
+        } else {
+          delegationLabel = ` [delegation:invalid:${verified.error}]`;
+        }
+      }
+    }
+    const rendered = `📥 ${heading}${delegationLabel}: ${msg.content}`.trim();
+    ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
+    runtime.log.append({
+      type: 'inbox',
+      messageId: msg.id,
+      rendered,
+      createdAt: msg.createdAt || null,
+      delegationToken: msg.delegationToken || null,
+      messageType: msg.messageType || null,
+      relatedSessionId: msg.relatedSessionId || null,
+      ...(msg.threadKey ? { threadKey: msg.threadKey } : {}),
+    });
+    if (inkRepl) {
+      // Emoji in label, clean content without emoji prefix
+      const inboxContent = `${heading}${delegationLabel}: ${msg.content}`.trim();
+      inkRepl.addMessage('inbox', inboxContent, {
+        label: '📬 inbox',
+        time: formatHumanTime(msg.createdAt, runtime.userTimezone),
+      });
+    } else {
+      printLine('');
+      printLine(separator());
+      printLine(
+        renderMessageLine('inbox', rendered, {
+          timezone: runtime.userTimezone,
+          ts: msg.createdAt,
+        })
+      );
+      printLine(separator());
+    }
+
+    const enqueueAutoRun = enqueueAutoRunFromInbox;
+    const eligibleForAutoRun =
+      runtime.autoRunInbox &&
+      readyForAutoRun &&
+      (msg.from || '').toLowerCase() !== sbSlug.toLowerCase() &&
+      msg.messageType !== 'notification' &&
+      msg.content.trim().length > 0;
+
+    if (eligibleForAutoRun && enqueueAutoRun) {
+      autoRunTurns.push(enqueueAutoRun(msg));
+    }
+    seenInboxIds.add(msg.id);
+  };
+
+  // Thread delivery for an attached REPL. Once the REPL's session is
+  // attached, the trigger handler delivers inline and spawns nothing, so the
+  // REPL is the only reader of threads stamped to its session. It drains
+  // them under the channel plugin's contract (shared/src/inkmail/drain.ts):
+  // fetch with markRead:false, intake, then ack the exact last id, only
+  // after intake returned. A headless run gets its message through
+  // --message and does not drain, or it would take that message twice.
+  const threadDrainState = createThreadDrainState();
+  const drainsThreads = !options.nonInteractive && !options.message;
+  const drainSessionThreads = async (autoRunTurns: Array<Promise<void>>): Promise<number> => {
+    // channelPoll scopes to the session named in x-ink-context and fails
+    // closed without one.
+    if (!drainsThreads || !runtime.sessionId) return 0;
+    const poll = (await inkClient
+      .callTool('get_inbox', {
+        sbSlug,
+        status: 'unread',
+        markRead: false,
+        limit: 20,
+        channelPoll: true,
+      })
+      .catch(() => null)) as Record<string, unknown> | null;
+    if (!poll || poll.success === false) return 0;
+    const threads = Array.isArray(poll.threadsWithUnread)
+      ? (poll.threadsWithUnread as Array<Record<string, unknown>>)
+      : [];
+    // An empty page still goes to the drain, as the plugin's does: a
+    // cold-start summary deferred by an earlier full batch is reported on the
+    // first quiet poll (Lumen, PR #686).
+    const drained = await drainThreads(
+      {
+        callInk: async (tool, args) =>
+          (await inkClient.callTool(tool, args).catch(() => null)) as Record<
+            string,
+            unknown
+          > | null,
+        notify: async (content, _meta, row) => {
+          if (row) {
+            const msg = extractInboxMessages({ messages: [row] })[0];
+            // Without an id there is nothing to take in or to ack past.
+            if (!msg) return;
+            // The drain has already skipped own-studio self messages. The
+            // legacy thread-binding filter (inboxMessageMatchesSessionScope)
+            // is not applied: the server stamped this thread to this
+            // session, and a row refused here would be acked unread. The
+            // visibility policy still applies. A refused row is acked
+            // without rendering, as the legacy path consumes at fetch.
+            if (!threadRowAllowedByPolicy(msg)) {
+              sbDebugLog('chat', 'thread_drain_policy_refused', {
+                messageId: msg.id,
+                threadKey: msg.threadKey,
+              });
+              return;
+            }
+            // Only a row typed permission_grant is a grant. The type is the
+            // server's gate (send_to_inbox refuses it from an SB); a grant
+            // shape in the metadata of any other row is chat.
+            if (msg.messageType === 'permission_grant') intakePermissionGrant(msg);
+            else intakeInboxMessage(msg, autoRunTurns);
+            return;
+          }
+          // The drain's own notice (the cold-start summary) carries no row.
+          ledger.addEntry('inbox', compactForLedger(content), 'inkmail');
+          if (inkRepl) inkRepl.addMessage('system', content);
+          else printLine(chalk.dim(content));
+        },
+        log: (level, message, data) =>
+          sbDebugLog('chat', 'thread_drain', { level, message, ...(data ?? {}) }),
+        sbSlug,
+        studioId: currentInkStudioId(),
+      },
+      threadDrainState,
+      threads,
+      {
+        moreThreadsPending: poll.unreadThreadsTruncated === true,
+        pollIncomplete: poll.channelPollIncomplete === true,
+      }
+    );
+    return drained.injected;
+  };
+
+  // Phase 1 (gated): fetch + render + accept auto-run turns into the queue.
+  // Must not await backend turns — pollInbox phase 2 awaits them, after the
+  // gate releases, so grant delivery keeps flowing during a turn.
   const collectInbox = async (
     force: boolean
-  ): Promise<{ freshCount: number; autoRunMessages: InboxMessage[] }> => {
+  ): Promise<{ freshCount: number; autoRunTurns: Array<Promise<void>> }> => {
     const inboxResult = (await inkClient
       .callTool('get_inbox', { sbSlug, status: 'unread', limit: 10 })
       .catch(() => null)) as Record<string, unknown> | null;
@@ -5596,92 +5804,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const fresh = messages
       .filter((msg) => !seenInboxIds.has(msg.id))
       .filter((msg) => inboxMessageMatchesSessionScope(runtime, msg))
-      .filter(
-        (msg) =>
-          toolPolicy.canAccessSession({
-            action: 'inbox',
-            requester: {
-              sessionId: runtime.sessionId,
-              threadKey: runtime.threadKey,
-              studioId: runtime.studioId,
-              sbSlug,
-            },
-            target: {
-              sessionId: msg.relatedSessionId,
-              threadKey: msg.threadKey,
-              studioId: msg.recipientStudioId,
-              sbSlug,
-            },
-          }).allowed
-      )
+      .filter(inboxMessageAllowedByPolicy)
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
-    const autoRunMessages: InboxMessage[] = [];
+    const autoRunTurns: Array<Promise<void>> = [];
 
     // Process permission grants separately — they modify local policy, not chat flow.
     const permissionGrants = fresh.filter((msg) => msg.messageType === 'permission_grant');
     const nonGrantMessages = fresh.filter((msg) => msg.messageType !== 'permission_grant');
     for (const msg of permissionGrants) {
-      seenInboxIds.add(msg.id);
-      const grant = parsePermissionGrant(msg.metadata);
-      if (!grant) {
-        printLine(
-          chalk.yellow(
-            `Received malformed permission grant from ${msg.from || 'unknown'} — ignoring.`
-          )
-        );
-        continue;
-      }
-      const result = applyPermissionGrant({
-        policy: toolPolicy,
-        grant,
-        sessionId: runtime.sessionId,
-      });
-
-      // Resolve pending approval requests if this grant matches
-      if (grant.requestId && approvalManager.hasPending(grant.requestId)) {
-        const decision = grant.action === 'deny' ? 'denied' : 'approved';
-        approvalManager.resolve(grant.requestId, decision, msg.from);
-      } else {
-        // Try matching by tool name for grants without explicit requestId
-        for (const tool of grant.tools) {
-          const pending = approvalManager.findPendingForTool(tool);
-          if (pending) {
-            const decision = grant.action === 'deny' ? 'denied' : 'approved';
-            approvalManager.resolve(pending.id, decision, msg.from);
-          }
-        }
-      }
-
-      const from = msg.from || 'remote';
-      const action = grant.action;
-      const label =
-        action === 'deny' ? '🚫 denied' : action === 'revoke' ? '↩ revoked' : '✅ granted';
-      if (inkRepl) {
-        inkRepl.addMessage('grant', result.summary, {
-          label,
-          time: formatHumanTime(msg.createdAt, runtime.userTimezone),
-          trailingMeta: `from ${from}`,
-        });
-      } else {
-        printLine('');
-        printLine(
-          renderMessageLine('grant', result.summary, {
-            label,
-            timezone: runtime.userTimezone,
-            ts: msg.createdAt,
-            trailingMeta: `from ${from}`,
-          })
-        );
-      }
-      appendTranscript(runtime.transcriptPath, {
-        type: 'permission_grant',
-        messageId: msg.id,
-        action,
-        tools: grant.tools,
-        summary: result.summary,
-        from,
-        createdAt: msg.createdAt || null,
-      });
+      intakePermissionGrant(msg);
     }
 
     // Partition non-grant messages into collapsed (old) and expanded (recent).
@@ -5702,7 +5833,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         const heading = msg.subject ? `${from} — ${msg.subject}` : from;
         const rendered = `📥 ${heading}: ${msg.content}`.trim();
         ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'inbox',
           messageId: msg.id,
           rendered,
@@ -5729,74 +5860,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     for (const msg of recentMessages) {
-      seenInboxIds.add(msg.id);
-      if (!runtime.threadKey && msg.threadKey) {
-        runtime.threadKey = msg.threadKey;
-      }
-      const from = msg.from || 'unknown';
-      const heading = msg.subject ? `${from} — ${msg.subject}` : from;
-      let delegationLabel = '';
-      if (msg.delegationToken) {
-        const secret = getDelegationSecret();
-        if (!secret) {
-          delegationLabel = ' [delegation:unverified:no-secret]';
-        } else {
-          const verified = verifyDelegationToken(msg.delegationToken, secret, {
-            expectedDelegateeSlug: sbSlug,
-            expectedThreadKey: runtime.threadKey ?? undefined,
-          });
-          if (verified.valid && verified.payload) {
-            const scopes = verified.payload.scopes.join(',');
-            delegationLabel = ` [delegation:${verified.payload.iss}->${verified.payload.sub}:${scopes}]`;
-          } else {
-            delegationLabel = ` [delegation:invalid:${verified.error}]`;
-          }
-        }
-      }
-      const rendered = `📥 ${heading}${delegationLabel}: ${msg.content}`.trim();
-      ledger.addEntry('inbox', compactForLedger(rendered), 'inkmail');
-      appendTranscript(runtime.transcriptPath, {
-        type: 'inbox',
-        messageId: msg.id,
-        rendered,
-        createdAt: msg.createdAt || null,
-        delegationToken: msg.delegationToken || null,
-        messageType: msg.messageType || null,
-        relatedSessionId: msg.relatedSessionId || null,
-      });
-      if (inkRepl) {
-        // Emoji in label, clean content without emoji prefix
-        const inboxContent = `${heading}${delegationLabel}: ${msg.content}`.trim();
-        inkRepl.addMessage('inbox', inboxContent, {
-          label: '📬 inbox',
-          time: formatHumanTime(msg.createdAt, runtime.userTimezone),
-        });
-      } else {
-        printLine('');
-        printLine(separator());
-        printLine(
-          renderMessageLine('inbox', rendered, {
-            timezone: runtime.userTimezone,
-            ts: msg.createdAt,
-          })
-        );
-        printLine(separator());
-      }
-
-      const eligibleForAutoRun =
-        runtime.autoRunInbox &&
-        readyForAutoRun &&
-        enqueueAutoRunFromInbox &&
-        (msg.from || '').toLowerCase() !== sbSlug.toLowerCase() &&
-        msg.messageType !== 'notification' &&
-        msg.content.trim().length > 0;
-
-      if (eligibleForAutoRun) {
-        autoRunMessages.push(msg);
-      }
+      intakeInboxMessage(msg, autoRunTurns);
     }
 
-    if (force && fresh.length === 0) {
+    const threadMessages = await drainSessionThreads(autoRunTurns);
+    const freshCount = fresh.length + threadMessages;
+
+    if (force && freshCount === 0) {
       if (inkRepl) {
         inkRepl.setCommandOutput(['No new inbox messages.']);
       } else {
@@ -5804,7 +5874,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     emitStatusLaneIfChanged();
-    return { freshCount: fresh.length, autoRunMessages };
+    return { freshCount, autoRunTurns };
   };
 
   const pollInbox = async (force = false): Promise<number> => {
@@ -5814,12 +5884,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // interval polling — and the permission-grant delivery a remote approval
     // depends on — continues while a turn is in flight.
     let autoRuns = 0;
-    const autoRunHandler = enqueueAutoRunFromInbox;
-    if (autoRunHandler) {
-      for (const msg of collected.autoRunMessages) {
-        await autoRunHandler(msg);
-        autoRuns += 1;
-      }
+    for (const turn of collected.autoRunTurns) {
+      await turn;
+      autoRuns += 1;
     }
     if (autoRuns > 0) {
       printLine(
@@ -5898,7 +5965,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // backend turn lifecycle) are dim event lines; everything else stays
       // a ⚡ activity block.
       const plan = classifyActivity(activity, sbSlug);
-      const activityEid = appendTranscript(runtime.transcriptPath, {
+      const activityEid = runtime.log.append({
         type: 'activity',
         activityId: activity.id,
         activityType: activity.type || null,
@@ -6043,6 +6110,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       cloneId: record.id,
       cloneLabel: record.label,
     };
+    // Its own log, with its own eid sequence and no observer: a clone's entries
+    // never reach the parent's live stream, whatever their type.
+    const cloneLog = new SessionLog({ path: record.transcriptPath });
 
     /**
      * Snapshot the provider at launch.
@@ -6106,6 +6176,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       idleTimeoutMs: runtime.backendIdleTimeoutMs,
       stream: true,
       toolRouting: cloneRouting,
+      cliAttached,
       ...sessionArgs,
     });
 
@@ -6162,7 +6233,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })();
       cloneGenerationAtReport = generationBeforeSpawn;
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
-      appendTranscript(record.transcriptPath, {
+      cloneLog.append({
         type: 'backend_turn',
         continuation: turnCtx.isContinuation,
         success: result.success,
@@ -6186,7 +6257,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     };
 
     try {
-      appendTranscript(record.transcriptPath, {
+      cloneLog.append({
         type: 'clone_start',
         id: record.id,
         label: record.label,
@@ -6230,10 +6301,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ui: {
             // A clone's progress belongs to the clone, not the parent's
             // scrollback — the parent gets one summary, which is the point.
-            printLine: (text) =>
-              appendTranscript(record.transcriptPath, { type: 'clone_line', text }),
-            printEvent: (text) =>
-              appendTranscript(record.transcriptPath, { type: 'clone_event', text }),
+            printLine: (text) => cloneLog.append({ type: 'clone_line', text }),
+            printEvent: (text) => cloneLog.append({ type: 'clone_event', text }),
             startWaiting: () => () => {},
           },
           tools: {
@@ -6249,7 +6318,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 policy: clonePolicy,
                 origin: cloneOrigin,
                 signal: execCtx.signal,
-                transcriptPath: record.transcriptPath,
+                log: cloneLog,
                 signalSink: cloneSignal,
               });
             },
@@ -6260,7 +6329,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       const fullText = result.assistantDisplayText || result.responseText;
       const summary = boundSummary(fullText);
-      appendTranscript(record.transcriptPath, {
+      cloneLog.append({
         type: 'clone_end',
         stopReason: result.stopReason,
         iterations: result.iterations,
@@ -6289,7 +6358,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      appendTranscript(record.transcriptPath, { type: 'clone_error', error: message });
+      cloneLog.append({ type: 'clone_error', error: message });
       cloneRegistry.update(record.id, { status: 'failed', error: message });
       logCloneActivity(record.id, 'failed', { error: message });
     }
@@ -6346,7 +6415,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       policy: ToolPolicyState;
       origin: ApprovalOriginInfo;
       signal?: AbortSignal;
-      transcriptPath: string;
+      log: SessionLog;
       signalSink: SignalSink;
     }
   ): Promise<ToolResultRecord[]> => {
@@ -6399,7 +6468,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               return handleClientLocalTool(
                 tool,
                 args,
-                cloneLedgerFor(opts.transcriptPath),
+                cloneLedgerFor(opts.log.path),
                 opts.signalSink
               );
             }
@@ -6427,7 +6496,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // detail has to hold for the caller reading it, not just the parent.
           const resultJson =
             result.result === undefined ? undefined : JSON.stringify(result.result);
-          appendTranscript(opts.transcriptPath, {
+          opts.log.append({
             type: 'clone_tool_call',
             tool: result.tool,
             args: result.args,
@@ -6508,7 +6577,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         label: task.label,
         prompt: task.prompt,
         parentSessionId: runtime.sessionId,
-        transcriptPath: runtime.transcriptPath.replace(/\.jsonl$/, `.${id}.jsonl`),
+        transcriptPath: runtime.log.path.replace(/\.jsonl$/, `.${id}.jsonl`),
       });
     });
 
@@ -6696,7 +6765,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         compactForLedger(rendered, MAX_CLONE_SUMMARY_CHARS),
         'shadow-clone'
       );
-      appendTranscript(runtime.transcriptPath, { type: 'clone_fanout', outcomes: fresh });
+      runtime.log.append({ type: 'clone_fanout', outcomes: fresh });
     }
 
     return {
@@ -6805,7 +6874,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             printEvent(
               chalk.yellow(`🛠 ${sbSlug} · ${result.tool} (${result.status}) — ${result.reason}`)
             );
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'local_tool_call',
               tool: result.tool,
               args: result.args,
@@ -6888,7 +6957,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 )
               );
             }
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'local_tool_call',
               tool: result.tool,
               args: result.args,
@@ -6925,7 +6994,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 `🛠 ${sbSlug} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
               )
             );
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'local_tool_call',
               tool: result.tool,
               args: result.args,
@@ -6981,17 +7050,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // with the turn.
     if (source === 'user') {
       ledger.addEntry('user', raw, 'repl');
-      appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+      runtime.log.append({ type: 'user', content: raw });
     } else if (source === 'system') {
       // Synthetic turn input: heartbeat triggers, server-delivered messages,
       // continuation prompts. Recorded as system (not "you") so transcripts
       // distinguish harness prompts from the human's words.
       const label = displayLabel || 'system';
       ledger.addEntry('system', raw, label);
-      appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
+      runtime.log.append({ type: 'system_turn', content: raw, label });
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${raw}`, 500), 'auto-run');
-      appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
+      runtime.log.append({ type: 'auto_turn', content: raw });
     }
 
     if (runtime.sessionId && !options.nonInteractive) {
@@ -7039,7 +7108,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Persist hook-injected entries to transcript so they survive reattach
     if (promptHookResult.injectedEntries.length > 0) {
       for (const entry of promptHookResult.injectedEntries) {
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'hook_injection',
           role: entry.role,
           content: entry.content,
@@ -7152,7 +7221,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // and RESUMES this native session instead of fragmenting into a new jsonl.
       // routing rides along so cross-process recovery can refuse a session
       // seeded under the other instruction envelope.
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'backend_session',
         id: seedProviderSessionId,
         routing: runtime.toolRouting,
@@ -7356,6 +7425,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // stateless adapters re-attach from `media` regardless.
       media: turnMedia.length > 0 ? turnMedia : undefined,
       ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
+      cliAttached,
       // The session argument is the DECISION's, never derived from the live id:
       // a seed assigns the minted id before spawning, and deriving from it sent
       // a resume of a session that did not exist yet (Lumen, PR #577).
@@ -7416,6 +7486,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ...(resumeProviderSession && activeBackendSessionId
             ? { backendSessionId: activeBackendSessionId }
             : {}),
+          cliAttached,
         });
         currentTurnAbort = turn.abort;
 
@@ -7449,7 +7520,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const reseedId = randomUUID();
           activeBackendSessionId = reseedId;
           activeBackendSessionShape = currentEnvelopeShape;
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'backend_session',
             id: reseedId,
             routing: runtime.toolRouting,
@@ -7490,6 +7561,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             media: turnMedia.length > 0 ? turnMedia : undefined,
             ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
             backendSessionSeedId: reseedId,
+            cliAttached,
           });
           currentTurnAbort = reseedTurn.abort;
           runResult = await reseedTurn.result.finally(() => {
@@ -7590,7 +7662,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // shape made the NEXT turn roll this session again — the very
         // fragmentation this fix exists to stop (Lumen, PR #577).
         activeBackendSessionShape = envelopeShapeKey(runtime);
-        appendTranscript(runtime.transcriptPath, {
+        runtime.log.append({
           type: 'backend_session',
           id: decision.id,
           routing: runtime.toolRouting,
@@ -7715,7 +7787,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // the fact, and not enough to reconstruct what the agent had acted
             // on without the provider's transcript (#569).
             recordProtocolViolation: (violation) => {
-              appendTranscript(runtime.transcriptPath, {
+              runtime.log.append({
                 type: 'protocol_violation',
                 kind: violation.kind,
                 phase: violation.phase,
@@ -7754,7 +7826,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (isAbortedTurn) {
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'assistant',
         backend: runtime.backend,
         model: runtime.model || null,
@@ -7768,7 +7840,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     } else {
       ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-      appendTranscript(runtime.transcriptPath, {
+      runtime.log.append({
         type: 'assistant',
         backend: runtime.backend,
         model: runtime.model || null,
@@ -7826,7 +7898,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // ledger on replay, and without this the gap had no explanation
         // (Lumen, PR #584).
         const tombstone = autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS);
-        const noteEid = appendTranscript(runtime.transcriptPath, {
+        const noteEid = runtime.log.append({
           type: 'context_note',
           source: AUTO_EVICT_TOMBSTONE_SOURCE,
           content: tombstone,
@@ -7866,7 +7938,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // Persist hook-injected entries to transcript so they survive reattach
         if (hookResult.injectedEntries.length > 0) {
           for (const entry of hookResult.injectedEntries) {
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'hook_injection',
               role: entry.role,
               content: entry.content,
@@ -7992,6 +8064,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     getSessionId: () => runtime.sessionId,
     getStudioId: () => currentInkStudioId(),
     sbSlug,
+    cliAttached,
     getServerUrl: async () => (await import('../lib/ink-mcp.js')).getInkServerUrl(),
     getToken: async (serverUrl) =>
       (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),
@@ -8080,10 +8153,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return turnQueue;
   };
 
-  enqueueAutoRunFromInbox = async (message: InboxMessage) => {
-    const prompt = buildAutoRunPromptFromInbox(runtime, message);
-    await enqueueTurn(prompt, 'inbox-auto');
-  };
+  // Not async: the turn is in the queue when this returns, and a failure to
+  // put it there throws into the caller's intake instead of rejecting later,
+  // after the message was acked. The promise is the turn's completion.
+  enqueueAutoRunFromInbox = (message: InboxMessage) =>
+    enqueueTurn(buildAutoRunPromptFromInbox(runtime, message), 'inbox-auto');
   readyForAutoRun = true;
 
   // Prime with current unread queue only after auto-run pipeline is ready.
@@ -8261,7 +8335,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         })
         .catch(() => undefined);
     }
-    appendTranscript(runtime.transcriptPath, {
+    runtime.log.append({
       type: 'session_pause',
       sessionId: runtime.sessionId || null,
       summary,
@@ -9203,7 +9277,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               .catch((error) => ({ error: String(error) }));
             const rendered = JSON.stringify(result, null, 2);
             ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'ink');
-            appendTranscript(runtime.transcriptPath, {
+            runtime.log.append({
               type: 'pcp_tool',
               tool,
               args: inkArgs,
@@ -9324,7 +9398,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             .catch((error) => ({ error: String(error) }));
           const rendered = JSON.stringify(result, null, 2);
           ledger.addEntry('system', compactForLedger(`ink ${tool} -> ${rendered}`, 500), 'ink');
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'pcp_tool',
             tool,
             args: inkArgs,
@@ -9504,7 +9578,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
           const summary = `Delegation token minted: ${payload.iss} -> ${payload.sub} scopes=${payload.scopes.join(',')} exp=${new Date(payload.exp * 1000).toISOString()}`;
           ledger.addEntry('system', summary, 'delegation');
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'delegation_create',
             payload,
             token,
@@ -9626,7 +9700,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const result = await inkClient
             .callTool('send_to_inbox', inboxArgs)
             .catch((error) => ({ error: String(error) }));
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'delegation_send',
             toAgent,
             scopes,
@@ -9724,7 +9798,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               })
               .catch(() => undefined);
           }
-          appendTranscript(runtime.transcriptPath, {
+          runtime.log.append({
             type: 'context_eject',
             bookmarkId: result.bookmark.id,
             bookmarkLabel: result.bookmark.label,
@@ -9900,7 +9974,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .callTool('end_session', { sbSlug, sessionId: runtime.sessionId, summary })
       .catch(() => undefined);
   }
-  appendTranscript(runtime.transcriptPath, {
+  runtime.log.append({
     type: 'session_end',
     sessionId: runtime.sessionId || null,
     summary,

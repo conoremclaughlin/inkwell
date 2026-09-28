@@ -1,9 +1,18 @@
 /**
- * Thread-drain core for the InkMail channel plugin.
+ * InkMail drain core: the one delivery contract for every reader that pulls
+ * a session's unread mail into a live agent — the Claude Code channel plugin
+ * and the `ink chat` REPL.
  *
- * Extracted from index.ts so the delivery behavior is unit-testable
- * (Lumen, PR #473: uneven batches, fetch failures, multi-poll summary
- * accumulation, paginated unread threads).
+ * Extracted from the plugin's index.ts so the delivery behavior is
+ * unit-testable (Lumen, PR #473: uneven batches, fetch failures, multi-poll
+ * summary accumulation, paginated unread threads), then moved here so the
+ * REPL drains threads under the same contract instead of a second one
+ * (Lumen, PR #685).
+ *
+ * This file imports nothing. The plugin runs from source under tsx in the
+ * main checkout and imports it by relative path: a `dist` import would fail
+ * in every new Claude session between a `git pull` that brought a change
+ * here and the next `yarn build`.
  *
  * Delivery contract (spec inkmail-read-state §1/§7 v11):
  * - EVERY fetch is markRead:false — fetch never consumes. After injection
@@ -28,8 +37,17 @@
 
 export interface PollDeps {
   callInk(tool: string, args: Record<string, unknown>): Promise<Record<string, unknown> | null>;
-  /** Emit a channel notification; MUST reject on emit failure. */
-  notify(content: string, meta: Record<string, unknown>): Promise<void>;
+  /**
+   * Deliver one message into the reader; MUST reject when delivery fails —
+   * the ack that follows is the only consumption. `message` is the raw row
+   * (thread or legacy inbox) for readers that render their own form; the
+   * drain's own summary notice has none.
+   */
+  notify(
+    content: string,
+    meta: Record<string, unknown>,
+    message?: Record<string, unknown>
+  ): Promise<void>;
   log(
     level: 'info' | 'warn' | 'error' | 'debug',
     message: string,
@@ -205,12 +223,16 @@ export async function drainThreads(
       const content = (msg.content as string) || '';
       const messageType = (msg.messageType as string) || 'message';
       try {
-        await deps.notify(`From ${sender}: ${content}`, {
-          thread_key: threadKey,
-          sender,
-          message_type: messageType,
-          message_id: msgId,
-        });
+        await deps.notify(
+          `From ${sender}: ${content}`,
+          {
+            thread_key: threadKey,
+            sender,
+            message_type: messageType,
+            message_id: msgId,
+          },
+          { ...msg, threadKey }
+        );
       } catch (err) {
         emitFailures += 1;
         deps.log('error', 'Channel emit failed — leaving remainder unread for redelivery', {
@@ -385,13 +407,17 @@ export async function drainLegacyInbox(
     const content = (msg.content as string) || '';
     const messageType = (msg.messageType as string) || 'message';
     try {
-      await deps.notify(`From ${sender}: ${content}`, {
-        thread_key: (msg.threadKey as string) || '',
-        sender,
-        message_type: messageType,
-        subject: (msg.subject as string) || '',
-        message_id: msgId,
-      });
+      await deps.notify(
+        `From ${sender}: ${content}`,
+        {
+          thread_key: (msg.threadKey as string) || '',
+          sender,
+          message_type: messageType,
+          subject: (msg.subject as string) || '',
+          message_id: msgId,
+        },
+        msg
+      );
     } catch (err) {
       emitFailures += 1;
       deps.log('error', 'Legacy emit failed — leaving remainder unread for redelivery', {
