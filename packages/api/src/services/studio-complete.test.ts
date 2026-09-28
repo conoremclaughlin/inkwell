@@ -111,9 +111,12 @@ describe('completeStudioViaCli', () => {
   });
 
   it('with no CLI build and no override, it reports the checklist as it stands and names the fix', async () => {
+    // The override names nothing, and the resolver's own search starts in a
+    // directory with no checkout — whether or not THIS checkout has a build.
     const result = await completeStudioViaCli(worktree, {
       sbSlug: 'wren',
       env: { INK_CLI_PATH: join(root, 'does-not-exist.js') },
+      cliStartDir: root,
     });
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/no ink CLI build/);

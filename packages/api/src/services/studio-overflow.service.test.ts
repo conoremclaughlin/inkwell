@@ -38,6 +38,51 @@ import type { StudioLeaseService, StudioLease } from './studio-lease.service';
 import { readCheckoutPin } from './studio-lease.service';
 import { ephemeralWorktreePath } from './studio-paths';
 
+/**
+ * The completion routine (`ink init` through this checkout's CLI, task
+ * c3b34be8) is mocked: its file writes are pinned in its own suites, and
+ * running the real CLI here would reach a live server for skills. What this
+ * suite pins is the boundary — that it runs after the row exists and, for a
+ * review checkout, after the PR-supplied startup config was quarantined.
+ */
+const completion = vi.hoisted(() => ({
+  calls: [] as Array<{
+    worktreePath: string;
+    studioId?: string;
+    sbSlug: string;
+    present: string[];
+  }>,
+}));
+vi.mock('./studio-complete', async () => {
+  const { lstat: lstatAt } = await import('fs/promises');
+  const pathMod = await import('path');
+  return {
+    completeStudioViaCli: vi.fn(
+      async (worktreePath: string, opts: { sbSlug: string; studioId?: string }) => {
+        const present: string[] = [];
+        for (const rel of ['.mcp.json', '.env.local', '.env', '.claude', '.codex', '.gemini']) {
+          if (
+            await lstatAt(pathMod.join(worktreePath, rel)).then(
+              () => true,
+              () => false
+            )
+          ) {
+            present.push(rel);
+          }
+        }
+        completion.calls.push({
+          worktreePath,
+          studioId: opts.studioId,
+          sbSlug: opts.sbSlug,
+          present,
+        });
+        return { ok: true, complete: true, missing: [] };
+      }
+    ),
+    ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+  };
+});
+
 // Every ephemeral mint in this file materializes under an isolated root —
 // never the real ~/.ink/studios. Restored so parallel-worker siblings that
 // share this process env are unaffected after the file completes.
@@ -1586,22 +1631,19 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       });
       expect(result?.id).toBe('new-primary');
 
-      // The PR's MCP server is gone; the main root's trusted copy is in place.
-      const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
-      expect(Object.keys(mcp.mcpServers)).toEqual(['trusted']);
-      // The PR's hook is gone; our generated settings stand alone.
-      const settings = JSON.parse(
-        await readFile(path.join(worktree, '.claude', 'settings.local.json'), 'utf8')
-      );
-      expect(JSON.stringify(settings)).not.toContain('PR-HOOK-RAN');
-      expect(settings.permissions?.allow?.length).toBeGreaterThan(0);
-      // Per-backend configs were regenerated from the trusted copy, not the PR's.
-      const codex = await readFile(path.join(worktree, '.codex', 'config.toml'), 'utf8');
-      expect(codex).not.toContain('pr-trap');
-      const gemini = await readFile(path.join(worktree, '.gemini', 'settings.json'), 'utf8');
-      expect(gemini).not.toContain('pr-trap');
-      // The PR's root .env is gone too: Gemini would have loaded it at startup.
-      await expect(access(path.join(worktree, '.env'))).rejects.toBeDefined();
+      // Every PR-supplied startup path is gone from the checkout — the MCP
+      // server, the hook, the per-backend configs, the root .env Gemini
+      // would have loaded — and the completion routine ran AFTER that, on
+      // a checkout holding none of them, with the row it now has. Its own
+      // suites pin that what it then writes comes from the main worktree.
+      for (const rel of ['.mcp.json', '.claude', '.codex', '.gemini', '.env']) {
+        await expect(access(path.join(worktree, rel))).rejects.toBeDefined();
+      }
+      const ran = completion.calls.find((c) => c.worktreePath === worktree);
+      expect(ran).toBeDefined();
+      expect(ran?.studioId).toBe('new-primary');
+      expect(ran?.sbSlug).toBe('lumen');
+      expect(ran?.present).toEqual([]);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1637,13 +1679,12 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       expect(result?.id).toBe('new-primary');
       // Nothing was written where the link pointed.
       await expect(access(path.join(outside, 'settings.local.json'))).rejects.toBeDefined();
-      // The checkout's .claude is a real directory of ours, not the PR's link.
-      const entry = await lstat(path.join(worktree, '.claude'));
-      expect(entry.isSymbolicLink()).toBe(false);
-      expect(entry.isDirectory()).toBe(true);
-      await expect(
-        access(path.join(worktree, '.claude', 'settings.local.json'))
-      ).resolves.toBeUndefined();
+      // The PR's link is gone by the time the completion routine runs, so
+      // the settings it writes land in a real directory of ours (its own
+      // suites pin that it refuses to write through a link that survives).
+      await expect(lstat(path.join(worktree, '.claude'))).rejects.toBeDefined();
+      const ran = completion.calls.find((c) => c.worktreePath === worktree);
+      expect(ran?.present).not.toContain('.claude');
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1691,6 +1732,9 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
       expect(Object.keys(mcp.mcpServers)).toEqual(['base-own']);
       expect(await readFile(path.join(worktree, '.env'), 'utf8')).toBe('BASE_OWN=1\n');
+      // The routine ran on a checkout that kept its trusted config.
+      const ran = completion.calls.find((c) => c.worktreePath === worktree);
+      expect(ran?.present).toEqual(expect.arrayContaining(['.mcp.json', '.env']));
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,

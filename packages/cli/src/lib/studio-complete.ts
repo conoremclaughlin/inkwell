@@ -123,12 +123,22 @@ export function defaultServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
 }
 
-/** The thin default `.mcp.json`: the inkwell server and, when built, the inkmail channel plugin. */
-export function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, unknown> {
+/**
+ * The thin default `.mcp.json`: the inkwell server and, when built, the
+ * inkmail channel plugin. `pluginBase` is where the plugin is looked for —
+ * the MAIN worktree for a studio, never the studio itself: a studio can be
+ * a checkout of unreviewed code (a PR under review), and an entry pointing
+ * at its copy of the plugin would run that code at the next session start
+ * (Lumen, PR #604).
+ */
+export function buildDefaultMcpJson(
+  serverUrl: string,
+  pluginBase?: string
+): Record<string, unknown> {
   const servers: Record<string, unknown> = {
     inkwell: { type: 'http', url: `${serverUrl}/mcp` },
   };
-  const channelPath = cwd ? resolveChannelPluginPath(cwd) : null;
+  const channelPath = pluginBase ? resolveChannelPluginPath(pluginBase) : null;
   if (channelPath) {
     servers['inkmail'] = { command: 'npx', args: ['tsx', channelPath] };
   }
@@ -139,7 +149,11 @@ export function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<str
  * Ensure `.mcp.json` names the inkwell server: create the default, add the
  * entry to an existing file that lacks it, or leave a configured one alone.
  */
-export function ensureMcpJson(cwd: string, serverUrl: string): StepResult {
+export function ensureMcpJson(
+  cwd: string,
+  serverUrl: string,
+  pluginBase: string = cwd
+): StepResult {
   const mcpPath = join(cwd, '.mcp.json');
   if (isSymlink(mcpPath)) {
     return {
@@ -154,7 +168,7 @@ export function ensureMcpJson(cwd: string, serverUrl: string): StepResult {
     const servers = (existing.mcpServers as Record<string, unknown> | undefined) || {};
     if (servers.inkwell) {
       if (!servers.inkmail) {
-        const channelPath = resolveChannelPluginPath(cwd);
+        const channelPath = resolveChannelPluginPath(pluginBase);
         if (channelPath) {
           const updated = {
             ...existing,
@@ -173,7 +187,10 @@ export function ensureMcpJson(cwd: string, serverUrl: string): StepResult {
     writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
     return { label: '.mcp.json', status: 'updated', detail: 'added inkwell server' };
   }
-  writeFileSync(mcpPath, JSON.stringify(buildDefaultMcpJson(serverUrl, cwd), null, 2) + '\n');
+  writeFileSync(
+    mcpPath,
+    JSON.stringify(buildDefaultMcpJson(serverUrl, pluginBase), null, 2) + '\n'
+  );
   return { label: '.mcp.json', status: 'created', detail: `inkwell → ${serverUrl}/mcp` };
 }
 
@@ -311,7 +328,9 @@ export async function completeStudio(
   }
   // With or without root sync the studio needs an inkwell entry; a main
   // worktree without `.mcp.json` gets the default here too.
-  steps.push(ensureMcpJson(worktreePath, serverUrl));
+  // The channel plugin entry, when generated, points at the main worktree's
+  // copy, never at this worktree's (it may be unreviewed code).
+  steps.push(ensureMcpJson(worktreePath, serverUrl, options.mainRoot ?? worktreePath));
 
   // Identity: who works here. Written once; existing fields are kept.
   const identityPath = join(inkDir, 'identity.json');

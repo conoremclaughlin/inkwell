@@ -236,6 +236,46 @@ describe('completeStudio — a fresh linked worktree', () => {
   });
 });
 
+describe('completeStudio — a studio never points its MCP config at its own checkout', () => {
+  it("the generated inkmail entry names the main worktree's plugin, or nothing, never the studio's copy", async () => {
+    // The studio (possibly a PR under review) ships a channel plugin of its
+    // own; the main worktree's .mcp.json has inkwell but no inkmail, and the
+    // main worktree has no plugin built.
+    mkdirSync(join(studio, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(join(studio, 'packages', 'channel-plugin', 'index.ts'), '// untrusted');
+    writeFileSync(
+      join(main, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
+      })
+    );
+    await completeStudio(studio, baseOptions());
+    const mcp = readJson(join(studio, '.mcp.json')) as { mcpServers: Record<string, unknown> };
+    expect(JSON.stringify(mcp)).not.toContain(join(studio, 'packages', 'channel-plugin'));
+    expect(mcp.mcpServers.inkmail).toBeUndefined();
+  });
+
+  it('with the plugin built in the main worktree, the entry names that copy', async () => {
+    mkdirSync(join(studio, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(join(studio, 'packages', 'channel-plugin', 'index.ts'), '// untrusted');
+    mkdirSync(join(main, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(join(main, 'packages', 'channel-plugin', 'index.ts'), '// trusted');
+    writeFileSync(
+      join(main, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
+      })
+    );
+    await completeStudio(studio, baseOptions());
+    const mcp = readJson(join(studio, '.mcp.json')) as {
+      mcpServers: { inkmail?: { args?: string[] } };
+    };
+    expect(mcp.mcpServers.inkmail?.args?.at(-1)).toBe(
+      join(main, 'packages', 'channel-plugin', 'index.ts')
+    );
+  });
+});
+
 describe('completeStudio — the main worktree', () => {
   it('gets hooks and backend config but no identity, no registration and no default permissions', async () => {
     const opts = { ...baseOptions(), mainRoot: null };

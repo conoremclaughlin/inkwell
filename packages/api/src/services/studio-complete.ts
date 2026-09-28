@@ -40,6 +40,8 @@ export interface CompleteStudioViaCliOptions {
   timeoutMs?: number;
   /** For tests: the environment the CLI is resolved from and run with. */
   env?: NodeJS.ProcessEnv;
+  /** For tests: where the resolver looks for this checkout's build (default: this module's checkout). */
+  cliStartDir?: string;
 }
 
 export interface CompleteStudioViaCliResult {
@@ -83,7 +85,7 @@ export async function completeStudioViaCli(
   worktreePath: string,
   options: CompleteStudioViaCliOptions
 ): Promise<CompleteStudioViaCliResult> {
-  const cli = resolveInkCli({ env: options.env });
+  const cli = resolveInkCli({ env: options.env, startDir: options.cliStartDir });
   if (!cli) {
     const audit = auditStudio(worktreePath, { linked: true });
     logger.warn('Studio left incomplete: no ink CLI build to run ink init with', {
