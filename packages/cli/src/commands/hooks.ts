@@ -2311,12 +2311,22 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   // Auto-register CLI-created studio in the cloud if not yet tracked
   if (studioName && !studioId) {
     try {
+      let branch: string | undefined;
+      try {
+        branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf-8' }).trim();
+      } catch {
+        // Not a git repo — no branch to record
+      }
       const createArgs: Record<string, unknown> = {
         email: config?.email,
         sbSlug,
         repoRoot: repoRoot || cwd,
         slug: studioName,
         skipGitOperations: true,
+        // The worktree as it is: the server records this path and branch
+        // rather than inventing a sibling path from the slug (PR #692).
+        worktreePath: repoRoot || cwd,
+        ...(branch ? { branch } : {}),
       };
       if (role) createArgs.roleTemplate = role;
 

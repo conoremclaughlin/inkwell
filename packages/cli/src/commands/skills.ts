@@ -137,6 +137,15 @@ function injectMcpServers(
   mcpJsonPath: string,
   skills: ServerSkill[]
 ): { added: string[]; existed: string[] } {
+  // Never write through a link: a checkout can ship .mcp.json as a symlink
+  // to anywhere, and the write would land outside the worktree (Lumen,
+  // PR #604 for the settings file; PR #692 round 1 for this writer, which
+  // the studio completion routine now reaches on the server's behalf).
+  try {
+    if (lstatSync(mcpJsonPath).isSymbolicLink()) return { added: [], existed: [] };
+  } catch {
+    // Absent: handled below.
+  }
   let config: McpJsonConfig = { mcpServers: {} };
   if (existsSync(mcpJsonPath)) {
     try {

@@ -180,7 +180,13 @@ function setup() {
     repositories: {
       users: { findById: vi.fn(async () => ({ id: USER })) },
       memory: { getSession, findOwnedActiveSessions: vi.fn(async () => [own]) },
-      studios: { create, update, findById: vi.fn(async () => studio), linkSession },
+      studios: {
+        create,
+        update,
+        findById: vi.fn(async () => studio),
+        findByPath: vi.fn(async () => null),
+        linkSession,
+      },
       activityStream: { logActivity },
     },
   };

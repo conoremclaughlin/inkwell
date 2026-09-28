@@ -114,6 +114,23 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default(false)
     .describe('If true, skip git worktree creation (useful when worktree already exists)'),
+  worktreePath: z
+    .string()
+    .refine((p) => path.isAbsolute(p) && !p.includes('\0'), 'worktreePath must be an absolute path')
+    .optional()
+    .describe(
+      'With skipGitOperations: the worktree as it is. Recorded instead of a sibling path derived from the slug, and an existing row at this path is reused (a repair). Ignored when the server creates the worktree itself.'
+    ),
+  branch: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine(
+      (b) => !b.startsWith('-') && !/[\s~^:?*\[\\]/.test(b) && !b.includes('..'),
+      'branch must be a plausible git ref'
+    )
+    .optional()
+    .describe('With skipGitOperations: the branch the worktree is on. Ignored otherwise.'),
 });
 
 const listStudiosSchema = userIdentifierBaseSchema.extend({
@@ -723,10 +740,52 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     mainRoot = path.resolve(repoRoot);
   }
 
-  // Derive branch name and worktree path (sibling of the main repo root)
+  // Derive branch name and worktree path (sibling of the main repo root).
+  // With the git work already done, the row records the worktree AS IT IS:
+  // a bare checkout at any path or branch used to be recorded at an
+  // invented sibling path on a `feat` branch (Lumen, PR #692 round 1).
   const abbrev = WORK_TYPE_ABBREV[workType] || 'other';
-  const branch = `${actor.sbSlug}/${abbrev}/${slug}`;
-  const worktreePath = studioSiblingPath(mainRoot, slug);
+  const branch =
+    skipGitOperations && parsed.branch ? parsed.branch : `${actor.sbSlug}/${abbrev}/${slug}`;
+  const worktreePath =
+    skipGitOperations && parsed.worktreePath
+      ? path.resolve(parsed.worktreePath)
+      : studioSiblingPath(mainRoot, slug);
+
+  // A repair: the worktree already has a row. Reuse it rather than register
+  // a second studio at the same path.
+  if (skipGitOperations) {
+    const existing = await dataComposer.repositories.studios.findByPath(worktreePath, {
+      userId: resolved.user.id,
+    });
+    if (existing) {
+      logger.info('Studio already registered at this worktree; reusing the row', {
+        studioId: existing.id,
+        worktreePath,
+      });
+      return successResponse({
+        message: `Studio already registered at ${worktreePath}`,
+        reused: true,
+        studio: {
+          id: existing.id,
+          studioId: existing.id,
+          sbSlug: existing.sbSlug,
+          branch: existing.branch,
+          worktreeFolder: path.basename(existing.worktreePath),
+          worktreePath: existing.worktreePath,
+          repoRoot: existing.repoRoot,
+          baseBranch: existing.baseBranch,
+          purpose: existing.purpose,
+          workType: existing.workType,
+          roleTemplate: existing.roleTemplate,
+          defaultProjectId: existing.defaultProjectId,
+          status: existing.status,
+          sessionId: existing.sessionId,
+          createdAt: existing.createdAt,
+        },
+      });
+    }
+  }
 
   // Perform git operations if not skipped
   if (!skipGitOperations) {

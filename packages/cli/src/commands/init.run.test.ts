@@ -189,6 +189,20 @@ describe('runInit in a linked worktree', () => {
   });
 });
 
+describe('runInit from inside a package directory (Lumen, PR #692 round 1)', () => {
+  it('completes the worktree root, not the directory it was run from', async () => {
+    const nested = join(studio, 'packages', 'api');
+    mkdirSync(nested, { recursive: true });
+    const deps = stubs();
+    const report = await runInit(nested, { agent: 'wren' }, deps);
+    expect(report.worktreePath).toBe(studio);
+    expect(report.audit.complete, report.audit.missing.join(',')).toBe(true);
+    expect(existsSync(join(studio, '.ink', 'identity.json'))).toBe(true);
+    expect(existsSync(join(nested, '.ink'))).toBe(false);
+    expect(existsSync(join(nested, '.mcp.json'))).toBe(false);
+  });
+});
+
 describe('runInit in the main worktree', () => {
   it('installs hooks and backend config and leaves identity, registration and permissions alone', async () => {
     rmSync(join(main, '.claude'), { recursive: true, force: true });

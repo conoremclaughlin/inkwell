@@ -55,6 +55,9 @@ export interface RegisterStudioArgs {
   sbSlug: string;
   repoRoot: string;
   slug: string;
+  /** The worktree as it is; the server must record this, not invent a sibling path. */
+  worktreePath: string;
+  branch?: string;
   purpose?: string;
   roleTemplate?: string;
 }
@@ -261,6 +264,8 @@ export async function registerStudioRow(args: RegisterStudioArgs): Promise<strin
       repoRoot: args.repoRoot,
       slug: args.slug,
       skipGitOperations: true,
+      worktreePath: args.worktreePath,
+      ...(args.branch ? { branch: args.branch } : {}),
       ...(args.purpose ? { purpose: args.purpose } : {}),
       ...(args.roleTemplate ? { roleTemplate: args.roleTemplate } : {}),
     });
@@ -335,6 +340,11 @@ export async function completeStudio(
   // Identity: who works here. Written once; existing fields are kept.
   const identityPath = join(inkDir, 'identity.json');
   let identity = readJson(identityPath);
+  // A pre-rename file names its owner as agentId. That owner is kept: the
+  // caller's slug fills a MISSING owner, never replaces one (Lumen, PR #692).
+  if (identity && identity.sbSlug === undefined && typeof identity.agentId === 'string') {
+    identity.sbSlug = identity.agentId;
+  }
   if (!studioSetup) {
     steps.push({
       label: 'identity',
@@ -414,6 +424,8 @@ export async function completeStudio(
           sbSlug: typeof identity.sbSlug === 'string' ? identity.sbSlug : options.sbSlug,
           repoRoot: options.mainRoot,
           slug: typeof identity.studio === 'string' ? identity.studio : studioName,
+          worktreePath,
+          ...(options.branch ? { branch: options.branch } : {}),
           ...(options.purpose ? { purpose: options.purpose } : {}),
           ...(options.role ? { roleTemplate: options.role } : {}),
         });
@@ -528,11 +540,16 @@ export async function completeStudio(
   steps.push(hookStep(worktreePath, 'codex', options.force));
   steps.push(hookStep(worktreePath, 'gemini', options.force));
 
-  // Skills: best effort, needs the server.
-  try {
-    steps.push(await skills(worktreePath));
-  } catch {
-    steps.push({ label: 'skills sync', status: 'skipped', detail: 'error during sync' });
+  // Skills: best effort, needs the server. Not when .mcp.json was refused
+  // above (a link): the skills step writes that file too.
+  if (steps.some((s) => s.label === '.mcp.json' && s.status === 'failed')) {
+    steps.push({ label: 'skills sync', status: 'skipped', detail: '.mcp.json was refused' });
+  } else {
+    try {
+      steps.push(await skills(worktreePath));
+    } catch {
+      steps.push({ label: 'skills sync', status: 'skipped', detail: 'error during sync' });
+    }
   }
 
   return { worktreePath, linked, steps, audit: auditStudio(worktreePath, { linked }) };

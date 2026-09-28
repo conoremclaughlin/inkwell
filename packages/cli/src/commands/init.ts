@@ -116,14 +116,18 @@ export async function runInit(
   deps: InitDeps = {}
 ): Promise<CompleteStudioReport> {
   const placement = (deps.placement ?? detectWorktree)(cwd);
-  const identity = readIdentityJson(cwd);
+  // The worktree is completed at its root: run from packages/api, the
+  // identity and config belong at the top level, not beside the package
+  // (Lumen, PR #692 round 1).
+  const target = placement.toplevel ?? cwd;
+  const identity = readIdentityJson(target);
   const sbSlug = options.agent || identity?.sbSlug || resolveSlug() || 'sb';
-  return completeStudio(cwd, {
+  return completeStudio(target, {
     sbSlug,
     mainRoot: placement.mainRoot,
     rootSync: options.rootSync !== false,
     studioSetup: options.studioSetup !== false,
-    ...(placement.linked ? { studioName: studioNameFromPath(cwd) } : {}),
+    ...(placement.linked ? { studioName: studioNameFromPath(target) } : {}),
     ...(placement.branch ? { branch: placement.branch } : {}),
     ...(options.purpose ? { purpose: options.purpose } : {}),
     ...(options.studioId ? { studioId: options.studioId } : {}),

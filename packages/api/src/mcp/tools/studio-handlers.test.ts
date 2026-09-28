@@ -119,7 +119,11 @@ describe('handleCreateStudio completes the studio through the routine', () => {
   const dataComposer = {
     getClient: () => ({}),
     repositories: {
-      studios: { create: studiosCreate, update: vi.fn(async () => ({})) },
+      studios: {
+        create: studiosCreate,
+        update: vi.fn(async () => ({})),
+        findByPath: vi.fn(async () => null),
+      },
       projects: { findById: vi.fn() },
       activityStream: { logActivity: vi.fn(async () => ({})) },
     },
@@ -339,7 +343,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const dc = {
       getClient: () => ({}),
       repositories: {
-        studios: { create, update, findById, linkSession },
+        studios: { create, update, findById, findByPath: vi.fn(async () => null), linkSession },
         projects: { findById: vi.fn() },
         activityStream: { logActivity },
         memory: { getSession },
