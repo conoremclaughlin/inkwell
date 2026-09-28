@@ -17,8 +17,8 @@ import type { DataComposer } from '../../data/composer';
 import type { Json } from '../../data/supabase/types';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
-import { ensureStudioSettings } from '../../services/studio-settings';
+import { isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
+import { completeStudioViaCli, ensureStudioComplete } from '../../services/studio-complete';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { resolveCaller, resolveImplicitSession } from './memory-handlers';
 import {
@@ -751,46 +751,11 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
           maxBuffer: 20 * 1024 * 1024,
         });
       }
-
-      // Seed local config the same way `ink studio new` does. .mcp.json and
-      // .env.local are gitignored, so `git worktree add` brings neither —
-      // without this the studio has no MCP config at all: Claude sessions get
-      // no tools, and Codex spawns against a partial [mcp_servers.inkwell]
-      // and dies on "invalid transport". Copy from the resolved main root, not
-      // the caller's repoRoot — a linked-worktree caller would otherwise seed
-      // the new studio from its own (possibly customised or missing) config.
-      // Best-effort; a studio that fails to bootstrap is still a usable
-      // worktree.
-      try {
-        const result = bootstrapStudio(mainRoot, worktreePath);
-        logger.info('Bootstrapped studio config', {
-          worktreePath,
-          copied: result.copied,
-          codex: result.codex,
-          gemini: result.gemini,
-        });
-      } catch (bootstrapError) {
-        logger.warn('Studio config bootstrap failed', {
-          worktreePath,
-          error: bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError),
-        });
-      }
     } catch (gitError) {
       const errorMessage = gitError instanceof Error ? gitError.message : String(gitError);
       logger.error('Git worktree creation failed', { error: errorMessage, branch, worktreePath });
       return errorResponse(`Failed to create git worktree: ${errorMessage}`);
     }
-  }
-
-  // Generate .claude/settings.local.json with default permissions + hooks
-  try {
-    await ensureStudioSettings(worktreePath);
-  } catch (settingsError) {
-    // Non-fatal — studio is usable without auto-generated settings
-    logger.warn('Failed to generate studio settings', {
-      worktreePath,
-      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
-    });
   }
 
   // Insert studio record into the database
@@ -829,6 +794,19 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     }
     const errorMessage = dbError instanceof Error ? dbError.message : String(dbError);
     return errorResponse(`Failed to save studio record: ${errorMessage}`);
+  }
+
+  // The one routine every creator runs (task c3b34be8): `ink init` in the
+  // new worktree with the row it now has — identity, permissions, hooks and
+  // backend config for every backend, root config synced from the main
+  // worktree. A CLI-created studio registering its row (skipGitOperations)
+  // has already run it itself.
+  if (!skipGitOperations) {
+    await completeStudioViaCli(worktreePath, {
+      sbSlug: actor.sbSlug,
+      studioId: studio.id,
+      ...(purpose ? { purpose } : {}),
+    });
   }
 
   const provenance = await recordStudioProvenance(dataComposer, {
@@ -1361,15 +1339,12 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     );
   }
 
-  // Ensure settings exist in the worktree (may be first time adopting an old studio)
-  try {
-    await ensureStudioSettings(studio.worktreePath);
-  } catch (settingsError) {
-    logger.warn('Failed to ensure studio settings on adopt', {
-      worktreePath: studio.worktreePath,
-      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
-    });
-  }
+  // An old studio may predate the checklist: complete it now, cheaply when
+  // it is already complete.
+  await ensureStudioComplete(studio.worktreePath, {
+    sbSlug: studio.sbSlug ?? actor.sbSlug,
+    studioId: studio.id,
+  });
 
   // Link session and set to active
   let updated = await studiosRepo.linkSession(studio.id, sessionId);

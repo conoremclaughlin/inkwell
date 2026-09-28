@@ -20,7 +20,10 @@ import { runWithRequestContext } from '../../utils/request-context';
 import { StudiosRepository } from '../../data/repositories/studios.repository';
 import { makeFakeSupabase, type Row } from '../../services/sessions/fake-supabase';
 
-vi.mock('../../services/studio-settings', () => ({ ensureStudioSettings: vi.fn() }));
+vi.mock('../../services/studio-complete', () => ({
+  completeStudioViaCli: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+}));
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));

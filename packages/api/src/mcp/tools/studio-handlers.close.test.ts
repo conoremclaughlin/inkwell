@@ -29,7 +29,10 @@ vi.mock('../../services/user-resolver', async (original) => ({
   ...(await original<typeof import('../../services/user-resolver')>()),
   resolveUserOrThrow: vi.fn(async () => ({ user: { id: 'user-1' } })),
 }));
-vi.mock('../../services/studio-settings', () => ({ ensureStudioSettings: vi.fn() }));
+vi.mock('../../services/studio-complete', () => ({
+  completeStudioViaCli: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+}));
 vi.mock('./inbox-handlers', () => ({ findOrCreateThread: vi.fn() }));
 vi.mock('../../services/sessions/thread-assignment', () => ({ assignThreadParticipant: vi.fn() }));
 // Mirror the production memory-handler wrapper; keep the actual shared

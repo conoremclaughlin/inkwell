@@ -45,6 +45,7 @@ import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { resolveSlug, normalizeIdentityJson } from '../backends/identity.js';
 import { registerStudioSandboxCommands } from './studio-sandbox.js';
 import { copyBootstrapFiles, syncMcpConfig } from '@inklabs/shared';
+import { completeStudio, type CompleteStudioReport } from '../lib/studio-complete.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -278,14 +279,11 @@ interface InteractiveResult {
   inheritClaudePermissions: boolean;
 }
 
-interface HooksInstallSummary {
-  backend: string;
-  result: 'installed' | 'already-installed' | 'conflict';
-}
-
 interface StudioCreateResult {
-  hooks: HooksInstallSummary[];
-  copiedClaudePermissions: boolean;
+  /** The completion routine's report: every step and the checklist audit. */
+  report: CompleteStudioReport;
+  /** Whether `yarn install` ran in the new worktree. */
+  installed: boolean;
 }
 
 function slugifyStudioNameForBranch(name: string): string {
@@ -392,54 +390,6 @@ function copyConfigDirs(sourceRoot: string, wsPath: string, dirs: string[]): voi
       cpSync(source, target, { recursive: true });
     }
   }
-}
-
-function copyClaudePermissionsFromSource(sourceRoot: string, wsPath: string): boolean {
-  const sourceSettingsPath = join(sourceRoot, '.claude', 'settings.local.json');
-  if (!existsSync(sourceSettingsPath)) return false;
-
-  let sourceSettings: Record<string, unknown>;
-  try {
-    sourceSettings = JSON.parse(readFileSync(sourceSettingsPath, 'utf-8')) as Record<
-      string,
-      unknown
-    >;
-  } catch {
-    return false;
-  }
-
-  if (!('permissions' in sourceSettings)) return false;
-
-  const targetClaudeDir = join(wsPath, '.claude');
-  const targetSettingsPath = join(targetClaudeDir, 'settings.local.json');
-  mkdirSync(targetClaudeDir, { recursive: true });
-
-  let targetSettings: Record<string, unknown> = {};
-  if (existsSync(targetSettingsPath)) {
-    try {
-      targetSettings = JSON.parse(readFileSync(targetSettingsPath, 'utf-8')) as Record<
-        string,
-        unknown
-      >;
-    } catch {
-      targetSettings = {};
-    }
-  }
-
-  const merged = {
-    ...targetSettings,
-    permissions: sourceSettings.permissions,
-  };
-  writeFileSync(targetSettingsPath, JSON.stringify(merged, null, 2) + '\n');
-  return true;
-}
-
-function installHooksForAllBackends(wsPath: string): HooksInstallSummary[] {
-  const backends = ['claude-code', 'codex', 'gemini'] as const;
-  return backends.map((backendName) => {
-    const { result, backend } = installHooks(wsPath, { backend: backendName });
-    return { backend: backend.name, result };
-  });
 }
 
 function resolveCopySourceRoot(gitRoot: string, copyFrom?: string): string {
@@ -756,6 +706,7 @@ async function createStudio(
     configDirs?: string;
     copyFrom?: string;
     inheritClaudePermissions?: boolean;
+    install?: boolean;
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
@@ -790,10 +741,28 @@ async function createStudio(
       const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
       console.log(chalk.dim('  Source: ') + copySourceRoot);
     }
-    const hookSummary = createResult.hooks.map((h) => `${h.backend}:${h.result}`).join(', ');
+    const { report } = createResult;
+    const hookSummary = report.steps
+      .filter((s) => s.label.startsWith('hooks ('))
+      .map((s) => `${s.label.slice('hooks ('.length, -1)}:${s.status}`)
+      .join(', ');
     console.log(chalk.dim('  Hooks:  ') + hookSummary);
-    if (createResult.copiedClaudePermissions) {
-      console.log(chalk.dim('  Claude: ') + 'permissions inherited from source settings');
+    const permissions = report.steps.find((s) => s.label === 'permissions');
+    if (permissions?.detail) {
+      console.log(chalk.dim('  Claude: ') + `permissions ${permissions.detail}`);
+    }
+    const registration = report.steps.find((s) => s.label === 'registration');
+    if (registration) {
+      console.log(chalk.dim('  Studio: ') + (registration.detail || registration.status));
+    }
+    if (createResult.installed) {
+      console.log(chalk.dim('  Deps:   ') + 'installed');
+    }
+    if (!report.audit.complete) {
+      console.log(
+        chalk.yellow(`  Incomplete: ${report.audit.missing.join(', ')}`) +
+          chalk.dim(' — run ink init inside the studio to repair')
+      );
     }
     console.log('');
     console.log(chalk.cyan('To start working:'));
@@ -891,6 +860,8 @@ async function createStudioInner(
     configDirs?: string;
     copyFrom?: string;
     inheritClaudePermissions?: boolean;
+    /** commander: `--no-install` sets install=false; absent means true. */
+    install?: boolean;
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<StudioCreateResult> {
@@ -923,76 +894,47 @@ async function createStudioInner(
     git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
   }
 
-  // Order is load-bearing: copyConfigDirs skips copying stale .codex/.gemini
-  // only when .mcp.json is already present, so the bootstrap copy must land
-  // first. That's why this calls the two shared steps around copyConfigDirs
-  // rather than using bootstrapStudio() — the server has no config-dirs step
-  // and uses the combined helper instead. Both paths share the same logic.
+  // Local config first, then the optional config-dir copy: copyConfigDirs
+  // skips stale .codex/.gemini only when .mcp.json is already present, and
+  // the completion routine below regenerates them from it anyway.
   copyBootstrapFiles(copySourceRoot, wsPath);
-
-  // Config dirs
   const configDirsList =
     overrides?.configDirsList ??
     (options.copyConfig ? (options.configDirs || '.claude').split(',').map((s) => s.trim()) : []);
-
   if (configDirsList.length > 0) {
     copyConfigDirs(copySourceRoot, wsPath, configDirsList);
   }
 
-  // Sync MCP config
-  if (existsSync(join(wsPath, '.mcp.json'))) {
-    try {
-      syncMcpConfig(wsPath);
-    } catch {
-      // Not critical
-    }
+  if (roleContent) {
+    mkdirSync(join(wsPath, '.ink'), { recursive: true });
+    writeFileSync(join(wsPath, '.ink', 'ROLE.md'), roleContent);
   }
 
-  // Inkwell identity
-  const inkDir = join(wsPath, '.ink');
-  mkdirSync(inkDir, { recursive: true });
-
-  let sbId: string | undefined;
-  const auth = loadAuth();
-  if (auth && !isTokenExpired(auth)) {
-    const payload = decodeJwtPayload(auth.access_token);
-    if (payload?.identityId) {
-      sbId = payload.identityId;
-    }
-  }
-
-  const identity: StudioIdentity = {
+  // The one routine every creator runs (task c3b34be8): identity, the
+  // studio row, permissions, hooks and backend config for every backend,
+  // then the checklist. The server's create_studio runs the same routine
+  // through `ink init`.
+  const report = await completeStudio(wsPath, {
     sbSlug,
-    ...(sbId ? { sbId } : {}),
-    context: `studio-${name}`,
+    mainRoot: copySourceRoot,
+    rootSync: true,
+    inheritPermissions: options.inheritClaudePermissions !== false,
+    studioSetup: true,
+    studioName: name,
+    ...(options.purpose ? { purpose: options.purpose } : {}),
+    branch,
     ...(options.backend ? { backend: options.backend } : {}),
     ...(options.template ? { role: options.template } : {}),
-    studio: name,
-    description: options.purpose || `Studio: ${name}`,
-    branch,
-    createdAt: new Date().toISOString(),
-    createdBy: getCurrentUser(),
-  };
+  });
 
-  writeFileSync(join(inkDir, 'identity.json'), JSON.stringify(identity, null, 2));
-
-  if (roleContent) {
-    writeFileSync(join(inkDir, 'ROLE.md'), roleContent);
+  // Dependencies, as the server's creators do after a worktree add.
+  let installed = false;
+  if (options.install !== false && existsSync(join(wsPath, 'package.json'))) {
+    execSync('yarn install', { cwd: wsPath, stdio: 'ignore' });
+    installed = true;
   }
 
-  // Install hooks for all backends (claude, codex, gemini) in every studio.
-  const hookResults = installHooksForAllBackends(wsPath);
-
-  // Optionally carry over Claude permissions from source settings.
-  const copiedClaudePermissions =
-    options.inheritClaudePermissions !== false
-      ? copyClaudePermissionsFromSource(copySourceRoot, wsPath)
-      : false;
-
-  return {
-    hooks: hookResults,
-    copiedClaudePermissions,
-  };
+  return { report, installed };
 }
 
 async function renameStudio(from: string, to: string): Promise<void> {
@@ -1445,8 +1387,6 @@ export {
   resolveRoleTemplate,
   listRoleTemplates,
   isValidTemplateName,
-  copyClaudePermissionsFromSource,
-  installHooksForAllBackends,
   BUILTIN_ROLE_TEMPLATES,
   getDefaultStudioMainBranch,
   planStudioHomeBranchRename,
@@ -1544,6 +1484,7 @@ export function registerStudioCommands(program: Command): void {
       '--no-inherit-claude-permissions',
       'Do not copy .claude/settings.local.json permissions from the source worktree'
     )
+    .option('--no-install', 'Skip yarn install in the new studio')
     .action(async (name: string | undefined, options) => {
       if (!name && process.stdin.isTTY) {
         // Interactive mode: prompt for all values

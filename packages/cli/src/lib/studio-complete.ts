@@ -40,7 +40,8 @@ import {
   DEFAULT_CLAUDE_DENY_RULES,
   type StudioAudit,
 } from '@inklabs/shared';
-import { installHooks } from '../commands/hooks.js';
+import { installHooks, callInkTool } from '../commands/hooks.js';
+import { syncSkills as syncSkillsFromServer } from '../commands/skills.js';
 import { resolveChannelPluginPath } from './skill-mcp.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 
@@ -64,6 +65,8 @@ export interface CompleteStudioOptions {
   mainRoot: string | null;
   /** Copy local config and permissions from the main worktree (default true). */
   rootSync?: boolean;
+  /** Copy the Claude permissions from the main worktree (default: rootSync). */
+  inheritPermissions?: boolean;
   /** Write identity and register the studio row (default true). */
   studioSetup?: boolean;
   /** The studio's name; defaults to the worktree folder's suffix after `--`. */
@@ -228,11 +231,58 @@ function hookStep(
   }
 }
 
+/**
+ * The default registration: the same call the on-session-start hook makes
+ * for a studio that has a name but no row — create_studio with the git
+ * work already done. Null when the server cannot be reached or refuses.
+ */
+export async function registerStudioRow(args: RegisterStudioArgs): Promise<string | null> {
+  try {
+    const created = await callInkTool('create_studio', {
+      email: currentUser(),
+      sbSlug: args.sbSlug,
+      repoRoot: args.repoRoot,
+      slug: args.slug,
+      skipGitOperations: true,
+      ...(args.purpose ? { purpose: args.purpose } : {}),
+      ...(args.roleTemplate ? { roleTemplate: args.roleTemplate } : {}),
+    });
+    const studio = (created.studio || created.workspace) as Record<string, unknown> | undefined;
+    return studio && typeof studio.id === 'string' ? studio.id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The default skills step: the server's MCP skills, best effort. */
+async function skillsStep(cwd: string): Promise<StepResult> {
+  try {
+    const result = await syncSkillsFromServer(cwd);
+    if (result.serverUnreachable) {
+      return { label: 'skills sync', status: 'skipped', detail: 'server not reachable' };
+    }
+    if (result.written > 0 || result.linked > 0) {
+      return {
+        label: 'skills sync',
+        status: 'created',
+        detail: `${result.written} written, ${result.linked} symlinked`,
+      };
+    }
+    if (result.skipped > 0)
+      return { label: 'skills sync', status: 'exists', detail: 'all up to date' };
+    return { label: 'skills sync', status: 'skipped', detail: 'no MCP skills on server' };
+  } catch {
+    return { label: 'skills sync', status: 'skipped', detail: 'error during sync' };
+  }
+}
+
 export async function completeStudio(
   worktreePath: string,
   options: CompleteStudioOptions
 ): Promise<CompleteStudioReport> {
   const linked = options.mainRoot !== null;
+  const register = options.register ?? registerStudioRow;
+  const skills = options.syncSkills ?? skillsStep;
   const rootSync = linked && options.rootSync !== false;
   const studioSetup = linked && options.studioSetup !== false;
   const serverUrl = options.serverUrl || defaultServerUrl();
@@ -338,10 +388,10 @@ export async function completeStudio(
     let studioId: string | null =
       options.studioId && UUID.test(options.studioId) ? options.studioId : null;
     let via = 'recorded';
-    if (!studioId && options.register && options.mainRoot) {
+    if (!studioId && options.mainRoot) {
       via = 'registered';
       try {
-        studioId = await options.register({
+        studioId = await register({
           sbSlug: typeof identity.sbSlug === 'string' ? identity.sbSlug : options.sbSlug,
           repoRoot: options.mainRoot,
           slug: typeof identity.studio === 'string' ? identity.studio : studioName,
@@ -393,7 +443,7 @@ export async function completeStudio(
       });
     } else {
       const mainSettings =
-        rootSync && options.mainRoot
+        (options.inheritPermissions ?? rootSync) && options.mainRoot
           ? readJson(join(options.mainRoot, '.claude', 'settings.local.json'))
           : null;
       const mainPermissions = mainSettings?.permissions as Record<string, unknown> | undefined;
@@ -460,12 +510,10 @@ export async function completeStudio(
   steps.push(hookStep(worktreePath, 'gemini', options.force));
 
   // Skills: best effort, needs the server.
-  if (options.syncSkills) {
-    try {
-      steps.push(await options.syncSkills(worktreePath));
-    } catch {
-      steps.push({ label: 'skills sync', status: 'skipped', detail: 'error during sync' });
-    }
+  try {
+    steps.push(await skills(worktreePath));
+  } catch {
+    steps.push({ label: 'skills sync', status: 'skipped', detail: 'error during sync' });
   }
 
   return { worktreePath, linked, steps, audit: auditStudio(worktreePath, { linked }) };

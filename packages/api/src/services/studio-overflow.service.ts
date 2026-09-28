@@ -57,10 +57,10 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { access, lstat, rm } from 'fs/promises';
-import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
+import { isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
 import { ephemeralWorktreePath } from './studio-paths';
-import { ensureStudioSettings } from './studio-settings';
+import { completeStudioViaCli } from './studio-complete';
 import {
   StudioLeaseService,
   captureWorktreeState,
@@ -568,6 +568,11 @@ export class StudioOverflowService {
           // the derived fallback is null and reuse-by-slug silently breaks.
           slug: s.slug,
         });
+        await completeStudioViaCli(created.worktreePath, {
+          sbSlug,
+          studioId: studio.id,
+          purpose: studio.purpose ?? undefined,
+        });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
           sbSlug,
@@ -730,6 +735,11 @@ export class StudioOverflowService {
         defaultProjectId: seed?.defaultProjectId ?? null,
         metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
       });
+      await completeStudioViaCli(created.worktreePath, {
+        sbSlug,
+        studioId: studio.id,
+        purpose: studio.purpose ?? undefined,
+      });
       logger.info('[StudioOverflow] Created parent studio', {
         studioId: studio.id,
         slug: studio.slug,
@@ -800,7 +810,7 @@ export class StudioOverflowService {
           return null;
         }
       }
-      return this.finishWorktreeSetup(mainRoot, worktreePath, branch, undefined, {
+      return this.finishWorktreeSetup(worktreePath, branch, undefined, {
         installDependencies: true,
       });
     }
@@ -921,7 +931,6 @@ export class StudioOverflowService {
     // sentinel says "no branch, cut from <ref>" and can never collide with
     // branch-based routing lookups.
     return this.finishWorktreeSetup(
-      mainRoot,
       worktreePath,
       `detached:${label}`,
       { mode: 'detached', ref: label, commit },
@@ -938,7 +947,6 @@ export class StudioOverflowService {
   }
 
   private async finishWorktreeSetup(
-    mainRoot: string,
     worktreePath: string,
     branch: string,
     checkout: DetachedCheckout | undefined,
@@ -963,16 +971,9 @@ export class StudioOverflowService {
       );
     }
 
-    try {
-      bootstrapStudio(mainRoot, worktreePath);
-    } catch (err) {
-      logger.warn('[StudioOverflow] bootstrapStudio failed (non-fatal)', {
-        worktreePath,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    await ensureStudioSettings(worktreePath).catch(() => undefined);
-
+    // Completion (identity, permissions, hooks, backend config) runs once the
+    // studio row exists, so the worktree can carry its own id: see the two
+    // callers.
     return checkout ? { worktreePath, branch, checkout } : { worktreePath, branch };
   }
 
