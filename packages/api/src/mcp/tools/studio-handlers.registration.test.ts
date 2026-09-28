@@ -113,7 +113,12 @@ function composer(
           rows.push(args);
           return { ...args, id: ROW_ID };
         }),
-        update: vi.fn(async () => ({})),
+        // The repository applies the patch it receives and returns the row;
+        // the mock does the same so the handler's response is the row as
+        // persisted, not a synthesis.
+        update: vi.fn(async (_id: string, patch: Record<string, unknown>) =>
+          existing ? Object.assign(existing, patch) : {}
+        ),
         findByPath: vi.fn(async () => existing),
       },
       activityStream: { logActivity: vi.fn(async () => ({})) },
@@ -320,6 +325,69 @@ describe('registration reuse boundaries (Lumen, PR #692 round 2)', () => {
           ? rows[0].slug
           : deriveStudioSlug(rows[0].worktreePath as string);
       expect(persisted).toBe('chosen-name');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Round 3 (Lumen): reviving by status alone left an expired ephemeral row
+ * with its old expiry, so listExpiredEphemeral selected it at once and the
+ * sweep would have torn the recreated worktree down before any session
+ * acquired it. Revival must tell one coherent story: the row describes THIS
+ * checkout, is not cleaned or archived, and is not already expired.
+ */
+describe('revival is coherent (Lumen, PR #692 round 3)', () => {
+  it('does not revive a recreated ephemeral worktree directly back into expiry eligibility', async () => {
+    const { base, main, actual } = fixture();
+    const rows: Record<string, unknown>[] = [];
+    const existing: Record<string, unknown> = {
+      id: '00000000-0000-4000-8000-000000000777',
+      userId: '00000000-0000-0000-0000-000000000001',
+      sbSlug: 'wren',
+      sbId: null,
+      worktreePath: actual,
+      repoRoot: main,
+      branch: 'wren/fix/old',
+      status: 'cleaned',
+      ephemeral: true,
+      cleanedAt: '2000-01-01T00:00:00.000Z',
+      archivedAt: null,
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      lease: null,
+    };
+    const dc = composer(rows, existing);
+    try {
+      const result = await handleCreateStudio(
+        {
+          sbSlug: 'wren',
+          repoRoot: main,
+          slug: 'fixture',
+          worktreePath: actual,
+          branch: 'wren/fix/existing',
+          skipGitOperations: true,
+        },
+        dc
+      );
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.success).toBe(true);
+      expect(payload.revived).toBe(true);
+      // listExpiredEphemeral's exact filters plus the sweep's vacant-row
+      // selection, evaluated on the persisted state; no sweep runs here.
+      const immediatelyEligible =
+        existing.ephemeral === true &&
+        ['active', 'idle'].includes(existing.status as string) &&
+        existing.expiresAt !== null &&
+        Date.parse(existing.expiresAt as string) <= Date.now() &&
+        existing.lease === null;
+      expect(immediatelyEligible).toBe(false);
+      // The row describes this checkout, and the response is the row as persisted.
+      expect(existing.branch).toBe('wren/fix/existing');
+      expect(existing.cleanedAt).toBeNull();
+      expect(existing.status).toBe('active');
+      expect(payload.studio.branch).toBe('wren/fix/existing');
+      expect(payload.studio.status).toBe('active');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

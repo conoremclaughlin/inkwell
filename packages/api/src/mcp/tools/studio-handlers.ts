@@ -769,10 +769,24 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     const existing = candidate && !studioOwnershipMismatch(candidate, actor) ? candidate : null;
     if (existing) {
       const revived = existing.status === 'cleaned' || existing.status === 'archived';
-      if (revived) {
-        await dataComposer.repositories.studios.update(existing.id, { status: 'active' });
-      }
-      const studio = revived ? { ...existing, status: 'active' as const } : existing;
+      // Revival tells one coherent story, as the overflow service's does:
+      // the row describes THIS checkout, is neither cleaned nor archived,
+      // and an ephemeral one gets a fresh expiry — status alone would have
+      // left an expired ephemeral row eligible for the sweep's teardown the
+      // moment it came back (Lumen, PR #692 round 3). The response carries
+      // the row as persisted.
+      const studio = revived
+        ? await dataComposer.repositories.studios.update(existing.id, {
+            status: 'active',
+            worktreePath,
+            branch,
+            cleanedAt: null,
+            archivedAt: null,
+            expiresAt: existing.ephemeral
+              ? new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString()
+              : null,
+          })
+        : existing;
       logger.info(
         revived
           ? 'Studio row at this worktree revived for the caller'
