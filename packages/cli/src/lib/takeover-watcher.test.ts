@@ -840,12 +840,14 @@ describe('per-owner epoch record files (task c07f35c8)', () => {
     expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toMatchObject({
       turnEpoch: 'e-new',
     });
-    // Migration is monotonic (Lumen, PR #691 round 1): the owner's own write
-    // retired its legacy copy at once, so an acknowledged new turn can never
-    // resurrect the older epoch.
-    expect(existsSync(legacy)).toBe(false);
+    // Migration is monotonic (Lumen, PR #691 rounds 1-2): the legacy file is
+    // shared and is never deleted by the new writer; the owner's namespace
+    // shadows it instead, and the shadow survives the owner's own cleanup,
+    // so an acknowledged new turn can never resurrect the older epoch.
+    expect(existsSync(legacy)).toBe(true);
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-new', wrapperGeneration: 'gen-1' });
     expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toBeNull();
+    expect(existsSync(legacy)).toBe(true);
     // A fully generation-less pair still matches (older hooks); a generation
     // never matches a generation-less record, nor the reverse.
     writeFileSync(
@@ -919,18 +921,20 @@ describe('migration is monotonic (Lumen, PR #691 round 1)', () => {
     }
   );
 
-  it("an owner's own write retires its legacy copy, and a foreign legacy record is left alone", async () => {
+  it("an owner's own write shadows its legacy copy without deleting it, and a foreign legacy record is left alone", async () => {
     const { cliTurnEpochPath, writeCliTurnEpoch, readCliTurnEpoch } =
       await import('./takeover-watcher.js');
     await seedLegacy();
     expect(writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' })).toBe(true);
-    expect(existsSync(cliTurnEpochPath(dir))).toBe(false);
+    // The shared file is not this writer's to delete (round 2): it stays, shadowed.
+    expect(existsSync(cliTurnEpochPath(dir))).toBe(true);
     expect(readCliTurnEpoch(dir, owner)).toMatchObject({ turnEpoch: 'epoch-new' });
-    // Another owner's legacy record is not this owner's to retire.
+    // Another owner's legacy record is neither read nor touched.
     const other = { sessionId: '55555555-5555-4555-8555-555555555555' };
     writeFileSync(cliTurnEpochPath(dir), JSON.stringify({ ...other, turnEpoch: 'epoch-other' }));
     writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-newer' });
     expect(readCliTurnEpoch(dir, other)).toMatchObject({ turnEpoch: 'epoch-other' });
+    expect(readCliTurnEpoch(dir, owner)).toMatchObject({ turnEpoch: 'epoch-newer' });
   });
 
   it('an acknowledged new turn never resurrects an older legacy epoch', async () => {
