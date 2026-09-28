@@ -75,7 +75,9 @@
 #   sh scripts/db-migrate.sh safe-origin <url>
 #
 # `--for`, `safe-origin` and `is-window` need node on the PATH (the URL
-# parser); `apply`, `status` and `scan` do not.
+# parser); `apply`, `status` and `scan` do not. psql is needed by `apply`,
+# `pending` and `status`, which ask for it before any other call; `scan`,
+# `is-window` and `safe-origin` run without it and without the Supabase CLI.
 #
 # DB_MIGRATE_URL, when set, is used instead of asking `supabase status`. It
 # exists for the integration test (a disposable database) and for a stack
@@ -173,8 +175,6 @@ fi
 here=$(cd "$(dirname "$0")" && pwd -P) || die "cannot locate the scripts directory"
 guard="$here/lib/sql-transaction-control.awk"
 [ -f "$guard" ] || die "missing $guard"
-command -v psql >/dev/null 2>&1 ||
-  die "psql not found on PATH; install it (brew install libpq && brew link --force libpq)"
 common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not inside a git checkout"
 root=$(cd "$common/.." && pwd -P) || die "could not resolve the repository root from $common"
 checkout=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git work tree"
@@ -182,6 +182,16 @@ checkout=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git w
 need_cli() {
   command -v supabase >/dev/null 2>&1 ||
     die "Supabase CLI not found on PATH (https://supabase.com/docs/guides/cli/getting-started)"
+}
+
+# psql runs the transaction, the ledger read and the connection every DB mode
+# uses: apply, pending and status ask for it, before any other call. scan,
+# is-window and safe-origin judge files and URLs with no database executable,
+# so a machine without psql (a CI runner, a laptop before libpq) runs them
+# (Lumen, PR #688 review).
+need_psql() {
+  command -v psql >/dev/null 2>&1 ||
+    die "psql not found on PATH; install it (brew install libpq && brew link --force libpq)"
 }
 
 # Paths are compared physically (pwd -P): git reports the real path of the
@@ -375,6 +385,7 @@ case "$mode" in
       shift
     fi
     [ "$#" -ge 1 ] || usage
+    need_psql
     connect
     status=0
     for f in "$@"; do
@@ -396,6 +407,7 @@ case "$mode" in
         *) usage ;;
       esac
     done
+    need_psql
     need_cli
     if [ -n "$expect" ]; then
       # Prove the stack before anything else, and bind the connection to the
@@ -458,6 +470,7 @@ case "$mode" in
     ;;
   status)
     [ "$#" -eq 0 ] || usage
+    need_psql
     connect
     need_cli
     # The CLI prints a table: local version | remote version | time. Bound to
