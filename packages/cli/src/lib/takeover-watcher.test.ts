@@ -835,19 +835,17 @@ describe('per-owner epoch record files (task c07f35c8)', () => {
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-legacy', wrapperGeneration: 'gen-2' });
     clearCliTurnEpoch(dir, 's2', { turnEpoch: 'e-legacy', wrapperGeneration: 'gen-1' });
     expect(existsSync(legacy)).toBe(true);
-    // An owner-format record wins over the legacy file, which stays untouched.
+    // An owner-format record wins over the legacy file.
     writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-new', wrapperGeneration: 'gen-1' });
     expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toMatchObject({
       turnEpoch: 'e-new',
     });
-    expect(JSON.parse(readFileSync(legacy, 'utf-8'))).toMatchObject({ turnEpoch: 'e-legacy' });
-    // The exact owner retires its legacy evidence once its own record is gone.
-    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-new', wrapperGeneration: 'gen-1' });
-    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toMatchObject({
-      turnEpoch: 'e-legacy',
-    });
-    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-legacy', wrapperGeneration: 'gen-1' });
+    // Migration is monotonic (Lumen, PR #691 round 1): the owner's own write
+    // retired its legacy copy at once, so an acknowledged new turn can never
+    // resurrect the older epoch.
     expect(existsSync(legacy)).toBe(false);
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-new', wrapperGeneration: 'gen-1' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toBeNull();
     // A fully generation-less pair still matches (older hooks); a generation
     // never matches a generation-less record, nor the reverse.
     writeFileSync(
@@ -888,5 +886,111 @@ describe('per-owner epoch record files (task c07f35c8)', () => {
     expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-b' })).toMatchObject({
       turnEpoch: 'e-B',
     });
+  });
+});
+
+describe('migration is monotonic (Lumen, PR #691 round 1)', () => {
+  const owner = {
+    sessionId: '11111111-1111-4111-8111-111111111111',
+    wrapperGeneration: '22222222-2222-4222-8222-222222222222',
+  };
+  const seedLegacy = async () => {
+    const { cliTurnEpochPath } = await import('./takeover-watcher.js');
+    writeFileSync(cliTurnEpochPath(dir), JSON.stringify({ ...owner, turnEpoch: 'epoch-old' }));
+  };
+
+  it.each([
+    ['malformed', '{broken'],
+    [
+      'foreign',
+      JSON.stringify({
+        ...owner,
+        sessionId: '33333333-3333-4333-8333-333333333333',
+        turnEpoch: 'x',
+      }),
+    ],
+  ])(
+    'an existing owner file that is %s never falls back to a valid legacy record',
+    async (_k, body) => {
+      const { cliTurnEpochPath, readCliTurnEpoch } = await import('./takeover-watcher.js');
+      await seedLegacy();
+      writeFileSync(cliTurnEpochPath(dir, owner), body);
+      expect(readCliTurnEpoch(dir, owner)).toBeNull();
+    }
+  );
+
+  it("an owner's own write retires its legacy copy, and a foreign legacy record is left alone", async () => {
+    const { cliTurnEpochPath, writeCliTurnEpoch, readCliTurnEpoch } =
+      await import('./takeover-watcher.js');
+    await seedLegacy();
+    expect(writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' })).toBe(true);
+    expect(existsSync(cliTurnEpochPath(dir))).toBe(false);
+    expect(readCliTurnEpoch(dir, owner)).toMatchObject({ turnEpoch: 'epoch-new' });
+    // Another owner's legacy record is not this owner's to retire.
+    const other = { sessionId: '55555555-5555-4555-8555-555555555555' };
+    writeFileSync(cliTurnEpochPath(dir), JSON.stringify({ ...other, turnEpoch: 'epoch-other' }));
+    writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-newer' });
+    expect(readCliTurnEpoch(dir, other)).toMatchObject({ turnEpoch: 'epoch-other' });
+  });
+
+  it('an acknowledged new turn never resurrects an older legacy epoch', async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } =
+      await import('./takeover-watcher.js');
+    await seedLegacy();
+    expect(writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' })).toBe(true);
+    clearCliTurnEpoch(dir, owner.sessionId, {
+      turnEpoch: 'epoch-new',
+      wrapperGeneration: owner.wrapperGeneration,
+    });
+    expect(readCliTurnEpoch(dir, owner)).toBeNull();
+  });
+
+  it('a scope closing after a migrated turn fences a later uncertain attempt instead of finalizing the legacy epoch', async () => {
+    const { writeCliTurnEpoch, clearCliTurnEpoch } = await import('./takeover-watcher.js');
+    await seedLegacy();
+    writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' });
+    clearCliTurnEpoch(dir, owner.sessionId, {
+      turnEpoch: 'epoch-new',
+      wrapperGeneration: owner.wrapperGeneration,
+    });
+    writeFileSync(
+      takeoverMarkerPath(dir, owner.wrapperGeneration),
+      JSON.stringify({ ...owner, at: new Date().toISOString(), attemptId: 'attempt-new' })
+    );
+    const claim = vi.fn(async () => 'failed' as const);
+    const finalizeScope = vi.fn(async () => undefined);
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: owner.sessionId,
+      generation: owner.wrapperGeneration,
+      claim,
+      finalizeScope,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(claim).toHaveBeenCalled(), { timeout: 2000 });
+    await watcher.stop();
+    // The stale legacy epoch, acknowledged, would have retired the marker
+    // without fencing attempt-new; a delayed claim could then land after exit.
+    expect(finalizeScope).toHaveBeenCalledWith(undefined, ['attempt-new']);
+  });
+
+  it("an unacknowledged epoch-bearing finalize retains its own record and a sibling generation's", async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch } = await import('./takeover-watcher.js');
+    writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' });
+    const sibling = { ...owner, wrapperGeneration: '44444444-4444-4444-8444-444444444444' };
+    writeCliTurnEpoch(dir, { ...sibling, turnEpoch: 'epoch-sibling' });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: owner.sessionId,
+      generation: owner.wrapperGeneration,
+      claim: async () => 'failed' as const,
+      finalizeScope: async () => {
+        throw new Error('synthetic 500');
+      },
+      intervalMs: 60_000,
+    });
+    await watcher.stop();
+    expect(readCliTurnEpoch(dir, owner)?.turnEpoch).toBe('epoch-new');
+    expect(readCliTurnEpoch(dir, sibling)?.turnEpoch).toBe('epoch-sibling');
   });
 });
