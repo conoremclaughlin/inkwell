@@ -163,8 +163,11 @@ vite.config.ts.timestamp-*
 # Inkwell hook runtime state (transient, per-session). The turn-epoch and
 # pending-takeover records are written by the on-prompt hook and the wrapper
 # watcher beside whatever cwd they run in, same as identity.json above.
+# The turn-epoch record is one file per owner (cli-turn-epoch.<session>[.<gen>].json,
+# task c07f35c8) written through a temp file beside it, plus the legacy
+# single file; the prefix covers all of them.
 **/.ink/runtime/
-**/.ink/cli-turn-epoch.json
+**/.ink/cli-turn-epoch*
 **/.ink/pending-takeover*.json
 
 # Local automation / benchmark artifacts

@@ -1494,7 +1494,10 @@ describe('CLI turn-epoch round-trip (round 10)', () => {
   it('the stop sends its OWN session record and clears it — foreign records untouched', async () => {
     const source = await loadSource();
     const stop = source.indexOf('async function onStopHandler(');
-    const read = source.indexOf('readCliTurnEpoch(cwd)', stop);
+    const read = source.indexOf(
+      'readCliTurnEpoch(cwd, { sessionId: stopSessionId, wrapperGeneration: stopGeneration })',
+      stop
+    );
     const scoped = source.indexOf(
       'const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);',
       stop
