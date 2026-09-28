@@ -27,7 +27,8 @@
 #   - a file outside supabase/migrations, misnamed, or carrying its own
 #     BEGIN/COMMIT is refused before psql
 #   - `scan` makes the name and transaction-control judgement with no
-#     database at all (CI's job), one refusal line shared with apply
+#     database at all (CI's job), one refusal line shared with apply, and
+#     without psql on the PATH; psql is asked for by apply, pending and status
 #   - a stopped stack, or a missing psql, is refused before psql; the hint
 #     names `supabase start`, never the setup script that resets the database
 #   - `status` counts pending files and rows applied from other checkouts
@@ -526,6 +527,28 @@ if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'psql n
 else
   bad "a missing psql is refused with an install hint (hermetic PATH)" "exit $rc: $out"
 fi
+
+# psql is a prerequisite of the modes that run it, not of the script: scan
+# judges files with no database executable at all (Lumen, PR #688 review).
+for m in pending status; do
+  reset_log
+  out=$(cd "$repo" && PATH="$work/stubs-nopsql:$work/tools" sh "$script" $m 2>&1)
+  rc=$?
+  [ "$rc" -eq 2 ] && [ -z "$(calls)" ] && echo "$out" | grep -q 'psql not found' &&
+    ok "$m without psql is refused with the install hint before any call" ||
+    bad "$m without psql is refused with the install hint before any call" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+done
+reset_log
+out=$(cd "$tc" && PATH="$work/stubs-nopsql:$work/tools" sh "$script" scan supabase/migrations/20260214000000_dollar_body.sql 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'scanned 1 file' && [ -z "$(calls)" ] &&
+  ok "scan without psql on PATH: a clean file exits 0" ||
+  bad "scan without psql on PATH: a clean file exits 0" "exit $rc: $out"
+out=$(cd "$tc" && PATH="$work/stubs-nopsql:$work/tools" sh "$script" scan supabase/migrations/20260201000000_commit_work.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'transaction control: COMMIT WORK' && ! echo "$out" | grep -q 'psql not found' &&
+  ok "scan without psql on PATH: transaction control is still named, and psql is not asked for" ||
+  bad "scan without psql on PATH: transaction control is still named, and psql is not asked for" "exit $rc: $out"
 
 reset_log
 out=$(cd "$repo" && STUB_PRECHECK_RC=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)

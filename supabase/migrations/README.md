@@ -51,7 +51,7 @@ either. `BEGIN ATOMIC` bodies are refused outright; use a dollar-quoted body.
 Two older files in this directory do carry a top-level `BEGIN`/`COMMIT`; they
 are already applied and do not go through the wrapper. Every other file is
 scanned in CI with `yarn db:migrate:scan` (`scripts/db-migrate.sh scan`: the
-same judgement, plus the name shape, with no database behind it), so a file the
+same judgement, plus the name shape, with no database and no psql behind it), so a file the
 wrapper would refuse cannot merge. Run it on your file before you push. The
 integration-DB job cannot stand in for it: its stack applies files with
 `supabase db reset`, which tolerates the pair, and on 2026-09-27 a file that
