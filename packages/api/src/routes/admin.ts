@@ -84,6 +84,7 @@ import {
   withLastMessage,
 } from '../services/thread-key/thread-conversation';
 import { openVerifiedMedia } from '../utils/media-path';
+import { describeCurrentWorkFromRow } from '../services/sessions/current-work';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -5945,6 +5946,16 @@ router.get('/sessions', async (req: Request, res: Response) => {
           activeThreadKey: s.active_thread_key || null,
           summary: s.summary,
           context: s.context,
+          // What this session is working on, with its age. `context` above is
+          // kept for callers that still read it, but it carries no timestamp of
+          // its own — rendering it alone is how a four-day-old note gets read
+          // as a live claim.
+          //
+          // 'owner': this route is the account holder's own dashboard, and every
+          // row it returns is already scoped to their user_id. The audience gate
+          // separates SBs from each other, not a user from their own sessions —
+          // `context` is returned in full two lines above for the same reason.
+          ...describeCurrentWorkFromRow(s, 'owner'),
           backend: s.backend,
           model: s.model,
           messageCount: s.message_count,

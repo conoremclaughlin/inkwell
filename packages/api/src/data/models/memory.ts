@@ -137,6 +137,14 @@ export interface Session {
   claudeSessionId?: string;
   workingDir?: string;
   context?: string;
+  /**
+   * When `context` was last written. Distinct from `updatedAt`, which moves on
+   * every write to the row and therefore cannot date the narrative.
+   */
+  contextUpdatedAt?: Date;
+  /** One line (<=120 chars): what this session is working on right now. */
+  headline?: string;
+  headlineUpdatedAt?: Date;
   startedAt: Date;
   endedAt?: Date;
   summary?: string;
@@ -240,6 +248,9 @@ export interface SessionRow {
   claude_session_id?: string | null;
   working_dir?: string | null;
   context?: string | null;
+  context_updated_at?: string | null;
+  headline?: string | null;
+  headline_updated_at?: string | null;
   started_at: string;
   ended_at: string | null;
   summary: string | null;

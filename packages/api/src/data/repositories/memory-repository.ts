@@ -1774,6 +1774,9 @@ export class MemoryRepository {
       status?: string;
       backendSessionId?: string;
       context?: string;
+      contextUpdatedAt?: Date;
+      headline?: string | null;
+      headlineUpdatedAt?: Date;
       workingDir?: string;
       cliAttached?: boolean;
       cliPollAt?: string;
@@ -1803,6 +1806,24 @@ export class MemoryRepository {
     }
     if (updates.context !== undefined) {
       dbUpdates.context = updates.context;
+    }
+    // Stamp whenever the text moves, whether or not the caller remembered to.
+    //
+    // These were independent optional params, which made the invariant
+    // "displayed text always has an age" a convention every future call site
+    // had to know about rather than a property of the column. One caller
+    // passing `context` alone would write text that renders ageless — the
+    // precise failure the column exists to prevent. This is the only code path
+    // that writes `sessions.context` (audited across TS, SQL, RPCs and the
+    // CLI), so enforcing it here makes it structural.
+    if (updates.context !== undefined || updates.contextUpdatedAt !== undefined) {
+      dbUpdates.context_updated_at = (updates.contextUpdatedAt ?? new Date()).toISOString();
+    }
+    if (updates.headline !== undefined) {
+      dbUpdates.headline = updates.headline;
+    }
+    if (updates.headline !== undefined || updates.headlineUpdatedAt !== undefined) {
+      dbUpdates.headline_updated_at = (updates.headlineUpdatedAt ?? new Date()).toISOString();
     }
     if (updates.workingDir !== undefined) {
       dbUpdates.working_dir = updates.workingDir;
@@ -2505,6 +2526,9 @@ export class MemoryRepository {
       claudeSessionId: row.claude_session_id || undefined,
       workingDir: row.working_dir || undefined,
       context: row.context || undefined,
+      contextUpdatedAt: row.context_updated_at ? new Date(row.context_updated_at) : undefined,
+      headline: row.headline || undefined,
+      headlineUpdatedAt: row.headline_updated_at ? new Date(row.headline_updated_at) : undefined,
       startedAt: new Date(row.started_at),
       endedAt: row.ended_at ? new Date(row.ended_at) : undefined,
       summary: row.summary || undefined,

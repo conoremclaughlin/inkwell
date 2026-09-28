@@ -23,6 +23,7 @@ import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import {
+  currentWorkAudience,
   isSessionAuthorized,
   loadAuthorizedAmbientSession,
   resolveCallerIdentity,
@@ -31,6 +32,10 @@ import {
 import { getCloudSkillsService } from '../../skills/cloud-service';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { StudioLeaseService } from '../../services/studio-lease.service';
+import {
+  describeCurrentWork,
+  type CurrentWorkAudience,
+} from '../../services/sessions/current-work';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -289,7 +294,18 @@ export function isCallerSessionEligible(
 
 /**
  * Map a Session to the bootstrap response shape.
- * context is only included for the caller's own session.
+ *
+ * `audience` is the caller's decision because this function cannot make it:
+ * bootstrap's session query filters on user and slug, and a slug is not an
+ * identity. Same name, different contact, different person.
+ *
+ * Note what `callerSessionId` is and is not. It comes from `x-ink-context`, an
+ * unsigned header — a caller asserting which session it is running in. That is
+ * fine for deciding which row to label as the caller's own, and it was NOT fine
+ * as the sole gate on returning that row's raw `context`: a caller that names a
+ * session id it does not own was handed the note in full, having passed no
+ * ownership check at all. So the id match selects the row and `audience`
+ * decides whether its narrative may be read, and both have to hold.
  */
 export function mapSessionForBootstrap(
   s: {
@@ -301,9 +317,13 @@ export function mapSessionForBootstrap(
     lifecycle?: string;
     currentPhase?: string;
     context?: string;
+    contextUpdatedAt?: Date;
+    headline?: string;
+    headlineUpdatedAt?: Date;
     startedAt: Date;
   },
-  callerSessionId: string | undefined
+  callerSessionId: string | undefined,
+  audience: CurrentWorkAudience
 ) {
   return {
     id: s.id,
@@ -313,7 +333,10 @@ export function mapSessionForBootstrap(
     activeThreadKey: s.activeThreadKey || null,
     lifecycle: s.lifecycle || null,
     currentPhase: s.currentPhase || null,
-    ...(callerSessionId && s.id === callerSessionId && s.context ? { context: s.context } : {}),
+    ...describeCurrentWork(s, audience),
+    ...(audience === 'owner' && callerSessionId && s.id === callerSessionId && s.context
+      ? { context: s.context }
+      : {}),
     startedAt: s.startedAt.toISOString(),
   };
 }
@@ -631,6 +654,13 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
       'The user explicitly chose this finished session out of their history and is continuing it: clears ended_at and restores a live lifecycle. Set this ONLY for a human selection — automatic routing and hooks must leave a completed session terminal, since ended_at is the fence that stops a finished thread swallowing its next trigger.'
     ),
   context: z.string().optional().describe('Brief context of current work state'),
+  headline: z
+    .string()
+    .max(120)
+    .optional()
+    .describe(
+      'ONE LINE, max 120 chars: what you are working on right now. This is what gets displayed wherever sessions are listed, so it is the only part of your state anyone reads casually. Keep it current — it is shown with its age, and a stale headline is visibly stale. Distinct from `context`, which stays the longer scratch board.'
+    ),
   workingDir: z.string().optional().describe('Working directory'),
   cliAttached: z
     .boolean()
@@ -1561,10 +1591,18 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
     };
   }
 
-  // Logs are the session's transcript. A peer may see that another SB is
-  // "reviewing"; it may not read what that SB recorded while doing so.
+  // An explicit sbSlug above is a free filter, so `session` may belong to
+  // another contact of the same SB — and `getActiveSession` filters
+  // `contact_id IS NULL`, so what a contact-bound caller gets back on the slug
+  // path is the account OWNER's session. One boolean gates everything
+  // narrative: logs, the scratch board, and the current-work line.
+  const authorized = isSessionAuthorized(session, user.id, caller);
+
+  // Logs are the session's transcript. An unauthorized reader may see that a
+  // session exists and that its phase is "reviewing" — structural facts it
+  // needs for routing — but not what was recorded while doing so.
   let logs;
-  if (params.includeLogs && isSessionAuthorized(session, user.id, caller)) {
+  if (params.includeLogs && authorized) {
     logs = await dataComposer.repositories.memory.getSessionLogs(session.id);
   }
 
@@ -1584,6 +1622,11 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               currentPhase: session.currentPhase || null,
               threadKey: session.threadKey || null,
               activeThreadKey: session.activeThreadKey || null,
+              ...describeCurrentWork(session, currentWorkAudience(session, user.id, caller)),
+              // Withheld for the same reason as logs, and omitted rather than
+              // nulled so an unauthorized read is byte-identical to main's,
+              // which never returned this field at all.
+              ...(authorized ? { context: session.context || null } : {}),
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
               summary: session.summary,
@@ -1607,6 +1650,10 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
 export async function handleListSessions(args: unknown, dataComposer: DataComposer) {
   const params = listSessionsSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+  // Same free-filter sbSlug as get_session, so rows here can belong to another
+  // contact of the same SB. Resolving the caller is what lets the narrative
+  // fields below tell "my session" from "a session with my name on it".
+  const caller = await resolveCaller(dataComposer, user.id, params.sbSlug);
   const rawStudioId = resolveStudioId(params);
   const scope = resolveStudioScope(rawStudioId);
   // listSessions uses a two-field shape (UUID + boolean flag). Map from scope.
@@ -1638,39 +1685,53 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
             success: true,
             user: { id: user.id, resolvedBy },
             count: sessions.length,
-            sessions: sessions.map((s) => ({
-              id: s.id,
-              sbSlug: s.sbSlug,
-              studioId: s.studioId,
-              studio: s.studioId
-                ? (() => {
-                    const workspace = workspaceById.get(s.studioId);
-                    if (!workspace) return null;
-                    return {
-                      id: workspace.id,
-                      worktreePath: workspace.worktreePath,
-                      worktreeFolder: path.basename(workspace.worktreePath),
-                      branch: workspace.branch,
-                    };
-                  })()
-                : null,
-              lifecycle: s.lifecycle || null,
-              currentPhase: s.currentPhase || null,
-              threadKey: s.threadKey || null,
-              activeThreadKey: s.activeThreadKey || null,
-              status: s.status || null,
-              backend: s.backend || null,
-              provider: (s.metadata?.provider as string) || null,
-              model: s.model || null,
-              backendSessionId: s.backendSessionId || null,
-              /** @deprecated Use backendSessionId */
-              claudeSessionId: s.backendSessionId || s.claudeSessionId || null,
-              context: s.context || null,
-              workingDir: s.workingDir || null,
-              startedAt: s.startedAt.toISOString(),
-              endedAt: s.endedAt?.toISOString(),
-              summary: s.summary,
-            })),
+            sessions: sessions.map((s) => {
+              const authorized = isSessionAuthorized(s, user.id, caller);
+              return {
+                id: s.id,
+                sbSlug: s.sbSlug,
+                studioId: s.studioId,
+                studio: s.studioId
+                  ? (() => {
+                      const workspace = workspaceById.get(s.studioId);
+                      if (!workspace) return null;
+                      return {
+                        id: workspace.id,
+                        worktreePath: workspace.worktreePath,
+                        worktreeFolder: path.basename(workspace.worktreePath),
+                        branch: workspace.branch,
+                      };
+                    })()
+                  : null,
+                lifecycle: s.lifecycle || null,
+                currentPhase: s.currentPhase || null,
+                threadKey: s.threadKey || null,
+                activeThreadKey: s.activeThreadKey || null,
+                status: s.status || null,
+                backend: s.backend || null,
+                provider: (s.metadata?.provider as string) || null,
+                model: s.model || null,
+                backendSessionId: s.backendSessionId || null,
+                /** @deprecated Use backendSessionId */
+                claudeSessionId: s.backendSessionId || s.claudeSessionId || null,
+                // What this session is working on, on the surface a reader
+                // actually sees. For the caller's own rows `currentWork` is always
+                // populated when there is anything to say — headline if one was
+                // written, otherwise the context truncated — so a caller never has
+                // to know which field to look in, and `ageLabel` means it is never
+                // read as now. Another contact's rows describe nothing at all.
+                ...describeCurrentWork(s, currentWorkAudience(s, user.id, caller)),
+                // Pre-dates this branch and was never authorized. Gated here
+                // because the check is now one line away and shipping a fixed
+                // fallback beside an unfixed copy of the same text would be
+                // theatre. Called out as scope growth in the PR.
+                ...(authorized ? { context: s.context || null } : {}),
+                workingDir: s.workingDir || null,
+                startedAt: s.startedAt.toISOString(),
+                endedAt: s.endedAt?.toISOString(),
+                summary: s.summary,
+              };
+            }),
           },
           null,
           2
@@ -1847,6 +1908,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     !params.backendSessionId &&
     !params.status &&
     !params.context &&
+    params.headline === undefined &&
     !params.workingDir &&
     params.cliAttached === undefined &&
     params.alias === undefined &&
@@ -1864,7 +1926,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
             {
               success: false,
               error:
-                'At least one field must be provided (phase, lifecycle, backendSessionId, status, context, workingDir, reopen).',
+                'At least one field must be provided (phase, lifecycle, backendSessionId, status, context, headline, workingDir, reopen).',
             },
             null,
             2
@@ -1944,6 +2006,9 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     status?: string;
     backendSessionId?: string;
     context?: string;
+    contextUpdatedAt?: Date;
+    headline?: string | null;
+    headlineUpdatedAt?: Date;
     workingDir?: string;
     cliAttached?: boolean;
     alias?: string | null;
@@ -2033,6 +2098,15 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   }
   if (params.context !== undefined) {
     updates.context = params.context;
+    // Stamped here rather than derived from sessions.updated_at, which moves on
+    // every write (lifecycle, phase, cliAttached) and so cannot say when the
+    // narrative was last true. Without a distinct stamp a four-day-old context
+    // block looks as fresh as the row it sits on.
+    updates.contextUpdatedAt = new Date();
+  }
+  if (params.headline !== undefined) {
+    updates.headline = params.headline || null;
+    updates.headlineUpdatedAt = new Date();
   }
   if (params.workingDir !== undefined) {
     updates.workingDir = params.workingDir;
@@ -2569,6 +2643,14 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     }
   }
 
+  // The session query filters on user and slug, so this list can hold rows the
+  // caller is not authorized for — a different contact of the same SB is a
+  // different person, and so is another workspace's SB of the same name.
+  // Classify per row; nothing narrative crosses that line.
+  const bootstrapCaller = await resolveCaller(dataComposer, user.id, sbSlug);
+  const sessionAudience = (s: Session): CurrentWorkAudience =>
+    currentWorkAudience(s, user.id, bootstrapCaller);
+
   const inferredThreadKey =
     params.threadKey || mergedSessions.find((session) => !!session.threadKey)?.threadKey;
   const focusText = params.focusText || focus?.focus_summary || undefined;
@@ -2808,6 +2890,13 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
             // Caller's own session IDs — surfaced at top level so they survive compaction.
             // Without this, the agent loses its own session identity after context eviction.
+            //
+            // `context` here is the same scratch board `activeSessions` gates,
+            // reached by a second path, and it was ungated on this one. The ids
+            // stay: they are what this field exists for, they are what the
+            // caller already named in its own request header, and a caller that
+            // cannot recover its session id after compaction is the failure
+            // this block was added to prevent. The note is what needs an owner.
             callerSession: callerSessionId
               ? (() => {
                   const cs = mergedSessions.find((s) => s.id === callerSessionId);
@@ -2817,7 +2906,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                         backendSessionId: cs.backendSessionId || null,
                         studioId: cs.studioId || null,
                         sbSlug: cs.sbSlug || null,
-                        context: cs.context || null,
+                        context: sessionAudience(cs) === 'owner' ? cs.context || null : null,
                       }
                     : null;
                 })()
@@ -2825,7 +2914,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
             // Active sessions — caller's own session always included (even if it fell off the top-10 list).
             // context is only included for the caller's own session.
-            activeSessions: mergedSessions.map((s) => mapSessionForBootstrap(s, callerSessionId)),
+            activeSessions: mergedSessions.map((s) =>
+              mapSessionForBootstrap(s, callerSessionId, sessionAudience(s))
+            ),
 
             // Knowledge summary: budget-constrained, grouped by topic (critical + high salience)
             // This is the MEMORY.md equivalent — read this first for what you know
