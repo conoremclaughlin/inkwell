@@ -39,8 +39,12 @@ vi.mock('../../services/user-resolver', async (importOriginal) => {
   };
 });
 
-vi.mock('../../services/studio-settings', () => ({
-  ensureStudioSettings: vi.fn(async () => undefined),
+const completeStudioViaCli = vi.hoisted(() =>
+  vi.fn(async () => ({ ok: true, complete: true, missing: [] as string[] }))
+);
+vi.mock('../../services/studio-complete', () => ({
+  completeStudioViaCli,
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
 }));
 
 // Defaults let the pre-existing bootstrap tests run unchanged: a caller with
@@ -100,7 +104,7 @@ const LINKED_MCP = JSON.stringify({
   mcpServers: { inkwell: { type: 'http', url: 'http://linked-custom' } },
 });
 
-describe('handleCreateStudio bootstrap source', () => {
+describe('handleCreateStudio completes the studio through the routine', () => {
   let base: string;
   let mainRoot: string;
   let linkedPath: string;
@@ -115,7 +119,11 @@ describe('handleCreateStudio bootstrap source', () => {
   const dataComposer = {
     getClient: () => ({}),
     repositories: {
-      studios: { create: studiosCreate, update: vi.fn(async () => ({})) },
+      studios: {
+        create: studiosCreate,
+        update: vi.fn(async () => ({})),
+        findByPath: vi.fn(async () => null),
+      },
       projects: { findById: vi.fn() },
       activityStream: { logActivity: vi.fn(async () => ({})) },
     },
@@ -150,7 +158,7 @@ describe('handleCreateStudio bootstrap source', () => {
     rmSync(base, { recursive: true, force: true });
   });
 
-  it('seeds a studio created from a linked worktree with main config, not the linked copy', async () => {
+  it('a studio created from a linked worktree is anchored to the main root and completed in its own worktree', async () => {
     const result = await handleCreateStudio(
       {
         sbSlug: 'wren',
@@ -167,17 +175,19 @@ describe('handleCreateStudio bootstrap source', () => {
     const studioPath = path.join(base, 'repo--fresh');
     expect(existsSync(studioPath)).toBe(true);
 
-    // .mcp.json must come from main, not the linked worktree's customised copy
-    expect(readFileSync(path.join(studioPath, '.mcp.json'), 'utf-8')).toBe(MAIN_MCP);
-    // .env.local exists only in main — bootstrapping from the linked path
-    // would have copied nothing
-    expect(readFileSync(path.join(studioPath, '.env.local'), 'utf-8')).toBe('SOURCE=main\n');
+    // The completion routine (`ink init`, task c3b34be8) runs in the new
+    // worktree with the row it now has; it syncs config from the MAIN
+    // worktree by its own placement detection, not from the caller's path.
+    expect(completeStudioViaCli).toHaveBeenCalledWith(
+      studioPath,
+      expect.objectContaining({ sbSlug: 'wren', studioId: 'studio-test-id' })
+    );
 
     // The studio record is anchored to the resolved main root as well
     expect(studiosCreate).toHaveBeenCalledWith(expect.objectContaining({ repoRoot: mainRoot }));
   });
 
-  it('seeds a studio created from the main root with its own config', async () => {
+  it('a studio created from the main root is completed in its own worktree', async () => {
     const result = await handleCreateStudio(
       {
         sbSlug: 'wren',
@@ -192,8 +202,20 @@ describe('handleCreateStudio bootstrap source', () => {
     expect(payload.success).toBe(true);
 
     const studioPath = path.join(base, 'repo--direct');
-    expect(readFileSync(path.join(studioPath, '.mcp.json'), 'utf-8')).toBe(MAIN_MCP);
-    expect(readFileSync(path.join(studioPath, '.env.local'), 'utf-8')).toBe('SOURCE=main\n');
+    expect(completeStudioViaCli).toHaveBeenCalledWith(
+      studioPath,
+      expect.objectContaining({ sbSlug: 'wren', studioId: 'studio-test-id' })
+    );
+  });
+
+  it('a CLI-created studio registering its row (skipGitOperations) is not completed twice', async () => {
+    completeStudioViaCli.mockClear();
+    const result = await handleCreateStudio(
+      { sbSlug: 'wren', repoRoot: mainRoot, slug: 'linked', skipGitOperations: true },
+      dataComposer
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    expect(completeStudioViaCli).not.toHaveBeenCalled();
   });
 });
 
@@ -321,7 +343,7 @@ describe('create_studio / adopt_studio provenance', () => {
     const dc = {
       getClient: () => ({}),
       repositories: {
-        studios: { create, update, findById, linkSession },
+        studios: { create, update, findById, findByPath: vi.fn(async () => null), linkSession },
         projects: { findById: vi.fn() },
         activityStream: { logActivity },
         memory: { getSession },

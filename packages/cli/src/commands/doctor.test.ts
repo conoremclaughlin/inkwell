@@ -135,3 +135,41 @@ describe('analyzeCliLink', () => {
     expect(result.checks.some((check) => check.name === 'Studio target match')).toBe(true);
   });
 });
+
+describe('studio checklist as doctor checks (task c3b34be8)', () => {
+  const audit = (overrides: Partial<{ ok: boolean; required: boolean }>[]) => ({
+    worktreePath: '/w',
+    linked: true,
+    checks: overrides.map((o, i) => ({
+      id: 'mcp-json' as const,
+      label: `item ${i}`,
+      ok: o.ok ?? true,
+      required: o.required ?? true,
+      detail: o.ok === false ? 'missing' : 'present',
+      repair: 'ink init',
+    })),
+    missing: [],
+    complete: overrides.every((o) => o.ok !== false || o.required === false),
+  });
+
+  it('a required missing item fails, a reported-only one warns, and each names the repair', async () => {
+    const { studioChecksFrom } = await import('./doctor.js');
+    const checks = studioChecksFrom(
+      audit([{ ok: true }, { ok: false }, { ok: false, required: false }]),
+      'not-applicable'
+    );
+    expect(checks.map((c) => c.status)).toEqual(['ok', 'fail', 'warn']);
+    expect(checks[1].detail).toContain('ink init');
+    expect(checks[2].detail).toContain('ink init');
+    expect(checks.every((c) => c.name.startsWith('Studio: '))).toBe(true);
+  });
+
+  it('registration is a check of its own for a linked worktree and absent for the main one', async () => {
+    const { studioChecksFrom } = await import('./doctor.js');
+    const base = audit([{ ok: true }]);
+    expect(studioChecksFrom(base, 'not-applicable').map((c) => c.name)).toEqual(['Studio: item 0']);
+    expect(studioChecksFrom(base, 'registered').at(-1)?.status).toBe('ok');
+    expect(studioChecksFrom(base, 'unregistered').at(-1)?.status).toBe('fail');
+    expect(studioChecksFrom(base, 'unreachable').at(-1)?.status).toBe('warn');
+  });
+});

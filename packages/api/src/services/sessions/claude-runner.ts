@@ -30,7 +30,8 @@ import {
 import { homedir } from 'os';
 import { join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
-import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
+import { applyPermissionOverlay } from '../studio-settings.js';
+import { ensureStudioComplete } from '../studio-complete.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
@@ -438,13 +439,17 @@ export class ClaudeRunner implements IRunner {
           })
         : null;
 
-    // Safety net: ensure .claude/settings.local.json exists before spawning.
-    // Non-fatal — if it fails, Claude still spawns with default permissions.
+    // Safety net: the studio checklist before spawning. A complete studio
+    // costs a few file reads; an incomplete linked worktree is completed by
+    // `ink init` (task c3b34be8). Non-fatal — Claude still spawns.
     if (config.workingDirectory) {
       try {
-        await ensureStudioSettings(config.workingDirectory);
+        await ensureStudioComplete(config.workingDirectory, {
+          sbSlug: config.sbSlug || 'unknown',
+          ...(config.studioId && config.studioId !== 'main' ? { studioId: config.studioId } : {}),
+        });
       } catch (err) {
-        logger.debug('ensureStudioSettings pre-spawn check failed (non-fatal)', {
+        logger.debug('ensureStudioComplete pre-spawn check failed (non-fatal)', {
           cwd: config.workingDirectory,
           error: err instanceof Error ? err.message : String(err),
         });

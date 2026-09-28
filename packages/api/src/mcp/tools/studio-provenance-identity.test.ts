@@ -20,7 +20,10 @@ import { runWithRequestContext } from '../../utils/request-context';
 import { StudiosRepository } from '../../data/repositories/studios.repository';
 import { makeFakeSupabase, type Row } from '../../services/sessions/fake-supabase';
 
-vi.mock('../../services/studio-settings', () => ({ ensureStudioSettings: vi.fn() }));
+vi.mock('../../services/studio-complete', () => ({
+  completeStudioViaCli: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+}));
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
@@ -177,7 +180,13 @@ function setup() {
     repositories: {
       users: { findById: vi.fn(async () => ({ id: USER })) },
       memory: { getSession, findOwnedActiveSessions: vi.fn(async () => [own]) },
-      studios: { create, update, findById: vi.fn(async () => studio), linkSession },
+      studios: {
+        create,
+        update,
+        findById: vi.fn(async () => studio),
+        findByPath: vi.fn(async () => null),
+        linkSession,
+      },
       activityStream: { logActivity },
     },
   };

@@ -29,7 +29,7 @@ import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveSbSlug } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
 import { ephemeralWorktreePath } from './studio-paths';
-import { ensureStudioSettings } from './studio-settings';
+import { completeStudioViaCli } from './studio-complete';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
 import { SYSTEM_PRINCIPAL } from './principals';
 
@@ -1254,13 +1254,6 @@ export class StrategyService {
       }
     }
 
-    // Generate studio settings
-    try {
-      await ensureStudioSettings(worktreePath);
-    } catch {
-      // Non-fatal
-    }
-
     // Insert studio record
     try {
       const studio = await this.dataComposer.repositories.studios.create({
@@ -1276,6 +1269,11 @@ export class StrategyService {
         // Root-based paths don't encode the slug — pass it explicitly or
         // the derived fallback is null and slug lookups silently break.
         slug,
+      });
+      await completeStudioViaCli(worktreePath, {
+        sbSlug: ownerSlug,
+        studioId: studio.id,
+        purpose: `Ephemeral sandbox for: ${group.title}`,
       });
 
       // Update the task group metadata with the new studioId
@@ -1374,12 +1372,6 @@ export class StrategyService {
     }
 
     try {
-      await ensureStudioSettings(worktreePath);
-    } catch {
-      // Non-fatal
-    }
-
-    try {
       const studio = await this.dataComposer.repositories.studios.create({
         userId: group.user_id,
         sbSlug,
@@ -1390,6 +1382,11 @@ export class StrategyService {
         purpose: `Strategy studio for: ${group.title}`,
         workType: 'feature',
         metadata: { ephemeral: false, taskGroupId: group.id },
+      });
+      await completeStudioViaCli(worktreePath, {
+        sbSlug,
+        studioId: studio.id,
+        purpose: `Strategy studio for: ${group.title}`,
       });
 
       const existingMeta = (group.metadata || {}) as Record<string, unknown>;

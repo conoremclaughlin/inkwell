@@ -532,6 +532,27 @@ The global link stays where it was. Your studio's build is for you to exercise, 
 
 **The server never uses the global link.** For the hooks it writes and the chat loops it spawns, it resolves its own checkout's `packages/cli/dist/cli.js` (see `packages/api/src/services/ink-cli.ts`), runs it through node, and takes `INK_CLI_PATH` as an explicit override. A checkout with no CLI build falls back to `ink` on PATH with a one-time warning; build it with `yarn workspace @inklabs/cli build`. A new call site that reaches for `ink` without going through that resolver is a code problem, not a reason to relink: route it through `resolveInkCli` and open a PR.
 
+## Studios: One Checklist, One Routine
+
+A studio is a linked git worktree, and a worktree is only a studio once it carries the full set of local files a session needs. Until 2026-09-28 no creator produced that set: the server wrote `.mcp.json` and Claude hooks but no identity file and no Codex or Gemini hooks, `ink studio create` wrote identity and hooks but no permissions and no `.env.local`, and a bare `git worktree add` wrote nothing. A partial studio is invisible until a session inside it finds it has no tools, and without `.ink/identity.json` its hooks book the work to the root studio.
+
+**The checklist** (`auditStudio` in `packages/shared/src/studio/checklist.ts`) is what a complete studio carries, each item judged on the file that carries it:
+
+| Item                                | Required in a studio | In the main worktree |
+| ----------------------------------- | -------------------- | -------------------- |
+| `.mcp.json` with the inkwell server | yes                  | yes                  |
+| `.env.local`                        | reported only        | reported only        |
+| `.ink/identity.json` naming the SB  | yes                  | reported only        |
+| `studioId` in identity.json         | yes                  | no                   |
+| Claude permissions                  | yes                  | no                   |
+| Claude ink hooks (six events)       | yes                  | yes                  |
+| Codex MCP section and three hooks   | yes                  | yes                  |
+| Gemini MCP section and three hooks  | yes                  | yes                  |
+
+**The routine** is `ink init`. In a linked worktree it completes the studio and is the repair for a partial one: `cd` into the worktree and run it. By default it syncs `.mcp.json`, `.env.local` and the Claude permissions from the main worktree (`--no-root-sync` generates the defaults instead) and writes the identity file and registers the studio row (`--no-studio-setup` for a checkout deliberately not tracked as a studio). It never overwrites a customised file, never clobbers an identity field, and never writes through a symlink; a second run reports every step as `exists`. In the main worktree it behaves as before: hooks, backend config, skills.
+
+**Every creator runs it.** `ink studio create` calls it after `git worktree add`; the server's `create_studio`, `adopt_studio`, the overflow service and the strategy service run `ink init --json` in the worktree (this checkout's CLI build via `resolveInkCli`, never the global link) with the studio row id they hold. Before every Claude spawn the runner reads the checklist and runs the routine only when something is missing. `ink doctor` prints the checklist plus whether the studio id names a row the server still has, and names `ink init` as the repair.
+
 ## Supabase Project ID
 
 When using MCP Supabase tools (`execute_sql`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:

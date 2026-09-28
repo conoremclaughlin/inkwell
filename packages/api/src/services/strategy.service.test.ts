@@ -35,8 +35,8 @@ vi.mock('fs', () => ({
   existsSync: vi.fn().mockReturnValue(false),
 }));
 
-vi.mock('./studio-settings', () => ({
-  ensureStudioSettings: vi.fn().mockResolvedValue(true),
+vi.mock('./studio-complete', () => ({
+  completeStudioViaCli: vi.fn().mockResolvedValue({ ok: true, complete: true, missing: [] }),
 }));
 
 vi.mock('../auth/resolve-identity', () => ({

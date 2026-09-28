@@ -50,8 +50,10 @@ vi.mock('../studio-paths.js', () => ({
   ensureInkStudiosRoot: vi.fn(async () => {}),
 }));
 vi.mock('../studio-settings.js', () => ({
-  ensureStudioSettings: vi.fn(async () => {}),
   applyPermissionOverlay: vi.fn(async () => async () => {}),
+}));
+vi.mock('../studio-complete.js', () => ({
+  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
 }));
 
 import { ClaudeRunner, IDLE_TIMEOUT_MS, PROCESS_TIMEOUT_MS } from './claude-runner.js';
