@@ -928,6 +928,155 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
   });
 });
 
+describe('StudioOverflowService.ensureParentStudio — a closed home is revived', () => {
+  /**
+   * A studios repository over ONE row: findBySlug reads the row as it stands
+   * and update applies the patch it receives, so a second ensure sees what
+   * the first one wrote rather than a stale fixture.
+   */
+  function oneRowStudios(row: Studio) {
+    let current = row;
+    const updates: Array<Record<string, unknown>> = [];
+    const studios = {
+      findById: vi.fn(),
+      findBySlug: vi.fn(async (_userId: string, slug: string) =>
+        slug === current.slug ? current : null
+      ),
+      findByRepoRoot: vi.fn().mockResolvedValue(null),
+      create: vi.fn(),
+      update: vi.fn(async (id: string, patch: Record<string, unknown>) => {
+        updates.push(patch);
+        if (id !== current.id) throw new Error(`no studio ${id}`);
+        current = { ...current, ...(patch as Partial<Studio>) };
+        return current;
+      }),
+    } as unknown as StudiosRepository;
+    return { studios, updates, current: () => current };
+  }
+
+  /** The home the 2026-09-28 PR session closed: cleaned, its branch kept. */
+  async function closedHome(repoRoot: string, overrides: Partial<Studio> = {}): Promise<Studio> {
+    await execFileAsync('git', ['branch', 'lumen/studio/lumen'], { cwd: repoRoot });
+    const slug = `${path.basename(repoRoot)}--lumen`;
+    return makeStudio({
+      id: 'home-1',
+      sbSlug: 'lumen',
+      sbId: 'sb-lumen',
+      repoRoot,
+      slug,
+      worktreePath: path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--${slug}`),
+      branch: 'lumen/studio/lumen',
+      purpose: 'Home studio for lumen (auto-created)',
+      defaultProjectId: null,
+      status: 'cleaned',
+      cleanedAt: '2026-09-28T08:57:57.069Z',
+      metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
+      ...overrides,
+    });
+  }
+
+  async function removeWorktree(repoRoot: string, worktreePath: string): Promise<void> {
+    await execFileAsync('git', ['worktree', 'remove', '--force', worktreePath], {
+      cwd: repoRoot,
+    }).catch(() => undefined);
+  }
+
+  it('revives its own cleaned home onto a fresh worktree on the surviving branch', async () => {
+    const repoRoot = await makeGitRepo();
+    const home = await closedHome(repoRoot);
+    const { studios, updates } = oneRowStudios(home);
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    completion.calls.length = 0;
+    try {
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureParentStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        repoRoot,
+        sbId: 'sb-lumen',
+      });
+
+      expect(result?.id).toBe('home-1');
+      expect(result?.status).toBe('active');
+      expect(studios.create).not.toHaveBeenCalled();
+      // The whole revive transition, not a status flip.
+      expect(updates).toEqual([
+        {
+          status: 'active',
+          worktreePath: home.worktreePath,
+          branch: 'lumen/studio/lumen',
+          cleanedAt: null,
+          archivedAt: null,
+          expiresAt: null,
+        },
+      ]);
+      // A real checkout, attached to the branch the teardown kept.
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: home.worktreePath,
+      });
+      expect(stdout.trim()).toBe('lumen/studio/lumen');
+      // Completed as a new home is, against the revived row's id.
+      expect(completion.calls).toEqual([
+        expect.objectContaining({ worktreePath: home.worktreePath, studioId: 'home-1' }),
+      ]);
+    } finally {
+      await removeWorktree(repoRoot, home.worktreePath);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('two concurrent ensures for one closed home converge on the single revived row', async () => {
+    const repoRoot = await makeGitRepo();
+    const home = await closedHome(repoRoot);
+    const { studios, updates } = oneRowStudios(home);
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    try {
+      const service = new StudioOverflowService(studios, leases);
+      const ensure = () =>
+        service.ensureParentStudio({
+          userId: 'user-1',
+          sbSlug: 'lumen',
+          repoRoot,
+          sbId: 'sb-lumen',
+        });
+      const [first, second] = await Promise.all([ensure(), ensure()]);
+
+      // Held triggers are not retried, so the loser of a git race must not
+      // come back null: it finds the winner's live row and reuses it.
+      expect(first?.id).toBe('home-1');
+      expect(second?.id).toBe('home-1');
+      expect(updates).toHaveLength(1);
+    } finally {
+      await removeWorktree(repoRoot, home.worktreePath);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("still refuses a cleaned row at the slug that is another identity's", async () => {
+    const repoRoot = await makeGitRepo();
+    const home = await closedHome(repoRoot, { sbId: 'sb-another-lumen' });
+    const { studios } = oneRowStudios(home);
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    try {
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureParentStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        repoRoot,
+        sbId: 'sb-lumen',
+      });
+
+      expect(result).toBeNull();
+      expect(studios.update).not.toHaveBeenCalled();
+      expect(studios.create).not.toHaveBeenCalled();
+      await expect(access(home.worktreePath)).rejects.toThrow();
+    } finally {
+      await removeWorktree(repoRoot, home.worktreePath);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
   it('refuses to tear down a non-ephemeral studio', async () => {
     const studios = { markCleaned: vi.fn() } as unknown as StudiosRepository;

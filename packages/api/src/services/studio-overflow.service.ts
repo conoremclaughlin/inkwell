@@ -652,6 +652,15 @@ export class StudioOverflowService {
    * convention, and inventing one here would silently start capturing threads
    * the operator never assigned.
    *
+   * A home its owner closed is REVIVED, not refused. Closing a studio is the
+   * documented end of a PR ("routing knows how to route back and recreate
+   * what it needs — closing costs nothing"), and the home is a working studio,
+   * so the PR that ran in it closes it. The cleaned row keeps the slug, so
+   * refusing it held every later thread for this (project, agent) with no
+   * way back: on 2026-09-28 a PR session closed `inktrade--wren` at merge,
+   * and each inktrade PR trigger to Wren after that was held as a slug
+   * "collision" with its own home.
+   *
    * Returns null when provisioning fails or the slug is already taken by an
    * unrelated studio; the caller then refuses rather than guessing.
    */
@@ -665,29 +674,51 @@ export class StudioOverflowService {
     const { userId, sbSlug, repoRoot, sbId } = opts;
     if (!isSafeStudioComponent(sbSlug)) throw new Error('Invalid SB path component');
     const slug = `${path.basename(repoRoot)}--${sbSlug}`;
+    // Same-home ensures in this process take turns end to end, as overflow
+    // ensures do: the second arrival then finds the first's row live at
+    // preflight and reuses it, instead of losing the race in git and being
+    // held.
+    return withKeyedLock(`parent-ensure:${userId}:${slug}`, () =>
+      this.ensureParentStudioExclusive(userId, sbSlug, repoRoot, slug, sbId ?? null)
+    );
+  }
 
+  private async ensureParentStudioExclusive(
+    userId: string,
+    sbSlug: string,
+    repoRoot: string,
+    slug: string,
+    sbId: string | null
+  ): Promise<Studio | null> {
+    let closedHome: Studio | null = null;
     const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
     if (existing) {
       // Reuse only a genuine match. A slug collision with an unrelated studio
       // must never be adopted — same reasoning as overflow reuse, and the
       // consequence here is worse because this row is durable.
-      // Reuse only a studio a runner can ACTUALLY use (Lumen, PR #514 round 1).
-      //
-      // The earlier predicate accepted any non-ephemeral match, including an
-      // archived or cleaned row, or one whose worktree is gone from disk.
-      // Handing one back creates a session that acquire() then refuses
-      // (spec §The five invariants #5: a cleaned studio is never re-leased,
-      // a configured-but-absent worktree is retired) — and the caller diverts
-      // to overflow or the default cwd instead of holding, which is the
-      // silent-wrong-place outcome this phase removes.
-      const reusable =
+      const ours =
         !existing.ephemeral &&
         existing.userId === userId &&
         existing.repoRoot === repoRoot &&
-        (sbId ? existing.sbId === sbId : existing.sbSlug === sbSlug) &&
-        (existing.status === 'active' || existing.status === 'idle');
+        (sbId ? existing.sbId === sbId : existing.sbSlug === sbSlug);
 
-      if (reusable) {
+      if (!ours) {
+        logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
+          slug,
+          repoRoot,
+          sbSlug,
+          collidingStudioId: existing.id,
+        });
+        return null;
+      }
+
+      // Reuse only a studio a runner can ACTUALLY use (Lumen, PR #514 round 1).
+      // Handing back a cleaned row, or one whose worktree is gone, creates a
+      // session that acquire() then refuses (spec §The five invariants #5: a
+      // cleaned studio is never re-leased, a configured-but-absent worktree
+      // is retired) — and the caller diverts to overflow or the default cwd
+      // instead of holding, the silent-wrong-place outcome Phase 3b removed.
+      if (existing.status === 'active' || existing.status === 'idle') {
         const present = await access(existing.worktreePath)
           .then(() => true)
           .catch(() => false);
@@ -699,27 +730,33 @@ export class StudioOverflowService {
         });
         return null;
       }
-      logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
-        slug,
-        repoRoot,
-        sbSlug,
-        collidingStudioId: existing.id,
-      });
-      return null;
+
+      // Cleaned or archived: this agent's own home, closed. It is revived
+      // below with a fresh worktree, never handed back as it stands.
+      closedHome = existing;
     }
 
     // Seed from a studio that already knows this repo, so worktree creation
-    // runs against a real checkout with the right base branch.
-    const seed = await this.studios.findByRepoRoot(userId, repoRoot).catch(() => null);
+    // runs against a real checkout with the right base branch. A closed home
+    // already records its own.
+    const seed = closedHome
+      ? null
+      : await this.studios.findByRepoRoot(userId, repoRoot).catch(() => null);
     const parentLike = {
       repoRoot,
-      baseBranch: seed?.baseBranch || 'main',
+      baseBranch: closedHome?.baseBranch || seed?.baseBranch || 'main',
     } as Studio;
 
+    // A closed home's branch normally survives its teardown (close_studio
+    // keeps branches); createWorktree reattaches to it.
     const created = await this.createWorktree(parentLike, slug, {
       branch: `${sbSlug}/studio/${sbSlug}`,
     });
     if (!created) return null;
+
+    if (closedHome) {
+      return this.reviveParentStudio(closedHome, created, { userId, sbSlug, repoRoot });
+    }
 
     try {
       const studio = await this.studios.create({
@@ -756,6 +793,56 @@ export class StudioOverflowService {
       });
       await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
         cwd: repoRoot,
+      }).catch(() => undefined);
+      return null;
+    }
+  }
+
+  /**
+   * Bring a closed home back onto a fresh worktree. Revival is the whole
+   * transition the other two revive paths make (ephemeral overflow above,
+   * create_studio registration): the row describes THIS checkout, is neither
+   * cleaned nor archived, and a durable row carries no expiry. Flipping
+   * status alone would leave `cleaned_at` telling the old story to the next
+   * reader. The row is then completed exactly as a new home is.
+   */
+  private async reviveParentStudio(
+    closedHome: Studio,
+    created: WorktreeCreation,
+    ctx: { userId: string; sbSlug: string; repoRoot: string }
+  ): Promise<Studio | null> {
+    try {
+      const studio = await this.studios.update(closedHome.id, {
+        status: 'active',
+        worktreePath: created.worktreePath,
+        branch: created.branch,
+        cleanedAt: null,
+        archivedAt: null,
+        expiresAt: null,
+      });
+      await completeStudioViaCli(created.worktreePath, {
+        sbSlug: ctx.sbSlug,
+        studioId: studio.id,
+        purpose: studio.purpose ?? undefined,
+      });
+      logger.info('[StudioOverflow] Revived closed parent studio', {
+        studioId: studio.id,
+        slug: studio.slug,
+        repoRoot: ctx.repoRoot,
+        sbSlug: ctx.sbSlug,
+        previousStatus: closedHome.status,
+        worktreePath: created.worktreePath,
+      });
+      return studio;
+    } catch (err) {
+      logger.error('[StudioOverflow] Parent studio revive failed; removing worktree', {
+        slug: closedHome.slug,
+        studioId: closedHome.id,
+        worktreePath: created.worktreePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+        cwd: ctx.repoRoot,
       }).catch(() => undefined);
       return null;
     }
