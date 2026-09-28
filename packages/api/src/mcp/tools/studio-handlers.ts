@@ -752,36 +752,55 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       ? path.resolve(parsed.worktreePath)
       : studioSiblingPath(mainRoot, slug);
 
-  // A repair: the worktree already has a row. Reuse it rather than register
-  // a second studio at the same path.
+  // A repair: the worktree already has a row of the CALLER's. Reuse it
+  // rather than register a second studio at the same path. Rows at one path
+  // may exist per SB, so the lookup is scoped to the caller's slug and the
+  // row is held to the same canonical-ownership rule adopt_studio applies:
+  // another workspace's "wren" is not this caller, and its row is not
+  // reused (Lumen, PR #692 round 2). A cleaned or archived row at a
+  // checkout that exists again is revived deliberately — the session
+  // resolver refuses a cleaned id, so handing one out would read complete
+  // and route nowhere.
   if (skipGitOperations) {
-    const existing = await dataComposer.repositories.studios.findByPath(worktreePath, {
+    const candidate = await dataComposer.repositories.studios.findByPath(worktreePath, {
       userId: resolved.user.id,
+      sbSlug: actor.sbSlug,
     });
+    const existing = candidate && !studioOwnershipMismatch(candidate, actor) ? candidate : null;
     if (existing) {
-      logger.info('Studio already registered at this worktree; reusing the row', {
-        studioId: existing.id,
-        worktreePath,
-      });
+      const revived = existing.status === 'cleaned' || existing.status === 'archived';
+      if (revived) {
+        await dataComposer.repositories.studios.update(existing.id, { status: 'active' });
+      }
+      const studio = revived ? { ...existing, status: 'active' as const } : existing;
+      logger.info(
+        revived
+          ? 'Studio row at this worktree revived for the caller'
+          : 'Studio already registered at this worktree; reusing the row',
+        { studioId: studio.id, worktreePath, sbSlug: actor.sbSlug, previousStatus: existing.status }
+      );
       return successResponse({
-        message: `Studio already registered at ${worktreePath}`,
+        message: revived
+          ? `Studio revived at ${worktreePath}`
+          : `Studio already registered at ${worktreePath}`,
         reused: true,
+        revived,
         studio: {
-          id: existing.id,
-          studioId: existing.id,
-          sbSlug: existing.sbSlug,
-          branch: existing.branch,
-          worktreeFolder: path.basename(existing.worktreePath),
-          worktreePath: existing.worktreePath,
-          repoRoot: existing.repoRoot,
-          baseBranch: existing.baseBranch,
-          purpose: existing.purpose,
-          workType: existing.workType,
-          roleTemplate: existing.roleTemplate,
-          defaultProjectId: existing.defaultProjectId,
-          status: existing.status,
-          sessionId: existing.sessionId,
-          createdAt: existing.createdAt,
+          id: studio.id,
+          studioId: studio.id,
+          sbSlug: studio.sbSlug,
+          branch: studio.branch,
+          worktreeFolder: path.basename(studio.worktreePath),
+          worktreePath: studio.worktreePath,
+          repoRoot: studio.repoRoot,
+          baseBranch: studio.baseBranch,
+          purpose: studio.purpose,
+          workType: studio.workType,
+          roleTemplate: studio.roleTemplate,
+          defaultProjectId: studio.defaultProjectId,
+          status: studio.status,
+          sessionId: studio.sessionId,
+          createdAt: studio.createdAt,
         },
       });
     }
@@ -837,6 +856,9 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       ephemeral,
       expiresAt,
       metadata: { createdVia: 'create_studio', createdBySessionId: creatorSessionId ?? null },
+      // The chosen slug, explicitly: a worktree at an arbitrary path (the
+      // repair case) derives none from its name.
+      slug,
     });
   } catch (dbError) {
     // If DB insert fails but git succeeded, attempt cleanup

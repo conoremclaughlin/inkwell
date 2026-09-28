@@ -75,6 +75,7 @@ vi.mock('../../services/studio-lease.service', async (importOriginal) => {
 import { handleCreateStudio } from './studio-handlers';
 import type { DataComposer } from '../../data/composer';
 import { runInit } from '../../../../cli/src/commands/init.js';
+import { deriveStudioSlug } from '../../data/repositories/studios.repository';
 
 const ROW_ID = '00000000-0000-4000-8000-000000000692';
 
@@ -204,6 +205,121 @@ describe('registration records the worktree as it is', () => {
       expect(payload.success).toBe(true);
       expect(rows[0].worktreePath).toBe(path.join(base, 'repo--fresh'));
       expect(rows[0].branch).toBe('wren/feat/fresh');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Round 2 (Lumen): the reuse added for repair must be the CALLER's row, at
+ * a lifecycle the session resolver accepts, and the row must carry the slug
+ * the caller chose.
+ */
+describe('registration reuse boundaries (Lumen, PR #692 round 2)', () => {
+  const USER = '00000000-0000-0000-0000-000000000001';
+
+  it("does not return a foreign canonical owner's row as the caller's repaired studio", async () => {
+    const { base, main, actual } = fixture();
+    const rows: Record<string, unknown>[] = [];
+    // Same slug, another canonical identity (another workspace's "wren").
+    const foreign = {
+      id: '00000000-0000-4000-8000-000000000777',
+      userId: USER,
+      sbSlug: 'wren',
+      sbId: '00000000-0000-4000-8000-000000000002',
+      worktreePath: actual,
+      branch: 'wren/fix/existing',
+      status: 'active',
+    };
+    callerMock.mockResolvedValueOnce({
+      sbSlug: 'wren',
+      sbId: '00000000-0000-4000-8000-000000000001',
+      agentBound: true,
+    } as never);
+    try {
+      const result = await handleCreateStudio(
+        {
+          sbSlug: 'wren',
+          repoRoot: main,
+          slug: 'fixture',
+          worktreePath: actual,
+          branch: 'wren/fix/existing',
+          skipGitOperations: true,
+        },
+        composer(rows, foreign)
+      );
+      const payload = JSON.parse(result.content[0].text);
+      // A scoped creation or an explicit refusal is fine; stamping the
+      // foreign studio's id into this caller's identity is not.
+      expect(payload.success && payload.studio?.id === foreign.id).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('does not declare complete when a recreated worktree resolves to a cleaned row left unchanged', async () => {
+    const { base, actual } = fixture();
+    const rows: Record<string, unknown>[] = [];
+    const existing = {
+      id: '00000000-0000-4000-8000-000000000777',
+      userId: USER,
+      sbSlug: 'wren',
+      sbId: null,
+      worktreePath: actual,
+      branch: 'wren/fix/existing',
+      status: 'cleaned',
+    };
+    const dc = composer(rows, existing);
+    try {
+      const report = await runInit(
+        actual,
+        { agent: 'wren' },
+        {
+          register: async (args) => {
+            const result = await handleCreateStudio({ ...args, skipGitOperations: true }, dc);
+            const payload = JSON.parse(result.content[0].text);
+            return payload.success ? payload.studio.id : null;
+          },
+          syncSkills: async () => ({ label: 'skills sync', status: 'skipped' }),
+        }
+      );
+      // Either revive the row deliberately or refuse; success with an
+      // unchanged cleaned row is an id the session resolver refuses.
+      const update = dc.repositories.studios.update as unknown as { mock: { calls: unknown[] } };
+      const unchanged = rows.length === 0 && update.mock.calls.length === 0;
+      expect(report.audit.complete && unchanged).toBe(false);
+      // The choice made here: revival, with the row set active for the caller.
+      expect(update.mock.calls.length).toBe(1);
+      expect(report.audit.complete).toBe(true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('records the chosen studio slug even when the directory has no -- suffix', async () => {
+    const { base, main, actual } = fixture();
+    const rows: Record<string, unknown>[] = [];
+    try {
+      const result = await handleCreateStudio(
+        {
+          sbSlug: 'wren',
+          repoRoot: main,
+          slug: 'chosen-name',
+          worktreePath: actual,
+          branch: 'wren/fix/existing',
+          skipGitOperations: true,
+        },
+        composer(rows)
+      );
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+      // StudiosRepository.create derives a slug from the path only when none
+      // is given; an arbitrary path derives nothing.
+      const persisted =
+        rows[0].slug !== undefined
+          ? rows[0].slug
+          : deriveStudioSlug(rows[0].worktreePath as string);
+      expect(persisted).toBe('chosen-name');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
