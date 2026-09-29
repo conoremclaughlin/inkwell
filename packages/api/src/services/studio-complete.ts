@@ -30,8 +30,27 @@ const execFileAsync = promisify(execFile);
 
 export interface CompleteStudioViaCliOptions {
   sbSlug: string;
+  /**
+   * The studio's owner, consulted by `ensureStudioComplete` only when the
+   * checklist is incomplete: the SB being spawned into a studio is not always
+   * the SB the studio belongs to, and the identity file names the owner.
+   * Three answers: a slug; null when there is CONFIRMED no owner to consult
+   * (no studio row, or a row that names none), in which case `sbSlug` is
+   * written; a thrown error when the question could not be asked, in which
+   * case nothing that names an owner is written — the routine runs with
+   * studio setup off, because a guess is durable: completeStudio keeps an
+   * owner it finds, so a transient lookup failure that wrote the spawning
+   * SB would have kept it after the lookup recovered (Lumen, PR #699).
+   */
+  owner?: () => Promise<string | null | undefined>;
   /** The studio row this worktree is; recorded into identity.json, never re-registered. */
   studioId?: string;
+  /**
+   * The owner's backend (`claude`, `codex`, `gemini`, `ink`), recorded in
+   * identity.json so the studio knows what its owner runs on. `ink init`
+   * resolves it itself when absent.
+   */
+  backend?: string;
   purpose?: string;
   /** Default true: copy .mcp.json, .env.local and permissions from the main worktree. */
   rootSync?: boolean;
@@ -109,6 +128,7 @@ export async function completeStudioViaCli(
     '--agent',
     options.sbSlug,
     ...(options.studioId ? ['--studio-id', options.studioId] : []),
+    ...(options.backend ? ['--backend', options.backend] : []),
     ...(options.purpose ? ['--purpose', options.purpose] : []),
     ...(options.rootSync === false ? ['--no-root-sync'] : []),
     ...(options.studioSetup === false ? ['--no-studio-setup'] : []),
@@ -159,7 +179,8 @@ export async function completeStudioViaCli(
 
 /**
  * The pre-spawn safety net: read the checklist, and only when something is
- * missing run the routine. A complete studio costs a few file reads.
+ * missing run the routine. A complete studio costs a few file reads; the
+ * owner lookup, when one is given, is paid only on the incomplete path.
  */
 export async function ensureStudioComplete(
   worktreePath: string,
@@ -176,5 +197,28 @@ export async function ensureStudioComplete(
     });
     return { ok: true, complete: false, missing: audit.missing };
   }
-  return completeStudioViaCli(worktreePath, options);
+  const { owner, ...rest } = options;
+  let ownerSlug: string | null | undefined = null;
+  if (owner) {
+    try {
+      ownerSlug = await owner();
+    } catch (err) {
+      // No answer is not "no owner". Complete what needs no owner — hooks,
+      // permissions, backend config — and leave identity and registration
+      // for a spawn that can ask.
+      logger.warn(
+        'Studio owner could not be looked up; completing without identity or registration',
+        {
+          worktreePath,
+          missing: audit.missing,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      );
+      return completeStudioViaCli(worktreePath, { ...rest, studioSetup: false });
+    }
+  }
+  return completeStudioViaCli(worktreePath, {
+    ...rest,
+    sbSlug: ownerSlug || options.sbSlug,
+  });
 }

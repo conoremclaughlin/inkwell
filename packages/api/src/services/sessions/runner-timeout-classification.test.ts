@@ -52,9 +52,6 @@ vi.mock('../studio-paths.js', () => ({
 vi.mock('../studio-settings.js', () => ({
   applyPermissionOverlay: vi.fn(async () => async () => {}),
 }));
-vi.mock('../studio-complete.js', () => ({
-  ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
-}));
 
 import { ClaudeRunner, IDLE_TIMEOUT_MS, PROCESS_TIMEOUT_MS } from './claude-runner.js';
 import {

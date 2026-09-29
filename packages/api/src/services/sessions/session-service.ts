@@ -73,6 +73,7 @@ import type {
   WriteIntent,
 } from '../../data/repositories/thread-key-types.repository.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
+import { ensureStudioComplete } from '../studio-complete.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
@@ -2322,6 +2323,14 @@ export class SessionService implements ISessionService {
     // settle point is what shutdown terminalized the owner with).
     let errorClassification: ErrorClassification | null = null;
     let refusedBeforeAcceptance = false;
+
+    // The studio checklist, whatever the runner — AFTER the takeover above
+    // has claimed the row and registered the run, so the file reads (and,
+    // for an incomplete studio, `ink init`) sit inside this turn's
+    // ownership rather than widening the window in which two turns race
+    // for the session. This is where the Claude runner used to do it.
+    await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
+
     const turnStartMs = Date.now();
 
     try {
@@ -4803,6 +4812,12 @@ This session will continue with a fresh context after compaction. Your identity,
                 ? this.inkRunner
                 : this.claudeRunner;
 
+      await this.completeStudioBeforeSpawn(
+        compactionWorkingDirectory,
+        session.studioId,
+        session.sbSlug
+      );
+
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
         backendSessionId: session.backendSessionId,
@@ -4915,6 +4930,50 @@ This session will continue with a fresh context after compaction. Your identity,
   /**
    * Resolve backend for this execution, prioritizing persisted session backend.
    */
+  /**
+   * The studio checklist before EVERY spawn, whatever the backend (task
+   * 2841c7a9). Until 2026-09-29 only the Claude runner read it, so a studio
+   * owned by a Codex or Gemini SB was never repaired by the server: Lumen's
+   * Inktrade home went five days without an identity file, its hooks booking
+   * every session to the root studio. A complete studio costs a few file
+   * reads; an incomplete linked worktree is completed by `ink init`
+   * (ensureStudioComplete). The owner written into identity.json is the
+   * studio row's SB, looked up only on the incomplete path, because the SB
+   * spawned into a studio is not always the SB it belongs to. Non-fatal: the
+   * spawn goes ahead either way, and the failure is logged.
+   */
+  private async completeStudioBeforeSpawn(
+    workingDirectory: string | undefined,
+    studioId: string | null | undefined,
+    sbSlug: string
+  ): Promise<void> {
+    if (!workingDirectory) return;
+    const rowId = studioId && studioId !== 'main' ? studioId : undefined;
+    try {
+      await ensureStudioComplete(workingDirectory, {
+        sbSlug,
+        ...(rowId ? { studioId: rowId } : {}),
+        // Null is a confirmed "nobody to ask": no studio on the session, or a
+        // row that names no owner. A repository that cannot be reached, or a
+        // read that fails, THROWS — that is no answer, and ensureStudioComplete
+        // then writes nothing that names an owner (Lumen, PR #699).
+        owner: async () => {
+          if (!rowId) return null;
+          const repo = this.getStudiosRepo();
+          if (!repo) throw new Error('no studios repository to look the owner up in');
+          const row = await repo.findById(rowId);
+          return row?.sbSlug ?? null;
+        },
+      });
+    } catch (err) {
+      logger.debug('Studio checklist before spawn failed (non-fatal)', {
+        workingDirectory,
+        studioId: rowId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined

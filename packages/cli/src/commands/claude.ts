@@ -29,6 +29,7 @@ import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import { formatCurrentWork } from '../lib/current-work.js';
+import { completeStudioAtLaunch } from '../lib/launch-studio.js';
 import {
   getCurrentRuntimeSession,
   listRuntimeSessions,
@@ -3701,6 +3702,10 @@ export async function runClaude(
     process.exit(1);
   }
   const adapter = getBackend(options.backend);
+  // The studio checklist before the session is resolved: an incomplete
+  // studio is completed with its row's owner, so the hooks that follow book
+  // this session to the right studio (task 2841c7a9).
+  await completeStudioAtLaunch(process.cwd(), sbSlug);
   const sessionContext = options.session
     ? await ensureInkSessionContext(
         sbSlug,
@@ -3951,6 +3956,9 @@ export async function runClaudeInteractive(
     process.exit(1);
   }
   const adapter = getBackend(options.backend);
+  // As in runClaude: the checklist first, so the session lands in a studio
+  // that knows its owner (task 2841c7a9).
+  await completeStudioAtLaunch(process.cwd(), sbSlug);
   const sessionContext = options.session
     ? await ensureInkSessionContext(sbSlug, options.backend, passthroughArgs, options.verbose, [], {
         listCandidates: options.sessionCandidates || options.sessionCandidatesJson,

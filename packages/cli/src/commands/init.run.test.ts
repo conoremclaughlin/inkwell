@@ -36,7 +36,7 @@ const git = (args: string[], cwd: string) =>
   });
 
 const readJson = (p: string) => JSON.parse(readFileSync(p, 'utf-8')) as Record<string, unknown>;
-const stubs = () => ({
+const stubs = (backend?: string) => ({
   register: vi.fn(async () => STUDIO_ID),
   syncSkills: vi.fn(
     async (): Promise<StepResult> => ({
@@ -45,6 +45,9 @@ const stubs = () => ({
       detail: 'stubbed',
     })
   ),
+  // The owner's backend lookup reaches the server (cached) by default; a
+  // test never does.
+  lookupBackend: vi.fn(async () => backend),
 });
 
 beforeEach(() => {
@@ -174,6 +177,80 @@ describe('runInit in a linked worktree', () => {
       permissions: { allow: string[] };
     };
     expect(settings.permissions.allow).toEqual(['Bash(*)']);
+  });
+
+  it("records the owner's backend from their identity record, so a Codex SB's studio says so", async () => {
+    const deps = stubs('codex');
+    await runInit(studio, { agent: 'lumen' }, deps);
+    expect(deps.lookupBackend).toHaveBeenCalledWith('lumen');
+    expect(readJson(join(studio, '.ink', 'identity.json'))).toMatchObject({
+      sbSlug: 'lumen',
+      backend: 'codex',
+    });
+    // Every backend's config is still written: knowing the owner runs Codex
+    // does not make the studio Codex-only.
+    expect(auditStudio(studio, { linked: true }).complete).toBe(true);
+  });
+
+  it('--backend wins over the record, and an unknown backend records nothing', async () => {
+    const explicit = stubs('codex');
+    await runInit(studio, { agent: 'lumen', backend: 'gemini' }, explicit);
+    expect(explicit.lookupBackend).not.toHaveBeenCalled();
+    expect(readJson(join(studio, '.ink', 'identity.json')).backend).toBe('gemini');
+
+    rmSync(join(studio, '.ink'), { recursive: true, force: true });
+    const unknown = stubs(undefined);
+    await runInit(studio, { agent: 'aster' }, unknown);
+    expect(unknown.lookupBackend).toHaveBeenCalledWith('aster');
+    expect(readJson(join(studio, '.ink', 'identity.json'))).not.toHaveProperty('backend');
+  });
+
+  it('fills the backend for the existing owner, not the explicit agent that cannot replace it (Lumen, #699 P2)', async () => {
+    // completeStudio keeps an owner it finds, so the backend recorded must be
+    // that owner's: `init --agent wren` in Lumen's studio wrote claude here.
+    mkdirSync(join(studio, '.ink'), { recursive: true });
+    writeFileSync(
+      join(studio, '.ink', 'identity.json'),
+      JSON.stringify({ sbSlug: 'lumen', studioId: STUDIO_ID })
+    );
+    const deps = {
+      ...stubs(),
+      lookupBackend: vi.fn(async (slug: string) => (slug === 'lumen' ? 'codex' : 'claude')),
+    };
+    await runInit(studio, { agent: 'wren' }, deps);
+    expect(readJson(join(studio, '.ink', 'identity.json'))).toMatchObject({
+      sbSlug: 'lumen',
+      backend: 'codex',
+    });
+    expect(deps.lookupBackend).toHaveBeenCalledWith('lumen');
+    expect(deps.lookupBackend).not.toHaveBeenCalledWith('wren');
+  });
+
+  it('a pre-rename identity (agentId) is the retained owner too', async () => {
+    mkdirSync(join(studio, '.ink'), { recursive: true });
+    writeFileSync(join(studio, '.ink', 'identity.json'), JSON.stringify({ agentId: 'lumen' }));
+    const deps = {
+      ...stubs(),
+      lookupBackend: vi.fn(async (slug: string) => (slug === 'lumen' ? 'codex' : 'claude')),
+    };
+    await runInit(studio, { agent: 'wren' }, deps);
+    expect(readJson(join(studio, '.ink', 'identity.json'))).toMatchObject({
+      sbSlug: 'lumen',
+      backend: 'codex',
+    });
+    expect(deps.lookupBackend).toHaveBeenCalledWith('lumen');
+  });
+
+  it('an identity that already names a backend keeps it, and the record is not consulted', async () => {
+    mkdirSync(join(studio, '.ink'), { recursive: true });
+    writeFileSync(
+      join(studio, '.ink', 'identity.json'),
+      JSON.stringify({ sbSlug: 'lumen', studio: 'alpha', backend: 'codex' })
+    );
+    const deps = stubs('gemini');
+    await runInit(studio, {}, deps);
+    expect(deps.lookupBackend).not.toHaveBeenCalled();
+    expect(readJson(join(studio, '.ink', 'identity.json')).backend).toBe('codex');
   });
 
   it('takes the SB from an existing identity when no --agent is given', async () => {

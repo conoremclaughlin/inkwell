@@ -522,6 +522,17 @@ export class StudioOverflowService {
             archivedAt: null,
             expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
           });
+          // A revived row sits on a FRESH worktree, and a fresh worktree
+          // carries none of the studio files: the routine has to run here as
+          // it does for a created one. Until 2026-09-29 it did not, so every
+          // review round after the first — the row is closed between rounds
+          // and revived for the next — spawned into a bare checkout with no
+          // identity, no permissions and no backend config (task 2841c7a9).
+          await completeStudioViaCli(created.worktreePath, {
+            sbSlug,
+            studioId: revived.id,
+            purpose: revived.purpose ?? undefined,
+          });
           await this.leases.logEvent(userId, revived.id, 'overflow', {
             threadKey,
             sbSlug,

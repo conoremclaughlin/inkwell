@@ -28,8 +28,18 @@ interface DoctorResult {
   checks: DoctorCheck[];
 }
 
-/** What the server knows about the studio this worktree claims to be. */
-export type StudioRegistration = 'registered' | 'unregistered' | 'unreachable' | 'not-applicable';
+/**
+ * What the server knows about the studio this worktree claims to be.
+ * `unrecorded`: a row exists for this path but identity.json does not carry
+ * its id — the shape of every studio created before the checklist, which
+ * used to read as "no studio row" although the server had one.
+ */
+export type StudioRegistration =
+  | 'registered'
+  | 'unrecorded'
+  | 'unregistered'
+  | 'unreachable'
+  | 'not-applicable';
 
 /**
  * The studio checklist as doctor checks (task c3b34be8): every item the
@@ -57,18 +67,32 @@ export function studioChecksFrom(
           ? 'the studio id in identity.json names a row the server has'
           : registration === 'unreachable'
             ? 'server not reachable; could not confirm the studio row'
-            : 'no studio row for this worktree — repair: ink init',
+            : registration === 'unrecorded'
+              ? 'the server has a studio row for this worktree, but identity.json does not record its id — repair: ink init'
+              : 'no studio row for this worktree — repair: ink init',
     });
   }
   return checks;
 }
 
-/** Ask the server whether the studio id names a row; never throws. */
-async function probeRegistration(studioId: string | undefined): Promise<StudioRegistration> {
-  if (!studioId) return 'unregistered';
+/**
+ * Ask the server whether the studio is registered; never throws. With an id
+ * from identity.json, that id must name a row. Without one, the worktree
+ * path is looked up the way the launcher does, so a row the server has is
+ * reported as such rather than as missing.
+ */
+export async function probeRegistration(
+  studioId: string | undefined,
+  worktreePath: string,
+  call: typeof callInkTool = callInkTool
+): Promise<StudioRegistration> {
+  const found = (result: Record<string, unknown> | undefined) =>
+    !!result && (!!result.studio || result.success === true);
   try {
-    const result = await callInkTool('get_studio', { studioId });
-    return result && (result.studio || result.success === true) ? 'registered' : 'unregistered';
+    if (studioId) {
+      return found(await call('get_studio', { studioId })) ? 'registered' : 'unregistered';
+    }
+    return found(await call('get_studio', { path: worktreePath })) ? 'unrecorded' : 'unregistered';
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return /not found|no studio|unknown studio/i.test(message) ? 'unregistered' : 'unreachable';
@@ -83,7 +107,7 @@ async function buildStudioChecks(cwd: string): Promise<DoctorCheck[]> {
   if (placement.linked) {
     const identity = audit.checks.find((c) => c.id === 'studio-id');
     const studioId = identity?.ok ? identity.detail.replace(/^studioId /, '') : undefined;
-    registration = await probeRegistration(studioId);
+    registration = await probeRegistration(studioId, placement.toplevel);
   }
   return studioChecksFrom(audit, registration);
 }

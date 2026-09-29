@@ -49,6 +49,8 @@ import {
 } from '../repl/spawn-agent.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
+import { completeStudioAtLaunch, type LaunchStudioDeps } from '../lib/launch-studio.js';
+import { detectWorktree } from './init.js';
 import { SessionLog } from '../session/session-log.js';
 import {
   ensureBackendAuthReady,
@@ -3456,6 +3458,29 @@ export function envelopeShapeKey(runtime: ChatRuntime): string {
   return (hash >>> 0).toString(36);
 }
 
+/**
+ * The studio checklist before the chat runtime reads its scope (task
+ * 2841c7a9, Lumen's PR #699 rounds 1 and 2). `-b ink`, `ink chat` and
+ * `ink alpha` all come through runChat, and none of them pass the backend
+ * wrappers that run the launch completion, so a partial linked worktree
+ * launched here started with no identity file and a session scoped to
+ * "main". The identity is read only AFTER the completion has had its
+ * chance to write it, and it is read where the completion writes it: the
+ * worktree ROOT. A launch from `<studio>/packages/api` completes the root
+ * and would otherwise read a `.ink/identity.json` that never exists beside
+ * the package (round 2). Outside a repository the cwd is the root. Exported
+ * so the ordering is testable without a live chat.
+ */
+export async function prepareChatStudio(
+  cwd: string,
+  sbSlug: string,
+  deps: LaunchStudioDeps = {}
+): Promise<{ identity: ReturnType<typeof readIdentityJson> }> {
+  const placement = (deps.placement ?? detectWorktree)(cwd);
+  await completeStudioAtLaunch(cwd, sbSlug, { ...deps, placement: () => placement });
+  return { identity: readIdentityJson(placement.toplevel ?? cwd) };
+}
+
 export async function runChat(options: ChatOptions): Promise<void> {
   const debugFile = initSbDebug({
     enabled: options.sbDebug,
@@ -3487,7 +3512,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     throw new Error('Could not resolve agent identity. Run `ink init` or pass `--agent <id>`.');
   }
   const sbSlug: string = resolvedSlug;
-  const identity = readIdentityJson(process.cwd());
+  const { identity } = await prepareChatStudio(process.cwd(), sbSlug);
   // x-ink-context on every ink-routed tool call: the server validates the
   // named session against the authenticated user and enriches request
   // identity from the session row (workspace scope for writes, session

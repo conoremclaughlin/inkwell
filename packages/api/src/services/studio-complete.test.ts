@@ -83,6 +83,25 @@ describe('completeStudioViaCli', () => {
     ]);
   });
 
+  it("passes the owner's backend through as --backend when it is known", async () => {
+    await completeStudioViaCli(worktree, {
+      sbSlug: 'lumen',
+      studioId: STUDIO_ID,
+      backend: 'codex',
+      env: env(),
+    });
+    expect(stubCall().argv).toEqual([
+      'init',
+      '--json',
+      '--agent',
+      'lumen',
+      '--studio-id',
+      STUDIO_ID,
+      '--backend',
+      'codex',
+    ]);
+  });
+
   it('passes the two switches through only when they are off', async () => {
     await completeStudioViaCli(worktree, {
       sbSlug: 'wren',
@@ -152,6 +171,58 @@ describe('ensureStudioComplete', () => {
     });
     expect(result.ok).toBe(true);
     expect(stubCall().argv).toContain('--studio-id');
+  });
+
+  it("an incomplete studio is completed for its row's owner, not for the SB spawned into it", async () => {
+    // Myra spawned into a studio Lumen owns: the identity file must say lumen.
+    writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere/.git/worktrees/alpha\n');
+    const owner = vi.fn(async () => 'lumen');
+    const result = await ensureStudioComplete(worktree, {
+      sbSlug: 'myra',
+      studioId: STUDIO_ID,
+      owner,
+      env: env(),
+    });
+    expect(result.ok).toBe(true);
+    expect(owner).toHaveBeenCalledTimes(1);
+    const argv = stubCall().argv;
+    expect(argv.slice(argv.indexOf('--agent'), argv.indexOf('--agent') + 2)).toEqual([
+      '--agent',
+      'lumen',
+    ]);
+  });
+
+  it('the owner lookup is not paid for a complete studio, and an unknown owner falls back to the SB', async () => {
+    writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere/.git/worktrees/alpha\n');
+    seedComplete(worktree);
+    const owner = vi.fn(async () => 'lumen');
+    await ensureStudioComplete(worktree, { sbSlug: 'myra', owner, env: env() });
+    expect(owner).not.toHaveBeenCalled();
+
+    rmSync(join(worktree, '.ink'), { recursive: true, force: true });
+    const unknown = vi.fn(async () => null);
+    await ensureStudioComplete(worktree, { sbSlug: 'myra', owner: unknown, env: env() });
+    expect(unknown).toHaveBeenCalledTimes(1);
+    expect(stubCall().argv).toContain('myra');
+  });
+
+  it('a lookup that throws is no answer: the routine runs with studio setup off, and no owner is written (Lumen, #699 P1)', async () => {
+    // A guess here would be durable — completeStudio keeps an owner it finds —
+    // so a database that cannot be reached must not turn the spawning SB into
+    // the studio's owner.
+    writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere/.git/worktrees/alpha\n');
+    const failing = vi.fn(async () => {
+      throw new Error('db down');
+    });
+    const result = await ensureStudioComplete(worktree, {
+      sbSlug: 'myra',
+      studioId: STUDIO_ID,
+      owner: failing,
+      env: env(),
+    });
+    expect(result.ok).toBe(true);
+    expect(failing).toHaveBeenCalledTimes(1);
+    expect(stubCall().argv).toContain('--no-studio-setup');
   });
 
   it('the main worktree is reported, never rewritten', async () => {

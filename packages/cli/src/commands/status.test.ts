@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { afterEach, describe, expect, it } from 'vitest';
-import { getClaudePermissionsStatus, getMcpConfigStatus } from './status.js';
+import { getClaudePermissionsStatus, getMcpConfigStatus, studioRepairHint } from './status.js';
 
 const cleanupPaths: string[] = [];
 
@@ -78,5 +78,18 @@ describe('status helpers', () => {
     expect(status.configExists).toBe(true);
     expect(status.parseError).toBe(true);
     expect(status.hasInkServer).toBe(false);
+  });
+});
+
+describe('studioRepairHint (task 2841c7a9)', () => {
+  it('names ink init when a linked worktree has no identity file', () => {
+    const hint = studioRepairHint({ linked: true }, null);
+    expect(hint).toContain('ink init');
+    expect(hint).toContain('.ink/identity.json');
+  });
+
+  it('says nothing in the main worktree or when the identity file names the SB', () => {
+    expect(studioRepairHint({ linked: false }, null)).toBeNull();
+    expect(studioRepairHint({ linked: true }, { sbSlug: 'lumen' })).toBeNull();
   });
 });

@@ -31,7 +31,6 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { applyPermissionOverlay } from '../studio-settings.js';
-import { ensureStudioComplete } from '../studio-complete.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
@@ -439,22 +438,9 @@ export class ClaudeRunner implements IRunner {
           })
         : null;
 
-    // Safety net: the studio checklist before spawning. A complete studio
-    // costs a few file reads; an incomplete linked worktree is completed by
-    // `ink init` (task c3b34be8). Non-fatal — Claude still spawns.
-    if (config.workingDirectory) {
-      try {
-        await ensureStudioComplete(config.workingDirectory, {
-          sbSlug: config.sbSlug || 'unknown',
-          ...(config.studioId && config.studioId !== 'main' ? { studioId: config.studioId } : {}),
-        });
-      } catch (err) {
-        logger.debug('ensureStudioComplete pre-spawn check failed (non-fatal)', {
-          cwd: config.workingDirectory,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
+    // The studio checklist ran here until 2026-09-29, for Claude spawns only.
+    // It now runs in the session service before EVERY runner (task
+    // 2841c7a9), so a Codex or Gemini SB's studio is completed too.
 
     // Apply per-session permission overlay (from strategy config or 2FA grant).
     // The restore function is called after the process exits to revert the overlay.
