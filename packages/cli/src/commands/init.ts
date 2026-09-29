@@ -24,6 +24,7 @@ import { execFileSync } from 'child_process';
 import { basename, dirname } from 'path';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { readIdentityJson, resolveSlug } from '../backends/identity.js';
+import { lookupAgentBackend } from '../backends/agent-backend.js';
 import {
   completeStudio,
   type CompleteStudioOptions,
@@ -85,6 +86,8 @@ export interface InitOptions {
   force?: boolean;
   agent?: string;
   studioId?: string;
+  /** The owner's backend for the identity file; resolved from their record when absent. */
+  backend?: string;
   purpose?: string;
   /** commander: `--no-root-sync` sets rootSync=false; absent means true. */
   rootSync?: boolean;
@@ -97,6 +100,27 @@ export interface InitDeps {
   placement?: (cwd: string) => WorktreePlacement;
   register?: CompleteStudioOptions['register'];
   syncSkills?: CompleteStudioOptions['syncSkills'];
+  /**
+   * The backend an SB runs on, for the identity file (default: the server's
+   * identity record through `lookupAgentBackend`, cached). Undefined when
+   * unknown, unrunnable or ambiguous; nothing is recorded then.
+   */
+  lookupBackend?: (sbSlug: string) => Promise<string | undefined>;
+}
+
+/**
+ * The owner's backend from their identity record, when this CLI can launch
+ * it. A record naming a backend this CLI has no adapter for is not written
+ * into identity.json, because `resolveBackend` would hand that name to
+ * `getBackend` at the next launch and fail where the record's own lookup
+ * falls back instead.
+ */
+async function lookupOwnerBackend(sbSlug: string): Promise<string | undefined> {
+  try {
+    return (await lookupAgentBackend(sbSlug)).backend;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The studio name a worktree folder carries after the repository's `--`. */
@@ -122,13 +146,24 @@ export async function runInit(
   const target = placement.toplevel ?? cwd;
   const identity = readIdentityJson(target);
   const sbSlug = options.agent || identity?.sbSlug || resolveSlug() || 'sb';
+  const studioSetup = options.studioSetup !== false;
+  // The studio knows what its owner runs on (Conor, 2026-09-29: a Codex SB's
+  // studio should say so, and still carry every backend's config). Given
+  // explicitly, or resolved from the owner's identity record once, when the
+  // identity file is about to be written or lacks it. Never overwrites.
+  const backend =
+    options.backend ||
+    (placement.linked && studioSetup && !identity?.backend
+      ? await (deps.lookupBackend ?? lookupOwnerBackend)(sbSlug)
+      : undefined);
   return completeStudio(target, {
     sbSlug,
     mainRoot: placement.mainRoot,
     rootSync: options.rootSync !== false,
-    studioSetup: options.studioSetup !== false,
+    studioSetup,
     ...(placement.linked ? { studioName: studioNameFromPath(target) } : {}),
     ...(placement.branch ? { branch: placement.branch } : {}),
+    ...(backend ? { backend } : {}),
     ...(options.purpose ? { purpose: options.purpose } : {}),
     ...(options.studioId ? { studioId: options.studioId } : {}),
     ...(options.force ? { force: true } : {}),
@@ -254,6 +289,10 @@ export function registerInitCommand(program: Command): void {
     .option('-f, --force', 'Overwrite existing hooks even if non-Inkwell hooks are present')
     .option('-a, --agent <slug>', 'SB slug for the studio identity (default: resolved identity)')
     .option('--studio-id <uuid>', 'An existing studio row to record instead of registering one')
+    .option(
+      '-b, --backend <name>',
+      "The owner's backend recorded in identity.json (default: their identity record)"
+    )
     .option('-p, --purpose <desc>', 'Purpose recorded on the studio identity and row')
     .option(
       '--no-root-sync',
