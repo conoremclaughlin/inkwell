@@ -1593,6 +1593,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         logEvent: vi.fn(),
       } as unknown as StudioLeaseService);
 
+      completion.calls.length = 0;
       const revived = await service.ensureOverflowStudio({
         userId: 'user-1',
         sbSlug: 'lumen',
@@ -1609,6 +1610,12 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         note: 'keep me',
         checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
       });
+      // The revived row sits on a FRESH worktree, so it is completed exactly
+      // as a created one is: with the row's id, after the row was updated.
+      // Every review round after the first takes this path (task 2841c7a9).
+      expect(completion.calls).toEqual([
+        expect.objectContaining({ worktreePath: worktree, studioId: 'stale-row', sbSlug: 'lumen' }),
+      ]);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,

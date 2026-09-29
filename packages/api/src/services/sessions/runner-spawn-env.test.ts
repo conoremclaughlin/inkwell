@@ -31,9 +31,6 @@ vi.mock('./resolve-binary.js', () => ({
   resolveBinaryPath: vi.fn(async (name: string) => `/fake/bin/${name}`),
   buildSpawnPath: vi.fn((bin: string) => `${bin}:dir:/usr/bin`),
 }));
-vi.mock('../studio-complete.js', () => ({
-  ensureStudioComplete: vi.fn(async () => undefined),
-}));
 
 import { ClaudeRunner } from './claude-runner.js';
 import { GeminiRunner } from './gemini-runner.js';

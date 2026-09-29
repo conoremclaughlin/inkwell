@@ -73,6 +73,7 @@ import type {
   WriteIntent,
 } from '../../data/repositories/thread-key-types.repository.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
+import { ensureStudioComplete } from '../studio-complete.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
@@ -2099,6 +2100,9 @@ export class SessionService implements ISessionService {
             : resolvedBackend === 'ink'
               ? this.inkRunner
               : this.claudeRunner;
+
+    // The studio checklist, before the spawn and whatever the runner.
+    await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
@@ -4796,6 +4800,12 @@ This session will continue with a fresh context after compaction. Your identity,
                 ? this.inkRunner
                 : this.claudeRunner;
 
+      await this.completeStudioBeforeSpawn(
+        compactionWorkingDirectory,
+        session.studioId,
+        session.sbSlug
+      );
+
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
         backendSessionId: session.backendSessionId,
@@ -4908,6 +4918,44 @@ This session will continue with a fresh context after compaction. Your identity,
   /**
    * Resolve backend for this execution, prioritizing persisted session backend.
    */
+  /**
+   * The studio checklist before EVERY spawn, whatever the backend (task
+   * 2841c7a9). Until 2026-09-29 only the Claude runner read it, so a studio
+   * owned by a Codex or Gemini SB was never repaired by the server: Lumen's
+   * Inktrade home went five days without an identity file, its hooks booking
+   * every session to the root studio. A complete studio costs a few file
+   * reads; an incomplete linked worktree is completed by `ink init`
+   * (ensureStudioComplete). The owner written into identity.json is the
+   * studio row's SB, looked up only on the incomplete path, because the SB
+   * spawned into a studio is not always the SB it belongs to. Non-fatal: the
+   * spawn goes ahead either way, and the failure is logged.
+   */
+  private async completeStudioBeforeSpawn(
+    workingDirectory: string | undefined,
+    studioId: string | null | undefined,
+    sbSlug: string
+  ): Promise<void> {
+    if (!workingDirectory) return;
+    const rowId = studioId && studioId !== 'main' ? studioId : undefined;
+    try {
+      await ensureStudioComplete(workingDirectory, {
+        sbSlug,
+        ...(rowId ? { studioId: rowId } : {}),
+        owner: async () => {
+          if (!rowId) return null;
+          const row = await this.getStudiosRepo()?.findById(rowId);
+          return row?.sbSlug ?? null;
+        },
+      });
+    } catch (err) {
+      logger.debug('Studio checklist before spawn failed (non-fatal)', {
+        workingDirectory,
+        studioId: rowId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
