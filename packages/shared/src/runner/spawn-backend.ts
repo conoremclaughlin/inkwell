@@ -257,10 +257,14 @@ export const SESSION_ENV_HANDOFF_NAMES: readonly string[] = [
  * it on every lifecycle request instead of claiming an epoch of its own
  * (repl/turn-signal.ts, routes/hook-lifecycle.ts).
  *
- * It is deliberately in neither list above. It describes the chat process's
- * relationship to one server run, and nothing below the chat is that
- * process: a provider child that inherited it would be naming a turn it does
- * not own.
+ * It is deliberately in neither list above, so no provider spawned through
+ * buildCleanEnv carries it: it describes the chat process's relationship to
+ * one server run, and a provider child that inherited it would be naming a
+ * turn it does not own. The chat's own local tools are another matter: a
+ * run's bash tool was seen carrying the chat's environment (the #694 probe),
+ * so a tool subprocess can carry it. Its only reader is the chat itself
+ * (chat.ts), so the one effect is that a non-attached `ink chat` started from
+ * a run's tool names the parent run's epoch and acts as another child of it.
  */
 export const RUN_TURN_EPOCH_ENV = 'INK_RUN_TURN_EPOCH';
 

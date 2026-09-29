@@ -51,8 +51,10 @@ vi.mock('../services/graph-executor.service', () => ({
 }));
 
 import { createTurnSignal } from '../../../cli/src/repl/turn-signal.js';
+import { sessionStartStateArgs } from '../../../cli/src/lib/session-start-state.js';
 
 import { createHookLifecycleRouter } from './hook-lifecycle';
+import { interruptActiveRuns } from '../services/sessions/interrupt-active-runs';
 import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { StudioLeaseService } from '../services/studio-lease.service';
 import type { DataComposer } from '../data/composer';
@@ -160,6 +162,67 @@ function serverFinalizes(): boolean {
   applyWrite({ lifecycle: 'idle', cli_attached: false });
   return true;
 }
+
+/**
+ * The shutdown sweep's view of the same row. Its update honours the two
+ * predicates interrupt-active-runs.ts puts on it: lifecycle = 'running' and
+ * turn_epoch in the run's epochs.
+ */
+function sweepClient() {
+  return {
+    from: () => ({
+      select: () => {
+        const read = {
+          eq: () => read,
+          maybeSingle: async () => ({
+            data: {
+              metadata: {},
+              lifecycle: row.lifecycle,
+              ended_at: null,
+              turn_epoch: row.turn_epoch,
+            },
+            error: null,
+          }),
+        };
+        return read;
+      },
+      update: (payload: Record<string, unknown>) => {
+        let lifecycleIs: unknown;
+        let epochIn: unknown[] | undefined;
+        const write = {
+          eq(col: string, val: unknown) {
+            if (col === 'lifecycle') lifecycleIs = val;
+            return write;
+          },
+          is: () => write,
+          in(col: string, vals: unknown[]) {
+            if (col === 'turn_epoch') epochIn = vals;
+            return write;
+          },
+          select: async () => {
+            const matches =
+              (lifecycleIs === undefined || row.lifecycle === lifecycleIs) &&
+              (epochIn === undefined || epochIn.includes(row.turn_epoch));
+            if (!matches) return { data: [], error: null };
+            if (typeof payload.lifecycle === 'string') applyWrite({ lifecycle: payload.lifecycle });
+            return { data: [{ id: SESSION_ID }], error: null };
+          },
+        };
+        return write;
+      },
+    }),
+  };
+}
+
+/** The run as the server's registry holds it while the turn executes. */
+const liveRun = () => ({
+  sessionId: SESSION_ID,
+  userId: 'user-1',
+  sbSlug: 'wren',
+  backend: 'claude',
+  startedAt: Date.now(),
+  turnEpoch: RUN_EPOCH,
+});
 
 describe('hook-lifecycle: a server run and the ink chat it spawned', () => {
   const updateSession = vi.fn(async (_id: string, updates: Record<string, unknown>) => {
@@ -300,6 +363,48 @@ describe('hook-lifecycle: a server run and the ink chat it spawned', () => {
     expect(row.turn_epoch).toBe(RUN_EPOCH);
     await chat.close();
     expect(serverFinalizes()).toBe(true);
+  });
+
+  /**
+   * A provider's startup hook: update_session_state with the arguments the
+   * CLI builds, which the tool maps onto the repository update one to one.
+   */
+  async function providerStarts(headless: boolean) {
+    const { lifecycle, workingDir } = sessionStartStateArgs({
+      sessionId: SESSION_ID,
+      sbSlug: 'wren',
+      workingDir: '/work/tree',
+      headless,
+    });
+    await updateSession(SESSION_ID, {
+      ...(lifecycle !== undefined ? { lifecycle } : {}),
+      workingDir,
+    });
+  }
+
+  it("keeps a fresh spawn's run running under its epoch through startup and prompt, so a shutdown marks it", async () => {
+    serverTakesTurn();
+
+    await providerStarts(true);
+    await post({ lifecycle: 'running', event: 'prompt', headless: true });
+
+    expect(rotations).toBe(0);
+    expect(row).toMatchObject({ lifecycle: 'running', turn_epoch: RUN_EPOCH });
+    const [outcome] = await interruptActiveRuns(sweepClient(), [liveRun()]);
+    expect(outcome).toMatchObject({ state: 'interrupted', marked: true });
+    expect(row.lifecycle).toBe('interrupted');
+  });
+
+  it("control: a startup that writes idle leaves the run reading idle, and a shutdown can't mark it", async () => {
+    serverTakesTurn();
+
+    await providerStarts(false);
+    await post({ lifecycle: 'running', event: 'prompt', headless: true });
+
+    expect(row.lifecycle).toBe('idle');
+    const [outcome] = await interruptActiveRuns(sweepClient(), [liveRun()]);
+    expect(outcome.state).toBe('finalized-elsewhere');
+    expect(row.lifecycle).toBe('idle');
   });
 
   /** A provider compacting mid-run, as its pre- and post-compact hooks post. */

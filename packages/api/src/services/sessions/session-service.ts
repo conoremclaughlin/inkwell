@@ -4787,6 +4787,9 @@ This session will continue with a fresh context after compaction. Your identity,
         ...(compactionToken ? { inkAccessToken: compactionToken } : {}),
         ...(compactionDelegationSecret ? { inkDelegationSecret: compactionDelegationSecret } : {}),
         repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
+        // No turnEpoch: compaction takes no turn of its own (no pre-spawn
+        // takeover, and markCompacted is not fenced), so an ink chat spawned
+        // here claims its own turn, as one a person starts does.
       };
 
       const runner =

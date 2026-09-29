@@ -36,6 +36,7 @@ import {
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { promptAttachmentWrite } from '../lib/turn-owner.js';
+import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
 
@@ -2473,24 +2474,20 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   inkThreadKey = await hydrateThreadKeyFromServer(inkSessionId, inkThreadKey, config?.email);
 
-  // Set lifecycle to idle on startup (ready for user input). A backend the
-  // server spawned is not waiting for input: the run already wrote `running`
-  // under its turn epoch, and its finalize writes what comes after. An idle
-  // here landed a second into the run, and the next `running` then rotated
-  // the epoch out from under it (2026-09-29: every fresh Claude Code server
-  // spawn, and each provider that started a fresh session mid-turn under ink
-  // chat). The linkage below still goes.
+  // Set lifecycle to idle on startup (ready for user input), unless the
+  // server spawned this backend: then the run owns the lifecycle and only the
+  // linkage goes (see sessionStartStateArgs).
   if (inkSessionId) {
     try {
-      const updateArgs: Record<string, unknown> = {
+      const updateArgs = sessionStartStateArgs({
         email: config?.email,
         sbSlug,
         sessionId: inkSessionId,
         workingDir: cwd,
-      };
-      if (!isHeadlessSession()) updateArgs.lifecycle = 'idle';
-      if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
-      if (inkThreadKey) updateArgs.activeThreadKey = inkThreadKey;
+        headless: isHeadlessSession(),
+        backendSessionId,
+        activeThreadKey: inkThreadKey,
+      });
       await callInkTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
