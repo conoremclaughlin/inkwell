@@ -204,19 +204,25 @@ describe('ensureStudioComplete', () => {
     await ensureStudioComplete(worktree, { sbSlug: 'myra', owner: unknown, env: env() });
     expect(unknown).toHaveBeenCalledTimes(1);
     expect(stubCall().argv).toContain('myra');
+  });
 
-    // A lookup that throws is a lookup that answered nothing.
-    rmSync(join(root, 'stub.log'), { force: true });
+  it('a lookup that throws is no answer: the routine runs with studio setup off, and no owner is written (Lumen, #699 P1)', async () => {
+    // A guess here would be durable — completeStudio keeps an owner it finds —
+    // so a database that cannot be reached must not turn the spawning SB into
+    // the studio's owner.
+    writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere/.git/worktrees/alpha\n');
     const failing = vi.fn(async () => {
       throw new Error('db down');
     });
     const result = await ensureStudioComplete(worktree, {
       sbSlug: 'myra',
+      studioId: STUDIO_ID,
       owner: failing,
       env: env(),
     });
     expect(result.ok).toBe(true);
-    expect(stubCall().argv).toContain('myra');
+    expect(failing).toHaveBeenCalledTimes(1);
+    expect(stubCall().argv).toContain('--no-studio-setup');
   });
 
   it('the main worktree is reported, never rewritten', async () => {

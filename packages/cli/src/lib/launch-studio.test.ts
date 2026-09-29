@@ -15,6 +15,7 @@ import {
   completeStudioForLaunch,
   describeLaunchStudioResult,
   type LaunchStudioDeps,
+  type LaunchStudioLookup,
 } from './launch-studio.js';
 
 let root: string;
@@ -56,7 +57,12 @@ function report(complete: boolean): CompleteStudioReport {
 function deps(overrides: Partial<LaunchStudioDeps> = {}) {
   return {
     placement: linked,
-    lookupStudio: vi.fn(async () => ({ id: STUDIO_ID, sbSlug: 'lumen' })),
+    lookupStudio: vi.fn(
+      async (): Promise<LaunchStudioLookup> => ({
+        status: 'found',
+        row: { id: STUDIO_ID, sbSlug: 'lumen' },
+      })
+    ),
     runInit: vi.fn(async () => report(true)),
     ...overrides,
   };
@@ -129,11 +135,29 @@ describe('completeStudioForLaunch', () => {
     expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'lumen', studioId: STUDIO_ID });
   });
 
-  it('a worktree with no row takes the launching slug and registers as ink init would', async () => {
-    const d = deps({ lookupStudio: vi.fn(async () => null) });
+  it('a worktree the server confirms has no row takes the launching slug and registers as ink init would', async () => {
+    const d = deps({
+      lookupStudio: vi.fn(async (): Promise<LaunchStudioLookup> => ({ status: 'none' })),
+    });
     const result = await completeStudioForLaunch(studio, 'wren', d);
     expect(result.owner).toBe('wren');
     expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'wren' });
+  });
+
+  it('a worktree whose owner the server could not name is completed with studio setup off', async () => {
+    const d = deps({
+      lookupStudio: vi.fn(
+        async (): Promise<LaunchStudioLookup> => ({ status: 'unknown', reason: 'fetch failed' })
+      ),
+    });
+    const result = await completeStudioForLaunch(studio, 'wren', d);
+    expect(result.owner).toBeUndefined();
+    expect(result.ownerUnknown).toBe('fetch failed');
+    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'wren', studioSetup: false });
+    const [line, ...rest] = describeLaunchStudioResult(result);
+    expect(line).toContain('owner is unknown');
+    expect(line).toContain('fetch failed');
+    expect(rest).toEqual([]);
   });
 
   it('a complete studio costs the checklist read and nothing else', async () => {

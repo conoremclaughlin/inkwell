@@ -4946,9 +4946,15 @@ This session will continue with a fresh context after compaction. Your identity,
       await ensureStudioComplete(workingDirectory, {
         sbSlug,
         ...(rowId ? { studioId: rowId } : {}),
+        // Null is a confirmed "nobody to ask": no studio on the session, or a
+        // row that names no owner. A repository that cannot be reached, or a
+        // read that fails, THROWS — that is no answer, and ensureStudioComplete
+        // then writes nothing that names an owner (Lumen, PR #699).
         owner: async () => {
           if (!rowId) return null;
-          const row = await this.getStudiosRepo()?.findById(rowId);
+          const repo = this.getStudiosRepo();
+          if (!repo) throw new Error('no studios repository to look the owner up in');
+          const row = await repo.findById(rowId);
           return row?.sbSlug ?? null;
         },
       });

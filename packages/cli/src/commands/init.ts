@@ -151,10 +151,15 @@ export async function runInit(
   // studio should say so, and still carry every backend's config). Given
   // explicitly, or resolved from the owner's identity record once, when the
   // identity file is about to be written or lacks it. Never overwrites.
+  // The owner looked up is the one the file will KEEP: completeStudio never
+  // replaces an owner it finds, so an existing identity's slug wins over
+  // --agent here as it does there — `init --agent wren` in Lumen's studio
+  // must record Lumen's backend, not Wren's (Lumen, PR #699 round 1).
+  const retainedOwner = identity?.sbSlug || sbSlug;
   const backend =
     options.backend ||
     (placement.linked && studioSetup && !identity?.backend
-      ? await (deps.lookupBackend ?? lookupOwnerBackend)(sbSlug)
+      ? await (deps.lookupBackend ?? lookupOwnerBackend)(retainedOwner)
       : undefined);
   return completeStudio(target, {
     sbSlug,

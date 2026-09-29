@@ -205,6 +205,42 @@ describe('runInit in a linked worktree', () => {
     expect(readJson(join(studio, '.ink', 'identity.json'))).not.toHaveProperty('backend');
   });
 
+  it('fills the backend for the existing owner, not the explicit agent that cannot replace it (Lumen, #699 P2)', async () => {
+    // completeStudio keeps an owner it finds, so the backend recorded must be
+    // that owner's: `init --agent wren` in Lumen's studio wrote claude here.
+    mkdirSync(join(studio, '.ink'), { recursive: true });
+    writeFileSync(
+      join(studio, '.ink', 'identity.json'),
+      JSON.stringify({ sbSlug: 'lumen', studioId: STUDIO_ID })
+    );
+    const deps = {
+      ...stubs(),
+      lookupBackend: vi.fn(async (slug: string) => (slug === 'lumen' ? 'codex' : 'claude')),
+    };
+    await runInit(studio, { agent: 'wren' }, deps);
+    expect(readJson(join(studio, '.ink', 'identity.json'))).toMatchObject({
+      sbSlug: 'lumen',
+      backend: 'codex',
+    });
+    expect(deps.lookupBackend).toHaveBeenCalledWith('lumen');
+    expect(deps.lookupBackend).not.toHaveBeenCalledWith('wren');
+  });
+
+  it('a pre-rename identity (agentId) is the retained owner too', async () => {
+    mkdirSync(join(studio, '.ink'), { recursive: true });
+    writeFileSync(join(studio, '.ink', 'identity.json'), JSON.stringify({ agentId: 'lumen' }));
+    const deps = {
+      ...stubs(),
+      lookupBackend: vi.fn(async (slug: string) => (slug === 'lumen' ? 'codex' : 'claude')),
+    };
+    await runInit(studio, { agent: 'wren' }, deps);
+    expect(readJson(join(studio, '.ink', 'identity.json'))).toMatchObject({
+      sbSlug: 'lumen',
+      backend: 'codex',
+    });
+    expect(deps.lookupBackend).toHaveBeenCalledWith('lumen');
+  });
+
   it('an identity that already names a backend keeps it, and the record is not consulted', async () => {
     mkdirSync(join(studio, '.ink'), { recursive: true });
     writeFileSync(
