@@ -255,6 +255,10 @@ describe('killProcess — real subprocess', () => {
 // NAMES it finds, never values.
 describe('child environment — real subprocess (Phase 0)', () => {
   it('the agy child never sees a server secret, and sees its own session credentials', async () => {
+    // With a token set the runner stages its MCP bridge and writes the agy
+    // MCP config under homedir(); HOME points at the fixture dir so a test
+    // never reaches the real one (Lumen, #694 r1).
+    vi.stubEnv('HOME', fixtures);
     vi.stubEnv('JWT_SECRET', 'synthetic-jwt-secret');
     vi.stubEnv('SUPABASE_SECRET_KEY', 'synthetic-service-key');
     vi.stubEnv('TELEGRAM_BOT_TOKEN', 'synthetic-bot');

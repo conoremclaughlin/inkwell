@@ -10,6 +10,8 @@ import {
   resolveSpawnTarget,
   LineBuffer,
   SPAWN_ENV_INHERITED_NAMES,
+  SESSION_ENV_HANDOFF_NAMES,
+  sessionEnvHandoff,
 } from './spawn-backend.js';
 
 describe('buildCleanEnv', () => {
@@ -180,6 +182,14 @@ describe('buildCleanEnv: the child inherits exact names only (Phase 0)', () => {
     }
   });
 
+  it('inherits the operator tool-policy path, which the ink chat child reads (Lumen, #694 r1)', () => {
+    const env = buildCleanEnv(undefined, {
+      ...parent,
+      INK_TOOL_POLICY_PATH: '/synthetic/policy.json',
+    });
+    expect(env.INK_TOOL_POLICY_PATH).toBe('/synthetic/policy.json');
+  });
+
   it('exports the inherited names so a spawner test can assert the final env against them', () => {
     expect(Array.isArray(SPAWN_ENV_INHERITED_NAMES)).toBe(true);
     expect(SPAWN_ENV_INHERITED_NAMES).toContain('HOME');
@@ -189,6 +199,59 @@ describe('buildCleanEnv: the child inherits exact names only (Phase 0)', () => {
     // No name is a pattern (macOS's __CF_USER_TEXT_ENCODING starts with underscores).
     expect(SPAWN_ENV_INHERITED_NAMES.every((name) => /^[A-Z_][A-Z0-9_]*$/.test(name))).toBe(true);
     expect(new Set(SPAWN_ENV_INHERITED_NAMES).size).toBe(SPAWN_ENV_INHERITED_NAMES.length);
+  });
+});
+
+// The ink chat child spawns its provider backend for a turn through
+// spawnBackend. That grandchild serves the SAME session, so the child hands
+// it its own credentials and identity explicitly (Lumen, #694 r1: with the
+// blanket inheritance gone, the provider lost its INK_ACCESS_TOKEN and its
+// session ids at the final spawn).
+describe('sessionEnvHandoff: a session process hands its own session state to its child', () => {
+  const childEnv: Record<string, string> = {
+    INK_ACCESS_TOKEN: 'child-session-token',
+    INK_DELEGATION_SECRET: 'synthetic-derived-secret',
+    INK_SESSION_ID: 'sess-1',
+    INK_STUDIO_ID: 'studio-1',
+    INK_CONTEXT: 'synthetic-context-token',
+    INK_RUNTIME_LINK_ID: 'link-1',
+    INK_CONSTITUTION_INJECTED: '1',
+    SB_SLUG: 'wren',
+    AGENT_ID: 'wren',
+    // Never part of a handoff: the server's secrets are not in this process
+    // to begin with after Phase 0, and would not cross even if they were.
+    JWT_SECRET: 'synthetic-jwt-secret',
+    SUPABASE_SECRET_KEY: 'synthetic-service-key',
+    HOME: '/home/synthetic',
+  };
+
+  it('hands over exactly the session credentials and identity, by name', () => {
+    const handoff = sessionEnvHandoff(childEnv);
+    expect(handoff).toEqual({
+      INK_ACCESS_TOKEN: 'child-session-token',
+      INK_DELEGATION_SECRET: 'synthetic-derived-secret',
+      INK_SESSION_ID: 'sess-1',
+      INK_STUDIO_ID: 'studio-1',
+      INK_CONTEXT: 'synthetic-context-token',
+      INK_RUNTIME_LINK_ID: 'link-1',
+      INK_CONSTITUTION_INJECTED: '1',
+      SB_SLUG: 'wren',
+      AGENT_ID: 'wren',
+    });
+  });
+
+  it('buildCleanEnv does not inherit any of them on its own; the handoff must be explicit', () => {
+    const inherited = buildCleanEnv(undefined, childEnv);
+    for (const name of SESSION_ENV_HANDOFF_NAMES) {
+      expect(name in inherited, name).toBe(false);
+    }
+    const final = buildCleanEnv(
+      { ...sessionEnvHandoff(childEnv), INK_SESSION_ID: 'from-prepare' },
+      childEnv
+    );
+    expect(final.INK_ACCESS_TOKEN).toBe('child-session-token');
+    expect(final.INK_SESSION_ID).toBe('from-prepare');
+    expect('JWT_SECRET' in final).toBe(false);
   });
 });
 

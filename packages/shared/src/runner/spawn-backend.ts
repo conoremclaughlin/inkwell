@@ -166,13 +166,16 @@ export const SPAWN_ENV_INHERITED_NAMES: readonly string[] = [
   'DOCKER_CONTEXT',
   'DOCKER_CERT_PATH',
   'DOCKER_TLS_VERIFY',
-  // Inkwell knobs a child reads. Credentials (INK_ACCESS_TOKEN,
-  // INK_DELEGATION_SECRET) are NOT here: a child gets its own, explicitly.
+  // Inkwell knobs a child reads (operator configuration, never a credential:
+  // INK_ACCESS_TOKEN and INK_DELEGATION_SECRET are NOT here, a child gets its
+  // own explicitly; see SESSION_ENV_HANDOFF_NAMES for the one case where a
+  // session process hands its own down).
   'INK_SERVER_URL',
   'INK_PORT_BASE',
   'INK_CLI_PATH',
   'INK_STUDIOS_ROOT',
   'INK_MCP_URL',
+  'INK_TOOL_POLICY_PATH',
   'SB_DEBUG',
   'SB_DEBUG_FILE',
   // Each runtime's own authentication and configuration, named one by one so
@@ -223,6 +226,39 @@ export function buildCleanEnv(
     if (value !== undefined) inherited[name] = value;
   }
   return { ...inherited, ...extraEnv };
+}
+
+/**
+ * The session state a session process hands to a child that serves the SAME
+ * session: the ink chat loop spawning its provider backend for a turn. These
+ * are its own credentials and its own session identity, not the server's, so
+ * handing them down is the one legitimate inheritance of a credential, and
+ * it is explicit: the spawner calls sessionEnvHandoff() and merges the
+ * result under its own prepared env. Nothing in this list is inherited by
+ * buildCleanEnv on its own (Lumen, #694 r1: the provider grandchild lost its
+ * INK_ACCESS_TOKEN the moment the server allowlist stopped the blanket
+ * inheritance it had been riding on).
+ */
+export const SESSION_ENV_HANDOFF_NAMES: readonly string[] = [
+  'INK_ACCESS_TOKEN',
+  'INK_DELEGATION_SECRET',
+  'INK_SESSION_ID',
+  'INK_STUDIO_ID',
+  'INK_CONTEXT',
+  'INK_RUNTIME_LINK_ID',
+  'INK_CONSTITUTION_INJECTED',
+  'SB_SLUG',
+  'AGENT_ID',
+];
+
+/** The SESSION_ENV_HANDOFF_NAMES present in `parent`, by exact name. */
+export function sessionEnvHandoff(parent: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const handoff: Record<string, string> = {};
+  for (const name of SESSION_ENV_HANDOFF_NAMES) {
+    const value = parent[name];
+    if (value !== undefined) handoff[name] = value;
+  }
+  return handoff;
 }
 
 /**

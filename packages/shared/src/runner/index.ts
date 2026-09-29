@@ -1,6 +1,8 @@
 export {
   buildCleanEnv,
   SPAWN_ENV_INHERITED_NAMES,
+  SESSION_ENV_HANDOFF_NAMES,
+  sessionEnvHandoff,
   resolveSpawnTarget,
   spawnBackend,
   LineBuffer,
