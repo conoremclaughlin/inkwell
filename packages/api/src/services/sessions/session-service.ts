@@ -2101,9 +2101,6 @@ export class SessionService implements ISessionService {
               ? this.inkRunner
               : this.claudeRunner;
 
-    // The studio checklist, before the spawn and whatever the runner.
-    await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
-
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
     const taskGroupId = (metadata?.taskGroupId as string) || undefined;
@@ -2326,6 +2323,14 @@ export class SessionService implements ISessionService {
     // settle point is what shutdown terminalized the owner with).
     let errorClassification: ErrorClassification | null = null;
     let refusedBeforeAcceptance = false;
+
+    // The studio checklist, whatever the runner — AFTER the takeover above
+    // has claimed the row and registered the run, so the file reads (and,
+    // for an incomplete studio, `ink init`) sit inside this turn's
+    // ownership rather than widening the window in which two turns race
+    // for the session. This is where the Claude runner used to do it.
+    await this.completeStudioBeforeSpawn(resolvedWorkingDirectory, session.studioId, sbSlug);
+
     const turnStartMs = Date.now();
 
     try {
