@@ -197,16 +197,16 @@ import {
   type LocalToolCall,
   type ToolResultRecord,
   MAX_RELAY_BYTES,
-} from '../repl/agent-loop.js';
+} from '@inklabs/shared/runtime';
 // Re-exported for callers (and tests) that have always imported these from
-// chat.js. The implementations moved to ../repl/agent-loop.js so the turn
+// chat.js. The implementations live in @inklabs/shared/runtime so the turn
 // primitive can be reused outside the REPL — see
 // ink://specs/ink-runtime-shadow-clones.
 export {
   extractLocalToolCalls,
   isTerminalSignalToolResult,
   stripLocalToolBlocks,
-} from '../repl/agent-loop.js';
+} from '@inklabs/shared/runtime';
 import {
   classifyError,
   createThreadDrainState,
@@ -7356,7 +7356,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     };
 
     // ── Backend port for this turn ──
-    // The loop (../repl/agent-loop.js) decides WHAT to send and whether to send
+    // The loop (@inklabs/shared/runtime) decides WHAT to send and whether to send
     // again. Everything below is this host's business: provider-session seeding
     // and reuse, recovery when a resumed session has vanished, media delivery
     // flags, SIGINT/abort wiring, debug + activity logging. A shadow clone

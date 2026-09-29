@@ -9,6 +9,13 @@ export default defineConfig({
       // needs the same mapping. No other package uses the '@' prefix, so this
       // is unambiguous at the workspace level.
       '@': path.resolve(__dirname, 'packages/web/src'),
+      // Everything else under @inklabs/shared resolves through its built dist,
+      // so a test reads whatever the last `yarn workspace @inklabs/shared
+      // build` left there. The agent loop moved into this subpath from the
+      // CLI, and the CLI's wiring tests drive it: through dist, an edit to the
+      // loop would not reach them until someone rebuilt, and they would pass
+      // against the old loop. packages/cli/vitest.config.ts repeats this.
+      '@inklabs/shared/runtime': path.resolve(__dirname, 'packages/shared/src/runtime/index.ts'),
     },
   },
   test: {

@@ -27,14 +27,14 @@ import {
   spawnDialogueText,
   continuationSpawnArgs,
 } from './chat.js';
-import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
+import { MAX_RELAY_BYTES } from '@inklabs/shared/runtime';
 import { SessionLog } from '../session/session-log.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import {
   findImitatedToolResults,
   isPotentialImitationPrefix,
   MAX_RELAY_CHARS,
-} from '../repl/agent-loop.js';
+} from '@inklabs/shared/runtime';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**

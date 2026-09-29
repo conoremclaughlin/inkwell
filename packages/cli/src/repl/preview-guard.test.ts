@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ImitationPreviewGuard } from './preview-guard.js';
-import { findImitatedToolResults, isPotentialImitationPrefix } from './agent-loop.js';
+import { findImitatedToolResults, isPotentialImitationPrefix } from '@inklabs/shared/runtime';
 
 /**
  * The observer projection, exercised as the host uses it: the REAL detector

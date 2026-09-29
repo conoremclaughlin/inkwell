@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ParagraphStreamBuffer, StreamedTurnRenderer } from './paragraph-stream.js';
-import { findImitatedToolResults, stripLocalToolBlocks } from './agent-loop.js';
+import { findImitatedToolResults, stripLocalToolBlocks } from '@inklabs/shared/runtime';
 
 describe('ParagraphStreamBuffer', () => {
   it('holds partial text until a blank-line boundary completes it', () => {

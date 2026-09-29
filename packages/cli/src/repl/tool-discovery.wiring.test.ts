@@ -24,7 +24,11 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { runAgentLoop, type BackendTurnOutcome, type ToolResultRecord } from './agent-loop.js';
+import {
+  runAgentLoop,
+  type BackendTurnOutcome,
+  type ToolResultRecord,
+} from '@inklabs/shared/runtime';
 import { executeToolCalls } from './tool-call-executor.js';
 import { ToolPolicyState } from './tool-policy.js';
 import { deriveClonePolicy, isForbiddenInClone } from './clone-policy.js';

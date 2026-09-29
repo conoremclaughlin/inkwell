@@ -29,6 +29,16 @@
         "types": "./dist/cjs/stories/*/index.d.ts",
         "default": "./dist/cjs/stories/*/index.js"
       }
+    },
+    "./runtime": {
+      "import": {
+        "types": "./dist/runtime/index.d.ts",
+        "default": "./dist/runtime/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/runtime/index.d.ts",
+        "default": "./dist/cjs/runtime/index.js"
+      }
     }
   },
   "scripts": {
