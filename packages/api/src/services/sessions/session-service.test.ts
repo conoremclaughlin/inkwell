@@ -720,6 +720,35 @@ describe('SessionService', () => {
     });
 
     /**
+     * Park the next turn inside its runner, and wait until it is actually
+     * there. The path from handleMessage to runner.run awaits real I/O (the
+     * studio checklist's stat, PR #699) as well as fake timers, so one
+     * advanceTimersByTimeAsync(0) is not a runner-entry barrier: it was on
+     * this machine and not on the CI runner. untilEntered keeps flushing
+     * the fake clock and yielding to the loop until the flag the mock sets
+     * on entry is true, however long the I/O takes; a path that never
+     * enters fails by the test timeout, with this name on it.
+     */
+    function parkNextRun() {
+      let release!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      let entered = false;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(() => {
+        entered = true;
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      });
+      return {
+        async untilEntered() {
+          while (!entered) await vi.advanceTimersByTimeAsync(0);
+        },
+        release(v: ReturnType<typeof createMockClaudeResult>) {
+          release(v);
+        },
+      };
+    }
+
+    /**
      * Round 8 (Lumen): a QUEUED next turn renews the lease before the
      * processing lock — invisible to every DB fence. The boundary consults
      * the in-process queue/lock instead of a heartbeat cutoff (which had
@@ -731,20 +760,13 @@ describe('SessionService', () => {
       const service = makeStatefulService(db.repo);
 
       // Park A inside its runner so B can queue behind the lock.
-      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
-      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseRunner = resolve;
-          })
-      );
-
+      const parked = parkNextRun();
       const aPromise = service.handleMessage(createMockRequest());
-      await vi.advanceTimersByTimeAsync(0); // A reaches the runner
+      await parked.untilEntered(); // A is inside the runner
       const bPromise = service.handleMessage(createMockRequest()); // queues
       await vi.advanceTimersByTimeAsync(0);
 
-      releaseRunner(createMockClaudeResult());
+      parked.release(createMockClaudeResult());
       const a = await aPromise;
       expect(a.success).toBe(true);
 
@@ -766,15 +788,9 @@ describe('SessionService', () => {
       await service.handleMessage(createMockRequest()); // turn A
 
       // Turn B enters and parks inside its runner — it holds the lock.
-      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
-      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseRunner = resolve;
-          })
-      );
+      const parked = parkNextRun();
       const bPromise = service.handleMessage(createMockRequest());
-      await vi.advanceTimersByTimeAsync(0);
+      await parked.untilEntered(); // B is inside the runner
 
       // A's retry fires from the background while B holds the lock. The row
       // is B's? No — B is parked BEFORE its running write? It wrote running
@@ -783,7 +799,7 @@ describe('SessionService', () => {
       // boundary effects either way.
       await vi.advanceTimersByTimeAsync(10_000);
 
-      releaseRunner(createMockClaudeResult());
+      parked.release(createMockClaudeResult());
       const b = await bPromise;
       expect(b.success).toBe(true);
       expect(activeRunCount()).toBe(0);
@@ -7466,7 +7482,12 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       let releaseFirst!: () => void;
+      let firstEntered!: () => void;
+      const untilFirstEntered = new Promise<void>((r) => {
+        firstEntered = r;
+      });
       vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        firstEntered();
         await new Promise<void>((r) => {
           releaseFirst = r;
         });
@@ -7474,7 +7495,10 @@ describe('SessionService', () => {
       });
 
       const p1 = sessionService.handleMessage(createMockRequest({ content: 'lock holder' }));
-      await new Promise((r) => setTimeout(r, 10));
+      // The lock holder is inside its runner: awaited, not assumed after ten
+      // milliseconds, because the path there includes real I/O (the studio
+      // checklist's stat, PR #699) whose duration is the filesystem's.
+      await untilFirstEntered;
       const p2 = sessionService.handleMessage(createMockRequest({ content: 'queued' }));
       await new Promise((r) => setTimeout(r, 10));
 
