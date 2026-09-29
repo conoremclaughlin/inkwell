@@ -21,6 +21,9 @@ vi.mock('../config/env', async () => ({
     MCP_HTTP_PORT: 0, // will be overridden
     MCP_REQUIRE_OAUTH: false,
     SUPABASE_ANON_KEY: 'test-anon-key',
+    // A shell flag does not reach this mock; an absent field schedules the
+    // sweep (Lumen, #695 r1).
+    ALERT_STALENESS_SWEEP_SECONDS: 0,
   },
 }));
 
@@ -685,6 +688,85 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       expect(JSON.stringify(fields)).not.toContain('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
     }
   });
+
+  // Lumen, #695 r1: the caller-profile header is arbitrary client text and
+  // decodeContextToken does not validate `runtime`, so it can be any JSON
+  // value. A measurement line that copies either has stopped being value-free.
+  // Every field must be a boolean or a finite category, whatever the client
+  // sends, under both flag settings, and the line fires before the challenge.
+  for (const oauthRequired of [true, false]) {
+    it(`logs a credential-less request with finite categories only, never client text (OAuth ${oauthRequired ? 'required' : 'optional'})`, async () => {
+      if (serverUnavailableError) return;
+      (env as any).MCP_REQUIRE_OAUTH = oauthRequired;
+      mockVerifyAccessToken.mockResolvedValue(null);
+      const { logger } = await import('../utils/logger');
+      const sentinel = 'SENTINEL-CLIENT-TEXT-9f3a';
+      const probes: Array<{ name: string; headers: Record<string, string> }> = [
+        {
+          name: 'arbitrary caller-profile text',
+          headers: {
+            'x-ink-caller-profile': sentinel,
+            'x-ink-context': encodeContextHeader({
+              sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+              studioId: 'studio-1',
+              sbSlug: 'wren',
+              cliAttached: true,
+              runtime: 'claude',
+            }),
+          },
+        },
+        {
+          name: 'arbitrary runtime string',
+          headers: {
+            'x-ink-context': encodeContextHeader({
+              sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+              studioId: 'studio-1',
+              sbSlug: 'wren',
+              cliAttached: true,
+              runtime: sentinel,
+            }),
+          },
+        },
+        {
+          name: 'runtime that is an object',
+          headers: {
+            'x-ink-context': Buffer.from(
+              JSON.stringify({
+                sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+                studioId: 'studio-1',
+                sbSlug: 'wren',
+                cliAttached: true,
+                runtime: { nested: sentinel },
+              })
+            ).toString('base64url'),
+          },
+        },
+      ];
+      try {
+        for (const probe of probes) {
+          (logger.info as ReturnType<typeof vi.fn>).mockClear();
+          const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, probe.headers);
+          expect(res.status, probe.name).toBe(oauthRequired ? 401 : 200);
+          const calls = (logger.info as ReturnType<typeof vi.fn>).mock.calls.filter(
+            ([message]) => message === 'MCP request without credential'
+          );
+          expect(calls.length, probe.name).toBe(1);
+          const [, fields] = calls[0] as [string, Record<string, unknown>];
+          expect(JSON.stringify(fields), probe.name).not.toContain(sentinel);
+          expect(['agent', 'runtime'], probe.name).toContain(fields.callerProfile);
+          expect(
+            ['claude', 'codex', 'gemini', 'ink', 'antigravity', 'unknown', 'missing'],
+            probe.name
+          ).toContain(fields.runtime);
+          expect(typeof fields.hasContextClaim, probe.name).toBe('boolean');
+          expect(typeof fields.hasLegacySessionHeader, probe.name).toBe('boolean');
+          expect(fields.oauthRequired, probe.name).toBe(oauthRequired);
+        }
+      } finally {
+        (env as any).MCP_REQUIRE_OAUTH = false;
+      }
+    });
+  }
 
   it('enriches a user-token request with the context session agent (PR #468)', async () => {
     if (serverUnavailableError) return;
