@@ -13,6 +13,7 @@ import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { signRunnerAccessToken } from '../../auth/ink-tokens';
+import { deriveDelegationSecret } from '../../auth/delegation-secret';
 import type { Database } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -1931,6 +1932,7 @@ export class SessionService implements ISessionService {
     );
 
     // 3. Build runner config
+    const inkDelegationSecret = this.createDelegationSecret();
     const inkAccessToken = this.createRunnerAccessToken(
       userId,
       sbSlug,
@@ -2040,6 +2042,7 @@ export class SessionService implements ISessionService {
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(runtimeEffort ? { effort: runtimeEffort } : {}),
       ...(inkAccessToken ? { inkAccessToken } : {}),
+      ...(inkDelegationSecret ? { inkDelegationSecret } : {}),
       inkSessionId: session.id,
       sbSlug,
       channel: request.channel,
@@ -2860,6 +2863,19 @@ export class SessionService implements ISessionService {
    * from issuing a token with no contact claim, which fails silently: the
    * runner looks owner-scoped and is refused its own contact's session.
    */
+  /**
+   * The delegation secret a spawned SB is handed, derived from the signing
+   * key. The child no longer inherits the server's environment
+   * (spec:sender-token-binding Phase 0), so the ink chat REPL's delegation
+   * tokens, which used to be signed with an inherited JWT_SECRET, get this
+   * value explicitly instead. Undefined when the server has no signing key,
+   * in which case the child's delegation labels read "unverified", as they
+   * did before for any child without the key.
+   */
+  private createDelegationSecret(): string | undefined {
+    return deriveDelegationSecret(process.env.JWT_SECRET);
+  }
+
   private createRunnerAccessToken(
     userId: string,
     sbSlug: string,
@@ -4730,6 +4746,7 @@ This session will continue with a fresh context after compaction. Your identity,
         session.studioId
       );
 
+      const compactionDelegationSecret = this.createDelegationSecret();
       const compactionToken = this.createRunnerAccessToken(
         session.userId,
         session.sbSlug,
@@ -4764,6 +4781,7 @@ This session will continue with a fresh context after compaction. Your identity,
         ),
         ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(compactionToken ? { inkAccessToken: compactionToken } : {}),
+        ...(compactionDelegationSecret ? { inkDelegationSecret: compactionDelegationSecret } : {}),
         repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
       };
 

@@ -1,4 +1,4 @@
-import { spawnBackend } from '@inklabs/shared';
+import { spawnBackend, sessionEnvHandoff } from '@inklabs/shared';
 import { getBackend } from '../backends/index.js';
 import { PARENT_OWNED_TURN_ENV } from '../lib/turn-owner.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -159,8 +159,11 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     binary: prepared.binary,
     args: prepared.args,
     // Every caller is `ink chat`, which owns the logical turn of the session
-    // this child inherits (lib/turn-owner.ts).
-    env: { ...prepared.env, ...PARENT_OWNED_TURN_ENV },
+    // this child inherits (lib/turn-owner.ts). The child serves THIS session,
+    // so this process hands it its own session credentials and identity by
+    // exact name (sessionEnvHandoff); buildCleanEnv inherits none of them on
+    // its own, and the adapter's prepared env still wins where it sets one.
+    env: { ...sessionEnvHandoff(), ...prepared.env, ...PARENT_OWNED_TURN_ENV },
     stdinData: prepared.stdinData,
     timeoutMs: request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS,
     idleTimeoutMs: request.idleTimeoutMs,

@@ -248,6 +248,12 @@ export function buildSessionEnv(options: {
   runtimeLinkId?: string;
   studioId?: string;
   accessToken?: string;
+  /**
+   * The secret the ink chat child verifies and mints delegation tokens with.
+   * Derived by the server from its signing key; the key itself never crosses
+   * (spec:sender-token-binding v3 §4 Phase 0).
+   */
+  delegationSecret?: string;
   sbSlug?: string;
   cliAttached?: boolean;
   runtime?: string;
@@ -267,6 +273,9 @@ export function buildSessionEnv(options: {
   }
   if (options.accessToken) {
     env.INK_ACCESS_TOKEN = options.accessToken;
+  }
+  if (options.delegationSecret) {
+    env.INK_DELEGATION_SECRET = options.delegationSecret;
   }
 
   // Consolidated context token (new — Phase 1)

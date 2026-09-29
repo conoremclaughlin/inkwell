@@ -60,6 +60,46 @@ function createMockChild(exitCode = 0): EventEmitter & {
 }
 
 describe('runBackendTurn', () => {
+  // spec:sender-token-binding Phase 0 (Lumen, #694 r1). The provider child
+  // serves this same session: the ink chat process hands it its own session
+  // credentials and identity explicitly, and never the server's secrets (which
+  // are not in this process after Phase 0, and would not cross regardless).
+  // The FINAL env handed to spawn is asserted, through the real shared
+  // spawnBackend, with the adapter's own env winning where it sets a name.
+  it('hands the provider child this session’s credentials and identity, and nothing secret', async () => {
+    state.prepareCalls = [];
+    spawnMock.mockImplementation(() => createMockChild(0));
+    vi.stubEnv('INK_ACCESS_TOKEN', 'child-session-token');
+    vi.stubEnv('INK_DELEGATION_SECRET', 'synthetic-derived-secret');
+    vi.stubEnv('INK_SESSION_ID', 'sess-from-parent');
+    vi.stubEnv('INK_STUDIO_ID', 'studio-from-parent');
+    vi.stubEnv('INK_CONTEXT', 'context-from-parent');
+    vi.stubEnv('JWT_SECRET', 'synthetic-jwt-secret');
+    vi.stubEnv('SUPABASE_SECRET_KEY', 'synthetic-service-key');
+    try {
+      await runBackendTurn({
+        backend: 'claude',
+        sbSlug: 'wren',
+        prompt: 'ping',
+      });
+      const [, , options] = spawnMock.mock.calls[0] as [
+        string,
+        string[],
+        { env: Record<string, string> },
+      ];
+      expect(options.env.INK_ACCESS_TOKEN).toBe('child-session-token');
+      expect(options.env.INK_DELEGATION_SECRET).toBe('synthetic-derived-secret');
+      expect(options.env.INK_SESSION_ID).toBe('sess-from-parent');
+      expect(options.env.INK_STUDIO_ID).toBe('studio-from-parent');
+      expect(options.env.INK_CONTEXT).toBe('context-from-parent');
+      expect('JWT_SECRET' in options.env).toBe(false);
+      expect('SUPABASE_SECRET_KEY' in options.env).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      spawnMock.mockReset();
+    }
+  });
+
   it('uses codex exec mode for non-interactive turns', async () => {
     state.prepareCalls = [];
     spawnMock.mockImplementation(() => createMockChild(0));

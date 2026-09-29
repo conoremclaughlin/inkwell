@@ -194,6 +194,51 @@ describe('CodexRunner', () => {
     expect(options.env?.INK_ACCESS_TOKEN).toBe('test-ink-token');
   });
 
+  // spec:sender-token-binding v3 §4 Phase 0 (task 7f4ceda4). The host path
+  // used to spread the server's whole environment under the session vars, so
+  // the codex child held the JWT signing key. The FINAL env handed to spawn is
+  // what is asserted, override order included: the session token the server
+  // minted is present, the parent's secret is not, and the basics survive.
+  it('hands codex an allowlisted env: the server secret never crosses, the session token does', async () => {
+    vi.stubEnv('JWT_SECRET', 'synthetic-jwt-secret');
+    vi.stubEnv('SUPABASE_SECRET_KEY', 'synthetic-service-key');
+    vi.stubEnv('HOME', '/home/synthetic');
+    try {
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: {
+          workingDirectory: process.cwd(),
+          mcpConfigPath: '',
+          model: 'gpt-5-codex',
+          inkAccessToken: 'test-ink-token',
+          inkSessionId: 'sess-env-1',
+          sbSlug: 'lumen',
+        },
+      });
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+      await runPromise;
+      const [, , options] = (spawn as Mock).mock.calls[0] as [
+        string,
+        string[],
+        { env?: Record<string, string> },
+      ];
+      expect(options.env).toBeDefined();
+      expect('JWT_SECRET' in options.env!).toBe(false);
+      expect('SUPABASE_SECRET_KEY' in options.env!).toBe(false);
+      expect(options.env!.INK_ACCESS_TOKEN).toBe('test-ink-token');
+      expect(options.env!.SB_SLUG).toBe('lumen');
+      expect(options.env!.HOME).toBe('/home/synthetic');
+      expect(options.env!.PATH).toBeDefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('should return null backendSessionId when no session ID is found in stdout', async () => {
     const mockProc = createMockProcess();
     (spawn as Mock).mockReturnValue(mockProc);
