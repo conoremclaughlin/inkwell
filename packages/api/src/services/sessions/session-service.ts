@@ -2333,7 +2333,11 @@ export class SessionService implements ISessionService {
         // that re-bootstraps on every turn, and needs this copy on hand to
         // recover when that bootstrap fails.
         injectedContext,
-        config: runnerConfig,
+        // The epoch every terminal write for this turn is fenced on. A
+        // backend process that reports its own turns to the lifecycle route
+        // (ink chat) names this one instead of claiming its own, which fenced
+        // this run out of its own finalize on every ink-backed turn.
+        config: { ...runnerConfig, turnEpoch },
         mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
@@ -4783,6 +4787,9 @@ This session will continue with a fresh context after compaction. Your identity,
         ...(compactionToken ? { inkAccessToken: compactionToken } : {}),
         ...(compactionDelegationSecret ? { inkDelegationSecret: compactionDelegationSecret } : {}),
         repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
+        // No turnEpoch: compaction takes no turn of its own (no pre-spawn
+        // takeover, and markCompacted is not fenced), so an ink chat spawned
+        // here claims its own turn, as one a person starts does.
       };
 
       const runner =

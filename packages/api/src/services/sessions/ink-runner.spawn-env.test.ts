@@ -127,4 +127,24 @@ describe('InkRunner child environment (Phase 0)', () => {
     expect('INK_DELEGATION_SECRET' in env).toBe(false);
     expect('JWT_SECRET' in env).toBe(false);
   });
+
+  it("hands the chat the run's own epoch, so its turn signal names the run's turn", async () => {
+    const env = await launchOnce({
+      workingDirectory: '/tmp',
+      sbSlug: 'myra',
+      inkSessionId: 'sess-env-3',
+      turnEpoch: 'run-epoch-3',
+    });
+    expect(env.INK_RUN_TURN_EPOCH).toBe('run-epoch-3');
+  });
+
+  it("never passes on an epoch from the server's own env", async () => {
+    vi.stubEnv('INK_RUN_TURN_EPOCH', 'someone-elses-epoch');
+    const env = await launchOnce({
+      workingDirectory: '/tmp',
+      sbSlug: 'myra',
+      inkSessionId: 'sess-env-4',
+    });
+    expect('INK_RUN_TURN_EPOCH' in env).toBe(false);
+  });
 });

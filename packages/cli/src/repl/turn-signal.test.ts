@@ -354,3 +354,57 @@ describe('turn-epoch round-trip (round 11)', () => {
     expect('turnEpoch' in lastBody).toBe(false);
   });
 });
+
+/**
+ * A chat the server spawned for one run names that run's epoch instead of
+ * claiming its own. Claiming fenced the run out of its own finalize on every
+ * ink-backed run (2026-09-29). The route side is pinned by
+ * api/src/routes/hook-lifecycle.server-run.test.ts.
+ */
+describe("a server run's chat (runTurnEpoch)", () => {
+  it('declares itself headless and names the run epoch on open, close and detach', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false, runTurnEpoch: 'run-epoch' });
+    const signal = createTurnSignal(deps);
+
+    await expect(signal.open()).resolves.toBe(true);
+    await expect(signal.close()).resolves.toBe(true);
+    await expect(signal.detach()).resolves.toBe(true);
+
+    for (const call of [0, 1, 2]) {
+      expect(bodyOf(fetchImpl, call)).toMatchObject({ headless: true, turnEpoch: 'run-epoch' });
+    }
+    expect(bodyOf(fetchImpl, 0).event).toBe('prompt');
+    expect(bodyOf(fetchImpl, 1).event).toBe('stop');
+    expect('turnEpochMissing' in bodyOf(fetchImpl, 1)).toBe(false);
+  });
+
+  it('keeps naming the run epoch when a response carries another', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => ({ success: true, turnEpoch: 'someone-elses' }),
+        }) as Response
+    );
+    const { deps } = makeDeps({ fetchImpl, cliAttached: false, runTurnEpoch: 'run-epoch' });
+    const signal = createTurnSignal(deps);
+
+    await signal.open();
+    await signal.close();
+
+    expect(bodyOf(fetchImpl, 1).turnEpoch).toBe('run-epoch');
+  });
+
+  it('control: without a run epoch nothing declares headless, and the stop sends what open claimed', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false, runTurnEpoch: '  ' });
+    const signal = createTurnSignal(deps);
+
+    await signal.open();
+    await signal.close();
+    await signal.detach();
+
+    for (const call of [0, 1, 2]) expect('headless' in bodyOf(fetchImpl, call)).toBe(false);
+    expect(bodyOf(fetchImpl, 1).turnEpochMissing).toBe(true);
+  });
+});

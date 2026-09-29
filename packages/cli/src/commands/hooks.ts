@@ -36,6 +36,7 @@ import {
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { promptAttachmentWrite } from '../lib/turn-owner.js';
+import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
 
@@ -2131,8 +2132,12 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
   // Only set 'compacting' lifecycle if this backend has a postCompact event
   // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
   // the lifecycle gets stuck at 'compacting' permanently.
+  // A backend the server spawned declares itself headless, and the route
+  // then writes no lifecycle: inside a server run only the run moves it.
   if (backend.events.postCompact) {
-    await updateRuntimeGenerationState(cwd, config, sbSlug, 'compacting', 'pre-compact');
+    await updateRuntimeGenerationState(cwd, config, sbSlug, 'compacting', 'pre-compact', {
+      headless: isHeadlessSession(),
+    });
   }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
@@ -2146,8 +2151,11 @@ async function postCompactHandler(): Promise<void> {
   const sbSlug = resolveSlug() || 'unknown';
 
   // Reset lifecycle from compacting back to idle. NOT a turn boundary —
-  // the same turn resumes after compaction (PR #492 round 4).
-  await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'post-compact');
+  // the same turn resumes after compaction (PR #492 round 4). Headless for a
+  // server spawn, as at pre-compact.
+  await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'post-compact', {
+    headless: isHeadlessSession(),
+  });
 
   let identityBlock = '';
   let memoriesBlock = '';
@@ -2466,18 +2474,20 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   inkThreadKey = await hydrateThreadKeyFromServer(inkSessionId, inkThreadKey, config?.email);
 
-  // Set lifecycle to idle on startup (ready for user input).
+  // Set lifecycle to idle on startup (ready for user input), unless the
+  // server spawned this backend: then the run owns the lifecycle and only the
+  // linkage goes (see sessionStartStateArgs).
   if (inkSessionId) {
     try {
-      const updateArgs: Record<string, unknown> = {
+      const updateArgs = sessionStartStateArgs({
         email: config?.email,
         sbSlug,
         sessionId: inkSessionId,
-        lifecycle: 'idle',
         workingDir: cwd,
-      };
-      if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
-      if (inkThreadKey) updateArgs.activeThreadKey = inkThreadKey;
+        headless: isHeadlessSession(),
+        backendSessionId,
+        activeThreadKey: inkThreadKey,
+      });
       await callInkTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.

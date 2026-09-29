@@ -31,6 +31,7 @@ import {
   injectSessionHeaders,
   buildSessionEnv,
   buildCleanEnv,
+  RUN_TURN_EPOCH_ENV,
   writeRuntimeSessionHint,
   describeExitResult,
   type ErrorClassification,
@@ -452,6 +453,10 @@ export class InkRunner implements IRunner {
       // (bootstrap, tools) without depending on the human's ~/.ink/auth.json.
       // getValidAccessToken() checks INK_ACCESS_TOKEN before any file source.
       ...(config.inkAccessToken ? { INK_ACCESS_TOKEN: config.inkAccessToken } : {}),
+      // The run's own epoch. The chat's turn signal names it on every
+      // lifecycle request; without it the chat claimed a fresh epoch at each
+      // outer turn and this run's finalize matched zero rows.
+      ...(config.turnEpoch ? { [RUN_TURN_EPOCH_ENV]: config.turnEpoch } : {}),
     }) as Record<string, string>;
 
     // Turn-scope the observer replay tail: drop anything buffered from a prior
