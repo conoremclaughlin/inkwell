@@ -11,6 +11,7 @@ import {
   LineBuffer,
   SPAWN_ENV_INHERITED_NAMES,
   SESSION_ENV_HANDOFF_NAMES,
+  RUN_TURN_EPOCH_ENV,
   sessionEnvHandoff,
 } from './spawn-backend.js';
 
@@ -199,6 +200,15 @@ describe('buildCleanEnv: the child inherits exact names only (Phase 0)', () => {
     // No name is a pattern (macOS's __CF_USER_TEXT_ENCODING starts with underscores).
     expect(SPAWN_ENV_INHERITED_NAMES.every((name) => /^[A-Z_][A-Z0-9_]*$/.test(name))).toBe(true);
     expect(new Set(SPAWN_ENV_INHERITED_NAMES).size).toBe(SPAWN_ENV_INHERITED_NAMES.length);
+  });
+
+  it("never passes a server run's epoch below the chat it was set on", () => {
+    // Set explicitly on the chat the server spawns, and on nothing else: a
+    // provider child carrying it would name a turn it does not own.
+    expect(SPAWN_ENV_INHERITED_NAMES).not.toContain(RUN_TURN_EPOCH_ENV);
+    expect(SESSION_ENV_HANDOFF_NAMES).not.toContain(RUN_TURN_EPOCH_ENV);
+    expect(sessionEnvHandoff({ [RUN_TURN_EPOCH_ENV]: 'run-epoch' })).toEqual({});
+    expect(buildCleanEnv(undefined, { [RUN_TURN_EPOCH_ENV]: 'run-epoch' })).toEqual({});
   });
 });
 

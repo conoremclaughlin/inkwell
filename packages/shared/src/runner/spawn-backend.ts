@@ -251,6 +251,19 @@ export const SESSION_ENV_HANDOFF_NAMES: readonly string[] = [
   'AGENT_ID',
 ];
 
+/**
+ * The epoch of the server run that spawned an `ink chat` process. The server
+ * sets it on the chat it spawns for a turn, and the chat's turn signal names
+ * it on every lifecycle request instead of claiming an epoch of its own
+ * (repl/turn-signal.ts, routes/hook-lifecycle.ts).
+ *
+ * It is deliberately in neither list above. It describes the chat process's
+ * relationship to one server run, and nothing below the chat is that
+ * process: a provider child that inherited it would be naming a turn it does
+ * not own.
+ */
+export const RUN_TURN_EPOCH_ENV = 'INK_RUN_TURN_EPOCH';
+
 /** The SESSION_ENV_HANDOFF_NAMES present in `parent`, by exact name. */
 export function sessionEnvHandoff(parent: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const handoff: Record<string, string> = {};

@@ -693,6 +693,12 @@ export interface ClaudeRunnerConfig {
    * §4 Phase 0). The key itself never reaches a child.
    */
   inkDelegationSecret?: string;
+  /**
+   * The epoch this run wrote onto the session before spawning, which its
+   * finalize is fenced on. InkRunner hands it to `ink chat` so the chat's
+   * turn signal names it instead of claiming a fresh one (RUN_TURN_EPOCH_ENV).
+   */
+  turnEpoch?: string;
   /** Inkwell session ID for this run — written to runtime hint files so hooks link correctly */
   inkSessionId?: string;
   /** SB slug for this run — written to runtime hint files */

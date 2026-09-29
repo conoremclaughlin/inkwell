@@ -86,7 +86,8 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
          * Server-spawned turn: the server's pre-turn write already owns the
          * turn epoch, so a prompt event must NOT claim a fresh one — rotating
          * here would fence the server's own finalize out of its turn
-         * (PR #563 round 6).
+         * (PR #563 round 6). The run owns the lifecycle too: a headless
+         * request never writes it (see runEpoch below).
          */
         headless?: boolean;
         /**
@@ -200,6 +201,26 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (cliAttached === false) updates.cliTurnAt = null;
       const isPromptEvent = event === 'prompt' || (!event && lifecycle === 'running');
       const isStopEvent = event === 'stop';
+      // Inside a server run, only the run moves the epoch and the lifecycle
+      // (2026-09-29). A headless request comes from a process the run
+      // spawned, and its `running` was a write, not a no-op: the installed
+      // handle_session_running_write mints a fresh epoch whenever `running`
+      // lands on a row that is not running, so anything that idled the row
+      // mid-run (a model's update_session_state, the chat's own stop between
+      // outer turns) made the next provider prompt rotate the run out of its
+      // own turn. The run's pre-turn write already said `running`, and its
+      // finalize says what comes after.
+      //
+      // A headless request that names an epoch is the `ink chat` the server
+      // spawned, carrying the run's epoch (INK_RUN_TURN_EPOCH). It never
+      // claims, and everything it writes is fenced on that epoch, so a
+      // successor that took the session mid-run (a person attaching) is
+      // never written over. Its stop only closes its own marker. It is not
+      // the owner's stop, so it neither stamps the stop tombstone nor runs
+      // the boundary releases: the run's finalize is the boundary.
+      const runEpoch =
+        headless === true && typeof turnEpoch === 'string' && turnEpoch ? turnEpoch : undefined;
+      if (headless === true) delete updates.lifecycle;
       // Round 11: a modern stop names the epoch it is ending, or admits the
       // record is missing. Only a LEGACY stop (neither field) still performs
       // the unfenced idle + marker-clear + tombstone write below — modern
@@ -212,10 +233,12 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // the session ends. Since c07f35c8 the CLI keeps the record per
       // (session, wrapper generation), so a sibling's prompt in the same
       // checkout no longer erases the epoch a stop is about to send.
-      const stopEpoch = isStopEvent && typeof turnEpoch === 'string' ? turnEpoch : undefined;
+      const stopEpoch =
+        isStopEvent && !runEpoch && typeof turnEpoch === 'string' ? turnEpoch : undefined;
       const stopEpochMissing = isStopEvent && !stopEpoch && turnEpochMissing === true;
       if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();
-      if (isStopEvent && !stopEpoch && !stopEpochMissing) {
+      if (isStopEvent && runEpoch) updates.cliTurnAt = null;
+      if (isStopEvent && !runEpoch && !stopEpoch && !stopEpochMissing) {
         updates.cliTurnAt = null;
         // The stop tombstone (round 9): the atomic revocation record every
         // later marker-reclaim CASes against.
@@ -409,7 +432,10 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         //     overwrite B's working_dir — which isEphemeralHeldElsewhere()
         //     reads to decide lease renewal/teardown. Zero rows = stale
         //     no-op.
-        const committedEpoch = claimedEpoch ?? stopEpoch;
+        // A server run's chat commits nothing of its own: its writes are
+        // fenced on the run's epoch, which the run committed before it
+        // spawned the chat.
+        const committedEpoch = claimedEpoch ?? stopEpoch ?? runEpoch;
         if (committedEpoch !== undefined) {
           const fencedRideAlong: Record<string, unknown> = {};
           if (updates.workingDir !== undefined) fencedRideAlong.working_dir = updates.workingDir;
@@ -555,7 +581,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      if (isStopEvent) {
+      if (isStopEvent && !runEpoch) {
         // Captured synchronously at the boundary: the release helper only
         // touches claims from BEFORE this instant, so a delayed release can
         // never take the next turn's claims (Lumen round 3 P1).
@@ -610,6 +636,8 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // a worktree whose lease is gone. The old fire-and-forget renewal
         // left a window where a 2xx implied protection the lease no longer
         // had.
+        // A server run's chat stop lands here too: for it the stop is a
+        // heartbeat, and the run's finalize is the boundary.
         // Round 13: the renewal is a PURE HEARTBEAT. Every lease restamp now
         // happens inside the atomic claim itself (which stamps ALL of the
         // session's leases) — an application-level restamp here was a rewind

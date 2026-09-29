@@ -214,6 +214,7 @@ import {
   drainThreads,
   encodeContextToken,
   mintDelegationToken,
+  RUN_TURN_EPOCH_ENV,
   verifyDelegationToken,
   type DelegationTokenPayload,
 } from '@inklabs/shared';
@@ -8065,6 +8066,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     getStudioId: () => currentInkStudioId(),
     sbSlug,
     cliAttached,
+    // Set by the server on a chat it spawned for one run (InkRunner). Only a
+    // one-shot run can be that chat; an interactive REPL owns its own turns.
+    runTurnEpoch: cliAttached ? undefined : process.env[RUN_TURN_EPOCH_ENV],
     getServerUrl: async () => (await import('../lib/ink-mcp.js')).getInkServerUrl(),
     getToken: async (serverUrl) =>
       (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),

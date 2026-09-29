@@ -2333,7 +2333,11 @@ export class SessionService implements ISessionService {
         // that re-bootstraps on every turn, and needs this copy on hand to
         // recover when that bootstrap fails.
         injectedContext,
-        config: runnerConfig,
+        // The epoch every terminal write for this turn is fenced on. A
+        // backend process that reports its own turns to the lifecycle route
+        // (ink chat) names this one instead of claiming its own, which fenced
+        // this run out of its own finalize on every ink-backed turn.
+        config: { ...runnerConfig, turnEpoch },
         mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
