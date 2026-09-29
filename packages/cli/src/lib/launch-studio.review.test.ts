@@ -69,10 +69,10 @@ afterEach(() => {
 });
 
 // The placement is stubbed at BOTH layers: the launcher's own read and the
-// one runInit makes for itself. A temp directory is not a git worktree, and
-// without the second stub runInit would treat it as a main worktree and
-// write no identity for any reason, which would make every test here pass
-// vacuously against the bug it is meant to catch.
+// one runInit makes for itself (Lumen's file did the same through its
+// deps()). A temp directory is not a git worktree, and a runInit left to
+// detect it would treat it as a main worktree and write no identity for any
+// reason — a harness that stubs only the launcher's layer passes vacuously.
 function launch(slug: string, d = initDeps()) {
   return completeStudioForLaunch(studio, slug, {
     placement,

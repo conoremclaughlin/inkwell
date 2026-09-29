@@ -101,6 +101,42 @@ describe('prepareChatStudio', () => {
     expect(rpc.call).not.toHaveBeenCalled();
   });
 
+  // Lumen's round-2 reproduction, as delivered: the completion resolved the
+  // nested cwd to the worktree root and wrote the identity there, and the
+  // read that followed used the nested cwd, so the runtime got null after a
+  // successful repair.
+  it('returns the repaired worktree identity when chat starts inside a package directory', async () => {
+    const nested = join(studio, 'packages', 'api');
+    mkdirSync(nested, { recursive: true });
+    rpc.call.mockResolvedValueOnce({ studio: { id: STUDIO_ID, sbSlug: 'lumen' } });
+    const { identity } = await prepareChatStudio(nested, 'wren', deps());
+    expect(auditStudio(studio, { linked: true }).complete).toBe(true);
+    expect(identity).toMatchObject({ sbSlug: 'lumen', studioId: STUDIO_ID, backend: 'codex' });
+    expect(existsSync(join(nested, '.ink', 'identity.json'))).toBe(false);
+  });
+
+  it('an already-complete worktree launched from a package directory hands back its root identity', async () => {
+    rpc.call.mockResolvedValueOnce({ studio: { id: STUDIO_ID, sbSlug: 'lumen' } });
+    await prepareChatStudio(studio, 'wren', deps());
+    rpc.call.mockReset();
+    const nested = join(studio, 'packages', 'cli');
+    mkdirSync(nested, { recursive: true });
+    const { identity } = await prepareChatStudio(nested, 'wren', deps());
+    expect(identity?.studioId).toBe(STUDIO_ID);
+    expect(rpc.call).not.toHaveBeenCalled();
+  });
+
+  it('outside a repository the cwd is the root: nothing is completed and the identity there is read', async () => {
+    const loose = join(root, 'loose');
+    mkdirSync(join(loose, '.ink'), { recursive: true });
+    writeFileSync(join(loose, '.ink', 'identity.json'), JSON.stringify({ sbSlug: 'wren' }));
+    const { identity } = await prepareChatStudio(loose, 'wren', {
+      placement: () => ({ toplevel: null, mainRoot: null, linked: false }),
+    });
+    expect(identity).toEqual({ sbSlug: 'wren' });
+    expect(rpc.call).not.toHaveBeenCalled();
+  });
+
   it('the main worktree is never completed from a chat launch', async () => {
     mkdirSync(join(main, '.ink'), { recursive: true });
     writeFileSync(join(main, '.ink', 'identity.json'), JSON.stringify({ sbSlug: 'wren' }));
