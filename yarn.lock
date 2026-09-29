@@ -3126,7 +3126,7 @@ __metadata:
     "@anthropic-ai/sdk": "npm:^0.71.2"
     "@inklabs/shared": "workspace:*"
     "@mariozechner/pi-agent-core": "npm:0.71.1"
-    "@mariozechner/pi-coding-agent": "npm:0.71.1"
+    "@mariozechner/pi-coding-agent": "npm:0.73.1"
     "@modelcontextprotocol/client": "npm:^2.0.0"
     "@modelcontextprotocol/node": "npm:^2.0.0"
     "@modelcontextprotocol/server": "npm:^2.0.0"
@@ -3197,7 +3197,7 @@ __metadata:
     "@inklabs/shared": "workspace:*"
     "@inquirer/prompts": "npm:^8.2.0"
     "@mariozechner/pi-agent-core": "npm:0.71.1"
-    "@mariozechner/pi-coding-agent": "npm:0.71.1"
+    "@mariozechner/pi-coding-agent": "npm:0.73.1"
     "@types/node": "npm:^20.10.0"
     "@types/react": "npm:^19.2.14"
     chalk: "npm:^5.3.0"
@@ -3237,7 +3237,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@inklabs/desktop@workspace:packages/desktop"
   dependencies:
-    electron: "npm:^43.0.0"
+    electron: "npm:^43.5.0"
   languageName: unknown
   linkType: soft
 
@@ -4126,25 +4126,23 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@mariozechner/jiti@npm:^2.6.2":
-  version: 2.6.5
-  resolution: "@mariozechner/jiti@npm:2.6.5"
-  dependencies:
-    std-env: "npm:^3.10.0"
-    yoctocolors: "npm:^2.1.2"
-  bin:
-    jiti: lib/jiti-cli.mjs
-  checksum: 10/53e94727a025d722a1d624c8f0ebde0fff4dcc768e9ea79f0a17e42a1056864da7568d997022c60832b083ebd69914af5244577bf5873329be98134d5977a489
-  languageName: node
-  linkType: hard
-
-"@mariozechner/pi-agent-core@npm:0.71.1, @mariozechner/pi-agent-core@npm:^0.71.1":
+"@mariozechner/pi-agent-core@npm:0.71.1":
   version: 0.71.1
   resolution: "@mariozechner/pi-agent-core@npm:0.71.1"
   dependencies:
     "@mariozechner/pi-ai": "npm:^0.71.1"
     typebox: "npm:^1.1.24"
   checksum: 10/f253ae61a39becb5b32956263fa58a236c153a196828527ea1d157cb86c6e626be33e88596e52713963e8e5e4cf261dda1c56746991aab09135ffd60d7978c1d
+  languageName: node
+  linkType: hard
+
+"@mariozechner/pi-agent-core@npm:^0.73.1":
+  version: 0.73.1
+  resolution: "@mariozechner/pi-agent-core@npm:0.73.1"
+  dependencies:
+    "@mariozechner/pi-ai": "npm:^0.73.1"
+    typebox: "npm:^1.1.24"
+  checksum: 10/9be1c1e20a5b89a6f3d6a1869f988034cd5deca4cc41d4c91fd6690840b8f9113c35ae26361024cdf03288c75692770a4499ddd89620fbea865b4dd469bd0abf
   languageName: node
   linkType: hard
 
@@ -4169,15 +4167,35 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@mariozechner/pi-coding-agent@npm:0.71.1":
-  version: 0.71.1
-  resolution: "@mariozechner/pi-coding-agent@npm:0.71.1"
+"@mariozechner/pi-ai@npm:^0.73.1":
+  version: 0.73.1
+  resolution: "@mariozechner/pi-ai@npm:0.73.1"
+  dependencies:
+    "@anthropic-ai/sdk": "npm:^0.91.1"
+    "@aws-sdk/client-bedrock-runtime": "npm:^3.1030.0"
+    "@google/genai": "npm:^1.40.0"
+    "@mistralai/mistralai": "npm:^2.2.0"
+    chalk: "npm:^5.6.2"
+    openai: "npm:6.26.0"
+    partial-json: "npm:^0.1.7"
+    proxy-agent: "npm:^6.5.0"
+    typebox: "npm:^1.1.24"
+    undici: "npm:^7.19.1"
+    zod-to-json-schema: "npm:^3.24.6"
+  bin:
+    pi-ai: dist/cli.js
+  checksum: 10/12990a4a15326385354fde93db627db109f9589ad5670fe747990302a902d6dce76980994e8f67985dfa927e4bf53759bea533f5dc62b33774fe8af0bd753344
+  languageName: node
+  linkType: hard
+
+"@mariozechner/pi-coding-agent@npm:0.73.1":
+  version: 0.73.1
+  resolution: "@mariozechner/pi-coding-agent@npm:0.73.1"
   dependencies:
     "@mariozechner/clipboard": "npm:^0.3.5"
-    "@mariozechner/jiti": "npm:^2.6.2"
-    "@mariozechner/pi-agent-core": "npm:^0.71.1"
-    "@mariozechner/pi-ai": "npm:^0.71.1"
-    "@mariozechner/pi-tui": "npm:^0.71.1"
+    "@mariozechner/pi-agent-core": "npm:^0.73.1"
+    "@mariozechner/pi-ai": "npm:^0.73.1"
+    "@mariozechner/pi-tui": "npm:^0.73.1"
     "@silvia-odwyer/photon-node": "npm:^0.3.4"
     chalk: "npm:^5.5.0"
     cli-highlight: "npm:^2.1.11"
@@ -4187,6 +4205,7 @@ __metadata:
     glob: "npm:^13.0.1"
     hosted-git-info: "npm:^9.0.2"
     ignore: "npm:^7.0.5"
+    jiti: "npm:^2.7.0"
     marked: "npm:^15.0.12"
     minimatch: "npm:^10.2.3"
     proper-lockfile: "npm:^4.1.2"
@@ -4200,13 +4219,13 @@ __metadata:
       optional: true
   bin:
     pi: dist/cli.js
-  checksum: 10/ac868029019b9b4baf7e555a8ab29e8210b9163cd8bc203cfb70cdd8dffbb003c2c81c3b8c11ea6fabd1c80a33a4691efdf4bc33814fd171854724a423fa1cdd
+  checksum: 10/0cc31aca6a1535ecc2590de25c940a640de84ce46e1aea9dbd988eb72dc1dbcabdbf516526141e93d97725c467850aa0591865ec19d99b54a703e61f99e2aa65
   languageName: node
   linkType: hard
 
-"@mariozechner/pi-tui@npm:^0.71.1":
-  version: 0.71.1
-  resolution: "@mariozechner/pi-tui@npm:0.71.1"
+"@mariozechner/pi-tui@npm:^0.73.1":
+  version: 0.73.1
+  resolution: "@mariozechner/pi-tui@npm:0.73.1"
   dependencies:
     "@types/mime-types": "npm:^2.1.4"
     chalk: "npm:^5.5.0"
@@ -4217,7 +4236,7 @@ __metadata:
   dependenciesMeta:
     koffi:
       optional: true
-  checksum: 10/ab29d89f6a6b678bb46d86adf91fc9947296c4054cef1790234bcb18b4997a46e5d9d78cc0cd29f7b2d9b2bd2796ee1d5d2d9f10fcf63d7cd9dad7514335a23d
+  checksum: 10/cb6dcbc37db2bf19b5bd2d5bad0edb1ecf7491901c5f70f5ffaa247654be9421c403fbf67261a23ae780c9e9888937839750997e367e78d6ce7a9a27b613bab4
   languageName: node
   linkType: hard
 
@@ -10103,9 +10122,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"electron@npm:^43.0.0":
-  version: 43.1.1
-  resolution: "electron@npm:43.1.1"
+"electron@npm:^43.5.0":
+  version: 43.5.0
+  resolution: "electron@npm:43.5.0"
   dependencies:
     "@electron-internal/extract-zip": "npm:^1.0.1"
     "@electron/get": "npm:^5.0.0"
@@ -10113,7 +10132,7 @@ __metadata:
   bin:
     electron: cli.js
     install-electron: install.js
-  checksum: 10/3d0b4aafd5cc0c3292d87294703aba824d5f104ece6b15f5b1edc2edeb3f1b8ff4a34ce0e349a8da5fef8529a9f28ccc5065c837553e429b1d3b0ac1da8184cf
+  checksum: 10/8078e8760b00d8907cd104a2371709d3cc9a82c0185d7beccc0bf535a46a99054f779b3a61789c6b354ee5689ecacb920b5c8441f627aebda9643a819b62a58f
   languageName: node
   linkType: hard
 
@@ -13023,6 +13042,15 @@ __metadata:
   bin:
     jiti: bin/jiti.js
   checksum: 10/6a182521532126e4b7b5ad64b64fb2e162718fc03bc6019c21aa2222aacde6c6dfce4fc3bce9f69561a73b24ab5f79750ad353c37c3487a220d5869a39eae3a2
+  languageName: node
+  linkType: hard
+
+"jiti@npm:^2.7.0":
+  version: 2.7.0
+  resolution: "jiti@npm:2.7.0"
+  bin:
+    jiti: lib/jiti-cli.mjs
+  checksum: 10/6d75a8dbd61dbee031aa0937fabb748ff8ddf370b971958cc704f5cf26b4c5bdc9dcd0563059b2627a2bd41d946fa0bc64f912fdc8981ca7945a9d63c74ad0f9
   languageName: node
   linkType: hard
 
@@ -18223,13 +18251,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"std-env@npm:^3.10.0":
-  version: 3.10.0
-  resolution: "std-env@npm:3.10.0"
-  checksum: 10/19c9cda4f370b1ffae2b8b08c72167d8c3e5cfa972aaf5c6873f85d0ed2faa729407f5abb194dc33380708c00315002febb6f1e1b484736bfcf9361ad366013a
-  languageName: node
-  linkType: hard
-
 "std-env@npm:^4.0.0-rc.1":
   version: 4.0.0
   resolution: "std-env@npm:4.0.0"
@@ -20231,13 +20252,6 @@ __metadata:
   version: 0.1.0
   resolution: "yocto-queue@npm:0.1.0"
   checksum: 10/f77b3d8d00310def622123df93d4ee654fc6a0096182af8bd60679ddcdfb3474c56c6c7190817c84a2785648cdee9d721c0154eb45698c62176c322fb46fc700
-  languageName: node
-  linkType: hard
-
-"yoctocolors@npm:^2.1.2":
-  version: 2.1.2
-  resolution: "yoctocolors@npm:2.1.2"
-  checksum: 10/6ee42d665a4cc161c7de3f015b2a65d6c65d2808bfe3b99e228bd2b1b784ef1e54d1907415c025fc12b400f26f372bfc1b71966c6c738d998325ca422eb39363
   languageName: node
   linkType: hard
 
