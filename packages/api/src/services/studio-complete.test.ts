@@ -227,10 +227,39 @@ describe('ensureStudioComplete', () => {
 
   it('the main worktree is reported, never rewritten', async () => {
     mkdirSync(join(worktree, '.git'));
-    expect(await isLinkedWorktree(worktree)).toBe(false);
+    expect(isLinkedWorktree(worktree)).toBe(false);
     const result = await ensureStudioComplete(worktree, { sbSlug: 'wren', env: env() });
     expect(result.ok).toBe(true);
     expect(result.complete).toBe(false);
+    expect(() => stubCall()).toThrow();
+  });
+
+  /**
+   * The fast path sits between the takeover write and the runner. An
+   * awaited stat there was enough for a queued turn to reach the runner a
+   * tick later than the turn-boundary tests choreograph (session-service
+   * "boundary effects are skipped when the next turn is queued": green
+   * locally, red on the CI runner at db1db97d). So the fast path resolves
+   * on microtasks alone: no macrotask, no I/O completion, no turn of the
+   * loop. Measured, not assumed — the settle flag is read after a handful
+   * of microtask hops and before any timer or I/O callback could run.
+   */
+  it('a complete studio, and a main worktree, are confirmed without a turn of the event loop', async () => {
+    const settledWithinMicrotasks = async (dir: string) => {
+      let settled = false;
+      void ensureStudioComplete(dir, { sbSlug: 'wren', env: env() }).then(() => {
+        settled = true;
+      });
+      for (let hop = 0; hop < 8; hop++) await Promise.resolve();
+      return settled;
+    };
+    writeFileSync(join(worktree, '.git'), 'gitdir: /elsewhere/.git/worktrees/alpha\n');
+    seedComplete(worktree);
+    expect(await settledWithinMicrotasks(worktree)).toBe(true);
+
+    const mainWorktree = join(root, 'repo');
+    mkdirSync(join(mainWorktree, '.git'), { recursive: true });
+    expect(await settledWithinMicrotasks(mainWorktree)).toBe(true);
     expect(() => stubCall()).toThrow();
   });
 });

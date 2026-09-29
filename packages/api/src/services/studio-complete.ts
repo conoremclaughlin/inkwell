@@ -19,7 +19,7 @@
  */
 
 import { execFile } from 'child_process';
-import { lstat } from 'fs/promises';
+import { lstatSync } from 'fs';
 import { join } from 'path';
 import { promisify } from 'util';
 import { auditStudio, type StudioCheckId } from '@inklabs/shared';
@@ -85,10 +85,20 @@ function parseReport(stdout: string): InitReport | null {
   }
 }
 
-/** A linked worktree keeps a `.git` FILE pointing at the main repository's `.git/worktrees/<name>`. */
-export async function isLinkedWorktree(worktreePath: string): Promise<boolean> {
+/**
+ * A linked worktree keeps a `.git` FILE pointing at the main repository's
+ * `.git/worktrees/<name>`. Synchronous on purpose, like the checklist read
+ * that follows it: the pre-spawn fast path (a complete studio, or a main
+ * worktree) must confirm itself without a turn of the event loop. It sits
+ * between the takeover write and the runner, where an awaited stat was
+ * enough for a queued turn to reach the runner a tick later than the
+ * turn-boundary tests expect (green here, red on the CI runner), and where
+ * every real await widens the window nothing else is watching. One lstat
+ * is microseconds; the repair itself, when needed, stays asynchronous.
+ */
+export function isLinkedWorktree(worktreePath: string): boolean {
   try {
-    return (await lstat(join(worktreePath, '.git'))).isFile();
+    return lstatSync(join(worktreePath, '.git')).isFile();
   } catch {
     return false;
   }
@@ -179,14 +189,15 @@ export async function completeStudioViaCli(
 
 /**
  * The pre-spawn safety net: read the checklist, and only when something is
- * missing run the routine. A complete studio costs a few file reads; the
- * owner lookup, when one is given, is paid only on the incomplete path.
+ * missing run the routine. A complete studio costs a few synchronous file
+ * reads and no turn of the event loop (see isLinkedWorktree); the owner
+ * lookup, when one is given, is paid only on the incomplete path.
  */
 export async function ensureStudioComplete(
   worktreePath: string,
   options: CompleteStudioViaCliOptions
 ): Promise<CompleteStudioViaCliResult> {
-  const linked = await isLinkedWorktree(worktreePath);
+  const linked = isLinkedWorktree(worktreePath);
   const audit = auditStudio(worktreePath, { linked });
   if (audit.complete) return { ok: true, complete: true, missing: [] };
   if (!linked) {
