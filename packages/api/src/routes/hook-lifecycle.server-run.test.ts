@@ -16,8 +16,12 @@
  * `handle_session_running_write` mints a new epoch whenever a `running` write
  * lands on a row that is not `running` and carries no new epoch. A provider
  * child's headless prompt wrote `lifecycle: 'running'` unfenced, so any idle
- * write in the middle of a run (a model's `update_session_state`, the chat's
- * own stop between outer turns) was followed by a rotation.
+ * write in the middle of a run was followed by a rotation. The measured idle
+ * was the child's own `startup` SessionStart hook: on 2026-09-29 all 12
+ * direct Claude Code spawns were fresh sessions and fired it, and all 11 that
+ * finished were fenced out. The CLI no longer sends it from a spawn
+ * (packages/cli/src/commands/hooks.server-run.test.ts); these tests pin the
+ * route as the backstop for any other idle.
  *
  * The rule these tests pin: inside a server run, only the run moves the
  * epoch and the lifecycle. The chat learns the run's epoch from its spawn
@@ -287,8 +291,8 @@ describe('hook-lifecycle: a server run and the ink chat it spawned', () => {
     const chat = chatSignal(RUN_EPOCH);
     await chat.open();
 
-    // A model calling update_session_state(lifecycle: 'idle') mid-turn: an
-    // id-only write through the same repository method.
+    // An id-only idle through the same repository method: what the startup
+    // hook of an older CLI still sends, or a model's update_session_state.
     await updateSession(SESSION_ID, { lifecycle: 'idle' });
     await providerStep();
 
@@ -296,6 +300,33 @@ describe('hook-lifecycle: a server run and the ink chat it spawned', () => {
     expect(row.turn_epoch).toBe(RUN_EPOCH);
     await chat.close();
     expect(serverFinalizes()).toBe(true);
+  });
+
+  /** A provider compacting mid-run, as its pre- and post-compact hooks post. */
+  async function providerCompacts(headless: boolean) {
+    const flag = headless ? { headless: true } : {};
+    await post({ lifecycle: 'compacting', event: 'pre-compact', ...flag });
+    await post({ lifecycle: 'idle', event: 'post-compact', ...flag });
+  }
+
+  it("keeps the run's lifecycle and epoch through a spawned provider's compaction", async () => {
+    serverTakesTurn();
+
+    await providerCompacts(true);
+    expect(row.lifecycle).toBe('running');
+    await providerStep();
+
+    expect(rotations).toBe(0);
+    expect(row).toMatchObject({ lifecycle: 'running', turn_epoch: RUN_EPOCH });
+    expect(serverFinalizes()).toBe(true);
+  });
+
+  it('control: a compaction that does not declare itself headless still idles the row', async () => {
+    serverTakesTurn();
+
+    await providerCompacts(false);
+
+    expect(row.lifecycle).toBe('idle');
   });
 
   it("marks the chat's own turn while it runs, fenced on the run's epoch", async () => {

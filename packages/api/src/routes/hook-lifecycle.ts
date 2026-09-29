@@ -206,9 +206,13 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // spawned, and its `running` was a write, not a no-op: the installed
       // handle_session_running_write mints a fresh epoch whenever `running`
       // lands on a row that is not running, so anything that idled the row
-      // mid-run (a model's update_session_state, the chat's own stop between
-      // outer turns) made the next provider prompt rotate the run out of its
-      // own turn. The run's pre-turn write already said `running`, and its
+      // mid-run made the next provider prompt rotate the run out of its own
+      // turn. Measured, the idle was the child's own startup hook (every
+      // fresh Claude Code spawn, and a provider starting a fresh session
+      // mid-turn under ink chat);
+      // the CLI no longer sends it from a spawn, and this route is the
+      // backstop for anything else (a model's update_session_state, an older
+      // CLI). The run's pre-turn write already said `running`, and its
       // finalize says what comes after.
       //
       // A headless request that names an epoch is the `ink chat` the server

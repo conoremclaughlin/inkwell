@@ -2131,8 +2131,12 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
   // Only set 'compacting' lifecycle if this backend has a postCompact event
   // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
   // the lifecycle gets stuck at 'compacting' permanently.
+  // A backend the server spawned declares itself headless, and the route
+  // then writes no lifecycle: inside a server run only the run moves it.
   if (backend.events.postCompact) {
-    await updateRuntimeGenerationState(cwd, config, sbSlug, 'compacting', 'pre-compact');
+    await updateRuntimeGenerationState(cwd, config, sbSlug, 'compacting', 'pre-compact', {
+      headless: isHeadlessSession(),
+    });
   }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
@@ -2146,8 +2150,11 @@ async function postCompactHandler(): Promise<void> {
   const sbSlug = resolveSlug() || 'unknown';
 
   // Reset lifecycle from compacting back to idle. NOT a turn boundary —
-  // the same turn resumes after compaction (PR #492 round 4).
-  await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'post-compact');
+  // the same turn resumes after compaction (PR #492 round 4). Headless for a
+  // server spawn, as at pre-compact.
+  await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'post-compact', {
+    headless: isHeadlessSession(),
+  });
 
   let identityBlock = '';
   let memoriesBlock = '';
@@ -2466,16 +2473,22 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   inkThreadKey = await hydrateThreadKeyFromServer(inkSessionId, inkThreadKey, config?.email);
 
-  // Set lifecycle to idle on startup (ready for user input).
+  // Set lifecycle to idle on startup (ready for user input). A backend the
+  // server spawned is not waiting for input: the run already wrote `running`
+  // under its turn epoch, and its finalize writes what comes after. An idle
+  // here landed a second into the run, and the next `running` then rotated
+  // the epoch out from under it (2026-09-29: every fresh Claude Code server
+  // spawn, and each provider that started a fresh session mid-turn under ink
+  // chat). The linkage below still goes.
   if (inkSessionId) {
     try {
       const updateArgs: Record<string, unknown> = {
         email: config?.email,
         sbSlug,
         sessionId: inkSessionId,
-        lifecycle: 'idle',
         workingDir: cwd,
       };
+      if (!isHeadlessSession()) updateArgs.lifecycle = 'idle';
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
       if (inkThreadKey) updateArgs.activeThreadKey = inkThreadKey;
       await callInkTool('update_session_state', updateArgs);
