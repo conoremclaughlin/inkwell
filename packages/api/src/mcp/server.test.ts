@@ -581,9 +581,18 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   // Session-validated context auth (x-ink-context without OAuth)
   // =========================================================================
 
-  it('should resolve identity from verified session in x-ink-context', async () => {
+  // spec:sender-token-binding v3 P1. A request with NO bearer used to be
+  // authenticated from its unsigned x-ink-context when the claimed session
+  // was live, and then marked agent-token-bound with that session's identity.
+  // The only secret was a session UUID, which list_sessions returns and which
+  // sits in hook payloads and epoch files. A session claim is routing scope,
+  // never a credential: with OAuth required it is challenged like any other
+  // credential-less request, and the session row is never consulted for it.
+  it('never authenticates a credential-less request from its session claim (OAuth required)', async () => {
     if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
     mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockClear();
     mockGetSession.mockResolvedValue({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
@@ -598,7 +607,6 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       user_id: 'user-456',
       users: { email: 'test@example.com' },
     };
-
     const contextHeader = encodeContextHeader({
       sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
@@ -606,13 +614,76 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       cliAttached: true,
       runtime: 'claude',
     });
+    try {
+      const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+        'x-ink-context': contextHeader,
+      });
+      expect(res.status).toBe(401);
+      expect(res.headers.get('www-authenticate')).toContain('Bearer');
+      // The live session it named was never even looked up as a credential.
+      expect(mockGetSession).not.toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+    } finally {
+      (env as any).MCP_REQUIRE_OAUTH = false;
+    }
+  });
 
-    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
-      'x-ink-context': contextHeader,
+  it('a credential-less request with OAuth optional carries no user and is never agent-bound, and is logged', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = false;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockClear();
+    mockGetSession.mockResolvedValue({
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      userId: 'user-456',
+      sbSlug: 'wren',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
     });
-
-    expect(res.status).toBe(200);
-    expect(mockGetSession).toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+    contextIdentity = {
+      id: 'sb-uuid-123',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+    const contextHeader = encodeContextHeader({
+      sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      studioId: 'studio-1',
+      sbSlug: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+    const { logger } = await import('../utils/logger');
+    (logger.info as ReturnType<typeof vi.fn>).mockClear();
+    const { Client, StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
+    const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+      requestInit: { headers: { 'x-ink-context': contextHeader } },
+    });
+    const client = new Client({ name: 'p1-probe', version: '0.0.0' });
+    try {
+      await client.connect(transport);
+      const result: any = await client.callTool({ name: 'echo_request_context', arguments: {} });
+      expect(result.isError).not.toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.before.userId).toBeUndefined();
+      expect(payload.before.agentTokenBound).toBeUndefined();
+      expect(payload.before.tokenSlug).toBeUndefined();
+      expect(payload.before.sbSlug).toBeUndefined();
+      // Routing scope still rides the header; identity does not.
+      expect(payload.before.sessionId).toBe('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+    } finally {
+      await client.close();
+    }
+    expect(mockGetSession).not.toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+    // The tokenless path is measurable: one info line per request, never a value.
+    const tokenless = (logger.info as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([message]) => message === 'MCP request without credential'
+    );
+    expect(tokenless.length).toBeGreaterThan(0);
+    for (const [, fields] of tokenless) {
+      expect(fields).toMatchObject({ hasContextClaim: true });
+      expect(JSON.stringify(fields)).not.toContain('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+    }
   });
 
   it('enriches a user-token request with the context session agent (PR #468)', async () => {

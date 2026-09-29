@@ -458,26 +458,23 @@ export class MCPServer {
         contextToken = decodeContextToken(contextHeader);
       }
 
-      // Session-validated context auth: when NO Authorization header is present
-      // but the request carries an x-ink-context with a sessionId + sbSlug,
-      // verify the session exists and is active in the database. The session was
-      // created through an authenticated start_session call, so a matching
-      // active session proves the caller owns the identity.
-      //
-      // This is NOT attempted when an Authorization header IS present but
-      // invalid — that's a hard auth failure, not a fallback scenario.
-      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.sbSlug) {
-        userData = await this.resolveUserFromContextSession(
-          contextToken.sessionId,
-          contextToken.sbSlug
-        );
-        if (userData) {
-          logger.debug('Context-based auth: resolved identity from verified session', {
-            sessionId: contextToken.sessionId,
-            sbSlug: contextToken.sbSlug,
-            userId: userData.userId,
-          });
-        }
+      // A request with no Authorization header is never authenticated from its
+      // x-ink-context. That header is unsigned routing scope (session, studio);
+      // until spec:sender-token-binding P1 a live session named in it was
+      // enough to be authenticated as the session's user AND marked
+      // agent-token-bound with its identity, and a session UUID is not a
+      // secret (list_sessions returns it; hook payloads and epoch files carry
+      // it). What happens to a credential-less request is decided below by
+      // MCP_REQUIRE_OAUTH alone; this line makes that traffic measurable
+      // before the flag changes. Never a value: presence only.
+      if (!authHeader) {
+        logger.info('MCP request without credential', {
+          hasContextClaim: Boolean(contextToken?.sessionId && contextToken?.sbSlug),
+          hasLegacySessionHeader: Boolean(req.header('x-ink-session-id')?.trim()),
+          callerProfile: req.header('x-ink-caller-profile') ?? null,
+          runtime: contextToken?.runtime ?? null,
+          oauthRequired: env.MCP_REQUIRE_OAUTH,
+        });
       }
 
       // OAuth challenge for MCP clients (e.g. Gemini) when auth is required.
