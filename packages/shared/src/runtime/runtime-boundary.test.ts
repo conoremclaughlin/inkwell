@@ -9,8 +9,9 @@
  * An import-graph check alone cannot see the second: `process.env` and
  * `Buffer` are globals, never imported. So this walks the TypeScript AST of
  * every non-test file in this directory and checks all three. The imports arm
- * requires every specifier to stay inside this directory, which makes the
- * check transitive: every file it can reach is a file this test scans.
+ * requires every specifier to name one of those files, which makes the check
+ * transitive: every file it can reach is a file this test scans. A file that
+ * sits in the directory but is not scanned, such as a test, does not count.
  *
  * The checker is a plain function so it can be run against known answers first.
  * A guard that reports nothing on the real tree proves nothing unless the same
@@ -19,12 +20,23 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readdirSync, readFileSync } from 'fs';
-import { dirname, join, relative, resolve, sep } from 'path';
+import { existsSync, readdirSync, readFileSync } from 'fs';
+import { dirname, join, relative, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import ts from 'typescript';
 
 const RUNTIME_DIR = dirname(fileURLToPath(import.meta.url));
+
+/** The files this test scans, and so the only files an import may reach. */
+const SCANNED = new Set(runtimeSourceFiles(RUNTIME_DIR));
+
+/**
+ * The declared types under which a module-level `new` is allowed. TypeScript's
+ * read-only collection interfaces have no mutators, while `Readonly<Set<T>>`
+ * keeps `add`, so the match is by exact name. A file that declares either name
+ * itself would shadow the global interface, so that is refused too.
+ */
+const READ_ONLY_COLLECTIONS = new Set(['ReadonlySet', 'ReadonlyMap']);
 
 /** Globals a host provides and a browser or edge runtime does not. */
 const HOST_GLOBALS = new Set([
@@ -96,14 +108,80 @@ function enclosingName(node: ts.Node): string | undefined {
   return undefined;
 }
 
-function specifierStaysInside(filePath: string, specifier: string): boolean {
+/**
+ * Whether a specifier names a scanned file: relative, spelled with the `.js`
+ * extension the build emits, and backed by a `.ts` file this test reads. Being
+ * inside the directory is not enough; a test file, a `.mts` file or a missing
+ * file would be reachable and unchecked.
+ */
+function reachesScannedFile(filePath: string, specifier: string): boolean {
   if (!specifier.startsWith('./') && !specifier.startsWith('../')) return false;
-  const target = resolve(dirname(filePath), specifier);
-  return target.startsWith(RUNTIME_DIR + sep);
+  if (!specifier.endsWith('.js')) return false;
+  const target = resolve(dirname(filePath), `${specifier.slice(0, -'.js'.length)}.ts`);
+  return SCANNED.has(target);
 }
 
-function hasModifier(flags: ts.NodeFlags, flag: ts.NodeFlags): boolean {
-  return (flags & flag) !== 0;
+/** The expression under any parentheses, type assertions, `!` and `satisfies`. */
+function unwrap(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
+    ts.isNonNullExpression(current) ||
+    ts.isSatisfiesExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+/**
+ * Whether `child` runs when `parent` is called or constructed rather than when
+ * the module loads: a function's parameters and body, and an instance field's
+ * initializer. Names, decorators and static fields all run at load.
+ */
+function runsLater(parent: ts.Node, child: ts.Node): boolean {
+  if (ts.isFunctionLike(parent)) {
+    const body = 'body' in parent ? parent.body : undefined;
+    return child === body || (parent.parameters as ReadonlyArray<ts.Node>).includes(child);
+  }
+  if (ts.isPropertyDeclaration(parent)) {
+    const isStatic = parent.modifiers?.some(
+      (modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword
+    );
+    return !isStatic && child === parent.initializer;
+  }
+  return false;
+}
+
+/** Whether an identifier is the name a declaration introduces. */
+function isDeclaredName(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  return (
+    (ts.isTypeAliasDeclaration(parent) ||
+      ts.isInterfaceDeclaration(parent) ||
+      ts.isClassDeclaration(parent) ||
+      ts.isEnumDeclaration(parent) ||
+      ts.isModuleDeclaration(parent) ||
+      ts.isFunctionDeclaration(parent) ||
+      ts.isVariableDeclaration(parent) ||
+      ts.isTypeParameterDeclaration(parent) ||
+      ts.isImportClause(parent) ||
+      ts.isImportSpecifier(parent) ||
+      ts.isNamespaceImport(parent) ||
+      ts.isImportEqualsDeclaration(parent)) &&
+    parent.name === node
+  );
+}
+
+function isReadOnlyCollection(type: ts.TypeNode | undefined): boolean {
+  return (
+    type !== undefined &&
+    ts.isTypeReferenceNode(type) &&
+    ts.isIdentifier(type.typeName) &&
+    READ_ONLY_COLLECTIONS.has(type.typeName.text)
+  );
 }
 
 /**
@@ -123,12 +201,48 @@ function boundaryViolations(filePath: string, sourceText: string): Violation[] {
       violations.push({ file, line: lineOf(node), kind: 'import', detail: '<computed specifier>' });
       return;
     }
-    if (!specifierStaysInside(filePath, specifier.text)) {
+    if (!reachesScannedFile(filePath, specifier.text)) {
       violations.push({ file, line: lineOf(node), kind: 'import', detail: specifier.text });
     }
   };
 
-  const visit = (node: ts.Node): void => {
+  const reportState = (node: ts.Node, detail: string): void => {
+    violations.push({ file, line: lineOf(node), kind: 'module-state', detail });
+  };
+
+  /** Load-time `new`s that a const declared as a read-only collection admits. */
+  const admitted = new Set<ts.Node>();
+
+  /**
+   * Module state is whatever runs once, when the module loads, and so is shared
+   * by every session in the process. That is anywhere outside a function body
+   * or an instance field, however deeply nested or wrapped.
+   */
+  const checkLoadTime = (node: ts.Node): void => {
+    if (ts.isVariableDeclarationList(node)) {
+      const isConst = (node.flags & ts.NodeFlags.BlockScoped) === ts.NodeFlags.Const;
+      for (const declaration of node.declarations) {
+        const name = ts.isIdentifier(declaration.name) ? declaration.name.text : '<pattern>';
+        if (!isConst) {
+          reportState(declaration, `top-level let/var ${name}`);
+          continue;
+        }
+        const init = declaration.initializer && unwrap(declaration.initializer);
+        if (init && ts.isNewExpression(init) && isReadOnlyCollection(declaration.type)) {
+          admitted.add(init);
+        }
+      }
+    } else if (ts.isNewExpression(node) && !admitted.has(node)) {
+      reportState(node, `load-time new: ${enclosingName(node) ?? '<module>'}`);
+    } else if (ts.isRegularExpressionLiteral(node)) {
+      const flags = node.text.slice(node.text.lastIndexOf('/') + 1);
+      if (/[gy]/.test(flags)) {
+        reportState(node, `load-time stateful regex: ${enclosingName(node) ?? '<module>'}`);
+      }
+    }
+  };
+
+  const visit = (node: ts.Node, loadTime: boolean): void => {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       checkSpecifier(node, node.moduleSpecifier);
     } else if (
@@ -149,40 +263,13 @@ function boundaryViolations(filePath: string, sourceText: string): Violation[] {
         enclosing: enclosingName(node),
       });
     }
-    ts.forEachChild(node, visit);
-  };
-  visit(source);
-
-  for (const statement of source.statements) {
-    if (!ts.isVariableStatement(statement)) continue;
-    const listFlags = statement.declarationList.flags;
-    const isConst = hasModifier(listFlags, ts.NodeFlags.Const);
-    for (const declaration of statement.declarationList.declarations) {
-      const name = ts.isIdentifier(declaration.name) ? declaration.name.text : '<pattern>';
-      const report = (detail: string): void => {
-        violations.push({ file, line: lineOf(declaration), kind: 'module-state', detail });
-      };
-      if (!isConst) {
-        report(`top-level let/var ${name}`);
-        continue;
-      }
-      const init = declaration.initializer;
-      if (!init) continue;
-      if (ts.isNewExpression(init)) {
-        const type = declaration.type;
-        const readonlyTyped =
-          type !== undefined &&
-          ts.isTypeReferenceNode(type) &&
-          ts.isIdentifier(type.typeName) &&
-          type.typeName.text.startsWith('Readonly');
-        if (!readonlyTyped) report(`top-level new without a Readonly type: ${name}`);
-      }
-      if (ts.isRegularExpressionLiteral(init)) {
-        const flags = init.text.slice(init.text.lastIndexOf('/') + 1);
-        if (/[gy]/.test(flags)) report(`top-level stateful regex: ${name}`);
-      }
+    if (ts.isIdentifier(node) && READ_ONLY_COLLECTIONS.has(node.text) && isDeclaredName(node)) {
+      reportState(node, `declares ${node.text}`);
     }
-  }
+    if (loadTime) checkLoadTime(node);
+    ts.forEachChild(node, (child) => visit(child, loadTime && !runsLater(node, child)));
+  };
+  visit(source, true);
 
   return violations;
 }
@@ -204,6 +291,9 @@ function check(sourceText: string, name = 'synthetic.ts'): Violation[] {
 
 const kinds = (violations: Violation[]): string[] =>
   violations.map((violation) => `${violation.kind}:${violation.detail}`);
+
+const moduleState = (violations: Violation[]): Violation[] =>
+  violations.filter((violation) => violation.kind === 'module-state');
 
 describe('runtime boundary checker, against known answers', () => {
   it('reports nothing for a file that keeps every rule', () => {
@@ -249,6 +339,26 @@ describe('runtime boundary checker, against known answers', () => {
   });
 
   it.each([
+    ["export { host } from './review-host-helper.test.js';", 'import:./review-host-helper.test.js'],
+    ["export * from './agent-loop.test.js';", 'import:./agent-loop.test.js'],
+    ["import { helper } from './helper.mjs';", 'import:./helper.mjs'],
+    ["import { missing } from './missing.js';", 'import:./missing.js'],
+    ["import { fenceAfterLine } from './imitation-grammar';", 'import:./imitation-grammar'],
+  ])(
+    'reports an import that stays in the directory but reaches no scanned file: %s',
+    (source, expected) => {
+      expect(kinds(check(source))).toContain(expected);
+    }
+  );
+
+  it('reports a test file re-exported from the real index, though it exists here', () => {
+    const index = join(RUNTIME_DIR, 'index.ts');
+    expect(existsSync(join(RUNTIME_DIR, 'agent-loop.test.ts'))).toBe(true);
+    const probe = `${readFileSync(index, 'utf8')}\nexport * from './agent-loop.test.js';\n`;
+    expect(kinds(boundaryViolations(index, probe))).toEqual(['import:./agent-loop.test.js']);
+  });
+
+  it.each([
     ['export const home = process.env.HOME;', 'global:process'],
     ["export const size = Buffer.from('x').length;", 'global:Buffer'],
     ["export const os = require('os');", 'global:require'],
@@ -263,18 +373,57 @@ describe('runtime boundary checker, against known answers', () => {
     ['let counter = 0;', 'module-state:top-level let/var counter'],
     ['var legacy = 1;', 'module-state:top-level let/var legacy'],
     ['export let exported = 0;', 'module-state:top-level let/var exported'],
-    [
-      'const cache = new Map<string, number>();',
-      'module-state:top-level new without a Readonly type: cache',
-    ],
-    [
-      'const seen: Set<string> = new Set();',
-      'module-state:top-level new without a Readonly type: seen',
-    ],
-    ['const GLOBAL = /a/g;', 'module-state:top-level stateful regex: GLOBAL'],
-    ['const STICKY = /a/y;', 'module-state:top-level stateful regex: STICKY'],
+    ['const cache = new Map<string, number>();', 'module-state:load-time new: cache'],
+    ['const seen: Set<string> = new Set();', 'module-state:load-time new: seen'],
+    ['const GLOBAL = /a/g;', 'module-state:load-time stateful regex: GLOBAL'],
+    ['const STICKY = /a/y;', 'module-state:load-time stateful regex: STICKY'],
+    ['type ReadonlySet<T> = Set<T>;', 'module-state:declares ReadonlySet'],
   ])('reports module-level state: %s', (source, expected) => {
     expect(kinds(check(source))).toContain(expected);
+  });
+
+  it.each([
+    'const cache = (new Map<string, number>());',
+    'const cache = new Map<string, number>() as Map<string, number>;',
+    'const cache = <Map<string, number>>new Map();',
+    'const cache = new Map<string, number>()!;',
+    'const cache = new Map<string, number>() satisfies Map<string, number>;',
+    'const matcher = (/x/g);',
+    'const matcher = /x/y as RegExp;',
+  ])('sees module-level state through a transparent wrapper: %s', (source) => {
+    expect(moduleState(check(source))).toHaveLength(1);
+  });
+
+  it.each([
+    'const TABLE = { cache: new Map<string, number>() };',
+    'const PATTERNS = [/a/g];',
+    'export class Registry { static cache = new Map<string, number>(); }',
+    'export default new Map<string, number>();',
+    "const TABLE: ReadonlyMap<string, Set<string>> = new Map([['a', new Set<string>()]]);",
+  ])('sees module-level state nested anywhere it runs at load time: %s', (source) => {
+    expect(moduleState(check(source))).toHaveLength(1);
+  });
+
+  it.each([
+    'const cache: Readonly<Set<string>> = new Set();',
+    'type ReadonlyCache = Map<string, number>;\nconst cache: ReadonlyCache = new Map();',
+    'type ReadonlySet<T> = Set<T>;\nconst cache: ReadonlySet<string> = new Set();',
+    'declare global { interface ReadonlySet<T> { add(value: T): this } }\nconst cache: ReadonlySet<string> = new Set();',
+  ])('admits only an unshadowed ReadonlySet or ReadonlyMap: %s', (source) => {
+    expect(moduleState(check(source))).toHaveLength(1);
+  });
+
+  it('stays quiet on allocations and regexes that run per call, and on the admitted tables', () => {
+    const later = [
+      'export function make(): Map<string, number> { return new Map(); }',
+      'export const makeArrow = (): Map<string, number> => new Map();',
+      'export function withDefault(seen = new Set<string>()): Set<string> { return seen; }',
+      'export class Box { items = new Map<string, number>(); static make(): Box { return new Box(); } }',
+      'export const scan = (text: string) => text.match(/a/g);',
+      "const RAN: ReadonlySet<string> = (new Set(['executed']));",
+      "const INDEX: ReadonlyMap<string, number> = new Map([['a', 1]]);",
+    ].join('\n');
+    expect(check(later)).toEqual([]);
   });
 
   it('records the enclosing declaration, which is what the allowlist matches on', () => {
