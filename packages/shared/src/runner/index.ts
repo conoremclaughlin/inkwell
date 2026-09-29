@@ -1,5 +1,6 @@
 export {
   buildCleanEnv,
+  SPAWN_ENV_INHERITED_NAMES,
   resolveSpawnTarget,
   spawnBackend,
   LineBuffer,

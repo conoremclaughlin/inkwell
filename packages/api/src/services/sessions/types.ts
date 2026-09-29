@@ -687,6 +687,12 @@ export interface ClaudeRunnerConfig {
   systemPrompt?: string;
   appendSystemPrompt?: string;
   inkAccessToken?: string;
+  /**
+   * The secret the ink chat child verifies and mints delegation tokens with,
+   * derived by the server from its signing key (spec:sender-token-binding v3
+   * §4 Phase 0). The key itself never reaches a child.
+   */
+  inkDelegationSecret?: string;
   /** Inkwell session ID for this run — written to runtime hint files so hooks link correctly */
   inkSessionId?: string;
   /** SB slug for this run — written to runtime hint files */

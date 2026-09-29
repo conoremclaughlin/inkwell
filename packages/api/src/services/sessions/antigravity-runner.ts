@@ -509,9 +509,9 @@ export class AntigravityRunner implements IRunner {
     const agyBin = await resolveBinaryPath('agy');
     const mcpUrl = await resolveInkMcpUrl(config);
     return new Promise((resolve, reject) => {
-      // Strip CLAUDECODE so it doesn't leak into the subprocess and make agy
-      // think it is nested inside a Claude Code session.
-      const { CLAUDECODE, ...cleanEnv } = process.env;
+      // The child inherits an allowlist of the server's env (resolveSpawnTarget
+      // → buildCleanEnv), never the whole of it: spec:sender-token-binding
+      // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(agyBin),
@@ -532,6 +532,7 @@ export class AntigravityRunner implements IRunner {
           inkSessionId: config.inkSessionId,
           studioId: config.studioId,
           accessToken: config.inkAccessToken,
+          delegationSecret: config.inkDelegationSecret,
           sbSlug: config.sbSlug,
           runtime: 'antigravity',
           repoRoot: config.repoRoot,
@@ -548,7 +549,7 @@ export class AntigravityRunner implements IRunner {
 
       const proc = spawn(target.binary, target.args, {
         cwd: target.cwd,
-        env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
+        env: target.env,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 

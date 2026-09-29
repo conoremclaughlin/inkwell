@@ -4,7 +4,13 @@ import { PassThrough } from 'stream';
 
 const spawnMock = vi.hoisted(() => vi.fn());
 vi.mock('child_process', () => ({ spawn: spawnMock }));
-import { buildCleanEnv, spawnBackend, resolveSpawnTarget, LineBuffer } from './spawn-backend.js';
+import {
+  buildCleanEnv,
+  spawnBackend,
+  resolveSpawnTarget,
+  LineBuffer,
+  SPAWN_ENV_INHERITED_NAMES,
+} from './spawn-backend.js';
 
 describe('buildCleanEnv', () => {
   it('strips CLAUDECODE from process.env', () => {
@@ -29,6 +35,160 @@ describe('buildCleanEnv', () => {
   it('extra env overrides process.env', () => {
     const env = buildCleanEnv({ HOME: '/custom/home' });
     expect(env.HOME).toBe('/custom/home');
+  });
+});
+
+// spec:sender-token-binding v3 §4 Phase 0 (task 7f4ceda4). A spawned SB used to
+// receive the server's ENTIRE environment minus one variable, so every child
+// held the JWT signing key and the Supabase service key (P4, measured by Myra
+// from inside a runner). The child now starts from nothing and inherits exact
+// names only. Every value below is synthetic; the fixture is a shape, not a
+// copy of any deployment.
+describe('buildCleanEnv: the child inherits exact names only (Phase 0)', () => {
+  const parent: Record<string, string> = {
+    // Process basics a runtime needs.
+    HOME: '/home/synthetic',
+    PATH: '/synthetic/bin',
+    USER: 'synthetic-user',
+    SHELL: '/bin/zsh',
+    TMPDIR: '/tmp/synthetic',
+    LANG: 'en_US.UTF-8',
+    TERM: 'xterm-256color',
+    SSH_AUTH_SOCK: '/tmp/synthetic-agent.sock',
+    // Toolchain paths.
+    NVM_DIR: '/home/synthetic/.nvm',
+    HOMEBREW_PREFIX: '/opt/homebrew',
+    DOCKER_HOST: 'unix:///synthetic/docker.sock',
+    // Inkwell knobs a child reads.
+    INK_SERVER_URL: 'http://localhost:4001',
+    INK_STUDIOS_ROOT: '/home/synthetic/.ink/studios',
+    // Each runtime's own authentication, named individually.
+    ANTHROPIC_API_KEY: 'synthetic-anthropic',
+    OPENAI_API_KEY: 'synthetic-openai',
+    GEMINI_API_KEY: 'synthetic-gemini',
+    GOOGLE_API_KEY: 'synthetic-google-api',
+    // A GitHub credential the SBs' own tooling uses (.mcp.json interpolates it).
+    GITHUB_TOKEN: 'synthetic-github',
+    // Server secrets and server-only configuration: must never cross.
+    JWT_SECRET: 'synthetic-jwt-secret',
+    SUPABASE_SECRET_KEY: 'synthetic-service-key',
+    SUPABASE_PUBLISHABLE_KEY: 'synthetic-anon-key',
+    SUPABASE_URL: 'http://localhost:54321',
+    GOOGLE_CLIENT_SECRET: 'synthetic-oauth-secret',
+    GOOGLE_CLIENT_ID: 'synthetic-oauth-id',
+    TELEGRAM_BOT_TOKEN: 'synthetic-bot',
+    TELEGRAM_BENSON_BOT_TOKEN: 'synthetic-bot-2',
+    SB_TEST_PASSWORD: 'synthetic-password',
+    SB_TEST_EMAIL: 'user@example.com',
+    SENTRY_DSN: 'https://synthetic@sentry.example/1',
+    MCP_REQUIRE_OAUTH: 'false',
+    ENABLE_TELEGRAM: 'true',
+    // A credential the PARENT happens to hold: a child gets its own, explicitly.
+    INK_ACCESS_TOKEN: 'parent-session-token',
+    INK_DELEGATION_SECRET: 'parent-delegation-secret',
+    // Node knobs that can inject code or carry a registry credential.
+    NODE_OPTIONS: '--require /synthetic/hook.js',
+    NODE_AUTH_TOKEN: 'synthetic-npm-token',
+    // Unlisted members of otherwise-inherited families: exact names, no prefixes.
+    NVM_SYNTHETIC_UNLISTED: 'x',
+    INK_SYNTHETIC_UNLISTED: 'x',
+    GOOGLE_SYNTHETIC_UNLISTED: 'x',
+    // The nested-session marker.
+    CLAUDECODE: '1',
+  };
+
+  it('passes the basics, toolchain, Inkwell knobs and each runtime credential through by name', () => {
+    const env = buildCleanEnv(undefined, parent);
+    for (const name of [
+      'HOME',
+      'PATH',
+      'USER',
+      'SHELL',
+      'TMPDIR',
+      'LANG',
+      'TERM',
+      'SSH_AUTH_SOCK',
+      'NVM_DIR',
+      'HOMEBREW_PREFIX',
+      'DOCKER_HOST',
+      'INK_SERVER_URL',
+      'INK_STUDIOS_ROOT',
+      'ANTHROPIC_API_KEY',
+      'OPENAI_API_KEY',
+      'GEMINI_API_KEY',
+      'GOOGLE_API_KEY',
+      'GITHUB_TOKEN',
+    ]) {
+      expect(env[name], name).toBe(parent[name]);
+    }
+  });
+
+  it('never passes a server secret, server-only configuration, or the parent credentials', () => {
+    const env = buildCleanEnv(undefined, parent);
+    for (const name of [
+      'JWT_SECRET',
+      'SUPABASE_SECRET_KEY',
+      'SUPABASE_PUBLISHABLE_KEY',
+      'SUPABASE_URL',
+      'GOOGLE_CLIENT_SECRET',
+      'GOOGLE_CLIENT_ID',
+      'TELEGRAM_BOT_TOKEN',
+      'TELEGRAM_BENSON_BOT_TOKEN',
+      'SB_TEST_PASSWORD',
+      'SB_TEST_EMAIL',
+      'SENTRY_DSN',
+      'MCP_REQUIRE_OAUTH',
+      'ENABLE_TELEGRAM',
+      'INK_ACCESS_TOKEN',
+      'INK_DELEGATION_SECRET',
+      'NODE_OPTIONS',
+      'NODE_AUTH_TOKEN',
+      'CLAUDECODE',
+    ]) {
+      expect(name in env, name).toBe(false);
+    }
+  });
+
+  it('matches exact names, never a prefix', () => {
+    const env = buildCleanEnv(undefined, parent);
+    expect('NVM_SYNTHETIC_UNLISTED' in env).toBe(false);
+    expect('INK_SYNTHETIC_UNLISTED' in env).toBe(false);
+    expect('GOOGLE_SYNTHETIC_UNLISTED' in env).toBe(false);
+  });
+
+  it('the explicit env is applied last: it wins over the parent and may add unlisted names', () => {
+    const env = buildCleanEnv(
+      { HOME: '/studio/home', INK_ACCESS_TOKEN: 'child-session-token', SB_SLUG: 'wren' },
+      parent
+    );
+    expect(env.HOME).toBe('/studio/home');
+    expect(env.INK_ACCESS_TOKEN).toBe('child-session-token');
+    expect(env.SB_SLUG).toBe('wren');
+    expect('JWT_SECRET' in env).toBe(false);
+  });
+
+  it('reads process.env when no parent is given, applying the same allowlist', () => {
+    vi.stubEnv('JWT_SECRET', 'synthetic-jwt-secret');
+    vi.stubEnv('LANG', 'C.UTF-8');
+    try {
+      const env = buildCleanEnv({ SB_SLUG: 'lumen' });
+      expect('JWT_SECRET' in env).toBe(false);
+      expect(env.LANG).toBe('C.UTF-8');
+      expect(env.SB_SLUG).toBe('lumen');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('exports the inherited names so a spawner test can assert the final env against them', () => {
+    expect(Array.isArray(SPAWN_ENV_INHERITED_NAMES)).toBe(true);
+    expect(SPAWN_ENV_INHERITED_NAMES).toContain('HOME');
+    expect(SPAWN_ENV_INHERITED_NAMES).toContain('GITHUB_TOKEN');
+    expect(SPAWN_ENV_INHERITED_NAMES).not.toContain('JWT_SECRET');
+    expect(SPAWN_ENV_INHERITED_NAMES).not.toContain('INK_ACCESS_TOKEN');
+    // No name is a pattern (macOS's __CF_USER_TEXT_ENCODING starts with underscores).
+    expect(SPAWN_ENV_INHERITED_NAMES.every((name) => /^[A-Z_][A-Z0-9_]*$/.test(name))).toBe(true);
+    expect(new Set(SPAWN_ENV_INHERITED_NAMES).size).toBe(SPAWN_ENV_INHERITED_NAMES.length);
   });
 });
 

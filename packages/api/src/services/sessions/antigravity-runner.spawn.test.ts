@@ -247,3 +247,63 @@ describe('killProcess — real subprocess', () => {
     expect(proc.signalCode).toBe('SIGKILL');
   }, 20_000);
 });
+
+// spec:sender-token-binding v3 §4 Phase 0 (task 7f4ceda4). A REAL child, so
+// this is the environment the binary itself sees, after docker-or-host
+// resolution and the runner's own merge: the parent's secrets are absent, the
+// session credentials the server minted are present. The fake agy reports the
+// NAMES it finds, never values.
+describe('child environment — real subprocess (Phase 0)', () => {
+  it('the agy child never sees a server secret, and sees its own session credentials', async () => {
+    vi.stubEnv('JWT_SECRET', 'synthetic-jwt-secret');
+    vi.stubEnv('SUPABASE_SECRET_KEY', 'synthetic-service-key');
+    vi.stubEnv('TELEGRAM_BOT_TOKEN', 'synthetic-bot');
+    vi.stubEnv('INK_ACCESS_TOKEN', 'parent-session-token');
+    try {
+      const probe = [
+        'JWT_SECRET',
+        'SUPABASE_SECRET_KEY',
+        'TELEGRAM_BOT_TOKEN',
+        'INK_ACCESS_TOKEN',
+        'INK_DELEGATION_SECRET',
+        'INK_SESSION_ID',
+        'SB_SLUG',
+        'HOME',
+        'PATH',
+      ];
+      hoisted.binary = fakeAgy(
+        'agy-env.mjs',
+        [
+          `const present = ${JSON.stringify(probe)}.filter((n) => n in process.env);`,
+          `const token = process.env.INK_ACCESS_TOKEN === 'child-session-token' ? 'child' : 'other';`,
+          `process.stdout.write(JSON.stringify({ event: 'init', conversation_id: 'conv-env' }) + '\\n');`,
+          `process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: 'conv-env', status: 'SUCCESS', response: present.join(',') + '|' + token } }) + '\\n');`,
+        ].join('\n')
+      );
+      const result = await new AntigravityRunner().run('hi', {
+        config: {
+          ...config(),
+          sbSlug: 'wren',
+          inkSessionId: 'sess-agy-env',
+          inkAccessToken: 'child-session-token',
+          inkDelegationSecret: 'synthetic-derived-secret',
+        } as never,
+      });
+      expect(result.success).toBe(true);
+      const [names, token] = (result.finalTextResponse ?? '').split('|');
+      const present = new Set(names.split(',').filter(Boolean));
+      expect(present.has('JWT_SECRET')).toBe(false);
+      expect(present.has('SUPABASE_SECRET_KEY')).toBe(false);
+      expect(present.has('TELEGRAM_BOT_TOKEN')).toBe(false);
+      expect(present.has('INK_ACCESS_TOKEN')).toBe(true);
+      expect(token).toBe('child');
+      expect(present.has('INK_DELEGATION_SECRET')).toBe(true);
+      expect(present.has('INK_SESSION_ID')).toBe(true);
+      expect(present.has('SB_SLUG')).toBe(true);
+      expect(present.has('HOME')).toBe(true);
+      expect(present.has('PATH')).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});

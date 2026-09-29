@@ -488,9 +488,9 @@ export class ClaudeRunner implements IRunner {
     }
 
     return new Promise((resolve, reject) => {
-      // Strip CLAUDECODE to prevent "nested session" detection when Inkwell is
-      // launched from inside a Claude Code session (e.g., via PM2).
-      const { CLAUDECODE, ...cleanEnv } = process.env;
+      // The child inherits an allowlist of the server's env (resolveSpawnTarget
+      // → buildCleanEnv), never the whole of it: spec:sender-token-binding
+      // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
         // Ensure Claude Code uses correct paths
         HOME: process.env.HOME || '',
@@ -506,6 +506,7 @@ export class ClaudeRunner implements IRunner {
           runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
           accessToken: config.inkAccessToken,
+          delegationSecret: config.inkDelegationSecret,
           sbSlug: config.sbSlug,
           runtime: 'claude',
           repoRoot: config.repoRoot,
@@ -529,7 +530,7 @@ export class ClaudeRunner implements IRunner {
 
       const proc = spawn(target.binary, target.args, {
         cwd: target.cwd,
-        env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
+        env: target.env,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
