@@ -47,6 +47,7 @@ import {
   startBackendTurn,
   CONFIG_REFUSED_EXIT_CODE,
   DEFAULT_TURN_HARD_TIMEOUT_MS,
+  EFFECTIVE_CONFIG_CHECK_FAILED,
   type BackendRunRequest,
 } from './backend-runner.js';
 import { SPAWN_ENV_INHERITED_NAMES } from '../runner/spawn-backend.js';
@@ -455,6 +456,12 @@ describe('runBackendTurn', () => {
           expect(check.binary).toBe('mock-backend');
           expect(check.timeoutMs).toBeGreaterThan(0);
           expect(check.timeoutMs).toBeLessThanOrEqual(10_000);
+          // Nothing the spawn would not get, and none of the session's own
+          // names (Myra, c41d867e).
+          const spawnEnv = spawnMock.mock.calls[0]![2].env as Record<string, string>;
+          const probeNames = Object.keys(check.probeEnv);
+          expect(probeNames.every((name) => name in spawnEnv)).toBe(true);
+          expect(probeNames.filter((name) => check.sessionEnvNames.includes(name))).toEqual([]);
         } finally {
           state.check = undefined;
           state.preparedEnv = {};
@@ -488,12 +495,14 @@ describe('runBackendTurn', () => {
         }
       });
 
-      it('ends the check on abort, and spawns nothing', async () => {
+      it('ends the check on abort, and reports the abort, not what the check answered', async () => {
         let checkSignal: AbortSignal | undefined;
+        // An aborted Codex probe answers with a reason (`aborted`), so the
+        // abort must win over it (Myra's M4, c41d867e).
         state.check = (check) =>
           new Promise((resolve) => {
             checkSignal = check.signal;
-            check.signal.addEventListener('abort', () => resolve(undefined));
+            check.signal.addEventListener('abort', () => resolve('synthetic reason on abort'));
           });
         spawnMock.mockReset().mockImplementation(() => createMockChild(0));
         try {
@@ -538,6 +547,89 @@ describe('runBackendTurn', () => {
         } finally {
           state.check = undefined;
           vi.useRealTimers();
+          spawnMock.mockReset();
+        }
+      });
+
+      // A slow mint (Myra's M1 and M2a, c41d867e): the check's budget, and
+      // then the child's ceiling, count from before the mint.
+      const slowMintHost = (mintMs: number) =>
+        fakeHost({
+          sessionEnv: () => new Promise((resolve) => setTimeout(() => resolve({}), mintMs)),
+        });
+
+      it('gives the check only what the mint left', async () => {
+        vi.useFakeTimers();
+        const seen: number[] = [];
+        state.check = async (check) => {
+          seen.push(check.timeoutMs);
+          return 'synthetic refusal';
+        };
+        spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+        try {
+          const turn = startBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            timeoutMs: 400,
+            host: slowMintHost(300),
+          });
+          await vi.advanceTimersByTimeAsync(300);
+          expect(await turn.result).toMatchObject({ exitCode: CONFIG_REFUSED_EXIT_CODE });
+          expect(seen).toEqual([100]);
+        } finally {
+          state.check = undefined;
+          vi.useRealTimers();
+          spawnMock.mockReset();
+        }
+      });
+
+      it('reports a deadline, not a refusal, when the mint spent the whole budget', async () => {
+        vi.useFakeTimers();
+        const check = vi.fn(async () => 'synthetic refusal');
+        state.check = check;
+        spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+        try {
+          const turn = startBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            timeoutMs: 400,
+            host: slowMintHost(500),
+          });
+          await vi.advanceTimersByTimeAsync(500);
+          expect(await turn.result).toMatchObject({ exitCode: 124, timedOut: true });
+          expect(check).not.toHaveBeenCalled();
+          expect(spawnMock).not.toHaveBeenCalled();
+        } finally {
+          state.check = undefined;
+          vi.useRealTimers();
+          spawnMock.mockReset();
+        }
+      });
+
+      it('refuses with a fixed reason when the check rejects', async () => {
+        state.check = async () => {
+          throw new Error('synthetic-canary-check-threw');
+        };
+        spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+        try {
+          const result = await runBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+          });
+          expect(result).toMatchObject({
+            exitCode: CONFIG_REFUSED_EXIT_CODE,
+            stderr: EFFECTIVE_CONFIG_CHECK_FAILED,
+          });
+          expect(result.stderr).not.toContain('synthetic-canary');
+          expect(spawnMock).not.toHaveBeenCalled();
+        } finally {
+          state.check = undefined;
           spawnMock.mockReset();
         }
       });

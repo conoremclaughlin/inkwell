@@ -23,6 +23,10 @@ export const EFFECTIVE_CONFIG_CHECK_MS = 10_000;
 /** What a spawn refused by its effective-config check reports: EX_CONFIG. */
 export const CONFIG_REFUSED_EXIT_CODE = 78;
 
+/** The refusal when a check rejects instead of answering: it could not vouch for the config. */
+export const EFFECTIVE_CONFIG_CHECK_FAILED =
+  "the backend's configuration could not be checked before the spawn";
+
 export interface BackendRunRequest {
   backend: string;
   sbSlug: string;
@@ -285,24 +289,40 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       const sessionAdditions = { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV };
 
       if (adapter.checkEffectiveConfig) {
+        // A budget the mint and the lookup already spent is a deadline passing,
+        // not a configuration refusal (Myra, #701 c41d867e).
+        const checkBudgetMs = Math.min(
+          EFFECTIVE_CONFIG_CHECK_MS,
+          mintedCeilingMs - (Date.now() - mintedAt)
+        );
+        if (checkBudgetMs <= 0) return deadlinePassed(command);
         // The names come from the very object the spawn gets, before anything
         // is trimmed for the probe: the credentials' names are what a server
         // outside the session must not draw (Myra, #701 5f569213). That
         // includes the adapter's own AGENT_ID and SB_SLUG. The allowlisted
-        // basics are left out, so a server drawing HOME is not refused.
+        // names are left out, so a server drawing HOME is not refused.
         const inherited = new Set(SPAWN_ENV_INHERITED_NAMES);
-        const refusal = await adapter.checkEffectiveConfig({
-          binary,
-          // By allowlist: the probe gets the inherited basics (HOME and
-          // CODEX_HOME included, as the spawn would) and none of the
-          // session's additions, so no credential can reach it.
-          probeEnv: buildCleanEnv(undefined, parentEnv),
-          sessionEnvNames: Object.keys(sessionAdditions).filter((name) => !inherited.has(name)),
-          cwd: request.workingDirectory,
-          signal: preSpawn.signal,
-          timeoutMs: Math.min(EFFECTIVE_CONFIG_CHECK_MS, mintedCeilingMs - (Date.now() - mintedAt)),
-          inkwellMcpUrl: host.inkwellMcpUrl,
-        });
+        let refusal: string | undefined;
+        try {
+          refusal = await adapter.checkEffectiveConfig({
+            binary,
+            // By allowlist: the probe gets what the spawn inherits from the
+            // host (HOME and CODEX_HOME included) and none of the session's
+            // additions. So it carries none of the session's credentials and
+            // nothing the spawn would not get; a host credential the
+            // allowlist passes, an API key, reaches both alike.
+            probeEnv: buildCleanEnv(undefined, parentEnv),
+            sessionEnvNames: Object.keys(sessionAdditions).filter((name) => !inherited.has(name)),
+            cwd: request.workingDirectory,
+            signal: preSpawn.signal,
+            timeoutMs: checkBudgetMs,
+            inkwellMcpUrl: host.inkwellMcpUrl,
+          });
+        } catch {
+          // A check that rejects has not vouched for the config.
+          refusal = EFFECTIVE_CONFIG_CHECK_FAILED;
+        }
+        // An abort wins over any answer the check gave while it was ending.
         if (abortRequested) return abortedBeforeSpawn(command);
         if (refusal !== undefined) return configRefused(command, refusal);
       }

@@ -94,7 +94,7 @@ const HOST_BOUNDARY_EXCEPTIONS: ReadonlyArray<{ at: string; reason: string }> = 
   {
     at: 'runner/probe.ts (module) child_process.execFile',
     reason:
-      "The effective-config probe (`codex mcp list --json`), asynchronous and bounded. It runs from startBackendTurn's check after preparation, never from prepare, on the host's base env through the allowlist, with no credential (Myra, #701 9bd3f8a9).",
+      "The effective-config probe (`codex mcp list --json`), asynchronous and bounded. It runs from startBackendTurn's check after preparation, never from prepare, on the host's base env through the allowlist: none of the session's credentials, and nothing the spawn would not get (Myra, #701 9bd3f8a9, c41d867e).",
   },
   {
     at: 'runner/spawn-backend.ts buildCleanEnv process.env',

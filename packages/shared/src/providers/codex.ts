@@ -56,8 +56,9 @@ export class CodexAdapter implements BackendAdapter {
 
   /**
    * Codex's own view of its merged MCP config, judged before the spawn
-   * (codex-mcp-list.ts). The listing runs on the probe env, which carries no
-   * credential, and its output goes only to the judge.
+   * (codex-mcp-list.ts). The listing runs on the probe env, which carries
+   * none of the session's credentials and nothing the spawn would not get,
+   * and its output goes only to the judge.
    */
   async checkEffectiveConfig(check: EffectiveConfigCheck): Promise<string | undefined> {
     const listing = await runProbe(check.binary, ['mcp', 'list', '--json'], {

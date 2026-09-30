@@ -246,6 +246,8 @@ export interface BackendAdapter {
    * output.
    */
   checkEffectiveConfig?(check: EffectiveConfigCheck): Promise<string | undefined>;
+  // A check that rejects is treated as a refusal (EFFECTIVE_CONFIG_CHECK_FAILED
+  // in backend-runner.ts), or as the abort when the turn was aborted.
 }
 
 /** What an adapter's effective-config check is given (BackendAdapter.checkEffectiveConfig). */
@@ -254,9 +256,13 @@ export interface EffectiveConfigCheck {
   binary: string;
   /**
    * The env for a config-only probe: the host's base env through the spawn
-   * allowlist, and nothing the runner adds for the session, so no
-   * credential ever reaches the probe. It carries whatever of HOME and
-   * CODEX_HOME the spawn will get, which is what selects the config read.
+   * allowlist, and nothing the runner adds for the session. So it carries
+   * none of the session's credentials and nothing the spawn would not get;
+   * a host credential the allowlist passes (an API key) reaches both alike.
+   * It carries whatever of HOME and CODEX_HOME the spawn will get, which is
+   * what selects the config read. It does not carry the adapter's own env,
+   * so a setting the adapter passes that way (Gemini's system settings
+   * path) is not in it.
    */
   probeEnv: Readonly<Record<string, string | undefined>>;
   /**

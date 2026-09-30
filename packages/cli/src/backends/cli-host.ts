@@ -13,6 +13,7 @@ import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { sessionEnvHandoff } from '@inklabs/shared';
 import { discoverSkillMcpServers, type BackendHost } from '@inklabs/shared/providers';
+import { getInkServerUrl } from '../lib/ink-mcp.js';
 
 /**
  * Once-per-process probe for `--include-partial-messages` support. It runs in
@@ -58,10 +59,10 @@ export function createCliBackendHost(): BackendHost {
     sessionEnv: async () => sessionEnvHandoff(),
     // The CLI host is its own session's process: the child inherits from it.
     baseEnv: async () => process.env,
-    // The server this process talks to (getInkServerUrl in lib/ink-mcp.ts),
-    // read when asked. Only its origin is compared.
+    // The server this process talks to, read when asked. Only its origin is
+    // compared.
     get inkwellMcpUrl() {
-      return `${process.env.INK_SERVER_URL || 'http://localhost:3001'}/mcp`;
+      return `${getInkServerUrl()}/mcp`;
     },
     // PATH lookup at spawn, as before.
     resolveBinary: async (name) => name,
