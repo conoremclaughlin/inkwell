@@ -18,7 +18,11 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
-import { BakedRoutingHeaderError, findGeminiSettingsRouting } from './gemini-settings-routing.js';
+import {
+  BakedRoutingHeaderError,
+  findGeminiExtensionManifests,
+  findGeminiSettingsRouting,
+} from './gemini-settings-routing.js';
 import type {
   BackendAdapter,
   BackendConfig,
@@ -126,8 +130,17 @@ export class GeminiAdapter implements BackendAdapter {
    *   (GEMINI_CLI_SYSTEM_SETTINGS_PATH, in the adapter's env). Its routing
    *   headers are this spawn's own, so only the rule on servers other than
    *   Inkwell applies to it. It carries the servers copied from `.mcp.json`;
-   * - system defaults: not read. The spawn never gets the path variable, and
-   *   the default location is unmeasured.
+   * - extensions: `<dir>/<ext>/gemini-extension.json` under
+   *   `<home>/.gemini/extensions`, whose servers load and expand like the
+   *   settings' (Myra, #701 42b6a265), and under `<cwd>/.gemini/extensions`,
+   *   whose loading is unmeasured. Every extension is read, enabled or not.
+   *
+   * Not read: the system-defaults file, whose path variable the spawn never
+   * gets and whose default location is unmeasured; and the platform's default
+   * system file (on macOS `/Library/Application Support/GeminiCli/settings.json`),
+   * which Gemini reads only when the adapter wrote no system file. Both are
+   * machine-wide admin files, and this check cannot ask which platform it is
+   * on without reading the host process.
    */
   async checkEffectiveConfig(check: EffectiveConfigCheck): Promise<string | undefined> {
     // What the spawn's env holds for a name: the adapter's own over the base.
@@ -145,6 +158,14 @@ export class GeminiAdapter implements BackendAdapter {
       const system = await findGeminiSettingsRouting([systemPath], scope);
       findings.push(...system.filter((finding) => finding.kind !== 'routing'));
     }
+    const extensions = await findGeminiExtensionManifests([
+      join(home, '.gemini', 'extensions'),
+      join(check.cwd, '.gemini', 'extensions'),
+    ]);
+    findings.push(
+      ...extensions.unreadable.map((path) => ({ path, kind: 'unreadable' as const })),
+      ...(await findGeminiSettingsRouting(extensions.manifests, scope))
+    );
     return findings.length > 0
       ? new BakedRoutingHeaderError('gemini', findings).message
       : undefined;

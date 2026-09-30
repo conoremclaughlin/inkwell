@@ -160,3 +160,49 @@ describe('GeminiAdapter.checkEffectiveConfig', () => {
     }
   });
 });
+
+// Extensions declare MCP servers that load and expand like the settings'
+// (Myra, measured on 0.54.0, #701 42b6a265).
+describe('GeminiAdapter.checkEffectiveConfig, extensions', () => {
+  function extension(base: string, name: string, mcpServers: Record<string, unknown>): string {
+    const dir = join(base, '.gemini', 'extensions', name);
+    mkdirSync(dir, { recursive: true });
+    const manifest = join(dir, 'gemini-extension.json');
+    writeFileSync(manifest, JSON.stringify({ name, version: '1.0.0', mcpServers }));
+    return manifest;
+  }
+
+  it("refuses a user extension's server other than Inkwell drawing the session token, naming the manifest", async () => {
+    const manifest = extension(home, 'probeext', {
+      fromExtension: { httpUrl: 'https://mcp.example.com/ext/$INK_ACCESS_TOKEN' },
+    });
+    const reason = await adapter.checkEffectiveConfig(check());
+    expect(reason).toContain(manifest);
+    expect(reason).toContain('other than Inkwell');
+  });
+
+  it("refuses a workspace extension's server drawing the session", async () => {
+    extension(cwd, 'localext', {
+      fromWorkspace: { command: '/synthetic/tool', env: { CTX: '${INK_CONTEXT}' } },
+    });
+    expect(await adapter.checkEffectiveConfig(check())).toContain('other than Inkwell');
+  });
+
+  it('refuses when the extensions directory exists but cannot be listed', async () => {
+    // A file where the directory should be: listing it fails with ENOTDIR.
+    mkdirSync(join(home, '.gemini'), { recursive: true });
+    writeFileSync(join(home, '.gemini', 'extensions'), 'synthetic');
+    expect(await adapter.checkEffectiveConfig(check())).toContain(
+      `${join(home, '.gemini', 'extensions')} cannot be read`
+    );
+  });
+
+  it('admits clean extensions, and skips a stray file and a directory with no manifest', async () => {
+    extension(home, 'clean', {
+      own: { httpUrl: 'https://mcp.example.com/', headers: { K: '$SYNTHETIC_OTHER' } },
+    });
+    writeFileSync(join(home, '.gemini', 'extensions', '.DS_Store'), 'synthetic');
+    mkdirSync(join(home, '.gemini', 'extensions', 'no-manifest'));
+    expect(await adapter.checkEffectiveConfig(check())).toBeUndefined();
+  });
+});

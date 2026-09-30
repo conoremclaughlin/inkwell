@@ -25,7 +25,8 @@
  * Gemini's effective settings.
  */
 
-import { readFile } from 'fs/promises';
+import { readdir, readFile } from 'fs/promises';
+import { join } from 'path';
 import { comparableOrigin, parseUrl } from './inkwell-origin.js';
 
 const ROUTING_HEADER_NAMES: ReadonlySet<string> = new Set([
@@ -215,6 +216,36 @@ export async function findGeminiSettingsRouting(
 }
 
 /** Reject with BakedRoutingHeaderError when any of `paths` has a finding. */
+/**
+ * The extension manifests under each of `dirs` (`<dir>/<ext>/gemini-extension.json`),
+ * whose `mcpServers` Gemini loads alongside its settings and expands like
+ * them (Myra, measured on 0.54.0, #701 42b6a265). Every extension directory
+ * counts, enabled or not, which errs toward refusing; an entry that is not a
+ * directory (or a link to one) is not an extension. A `dirs` entry that is
+ * absent has none; one that cannot be listed is reported as unreadable.
+ */
+export async function findGeminiExtensionManifests(
+  dirs: readonly string[]
+): Promise<{ manifests: string[]; unreadable: string[] }> {
+  const manifests: string[] = [];
+  const unreadable: string[] = [];
+  for (const dir of dirs) {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') unreadable.push(dir);
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) {
+        manifests.push(join(dir, entry.name, 'gemini-extension.json'));
+      }
+    }
+  }
+  return { manifests: manifests.sort(), unreadable };
+}
+
 export async function refuseGeminiSettingsRouting(paths: readonly string[]): Promise<void> {
   const findings = await findGeminiSettingsRouting(paths);
   if (findings.length > 0) throw new BakedRoutingHeaderError('gemini', findings);
