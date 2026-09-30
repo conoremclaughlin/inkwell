@@ -48,6 +48,25 @@ describe('sb wait', () => {
     expect(output).toContain('--group');
   });
 
+  it('shows -f, --follow in help', async () => {
+    const result = await runWait(['--help']);
+    expect(result.stdout + result.stderr).toContain('-f, --follow');
+  });
+
+  // Rejected before anything else runs: NaN seconds used to become a ~1ms
+  // setTimeout, which is a busy loop.
+  it.each([['--interval'], ['--timeout']])('exits 2 when %s is not a number', async (flag) => {
+    const result = await runWait([flag, 'soon', '--follow']);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain(`${flag} must be a number of seconds`);
+  });
+
+  it('exits 2 for --follow with --group, whose watch already streams until the strategy ends', async () => {
+    const result = await runWait(['--group', '00000000-0000-4000-8000-000000000000', '--follow']);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain('--follow does not apply to --group');
+  });
+
   // Integration tests — require running Inkwell server
   it.skipIf(!process.env.INK_INTEGRATION)(
     'times out with exit code 1 when no new messages',

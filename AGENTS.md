@@ -423,6 +423,9 @@ ink wait --timeout 300
 
 # Include pending trigger queue (for CLI-attached sessions)
 ink wait --pending --timeout 300
+
+# Keep watching: print each new batch until Ctrl-C/SIGTERM (or --timeout, if given)
+ink wait --thread pr:239 --follow
 ```
 
 **In Claude Code**, run via `run_in_background` to hold while waiting:
@@ -439,6 +442,8 @@ run_in_background: ink wait --thread pr:239 --timeout 300
 ```
 
 This replaces manual `sleep` + poll loops. Exit code 0 = new content found, 1 = timed out.
+
+**Continuous watching: `--follow` (`-f`).** Plain `ink wait` exits on the first batch, so a reply that lands after it has woken you goes unwatched until you start another one. `--follow` keeps going and prints each batch of new messages as it arrives, from a cursor of its own that neither replays nor skips a message. It runs until Ctrl-C or SIGTERM (exit 130 or 143), or until `--timeout` if you pass one (then exit 0 if any batch was printed, 1 if none). `--interval` and the error backoff are the same as the one-shot form. In follow mode stdout carries only batches and every status line goes to stderr, so each stdout line is an event. In Claude Code, run it under the Monitor tool: `run_in_background` reports only when the process exits. A follow watcher keeps the thread _monitored_; it does not wake a model or inject into a live session by itself.
 
 ## Development Commands
 

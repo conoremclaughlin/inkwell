@@ -59,6 +59,7 @@ import {
   handleGetThreadMessages,
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
+import { readTieRemainder } from './tie-completion.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1670,28 +1671,29 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // siblings. Extend the page with every remaining row that shares the
   // boundary timestamp so a tie group is always delivered whole.
   let page = fetched ?? [];
-  // Only ack-capable shapes (no narrowing filters) extend: a filtered page
-  // never advances the pointer OR acks, so completion there would smuggle
-  // rows the caller filtered OUT (urgent-only limit:1 returned a normal
-  // task request sharing the boundary timestamp — Lumen #504 r3 P2).
-  const tieCompletionApplies = oldestFirst && !priority && !messageType && !since;
+  // Narrowing filters don't extend: completion there would smuggle in rows
+  // the caller filtered OUT (urgent-only limit:1 returned a normal task
+  // request sharing the boundary timestamp — Lumen #504 r3 P2). `since` is a
+  // range, not a narrowing filter: every row sharing the boundary timestamp
+  // is past it too. A `since` pager (ink wait --follow) needs the group whole
+  // as much as the pointer does: it pages on the last timestamp it read
+  // (Lumen, #702). The remainder is paged by id (readTieRemainder), since one
+  // select stops at max_rows without saying so.
+  const tieCompletionApplies = oldestFirst && !priority && !messageType;
   if (tieCompletionApplies && page.length >= limit && page.length > 0) {
-    const boundary = (page[page.length - 1] as { created_at: string }).created_at;
-    const pageIds = page.map((m) => (m as { id: string }).id);
-    let tieQuery = supabase
-      .from('agent_inbox')
-      .select('*')
-      .eq('recipient_user_id', resolved.user.id)
-      .eq('created_at', boundary)
-      .not('id', 'in', `(${pageIds.join(',')})`)
-      .order('id', { ascending: true });
-    if (sbSlug) tieQuery = tieQuery.eq('recipient_agent_id', sbSlug);
-    tieQuery = tieQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
-    const { data: siblings, error: tieError } = await tieQuery;
-    if (tieError) {
-      throw new Error(`Failed to complete timestamp tie group: ${tieError.message}`);
-    }
-    if (siblings?.length) page = [...page, ...siblings];
+    const last = page[page.length - 1] as { created_at: string; id: string };
+    const siblings = await readTieRemainder((afterId, withCount) => {
+      let tieQuery = supabase
+        .from('agent_inbox')
+        .select('*', withCount ? { count: 'exact' } : undefined)
+        .eq('recipient_user_id', resolved.user.id)
+        .eq('created_at', last.created_at)
+        .gt('id', afterId)
+        .order('id', { ascending: true });
+      if (sbSlug) tieQuery = tieQuery.eq('recipient_agent_id', sbSlug);
+      return tieQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+    }, last.id);
+    if (siblings.length) page = [...page, ...(siblings as typeof page)];
   }
 
   // Display contract stays newest-first; only the SELECTION flipped.
