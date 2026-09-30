@@ -27,6 +27,12 @@ export interface BackendHost {
    * it: startBackendTurn clamps each spawn's hard ceiling to the time left
    * and starts none once it has passed, so no spawn restarts the run's
    * budget. The CLI's host has none.
+   *
+   * It is compared with this process's Date.now(), so compute it here, at
+   * admission, as now plus the run's budget. Never derive it from a database
+   * timestamp: the local database container's clock was measured freezing
+   * across a host sleep (2026-09-23), which would make a derived deadline
+   * early after a wake and refuse runs that have time left.
    */
   readonly deadlineAt?: number;
   /**
@@ -43,7 +49,10 @@ export interface BackendHost {
    * The credentials for one spawn, asked for after preparation, just before
    * the spawn. `hardTimeoutMs` is the spawn's hard ceiling, already clamped
    * to `deadlineAt`: a host that mints makes them last that long, plus grace
-   * to settle. Routing names in the result are dropped (see startBackendTurn).
+   * to settle. A child stopped at its ceiling can keep running, and writing,
+   * for STOP_GRACE_MS and then STOP_GIVE_UP_MS more (runner/spawn-backend.ts),
+   * so size the grace from those. Routing names in the result are dropped
+   * (see startBackendTurn).
    */
   sessionEnv(spawn: { hardTimeoutMs: number }): Promise<Record<string, string>>;
   /** The executable to spawn for an adapter's binary name. */

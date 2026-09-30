@@ -13,6 +13,8 @@ import {
   SESSION_ENV_HANDOFF_NAMES,
   RUN_TURN_EPOCH_ENV,
   sessionEnvHandoff,
+  STOP_GRACE_MS,
+  STOP_GIVE_UP_MS,
 } from './spawn-backend.js';
 
 describe('buildCleanEnv', () => {
@@ -539,6 +541,13 @@ describe('spawnBackend (mocked process boundary)', () => {
       stop(3_000);
       await vi.advanceTimersByTimeAsync(3_000 + 5_000);
       expect(await result).toMatchObject({ timedOut: false, exitCode: 137, childExited: false });
+    });
+
+    // A host sizes a credential's grace from these (BackendHost.sessionEnv),
+    // so they must be the timings the ladder above is measured to use.
+    it('exports the ladder’s timings', () => {
+      expect(STOP_GRACE_MS).toBe(5_000);
+      expect(STOP_GIVE_UP_MS).toBe(5_000);
     });
 
     it('stop() after the close signals nothing', async () => {

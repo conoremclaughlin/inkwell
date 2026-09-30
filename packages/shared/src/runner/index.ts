@@ -6,6 +6,8 @@ export {
   sessionEnvHandoff,
   resolveSpawnTarget,
   spawnBackend,
+  STOP_GRACE_MS,
+  STOP_GIVE_UP_MS,
   LineBuffer,
   CONTAINER_RUNNER_FILES,
   type ContainerTarget,

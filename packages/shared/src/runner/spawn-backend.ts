@@ -102,15 +102,18 @@ export interface SpawnedBackend {
   stop: (graceMs?: number) => void;
 }
 
-/** Between the SIGTERM and the SIGKILL of a stop the caller did not time. */
-const STOP_GRACE_MS = 5000;
+/**
+ * Between the SIGTERM and the SIGKILL of a stop the caller did not time.
+ * Exported so a host sizes a credential's grace from the ladder itself.
+ */
+export const STOP_GRACE_MS = 5000;
 
 /**
  * How long a stop waits for the close after SIGKILL before settling anyway.
  * SIGKILL cannot be caught, so a child still open by then is one that cannot
  * be reaped yet; the result says so rather than waiting forever.
  */
-const STOP_GIVE_UP_MS = 5000;
+export const STOP_GIVE_UP_MS = 5000;
 
 /** What a shell reports for a process ended by SIGKILL. */
 const SIGKILL_EXIT_CODE = 128 + 9;
