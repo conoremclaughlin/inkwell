@@ -271,24 +271,57 @@ function ensureTrailingNewline(content: string): string {
   return content.endsWith('\n') ? content : `${content}\n`;
 }
 
+/** The pattern of the managed block in `existing` (current or legacy markers), if it has one. */
+function managedBlockPattern(existing: string): RegExp | undefined {
+  const hasCurrentBlock =
+    existing.includes(CODEX_MANAGED_START) && existing.includes(CODEX_MANAGED_END);
+  const hasLegacyBlock =
+    existing.includes(CODEX_MANAGED_START_LEGACY) && existing.includes(CODEX_MANAGED_END_LEGACY);
+  if (!hasCurrentBlock && !hasLegacyBlock) return undefined;
+  const startMarker = hasCurrentBlock ? CODEX_MANAGED_START : CODEX_MANAGED_START_LEGACY;
+  const endMarker = hasCurrentBlock ? CODEX_MANAGED_END : CODEX_MANAGED_END_LEGACY;
+  return new RegExp(`${escapeRegExp(startMarker)}[\\s\\S]*?${escapeRegExp(endMarker)}\\n?`, 'm');
+}
+
+/**
+ * The tables a TOML file declares, each as its dotted path with quotes and
+ * whitespace removed (`[ mcp_servers . "figma" ]` is `mcp_servers.figma`), in
+ * file order. An array-of-tables header (`[[...]]`) is not a table and is
+ * left out. Declaring the same table twice is a parse error for Codex.
+ */
+export function tomlTableHeaders(toml: string): string[] {
+  const headers: string[] = [];
+  for (const line of toml.split('\n')) {
+    const match = /^\s*\[(?!\[)([^[\]]+)\]\s*(?:#.*)?$/.exec(line);
+    if (match) headers.push(match[1]!.replace(/["'\s]/g, ''));
+  }
+  return headers;
+}
+
+/**
+ * The MCP servers a Codex config declares outside ink's managed block. The
+ * sync rewrites only its block, so a server declared outside stays; the block
+ * must not declare it again, or the file declares the table twice and Codex
+ * refuses to start (lumen-alpha, 2026-09-29, #701). A file with no block has
+ * its old generated sections stripped instead, so nothing outside survives.
+ */
+function codexServersOutsideBlock(existing: string | undefined): Set<string> {
+  const pattern = existing ? managedBlockPattern(existing) : undefined;
+  if (!existing || !pattern) return new Set();
+  return new Set(
+    tomlTableHeaders(existing.replace(pattern, ''))
+      .filter((header) => header.startsWith('mcp_servers.'))
+      .map((header) => header.split('.')[1]!)
+  );
+}
+
 function mergeCodexConfig(existing: string | undefined, managedBlock: string): string {
   if (!existing || existing.trim() === '') {
     return managedBlock;
   }
 
-  // Detect current or legacy managed block markers
-  const hasCurrentBlock =
-    existing.includes(CODEX_MANAGED_START) && existing.includes(CODEX_MANAGED_END);
-  const hasLegacyBlock =
-    existing.includes(CODEX_MANAGED_START_LEGACY) && existing.includes(CODEX_MANAGED_END_LEGACY);
-
-  if (hasCurrentBlock || hasLegacyBlock) {
-    const startMarker = hasCurrentBlock ? CODEX_MANAGED_START : CODEX_MANAGED_START_LEGACY;
-    const endMarker = hasCurrentBlock ? CODEX_MANAGED_END : CODEX_MANAGED_END_LEGACY;
-    const pattern = new RegExp(
-      `${escapeRegExp(startMarker)}[\\s\\S]*?${escapeRegExp(endMarker)}\\n?`,
-      'm'
-    );
+  const pattern = managedBlockPattern(existing);
+  if (pattern) {
     return ensureTrailingNewline(existing.replace(pattern, managedBlock));
   }
 
@@ -397,7 +430,12 @@ function isSymlink(p: string): boolean {
 export function syncMcpConfig(
   targetDir: string,
   options?: { sourceMcpPath?: string; sourceEnvPath?: string }
-): { codex: boolean; gemini: boolean } {
+): {
+  codex: boolean;
+  gemini: boolean;
+  /** Servers the Codex block left out because the file declares them outside it. */
+  codexKeptOutside?: string[];
+} {
   const mcpPath = options?.sourceMcpPath || join(targetDir, '.mcp.json');
 
   if (!existsSync(mcpPath)) {
@@ -425,10 +463,20 @@ export function syncMcpConfig(
   const codexDir = join(targetDir, '.codex');
   const codexPath = join(codexDir, 'config.toml');
   let codex = false;
+  let codexKeptOutside: string[] = [];
   if (!isSymlink(codexDir) && !isSymlink(codexPath)) {
     mkdirSync(codexDir, { recursive: true });
     const existingCodex = existsSync(codexPath) ? readFileSync(codexPath, 'utf-8') : undefined;
-    const managedBlock = renderCodexManagedBlock(servers);
+    // A server already declared outside the block keeps that declaration,
+    // since the sync never rewrites outside its block; the block leaves it out.
+    const outside = codexServersOutsideBlock(existingCodex);
+    const managedServers = Object.fromEntries(
+      Object.entries(servers).filter(([name]) => !outside.has(name))
+    );
+    codexKeptOutside = Object.keys(servers)
+      .filter((name) => outside.has(name))
+      .sort();
+    const managedBlock = renderCodexManagedBlock(managedServers);
     writeFileSync(codexPath, mergeCodexConfig(existingCodex, managedBlock));
     codex = true;
   }
@@ -459,5 +507,5 @@ export function syncMcpConfig(
     ensureGitignoreEntries(targetDir, ['.codex/', '.gemini/']);
   }
 
-  return { codex, gemini };
+  return { codex, gemini, ...(codexKeptOutside.length > 0 ? { codexKeptOutside } : {}) };
 }

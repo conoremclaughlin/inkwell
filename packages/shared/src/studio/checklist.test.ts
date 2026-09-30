@@ -11,6 +11,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import path from 'path';
 import { tmpdir } from 'os';
 import { auditStudio, STUDIO_CHECK_IDS } from './checklist';
+import { syncMcpConfig } from './mcp-config-sync';
 
 const INK = 'node /repo/packages/cli/dist/cli.js';
 const claudeHooks = () => ({
@@ -329,6 +330,30 @@ describe('auditStudio', () => {
       await writeFile(path.join(root, '.claude', 'settings.local.json'), '{not json');
       const audit = auditStudio(root, { linked: true });
       expect(audit.missing).toEqual(['mcp-json', 'claude-permissions', 'claude-hooks']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // A table declared twice is a parse error: Codex refused every spawn in
+  // lumen-alpha on 2026-09-29 (#701), while this check called it complete.
+  it('fails the Codex check on a table declared twice, until one sync repairs it', async () => {
+    const root = await scratch();
+    try {
+      await completeStudio(root, { studioId: STUDIO_ID });
+      await writeFile(
+        path.join(root, '.codex', 'config.toml'),
+        `${codexToml()}\n[mcp_servers.inkwell]\nurl = "http://localhost:3001/mcp"\n`
+      );
+      const broken = auditStudio(root, { linked: true });
+      expect(broken.missing).toEqual(['codex-mcp']);
+      expect(broken.checks.find((c) => c.id === 'codex-mcp')?.detail).toContain(
+        '[mcp_servers.inkwell] more than once'
+      );
+
+      syncMcpConfig(root);
+
+      expect(auditStudio(root, { linked: true }).complete).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

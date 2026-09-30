@@ -24,6 +24,7 @@
 
 import { existsSync, lstatSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { tomlTableHeaders } from './mcp-config-sync.js';
 
 export const STUDIO_CHECK_IDS = [
   'mcp-json',
@@ -265,12 +266,24 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
   // hooks table `ink hooks install --backend codex` writes.
   const codex = readText(join(worktreePath, '.codex', 'config.toml'));
   const codexMcp = !!codex && /^\[mcp_servers\.inkwell\]\s*$/m.test(codex);
+  // A table declared twice is a parse error: Codex refuses to start at all
+  // (lumen-alpha, 2026-09-29, #701), so the studio goes to its repair.
+  const codexTables = codex ? tomlTableHeaders(codex) : [];
+  const codexDuplicates = [
+    ...new Set(codexTables.filter((table, i) => codexTables.indexOf(table) !== i)),
+  ];
   add(
     'codex-mcp',
     '.codex/config.toml inkwell MCP section',
     true,
-    codexMcp,
-    codexMcp ? 'inkwell server configured' : codex ? 'no [mcp_servers.inkwell]' : 'missing'
+    codexMcp && codexDuplicates.length === 0,
+    !codexMcp
+      ? codex
+        ? 'no [mcp_servers.inkwell]'
+        : 'missing'
+      : codexDuplicates.length > 0
+        ? `declares [${codexDuplicates.join('], [')}] more than once, which Codex cannot parse; run \`ink mcp sync\``
+        : 'inkwell server configured'
   );
   const codexCommands = codex
     ? codex
