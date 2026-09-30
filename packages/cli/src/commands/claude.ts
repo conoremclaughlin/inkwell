@@ -1684,6 +1684,42 @@ export function extractClaudeHistorySessionsForProject(
   return sessions;
 }
 
+/**
+ * Rows from `sqlite3 -json`: an array of objects, or nothing at all for zero
+ * rows. Null when the output is not that — a sqlite3 too old for -json
+ * prints an error and exits non-zero, but anything else unexpected must not
+ * be mistaken for "no threads".
+ */
+export function parseSqliteJsonRows(stdout: string): Array<Record<string, unknown>> | null {
+  const text = stdout.trim();
+  if (!text) return [];
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return Array.isArray(parsed)
+      ? parsed.filter((row): row is Record<string, unknown> => !!row && typeof row === 'object')
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Codex's backfill of the state DB from its rollout files: 'complete' when
+ * the table says so, another status when it does not, null when the table
+ * cannot be read (no table, old schema, sqlite3 unavailable).
+ */
+export function readCodexBackfillStatus(codexStateDbPath: string): string | null {
+  const result = spawnSync(
+    'sqlite3',
+    ['-json', codexStateDbPath, 'SELECT status FROM backfill_state WHERE id = 1;'],
+    { encoding: 'utf-8', maxBuffer: 1024 * 1024 }
+  );
+  if (result.error || result.status !== 0) return null;
+  const rows = parseSqliteJsonRows(result.stdout);
+  const status = rows?.[0]?.status;
+  return typeof status === 'string' && status.trim() ? status.trim() : null;
+}
+
 export function getCodexLocalSessionsForProject(
   cwd = process.cwd(),
   limit = 20,
@@ -1726,20 +1762,35 @@ export function getCodexLocalSessionsForProject(
     return [];
   }
 
+  // The DB is authoritative only once Codex has finished backfilling it from
+  // the rollout files: Codex's own reader requires backfill_state.status =
+  // 'complete' before it trusts the table, and so does this one (Lumen, PR
+  // #703 round 1). Pending, interrupted, a table it cannot read, or an
+  // sqlite3 that cannot answer, all mean the files are the record.
+  const backfillStatus = readCodexBackfillStatus(codexStateDbPath);
+  if (backfillStatus !== 'complete') {
+    sbDebugLog('backend', 'codex_local_sessions_backfill_incomplete', {
+      cwd: normalizedCwd,
+      codexStateDbPath,
+      backfillStatus,
+    });
+    return fallbackToJsonl(`backfill_${backfillStatus ?? 'unreadable'}`);
+  }
+
   // Ask the question we have: this cwd's threads, not the 200 newest across
   // every cwd (which cost 170 ms on a 6,000-thread DB and could miss a
   // project whose sessions were older than the newest 200). The DB carries an
   // index on (archived, cwd, updated_at), so this is ~10 ms. Both spellings
-  // of the cwd are asked for: Codex records the path as it saw it, which may
-  // be the symlinked form or the real one, and the JS-side normalisation
-  // below still decides.
+  // of the cwd are asked for, as given and resolved, so a launch through a
+  // symlinked path finds the canonical path Codex records. The reverse — a
+  // row recorded under an alias, a launch from the real path — is not
+  // covered: Codex canonicalises the cwd it stores (every distinct cwd in the
+  // live DB was canonical when this was checked), and the JS-side
+  // normalisation below still decides what matches.
   const quoteSqlString = (value: string) => `'${value.replace(/'/g, "''")}'`;
   const cwdSpellings = Array.from(new Set([cwd, normalizedCwd])).map(quoteSqlString);
   const query = `
-SELECT id, cwd, updated_at,
-       replace(replace(first_user_message, char(10), ' '), char(9), ' ') AS first_user_message,
-       rollout_path,
-       git_branch
+SELECT id, cwd, updated_at, first_user_message, rollout_path, git_branch
 FROM threads
 WHERE archived = 0
   AND cwd IN (${cwdSpellings.join(', ')})
@@ -1748,11 +1799,14 @@ ORDER BY updated_at DESC
 LIMIT ${Math.max(1, Math.min(limit, 200))};
 `;
 
+  // JSON output, decoded as JSON: the tab-separated mode quotes any field
+  // that needs it, so a cwd with an apostrophe came back wrapped in double
+  // quotes, matched nothing, and was dropped (Lumen, PR #703 round 1).
   // maxBuffer: the default (~1MB) overflows with ENOBUFS on real codex state
   // DBs — rows carrying a (truncated but still multi-KB) first_user_message
   // can exceed it, which silently drops session listing to the slower jsonl
   // fallback and adds retry latency to every codex startup.
-  const result = spawnSync('sqlite3', ['-tabs', codexStateDbPath, query], {
+  const result = spawnSync('sqlite3', ['-json', codexStateDbPath, query], {
     encoding: 'utf-8',
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -1768,22 +1822,35 @@ LIMIT ${Math.max(1, Math.min(limit, 200))};
     });
     return fallbackToJsonl('sqlite_query_failed');
   }
+  const rows = parseSqliteJsonRows(result.stdout);
+  if (!rows) {
+    sbDebugLog('backend', 'codex_local_sessions_query_unparseable', {
+      cwd: normalizedCwd,
+      codexStateDbPath,
+      stdoutHead: result.stdout.slice(0, 200),
+    });
+    return fallbackToJsonl('sqlite_output_unparseable');
+  }
 
   const sessions: BackendLocalSessionSummary[] = [];
-  const lines = result.stdout.split('\n').map((line) => line.trim());
-  for (const line of lines) {
-    if (!line) continue;
-    const [sessionId, sessionCwd, updatedAtRaw, firstPrompt, rolloutPath, gitBranch] =
-      line.split('\t');
-    if (!sessionId || !sessionCwd || !updatedAtRaw) continue;
+  for (const row of rows) {
+    const sessionId = typeof row.id === 'string' ? row.id.trim() : '';
+    const sessionCwd = typeof row.cwd === 'string' ? row.cwd.trim() : '';
+    if (!sessionId || !sessionCwd) continue;
 
     const normalizedSessionPath = normalizePath(sessionCwd);
     if (!normalizedSessionPath || normalizedSessionPath !== normalizedCwd) continue;
 
-    const updatedAtSeconds = Number(updatedAtRaw);
+    const updatedAtSeconds = Number(row.updated_at);
     const modified = Number.isFinite(updatedAtSeconds)
       ? new Date(updatedAtSeconds * 1000).toISOString()
       : new Date().toISOString();
+    const firstPrompt =
+      typeof row.first_user_message === 'string'
+        ? row.first_user_message.replace(/\s+/g, ' ').trim()
+        : undefined;
+    const rolloutPath = typeof row.rollout_path === 'string' ? row.rollout_path : undefined;
+    const gitBranch = typeof row.git_branch === 'string' ? row.git_branch : undefined;
 
     let latestPrompt: string | undefined;
     let latestPromptAt: string | undefined;
@@ -1815,10 +1882,10 @@ LIMIT ${Math.max(1, Math.min(limit, 200))};
       projectPath: sessionCwd,
       modified,
       fileSizeBytes,
-      firstPrompt: firstPrompt?.trim(),
+      firstPrompt: firstPrompt || undefined,
       latestPrompt,
       latestPromptAt,
-      gitBranch: gitBranch?.trim(),
+      gitBranch: gitBranch?.trim() || undefined,
       transcriptPath,
     });
   }

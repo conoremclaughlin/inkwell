@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'child_process';
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
@@ -1776,16 +1784,28 @@ describe('getCodexLocalSessionsForProject asks the state DB for this cwd (task 3
     }
   }
 
-  /** The columns the production query reads, in a DB the sqlite3 CLI made. */
+  /**
+   * The columns the production query reads, in a DB the sqlite3 CLI made,
+   * with Codex's backfill_state row: 'complete' unless a test says otherwise,
+   * and no table at all for `null`.
+   */
   function makeStateDb(
     home: string,
-    rows: Array<{ id: string; cwd: string; updatedAt: number; rolloutPath?: string }>
+    rows: Array<{ id: string; cwd: string; updatedAt: number; rolloutPath?: string }>,
+    options: { backfill?: string | null } = {}
   ): void {
     mkdirSync(join(home, '.codex'), { recursive: true });
     const db = join(home, '.codex', 'state_5.sqlite');
     const q = (v: string) => `'${v.replace(/'/g, "''")}'`;
+    const backfill = options.backfill === undefined ? 'complete' : options.backfill;
     const sql = [
       "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, git_branch TEXT, first_user_message TEXT NOT NULL DEFAULT '');",
+      ...(backfill === null
+        ? []
+        : [
+            'CREATE TABLE backfill_state (id INTEGER PRIMARY KEY CHECK (id = 1), status TEXT NOT NULL, last_watermark TEXT, last_success_at INTEGER, updated_at INTEGER NOT NULL);',
+            `INSERT INTO backfill_state (id, status, last_watermark, last_success_at, updated_at) VALUES (1, ${q(backfill)}, NULL, NULL, 1800000000);`,
+          ]),
       ...rows.map(
         (row) =>
           `INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, first_user_message) VALUES (${q(row.id)}, ${q(row.rolloutPath ?? '')}, ${row.updatedAt}, ${row.updatedAt}, 'cli', 'openai', ${q(row.cwd)}, '', '', '', 'main', 'first prompt');`
@@ -1855,18 +1875,59 @@ describe('getCodexLocalSessionsForProject asks the state DB for this cwd (task 3
     }
   );
 
-  it.skipIf(!hasSqlite3)('both spellings of the cwd are asked for', () => {
-    withTempHome((home) => {
-      // The temp dir is a symlink on macOS (/var -> /private/var): the DB
-      // stores the real path, the launch names the other one.
-      const project = join(home, 'repo');
-      mkdirSync(project);
-      makeStateDb(home, [{ id: 'real', cwd: realpathSync(project), updatedAt: 1_800_000_000 }]);
-      expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
-        'real',
-      ]);
-    });
-  });
+  it.skipIf(!hasSqlite3)(
+    'a launch through a symlinked path finds the canonical path Codex records',
+    () => {
+      withTempHome((home) => {
+        // Codex canonicalises the cwd it stores; the launch may name an
+        // alias. The reverse (a row under an alias, a launch from the real
+        // path) is not covered, and the query comment says so.
+        const project = join(home, 'repo');
+        mkdirSync(project);
+        const alias = join(home, 'alias');
+        symlinkSync(project, alias);
+        makeStateDb(home, [{ id: 'real', cwd: realpathSync(project), updatedAt: 1_800_000_000 }]);
+        expect(getCodexLocalSessionsForProject(alias, 10).map((s) => s.sessionId)).toEqual([
+          'real',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a cwd with an apostrophe is decoded as the DB stored it (Lumen, #703: -tabs quoted it and the row was dropped)',
+    () => {
+      withTempHome((home) => {
+        const project = join(home, "repo's-root");
+        mkdirSync(project);
+        makeStateDb(home, [{ id: 'mine', cwd: project, updatedAt: 1_800_000_000 }]);
+        expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+          'mine',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a DB whose backfill is not complete is not the record: the files are (Lumen, #703)',
+    () => {
+      for (const backfill of ['pending', 'interrupted', null]) {
+        withTempHome((home) => {
+          const project = join(home, 'repo');
+          mkdirSync(project);
+          // The DB has nothing for this cwd; the rollout on disk is the truth
+          // until the backfill says 'complete'. A missing table is the same.
+          makeStateDb(home, [{ id: 'other', cwd: join(home, 'elsewhere'), updatedAt: 1 }], {
+            backfill,
+          });
+          writeRollout(home, '2026/09/29', 'mine', project);
+          expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+            'mine',
+          ]);
+        });
+      }
+    }
+  );
 
   it.skipIf(!hasSqlite3)('the preview is read from the tail of the transcript', () => {
     withTempHome((home) => {
