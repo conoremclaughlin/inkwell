@@ -61,6 +61,8 @@ export interface MessageWaitDeps {
 
 /** Page size for draining a thread or the legacy inbox past the cursor. */
 export const WAIT_PAGE_SIZE = 50;
+/** The largest page the server serves: how far a page grows to get past a tie. */
+export const WAIT_MAX_PAGE_SIZE = 200;
 /** Pages drained per poll before the rest is left for the next one. */
 const MAX_PAGES_PER_POLL = 20;
 
@@ -77,6 +79,94 @@ interface WatchSource {
 }
 
 type Row = Record<string, unknown>;
+
+/**
+ * Where a drain stands: the newest timestamp read, and the ids read at or
+ * just below it.
+ *
+ * The server's floors are strict (`created_at > floor`, for a thread's
+ * `newerThan` and `afterMessageId` and for the inbox's `since`), and a thread
+ * page is ordered by `created_at` alone. A cursor on the newest message read
+ * therefore skips every other message sharing its timestamp, and rows written
+ * in one transaction all share it. So each read starts one millisecond before
+ * the newest timestamp seen, which the ids already read are filtered against.
+ * Timestamps are compared as instants, never as strings: the server writes
+ * microseconds and `+00:00` where a Date writes milliseconds and `Z`.
+ */
+interface DrainTail {
+  boundary?: string;
+  seen: Map<string, number>;
+}
+
+/** A page past `floor` (exclusive), oldest first, or undefined when there is nothing to read. */
+type PageReader = (floor: string | undefined, limit: number) => Promise<Row[] | undefined>;
+
+const emptyTail = (): DrainTail => ({ seen: new Map() });
+
+function instantOf(row: Row): number {
+  return Date.parse(String(row.createdAt));
+}
+
+/** One millisecond before `at`: an inclusive floor for a strict `created_at >`. */
+function inclusiveFloor(at: string): string {
+  return new Date(Date.parse(at) - 1).toISOString();
+}
+
+/** Record `rows` as read, moving the boundary to the newest of them. */
+function absorb(tail: DrainTail, rows: Row[]): Row[] {
+  const unseen: Row[] = [];
+  for (const row of rows) {
+    const id = String(row.id);
+    if (tail.seen.has(id)) continue;
+    tail.seen.set(id, instantOf(row));
+    unseen.push(row);
+    const at = stringOf(row.createdAt);
+    if (at && (!tail.boundary || Date.parse(at) >= Date.parse(tail.boundary))) tail.boundary = at;
+  }
+  return unseen;
+}
+
+/**
+ * Everything past `tail`, oldest first. Works on a copy, returned with the
+ * rows: a read that fails midway leaves the caller's tail where it was, so
+ * the next poll reads those pages again rather than skipping them.
+ */
+async function drainPast(
+  from: DrainTail,
+  read: PageReader,
+  warn: (line: string) => void
+): Promise<{ fresh: Row[]; tail: DrainTail }> {
+  const tail: DrainTail = { boundary: from.boundary, seen: new Map(from.seen) };
+  const fresh: Row[] = [];
+  let limit = WAIT_PAGE_SIZE;
+  for (let page = 0; page < MAX_PAGES_PER_POLL; page++) {
+    const rows = await read(tail.boundary ? inclusiveFloor(tail.boundary) : undefined, limit);
+    if (!rows) break;
+    const unseen = absorb(tail, rows);
+    fresh.push(...unseen);
+    if (rows.length < limit) break;
+    if (unseen.length === 0) {
+      // A full page of rows already read: a tie group at least a page long
+      // sits on the boundary. One larger page gets past it.
+      if (limit < WAIT_MAX_PAGE_SIZE) {
+        limit = WAIT_MAX_PAGE_SIZE;
+        continue;
+      }
+      warn(
+        `[ink wait] More than ${WAIT_MAX_PAGE_SIZE} messages share one timestamp; any past that page are not reported.`
+      );
+      break;
+    }
+    limit = WAIT_PAGE_SIZE;
+  }
+  // Only ids the next read can return again are worth remembering.
+  if (tail.boundary) {
+    const keepFrom = Date.parse(tail.boundary) - 1;
+    for (const [id, at] of tail.seen) if (at < keepFrom) tail.seen.delete(id);
+  }
+  fresh.sort((a, b) => instantOf(a) - instantOf(b));
+  return { fresh, tail };
+}
 
 export async function watchMessages(
   opts: MessageWaitOptions,
@@ -233,21 +323,22 @@ async function watchUntilStopped(
 }
 
 /**
- * One thread, cursor-based. The cursor is the newest message consumed from
- * anyone, so the watcher's own messages move it forward without being
- * reported. `fullHistory` keeps every read independent of the read pointer:
- * push-channel delivery marks threads read, and a watcher that fell back to
- * the pointer baselined on 0 messages and then raced the push pipeline on
- * every poll (the pr:404/pr:408 watchers timed out through live replies).
+ * A read position in one thread, tie-safe (see DrainTail). The position is
+ * the newest message read from anyone, so the watcher's own messages move it
+ * forward without being reported. `fullHistory` keeps each read independent
+ * of the read pointer: push-channel delivery marks threads read, and a
+ * watcher that fell back to the pointer baselined on 0 messages and then
+ * raced the push pipeline on every poll (the pr:404/pr:408 watchers timed out
+ * through live replies).
  */
-class ThreadWatch implements WatchSource {
-  private cursor: { id: string; createdAt?: string } | undefined;
+class ThreadCursor {
+  private tail: DrainTail = emptyTail();
 
   constructor(
     private readonly call: WaitToolCall,
     private readonly opts: MessageWaitOptions,
-    private readonly threadKey: string,
-    private readonly output: WaitOutput
+    readonly threadKey: string,
+    private readonly warn: (line: string) => void
   ) {}
 
   private args(extra: Record<string, unknown>): Record<string, unknown> {
@@ -256,59 +347,104 @@ class ThreadWatch implements WatchSource {
       sbSlug: this.opts.sbSlug,
       threadKey: this.threadKey,
       markRead: false,
-      fullHistory: true,
       ...extra,
     };
   }
 
-  async baseline(): Promise<void> {
+  private readonly readPage: PageReader = async (floor, limit) => {
+    const extra: Record<string, unknown> = { fullHistory: true, limit };
+    if (floor) extra.newerThan = floor;
+    const result = await this.call('get_thread_messages', this.args(extra));
+    if (threadAbsent(result)) return undefined;
+    requireSuccess(result, 'get_thread_messages');
+    return rowsOf(result.messages);
+  };
+
+  /**
+   * Anchor at the thread's current end, so nothing already there is new:
+   * the newest message and every message sharing its timestamp. Returns the
+   * thread's length, or the server's reason when the thread is absent.
+   */
+  async anchorAtEnd(): Promise<{ total: number; anchor?: string } | { absent: string }> {
     // latestN returns the newest message, so the anchor is the true end of
     // the thread however long it is. `limit: 200` is what a server predating
     // latestN falls back to: the anchor lands on message #200, as it used to.
-    const result = await this.call('get_thread_messages', this.args({ latestN: 1, limit: 200 }));
-    if (threadAbsent(result)) {
+    const result = await this.call(
+      'get_thread_messages',
+      this.args({ fullHistory: true, latestN: 1, limit: WAIT_MAX_PAGE_SIZE })
+    );
+    if (threadAbsent(result)) return { absent: String(result.error) };
+    requireSuccess(result, 'get_thread_messages');
+    const messages = rowsOf(result.messages);
+    const total = messages.length + (Number(result.skippedOlderCount) || 0);
+    const newest = messages[messages.length - 1];
+    const tail = emptyTail();
+    absorb(tail, messages.slice(-1));
+    if (tail.boundary) {
+      absorb(tail, (await this.readPage(inclusiveFloor(tail.boundary), WAIT_MAX_PAGE_SIZE)) ?? []);
+    }
+    this.tail = tail;
+    return { total, anchor: newest ? String(newest.id) : undefined };
+  }
+
+  /**
+   * For a thread first seen after the baseline: it had nothing unread then,
+   * so everything past its read pointer arrived since. Reads that, then
+   * drains on from its newest message.
+   */
+  async readFromPointer(): Promise<{ fresh: Row[]; commit: () => void }> {
+    const result = await this.call('get_thread_messages', this.args({ limit: WAIT_PAGE_SIZE }));
+    if (threadAbsent(result)) return { fresh: [], commit: () => {} };
+    requireSuccess(result, 'get_thread_messages');
+    const rows = rowsOf(result.messages);
+    const start = emptyTail();
+    const first = absorb(start, rows);
+    if (rows.length < WAIT_PAGE_SIZE) {
+      return { fresh: first, commit: () => (this.tail = start) };
+    }
+    const { fresh, tail } = await drainPast(start, this.readPage, this.warn);
+    return { fresh: [...first, ...fresh], commit: () => (this.tail = tail) };
+  }
+
+  /** Everything past the position, oldest first; applied only by `commit`. */
+  async drain(): Promise<{ fresh: Row[]; commit: () => void }> {
+    const { fresh, tail } = await drainPast(this.tail, this.readPage, this.warn);
+    return { fresh, commit: () => (this.tail = tail) };
+  }
+}
+
+/** One thread. */
+class ThreadWatch implements WatchSource {
+  private readonly cursor: ThreadCursor;
+
+  constructor(
+    call: WaitToolCall,
+    private readonly opts: MessageWaitOptions,
+    private readonly threadKey: string,
+    private readonly output: WaitOutput
+  ) {
+    this.cursor = new ThreadCursor(call, opts, threadKey, (line) => output.status(line));
+  }
+
+  async baseline(): Promise<void> {
+    const anchored = await this.cursor.anchorAtEnd();
+    if ('absent' in anchored) {
       this.output.status(
-        `[ink wait] Baseline: ${String(result.error)} (watching from its first message)`
+        `[ink wait] Baseline: ${anchored.absent} (watching from its first message)`
       );
       return;
     }
-    requireSuccess(result, 'get_thread_messages');
-    const messages = rowsOf(result.messages);
-    const newest = messages[messages.length - 1];
-    this.cursor = newest ? cursorOf(newest) : undefined;
-    const total = messages.length + (Number(result.skippedOlderCount) || 0);
     this.output.status(
-      `[ink wait] Baseline: ${total} messages in thread${this.cursor ? ` (anchor: ${this.cursor.id.slice(0, 8)})` : ''}`
+      `[ink wait] Baseline: ${anchored.total} messages in thread${anchored.anchor ? ` (anchor: ${anchored.anchor.slice(0, 8)})` : ''}`
     );
   }
 
   async poll(): Promise<string[]> {
-    let cursor = this.cursor;
-    const fresh: Row[] = [];
-    for (let page = 0; page < MAX_PAGES_PER_POLL; page++) {
-      const extra: Record<string, unknown> = { limit: WAIT_PAGE_SIZE };
-      if (cursor) {
-        extra.afterMessageId = cursor.id;
-        // The same floor by timestamp: if the cursor message is ever gone,
-        // afterMessageId resolves to nothing and the read would restart at
-        // the beginning of the thread.
-        if (cursor.createdAt) extra.newerThan = cursor.createdAt;
-      }
-      const result = await this.call('get_thread_messages', this.args(extra));
-      if (threadAbsent(result)) break;
-      requireSuccess(result, 'get_thread_messages');
-      const messages = rowsOf(result.messages);
-      const last = messages[messages.length - 1];
-      if (!last || String(last.id) === cursor?.id) break;
-      fresh.push(...messages);
-      cursor = cursorOf(last);
-      if (messages.length < WAIT_PAGE_SIZE) break;
-    }
-    // Committed only once every page has landed. A failure mid-drain leaves
-    // the cursor where the last complete poll put it, so the next poll reads
+    // Applied only once every page has landed. A failure mid-drain leaves the
+    // position where the last complete poll put it, so the next poll reads
     // those pages again rather than skipping them.
-    this.cursor = cursor;
-
+    const { fresh, commit } = await this.cursor.drain();
+    commit();
     const fromOthers = fresh.filter((m) => m.senderSlug !== this.opts.sbSlug);
     if (fromOthers.length === 0) return [];
     return [
@@ -373,17 +509,25 @@ class InboxCountWatch implements WatchSource {
 /**
  * The inbox, followed. A running count cannot carry a cursor: a message read
  * and a message arriving inside one interval cancel out, and the arrival is
- * never reported. This tracks what it has reported instead: a high-water
- * `createdAt` for legacy inbox messages, and per thread the newest message
- * from someone else. Both are server timestamps compared with each other,
- * never with the local clock.
+ * never reported. This keeps read positions instead: one over legacy inbox
+ * messages, and one per thread. All of them are server timestamps compared
+ * with each other, never with the local clock.
+ *
+ * A thread's inbox summary says only that it has unread messages. Its count
+ * includes the watcher's own posts to itself, and its preview is the newest
+ * three messages, so neither can say what arrived from others: three posts
+ * of the watcher's own hid a reply under them, and one of them re-surfaced a
+ * reply read long ago (Lumen, #702). A listed thread is read instead, from
+ * its own position.
  *
  * Like one-shot inbox mode it reports what is still unread when it polls; a
- * message another path delivered and marked read first is not reported.
+ * message another path delivered and marked read first is not reported. The
+ * inbox lists at most 20 unread threads (`unreadThreadsTruncated`), so a
+ * thread past that page is read once it comes onto it.
  */
 class InboxActivityWatch implements WatchSource {
-  private legacyHighWater: string | undefined;
-  private threadMarks = new Map<string, string>();
+  private legacy: DrainTail = emptyTail();
+  private readonly threads = new Map<string, ThreadCursor>();
 
   constructor(
     private readonly call: WaitToolCall,
@@ -400,72 +544,91 @@ class InboxActivityWatch implements WatchSource {
     });
   }
 
+  private cursorFor(threadKey: string): ThreadCursor {
+    return new ThreadCursor(this.call, this.opts, threadKey, (line) => this.output.status(line));
+  }
+
   async baseline(): Promise<void> {
     // status 'all' selects newest-first, so this is the newest legacy message
-    // whether or not it has been read.
+    // whether or not it has been read, then everything sharing its timestamp.
     const result = await this.read({ status: 'all', limit: 1 });
     requireSuccess(result, 'get_inbox');
-    this.legacyHighWater = stringOf(rowsOf(result.messages)[0]?.createdAt);
-    for (const thread of rowsOf(result.threadsWithUnread)) {
-      const newest = newestFromOthers(thread, this.opts.sbSlug);
-      if (newest) this.threadMarks.set(String(thread.threadKey), newest);
+    const legacy = emptyTail();
+    absorb(legacy, rowsOf(result.messages).slice(0, 1));
+    if (legacy.boundary) {
+      const ties = await this.read({
+        status: 'all',
+        since: inclusiveFloor(legacy.boundary),
+        limit: WAIT_MAX_PAGE_SIZE,
+      });
+      requireSuccess(ties, 'get_inbox');
+      absorb(legacy, rowsOf(ties.messages));
     }
+    // A thread with unread messages now is anchored at its end: what it
+    // already holds is backlog, not arrival.
+    const threads = new Map<string, ThreadCursor>();
+    for (const thread of rowsOf(result.threadsWithUnread)) {
+      const cursor = this.cursorFor(String(thread.threadKey));
+      await cursor.anchorAtEnd();
+      threads.set(cursor.threadKey, cursor);
+    }
+    this.legacy = legacy;
+    for (const [key, cursor] of threads) this.threads.set(key, cursor);
     this.output.status(`[ink wait] Baseline: ${unreadTotal(result)} unread`);
   }
 
   async poll(): Promise<string[]> {
-    let highWater = this.legacyHighWater;
-    const fresh: Row[] = [];
-    let threads: Row[] | undefined;
-    for (let page = 0; page < MAX_PAGES_PER_POLL; page++) {
-      // status 'unread' selects oldest-first, so `since` pages forward.
-      const extra: Record<string, unknown> = { status: 'unread', limit: WAIT_PAGE_SIZE };
-      if (highWater) extra.since = highWater;
+    let listed: Row[] | undefined;
+    // status 'unread' selects oldest-first, so `since` pages forward.
+    const readLegacy: PageReader = async (floor, limit) => {
+      const extra: Record<string, unknown> = { status: 'unread', limit };
+      if (floor) extra.since = floor;
       const result = await this.read(extra);
       requireSuccess(result, 'get_inbox');
-      threads ??= rowsOf(result.threadsWithUnread);
-      const messages = rowsOf(result.messages);
-      const newer = messages.filter((m) => {
-        const at = stringOf(m.createdAt);
-        return at !== undefined && (highWater === undefined || at > highWater);
-      });
-      if (newer.length === 0) break;
-      fresh.push(...newer);
-      highWater = newer.map((m) => String(m.createdAt)).reduce((a, b) => (b > a ? b : a));
-      if (messages.length < WAIT_PAGE_SIZE) break;
-    }
+      listed ??= rowsOf(result.threadsWithUnread);
+      return rowsOf(result.messages);
+    };
+    const legacy = await drainPast(this.legacy, readLegacy, (line) => this.output.status(line));
 
-    const marks = new Map(this.threadMarks);
-    const active: Row[] = [];
-    for (const thread of threads ?? []) {
-      const newest = newestFromOthers(thread, this.opts.sbSlug);
-      const key = String(thread.threadKey);
-      const reported = marks.get(key);
-      if (!newest || (reported !== undefined && newest <= reported)) continue;
-      marks.set(key, newest);
-      active.push(thread);
+    const active: Array<{ threadKey: string; unreadCount: unknown; fromOthers: Row[] }> = [];
+    const commits: Array<() => void> = [];
+    const discovered: ThreadCursor[] = [];
+    for (const thread of listed ?? []) {
+      const threadKey = String(thread.threadKey);
+      let cursor = this.threads.get(threadKey);
+      let read: { fresh: Row[]; commit: () => void };
+      if (cursor) {
+        read = await cursor.drain();
+      } else {
+        cursor = this.cursorFor(threadKey);
+        read = await cursor.readFromPointer();
+        discovered.push(cursor);
+      }
+      commits.push(read.commit);
+      const fromOthers = read.fresh.filter((m) => m.senderSlug !== this.opts.sbSlug);
+      if (fromOthers.length > 0) {
+        active.push({ threadKey, unreadCount: thread.unreadCount, fromOthers });
+      }
     }
 
     // Committed together, after every read succeeded.
-    this.legacyHighWater = highWater;
-    this.threadMarks = marks;
+    this.legacy = legacy.tail;
+    for (const commit of commits) commit();
+    for (const cursor of discovered) this.threads.set(cursor.threadKey, cursor);
 
-    const legacy = fresh
-      .filter((m) => m.senderSlug !== this.opts.sbSlug)
-      .sort((a, b) => (String(a.createdAt) < String(b.createdAt) ? -1 : 1));
-    if (legacy.length === 0 && active.length === 0) return [];
+    const inbox = legacy.fresh.filter((m) => m.senderSlug !== this.opts.sbSlug);
+    if (inbox.length === 0 && active.length === 0) return [];
 
     const lines = [
-      `[ink wait] New unread: ${legacy.length} inbox message(s), ${active.length} thread(s) with new activity`,
+      `[ink wait] New unread: ${inbox.length} inbox message(s), ${active.length} thread(s) with new activity`,
     ];
-    for (const m of legacy) {
+    for (const m of inbox) {
       lines.push(`  inbox: from ${senderOf(m)}: ${preview(m.content, 150)}`);
     }
     for (const thread of active) {
-      lines.push(`  thread ${String(thread.threadKey)}: ${String(thread.unreadCount)} unread`);
-      const latest = latestFromOthers(thread, this.opts.sbSlug);
-      if (latest) {
-        lines.push(`    latest from ${senderOf(latest)}: ${preview(latest.content, 150)}`);
+      lines.push(`  thread ${thread.threadKey}: ${String(thread.unreadCount)} unread`);
+      for (const m of thread.fromOthers) {
+        lines.push(`    from ${senderOf(m)}: ${preview(m.content, 150)}`);
       }
     }
     return lines;
@@ -571,10 +734,6 @@ function stringOf(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-function cursorOf(message: Row): { id: string; createdAt?: string } {
-  return { id: String(message.id), createdAt: stringOf(message.createdAt) };
-}
-
 function unreadTotal(result: Record<string, unknown>): number {
   return ((result.totalUnreadCount as number) ?? (result.unreadCount as number)) || 0;
 }
@@ -589,24 +748,4 @@ function preview(content: unknown, length: number): string {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-/** The newest preview message from someone other than `sbSlug`. */
-function latestFromOthers(thread: Row, sbSlug: string): Row | undefined {
-  let latest: Row | undefined;
-  for (const m of rowsOf(thread.previewMessages)) {
-    const at = stringOf(m.createdAt);
-    if (!at || m.senderSlug === sbSlug) continue;
-    if (!latest || at > String(latest.createdAt)) latest = m;
-  }
-  return latest;
-}
-
-/**
- * When the thread's activity from others was last seen. Previews carry the
- * newest three messages, so three of the watcher's own posts landing on top
- * of someone else's reply inside one interval hide that reply.
- */
-function newestFromOthers(thread: Row, sbSlug: string): string | undefined {
-  return stringOf(latestFromOthers(thread, sbSlug)?.createdAt);
 }

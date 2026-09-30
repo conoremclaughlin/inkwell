@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   watchMessages,
   WAIT_PAGE_SIZE,
@@ -531,7 +531,7 @@ describe('ink wait --pending', () => {
 // ── Inbox mode ──
 
 interface ThreadState {
-  messages: Array<{ senderSlug: string; createdAt: string; content: string }>;
+  messages: Msg[];
   lastReadAt?: string;
 }
 
@@ -545,7 +545,31 @@ function inboxServer() {
   const threadUnread = (t: ThreadState) =>
     t.messages.filter((m) => !t.lastReadAt || m.createdAt > t.lastReadAt).length;
 
+  // get_thread_messages as the server serves it: past the read pointer unless
+  // fullHistory, past a strict `newerThan`, oldest-first, latestN the newest.
+  const threadMessages = (args: Record<string, unknown>) => {
+    if (args.markRead !== false) throw new Error('watcher must not advance a read pointer');
+    const t = threads.get(String(args.threadKey));
+    if (!t) return { success: false, error: `Thread not found: ${String(args.threadKey)}` };
+    let pool = [...t.messages].sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    if (args.fullHistory !== true && t.lastReadAt) {
+      const floor = t.lastReadAt;
+      pool = pool.filter((m) => m.createdAt > floor);
+    }
+    if (typeof args.newerThan === 'string') {
+      const floor = args.newerThan;
+      pool = pool.filter((m) => m.createdAt > floor);
+    }
+    const limit = Math.min(Number(args.limit ?? 50), Number(args.latestN ?? Infinity));
+    if (args.latestN !== undefined) {
+      const page = pool.slice(-limit);
+      return { success: true, messages: page, skippedOlderCount: pool.length - page.length };
+    }
+    return { success: true, messages: pool.slice(0, limit) };
+  };
+
   const call: WaitToolCall = async (tool, args) => {
+    if (tool === 'get_thread_messages') return threadMessages(args);
     if (tool !== 'get_inbox') throw new Error(`unexpected tool ${tool}`);
     if (args.markRead !== false) throw new Error('watcher must not drain the inbox');
     const since = typeof args.since === 'string' ? args.since : undefined;
@@ -606,7 +630,8 @@ function inboxServer() {
       selfTargeted = false
     ) {
       const t = threads.get(threadKey) ?? { messages: [] };
-      t.messages.push({ senderSlug, content, createdAt: stamp(atMs) });
+      seq += 1;
+      t.messages.push({ id: `t-${seq}`, senderSlug, content, createdAt: stamp(atMs) });
       if (senderSlug === 'wren' && !selfTargeted) t.lastReadAt = stamp(atMs);
       threads.set(threadKey, t);
     },
@@ -701,8 +726,124 @@ describe('ink wait: inbox', () => {
       [
         '[ink wait] New unread: 0 inbox message(s), 1 thread(s) with new activity',
         '  thread pr:5: 4 unread',
-        '    latest from lumen: third',
+        '    from lumen: third',
       ],
     ]);
+  });
+});
+
+// Lumen's independent review of #702 at d7e59536: each of these was red there.
+// Synthetic data and an injected transport only.
+describe('#702 review regressions (Lumen)', () => {
+  it('thread drain does not drop siblings of a page-boundary timestamp', async () => {
+    const server = threadServer();
+    server.post('lumen', 'baseline', -1000);
+    const { clock } = virtualClock([
+      [
+        10000,
+        () => {
+          for (let i = 0; i < WAIT_PAGE_SIZE + 1; i++) server.post('lumen', `tied ${i}`, 10000);
+        },
+      ],
+    ]);
+    const { out, done } = run({ ...FOLLOW, timeoutSec: 60 }, server.call, clock);
+    await done;
+    expect(out.batches.flatMap(bodyOf)).toHaveLength(WAIT_PAGE_SIZE + 1);
+  });
+
+  it('inbox since pagination does not drop siblings of a page-boundary timestamp', async () => {
+    const server = inboxServer();
+    server.deliver('lumen', 'baseline', -1000);
+    const { clock } = virtualClock([
+      [
+        10000,
+        () => {
+          for (let i = 0; i < WAIT_PAGE_SIZE + 1; i++) server.deliver('lumen', `tied ${i}`, 10000);
+        },
+      ],
+    ]);
+    const { out, done } = run({ ...INBOX_FOLLOW, timeoutSec: 60 }, server.call, clock);
+    await done;
+    expect(out.batches.flatMap(bodyOf)).toHaveLength(WAIT_PAGE_SIZE + 1);
+  });
+
+  it('inbox does not lose a still-unread reply underneath three self-targeted messages', async () => {
+    const server = inboxServer();
+    server.postToThread('pr:5', 'lumen', 'baseline', -1000);
+    const { clock } = virtualClock([
+      [
+        10000,
+        () => {
+          server.postToThread('pr:5', 'lumen', 'new reply', 10000);
+          for (let i = 0; i < 3; i++)
+            server.postToThread('pr:5', 'wren', `own ${i}`, 10001 + i, true);
+        },
+      ],
+    ]);
+    const { out, done } = run({ ...INBOX_FOLLOW, timeoutSec: 60 }, server.call, clock);
+    await done;
+    expect(out.batches.flat().join('\n')).toContain('new reply');
+  });
+
+  it('inbox does not replay a read reply when only a new self-targeted message arrives', async () => {
+    const server = inboxServer();
+    server.postToThread('pr:5', 'lumen', 'old already read reply', -2000);
+    server.postToThread('pr:5', 'wren', 'read through this own post', -1000);
+    const { clock } = virtualClock([
+      [10000, () => server.postToThread('pr:5', 'wren', 'new self-targeted note', 10000, true)],
+    ]);
+    const { out, done } = run({ ...INBOX_FOLLOW, timeoutSec: 60 }, server.call, clock);
+    await done;
+    expect(out.batches).toEqual([]);
+  });
+
+  it('does not begin another poll once the deadline has been reached', async () => {
+    const server = threadServer();
+    const { clock, now } = virtualClock();
+    server.bindClock(now);
+    const { done } = run({ ...FOLLOW, timeoutSec: 10, intervalSec: 5 }, server.call, clock);
+    await done;
+    expect(server.calls.filter((c) => c.at >= 10000)).toEqual([]);
+  });
+
+  it('settles at the deadline even if an earlier poll never settles (real timers, faked)', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    try {
+      let calls = 0;
+      const call: WaitToolCall = async () => {
+        calls++;
+        if (calls === 1) return { success: true, messages: [] };
+        return new Promise(() => {});
+      };
+      const delay = (ms: number, signal: AbortSignal) =>
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, ms);
+          signal.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true }
+          );
+        });
+      const clock: WaitClock = {
+        now: () => Date.now(),
+        random: () => 0,
+        sleep: delay,
+        timer: delay,
+      };
+      let result: number | undefined;
+      const { done } = run({ ...FOLLOW, timeoutSec: 10, intervalSec: 5 }, call, clock, controller);
+      void done.then((code) => {
+        result = code;
+      });
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(result).toBe(1);
+    } finally {
+      controller.abort('SIGINT');
+      vi.useRealTimers();
+    }
   });
 });
