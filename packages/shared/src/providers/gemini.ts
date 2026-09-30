@@ -55,7 +55,7 @@ export function buildGeminiSettings(
   }
 
   // Merge Inkwell auth + session headers into the canonical 'inkwell' server.
-  // The legacy 'pcp' server name is retired — never target or create it.
+  // Only the canonical Inkwell server is a header-injection target.
   const serverKey = 'inkwell';
   const serverConfig = (mcpServers[serverKey] || {}) as Record<string, unknown>;
   const existingHeaders = { ...((serverConfig.headers || {}) as Record<string, string>) };
