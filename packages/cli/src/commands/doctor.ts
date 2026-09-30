@@ -90,9 +90,13 @@ export async function probeRegistration(
     !!result && (!!result.studio || result.success === true);
   try {
     if (studioId) {
-      return found(await call('get_studio', { studioId })) ? 'registered' : 'unregistered';
+      return found(await call('get_studio', { studioId }, { idempotent: true }))
+        ? 'registered'
+        : 'unregistered';
     }
-    return found(await call('get_studio', { path: worktreePath })) ? 'unrecorded' : 'unregistered';
+    return found(await call('get_studio', { path: worktreePath }, { idempotent: true }))
+      ? 'unrecorded'
+      : 'unregistered';
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return /not found|no studio|unknown studio/i.test(message) ? 'unregistered' : 'unreachable';

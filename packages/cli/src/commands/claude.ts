@@ -562,7 +562,7 @@ async function resolveCodexStartupContextBlock(options: {
         email: inkConfig?.email,
         sbSlug,
       },
-      { timeoutMs: 5000, callerProfile: 'runtime' }
+      { timeoutMs: 5000, callerProfile: 'runtime', idempotent: true }
     );
 
     const { studioId: ctxStudioId, studioName: ctxStudioName } = await resolveStudioId(
@@ -644,7 +644,7 @@ async function resolveStudioId(cwd: string): Promise<{
     const result = await callInkTool<{ studio?: { id?: string } }>(
       'get_studio',
       { path: cwd },
-      { timeoutMs: 3000 }
+      { timeoutMs: 3000, idempotent: true }
     );
     if (result?.studio?.id) {
       return { ...local, studioId: result.studio.id };
@@ -1696,13 +1696,20 @@ export function getCodexLocalSessionsForProject(
   // session visibility compared to prior behavior.
   const includeExecSources = options.includeExecSources !== false;
   const fallbackToJsonl = (reason: string): BackendLocalSessionSummary[] => {
-    const fallback = getCodexLocalSessionsFromJsonl(cwd, limit, { includeExecSources });
+    const stats: CodexJsonlScanStats = {
+      filesListed: 0,
+      filesInspected: 0,
+      headBytesRead: 0,
+      tailBytesRead: 0,
+    };
+    const fallback = getCodexLocalSessionsFromJsonl(cwd, limit, { includeExecSources, stats });
     sbDebugLog('backend', 'codex_local_sessions_fallback_jsonl', {
       cwd,
       reason,
       includeExecSources,
       returnedSessions: fallback.length,
       sessionIds: fallback.map((session) => session.sessionId),
+      ...stats,
     });
     return fallback;
   };
@@ -1719,6 +1726,15 @@ export function getCodexLocalSessionsForProject(
     return [];
   }
 
+  // Ask the question we have: this cwd's threads, not the 200 newest across
+  // every cwd (which cost 170 ms on a 6,000-thread DB and could miss a
+  // project whose sessions were older than the newest 200). The DB carries an
+  // index on (archived, cwd, updated_at), so this is ~10 ms. Both spellings
+  // of the cwd are asked for: Codex records the path as it saw it, which may
+  // be the symlinked form or the real one, and the JS-side normalisation
+  // below still decides.
+  const quoteSqlString = (value: string) => `'${value.replace(/'/g, "''")}'`;
+  const cwdSpellings = Array.from(new Set([cwd, normalizedCwd])).map(quoteSqlString);
   const query = `
 SELECT id, cwd, updated_at,
        replace(replace(first_user_message, char(10), ' '), char(9), ' ') AS first_user_message,
@@ -1726,20 +1742,23 @@ SELECT id, cwd, updated_at,
        git_branch
 FROM threads
 WHERE archived = 0
+  AND cwd IN (${cwdSpellings.join(', ')})
   ${includeExecSources ? '' : "AND source = 'cli'"}
 ORDER BY updated_at DESC
-LIMIT 200;
+LIMIT ${Math.max(1, Math.min(limit, 200))};
 `;
 
   // maxBuffer: the default (~1MB) overflows with ENOBUFS on real codex state
-  // DBs — 200 rows each carrying a (truncated but still multi-KB)
-  // first_user_message can exceed it, which silently drops session listing to
-  // the slower jsonl fallback and adds retry latency to every codex startup.
+  // DBs — rows carrying a (truncated but still multi-KB) first_user_message
+  // can exceed it, which silently drops session listing to the slower jsonl
+  // fallback and adds retry latency to every codex startup.
   const result = spawnSync('sqlite3', ['-tabs', codexStateDbPath, query], {
     encoding: 'utf-8',
     maxBuffer: 64 * 1024 * 1024,
   });
-  if (result.error || result.status !== 0 || !result.stdout) {
+  // Empty stdout is the DB's answer ("no threads here"), not a failure: only
+  // a sqlite3 that could not run or exited non-zero sends us to the files.
+  if (result.error || result.status !== 0) {
     sbDebugLog('backend', 'codex_local_sessions_query_failed', {
       cwd: normalizedCwd,
       codexStateDbPath,
@@ -1773,7 +1792,9 @@ LIMIT 200;
     if (transcriptPath && existsSync(transcriptPath)) {
       try {
         fileSizeBytes = statSync(transcriptPath).size;
-        const transcript = readFileSync(transcriptPath, 'utf-8');
+        // The latest preview lives at the end of the rollout: the tail is
+        // enough, and a multi-megabyte transcript is not read whole for it.
+        const transcript = readFileTailUtf8(transcriptPath);
         const preview = extractLatestPreviewFromCodexRolloutJsonl(transcript);
         if (preview) {
           latestPrompt = formatSessionPreviewText(preview);
@@ -1810,113 +1831,201 @@ LIMIT 200;
     returnedSessions: scoped.length,
     sessionIds: scoped.map((session) => session.sessionId),
   });
-  return scoped.length > 0 ? scoped : fallbackToJsonl('sqlite_query_empty');
+  // A DB that answered is trusted, empty answers included. Until 2026-09-29
+  // an empty answer fell through to the jsonl scan, which read the newest
+  // thousand rollouts in full — 1.26 GB, ten seconds — on every launch in a
+  // studio with no Codex history yet, i.e. every fresh studio (task
+  // 38af403e). The scan is for a missing or broken DB only.
+  return scoped;
 }
 
-function getCodexLocalSessionsFromJsonl(
+/** How many rollout files the jsonl fallback inspects, newest first. */
+export const CODEX_JSONL_FALLBACK_MAX_FILES = 300;
+/**
+ * A rollout's first line is its session_meta: read this much before growing
+ * the read. Measured on twenty recent rollouts: 4.4 KB min, 4.9 KB median,
+ * 23 KB max, so one read covers nearly every file.
+ */
+const CODEX_ROLLOUT_HEAD_INITIAL_BYTES = 32 * 1024;
+/** ...and give up on a file whose first line is longer than this. */
+const CODEX_ROLLOUT_HEAD_MAX_BYTES = 512 * 1024;
+
+/** What the jsonl fallback did, for the debug trace and for tests to pin its bounds. */
+export interface CodexJsonlScanStats {
+  filesListed: number;
+  filesInspected: number;
+  headBytesRead: number;
+  tailBytesRead: number;
+}
+
+/**
+ * Rollout files newest first, without a stat per file: the tree is
+ * `sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`, so directory and file
+ * names sort chronologically and a descending walk yields the newest first.
+ * Stops at `cap` files; a listing of six thousand is never built.
+ */
+function listCodexRolloutFilesNewestFirst(root: string, cap: number): string[] {
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    if (out.length >= cap) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
+    for (const entry of entries) {
+      if (out.length >= cap) return;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) walk(fullPath);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) out.push(fullPath);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+/**
+ * The first line of a file, read in growing bounded chunks. Null when no
+ * line ends within `maxBytes` (a first line that long is not a session_meta
+ * we want). A file that is one line with no newline is that line.
+ */
+function readFirstLineUtf8(
+  filePath: string,
+  initialBytes: number,
+  maxBytes: number
+): { line: string | null; bytesRead: number } {
+  const fd = openSync(filePath, 'r');
+  try {
+    let chunkSize = initialBytes;
+    let collected = Buffer.alloc(0);
+    let offset = 0;
+    while (offset < maxBytes) {
+      const chunk = Buffer.allocUnsafe(Math.min(chunkSize, maxBytes - offset));
+      const read = readSync(fd, chunk, 0, chunk.length, offset);
+      if (read <= 0) break;
+      collected = Buffer.concat([collected, chunk.subarray(0, read)]);
+      offset += read;
+      const newline = collected.indexOf(0x0a);
+      if (newline !== -1) {
+        return { line: collected.subarray(0, newline).toString('utf-8'), bytesRead: offset };
+      }
+      if (read < chunk.length) {
+        // End of file without a newline: the whole file is its first line.
+        return { line: collected.toString('utf-8'), bytesRead: offset };
+      }
+      chunkSize = Math.min(chunkSize * 2, maxBytes);
+    }
+    return { line: null, bytesRead: offset };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * The fallback for a missing or broken state DB: bounded, and head-first.
+ * Until 2026-09-29 it listed and stat'ed every rollout on the machine
+ * (6,130 of them), then read the newest thousand IN FULL to find their
+ * session_meta line — 1.26 GB and ten seconds of blocked event loop on a
+ * launch, and it ran on every launch in a fresh studio because an empty DB
+ * answer was treated as no answer (task 38af403e). Now: the newest
+ * CODEX_JSONL_FALLBACK_MAX_FILES files by name, the first line of each
+ * (session_meta is first; a few KB), and the tail only of the ones whose
+ * cwd matches, for the preview. Reads are counted in `options.stats`.
+ */
+export function getCodexLocalSessionsFromJsonl(
   cwd = process.cwd(),
   limit = 20,
   options: {
     includeExecSources?: boolean;
+    stats?: CodexJsonlScanStats;
   } = {}
 ): BackendLocalSessionSummary[] {
   const includeExecSources = options.includeExecSources !== false;
+  const stats = options.stats ?? {
+    filesListed: 0,
+    filesInspected: 0,
+    headBytesRead: 0,
+    tailBytesRead: 0,
+  };
   const codexSessionsDir = join(homedir(), '.codex', 'sessions');
   if (!existsSync(codexSessionsDir)) return [];
 
   const normalizedCwd = normalizePath(cwd);
   if (!normalizedCwd) return [];
 
-  const sessionFiles: Array<{ path: string; modified: string }> = [];
-  const stack: string[] = [codexSessionsDir];
-  while (stack.length > 0) {
-    const dir = stack.pop();
-    if (!dir) continue;
-
-    let entries: Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(fullPath);
-        continue;
-      }
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
-      try {
-        const stats = statSync(fullPath);
-        sessionFiles.push({ path: fullPath, modified: stats.mtime.toISOString() });
-      } catch {
-        // Ignore unreadable files.
-      }
-    }
-  }
-
-  const maxFilesToInspect = Math.max(limit * 25, 250);
-  const sortedFiles = sessionFiles
-    .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
-    .slice(0, maxFilesToInspect);
+  const files = listCodexRolloutFilesNewestFirst(codexSessionsDir, CODEX_JSONL_FALLBACK_MAX_FILES);
+  stats.filesListed = files.length;
 
   const sessions: BackendLocalSessionSummary[] = [];
-  for (const sessionFile of sortedFiles) {
-    let content: string;
+  for (const filePath of files) {
+    let head: { line: string | null; bytesRead: number };
     try {
-      content = readFileSync(sessionFile.path, 'utf-8');
+      head = readFirstLineUtf8(
+        filePath,
+        CODEX_ROLLOUT_HEAD_INITIAL_BYTES,
+        CODEX_ROLLOUT_HEAD_MAX_BYTES
+      );
     } catch {
       continue;
     }
+    stats.filesInspected += 1;
+    stats.headBytesRead += head.bytesRead;
+    const firstLine = head.line?.trim();
+    if (!firstLine) continue;
 
-    let matched: BackendLocalSessionSummary | undefined;
-    const latestPreview = extractLatestPreviewFromCodexRolloutJsonl(content);
-    const lines = content.split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+    let parsed: CodexSessionMetaLine;
+    try {
+      parsed = JSON.parse(firstLine) as CodexSessionMetaLine;
+    } catch {
+      continue;
+    }
+    if (parsed.type !== 'session_meta') continue;
+    const sessionId = parsed.payload?.id?.trim();
+    const sessionCwd = parsed.payload?.cwd?.trim();
+    if (!sessionId || !sessionCwd) continue;
+    const originator = parsed.payload?.originator?.trim();
+    if (!includeExecSources && originator && !originator.startsWith('codex_cli')) continue;
 
-      let parsed: CodexSessionMetaLine;
-      try {
-        parsed = JSON.parse(trimmed) as CodexSessionMetaLine;
-      } catch {
-        continue;
-      }
+    const normalizedSessionCwd = normalizePath(sessionCwd);
+    if (!normalizedSessionCwd || normalizedSessionCwd !== normalizedCwd) continue;
 
-      if (parsed.type !== 'session_meta') continue;
-      const sessionId = parsed.payload?.id?.trim();
-      const sessionCwd = parsed.payload?.cwd?.trim();
-      if (!sessionId || !sessionCwd) break;
-      const originator = parsed.payload?.originator?.trim();
-      if (!includeExecSources && originator && !originator.startsWith('codex_cli')) break;
-
-      const normalizedSessionCwd = normalizePath(sessionCwd);
-      if (!normalizedSessionCwd || normalizedSessionCwd !== normalizedCwd) break;
-
-      matched = {
-        backend: 'codex',
-        sessionId,
-        projectPath: sessionCwd,
-        modified: parsed.payload?.timestamp || parsed.timestamp || sessionFile.modified,
-        latestPrompt: latestPreview ? formatSessionPreviewText(latestPreview) : undefined,
-        latestPromptAt: latestPreview?.ts,
-        fileSizeBytes: (() => {
-          try {
-            return statSync(sessionFile.path).size;
-          } catch {
-            return undefined;
-          }
-        })(),
-        transcriptPath: sessionFile.path,
-      };
-      if (!matched.latestPrompt) {
-        matched.latestPrompt = withSessionFileSize(undefined, matched.fileSizeBytes);
-      }
-      break;
+    // A match: the tail for the preview, and a stat for the size and, when
+    // the meta carries no timestamp, the modified time.
+    let fileSizeBytes: number | undefined;
+    let mtimeIso: string | undefined;
+    try {
+      const fileStats = statSync(filePath);
+      fileSizeBytes = fileStats.size;
+      mtimeIso = fileStats.mtime.toISOString();
+    } catch {
+      // Size and mtime are best effort.
+    }
+    let latestPreview: SessionPreviewSummary | undefined;
+    try {
+      const tail = readFileTailUtf8(filePath);
+      stats.tailBytesRead += Buffer.byteLength(tail, 'utf-8');
+      latestPreview = extractLatestPreviewFromCodexRolloutJsonl(tail);
+    } catch {
+      // Best-effort preview extraction only.
     }
 
-    if (matched) sessions.push(matched);
+    const matched: BackendLocalSessionSummary = {
+      backend: 'codex',
+      sessionId,
+      projectPath: sessionCwd,
+      modified:
+        parsed.payload?.timestamp || parsed.timestamp || mtimeIso || new Date().toISOString(),
+      latestPrompt: latestPreview ? formatSessionPreviewText(latestPreview) : undefined,
+      latestPromptAt: latestPreview?.ts,
+      fileSizeBytes,
+      transcriptPath: filePath,
+    };
+    if (!matched.latestPrompt) {
+      matched.latestPrompt = withSessionFileSize(undefined, matched.fileSizeBytes);
+    }
+    sessions.push(matched);
   }
 
   const deduped = new Map<string, BackendLocalSessionSummary>();
@@ -2597,18 +2706,28 @@ async function ensureInkSessionContext(
   } else {
     try {
       const [listed, allAgentListed] = await Promise.all([
-        callInkTool<ListSessionsResult>('list_sessions', {
-          email,
-          sbSlug,
-          ...(studioId ? { studioId } : {}),
-          limit: inkSessionLimit,
-        }),
+        callInkTool<ListSessionsResult>(
+          'list_sessions',
+          {
+            email,
+            sbSlug,
+            ...(studioId ? { studioId } : {}),
+            limit: inkSessionLimit,
+          },
+          // Reads, sent right after the local session scan: the one place
+          // the stale-pooled-socket reset has been measured (task 38af403e).
+          { idempotent: true }
+        ),
         // Cross-agent view, used only for ownership attribution. Local
         // backend transcripts in a shared directory can belong to any agent
         // (a sibling's heartbeat spawns land in the same encoded-cwd dir),
         // and the agent-scoped list above can never name those owners.
         // Best-effort: attribution degrades to unlabeled rows on failure.
-        callInkTool<ListSessionsResult>('list_sessions', { email, limit: 100 }).catch(() => null),
+        callInkTool<ListSessionsResult>(
+          'list_sessions',
+          { email, limit: 100 },
+          { idempotent: true }
+        ).catch(() => null),
       ]);
       allAgentSessions = allAgentListed?.sessions || [];
       activeSessions = filterInkSessionsForContext(
@@ -2750,7 +2869,7 @@ async function ensureInkSessionContext(
             ...(studioId ? { studioId } : {}),
             limit: inkSessionLimit,
           },
-          { callerProfile: 'runtime' }
+          { callerProfile: 'runtime', idempotent: true }
         );
         const listedActive = filterInkSessionsForContext(
           (listed.sessions || []).filter((session) => isSessionResumable(session)),

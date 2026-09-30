@@ -183,9 +183,11 @@ describe('doctor: the registration probe (task 2841c7a9)', () => {
     expect(
       await probeRegistration('191b7705-85bd-4c76-b622-43f655bf7fd6', '/repo--alpha', call)
     ).toBe('registered');
-    expect(call).toHaveBeenCalledWith('get_studio', {
-      studioId: '191b7705-85bd-4c76-b622-43f655bf7fd6',
-    });
+    expect(call).toHaveBeenCalledWith(
+      'get_studio',
+      { studioId: '191b7705-85bd-4c76-b622-43f655bf7fd6' },
+      { idempotent: true }
+    );
   });
 
   it('without an id, a row the server has for this path is "unrecorded", not "no studio row"', async () => {
@@ -195,7 +197,7 @@ describe('doctor: the registration probe (task 2841c7a9)', () => {
     const { probeRegistration } = await import('./doctor.js');
     const call = vi.fn(async () => row);
     expect(await probeRegistration(undefined, '/repo--alpha', call)).toBe('unrecorded');
-    expect(call).toHaveBeenCalledWith('get_studio', { path: '/repo--alpha' });
+    expect(call).toHaveBeenCalledWith('get_studio', { path: '/repo--alpha' }, { idempotent: true });
   });
 
   it('without an id and without a row it is unregistered; a server failure is unreachable', async () => {
