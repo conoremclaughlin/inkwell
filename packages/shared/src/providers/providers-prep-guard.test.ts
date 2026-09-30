@@ -94,12 +94,12 @@ const HOST_BOUNDARY_EXCEPTIONS: ReadonlyArray<{ at: string; reason: string }> = 
   {
     at: 'runner/spawn-backend.ts buildCleanEnv process.env',
     reason:
-      "The default parent env, for spawnBackend's callers outside this path (the API runners through resolveSpawnTarget, the CLI's backend-auth). startBackendTurn always passes its host's BackendHost.baseEnv as parentEnv, which backend-runner.concurrent.test proves; the default goes when those callers move onto the providers path.",
+      "The default parent env, for the six callers outside this path that pass none: resolveSpawnTarget in api antigravity-runner.ts, claude-runner.ts, codex-runner.ts and gemini-runner.ts, and buildCleanEnv in api ink-runner.ts and cli lib/backend-auth.ts. startBackendTurn always passes its host's BackendHost.baseEnv as parentEnv, which backend-runner.concurrent.test proves; the default goes with those callers in the switchover (Myra, #701 9b4f0752).",
   },
   {
     at: 'runner/spawn-backend.ts sessionEnvHandoff process.env',
     reason:
-      "The chat process's handoff of its own session to its child. Only the CLI host calls it; a preparation file that did is refused (REFUSED_NAMES).",
+      "The chat process's handoff of its own session to its child, defaulting to its own env for its one caller, cli backends/cli-host.ts (the seventh default-reliant site); a preparation file that called it is refused (REFUSED_NAMES).",
   },
 ];
 
@@ -110,9 +110,19 @@ interface Violation {
   within: string;
 }
 
+/** Subpaths of a host module admitted whole: asynchronous file IO. */
+const ADMITTED_SUBPATHS: ReadonlySet<string> = new Set(['fs/promises']);
+
+/**
+ * The host module a specifier names, or undefined. A subpath of one
+ * (`inspector/promises`) is that module too, and gives nothing, unless it is
+ * admitted by name.
+ */
 function hostModule(specifier: string): string | undefined {
   const bare = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
-  return bare in HOST_MODULES ? bare : undefined;
+  if (bare in HOST_MODULES) return bare;
+  const root = bare.split('/')[0]!;
+  return root in HOST_MODULES && !ADMITTED_SUBPATHS.has(bare) ? bare : undefined;
 }
 
 function isCliOnly(specifier: string): boolean {
@@ -170,7 +180,7 @@ function prepViolations(fileName: string, text: string): Violation[] {
       const typeOnly = Boolean(clause?.isTypeOnly);
       const host = checkSpecifier(node, node.moduleSpecifier.text);
       if (host && !typeOnly && clause) {
-        const allowed = HOST_MODULES[host]!;
+        const allowed = HOST_MODULES[host] ?? new Set<string>();
         if (clause.name) add(node, `default import of ${host}`);
         const bindings = clause.namedBindings;
         if (bindings && ts.isNamespaceImport(bindings)) add(node, `namespace import of ${host}`);
@@ -407,6 +417,9 @@ describe('preparation guard, against known answers', () => {
     ["import vm from 'vm';", 'default import of vm'],
     ["import { Worker } from 'node:worker_threads';", 'worker_threads.Worker'],
     ["const m = import('node:inspector');", 'dynamic import of inspector'],
+    // A subpath of a refused module is the module (Myra, #701).
+    ["import { Session } from 'node:inspector/promises';", 'inspector/promises.Session'],
+    ["const m = import('inspector/promises');", 'dynamic import of inspector/promises'],
     ["holder['require']('fs');", "['require']"],
     ['holder[`require`]("fs");', "['require']"],
     [
