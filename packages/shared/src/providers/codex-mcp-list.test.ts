@@ -284,6 +284,12 @@ describe('judgeCodexMcpList, the session env stays with Inkwell (Myra, 9bd3f8a9)
     ['a routing key drawn from another var', { 'x-ink-studio-id': 'SYNTHETIC_OTHER' }],
     ["the adapter's agent header from another var", { 'x-ink-agent-id': 'SYNTHETIC_OTHER' }],
     ['an env-drawn Authorization', { Authorization: 'INK_ACCESS_TOKEN' }],
+    // Myra's F5 and F6 as she ran them (ade5865f): each admitted at 497a1327.
+    [
+      "a casing twin beside the adapter's own key (F5)",
+      { 'x-ink-studio-id': 'INK_STUDIO_ID', 'X-Ink-Studio-Id': 'SYNTHETIC_OTHER_VAR' },
+    ],
+    ['an env Authorization from a non-session var (F6)', { Authorization: 'SYNTHETIC_OTHER_VAR' }],
   ])('refuses on Inkwell %s, with the repair', (_label, envHeaders) => {
     const inkwell = http('inkwell', INKWELL, { env_http_headers: envHeaders });
     expect(judge([inkwell])).toBe(CODEX_CONFIG_REFUSALS.inkwellEnvHeader);
@@ -363,6 +369,16 @@ describe('judgeCodexMcpList, drift from 0.158.0 is refused, not guessed at', () 
       () => {
         const entry = measuredHttp();
         entry.transport.env_http_headers = { 'x-anything': { var: 'INK_ACCESS_TOKEN' } };
+        return [entry];
+      },
+    ],
+    [
+      // Myra's M5/F7 (ade5865f): the check on this field survived every test,
+      // and the env-var rule now reads it.
+      'a bearer_token_env_var that is not a name (F7)',
+      () => {
+        const entry = measuredHttp();
+        entry.transport.bearer_token_env_var = 42;
         return [entry];
       },
     ],
