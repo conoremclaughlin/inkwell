@@ -24,9 +24,12 @@ non-test source file in this directory.
 - The hash helper's exact `import { createHash } from 'node:crypto'` is allowed to
   preserve existing content-addressed eviction references. Namespace imports,
   other crypto bindings and other importing files remain forbidden. The one
-  importer is `entry-ref-hash.ts`; a load-time call to `createHash` is refused
-  because the resulting accumulator would be shared mutable state. This is
-  deterministic hashing, not a new filesystem/process/network dependency.
+  importer is `entry-ref-hash.ts`, and every reference to the binding there must
+  be the callee of a direct call: exporting, aliasing, wrapping or passing it
+  would hand the Node primitive to files the import rule never admitted. A
+  load-time call is refused by the module-state rule below, because the
+  accumulator it returns would be shared. This is deterministic hashing, not a
+  new filesystem/process/network dependency.
 - **No host globals.** `process`, `require`, `__dirname`, `global`,
   `globalThis` and their relatives are refused. The one exception is
   `Buffer.byteLength` in `utf8Bytes` (`agent-loop.ts`), so this directory is
@@ -41,9 +44,15 @@ non-test source file in this directory.
   `lastIndex` is state), and no `new`, except as the whole initializer of a
   `const` declared `ReadonlySet<…>` or `ReadonlyMap<…>`. The match is by exact
   name, since `Readonly<Set<T>>` keeps `add`. No file here may declare either
-  name, because that would shadow the global interface. Constant array and
-  object tables, and values returned from a load-time call, are allowed. The
-  check cannot prove nobody mutates them, so don't.
+  name, because that would shadow the global interface. There is no load-time
+  call or tagged template either: a factory, an immediately invoked function or
+  an aliased `createHash` returns state as surely as `new` does, and the `new`
+  it hides sits in a function body the rule treats as running later. The
+  exceptions are `Object.freeze`, `Symbol` and `Symbol.for`, whose arguments are
+  still checked, and two reviewed `.map` calls in `imitation-grammar.ts` that
+  build plain grammar pieces from string literals; the test names both.
+  Constant array and object tables are allowed. The check cannot prove nobody
+  mutates them, so don't.
 - **Imported by its own path, never re-exported from the package root.** The
   root barrel carries Node-only code (process spawning, filesystem config).
 - **Tests sit beside the code.** The CLI's tests resolve this subpath to its
