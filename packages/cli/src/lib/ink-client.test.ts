@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { fetchWithTimeout, InkClient } from './ink-client';
+import { captureToolImages, takeCapturedImages } from '../repl/tool-images.js';
 
 const originalFetch = global.fetch;
 
@@ -264,6 +265,60 @@ describe('InkClient surfaces failed tool calls', () => {
     await expect(makeClient().callTool('some_tool', {})).rejects.toThrow(
       /failed without a text error message/
     );
+  });
+
+  describe('keeps image blocks that arrive beside text (PR #708)', () => {
+    // A real 1x1 PNG, so the capture step downstream can measure it.
+    const PNG_1X1 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const image = { type: 'image', data: PNG_1X1, mimeType: 'image/png' };
+    const respond = (content: unknown[]) => {
+      global.fetch = vi.fn(async () =>
+        okJson({ jsonrpc: '2.0', id: 1, result: { content } })
+      ) as unknown as typeof fetch;
+    };
+
+    it('beside a JSON payload: the payload unwrapped as before, the image on content', async () => {
+      respond([{ type: 'text', text: JSON.stringify({ success: true, name: 'chart' }) }, image]);
+      const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+      expect(result.success).toBe(true);
+      expect(result.name).toBe('chart');
+      expect(result.content).toEqual([image]);
+    });
+
+    it('beside plain text', async () => {
+      respond([{ type: 'text', text: 'here is the chart' }, image]);
+      const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+      expect(result).toEqual({ text: 'here is the chart', content: [image] });
+    });
+
+    it('beside a JSON value that is not an object', async () => {
+      respond([{ type: 'text', text: '[1,2]' }, image]);
+      const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+      expect(result).toEqual({ result: [1, 2], content: [image] });
+    });
+
+    it('with no image, the payload is exactly what it always was', async () => {
+      respond([{ type: 'text', text: JSON.stringify({ success: true }) }]);
+      const result = await makeClient().callTool('render_chart', {});
+      expect(result).toEqual({ success: true });
+    });
+
+    it('and the chat runtime then captures it instead of relaying base64', async () => {
+      respond([{ type: 'text', text: JSON.stringify({ success: true }) }, image]);
+      const parsed = await makeClient().callTool('render_chart', {});
+      const cacheDir = mkdtempSync(join(tmpdir(), 'ink-client-capture-'));
+      try {
+        const captured = await captureToolImages(parsed, {
+          cacheDir: async () => cacheDir,
+          delivery: () => ({ deliverable: true }),
+        });
+        expect(takeCapturedImages(captured)).toHaveLength(1);
+        expect(JSON.stringify(captured)).not.toContain(PNG_1X1.slice(0, 32));
+      } finally {
+        rmSync(cacheDir, { recursive: true, force: true });
+      }
+    });
   });
 
   it('still returns plain non-JSON text when the call did not fail', async () => {

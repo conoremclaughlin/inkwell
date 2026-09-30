@@ -30,6 +30,29 @@ interface JsonRpcResponse {
   error?: { code?: number; message?: string };
 }
 
+/**
+ * A text-derived payload with the call's image blocks kept beside it.
+ *
+ * The text is the payload callers read, so it is unwrapped as it always was;
+ * but a result can carry an image next to that text, and unwrapping alone
+ * dropped it (Lumen, PR #708). The images go on `content`, where the chat
+ * runtime's capture step looks, and are appended to one already there. With
+ * no image blocks the payload is returned exactly as parsed.
+ */
+function withImageBlocks(
+  parsed: unknown,
+  content: JsonRpcToolResult['content']
+): InkToolCallResult {
+  const images = (content ?? []).filter((item) => item?.type === 'image');
+  if (images.length === 0) return parsed as InkToolCallResult;
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const payload = parsed as InkToolCallResult;
+    const existing = Array.isArray(payload.content) ? (payload.content as unknown[]) : [];
+    return { ...payload, content: [...existing, ...images] };
+  }
+  return { result: parsed, content: images };
+}
+
 let jsonRpcId = 1;
 
 /**
@@ -271,7 +294,7 @@ export class InkClient {
     const firstText = toolResult?.content?.find((item) => typeof item.text === 'string')?.text;
     if (typeof firstText === 'string') {
       try {
-        return JSON.parse(firstText) as InkToolCallResult;
+        return withImageBlocks(JSON.parse(firstText), toolResult?.content);
       } catch {
         // Unparseable text on an isError result is a protocol-level failure —
         // argument validation, an unknown tool, a thrown handler. The server
@@ -286,7 +309,7 @@ export class InkClient {
         if (toolResult?.isError) {
           throw new Error(`Inkwell tool call failed: ${firstText}`);
         }
-        return { text: firstText };
+        return withImageBlocks({ text: firstText }, toolResult?.content);
       }
     }
 
