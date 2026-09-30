@@ -58,6 +58,11 @@ export function createCliBackendHost(): BackendHost {
     sessionEnv: async () => sessionEnvHandoff(),
     // The CLI host is its own session's process: the child inherits from it.
     baseEnv: async () => process.env,
+    // The server this process talks to (getInkServerUrl in lib/ink-mcp.ts),
+    // read when asked. Only its origin is compared.
+    get inkwellMcpUrl() {
+      return `${process.env.INK_SERVER_URL || 'http://localhost:3001'}/mcp`;
+    },
     // PATH lookup at spawn, as before.
     resolveBinary: async (name) => name,
     warn: (message) => console.warn(message),

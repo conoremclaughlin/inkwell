@@ -7,6 +7,10 @@ const state = vi.hoisted(() => ({
   cleanups: 0,
   /** When set, the prepared cleanup resolves only when this does. */
   cleanupGate: undefined as Promise<void> | undefined,
+  /** When set, the adapter has an effective-config check that runs this. */
+  check: undefined as undefined | ((check: EffectiveConfigCheck) => Promise<string | undefined>),
+  /** The env the adapter prepares, for the check's session names. */
+  preparedEnv: {} as Record<string, string>,
 }));
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -21,13 +25,16 @@ vi.mock('./registry.js', () => ({
       return {
         binary: 'mock-backend',
         args: [...config.promptParts],
-        env: {},
+        env: { ...state.preparedEnv },
         cleanup: async () => {
           state.cleanups += 1;
           await state.cleanupGate;
         },
       };
     },
+    ...(state.check
+      ? { checkEffectiveConfig: (check: EffectiveConfigCheck) => state.check!(check) }
+      : {}),
   }),
 }));
 
@@ -38,10 +45,12 @@ vi.mock('child_process', () => ({
 import {
   runBackendTurn,
   startBackendTurn,
+  CONFIG_REFUSED_EXIT_CODE,
   DEFAULT_TURN_HARD_TIMEOUT_MS,
   type BackendRunRequest,
 } from './backend-runner.js';
-import type { BackendHost } from './types.js';
+import { SPAWN_ENV_INHERITED_NAMES } from '../runner/spawn-backend.js';
+import type { BackendHost, EffectiveConfigCheck } from './types.js';
 
 /** A host that answers everything and touches nothing. */
 function fakeHost(overrides: Partial<BackendHost> = {}): BackendHost {
@@ -56,6 +65,7 @@ function fakeHost(overrides: Partial<BackendHost> = {}): BackendHost {
     skillMcpServers: async () => [],
     sessionEnv: async () => ({}),
     baseEnv: async () => process.env,
+    inkwellMcpUrl: 'http://localhost:3001/mcp',
     resolveBinary: async (name) => name,
     warn: () => undefined,
     ...overrides,
@@ -394,6 +404,144 @@ describe('runBackendTurn', () => {
 
     /** Preparation is asynchronous: the child exists once spawn was called. */
     const untilSpawned = () => vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
+
+    // The adapter's effective-config check (Myra, #701 9bd3f8a9, 5f569213,
+    // 2c705c16): given the session's names from the spawn's own additions,
+    // a probe env with none of them, and a refusal that spawns nothing.
+    describe('effective-config check', () => {
+      const credentialHost = () =>
+        fakeHost({
+          sessionEnv: async () => ({
+            INK_ACCESS_TOKEN: 'synthetic-token',
+            INK_DELEGATION_SECRET: 'synthetic-secret',
+          }),
+          baseEnv: async () => ({
+            HOME: '/synthetic/home',
+            PATH: '/synthetic/bin',
+            SYNTHETIC_HOST_ONLY: 'x',
+          }),
+        });
+
+      it("is given the session's names from the spawn's additions, and a probe env with none of them", async () => {
+        const seen: EffectiveConfigCheck[] = [];
+        state.preparedEnv = { AGENT_ID: 'wren', SB_SLUG: 'wren', HOME: '/synthetic/adapter-home' };
+        state.check = async (check) => {
+          seen.push(check);
+          return undefined;
+        };
+        spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+        try {
+          const result = await runBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            host: credentialHost(),
+          });
+          expect(result.success).toBe(true);
+          expect(seen).toHaveLength(1);
+          const check = seen[0]!;
+          // The credentials' names are there, and so is the adapter's own
+          // AGENT_ID; an allowlisted basic (HOME) is not.
+          expect(check.sessionEnvNames).toEqual(
+            expect.arrayContaining(['INK_ACCESS_TOKEN', 'INK_DELEGATION_SECRET', 'AGENT_ID'])
+          );
+          expect(check.sessionEnvNames).not.toContain('HOME');
+          // The probe env is the base env through the allowlist, nothing more.
+          expect(check.probeEnv).toEqual({ HOME: '/synthetic/home', PATH: '/synthetic/bin' });
+          const inherited = new Set(SPAWN_ENV_INHERITED_NAMES);
+          expect(Object.keys(check.probeEnv).every((name) => inherited.has(name))).toBe(true);
+          expect(check.inkwellMcpUrl).toBe('http://localhost:3001/mcp');
+          expect(check.binary).toBe('mock-backend');
+          expect(check.timeoutMs).toBeGreaterThan(0);
+          expect(check.timeoutMs).toBeLessThanOrEqual(10_000);
+        } finally {
+          state.check = undefined;
+          state.preparedEnv = {};
+          spawnMock.mockReset();
+        }
+      });
+
+      it('spawns nothing on a refusal, reports the fixed reason, and removes the per-spawn files', async () => {
+        state.cleanups = 0;
+        state.check = async () => 'synthetic fixed refusal';
+        spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+        try {
+          const result = await runBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            host: credentialHost(),
+          });
+          expect(result).toMatchObject({
+            success: false,
+            exitCode: CONFIG_REFUSED_EXIT_CODE,
+            stderr: 'synthetic fixed refusal',
+            childExited: true,
+          });
+          expect(spawnMock).not.toHaveBeenCalled();
+          expect(state.cleanups).toBe(1);
+        } finally {
+          state.check = undefined;
+          spawnMock.mockReset();
+        }
+      });
+
+      it('ends the check on abort, and spawns nothing', async () => {
+        let checkSignal: AbortSignal | undefined;
+        state.check = (check) =>
+          new Promise((resolve) => {
+            checkSignal = check.signal;
+            check.signal.addEventListener('abort', () => resolve(undefined));
+          });
+        spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+        try {
+          const turn = startBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            host: credentialHost(),
+          });
+          await vi.waitFor(() => expect(checkSignal).toBeDefined());
+          turn.abort();
+          expect(await turn.result).toMatchObject({ exitCode: 143, childExited: true });
+          expect(checkSignal!.aborted).toBe(true);
+          expect(spawnMock).not.toHaveBeenCalled();
+        } finally {
+          state.check = undefined;
+          spawnMock.mockReset();
+        }
+      });
+
+      it("takes the check's time out of the spawn's ceiling (Myra, 2c705c16)", async () => {
+        vi.useFakeTimers();
+        const child = createHeldChild();
+        state.check = () => new Promise((resolve) => setTimeout(() => resolve(undefined), 300));
+        spawnMock.mockReset().mockImplementation(() => child);
+        try {
+          const turn = startBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            timeoutMs: 400,
+          });
+          await vi.advanceTimersByTimeAsync(300);
+          expect(spawnMock).toHaveBeenCalledTimes(1);
+          // 400 minted, 300 spent in the check: the child has 100 left.
+          await vi.advanceTimersByTimeAsync(100);
+          expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+          child.emit('close', null, 'SIGTERM');
+          expect(await turn.result).toMatchObject({ timedOut: true, exitCode: 124 });
+        } finally {
+          state.check = undefined;
+          vi.useRealTimers();
+          spawnMock.mockReset();
+        }
+      });
+    });
 
     // One run, one deadline: a continuation late in the run gets the time
     // left, and its credentials are minted for exactly that (Lumen, ff78c1b3).

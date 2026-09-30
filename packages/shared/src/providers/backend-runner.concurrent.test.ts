@@ -100,6 +100,7 @@ describe('overlapping provider turns in one process', () => {
           SYNTHETIC_HOST_ONLY: 'synthetic-host-only',
           INK_ACCESS_TOKEN: 'synthetic-host-base-token',
         }),
+        inkwellMcpUrl: 'http://127.0.0.1:9/mcp',
         resolveBinary: async () => 'synthetic-provider-never-executed',
         warn: () => undefined,
       };

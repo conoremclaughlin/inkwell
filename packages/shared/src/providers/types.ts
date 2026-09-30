@@ -66,6 +66,12 @@ export interface BackendHost {
    * HOME, and so of every config read from it.
    */
   baseEnv(): Promise<Readonly<Record<string, string | undefined>>>;
+  /**
+   * This session's Inkwell MCP server, as the host knows it. An effective-
+   * config check takes what counts as Inkwell from here, never from the
+   * config it is checking.
+   */
+  readonly inkwellMcpUrl: string;
   /** The executable to spawn for an adapter's binary name. */
   resolveBinary(name: string): Promise<string>;
   /** A warning an adapter raises, such as media it could not inject. */
@@ -231,4 +237,40 @@ export interface BackendAdapter {
    * the runner treats stdout as opaque response text (plain-text backends).
    */
   createStreamParser?(): BackendStreamParser;
+
+  /**
+   * Optional. A check of the backend's effective configuration, run by
+   * startBackendTurn after the credentials are minted and the binary
+   * resolved, just before the spawn. Returns a fixed reason to refuse the
+   * spawn, or undefined to go ahead. A reason never quotes the backend's
+   * output.
+   */
+  checkEffectiveConfig?(check: EffectiveConfigCheck): Promise<string | undefined>;
+}
+
+/** What an adapter's effective-config check is given (BackendAdapter.checkEffectiveConfig). */
+export interface EffectiveConfigCheck {
+  /** The resolved executable the spawn would run. */
+  binary: string;
+  /**
+   * The env for a config-only probe: the host's base env through the spawn
+   * allowlist, and nothing the runner adds for the session, so no
+   * credential ever reaches the probe. It carries whatever of HOME and
+   * CODEX_HOME the spawn will get, which is what selects the config read.
+   */
+  probeEnv: Readonly<Record<string, string | undefined>>;
+  /**
+   * The names of the env vars the runner adds for this session on top of the
+   * base env (credentials, the adapter's env, the turn-owner marker), less
+   * the allowlisted basics. A server outside the session drawing any of them
+   * is drawing the session's own.
+   */
+  sessionEnvNames: readonly string[];
+  cwd: string;
+  /** Aborted when the turn is. */
+  signal: AbortSignal;
+  /** The check's whole budget. */
+  timeoutMs: number;
+  /** This session's Inkwell MCP server, from the host (BackendHost.inkwellMcpUrl). */
+  inkwellMcpUrl: string;
 }

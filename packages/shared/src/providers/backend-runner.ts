@@ -1,4 +1,4 @@
-import { spawnBackend } from '../runner/spawn-backend.js';
+import { buildCleanEnv, SPAWN_ENV_INHERITED_NAMES, spawnBackend } from '../runner/spawn-backend.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from '../runtime/token-usage.js';
 import { getBackend } from './registry.js';
 import { PARENT_OWNED_TURN_ENV } from './turn-owner.js';
@@ -16,6 +16,12 @@ export const DEFAULT_TURN_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
 /** Env names that say which session a child serves; only the request's ids set them. */
 const ROUTING_ENV_NAMES = ['INK_SESSION_ID', 'INK_STUDIO_ID', 'INK_CONTEXT'] as const;
+
+/** The most an adapter's effective-config check may take (BackendAdapter.checkEffectiveConfig). */
+export const EFFECTIVE_CONFIG_CHECK_MS = 10_000;
+
+/** What a spawn refused by its effective-config check reports: EX_CONFIG. */
+export const CONFIG_REFUSED_EXIT_CODE = 78;
 
 export interface BackendRunRequest {
   backend: string;
@@ -184,9 +190,11 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   };
 
   // Set once the child is spawned. An abort before then is remembered, and
-  // the turn ends without spawning.
+  // the turn ends without spawning; one during the effective-config check
+  // also ends the check.
   let stop: ((graceMs?: number) => void) | undefined;
   let abortRequested = false;
+  const preSpawn = new AbortController();
 
   const run = async (): Promise<BackendRunResult> => {
     const prepared = await adapter.prepare(
@@ -242,6 +250,17 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         timedOut: false,
         childExited: true,
       });
+      // The adapter's fixed reason, never the backend's own output.
+      const configRefused = (command: string, reason: string): BackendRunResult => ({
+        success: false,
+        stdout: '',
+        stderr: reason,
+        exitCode: CONFIG_REFUSED_EXIT_CODE,
+        durationMs: 0,
+        command,
+        timedOut: false,
+        childExited: true,
+      });
       // An abort during preparation ends the turn before anything is minted:
       // a minting host's credential would otherwise outlive the turn.
       if (abortRequested) {
@@ -251,6 +270,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       if (mintedCeilingMs <= 0) {
         return deadlinePassed(`${prepared.binary} ${prepared.args.join(' ')}`);
       }
+      const mintedAt = Date.now();
       const credentials: Record<string, string> = {
         ...(await host.sessionEnv({ hardTimeoutMs: mintedCeilingMs })),
       };
@@ -258,9 +278,39 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       const parentEnv = await host.baseEnv();
       const binary = await host.resolveBinary(prepared.binary);
       const command = `${binary} ${prepared.args.join(' ')}`;
-      // Measured again at the spawn: time has passed since the mint, so the
-      // child's ceiling is never longer than the credentials it was handed.
-      const hardTimeoutMs = Math.min(mintedCeilingMs, ceilingMs());
+      // Everything the runner adds for this session on top of the host's base
+      // env. The caller owns the logical turn of the session this child
+      // serves (turn-owner.ts), and its host hands over that session's
+      // credentials; buildCleanEnv inherits none of them on its own.
+      const sessionAdditions = { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV };
+
+      if (adapter.checkEffectiveConfig) {
+        // The names come from the very object the spawn gets, before anything
+        // is trimmed for the probe: the credentials' names are what a server
+        // outside the session must not draw (Myra, #701 5f569213). That
+        // includes the adapter's own AGENT_ID and SB_SLUG. The allowlisted
+        // basics are left out, so a server drawing HOME is not refused.
+        const inherited = new Set(SPAWN_ENV_INHERITED_NAMES);
+        const refusal = await adapter.checkEffectiveConfig({
+          binary,
+          // By allowlist: the probe gets the inherited basics (HOME and
+          // CODEX_HOME included, as the spawn would) and none of the
+          // session's additions, so no credential can reach it.
+          probeEnv: buildCleanEnv(undefined, parentEnv),
+          sessionEnvNames: Object.keys(sessionAdditions).filter((name) => !inherited.has(name)),
+          cwd: request.workingDirectory,
+          signal: preSpawn.signal,
+          timeoutMs: Math.min(EFFECTIVE_CONFIG_CHECK_MS, mintedCeilingMs - (Date.now() - mintedAt)),
+          inkwellMcpUrl: host.inkwellMcpUrl,
+        });
+        if (abortRequested) return abortedBeforeSpawn(command);
+        if (refusal !== undefined) return configRefused(command, refusal);
+      }
+
+      // Measured at the spawn, after the check: the child's ceiling is never
+      // longer than what is left of the credentials it is handed, however
+      // long the mint, the lookup and the check took.
+      const hardTimeoutMs = Math.min(mintedCeilingMs - (Date.now() - mintedAt), ceilingMs());
       if (hardTimeoutMs <= 0) return deadlinePassed(command);
 
       // An abort during the mint or the lookup: the credential exists, but
@@ -271,10 +321,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         binary,
         args: prepared.args,
         cwd: request.workingDirectory,
-        // The caller owns the logical turn of the session this child serves
-        // (turn-owner.ts), and its host hands over that session's
-        // credentials; buildCleanEnv inherits none of them on its own.
-        env: { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV },
+        env: sessionAdditions,
         // What the child inherits comes from the host, never from this process.
         parentEnv,
         stdinData: prepared.stdinData,
@@ -326,6 +373,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     // parent waiting. The close cancels the SIGKILL, and the result, the
     // temp-file cleanup with it, waits for the child to stop.
     abort: () => {
+      preSpawn.abort();
       if (stop) stop(3000);
       else abortRequested = true;
     },

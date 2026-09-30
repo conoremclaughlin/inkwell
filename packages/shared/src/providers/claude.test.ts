@@ -40,6 +40,7 @@ function testHost(overrides: Partial<BackendHost> = {}): BackendHost {
     skillMcpServers: async () => [],
     sessionEnv: async () => ({}),
     baseEnv: async () => process.env,
+    inkwellMcpUrl: 'http://localhost:3001/mcp',
     resolveBinary: async (name) => name,
     warn: () => undefined,
     ...overrides,

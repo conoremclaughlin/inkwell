@@ -74,6 +74,7 @@ const serverHost = (credentials: Record<string, string>): BackendHost => ({
   skillMcpServers: async () => [],
   sessionEnv: async () => ({ ...credentials }),
   baseEnv: async () => process.env,
+  inkwellMcpUrl: 'http://localhost:3001/mcp',
   resolveBinary: async (name) => name,
   warn: () => undefined,
 });
