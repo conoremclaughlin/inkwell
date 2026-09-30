@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { decodeContextToken, encodeContextToken } from '@inklabs/shared';
+import { decodeContextToken, encodeContextToken } from '../runner/mcp-config.js';
 
 /**
  * What a provider child is actually handed when a host spawns it for a

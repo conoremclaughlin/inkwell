@@ -3,7 +3,7 @@ import { execSync } from 'child_process';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { decodeContextToken, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
+import { decodeContextToken, PRINT_MODE_CHANNEL_ENV } from '../runner/mcp-config.js';
 import {
   ClaudeAdapter,
   classifyMedia,
@@ -13,7 +13,7 @@ import {
 } from './claude.js';
 
 // Keep user-installed skills out of the merged MCP config.
-vi.mock('../repl/skills.js', () => ({
+vi.mock('./skill-discovery.js', () => ({
   discoverSkills: () => [],
 }));
 

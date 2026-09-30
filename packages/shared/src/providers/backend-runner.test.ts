@@ -8,7 +8,7 @@ const state = vi.hoisted(() => ({
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
-vi.mock('../backends/index.js', () => ({
+vi.mock('./registry.js', () => ({
   getBackend: (backend: string) => ({
     name: backend,
     binary: 'mock-backend',

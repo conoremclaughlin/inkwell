@@ -2,10 +2,10 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { parseSkillMcpConfig, discoverSkillMcpServers, buildMergedMcpConfig } from './skill-mcp.js';
+import { parseSkillMcpConfig, buildMergedMcpConfig } from './skill-mcp.js';
 
 // Mock discoverSkills so tests don't pick up user-installed skills from ~/.ink/skills/
-vi.mock('../repl/skills.js', () => ({
+vi.mock('./skill-discovery.js', () => ({
   discoverSkills: (cwd: string) => {
     // Only scan cwd/.ink/skills/ (workspace tier) — skip managed/bundled/extra tiers
     const { existsSync, readdirSync } = require('fs');
