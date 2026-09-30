@@ -240,6 +240,8 @@ function hookStep(
   switch (result) {
     case 'installed':
       return { label, status: 'created', detail: resolved.configPath };
+    case 'updated':
+      return { label, status: 'updated', detail: resolved.configPath };
     case 'already-installed':
       return { label, status: 'exists', detail: resolved.configPath };
     case 'conflict':
