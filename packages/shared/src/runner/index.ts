@@ -17,16 +17,16 @@ export {
 } from './spawn-backend.js';
 
 export {
-  injectSessionHeaders,
   applySessionHeaders,
   buildSessionEnv,
   encodeContextToken,
   decodeContextToken,
   PRINT_MODE_CHANNEL_ENV,
   type InjectSessionHeadersOptions,
-  type InjectSessionHeadersResult,
   type InkContextToken,
 } from './mcp-config.js';
+
+export { injectSessionHeaders, type InjectSessionHeadersResult } from './mcp-config-file.js';
 
 export { writeRuntimeSessionHint } from './runtime-hints.js';
 

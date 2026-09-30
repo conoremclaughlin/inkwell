@@ -3,12 +3,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, rmSync 
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
-  injectSessionHeaders,
   buildSessionEnv,
   encodeContextToken,
   decodeContextToken,
   type InkContextToken,
 } from './mcp-config.js';
+import { injectSessionHeaders } from './mcp-config-file.js';
 
 const testDir = join(tmpdir(), 'sb-mcp-test');
 
