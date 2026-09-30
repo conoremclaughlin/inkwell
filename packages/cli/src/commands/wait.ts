@@ -16,6 +16,7 @@
  */
 
 import type { Command } from 'commander';
+import { exitAfterFlush } from '../lib/exit-after-flush.js';
 import { InkClient } from '../lib/ink-client.js';
 import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 import { watchMessages, type WaitClock, type WaitOutput } from './wait-watch.js';
@@ -99,7 +100,7 @@ export function registerWaitCommand(program: Command): void {
       if (interval === undefined || (options.timeout !== undefined && timeout === undefined)) {
         const flag = interval === undefined ? '--interval' : '--timeout';
         console.error(`[ink wait] ${flag} must be a number of seconds.`);
-        process.exit(2);
+        return exitAfterFlush(2);
       }
       if (follow && options.group) {
         // The strategy watch already reports each change until the strategy
@@ -109,7 +110,7 @@ export function registerWaitCommand(program: Command): void {
           '[ink wait] --follow does not apply to --group: the strategy watch already reports ' +
             'each change until the strategy ends. Use --timeout to watch it for longer.'
         );
-        process.exit(2);
+        return exitAfterFlush(2);
       }
       const intervalSec = Math.max(5, interval);
       // One-shot keeps its 300s default. Follow runs until cancelled unless a
@@ -122,7 +123,7 @@ export function registerWaitCommand(program: Command): void {
 
       if (!config.email) {
         console.error(`[ink wait] ${NOT_SIGNED_IN_MESSAGE}`);
-        process.exit(2);
+        return exitAfterFlush(2);
       }
 
       // ── Strategy/task group watch mode ──
@@ -155,7 +156,7 @@ export function registerWaitCommand(program: Command): void {
           signal: controller.signal,
         }
       );
-      process.exit(code);
+      return exitAfterFlush(code);
     });
 }
 
@@ -244,7 +245,7 @@ async function watchStrategy(
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     console.error(`[ink wait] Failed to fetch initial strategy status: ${msg}`);
-    process.exit(2);
+    return exitAfterFlush(2);
   }
 
   while (Date.now() < deadline) {
@@ -278,7 +279,7 @@ async function watchStrategy(
         if (status.summary) {
           console.log(`[ink wait] ${status.summary}`);
         }
-        process.exit(strategyStatus === 'completed' ? 0 : 1);
+        return exitAfterFlush(strategyStatus === 'completed' ? 0 : 1);
       }
 
       // Strategy paused (e.g., awaiting approval)
@@ -347,5 +348,5 @@ async function watchStrategy(
   }
 
   console.error(`[ink wait] Timed out after ${timeoutSec}s. Strategy still running.`);
-  process.exit(1);
+  return exitAfterFlush(1);
 }
