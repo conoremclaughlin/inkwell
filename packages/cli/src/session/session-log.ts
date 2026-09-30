@@ -26,7 +26,8 @@ export const OBS_PROJECTION_TYPES: ReadonlySet<string> = new Set([
 
 /**
  * Where a session log's entries are persisted. `line` is one complete,
- * newline-terminated JSON entry.
+ * newline-terminated JSON entry, with an extra leading newline after a
+ * synchronous write failure to separate any partially written prior entry.
  *
  * A synchronous sink reports failure by throwing, to the caller whose append
  * caused it. An asynchronous sink reports it by rejecting, after that caller
@@ -91,6 +92,8 @@ export class SessionLog {
   private pending: Promise<void> | undefined;
   /** The first async write failure. Once set, nothing more is written. */
   private failure: { error: unknown } | undefined;
+  /** A synchronous throw may have left a partial line in the sink. */
+  private needsLineBoundary = false;
 
   constructor(options: SessionLogOptions) {
     this.path = options.path;
@@ -147,7 +150,18 @@ export class SessionLog {
         line
       );
     } else {
-      const written = this.sink.write(line);
+      let written: void | Promise<void>;
+      try {
+        written = this.sink.write(this.needsLineBoundary ? '\n' + line : line);
+        this.needsLineBoundary = false;
+      } catch (error) {
+        // Preserve the existing synchronous contract: this caller sees the
+        // failure, and a later append may still succeed. Start that append on
+        // its own line so a torn intent cannot swallow its no-dispatch outcome.
+        // Async failures remain sticky; their queued entries never resume.
+        this.needsLineBoundary = true;
+        throw error;
+      }
       if (isPromiseLike(written)) this.enqueue(Promise.resolve(written), entry, line);
       else this.mirror(entry);
     }

@@ -109,6 +109,39 @@ describe('session log tool intent adapter (in-memory sinks, fake tools)', () => 
     }
   );
 
+  it('keeps the no-dispatch closure readable after a torn synchronous intent write', async () => {
+    let bytes = '';
+    let first = true;
+    const h = harness({
+      write: (line) => {
+        if (first) {
+          first = false;
+          bytes += line.slice(0, line.length / 2);
+          throw new Error('fixture partial write');
+        }
+        bytes += line;
+      },
+    });
+    const [result] = await executeToolCalls([call], h.d);
+    const readable = bytes.split('\n').flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+    expect(h.d.callTool).not.toHaveBeenCalled();
+    expect(readable).toEqual([
+      expect.objectContaining({
+        type: 'local_tool_call',
+        eid: 2,
+        invocationId: result.invocationId,
+        dispatchState: 'not-dispatched',
+      }),
+    ]);
+    expect(h.projected).toEqual(readable);
+  });
+
   it('closes an intent when cancellation arrives during commit', async () => {
     const controller = new AbortController();
     const records: Record<string, unknown>[] = [];
