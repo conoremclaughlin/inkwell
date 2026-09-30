@@ -1727,15 +1727,22 @@ describe('detachOnChildExit', () => {
   // inline to it (Myra, #701 93c9def5; task ca307a72).
   for (const backend of ['codex', 'gemini']) {
     it(`detaches an interactive ${backend} its hooks marked attached, with or without a token`, async () => {
-      const spawnEnvs: Record<string, string>[] = [{ INK_CONTEXT: inkContext(true) }, {}];
-      for (const spawnEnv of spawnEnvs) {
+      const cases: [Record<string, string>, NodeJS.ProcessEnv][] = [
+        [{ INK_CONTEXT: inkContext(true) }, {}],
+        [{}, {}],
+        // Run from an SB's shell, the wrapper's own env carries a headless
+        // token, but the child runs with the adapter's attached token over it
+        // and its hooks write true (Myra, #701 65619ac6).
+        [{ INK_CONTEXT: inkContext(true) }, { INK_CONTEXT: inkContext(false) }],
+      ];
+      for (const [spawnEnv, parentEnv] of cases) {
         const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
         const ok = await detachOnChildExit(
           backend,
           spawnEnv,
           'sess-1',
           'lumen',
-          deps(fetchImpl as unknown as typeof fetch)
+          deps(fetchImpl as unknown as typeof fetch, parentEnv)
         );
         expect(ok).toBe(true);
         const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
