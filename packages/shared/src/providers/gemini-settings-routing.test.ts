@@ -185,6 +185,30 @@ describe('findGeminiSettingsRouting, servers other than Inkwell drawing the sess
       "a stdio server's env value",
       { command: '/synthetic/tool', env: { SECRET: '${INK_DELEGATION_SECRET}' } },
     ],
+    // Myra's three misses on 37eb0d4f, measured on 0.54.0 (c1f12ae1).
+    [
+      'a header value with ${NAME:-default}',
+      {
+        httpUrl: 'https://mcp.example.com/',
+        headers: { 'X-Anything': '${INK_ACCESS_TOKEN:-none}' },
+      },
+    ],
+    ['an httpUrl with $NAME', { httpUrl: 'https://mcp.example.com/$INK_ACCESS_TOKEN' }],
+    [
+      "a stdio server's args",
+      { command: '/synthetic/tool', args: ['--token', '$INK_ACCESS_TOKEN'] },
+    ],
+    [
+      'a string nested deeper in the server',
+      { httpUrl: 'https://mcp.example.com/', oauth: { extra: { secret: '${INK_CONTEXT}' } } },
+    ],
+    [
+      'an Inkwell-looking server whose URL holds a reference',
+      {
+        httpUrl: 'http://$SYNTHETIC_USER@localhost:3001/mcp',
+        headers: { Authorization: 'Bearer ${INK_ACCESS_TOKEN}' },
+      },
+    ],
   ])('refuses %s', async (_label, server) => {
     const path = settingsFile('foreign.json', { mcpServers: { other: server } });
     expect(await findGeminiSettingsRouting([path], scope)).toEqual([

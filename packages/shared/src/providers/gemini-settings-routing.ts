@@ -41,10 +41,11 @@ export type GeminiSettingsFinding =
 
 /**
  * The session a spawn serves, for the rule on servers other than Inkwell:
- * Gemini expands `$NAME` and `${NAME}` in a server's `headers` and `env`
- * values from the env it runs with (Myra, measured on 0.54.0, #701
- * aebf2020), so a foreign server whose values name a session var is handed
- * the session's value.
+ * Gemini expands env references in every string of its loaded settings
+ * (resolveEnvVarsInObject) from the env it runs with, so a foreign server
+ * whose config names a session var anywhere is handed the session's value.
+ * Measured on 0.54.0 in headers, env, `httpUrl` and stdio `args`, including
+ * the `${NAME:-default}` spelling (Myra, #701 aebf2020, c1f12ae1).
  */
 export interface GeminiSessionScope {
   /** This session's Inkwell MCP server, from the host. */
@@ -53,12 +54,22 @@ export interface GeminiSessionScope {
   sessionEnvNames: Iterable<string>;
 }
 
-/** `$NAME` and `${NAME}` references in a string. */
-const ENV_REFERENCE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
+/**
+ * Gemini 0.54.0's own reference pattern: `$NAME`, `${NAME}` and
+ * `${NAME:-default}`, the name in the first or second group.
+ */
+const ENV_REFERENCE = /\$(?:(\w+)|\{([^}]+?)(?::-[^}]*)?\})/g;
 
-function referencedNames(value: unknown): string[] {
-  if (typeof value !== 'string') return [];
+function referencedNames(value: string): string[] {
   return [...value.matchAll(ENV_REFERENCE)].map((match) => (match[1] ?? match[2])!);
+}
+
+/** Every string value anywhere in `value`, however deep. */
+function stringsIn(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(stringsIn);
+  if (isRecord(value)) return Object.values(value).flatMap(stringsIn);
+  return [];
 }
 
 export class BakedRoutingHeaderError extends Error {
@@ -143,10 +154,12 @@ function routingHeaderNames(settings: unknown): string[] {
 }
 
 /**
- * Whether any server other than Inkwell draws a session var through a
- * `headers` or `env` value. A server is Inkwell when its `httpUrl` or `url`
- * has the origin of the host's Inkwell URL, loopback aliases folded; one
- * with no readable URL, a stdio server included, is not Inkwell.
+ * Whether any server other than Inkwell draws a session var through any
+ * string in its config. A server is Inkwell when its `httpUrl` or `url` has
+ * the origin of the host's Inkwell URL, loopback aliases folded. One with no
+ * readable URL (a stdio server included), or whose URL itself holds a
+ * reference, is not: the comparison sees the unexpanded URL, and an
+ * expansion can change its host (Myra, c1f12ae1).
  */
 function drawsSessionEnvOffInkwell(settings: unknown, scope: GeminiSessionScope): boolean {
   if (!isRecord(settings) || !isRecord(settings.mcpServers)) return false;
@@ -156,15 +169,10 @@ function drawsSessionEnvOffInkwell(settings: unknown, scope: GeminiSessionScope)
   for (const server of Object.values(settings.mcpServers)) {
     if (!isRecord(server)) continue;
     const rawUrl = typeof server.httpUrl === 'string' ? server.httpUrl : server.url;
-    const url = typeof rawUrl === 'string' ? parseUrl(rawUrl) : undefined;
+    const url = typeof rawUrl === 'string' && !rawUrl.includes('$') ? parseUrl(rawUrl) : undefined;
     if (url && inkwellOrigin !== undefined && comparableOrigin(url) === inkwellOrigin) continue;
-    const values = [
-      ...(isRecord(server.headers) ? Object.values(server.headers) : []),
-      ...(isRecord(server.env) ? Object.values(server.env) : []),
-    ];
-    if (values.some((value) => referencedNames(value).some((name) => sessionVars.has(name)))) {
-      return true;
-    }
+    const drawn = stringsIn(server).flatMap(referencedNames);
+    if (drawn.some((name) => sessionVars.has(name))) return true;
   }
   return false;
 }
