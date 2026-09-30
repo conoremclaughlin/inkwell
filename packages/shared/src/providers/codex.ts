@@ -8,11 +8,9 @@
  */
 
 import { mkdirSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
-import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+import type { BackendAdapter, BackendConfig, BackendHost, PreparedBackend } from './types.js';
 
 /**
  * Inkwell headers to inject as env_http_headers on the "inkwell" MCP server.
@@ -40,7 +38,7 @@ export class CodexAdapter implements BackendAdapter {
   // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
   readonly promptTransport = 'argv' as const;
 
-  prepare(config: BackendConfig): PreparedBackend {
+  async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
     const { promptFile, cleanup } = createIdentityPromptFile(
       config.sbSlug,
       config.startupContextBlock,
@@ -64,7 +62,7 @@ export class CodexAdapter implements BackendAdapter {
     // alongside the workspace. --add-dir exists on both the root command and
     // the resume subcommand, and this push lands after `resume` when
     // resuming, so both shapes carry the grant. Created if missing.
-    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    const inkStudiosDir = host.paths.studiosRoot;
     try {
       mkdirSync(inkStudiosDir, { recursive: true });
     } catch {
@@ -146,7 +144,7 @@ export class CodexAdapter implements BackendAdapter {
       sessionId: config.inkSessionId || '',
       studioId: config.studioId || '',
       sbSlug: config.sbSlug,
-      cliAttached: config.cliAttached ?? true,
+      cliAttached: config.cliAttached,
       runtime: 'codex',
     });
 

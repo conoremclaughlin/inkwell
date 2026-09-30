@@ -14,13 +14,16 @@ import {
   openSync,
   readSync,
 } from 'fs';
-import { execFileSync } from 'child_process';
-import { join } from 'path';
-import { homedir } from 'os';
 import { encodeContextToken, PRINT_MODE_CHANNEL_ENV } from '../runner/mcp-config.js';
 import { buildIdentityPrompt } from './identity-prompt.js';
 import { buildMergedMcpConfig } from './skill-mcp.js';
-import type { BackendAdapter, BackendConfig, PreparedBackend, TurnMedia } from './types.js';
+import type {
+  BackendAdapter,
+  BackendConfig,
+  BackendHost,
+  PreparedBackend,
+  TurnMedia,
+} from './types.js';
 import type { BackendStreamParser } from './stream.js';
 import { ClaudeStreamParser } from './claude-stream.js';
 
@@ -137,31 +140,13 @@ export function encodeMediaBlocks(
   return out;
 }
 
-/**
- * Once-per-process probe for `--include-partial-messages` support. This runs
- * in the ink CLI process (never the API server), so a brief sync probe just
- * before spawning a multi-second backend turn is acceptable.
- */
-let partialMessagesSupport: boolean | null = null;
-function supportsPartialMessages(): boolean {
-  if (partialMessagesSupport === null) {
-    try {
-      const help = execFileSync('claude', ['--help'], { encoding: 'utf-8', timeout: 5000 });
-      partialMessagesSupport = help.includes('--include-partial-messages');
-    } catch {
-      partialMessagesSupport = false;
-    }
-  }
-  return partialMessagesSupport;
-}
-
 export class ClaudeAdapter implements BackendAdapter {
   readonly name = 'claude';
   readonly binary = 'claude';
   // Prompt is delivered via stdin (see prepare() below) — no argv ceiling.
   readonly promptTransport = 'stdin' as const;
 
-  prepare(config: BackendConfig): PreparedBackend {
+  async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
     const identityPrompt = buildIdentityPrompt(
       config.sbSlug,
       undefined,
@@ -197,7 +182,7 @@ export class ClaudeAdapter implements BackendAdapter {
     let rejectionNote = '';
     if (encoded && encoded.rejected.length > 0) {
       for (const r of encoded.rejected) {
-        console.warn(`[media] not injected (${r.reason}): ${r.media.path}`);
+        host.warn(`[media] not injected (${r.reason}): ${r.media.path}`);
       }
       rejectionNote =
         '\n\n[media note] The following attached file(s) could NOT be delivered ' +
@@ -230,7 +215,8 @@ export class ClaudeAdapter implements BackendAdapter {
       // Partial-message deltas drive paragraph-by-paragraph TUI rendering.
       // Probed (not assumed) so an older claude binary doesn't fail every
       // turn on an unknown flag; absence degrades to block-level streaming.
-      if (supportsPartialMessages()) {
+      // The host owns the probe: the CLI runs it once per process.
+      if (await host.claudeSupportsPartialMessages()) {
         args.push('--include-partial-messages');
       }
     }
@@ -267,15 +253,23 @@ export class ClaudeAdapter implements BackendAdapter {
     // its own, and the withheld servers leak straight back in. (Same pattern
     // openclaw uses: `--strict-mcp-config --mcp-config <controlled>`.)
     const localRouting = config.toolRouting === 'local';
+    // A launcher's MCP headers fall back to the session it runs in; a spawn
+    // that named its session routes by exactly what it named.
+    const ambient = config.explicitSession ? {} : host.ambientSession();
     const {
       mcpConfigPath,
       hasChannelBridge,
       cleanup: mcpCleanup,
-    } = buildMergedMcpConfig(config.cwd ?? process.cwd(), {
-      inkSessionId: config.inkSessionId,
-      studioId: config.studioId,
+    } = buildMergedMcpConfig(config.cwd, {
+      inkSessionId: config.explicitSession
+        ? config.inkSessionId
+        : config.inkSessionId || ambient.inkSessionId,
+      studioId: config.explicitSession ? config.studioId : config.studioId || ambient.studioId,
       omitToolServers: localRouting,
       explicitSession: config.explicitSession,
+      // Withheld with the rest of the tool servers under local routing, so
+      // only discovered when they can be used.
+      skillServers: localRouting ? [] : await host.skillMcpServers(config.cwd),
     });
     if (mcpConfigPath) {
       args.push('--mcp-config', mcpConfigPath);
@@ -316,7 +310,7 @@ export class ClaudeAdapter implements BackendAdapter {
     // Inkwell media directory: always grant read access so agents can
     // read downloaded attachments (email, Telegram, etc.) via the native
     // Read tool. This is Inkwell's own directory, not arbitrary fs access.
-    const inkFilesDir = join(homedir(), '.ink', 'files');
+    const inkFilesDir = host.paths.inkFiles;
     if (existsSync(inkFilesDir)) {
       args.push('--add-dir', inkFilesDir);
     }
@@ -325,7 +319,7 @@ export class ClaudeAdapter implements BackendAdapter {
     // so create_studio/overflow worktrees minted mid-session are accessible —
     // a live session can never be granted a new directory. Created if
     // missing: Claude Code ignores a nonexistent --add-dir.
-    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    const inkStudiosDir = host.paths.studiosRoot;
     try {
       mkdirSync(inkStudiosDir, { recursive: true });
     } catch {
@@ -359,7 +353,7 @@ export class ClaudeAdapter implements BackendAdapter {
       sessionId: config.inkSessionId || '',
       studioId: config.studioId || '',
       sbSlug: config.sbSlug,
-      cliAttached: config.cliAttached ?? true,
+      cliAttached: config.cliAttached,
       runtime: 'claude',
     });
 

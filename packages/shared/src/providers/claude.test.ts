@@ -1,6 +1,14 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { execSync } from 'child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { decodeContextToken, PRINT_MODE_CHANNEL_ENV } from '../runner/mcp-config.js';
@@ -11,22 +19,35 @@ import {
   readMediaBounded,
   MAX_MEDIA_FILE_BYTES,
 } from './claude.js';
+import type { BackendHost } from './types.js';
 
-// Keep user-installed skills out of the merged MCP config.
-vi.mock('./skill-discovery.js', () => ({
-  discoverSkills: () => [],
-}));
+// The host's directories live in a temp root, so no case touches the real
+// ~/.ink. It discovers no skills and runs no `claude --help` probe.
+const hostRoot = mkdtempSync(join(tmpdir(), 'claude-host-'));
+afterAll(() => rmSync(hostRoot, { recursive: true, force: true }));
 
-// Disable the `claude --help` partial-messages probe — no subprocesses in unit tests.
-vi.mock('child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('child_process')>();
+function testHost(overrides: Partial<BackendHost> = {}): BackendHost {
   return {
-    ...actual,
-    execFileSync: vi.fn(() => {
-      throw new Error('probe disabled in tests');
-    }),
+    paths: { inkFiles: join(hostRoot, 'files'), studiosRoot: join(hostRoot, 'studios') },
+    ambientSession: () => ({}),
+    claudeSupportsPartialMessages: async () => false,
+    skillMcpServers: async () => [],
+    sessionEnv: async () => ({}),
+    resolveBinary: async (name) => name,
+    warn: () => undefined,
+    ...overrides,
   };
+}
+
+let host = testHost();
+beforeEach(() => {
+  host = testHost();
 });
+
+/** A launcher's config: the directory each case changed into, attached. */
+function adapterDefaults() {
+  return { cwd: process.cwd(), cliAttached: true };
+}
 
 function mcpConfigFrom(args: string[]): Record<string, unknown> {
   const idx = args.indexOf('--mcp-config');
@@ -63,15 +84,19 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("ink-owned routing ('local') withholds tool servers AND built-ins, pinning the config strictly", () => {
+  it("ink-owned routing ('local') withholds tool servers AND built-ins, pinning the config strictly", async () => {
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+      },
+      host
+    );
     try {
       // Without strict mode claude merges user/project-scope MCP configs on
       // its own and the withheld servers leak back in.
@@ -91,16 +116,20 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
-  it('threads a per-SB effort to the claude CLI, and sends none when unset (task 7ea6cdf7)', () => {
+  it('threads a per-SB effort to the claude CLI, and sends none when unset (task 7ea6cdf7)', async () => {
     const adapter = new ClaudeAdapter();
-    const withEffort = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-      effort: 'xhigh',
-    });
+    const withEffort = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+        effort: 'xhigh',
+      },
+      host
+    );
     try {
       const idx = withEffort.args.indexOf('--effort');
       expect(idx).toBeGreaterThan(-1);
@@ -108,13 +137,17 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     } finally {
       withEffort.cleanup();
     }
-    const without = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-    });
+    const without = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+      },
+      host
+    );
     try {
       expect(without.args).not.toContain('--effort');
     } finally {
@@ -122,19 +155,23 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
-  it('local routing exposes native Read ONLY for attachment-bearing sessions (named exception)', () => {
+  it('local routing exposes native Read ONLY for attachment-bearing sessions (named exception)', async () => {
     // The multimodal render path: --attach-file media is read natively
     // (images cannot flow through ink-block tools). This is a documented
     // exception to wholly-in-ink, not the default.
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'what is in this image?',
-      promptParts: ['what is in this image?'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-      attachmentDirs: [tmpDir],
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'what is in this image?',
+        promptParts: ['what is in this image?'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+        attachmentDirs: [tmpDir],
+      },
+      host
+    );
     try {
       const toolsIdx = prepared.args.indexOf('--tools');
       expect(prepared.args[toolsIdx + 1]).toBe('Read');
@@ -144,7 +181,7 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
-  it('an adversarial inkmail entry is replaced by the constructed canonical entry', () => {
+  it('an adversarial inkmail entry is replaced by the constructed canonical entry', async () => {
     // Lumen's repro family: the project entry's launcher/args are never
     // copied — the retained entry is constructed from the resolver's on-disk
     // candidate, so the attacker string cannot reach the provider.
@@ -162,13 +199,17 @@ describe('ClaudeAdapter prepare — tool routing', () => {
       })
     );
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+      },
+      host
+    );
     try {
       const servers = mcpConfigFrom(prepared.args) as Record<
         string,
@@ -189,19 +230,23 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
-  it('a declared inkmail with no resolvable plugin yields no bridge and no channel flag', () => {
+  it('a declared inkmail with no resolvable plugin yields no bridge and no channel flag', async () => {
     // Channel loading keys off the RETAINED entry, never the raw project
     // file — claude must not be asked to load `server:inkmail` from a strict
     // config that does not define it.
     rmSync(join(tmpDir, 'packages'), { recursive: true, force: true });
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+      },
+      host
+    );
     try {
       expect(mcpConfigFrom(prepared.args)).toEqual({});
       expect(prepared.args).not.toContain('--dangerously-load-development-channels');
@@ -210,14 +255,18 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
-  it('provider-owned routing (undefined/backend) passes the full config, no strict flag', () => {
+  it('provider-owned routing (undefined/backend) passes the full config, no strict flag', async () => {
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'wren',
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'wren',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+      },
+      host
+    );
     try {
       expect(prepared.args).not.toContain('--strict-mcp-config');
       expect(prepared.args).not.toContain('--tools');
@@ -228,20 +277,106 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
+  // A launcher's MCP headers fall back to the session it runs in, which its
+  // host names; a spawn that named its own session (startBackendTurn's
+  // always do) never consults it, even to fill an id it left undefined.
+  it('routes a launcher by its host’s ambient session, and an explicit spawn never', async () => {
+    // Blank in the process env, so only the host can supply them.
+    vi.stubEnv('INK_SESSION_ID', '');
+    vi.stubEnv('INK_STUDIO_ID', '');
+    host = testHost({
+      ambientSession: () => ({ inkSessionId: 'ambient-session', studioId: 'ambient-studio' }),
+    });
+    const config = {
+      ...adapterDefaults(),
+      sbSlug: 'wren',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+    };
+    const launcher = await new ClaudeAdapter().prepare(config, host);
+    const explicit = await new ClaudeAdapter().prepare({ ...config, explicitSession: true }, host);
+    const headersOf = (args: string[]) =>
+      (mcpConfigFrom(args).inkwell as { headers: Record<string, string> }).headers;
+    try {
+      expect(headersOf(launcher.args)).toMatchObject({
+        'x-ink-session-id': '${INK_SESSION_ID}',
+        'x-ink-studio-id': '${INK_STUDIO_ID}',
+      });
+      expect(headersOf(explicit.args)['x-ink-session-id']).toBeUndefined();
+      expect(headersOf(explicit.args)['x-ink-studio-id']).toBeUndefined();
+    } finally {
+      launcher.cleanup();
+      explicit.cleanup();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('asks its host whether claude streams partial messages', async () => {
+    for (const supported of [true, false]) {
+      host = testHost({ claudeSupportsPartialMessages: async () => supported });
+      const prepared = await new ClaudeAdapter().prepare(
+        {
+          ...adapterDefaults(),
+          sbSlug: 'wren',
+          prompt: 'hello',
+          promptParts: ['hello'],
+          passthroughArgs: [],
+          stream: true,
+        },
+        host
+      );
+      try {
+        expect(prepared.args.includes('--include-partial-messages')).toBe(supported);
+      } finally {
+        prepared.cleanup();
+      }
+    }
+  });
+
+  it('grants the host’s studios root, created, and its media directory when it exists', async () => {
+    const config = {
+      ...adapterDefaults(),
+      sbSlug: 'wren',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+    };
+    const grants = (args: string[]) =>
+      args.flatMap((arg, i) => (arg === '--add-dir' ? [args[i + 1]] : []));
+
+    rmSync(host.paths.inkFiles, { recursive: true, force: true });
+    const without = await new ClaudeAdapter().prepare(config, host);
+    mkdirSync(host.paths.inkFiles, { recursive: true });
+    const withFiles = await new ClaudeAdapter().prepare(config, host);
+    try {
+      expect(grants(without.args)).toEqual([host.paths.studiosRoot]);
+      expect(existsSync(host.paths.studiosRoot)).toBe(true);
+      expect(grants(withFiles.args)).toEqual([host.paths.inkFiles, host.paths.studiosRoot]);
+    } finally {
+      without.cleanup();
+      withFiles.cleanup();
+    }
+  });
+
   // Task 2f892701: `-p` cannot show a channel notification, and both routings
   // can still load the inkmail plugin (local keeps the bridge; backend is not
   // strict). Every print-mode spawn must tell the plugin to stay inert, and an
   // interactive one must not, or live CLIs lose channel delivery.
-  it('declares print mode to the channel plugin on every -p spawn, and only there', () => {
+  it('declares print mode to the channel plugin on every -p spawn, and only there', async () => {
     const adapter = new ClaudeAdapter();
     for (const toolRouting of ['local', undefined] as const) {
-      const printed = adapter.prepare({
-        sbSlug: 'myra',
-        prompt: 'hello',
-        promptParts: ['hello'],
-        passthroughArgs: [],
-        ...(toolRouting ? { toolRouting } : {}),
-      });
+      const printed = await adapter.prepare(
+        {
+          ...adapterDefaults(),
+          sbSlug: 'myra',
+          prompt: 'hello',
+          promptParts: ['hello'],
+          passthroughArgs: [],
+          ...(toolRouting ? { toolRouting } : {}),
+        },
+        host
+      );
       try {
         expect(printed.args).toContain('-p');
         expect(printed.env).toMatchObject(PRINT_MODE_CHANNEL_ENV);
@@ -250,12 +385,10 @@ describe('ClaudeAdapter prepare — tool routing', () => {
       }
     }
 
-    const interactive = adapter.prepare({
-      sbSlug: 'wren',
-      prompt: '',
-      promptParts: [],
-      passthroughArgs: [],
-    });
+    const interactive = await adapter.prepare(
+      { ...adapterDefaults(), sbSlug: 'wren', prompt: '', promptParts: [], passthroughArgs: [] },
+      host
+    );
     try {
       expect(interactive.args).not.toContain('-p');
       expect(interactive.args).toContain('--dangerously-load-development-channels');
@@ -271,12 +404,16 @@ describe('ClaudeAdapter prepare — tool routing', () => {
   // must go inert there too (PR #685, Lumen).
   it.each([[['-p', 'hello']], [['--print', 'hello']], [['--model', 'sonnet', '-p']]])(
     'treats a print flag in passthrough %j as print mode',
-    (passthroughArgs) => {
-      const prepared = new ClaudeAdapter().prepare({
-        sbSlug: 'wren',
-        promptParts: [],
-        passthroughArgs: [...passthroughArgs],
-      });
+    async (passthroughArgs) => {
+      const prepared = await new ClaudeAdapter().prepare(
+        {
+          ...adapterDefaults(),
+          sbSlug: 'wren',
+          promptParts: [],
+          passthroughArgs: [...passthroughArgs],
+        },
+        host
+      );
       try {
         expect(prepared.env).toMatchObject(PRINT_MODE_CHANNEL_ENV);
         // The user's flag is the only one: nothing is added in front of it.
@@ -291,33 +428,36 @@ describe('ClaudeAdapter prepare — tool routing', () => {
   // Two separate questions: can this host render a channel message (never,
   // in print mode), and does the spawner own an attached session (its call).
   // An attached `ink chat` REPL's children keep the plugin inert, and a
-  // headless run's children declare themselves unattached. The default stays
-  // attached: an attached prompt is what claims the turn epoch and renews the
-  // studio lease for a human's one-shot `ink "…"`.
-  it('keeps print-mode attachment the spawner’s call, and the plugin inert either way', () => {
+  // headless run's children declare themselves unattached. There is no
+  // default any more: a human's one-shot `ink "…"` launcher passes true,
+  // since an attached prompt is what claims the turn epoch and renews the
+  // studio lease.
+  it('keeps print-mode attachment the spawner’s call, and the plugin inert either way', async () => {
     const adapter = new ClaudeAdapter();
-    const cases = [
-      { cliAttached: undefined, expected: true },
-      { cliAttached: true, expected: true },
-      { cliAttached: false, expected: false },
-    ];
-    for (const { cliAttached, expected } of cases) {
-      const prepared = adapter.prepare({
-        sbSlug: 'myra',
-        prompt: 'hello',
-        promptParts: ['hello'],
-        passthroughArgs: [],
-        ...(cliAttached !== undefined ? { cliAttached } : {}),
-      });
+    for (const cliAttached of [true, false]) {
+      const prepared = await adapter.prepare(
+        {
+          ...adapterDefaults(),
+          sbSlug: 'myra',
+          prompt: 'hello',
+          promptParts: ['hello'],
+          passthroughArgs: [],
+          cliAttached,
+        },
+        host
+      );
       try {
-        expect(decodeContextToken(prepared.env.INK_CONTEXT)?.cliAttached).toBe(expected);
+        expect(decodeContextToken(prepared.env.INK_CONTEXT)?.cliAttached).toBe(cliAttached);
         expect(prepared.env).toMatchObject(PRINT_MODE_CHANNEL_ENV);
       } finally {
         prepared.cleanup();
       }
     }
 
-    const interactive = adapter.prepare({ sbSlug: 'wren', promptParts: [], passthroughArgs: [] });
+    const interactive = await adapter.prepare(
+      { ...adapterDefaults(), sbSlug: 'wren', promptParts: [], passthroughArgs: [] },
+      host
+    );
     try {
       expect(decodeContextToken(interactive.env.INK_CONTEXT)?.cliAttached).toBe(true);
     } finally {
@@ -457,18 +597,22 @@ describe('ClaudeAdapter prepare — media injection', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('fully-injected media: stream-json stdin envelope, --tools stays empty', () => {
+  it('fully-injected media: stream-json stdin envelope, --tools stays empty', async () => {
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'what is in this image?',
-      promptParts: ['what is in this image?'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-      attachmentDirs: [tmpDir],
-      media: [{ path: pngPath, mimeType: 'image/png' }],
-      deliverMedia: true,
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'what is in this image?',
+        promptParts: ['what is in this image?'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+        attachmentDirs: [tmpDir],
+        media: [{ path: pngPath, mimeType: 'image/png' }],
+        deliverMedia: true,
+      },
+      host
+    );
     try {
       expect(prepared.args).toContain('--input-format');
       expect(prepared.args[prepared.args.indexOf('--input-format') + 1]).toBe('stream-json');
@@ -490,23 +634,27 @@ describe('ClaudeAdapter prepare — media injection', () => {
     }
   });
 
-  it('partially-injected media keeps the gated Read fallback for the rest', () => {
+  it('partially-injected media keeps the gated Read fallback for the rest', async () => {
     const pdfPath = join(tmpDir, 'doc.pdf');
     writeFileSync(pdfPath, 'not really a pdf');
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'summarize these',
-      promptParts: ['summarize these'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-      attachmentDirs: [tmpDir],
-      media: [
-        { path: pngPath, mimeType: 'image/png' },
-        { path: pdfPath, mimeType: 'application/pdf' },
-      ],
-      deliverMedia: true,
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'summarize these',
+        promptParts: ['summarize these'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+        attachmentDirs: [tmpDir],
+        media: [
+          { path: pngPath, mimeType: 'image/png' },
+          { path: pdfPath, mimeType: 'application/pdf' },
+        ],
+        deliverMedia: true,
+      },
+      host
+    );
     try {
       // Image still injected…
       expect(prepared.args).toContain('--input-format');
@@ -518,15 +666,19 @@ describe('ClaudeAdapter prepare — media injection', () => {
     }
   });
 
-  it('text-only turns keep the plain stdin path', () => {
+  it('text-only turns keep the plain stdin path', async () => {
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'hello',
-      promptParts: ['hello'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+      },
+      host
+    );
     try {
       expect(prepared.args).not.toContain('--input-format');
       expect(prepared.stdinData).toBe('hello');
@@ -535,22 +687,26 @@ describe('ClaudeAdapter prepare — media injection', () => {
     }
   });
 
-  it('resume spawns keep the delivery disposition: no re-embed, --tools stays empty', () => {
+  it('resume spawns keep the delivery disposition: no re-embed, --tools stays empty', async () => {
     // Lumen's round-1 repro (review 4900120086): a tool-loop continuation
     // resumes the provider session that already holds the injected image.
     // It must NOT reopen native Read — the boundary decision derives from
     // the same mime classification as the delivery spawn.
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'continue',
-      promptParts: ['continue'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-      attachmentDirs: [tmpDir],
-      media: [{ path: pngPath, mimeType: 'image/png' }],
-      backendSessionId: 'live-session-abc',
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'continue',
+        promptParts: ['continue'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+        attachmentDirs: [tmpDir],
+        media: [{ path: pngPath, mimeType: 'image/png' }],
+        backendSessionId: 'live-session-abc',
+      },
+      host
+    );
     try {
       expect(prepared.args).not.toContain('--input-format');
       expect(prepared.stdinData).toBe('continue');
@@ -561,23 +717,29 @@ describe('ClaudeAdapter prepare — media injection', () => {
     }
   });
 
-  it('injection failure fails CLOSED and the rejection rides the prompt itself', () => {
+  it('injection failure fails CLOSED and the rejection rides the prompt itself', async () => {
     // A supported image that cannot be read (missing file) is rejected —
     // it neither injects nor reopens the native-read exception. And because
     // stderr is invisible on successful headless runs, the note is embedded
     // in the provider input so the user hears about it.
     const adapter = new ClaudeAdapter();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'look at this',
-      promptParts: ['look at this'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-      attachmentDirs: [tmpDir],
-      media: [{ path: join(tmpDir, 'vanished.png'), mimeType: 'image/png' }],
-      deliverMedia: true,
-    });
+    // Through the host, which is where a server would log it.
+    const warn = vi.fn();
+    host = testHost({ warn });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'look at this',
+        promptParts: ['look at this'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+        attachmentDirs: [tmpDir],
+        media: [{ path: join(tmpDir, 'vanished.png'), mimeType: 'image/png' }],
+        deliverMedia: true,
+      },
+      host
+    );
     try {
       expect(prepared.args).not.toContain('--input-format');
       const toolsIdx = prepared.args.indexOf('--tools');
@@ -587,28 +749,31 @@ describe('ClaudeAdapter prepare — media injection', () => {
       expect(prepared.stdinData).toContain('[media note]');
       expect(prepared.stdinData).toContain('vanished.png');
     } finally {
-      warn.mockRestore();
       prepared.cleanup();
     }
   });
 
-  it('new media on a RESUMED conversation embeds when marked as delivery', () => {
+  it('new media on a RESUMED conversation embeds when marked as delivery', async () => {
     // Lumen's round-2 repro (review 4900202375): a server heartbeat or
     // reattach can recover an existing provider session AND deliver brand
     // new media in the same spawn. backendSessionId alone must not suppress
     // embedding — deliverMedia is the explicit signal.
     const adapter = new ClaudeAdapter();
-    const prepared = adapter.prepare({
-      sbSlug: 'myra',
-      prompt: 'here is a new photo',
-      promptParts: ['here is a new photo'],
-      passthroughArgs: [],
-      toolRouting: 'local',
-      attachmentDirs: [tmpDir],
-      media: [{ path: pngPath, mimeType: 'image/png' }],
-      deliverMedia: true,
-      backendSessionId: 'recovered-session-xyz',
-    });
+    const prepared = await adapter.prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'myra',
+        prompt: 'here is a new photo',
+        promptParts: ['here is a new photo'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+        attachmentDirs: [tmpDir],
+        media: [{ path: pngPath, mimeType: 'image/png' }],
+        deliverMedia: true,
+        backendSessionId: 'recovered-session-xyz',
+      },
+      host
+    );
     try {
       expect(prepared.args).toContain('--resume');
       expect(prepared.args).toContain('--input-format');

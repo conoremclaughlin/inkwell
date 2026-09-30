@@ -38,18 +38,33 @@ import {
   DEFAULT_TURN_HARD_TIMEOUT_MS,
   type BackendRunRequest,
 } from './backend-runner.js';
+import type { BackendHost } from './types.js';
+
+/** A host that answers everything and touches nothing. */
+function fakeHost(overrides: Partial<BackendHost> = {}): BackendHost {
+  return {
+    paths: { inkFiles: '/synthetic/ink-files', studiosRoot: '/synthetic/studios' },
+    ambientSession: () => ({}),
+    claudeSupportsPartialMessages: async () => false,
+    skillMcpServers: async () => [],
+    sessionEnv: async () => ({}),
+    resolveBinary: async (name) => name,
+    warn: () => undefined,
+    ...overrides,
+  };
+}
 
 // Even fake spawns name their host context. Only the explicit JavaScript
 // omission case below intentionally violates the request contract.
 const spawnContext: Pick<
   BackendRunRequest,
-  'cliAttached' | 'workingDirectory' | 'inkSessionId' | 'studioId' | 'sessionEnv'
+  'cliAttached' | 'workingDirectory' | 'inkSessionId' | 'studioId' | 'host'
 > = {
   cliAttached: false,
   workingDirectory: '/synthetic/studio',
   inkSessionId: undefined,
   studioId: undefined,
-  sessionEnv: {},
+  host: fakeHost(),
 };
 
 function createMockChild(exitCode = 0): EventEmitter & {
@@ -82,12 +97,12 @@ function createMockChild(exitCode = 0): EventEmitter & {
 
 describe('runBackendTurn', () => {
   // spec:sender-token-binding Phase 0 (Lumen, #694 r1). The provider child
-  // serves the caller's session: the caller hands it that session's
+  // serves the caller's session: its host hands it that session's
   // credentials and identity explicitly (ink chat: sessionEnvHandoff(), its
-  // own), and never the host's secrets. The FINAL env handed to spawn is
-  // asserted, through the real shared spawnBackend, with the adapter's own env
-  // winning where it sets a name.
-  it('hands the provider child the session env it is given, and nothing secret', async () => {
+  // own), and never the host process's secrets. The FINAL env handed to
+  // spawn is asserted, through the real shared spawnBackend, with the
+  // adapter's own env winning where it sets a name.
+  it('hands the provider child the credentials its host gives, and nothing secret', async () => {
     state.prepareCalls = [];
     spawnMock.mockImplementation(() => createMockChild(0));
     vi.stubEnv('INK_ACCESS_TOKEN', 'host-process-token');
@@ -103,13 +118,15 @@ describe('runBackendTurn', () => {
         workingDirectory: '/synthetic/studio',
         inkSessionId: 'sess-served',
         studioId: 'studio-served',
-        sessionEnv: {
-          INK_ACCESS_TOKEN: 'child-session-token',
-          INK_DELEGATION_SECRET: 'synthetic-derived-secret',
-          INK_SESSION_ID: 'sess-served',
-          INK_STUDIO_ID: 'studio-served',
-          INK_CONTEXT: 'context-served',
-        },
+        host: fakeHost({
+          sessionEnv: async () => ({
+            INK_ACCESS_TOKEN: 'child-session-token',
+            INK_DELEGATION_SECRET: 'synthetic-derived-secret',
+            INK_SESSION_ID: 'sess-served',
+            INK_STUDIO_ID: 'studio-served',
+            INK_CONTEXT: 'context-served',
+          }),
+        }),
       });
       const [, , options] = spawnMock.mock.calls[0] as [
         string,
@@ -119,7 +136,7 @@ describe('runBackendTurn', () => {
       expect(options.env.INK_ACCESS_TOKEN).toBe('child-session-token');
       expect(options.env.INK_DELEGATION_SECRET).toBe('synthetic-derived-secret');
       // Routing is the request's ids alone: the adapter writes these from
-      // them (this fake adapter writes none), and sessionEnv's are dropped.
+      // them (this fake adapter writes none), and the host's are dropped.
       expect('INK_SESSION_ID' in options.env).toBe(false);
       expect('INK_STUDIO_ID' in options.env).toBe(false);
       expect('INK_CONTEXT' in options.env).toBe(false);
@@ -138,23 +155,94 @@ describe('runBackendTurn', () => {
     }
   });
 
-  // The request type requires sessionEnv; a JavaScript caller can still omit
-  // it. The child then gets no session credentials, never the host process's.
-  it('gives a child whose caller omitted sessionEnv none of the host’s session values', async () => {
-    spawnMock.mockImplementation(() => createMockChild(0));
+  // The request type requires a host; a JavaScript caller can still omit it.
+  // Nothing then spawns, so no child can fall back to the host process's own
+  // session values.
+  it('spawns nothing for a caller that omitted the host', async () => {
+    spawnMock.mockReset().mockImplementation(() => createMockChild(0));
     vi.stubEnv('INK_ACCESS_TOKEN', 'host-process-token');
     vi.stubEnv('INK_SESSION_ID', 'host-process-session');
     try {
-      await runBackendTurn({
+      await expect(
+        runBackendTurn({
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'ping',
+        } as unknown as Parameters<typeof runBackendTurn>[0])
+      ).rejects.toThrow(TypeError);
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      spawnMock.mockReset();
+    }
+  });
+
+  it('asks the host for credentials after preparation, with the spawn’s hard ceiling', async () => {
+    spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+    state.prepareCalls = [];
+    const asked: Array<{ hardTimeoutMs: number; preparedBefore: number }> = [];
+    try {
+      for (const timeoutMs of [undefined, 1234]) {
+        await runBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'ping',
+          timeoutMs,
+          host: fakeHost({
+            sessionEnv: async (spawn) => {
+              asked.push({ ...spawn, preparedBefore: state.prepareCalls.length });
+              return {};
+            },
+          }),
+        });
+      }
+      expect(asked).toEqual([
+        { hardTimeoutMs: DEFAULT_TURN_HARD_TIMEOUT_MS, preparedBefore: 1 },
+        { hardTimeoutMs: 1234, preparedBefore: 2 },
+      ]);
+    } finally {
+      spawnMock.mockReset();
+    }
+  });
+
+  it('spawns the binary the host resolves, and reports it in the command', async () => {
+    spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+    try {
+      const result = await runBackendTurn({
+        ...spawnContext,
         backend: 'claude',
         sbSlug: 'wren',
         prompt: 'ping',
-      } as unknown as Parameters<typeof runBackendTurn>[0]);
-      const env = (spawnMock.mock.calls[0]?.[2] as { env: Record<string, string> }).env;
-      expect('INK_ACCESS_TOKEN' in env).toBe(false);
-      expect('INK_SESSION_ID' in env).toBe(false);
+        host: fakeHost({ resolveBinary: async (name) => `/synthetic/bin/${name}` }),
+      });
+      expect(spawnMock.mock.calls[0]?.[0]).toBe('/synthetic/bin/mock-backend');
+      expect(result.command).toBe('/synthetic/bin/mock-backend ping');
     } finally {
-      vi.unstubAllEnvs();
+      spawnMock.mockReset();
+    }
+  });
+
+  it('removes the per-spawn files and spawns nothing when the host cannot hand over credentials', async () => {
+    spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+    state.cleanups = 0;
+    try {
+      await expect(
+        runBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'ping',
+          host: fakeHost({
+            sessionEnv: async () => {
+              throw new Error('synthetic mint failure');
+            },
+          }),
+        })
+      ).rejects.toThrow('synthetic mint failure');
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(state.cleanups).toBe(1);
+    } finally {
       spawnMock.mockReset();
     }
   });
@@ -296,6 +384,34 @@ describe('runBackendTurn', () => {
       });
     }
 
+    /** Preparation is asynchronous: the child exists once spawn was called. */
+    const untilSpawned = () => vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
+
+    it('an abort during preparation spawns nothing and removes the per-spawn files', async () => {
+      spawnMock.mockReset().mockImplementation(() => createHeldChild());
+      state.cleanups = 0;
+      try {
+        const turn = startBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+        });
+        turn.abort();
+        expect(await turn.result).toMatchObject({
+          success: false,
+          exitCode: 143,
+          stderr: 'aborted before the backend was spawned',
+          timedOut: false,
+          childExited: true,
+        });
+        expect(spawnMock).not.toHaveBeenCalled();
+        expect(state.cleanups).toBe(1);
+      } finally {
+        spawnMock.mockReset();
+      }
+    });
+
     it('abort() sends SIGTERM, and the close cancels its SIGKILL', async () => {
       vi.useFakeTimers();
       try {
@@ -307,6 +423,7 @@ describe('runBackendTurn', () => {
           sbSlug: 'wren',
           prompt: 'synthetic',
         });
+        await untilSpawned();
         turn.abort();
         expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
         child.emit('close', null, 'SIGTERM');
@@ -331,6 +448,7 @@ describe('runBackendTurn', () => {
           sbSlug: 'wren',
           prompt: 'synthetic',
         });
+        await untilSpawned();
         turn.abort();
         await vi.advanceTimersByTimeAsync(2_999);
         expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
@@ -355,6 +473,7 @@ describe('runBackendTurn', () => {
           sbSlug: 'wren',
           prompt: 'synthetic',
         });
+        await untilSpawned();
         turn.abort();
         await vi.advanceTimersByTimeAsync(3_000 + 5_000);
         expect(child.kill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);

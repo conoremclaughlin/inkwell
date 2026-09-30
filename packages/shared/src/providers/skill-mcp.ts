@@ -213,7 +213,8 @@ function withoutRoutingHeaders(path: string): { path: string; cleanup: () => voi
  *
  * Two layers:
  * 1. Session header injection (shared with server runners via @inklabs/shared)
- * 2. Skill MCP server merging (CLI-only — server runners don't load skills)
+ * 2. Skill MCP server merging, of the servers the caller's host discovered
+ *    (the CLI's host uses discoverSkillMcpServers below)
  *
  * Returns the path to a temp file and a cleanup function.
  * When no modifications are needed, returns the original .mcp.json path.
@@ -227,16 +228,23 @@ function withoutRoutingHeaders(path: string): { path: string; cleanup: () => voi
  */
 export function buildMergedMcpConfig(
   cwd: string,
-  options?: {
+  options: {
+    /**
+     * The session and studio the headers route to, already resolved: a
+     * launcher's adapter has applied its host's ambient session, and a spawn
+     * that named its own passes exactly that. Nothing is read from the env.
+     */
     inkSessionId?: string;
     studioId?: string;
     omitToolServers?: boolean;
     /**
-     * The caller named the session and studio, possibly as none: route by
-     * exactly those, never the process env, and drop any session, studio or
-     * context header the project config carries (see BackendConfig).
+     * The caller named the session and studio, possibly as none: drop any
+     * session, studio or context header the project config carries, so the
+     * named ids are the only routing (see BackendConfig).
      */
     explicitSession?: boolean;
+    /** Skill-provided servers to merge, as the host discovered them. */
+    skillServers: SkillMcpServer[];
   }
 ): {
   mcpConfigPath: string | null;
@@ -253,7 +261,7 @@ export function buildMergedMcpConfig(
   const projectMcpPath = join(cwd, '.mcp.json');
   const hasProjectConfig = existsSync(projectMcpPath);
 
-  if (options?.omitToolServers) {
+  if (options.omitToolServers) {
     // Channel-only, deliberately: skill-provided MCP servers are NOT merged
     // here. Skill discovery spans repo/home roots independent of active
     // skills or tool policy, so re-adding them would restore provider-native
@@ -328,19 +336,12 @@ export function buildMergedMcpConfig(
 
   // ── Layer 1: Session header injection (shared logic) ──
   // Delegates to the same injectSessionHeaders used by server runners.
-  // Prefer explicit options over process.env — the CLI knows the session ID
-  // before it's set in the spawn env.
   const cleanups: Array<() => void> = [];
   let effectivePath = hasProjectConfig ? projectMcpPath : null;
 
-  // A launcher runs in the user's own session and may learn it from the env.
-  // A caller that named the session routes by exactly what it named: a host
-  // serving other sessions would otherwise stamp its own onto theirs.
-  const explicit = options?.explicitSession === true;
-  const sessionId = explicit
-    ? options?.inkSessionId
-    : options?.inkSessionId || process.env.INK_SESSION_ID;
-  const studioId = explicit ? options?.studioId : options?.studioId || process.env.INK_STUDIO_ID;
+  const explicit = options.explicitSession === true;
+  const sessionId = options.inkSessionId;
+  const studioId = options.studioId;
 
   // injectSessionHeaders keeps a header the project config already sets. For
   // an explicit caller a configured one is stale routing: drop it, so the
@@ -369,8 +370,8 @@ export function buildMergedMcpConfig(
     }
   }
 
-  // ── Layer 2: Skill MCP server merging (CLI-only) ──
-  const skillServers = discoverSkillMcpServers(cwd);
+  // ── Layer 2: Skill MCP server merging ──
+  const skillServers = options.skillServers;
   if (skillServers.length === 0) {
     return {
       mcpConfigPath: effectivePath,

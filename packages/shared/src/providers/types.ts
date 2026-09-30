@@ -6,6 +6,43 @@
  */
 
 import type { BackendStreamParser } from './stream.js';
+import type { SkillMcpServer } from './skill-mcp.js';
+
+/**
+ * What a provider spawn needs from the process that makes it, asked for by
+ * name rather than read from that process's env, cwd or home. The CLI's host
+ * answers from its own process, as the adapters once did themselves; a host
+ * serving many sessions answers for each one, and never from its own.
+ */
+export interface BackendHost {
+  readonly paths: {
+    /** Inkwell's downloaded-media directory, granted read access when it exists. */
+    readonly inkFiles: string;
+    /** The ephemeral-studio root: created if missing, and granted at spawn. */
+    readonly studiosRoot: string;
+  };
+  /**
+   * The routing a launcher inherits from the session it runs in. Read only
+   * for a spawn that does not name its own (BackendConfig.explicitSession
+   * unset), and then only for the MCP routing headers.
+   */
+  ambientSession(): { inkSessionId?: string; studioId?: string };
+  /** Whether the installed claude accepts --include-partial-messages. */
+  claudeSupportsPartialMessages(): Promise<boolean>;
+  /** Skill-provided MCP servers visible from a working directory. */
+  skillMcpServers(cwd: string): Promise<SkillMcpServer[]>;
+  /**
+   * The credentials for one spawn, asked for after preparation, just before
+   * the spawn. `hardTimeoutMs` is the spawn's hard ceiling: a host that mints
+   * makes them last that long, within its own run's deadline, plus grace to
+   * settle. Routing names in the result are dropped (see startBackendTurn).
+   */
+  sessionEnv(spawn: { hardTimeoutMs: number }): Promise<Record<string, string>>;
+  /** The executable to spawn for an adapter's binary name. */
+  resolveBinary(name: string): Promise<string>;
+  /** A warning an adapter raises, such as media it could not inject. */
+  warn(message: string): void;
+}
 
 /** A media file attached to a turn (downloaded by channel listeners). */
 export interface TurnMedia {
@@ -37,12 +74,12 @@ export interface BackendConfig {
   systemPromptOverride?: string;
   /**
    * The directory the backend runs in, and the one its project config is read
-   * from: `.mcp.json`, skills, the channel plugin. A launcher that runs in the
-   * user's own directory may omit it (process.cwd()); a host that spawns for
-   * a session in another directory must set it, or the child reads the host's
-   * config and loads none of the studio's hooks.
+   * from: `.mcp.json`, skills, the channel plugin. Required: a launcher that
+   * runs in the user's own directory passes process.cwd() itself, and a host
+   * that spawns for a session passes that session's, or the child would read
+   * the host's config and load none of the studio's hooks.
    */
-  cwd?: string;
+  cwd: string;
   /**
    * The caller named this spawn's session and studio, possibly as none. The
    * adapter then routes by exactly `inkSessionId` and `studioId`: no fallback
@@ -106,10 +143,10 @@ export interface BackendConfig {
    * hooks read. The spawner knows; the adapter cannot. A child of a headless
    * `ink chat` inherits its parent's INK_SESSION_ID, so a child that claims
    * attachment marks the parent's session attached, and the trigger handler
-   * then skips the spawn and delivers inline to nobody. Undefined keeps the
-   * adapters' default: attached.
+   * then skips the spawn and delivers inline to nobody. Required, so no
+   * spawner inherits an answer: a launcher in the user's terminal passes true.
    */
-  cliAttached?: boolean;
+  cliAttached: boolean;
 }
 
 export interface PreparedBackend {
@@ -144,9 +181,10 @@ export interface BackendAdapter {
   /**
    * Prepare everything needed to spawn the backend process.
    * Writes temp files for identity injection, builds args, sets env vars.
-   * Returns a cleanup function to remove temp files on exit.
+   * Returns a cleanup function to remove temp files on exit. Everything it
+   * needs from the spawning process comes from `host`.
    */
-  prepare(config: BackendConfig): PreparedBackend;
+  prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend>;
 
   /**
    * Optional. Presence declares "this adapter emits a parseable event stream"

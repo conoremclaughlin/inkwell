@@ -25,6 +25,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import { getBackend, BACKEND_NAMES } from '../backends/index.js';
+import { createCliBackendHost } from '../backends/cli-host.js';
 import { callInkTool } from '../lib/ink-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
@@ -440,15 +441,21 @@ async function awakenCommand(options: {
   }
 
   // 4b. Prepare and spawn an external backend CLI
-  const prepared = adapter!.prepare({
-    sbSlug: 'nascent',
-    promptParts: [],
-    passthroughArgs: [],
-    // Undefined is meaningful: adapters skip --model entirely, so the backend
-    // picks. See MODEL_CHOICES for why that is the default rather than a
-    // hardcoded id.
-    model: options.model,
-  });
+  const prepared = await adapter!.prepare(
+    {
+      sbSlug: 'nascent',
+      promptParts: [],
+      passthroughArgs: [],
+      // Undefined is meaningful: adapters skip --model entirely, so the backend
+      // picks. See MODEL_CHOICES for why that is the default rather than a
+      // hardcoded id.
+      model: options.model,
+      // A launcher runs in the user's own directory and terminal.
+      cwd: process.cwd(),
+      cliAttached: true,
+    },
+    createCliBackendHost()
+  );
 
   // Override the identity prompt file with our awakening prompt
   // For Gemini: GEMINI_SYSTEM_MD env var

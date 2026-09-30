@@ -15,11 +15,11 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
-import { tmpdir, homedir } from 'os';
+import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
-import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+import type { BackendAdapter, BackendConfig, BackendHost, PreparedBackend } from './types.js';
 
 /**
  * Build a temp Gemini settings.json that merges Inkwell auth + session headers
@@ -108,7 +108,7 @@ export class GeminiAdapter implements BackendAdapter {
   // Prompt rides argv (`-p <prompt>`) — bounded by OS ARG_MAX.
   readonly promptTransport = 'argv' as const;
 
-  prepare(config: BackendConfig): PreparedBackend {
+  async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
     const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(
       config.sbSlug,
       undefined,
@@ -143,7 +143,7 @@ export class GeminiAdapter implements BackendAdapter {
     // Ephemeral-studio root (spec:studio-materialization v8): Gemini's
     // workspace-grant equivalent of --add-dir, so studios minted mid-session
     // stay editable. Created if missing.
-    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    const inkStudiosDir = host.paths.studiosRoot;
     try {
       mkdirSync(inkStudiosDir, { recursive: true });
     } catch {
@@ -159,7 +159,7 @@ export class GeminiAdapter implements BackendAdapter {
       sessionId: config.inkSessionId || '',
       studioId: config.studioId || '',
       sbSlug: config.sbSlug,
-      cliAttached: config.cliAttached ?? true,
+      cliAttached: config.cliAttached,
       runtime: 'gemini',
     });
 
@@ -167,7 +167,7 @@ export class GeminiAdapter implements BackendAdapter {
     // INK_ACCESS_TOKEN is set at the spawn site (after prepare) — the
     // ${INK_ACCESS_TOKEN} syntax in settings.json resolves at Gemini runtime.
     const settings = buildGeminiSettings(
-      config.cwd ?? process.cwd(),
+      config.cwd,
       contextToken,
       config.inkSessionId,
       config.studioId,

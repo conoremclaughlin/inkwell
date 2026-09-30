@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { parseSkillMcpConfig, buildMergedMcpConfig } from './skill-mcp.js';
+import { parseSkillMcpConfig, buildMergedMcpConfig, discoverSkillMcpServers } from './skill-mcp.js';
 
 // Mock discoverSkills so tests don't pick up user-installed skills from ~/.ink/skills/
 vi.mock('./skill-discovery.js', () => ({
@@ -80,30 +80,14 @@ type: guide
 
 describe('buildMergedMcpConfig', () => {
   let tmpDir: string;
-  let savedInkSessionId: string | undefined;
-  let savedInkStudioId: string | undefined;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'merged-mcp-'));
-    // Isolate INK_SESSION_ID and INK_STUDIO_ID — some tests depend on them being absent
-    savedInkSessionId = process.env.INK_SESSION_ID;
-    savedInkStudioId = process.env.INK_STUDIO_ID;
-    delete process.env.INK_SESSION_ID;
-    delete process.env.INK_STUDIO_ID;
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
-    if (savedInkSessionId !== undefined) {
-      process.env.INK_SESSION_ID = savedInkSessionId;
-    } else {
-      delete process.env.INK_SESSION_ID;
-    }
-    if (savedInkStudioId !== undefined) {
-      process.env.INK_STUDIO_ID = savedInkStudioId;
-    } else {
-      delete process.env.INK_STUDIO_ID;
-    }
+    vi.unstubAllEnvs();
   });
 
   it('injects x-ink-context header even when no skill servers and no session', () => {
@@ -116,7 +100,9 @@ describe('buildMergedMcpConfig', () => {
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+    });
     try {
       // x-ink-context is now layered unconditionally so the backend runtime
       // still receives sbSlug/studioId/runtime even without a session.
@@ -131,7 +117,9 @@ describe('buildMergedMcpConfig', () => {
   });
 
   it('returns null when no .mcp.json and no skill servers', () => {
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+    });
     try {
       expect(mcpConfigPath).toBeNull();
     } finally {
@@ -169,7 +157,9 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+    });
     try {
       expect(mcpConfigPath).not.toBeNull();
       // Should be a temp file, not the original
@@ -209,8 +199,8 @@ mcp:
       })
     );
 
-    const first = buildMergedMcpConfig(tmpDir);
-    const second = buildMergedMcpConfig(tmpDir);
+    const first = buildMergedMcpConfig(tmpDir, { skillServers: discoverSkillMcpServers(tmpDir) });
+    const second = buildMergedMcpConfig(tmpDir, { skillServers: discoverSkillMcpServers(tmpDir) });
     try {
       expect(second.mcpConfigPath).not.toBe(first.mcpConfigPath);
       first.cleanup();
@@ -252,7 +242,9 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+    });
     try {
       const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
       // Original inkwell config preserved, not overridden by skill
@@ -265,8 +257,7 @@ mcp:
 
   // ─── Inkwell Session Header Injection ───
 
-  it('injects x-ink-session-id header when INK_SESSION_ID is set', () => {
-    process.env.INK_SESSION_ID = 'abc-123-def';
+  it('injects x-ink-session-id header when a session is named', () => {
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -276,7 +267,10 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      inkSessionId: 'abc-123-def',
+    });
     try {
       expect(mcpConfigPath).not.toBeNull();
       // Should be a temp file (modified), not the original
@@ -292,7 +286,11 @@ mcp:
     }
   });
 
-  it('omits x-ink-session-id header when INK_SESSION_ID is not set', () => {
+  // A launcher's fallback to the session it runs in is its adapter's, through
+  // the host (claude.test.ts); this builder reads no session from the env.
+  it('omits x-ink-session-id header for an unnamed session, whatever the env holds', () => {
+    vi.stubEnv('INK_SESSION_ID', 'ambient-env-session');
+    vi.stubEnv('INK_STUDIO_ID', 'ambient-env-studio');
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -302,11 +300,14 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+    });
     try {
       // Injects a merged temp file (for x-ink-context) but NOT x-ink-session-id
       const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
       expect(merged.mcpServers.inkwell.headers['x-ink-session-id']).toBeUndefined();
+      expect(merged.mcpServers.inkwell.headers['x-ink-studio-id']).toBeUndefined();
       expect(merged.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');
     } finally {
       cleanup();
@@ -314,7 +315,6 @@ mcp:
   });
 
   it('respects existing user-configured x-ink-session-id header', () => {
-    process.env.INK_SESSION_ID = 'should-not-override';
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -331,7 +331,10 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      inkSessionId: 'should-not-override',
+    });
     try {
       // No modification — user already configured the header
       expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
@@ -341,7 +344,6 @@ mcp:
   });
 
   it('preserves existing headers when injecting session id', () => {
-    process.env.INK_SESSION_ID = 'abc-123';
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -355,7 +357,10 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      inkSessionId: 'abc-123',
+    });
     try {
       const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
       // Both headers present
@@ -366,9 +371,7 @@ mcp:
     }
   });
 
-  it('injects header via explicit options even without env var', () => {
-    // Simulates the CLI passing inkSessionId directly (before setting spawn env)
-    delete process.env.INK_SESSION_ID;
+  it('injects the session and studio headers for a named session and studio', () => {
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -379,6 +382,7 @@ mcp:
     );
 
     const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
       inkSessionId: 'explicit-session-id',
       studioId: 'explicit-studio-id',
     });
@@ -393,7 +397,6 @@ mcp:
   });
 
   it('does not inject header when no Inkwell server entry exists', () => {
-    process.env.INK_SESSION_ID = 'abc-123';
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -403,7 +406,10 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      inkSessionId: 'abc-123',
+    });
     try {
       // No Inkwell server to inject into — return original
       expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
@@ -451,7 +457,10 @@ describe('buildMergedMcpConfig omitToolServers (wholly-in-ink)', () => {
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      omitToolServers: true,
+    });
     try {
       // Never the project config itself — always a controlled temp file.
       expect(mcpConfigPath).not.toBe(join(tmpDir, '.mcp.json'));
@@ -500,7 +509,10 @@ mcp:
 `
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      omitToolServers: true,
+    });
     try {
       const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
       expect(Object.keys(config.mcpServers)).toEqual(['inkmail']);
@@ -524,6 +536,7 @@ mcp:
     );
 
     const { mcpConfigPath, hasChannelBridge, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
       omitToolServers: true,
     });
     try {
@@ -561,6 +574,7 @@ mcp:
       writeFileSync(join(tmpDir, '.mcp.json'), JSON.stringify({ mcpServers: { inkmail: evil } }));
 
       const { mcpConfigPath, hasChannelBridge, cleanup } = buildMergedMcpConfig(tmpDir, {
+        skillServers: discoverSkillMcpServers(tmpDir),
         omitToolServers: true,
       });
       try {
@@ -600,7 +614,10 @@ mcp:
       })
     );
 
-    const withheld = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const withheld = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      omitToolServers: true,
+    });
     try {
       expect(withheld.hasChannelBridge).toBe(true);
     } finally {
@@ -608,7 +625,9 @@ mcp:
     }
 
     // Non-withholding path: keyed off the project config's own entry.
-    const passthrough = buildMergedMcpConfig(tmpDir);
+    const passthrough = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+    });
     try {
       expect(passthrough.hasChannelBridge).toBe(true);
     } finally {
@@ -617,7 +636,10 @@ mcp:
   });
 
   it('returns an empty (but valid) config when there is no project .mcp.json', () => {
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      omitToolServers: true,
+    });
     try {
       // Still a real file: paired with --strict-mcp-config this means
       // "no MCP servers at all" rather than falling back to claude's own
@@ -631,7 +653,10 @@ mcp:
   });
 
   it('cleanup removes the temp file', () => {
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      omitToolServers: true,
+    });
     expect(existsSync(mcpConfigPath!)).toBe(true);
     cleanup();
     expect(existsSync(mcpConfigPath!)).toBe(false);
@@ -641,8 +666,14 @@ mcp:
   // in one host) each get their own file, so the first to finish cannot delete
   // a config the second's backend has not read yet.
   it('gives each spawn its own file, so one cleanup leaves the other config in place', () => {
-    const first = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
-    const second = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const first = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      omitToolServers: true,
+    });
+    const second = buildMergedMcpConfig(tmpDir, {
+      skillServers: discoverSkillMcpServers(tmpDir),
+      omitToolServers: true,
+    });
     try {
       expect(second.mcpConfigPath).not.toBe(first.mcpConfigPath);
       first.cleanup();

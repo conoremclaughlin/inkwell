@@ -22,6 +22,7 @@ import {
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveSlug } from '../backends/index.js';
+import { createCliBackendHost } from '../backends/cli-host.js';
 import { classifyError, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
@@ -3762,17 +3763,23 @@ export async function runClaude(
     inkSessionId: sessionContext.inkSessionId,
   });
 
-  const prepared = adapter.prepare({
-    sbSlug,
-    model: options.model,
-    prompt,
-    promptParts,
-    passthroughArgs,
-    ...(startupContextBlock ? { startupContextBlock } : {}),
-    ...sessionContext,
-    ...(studioId ? { studioId } : {}),
-    ...(options.dangerous ? { dangerous: true } : {}),
-  });
+  const prepared = await adapter.prepare(
+    {
+      sbSlug,
+      model: options.model,
+      prompt,
+      promptParts,
+      passthroughArgs,
+      // A launcher runs in the user's own directory and terminal.
+      cwd: process.cwd(),
+      cliAttached: true,
+      ...(startupContextBlock ? { startupContextBlock } : {}),
+      ...sessionContext,
+      ...(studioId ? { studioId } : {}),
+      ...(options.dangerous ? { dangerous: true } : {}),
+    },
+    createCliBackendHost()
+  );
 
   if (options.verbose) {
     console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
@@ -4021,18 +4028,26 @@ export async function runClaudeInteractive(
   let finalCapturedBackendSessionId = sessionContext.backendSessionId;
 
   const runAttempt = async (): Promise<{ code: number | null; stderrText: string }> => {
-    const prepared = adapter.prepare({
-      sbSlug,
-      model: options.model,
-      promptParts: [],
-      passthroughArgs,
-      ...(startupContextBlock ? { startupContextBlock } : {}),
-      ...sessionContext,
-      ...(attemptBackendSessionId ? { backendSessionId: attemptBackendSessionId } : {}),
-      ...(attemptBackendSessionSeedId ? { backendSessionSeedId: attemptBackendSessionSeedId } : {}),
-      ...(studioId ? { studioId } : {}),
-      ...(options.dangerous ? { dangerous: true } : {}),
-    });
+    const prepared = await adapter.prepare(
+      {
+        sbSlug,
+        model: options.model,
+        promptParts: [],
+        passthroughArgs,
+        // A launcher runs in the user's own directory and terminal.
+        cwd: process.cwd(),
+        cliAttached: true,
+        ...(startupContextBlock ? { startupContextBlock } : {}),
+        ...sessionContext,
+        ...(attemptBackendSessionId ? { backendSessionId: attemptBackendSessionId } : {}),
+        ...(attemptBackendSessionSeedId
+          ? { backendSessionSeedId: attemptBackendSessionSeedId }
+          : {}),
+        ...(studioId ? { studioId } : {}),
+        ...(options.dangerous ? { dangerous: true } : {}),
+      },
+      createCliBackendHost()
+    );
 
     if (options.verbose) {
       console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));

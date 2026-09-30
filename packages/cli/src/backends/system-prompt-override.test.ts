@@ -12,6 +12,12 @@
 import { describe, it, expect } from 'vitest';
 import { buildIdentityPrompt } from './identity.js';
 import { getBackend } from './index.js';
+import { createCliBackendHost } from './cli-host.js';
+
+// Awakening prepares as a launcher does: the CLI's own host, in the test
+// process's directory, attached to its terminal.
+const cliHost = createCliBackendHost();
+const LAUNCHER_DEFAULTS = { cwd: process.cwd(), cliAttached: true };
 
 const AWAKENING = '# Awakening\n\nYou are a newly awakened SB. You have no name yet.';
 
@@ -53,13 +59,17 @@ describe('buildIdentityPrompt — override', () => {
 });
 
 describe('adapters carry the override to the backend', () => {
-  it('claude passes it via --append-system-prompt', () => {
-    const prepared = getBackend('claude').prepare({
-      sbSlug: 'nascent',
-      promptParts: [],
-      passthroughArgs: [],
-      systemPromptOverride: AWAKENING,
-    });
+  it('claude passes it via --append-system-prompt', async () => {
+    const prepared = await getBackend('claude').prepare(
+      {
+        ...LAUNCHER_DEFAULTS,
+        sbSlug: 'nascent',
+        promptParts: [],
+        passthroughArgs: [],
+        systemPromptOverride: AWAKENING,
+      },
+      cliHost
+    );
     const idx = prepared.args.indexOf('--append-system-prompt');
     expect(idx).toBeGreaterThan(-1);
     expect(prepared.args[idx + 1]).toBe(AWAKENING);
@@ -71,12 +81,16 @@ describe('adapters carry the override to the backend', () => {
     ['gemini', 'GEMINI_SYSTEM_MD'],
   ])('%s writes it to the prompt file it hands the backend', async (backend, marker) => {
     const { readFileSync } = await import('fs');
-    const prepared = getBackend(backend).prepare({
-      sbSlug: 'nascent',
-      promptParts: [],
-      passthroughArgs: [],
-      systemPromptOverride: AWAKENING,
-    });
+    const prepared = await getBackend(backend).prepare(
+      {
+        ...LAUNCHER_DEFAULTS,
+        sbSlug: 'nascent',
+        promptParts: [],
+        passthroughArgs: [],
+        systemPromptOverride: AWAKENING,
+      },
+      cliHost
+    );
 
     const fromEnv = prepared.env[marker];
     const fromArgs = prepared.args
@@ -89,12 +103,11 @@ describe('adapters carry the override to the backend', () => {
     prepared.cleanup();
   });
 
-  it('leaves the normal identity prompt intact when no override is given', () => {
-    const prepared = getBackend('claude').prepare({
-      sbSlug: 'wren',
-      promptParts: [],
-      passthroughArgs: [],
-    });
+  it('leaves the normal identity prompt intact when no override is given', async () => {
+    const prepared = await getBackend('claude').prepare(
+      { ...LAUNCHER_DEFAULTS, sbSlug: 'wren', promptParts: [], passthroughArgs: [] },
+      cliHost
+    );
     const idx = prepared.args.indexOf('--append-system-prompt');
     expect(prepared.args[idx + 1]).toContain('You are wren');
     prepared.cleanup();

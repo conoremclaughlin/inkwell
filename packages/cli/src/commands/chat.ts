@@ -20,6 +20,7 @@ import {
   type RuntimePreferences,
 } from '../backends/identity.js';
 import { promptTransportFor } from '../backends/index.js';
+import { createCliBackendHost } from '../backends/cli-host.js';
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
 import {
@@ -215,7 +216,6 @@ import {
   encodeContextToken,
   mintDelegationToken,
   RUN_TURN_EPOCH_ENV,
-  sessionEnvHandoff,
   verifyDelegationToken,
   type DelegationTokenPayload,
 } from '@inklabs/shared';
@@ -3621,18 +3621,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
   currentInkSessionId = () => runtime.sessionId;
   currentInkStudioId = () => runtime.studioId || identity?.studioId;
   // What every provider spawn of this chat serves: this chat's directory, its
-  // session, and its own session credentials (backend-runner.ts). Read at
-  // spawn time, because the session and studio can change after startup. The
-  // root checkout's 'main' is a sentinel, not a studio id, so it names no
-  // studio here, as in hooks.ts and turn-signal.ts.
+  // session, and this process as its host, which hands over its own session
+  // credentials (backend-runner.ts, backends/cli-host.ts). Read at spawn
+  // time, because the session and studio can change after startup. The root
+  // checkout's 'main' is a sentinel, not a studio id, so it names no studio
+  // here, as in hooks.ts and turn-signal.ts.
+  const providerHost = createCliBackendHost();
   const providerSpawnContext = (): Pick<
     BackendRunRequest,
-    'workingDirectory' | 'inkSessionId' | 'studioId' | 'sessionEnv'
+    'workingDirectory' | 'inkSessionId' | 'studioId' | 'host'
   > => ({
     workingDirectory: process.cwd(),
     inkSessionId: runtime.sessionId,
     studioId: runtime.studioId && runtime.studioId !== 'main' ? runtime.studioId : undefined,
-    sessionEnv: sessionEnvHandoff(),
+    host: providerHost,
   });
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {

@@ -3,7 +3,7 @@ import { extractBackendTokenUsage, type BackendTokenUsage } from '../runtime/tok
 import { getBackend } from './registry.js';
 import { PARENT_OWNED_TURN_ENV } from './turn-owner.js';
 import type { BackendTurnEvent } from './stream.js';
-import type { TurnMedia } from './types.js';
+import type { BackendHost, TurnMedia } from './types.js';
 
 /**
  * Default absolute backstop for a single backend turn. Deliberately generous:
@@ -103,14 +103,15 @@ export interface BackendRunRequest {
   inkSessionId: string | undefined;
   studioId: string | undefined;
   /**
-   * The session credentials the child is handed: `ink chat` passes
-   * `sessionEnvHandoff()`, its own; a host serving several sessions passes
-   * each spawn's own, never the host process's. Routing names in it
-   * (INK_SESSION_ID, INK_STUDIO_ID, INK_CONTEXT) are dropped in favour of the
-   * ids above. The adapter's prepared env and the turn-owner marker are
-   * applied on top.
+   * Everything the spawn needs from the process making it (see BackendHost).
+   * The child's credentials are `host.sessionEnv()`, asked for once per spawn
+   * after preparation: `ink chat`'s host hands over its own session's, and a
+   * host serving several sessions mints each spawn's, never its own. Routing
+   * names in them (INK_SESSION_ID, INK_STUDIO_ID, INK_CONTEXT) are dropped in
+   * favour of the ids above; the adapter's prepared env and the turn-owner
+   * marker are applied on top.
    */
-  sessionEnv: Record<string, string>;
+  host: BackendHost;
 }
 
 export interface BackendRunResult {
@@ -143,42 +144,19 @@ export interface BackendTurnHandle {
   abort: () => void;
 }
 
+/**
+ * What an abort before the spawn reports: the SIGTERM exit an abort gives a
+ * spawned child, so a caller sees one shape either way.
+ */
+const ABORTED_BEFORE_SPAWN_EXIT_CODE = 128 + 15;
+
 export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle {
   const adapter = getBackend(request.backend);
+  const host = request.host;
   const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
   const streaming = Boolean(request.stream && adapter.createStreamParser);
   const parser = streaming ? adapter.createStreamParser!() : null;
-
-  const prepared = adapter.prepare({
-    sbSlug: request.sbSlug,
-    model: request.model,
-    effort: request.effort,
-    prompt: request.prompt,
-    promptParts,
-    passthroughArgs: request.passthroughArgs || [],
-    systemPromptOverride: request.systemPromptOverride,
-    attachmentDirs: request.attachmentDirs,
-    backendSessionId: request.backendSessionId,
-    backendSessionSeedId: request.backendSessionSeedId,
-    stream: streaming,
-    toolRouting: request.toolRouting,
-    media: request.media,
-    deliverMedia: request.deliverMedia,
-    cliAttached: request.cliAttached,
-    cwd: request.workingDirectory,
-    explicitSession: true,
-    inkSessionId: request.inkSessionId,
-    studioId: request.studioId,
-  });
-
-  // The request's ids are the only source of the child's routing. The adapter
-  // writes INK_CONTEXT, and INK_SESSION_ID/INK_STUDIO_ID when named, from
-  // them; the same names in sessionEnv are dropped, so an id the caller left
-  // undefined stays absent rather than arriving from wherever the env came.
-  const credentials: Record<string, string> = { ...(request.sessionEnv ?? {}) };
-  for (const name of ROUTING_ENV_NAMES) delete credentials[name];
-
-  const command = `${prepared.binary} ${prepared.args.join(' ')}`;
+  const hardTimeoutMs = request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS;
 
   // Streaming accumulators, populated as events arrive.
   let accumulatedText = '';
@@ -199,32 +177,86 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     }
   };
 
-  const { result, stop } = spawnBackend({
-    binary: prepared.binary,
-    args: prepared.args,
-    cwd: request.workingDirectory,
-    // The caller owns the logical turn of the session this child serves
-    // (lib/turn-owner.ts), and hands it that session's credentials
-    // explicitly; buildCleanEnv inherits none of them on its own. A JavaScript
-    // caller that omits them gets none rather than the host's.
-    env: { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV },
-    stdinData: prepared.stdinData,
-    timeoutMs: request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS,
-    idleTimeoutMs: request.idleTimeoutMs,
-    onStdout:
-      streaming || request.verbose
-        ? (chunk) => {
-            if (request.verbose) process.stdout.write(chunk);
-            if (parser) drain(parser.push(chunk));
-          }
-        : undefined,
-    onStderr: request.verbose ? (chunk) => process.stderr.write(chunk) : undefined,
-  });
+  // Set once the child is spawned. An abort before then is remembered, and
+  // the turn ends without spawning.
+  let stop: ((graceMs?: number) => void) | undefined;
+  let abortRequested = false;
 
-  return {
-    result: result.then((spawnResult) => {
+  const run = async (): Promise<BackendRunResult> => {
+    const prepared = await adapter.prepare(
+      {
+        sbSlug: request.sbSlug,
+        model: request.model,
+        effort: request.effort,
+        prompt: request.prompt,
+        promptParts,
+        passthroughArgs: request.passthroughArgs || [],
+        systemPromptOverride: request.systemPromptOverride,
+        attachmentDirs: request.attachmentDirs,
+        backendSessionId: request.backendSessionId,
+        backendSessionSeedId: request.backendSessionSeedId,
+        stream: streaming,
+        toolRouting: request.toolRouting,
+        media: request.media,
+        deliverMedia: request.deliverMedia,
+        cliAttached: request.cliAttached,
+        cwd: request.workingDirectory,
+        explicitSession: true,
+        inkSessionId: request.inkSessionId,
+        studioId: request.studioId,
+      },
+      host
+    );
+    try {
+      // Asked for after preparation, so a credential minted for this spawn
+      // starts its life as close to the spawn as it can. The request's ids
+      // are the only source of the child's routing: the adapter writes
+      // INK_CONTEXT, and INK_SESSION_ID/INK_STUDIO_ID when named, from them,
+      // and the same names in the credentials are dropped, so an id the
+      // caller left undefined stays absent rather than arriving from
+      // wherever the credentials came.
+      const credentials: Record<string, string> = { ...(await host.sessionEnv({ hardTimeoutMs })) };
+      for (const name of ROUTING_ENV_NAMES) delete credentials[name];
+      const binary = await host.resolveBinary(prepared.binary);
+      const command = `${binary} ${prepared.args.join(' ')}`;
+
+      if (abortRequested) {
+        return {
+          success: false,
+          stdout: '',
+          stderr: 'aborted before the backend was spawned',
+          exitCode: ABORTED_BEFORE_SPAWN_EXIT_CODE,
+          durationMs: 0,
+          command,
+          timedOut: false,
+          childExited: true,
+        };
+      }
+
+      const spawned = spawnBackend({
+        binary,
+        args: prepared.args,
+        cwd: request.workingDirectory,
+        // The caller owns the logical turn of the session this child serves
+        // (turn-owner.ts), and its host hands over that session's
+        // credentials; buildCleanEnv inherits none of them on its own.
+        env: { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV },
+        stdinData: prepared.stdinData,
+        timeoutMs: hardTimeoutMs,
+        idleTimeoutMs: request.idleTimeoutMs,
+        onStdout:
+          streaming || request.verbose
+            ? (chunk) => {
+                if (request.verbose) process.stdout.write(chunk);
+                if (parser) drain(parser.push(chunk));
+              }
+            : undefined,
+        onStderr: request.verbose ? (chunk) => process.stderr.write(chunk) : undefined,
+      });
+      stop = spawned.stop;
+      const spawnResult = await spawned.result;
+
       if (parser) drain(parser.end());
-      prepared.cleanup();
       // In streaming mode the parsed assistant text is authoritative (stdout is
       // the raw event stream). Fall back to accumulated deltas if no `result`
       // event arrived (e.g. the turn was reaped mid-flight).
@@ -245,11 +277,22 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         timeoutType: spawnResult.timeoutType,
         childExited: spawnResult.childExited,
       };
-    }),
+    } finally {
+      // After the child has stopped (spawnBackend settles no sooner), or
+      // after a failure before it was spawned.
+      prepared.cleanup();
+    }
+  };
+
+  return {
+    result: run(),
     // The timeout's ladder with a shorter grace: an abort is a person or a
     // parent waiting. The close cancels the SIGKILL, and the result, the
     // temp-file cleanup with it, waits for the child to stop.
-    abort: () => stop(3000),
+    abort: () => {
+      if (stop) stop(3000);
+      else abortRequested = true;
+    },
   };
 }
 

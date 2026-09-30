@@ -27,8 +27,6 @@ vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
   return {
     ...actual,
-    // Capability discovery is IO too; never run an installed provider in a unit test.
-    execFileSync: vi.fn(() => '--include-partial-messages'),
     spawn: (
       _binary: string,
       args: string[],
@@ -55,8 +53,25 @@ vi.mock('child_process', async (importOriginal) => {
 });
 
 import { runBackendTurn } from './backend-runner.js';
+import type { BackendHost } from './types.js';
 
 let studio: string;
+
+/**
+ * A host serving several sessions. Its own ambient session is the host's,
+ * which a spawn that names its session must never use; each spawn's
+ * credentials are the ones handed to it here. The probe is answered, never
+ * run: no installed provider runs in a unit test.
+ */
+const serverHost = (credentials: Record<string, string>): BackendHost => ({
+  paths: { inkFiles: join(studio, '.host-files'), studiosRoot: join(studio, '.host-studios') },
+  ambientSession: () => ({ inkSessionId: 'host-own-session', studioId: 'host-own-studio' }),
+  claudeSupportsPartialMessages: async () => true,
+  skillMcpServers: async () => [],
+  sessionEnv: async () => ({ ...credentials }),
+  resolveBinary: async (name) => name,
+  warn: () => undefined,
+});
 
 beforeEach(() => {
   spawned.length = 0;
@@ -90,7 +105,7 @@ const hosted = (backend: string) => ({
   workingDirectory: studio,
   inkSessionId: 'sess-hosted',
   studioId: 'studio-hosted',
-  sessionEnv: { INK_ACCESS_TOKEN: 'minted-for-this-spawn', INK_SESSION_ID: 'sess-hosted' },
+  host: serverHost({ INK_ACCESS_TOKEN: 'minted-for-this-spawn', INK_SESSION_ID: 'sess-hosted' }),
 });
 
 describe('a provider spawned for a session', () => {
@@ -102,6 +117,8 @@ describe('a provider spawned for a session', () => {
       const [child] = spawned;
 
       expect(child.cwd).toBe(studio);
+      // The studios root it is granted is the host's, not the server's home.
+      expect(child.args).toContain(join(studio, '.host-studios'));
       expect(child.env.INK_ACCESS_TOKEN).toBe('minted-for-this-spawn');
       expect(child.env.INK_SESSION_ID).toBe('sess-hosted');
       expect(child.env.INK_STUDIO_ID).toBe('studio-hosted');
@@ -135,8 +152,9 @@ describe('a provider spawned for a session', () => {
 /**
  * The negative space (Lumen, P1 review): a caller that names no session or
  * studio, the root checkout or a session not yet started, must not have one
- * supplied by the host's env, by routing names in its own sessionEnv, or by a
- * routing header the project config carries.
+ * supplied by the host's env or ambient session, by routing names in the
+ * credentials its host hands over, or by a routing header the project config
+ * carries.
  */
 describe('a provider spawned with no session or studio named', () => {
   const writeStaleProjectConfig = () =>
@@ -160,11 +178,11 @@ describe('a provider spawned with no session or studio named', () => {
     ...hosted(backend),
     inkSessionId: undefined,
     studioId: undefined,
-    sessionEnv: {
+    host: serverHost({
       INK_ACCESS_TOKEN: 'minted-for-this-spawn',
       INK_SESSION_ID: 'routing-in-session-env',
       INK_CONTEXT: 'routing-in-session-env',
-    },
+    }),
   });
   const lowerKeys = (headers: Record<string, string>) =>
     Object.keys(headers).map((name) => name.toLowerCase());
@@ -208,6 +226,7 @@ describe('a provider spawned with no session or studio named', () => {
     writeStaleProjectConfig();
     await runBackendTurn(unnamed('gemini'));
     const [child] = spawned;
+    expect(child.args).toContain(join(studio, '.host-studios'));
     const headers = JSON.parse(child.geminiSettings!).mcpServers.inkwell.headers as Record<
       string,
       string
