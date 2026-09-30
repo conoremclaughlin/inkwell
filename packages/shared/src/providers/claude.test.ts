@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -369,6 +370,34 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     expect(existsSync(path)).toBe(true);
     await prepared.cleanup();
     expect(existsSync(path)).toBe(false);
+  });
+
+  it('removes its MCP config when a later host call fails', async () => {
+    const sbMcp = join(host.paths.tempDir, 'sb-mcp');
+    const before = existsSync(sbMcp) ? readdirSync(sbMcp) : [];
+    host = testHost({
+      claudeSupportsPartialMessages: async () => {
+        throw new Error('synthetic probe failure');
+      },
+    });
+    await expect(
+      new ClaudeAdapter().prepare(
+        {
+          ...adapterDefaults(),
+          sbSlug: 'wren',
+          prompt: 'hello',
+          promptParts: ['hello'],
+          passthroughArgs: [],
+          toolRouting: 'local',
+          stream: true,
+        },
+        host
+      )
+    ).rejects.toThrow('synthetic probe failure');
+    // Only new files count: other cases' unawaited cleanups may still be
+    // removing theirs.
+    const after = existsSync(sbMcp) ? readdirSync(sbMcp) : [];
+    expect(after.filter((name) => !before.includes(name))).toEqual([]);
   });
 
   it('asks its host whether claude streams partial messages', async () => {

@@ -140,6 +140,53 @@ export class ClaudeAdapter implements BackendAdapter {
   readonly promptTransport = 'stdin' as const;
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
+    // MCP config: merge project .mcp.json with skill-provided MCP servers.
+    // Pass inkSessionId/studioId explicitly — process.env doesn't have them yet
+    // (they're set in the spawn env below, not in the sb CLI's own env).
+    //
+    // Ink-owned routing (wholly-in-ink): tool-bearing servers are withheld
+    // structurally. `--allowedTools ''` cannot do this — it is a permission
+    // auto-approve list, nullified by --dangerously-skip-permissions — so the
+    // provider must never see the servers at all. `--strict-mcp-config` is
+    // essential: without it claude merges user/project-scope MCP configs on
+    // its own, and the withheld servers leak straight back in. (Same pattern
+    // openclaw uses: `--strict-mcp-config --mcp-config <controlled>`.)
+    const localRouting = config.toolRouting === 'local';
+    // A launcher's MCP headers fall back to the session it runs in; a spawn
+    // that named its session routes by exactly what it named.
+    const ambient = config.explicitSession ? {} : host.ambientSession();
+    const merged = await buildMergedMcpConfig(config.cwd, {
+      inkSessionId: config.explicitSession
+        ? config.inkSessionId
+        : config.inkSessionId || ambient.inkSessionId,
+      studioId: config.explicitSession ? config.studioId : config.studioId || ambient.studioId,
+      omitToolServers: localRouting,
+      explicitSession: config.explicitSession,
+      // Withheld with the rest of the tool servers under local routing, so
+      // only discovered when they can be used.
+      skillServers: localRouting ? [] : await host.skillMcpServers(config.cwd),
+      tempDir: host.paths.tempDir,
+    });
+    // The MCP config is the one file this adapter writes, so it is built
+    // first and removed if anything after it fails: a prepare that rejects
+    // leaves nothing behind (PreparedBackend.cleanup).
+    try {
+      return await this.prepareWith(config, host, merged);
+    } catch (error) {
+      await merged.cleanup();
+      throw error;
+    }
+  }
+
+  private async prepareWith(
+    config: BackendConfig,
+    host: BackendHost,
+    {
+      mcpConfigPath,
+      hasChannelBridge,
+      cleanup: mcpCleanup,
+    }: Awaited<ReturnType<typeof buildMergedMcpConfig>>
+  ): Promise<PreparedBackend> {
     const identityPrompt = buildIdentityPrompt(
       config.sbSlug,
       undefined,
@@ -234,37 +281,7 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--session-id', config.backendSessionSeedId);
     }
 
-    // MCP config: merge project .mcp.json with skill-provided MCP servers.
-    // Pass inkSessionId/studioId explicitly — process.env doesn't have them yet
-    // (they're set in the spawn env below, not in the sb CLI's own env).
-    //
-    // Ink-owned routing (wholly-in-ink): tool-bearing servers are withheld
-    // structurally. `--allowedTools ''` cannot do this — it is a permission
-    // auto-approve list, nullified by --dangerously-skip-permissions — so the
-    // provider must never see the servers at all. `--strict-mcp-config` is
-    // essential: without it claude merges user/project-scope MCP configs on
-    // its own, and the withheld servers leak straight back in. (Same pattern
-    // openclaw uses: `--strict-mcp-config --mcp-config <controlled>`.)
     const localRouting = config.toolRouting === 'local';
-    // A launcher's MCP headers fall back to the session it runs in; a spawn
-    // that named its session routes by exactly what it named.
-    const ambient = config.explicitSession ? {} : host.ambientSession();
-    const {
-      mcpConfigPath,
-      hasChannelBridge,
-      cleanup: mcpCleanup,
-    } = await buildMergedMcpConfig(config.cwd, {
-      inkSessionId: config.explicitSession
-        ? config.inkSessionId
-        : config.inkSessionId || ambient.inkSessionId,
-      studioId: config.explicitSession ? config.studioId : config.studioId || ambient.studioId,
-      omitToolServers: localRouting,
-      explicitSession: config.explicitSession,
-      // Withheld with the rest of the tool servers under local routing, so
-      // only discovered when they can be used.
-      skillServers: localRouting ? [] : await host.skillMcpServers(config.cwd),
-      tempDir: host.paths.tempDir,
-    });
     if (mcpConfigPath) {
       args.push('--mcp-config', mcpConfigPath);
     }
