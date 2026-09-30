@@ -4,8 +4,16 @@ import { CODEX_LAUNCH_REFUSALS, classifyCodexPassthrough } from './codex-launch-
 describe('classifyCodexPassthrough', () => {
   it('carries every --config spelling into `-c V` pairs, in order', () => {
     expect(
-      classifyCodexPassthrough(['-c', 'a=1', '--config', 'b=2', '--config=c=3', '-cd=4'])
-    ).toEqual({ args: ['-c', 'a=1', '-c', 'b=2', '-c', 'c=3', '-c', 'd=4'] });
+      classifyCodexPassthrough(['-c', 'a=1', '--config', 'b=2', '--config=c=3', '-cd=4', '-c=e=5'])
+    ).toEqual({ args: ['-c', 'a=1', '-c', 'b=2', '-c', 'c=3', '-c', 'd=4', '-c', 'e=5'] });
+  });
+
+  // Codex reads `-c=K=V` as `K=V` (Lumen, measured on 0.159.2): one `=` after
+  // a short option is a separator. A separate value is taken as it is.
+  it('drops exactly one = after a short option, and none from a separate value', () => {
+    expect(classifyCodexPassthrough(['-c==x=1', '-c', '=y=2', '-m=gpt-synthetic'])).toEqual({
+      args: ['-c', '=x=1', '-c', '=y=2'],
+    });
   });
 
   it('passes over options that do not touch the config, with their values', () => {

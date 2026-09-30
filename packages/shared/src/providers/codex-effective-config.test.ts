@@ -172,29 +172,41 @@ describe("CodexAdapter: the check judges the launch's own configuration", () => 
   const lastArgs = () => probe.calls[probe.calls.length - 1]!.args;
   const unquote = (value: string) => value.replace(/^"(.*)"$/, '$1');
 
-  /** Codex's merge, for the keys the judge reads, over a clean file. */
+  /**
+   * Codex's merge, for the keys the judge reads, over a clean file. A `-c`
+   * table merges into the configured one, so `-c mcp_servers={}` leaves
+   * Inkwell listed (Lumen, measured on 0.159.2); only `enabled` turns it off.
+   */
   function listingFor(args: string[]): unknown[] {
-    let inkwell: ReturnType<typeof http> | undefined = http('inkwell', INKWELL_URL);
+    const inkwell = http('inkwell', INKWELL_URL);
     for (let i = 0; i < args.length; i += 1) {
       if (args[i] !== '-c') continue;
       const override = args[i + 1]!;
       const eq = override.indexOf('=');
       const key = override.slice(0, eq);
       const value = unquote(override.slice(eq + 1));
-      if (key === 'mcp_servers' && value === '{}') inkwell = undefined;
-      if (!inkwell || !key.startsWith('mcp_servers.inkwell.')) continue;
+      if (!key.startsWith('mcp_servers.inkwell.')) continue;
       const [field, header] = key.slice('mcp_servers.inkwell.'.length).split(/\.(.*)/s);
       const transport = inkwell.transport as Record<string, unknown>;
+      if (field === 'enabled') inkwell.enabled = value === 'true';
       if (field === 'url') transport.url = value;
       if (field === 'bearer_token_env_var') transport.bearer_token_env_var = value;
       if (field === 'http_headers' || field === 'env_http_headers') {
         transport[field] = { ...((transport[field] as object | null) ?? {}), [header!]: value };
       }
     }
-    return inkwell ? [inkwell] : [];
+    listings.push([inkwell]);
+    return [inkwell];
   }
+  let listings: unknown[][] = [];
+  /** The argv of the last launch prepared, as it would be spawned. */
+  let spawnArgs: readonly string[] = [];
+  beforeEach(() => {
+    listings = [];
+    spawnArgs = [];
+  });
 
-  async function launch(passthroughArgs: string[], backendSessionId?: string) {
+  async function launch(passthroughArgs: string[], backendSessionId?: string, prompt = 'hello') {
     const host: BackendHost = {
       paths: {
         inkFiles: join(root, 'files'),
@@ -213,8 +225,8 @@ describe("CodexAdapter: the check judges the launch's own configuration", () => 
     const prepared = await new CodexAdapter().prepare(
       {
         sbSlug: 'wren',
-        prompt: 'hello',
-        promptParts: ['exec', 'hello'],
+        prompt,
+        promptParts: ['exec', prompt],
         passthroughArgs,
         cliAttached: false,
         cwd: root,
@@ -222,6 +234,7 @@ describe("CodexAdapter: the check judges the launch's own configuration", () => 
       },
       host
     );
+    spawnArgs = prepared.args;
     try {
       return await new CodexAdapter().checkEffectiveConfig(
         check({ launchConfig: prepared.launchConfig ?? { args: [] } })
@@ -255,6 +268,8 @@ describe("CodexAdapter: the check judges the launch's own configuration", () => 
       ['--config', elsewhere],
       [`--config=${elsewhere}`],
       [`-c${elsewhere}`],
+      // Codex reads `-c=K=V` as `K=V` (Lumen, measured on 0.159.2).
+      [`-c=${elsewhere}`],
     ]) {
       expect(await launch(passthrough), passthrough.join(' ')).toBe(
         CODEX_CONFIG_REFUSALS.inkwellElsewhere
@@ -271,7 +286,11 @@ describe("CodexAdapter: the check judges the launch's own configuration", () => 
     );
   });
 
-  it("admits ink chat's strict-tools pass-through, which disables every MCP server", async () => {
+  // `mcp_servers={}` merges rather than replaces, so this launch still lists
+  // Inkwell, disabled, at this session's server, and the judge reads it as
+  // it reads any server. Whether strict-tools also turns off servers the
+  // config adds is ink chat's question, not this check's.
+  it("admits ink chat's strict-tools pass-through, which keeps Inkwell listed and disabled", async () => {
     const strict = [
       '--color',
       'never',
@@ -287,8 +306,47 @@ describe("CodexAdapter: the check judges the launch's own configuration", () => 
     ];
     expect(await launch(strict)).toBeUndefined();
     expect(lastArgs()).toContain('mcp_servers={}');
+    expect(listings.at(-1)).toEqual([
+      expect.objectContaining({
+        name: 'inkwell',
+        enabled: false,
+        transport: expect.objectContaining({ url: INKWELL_URL }),
+      }),
+    ]);
     // Options that do not touch the config are not carried into the listing.
     expect(lastArgs()).not.toContain('--sandbox');
+  });
+
+  /**
+   * The `-c` values Codex reads from `args`, in order, up to the first `--`.
+   * Written apart from codex-launch-config.ts, so the two can disagree.
+   */
+  function configOverrides(args: readonly string[]): string[] {
+    const values: string[] = [];
+    for (let i = 0; i < args.length; i += 1) {
+      const token = args[i]!;
+      if (token === '--') break;
+      if (token === '-c' || token === '--config') values.push(args[(i += 1)]!);
+      else if (token.startsWith('--config=')) values.push(token.slice('--config='.length));
+      else if (/^-c./s.test(token)) values.push(token.slice(2).replace(/^=/, ''));
+    }
+    return values;
+  }
+
+  it('checks every override the spawn reads, and no more, whatever the prompt begins with', async () => {
+    const dashPrompts = [
+      '--config=mcp_servers.inkwell.url="http://127.0.0.1:4001/mcp"',
+      '-cmcp_servers.inkwell.http_headers.x-ink-session-id="s"',
+      '- a markdown bullet',
+    ];
+    for (const prompt of ['hello', ...dashPrompts]) {
+      for (const passthrough of [[], ['-c', 'a.b=1', '--skip-git-repo-check']]) {
+        await launch(passthrough, undefined, prompt);
+        expect(configOverrides(spawnArgs), prompt).toEqual(
+          configOverrides(lastArgs().slice('mcp list --json'.split(' ').length))
+        );
+      }
+    }
   });
 
   it('refuses a profile, a working directory, a feature switch or an unknown option, before any listing', async () => {
