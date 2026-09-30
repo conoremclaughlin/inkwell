@@ -518,6 +518,11 @@ export async function completeStudio(
       // A part the sync could not repair is a failed step, whatever it wrote:
       // the report must not claim a repair that did not happen (Myra, #701).
       const handEdit = synced.codexHandEdit ?? [];
+      const keptOutside = synced.codexKeptOutside?.length
+        ? [
+            `kept outside ink's Codex block, as defined there: ${synced.codexKeptOutside.join(', ')}`,
+          ]
+        : [];
       const status: StepResult['status'] = handEdit.length
         ? 'failed'
         : !written.length
@@ -530,9 +535,11 @@ export async function completeStudio(
       steps.push({
         label: 'backend configs',
         status,
-        detail: [written.length ? written.join(', ') : 'no servers to sync', ...handEdit].join(
-          '; '
-        ),
+        detail: [
+          written.length ? written.join(', ') : 'no servers to sync',
+          ...keptOutside,
+          ...handEdit,
+        ].join('; '),
       });
     } catch (error) {
       steps.push({

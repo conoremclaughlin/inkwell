@@ -359,12 +359,25 @@ describe('auditStudio', () => {
       return readFileSync(path.join(root, '.codex', 'config.toml'), 'utf-8');
     };
 
+    // Every form that defines the table mcp_servers.figma itself (Myra, #701 73a3b6fd).
     for (const [name, outside] of [
       [
-        'a quoted and spaced header after the block',
+        'a two-segment header, quoted and spaced, after the block',
         (t: string) => `${t}\n[ mcp_servers . "figma" ]\nurl = "x"\n`,
       ],
       ['root dotted keys before the block', (t: string) => `mcp_servers.figma.url = "x"\n\n${t}`],
+      [
+        'dotted keys under [mcp_servers] after the block',
+        (t: string) => `${t}\n[mcp_servers]\nfigma.url = "x"\n`,
+      ],
+      [
+        'an inline table under [mcp_servers] after the block',
+        (t: string) => `${t}\n[mcp_servers]\nfigma = { url = "x" }\n`,
+      ],
+      [
+        'a root inline table before the block',
+        (t: string) => `mcp_servers.figma = { url = "x" }\n\n${t}`,
+      ],
     ] as const) {
       it(`fails figma defined twice, by ${name}, until one sync repairs it`, async () => {
         const root = await scratch();

@@ -159,40 +159,51 @@ describe('syncMcpConfig: a server defined outside the block, in any spelling (My
     ...body,
     '# ink-managed:end mcp_servers',
   ];
+  const inkwellOnly = ['[mcp_servers.inkwell]', 'url = "http://localhost:3001/mcp"'];
+  const withFigma = [
+    '[mcp_servers.figma]',
+    'url = "https://mcp.example.com/figma"',
+    ...inkwellOnly,
+  ];
 
-  it('a quoted and spaced header after the block', () => {
-    const codexPath = studio(
-      [
-        ...block('[mcp_servers.inkwell]', 'url = "http://localhost:3001/mcp"'),
-        '[ mcp_servers . "figma" ]',
-        'url = "https://mcp.example.com/figma"',
-        '',
-      ].join('\n')
-    );
-    const result = syncMcpConfig(root);
-    const text = readFileSync(codexPath, 'utf-8');
-    expect(parseProblems(text)).toEqual({ redefined: [], unreadableLine: undefined });
-    expect(definedOnce(text, 'figma')).toBe(true);
-    expect(blockServers(text)).toEqual(['inkwell']);
-    expect(result.codexKeptOutside).toEqual(['figma']);
-  });
+  // Every form that defines the table mcp_servers.figma itself (Myra, #701
+  // 73a3b6fd), before or after the block as each one can be written.
+  for (const [name, { before = [], after = [] }] of [
+    [
+      'a two-segment header, quoted and spaced',
+      { after: ['[ mcp_servers . "figma" ]', 'url = "https://mcp.example.com/figma"'] },
+    ],
+    ['root dotted keys', { before: ['mcp_servers.figma.url = "https://mcp.example.com/figma"'] }],
+    [
+      'dotted keys under [mcp_servers]',
+      { after: ['[mcp_servers]', 'figma.url = "https://mcp.example.com/figma"'] },
+    ],
+    [
+      'an inline table under [mcp_servers]',
+      { after: ['[mcp_servers]', 'figma = { url = "https://mcp.example.com/figma" }'] },
+    ],
+    [
+      'a root inline table',
+      { before: ['mcp_servers.figma = { url = "https://mcp.example.com/figma" }'] },
+    ],
+  ] as const) {
+    const file = (body: readonly string[]) =>
+      [...before, '', ...block(...body), ...after, ''].join('\n');
 
-  it('root dotted keys before the block', () => {
-    const codexPath = studio(
-      [
-        'mcp_servers.figma.url = "https://mcp.example.com/figma"',
-        '',
-        ...block('[mcp_servers.inkwell]', 'url = "http://localhost:3001/mcp"'),
-        '',
-      ].join('\n')
-    );
-    const result = syncMcpConfig(root);
-    const text = readFileSync(codexPath, 'utf-8');
-    expect(parseProblems(text)).toEqual({ redefined: [], unreadableLine: undefined });
-    expect(definedOnce(text, 'figma')).toBe(true);
-    expect(blockServers(text)).toEqual(['inkwell']);
-    expect(result.codexKeptOutside).toEqual(['figma']);
-  });
+    it(`${name}: beside figma in the block it is a redefinition, and the sync leaves figma to it`, () => {
+      expect(readCodexConfig(file(withFigma))).toMatchObject({
+        redefined: ['mcp_servers.figma'],
+        collidingWithBlock: ['figma'],
+      });
+      const codexPath = studio(file(inkwellOnly));
+      const result = syncMcpConfig(root);
+      const text = readFileSync(codexPath, 'utf-8');
+      expect(parseProblems(text)).toEqual({ redefined: [], unreadableLine: undefined });
+      expect(definedOnce(text, 'figma')).toBe(true);
+      expect(blockServers(text)).toEqual(['inkwell']);
+      expect(result.codexKeptOutside).toEqual(['figma']);
+    });
+  }
 
   it('a file with no block, whose old section the legacy strip does not recognise', () => {
     const codexPath = studio(
@@ -256,24 +267,33 @@ describe('syncMcpConfig: what it cannot repair, it names as a hand edit (Myra, #
     });
   });
 
-  it('a table defined twice outside the block: named, with the block still written', () => {
-    const codexPath = studio(
-      ['[profiles.fast]', 'model = "m"', '[ profiles . "fast" ]', 'model = "m"', ''].join('\n')
-    );
+  // What would be written is read before it is written; a file that fails
+  // the reading is left as it was (Myra, #701 73a3b6fd).
+  it('a table defined twice outside the block: named, and the file left unchanged', () => {
+    const broken = ['[profiles.fast]', 'model = "m"', '[ profiles . "fast" ]', 'model = "m"', ''];
+    const codexPath = studio(broken.join('\n'));
     const result = syncMcpConfig(root);
-    expect(result.codexHandEdit).toEqual([
-      ".codex/config.toml defines [profiles.fast] more than once outside ink's managed block, which Codex cannot parse: remove one",
-    ]);
-    expect(blockServers(readFileSync(codexPath, 'utf-8'))).toEqual(['figma', 'inkwell']);
+    expect(result).toEqual({
+      codex: false,
+      gemini: true,
+      codexHandEdit: [
+        ".codex/config.toml defines [profiles.fast] more than once outside ink's managed block, which Codex cannot parse, so the sync left it unchanged: remove one, then run `ink mcp sync`",
+      ],
+    });
+    expect(readFileSync(codexPath, 'utf-8')).toBe(broken.join('\n'));
   });
 
-  it('text it cannot read: named with its line, never reported as checked, and the block written as before', () => {
-    const codexPath = studio(['model = "gpt', '[mcp_servers.figma]', 'url = "x"', ''].join('\n'));
+  it('text it cannot read: named with its line, and the file left unchanged', () => {
+    const unreadable = ['model = "gpt', '[mcp_servers.figma]', 'url = "x"', ''].join('\n');
+    const codexPath = studio(unreadable);
     const result = syncMcpConfig(root);
-    expect(result.codexHandEdit).toEqual([
-      '.codex/config.toml could not be read at line 1, so the sync could not check it for a server defined twice',
-    ]);
-    expect(result.codexKeptOutside).toBeUndefined();
-    expect(readFileSync(codexPath, 'utf-8')).toContain('[mcp_servers.inkwell]');
+    expect(result).toEqual({
+      codex: false,
+      gemini: true,
+      codexHandEdit: [
+        '.codex/config.toml could not be read at line 1, so the sync left it unchanged: fix that line, then run `ink mcp sync`',
+      ],
+    });
+    expect(readFileSync(codexPath, 'utf-8')).toBe(unreadable);
   });
 });

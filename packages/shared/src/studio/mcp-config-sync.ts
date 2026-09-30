@@ -473,11 +473,16 @@ function isSymlink(p: string): boolean {
  * block, reads the merged file as Codex would, and drops the servers it
  * charges a redefinition to, until none is charged; dropping a definition
  * never makes a new collision, so each pass drops at least one or ends.
+ *
+ * The last reading is the check on what would be written. A file it cannot
+ * read, or one still defining something twice, is not `checked`, and the
+ * caller leaves the file as it was: Codex does not start at all on a config
+ * it cannot parse (Myra, #701 73a3b6fd).
  */
 function mergeCodexServers(
   existing: string | undefined,
   servers: Record<string, McpServerConfig>
-): { merged: string; keptOutside: string[]; handEdit: string[] } {
+): { merged: string; checked: boolean; keptOutside: string[]; handEdit: string[] } {
   const managed = { ...servers };
   const keptOutside: string[] = [];
   for (;;) {
@@ -489,24 +494,25 @@ function mergeCodexServers(
       keptOutside.push(...colliding);
       continue;
     }
+    const checked = reading.unreadableLine === undefined && reading.redefined.length === 0;
     // Fixed strings, key paths and line numbers only: never a value.
     const handEdit: string[] = [];
     if (reading.unreadableLine !== undefined) {
       handEdit.push(
-        `.codex/config.toml could not be read at line ${reading.unreadableLine}, so the sync could not check it for a server defined twice`
-      );
-    }
-    if (keptOutside.includes('inkwell')) {
-      handEdit.push(
-        ".codex/config.toml defines the inkwell server outside ink's managed block, where the sync cannot update it: remove that definition, then run `ink mcp sync`"
+        `.codex/config.toml could not be read at line ${reading.unreadableLine}, so the sync left it unchanged: fix that line, then run \`ink mcp sync\``
       );
     }
     if (reading.redefinedOutsideBlock.length > 0) {
       handEdit.push(
-        `.codex/config.toml defines [${reading.redefinedOutsideBlock.join('], [')}] more than once outside ink's managed block, which Codex cannot parse: remove one`
+        `.codex/config.toml defines [${reading.redefinedOutsideBlock.join('], [')}] more than once outside ink's managed block, which Codex cannot parse, so the sync left it unchanged: remove one, then run \`ink mcp sync\``
       );
     }
-    return { merged, keptOutside: keptOutside.sort(), handEdit };
+    if (checked && keptOutside.includes('inkwell')) {
+      handEdit.push(
+        ".codex/config.toml defines the inkwell server outside ink's managed block, where the sync cannot update it: remove that definition, then run `ink mcp sync`"
+      );
+    }
+    return { merged, checked, keptOutside: checked ? keptOutside.sort() : [], handEdit };
   }
 }
 
@@ -518,7 +524,10 @@ export function syncMcpConfig(
   gemini: boolean;
   /** Servers the Codex block left out because the file defines them outside it. */
   codexKeptOutside?: string[];
-  /** What the sync could not repair in .codex/config.toml, for a human to edit. */
+  /**
+   * What the sync could not repair in .codex/config.toml, for a human to
+   * edit. With `codex: false`, the sync left the file as it was.
+   */
   codexHandEdit?: string[];
 } {
   const mcpPath = options?.sourceMcpPath || join(targetDir, '.mcp.json');
@@ -555,11 +564,13 @@ export function syncMcpConfig(
     const existingCodex = existsSync(codexPath) ? readFileSync(codexPath, 'utf-8') : undefined;
     // A server already defined outside the block keeps that definition,
     // since the sync never rewrites outside its block; the block leaves it out.
-    const { merged, keptOutside, handEdit } = mergeCodexServers(existingCodex, servers);
+    const { merged, checked, keptOutside, handEdit } = mergeCodexServers(existingCodex, servers);
     codexKeptOutside = keptOutside;
     codexHandEdit = handEdit;
-    writeFileSync(codexPath, merged);
-    codex = true;
+    if (checked) {
+      writeFileSync(codexPath, merged);
+      codex = true;
+    }
   }
 
   // --- Gemini: .gemini/settings.json ---
