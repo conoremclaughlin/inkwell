@@ -26,7 +26,7 @@
  */
 
 import { readdir, readFile } from 'fs/promises';
-import { join } from 'path';
+import { isAbsolute, join } from 'path';
 import { comparableOrigin, parseUrl } from './inkwell-origin.js';
 
 const ROUTING_HEADER_NAMES: ReadonlySet<string> = new Set([
@@ -238,12 +238,42 @@ export async function findGeminiExtensionManifests(
       continue;
     }
     for (const entry of entries) {
-      if (entry.isDirectory() || entry.isSymbolicLink()) {
-        manifests.push(join(dir, entry.name, 'gemini-extension.json'));
-      }
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const found = await extensionManifest(join(dir, entry.name));
+      if ('manifest' in found) manifests.push(found.manifest);
+      else unreadable.push(found.unreadable);
     }
   }
   return { manifests: manifests.sort(), unreadable };
+}
+
+/**
+ * Where one extension's manifest is. A linked install keeps only its install
+ * metadata in the extension directory, and Gemini loads the manifest from the
+ * link's source (loadExtension on 0.54.0; Myra, measured, #701 fdb2c11b). So
+ * `.gemini-extension-install.json` with `type: "link"` sends the check to
+ * `<source>/gemini-extension.json`. Metadata that cannot be read or parsed,
+ * or a link whose source is not an absolute path, makes the extension
+ * unreadable. Without metadata, the manifest is the directory's own.
+ */
+async function extensionManifest(
+  extensionDir: string
+): Promise<{ manifest: string } | { unreadable: string }> {
+  const metadataPath = join(extensionDir, '.gemini-extension-install.json');
+  let metadata: unknown;
+  try {
+    metadata = JSON.parse(await readFile(metadataPath, 'utf-8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { manifest: join(extensionDir, 'gemini-extension.json') };
+    }
+    return { unreadable: metadataPath };
+  }
+  if (!isRecord(metadata)) return { unreadable: metadataPath };
+  if (metadata.type !== 'link') return { manifest: join(extensionDir, 'gemini-extension.json') };
+  return typeof metadata.source === 'string' && isAbsolute(metadata.source)
+    ? { manifest: join(metadata.source, 'gemini-extension.json') }
+    : { unreadable: metadataPath };
 }
 
 export async function refuseGeminiSettingsRouting(paths: readonly string[]): Promise<void> {

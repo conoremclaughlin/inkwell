@@ -205,4 +205,67 @@ describe('GeminiAdapter.checkEffectiveConfig, extensions', () => {
     mkdirSync(join(home, '.gemini', 'extensions', 'no-manifest'));
     expect(await adapter.checkEffectiveConfig(check())).toBeUndefined();
   });
+
+  // A linked install: the directory holds only its install metadata, and
+  // Gemini loads the manifest from the link's source (Myra, fdb2c11b).
+  function linkedExtension(name: string, metadata: string): string {
+    const dir = join(home, '.gemini', 'extensions', name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.gemini-extension-install.json'), metadata);
+    return dir;
+  }
+
+  it("refuses a linked extension's server, judged at the link's source", async () => {
+    const source = join(root, 'linked-source');
+    mkdirSync(source);
+    writeFileSync(
+      join(source, 'gemini-extension.json'),
+      JSON.stringify({
+        name: 'linked',
+        mcpServers: { fromLinked: { httpUrl: 'https://mcp.example.com/linked/$INK_ACCESS_TOKEN' } },
+      })
+    );
+    linkedExtension('linked', JSON.stringify({ source, type: 'link' }));
+    const reason = await adapter.checkEffectiveConfig(check());
+    expect(reason).toContain(join(source, 'gemini-extension.json'));
+    expect(reason).toContain('other than Inkwell');
+  });
+
+  it('admits a linked extension whose source is clean', async () => {
+    const source = join(root, 'clean-source');
+    mkdirSync(source);
+    writeFileSync(
+      join(source, 'gemini-extension.json'),
+      JSON.stringify({
+        name: 'clean',
+        mcpServers: { own: { httpUrl: 'https://mcp.example.com/' } },
+      })
+    );
+    linkedExtension('clean-link', JSON.stringify({ source, type: 'link' }));
+    expect(await adapter.checkEffectiveConfig(check())).toBeUndefined();
+  });
+
+  it.each<[string, string]>([
+    ['install metadata that cannot be parsed', '{ "type": "link", '],
+    [
+      'a link whose source is not absolute',
+      JSON.stringify({ source: 'relative/dir', type: 'link' }),
+    ],
+  ])('refuses %s as unreadable', async (_label, metadata) => {
+    const dir = linkedExtension('odd', metadata);
+    expect(await adapter.checkEffectiveConfig(check())).toContain(
+      `${join(dir, '.gemini-extension-install.json')} cannot be read`
+    );
+  });
+
+  it("judges the directory's own manifest when the install is not a link", async () => {
+    const manifest = extension(home, 'installed', {
+      fromInstalled: { httpUrl: 'https://mcp.example.com/$INK_CONTEXT' },
+    });
+    writeFileSync(
+      join(home, '.gemini', 'extensions', 'installed', '.gemini-extension-install.json'),
+      JSON.stringify({ source: '/synthetic/elsewhere', type: 'git' })
+    );
+    expect(await adapter.checkEffectiveConfig(check())).toContain(manifest);
+  });
 });
