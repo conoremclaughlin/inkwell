@@ -15,3 +15,7 @@ export {
   isImitationResultLine,
   type OpenFence,
 } from './imitation-grammar.js';
+
+export * from './context-ledger.js';
+export * from './hook-registry.js';
+export * from './builtin-hooks.js';

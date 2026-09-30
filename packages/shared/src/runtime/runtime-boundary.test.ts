@@ -49,6 +49,7 @@ const HOST_GLOBALS = new Set([
   '__filename',
   'global',
   'globalThis',
+  'console',
 ]);
 
 interface Violation {
@@ -61,13 +62,13 @@ interface Violation {
 }
 
 /**
- * The one sanctioned host global: `Buffer.byteLength` counts UTF-8 bytes for
- * the relay cap. It makes the runtime Node-compatible rather than
- * browser-native, which is the documented ceiling. A second use is a
- * violation, and so is this entry once the use is gone.
+ * Deterministic Node primitives, not host I/O: Buffer measures the relay cap,
+ * and createHash preserves persisted ledger references. Neither permits a
+ * general Node import. A second use or a stale allowance is a violation.
  */
 const ALLOWED: ReadonlyArray<Pick<Violation, 'file' | 'kind' | 'detail' | 'enclosing'>> = [
   { file: 'agent-loop.ts', kind: 'global', detail: 'Buffer', enclosing: 'utf8Bytes' },
+  { file: 'entry-ref-hash.ts', kind: 'import', detail: 'node:crypto::{createHash}' },
 ];
 
 /** A position where an identifier names a property or member, not a binding. */
@@ -202,7 +203,27 @@ function boundaryViolations(filePath: string, sourceText: string): Violation[] {
       return;
     }
     if (!reachesScannedFile(filePath, specifier.text)) {
-      violations.push({ file, line: lineOf(node), kind: 'import', detail: specifier.text });
+      // Recognize only the exact named import; namespace/default/extra bindings,
+      // re-exports and dynamic loads must not inherit the ledger's allowance.
+      const clause = ts.isImportDeclaration(node) ? node.importClause : undefined;
+      const bindings = clause?.namedBindings;
+      const hashOnly =
+        specifier.text === 'node:crypto' &&
+        clause &&
+        !clause.name &&
+        !clause.isTypeOnly &&
+        bindings &&
+        ts.isNamedImports(bindings) &&
+        bindings.elements.length === 1 &&
+        bindings.elements[0].name.text === 'createHash' &&
+        !bindings.elements[0].propertyName &&
+        !bindings.elements[0].isTypeOnly;
+      violations.push({
+        file,
+        line: lineOf(node),
+        kind: 'import',
+        detail: hashOnly ? 'node:crypto::{createHash}' : specifier.text,
+      });
     }
   };
 
@@ -232,6 +253,12 @@ function boundaryViolations(filePath: string, sourceText: string): Violation[] {
           admitted.add(init);
         }
       }
+    } else if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === 'createHash'
+    ) {
+      reportState(node, `load-time hash factory: ${enclosingName(node) ?? '<module>'}`);
     } else if (ts.isNewExpression(node) && !admitted.has(node)) {
       reportState(node, `load-time new: ${enclosingName(node) ?? '<module>'}`);
     } else if (ts.isRegularExpressionLiteral(node)) {
@@ -365,6 +392,7 @@ describe('runtime boundary checker, against known answers', () => {
     ['export const here = __dirname;', 'global:__dirname'],
     ['export const f = globalThis.fetch;', 'global:globalThis'],
     ['export const shorthand = { process };', 'global:process'],
+    ["console.warn('host output');", 'global:console'],
   ])('reports a host global: %s', (source, expected) => {
     expect(kinds(check(source))).toContain(expected);
   });
@@ -438,6 +466,43 @@ describe('runtime boundary checker, against known answers', () => {
       enclosing: 'utf8Bytes',
     });
   });
+
+  it('recognizes only the exact hash import as the reviewed Node primitive', () => {
+    const source = "import { createHash } from 'node:crypto';";
+    const allowed = ALLOWED[1];
+    expect(check(source, 'entry-ref-hash.ts')).toEqual([{ ...allowed, line: 1 }]);
+    expect(check(source, 'another.ts')[0].file).not.toBe(allowed.file);
+  });
+
+  it.each([
+    "import crypto from 'node:crypto';",
+    "import * as crypto from 'node:crypto';",
+    "import 'node:crypto';",
+    "import { createHash, randomBytes } from 'node:crypto';",
+    "import { randomBytes as createHash } from 'node:crypto';",
+    "import { createHash as h } from 'node:crypto';",
+    "import type { createHash } from 'node:crypto';",
+    "export { createHash } from 'node:crypto';",
+    "export * from 'node:crypto';",
+    "const load = () => import('node:crypto');",
+  ])('does not widen the hash allowance: %s', (source) => {
+    expect(kinds(check(source, 'entry-ref-hash.ts'))).toContain('import:node:crypto');
+  });
+
+  it('refuses the bare crypto specifier, which could silently acquire a browser polyfill', () => {
+    expect(kinds(check("import { createHash } from 'crypto';", 'entry-ref-hash.ts'))).toEqual([
+      'import:crypto',
+    ]);
+  });
+
+  it('refuses a shared hash accumulator but permits per-call hashing', () => {
+    expect(kinds(check("const H = createHash('sha1');"))).toEqual([
+      'module-state:load-time hash factory: H',
+    ]);
+    expect(
+      check("export const h = (s: string) => createHash('sha1').update(s).digest('hex');")
+    ).toEqual([]);
+  });
 });
 
 describe('@inklabs/shared/runtime keeps its boundary', () => {
@@ -455,7 +520,15 @@ describe('@inklabs/shared/runtime keeps its boundary', () => {
   it('scans the files the subpath ships', () => {
     const names = files.map((path) => relative(RUNTIME_DIR, path));
     expect(names).toEqual(
-      expect.arrayContaining(['agent-loop.ts', 'imitation-grammar.ts', 'index.ts'])
+      expect.arrayContaining([
+        'agent-loop.ts',
+        'imitation-grammar.ts',
+        'index.ts',
+        'context-ledger.ts',
+        'hook-registry.ts',
+        'builtin-hooks.ts',
+        'entry-ref-hash.ts',
+      ])
     );
   });
 
