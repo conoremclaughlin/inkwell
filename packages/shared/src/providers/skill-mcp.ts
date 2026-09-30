@@ -8,11 +8,11 @@
  * utility (packages/shared) so the same logic runs in both CLI and server paths.
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
+import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
-import { injectSessionHeaders } from '../runner/mcp-config.js';
+import { applySessionHeaders } from '../runner/mcp-config.js';
 import { discoverSkills } from './skill-discovery.js';
 
 export interface SkillMcpServer {
@@ -141,6 +141,14 @@ interface McpJsonConfig {
   >;
 }
 
+/** Where the InkMail channel plugin may live, in the order they are tried. */
+function channelPluginCandidates(cwd: string): string[] {
+  return [
+    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
+    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
+  ];
+}
+
 /**
  * Resolve the InkMail channel plugin's entrypoint on disk. Shared with
  * `ink init` (which generates the project entry from the same candidates) so
@@ -148,13 +156,20 @@ interface McpJsonConfig {
  * the plugin IS. Returns null when no candidate exists.
  */
 export function resolveChannelPluginPath(cwd: string): string | null {
-  // Look for the channel plugin relative to the repo root
-  const candidates = [
-    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
-    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
-  ];
-  for (const p of candidates) {
+  for (const p of channelPluginCandidates(cwd)) {
     if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/** resolveChannelPluginPath without blocking, for a spawn's preparation. */
+async function findChannelPluginPath(cwd: string): Promise<string | null> {
+  for (const p of channelPluginCandidates(cwd)) {
+    const found = await stat(p).then(
+      () => true,
+      () => false
+    );
+    if (found) return p;
   }
   return null;
 }
@@ -167,17 +182,10 @@ const ROUTING_HEADERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A copy of the config at `path` with every routing header removed from every
- * server, or null when it carries none. Header names match case-insensitively,
- * as HTTP does.
+ * Remove every routing header from every server, matching names
+ * case-insensitively, as HTTP does. Returns whether any was removed.
  */
-function withoutRoutingHeaders(path: string): { path: string; cleanup: () => void } | null {
-  let config: McpJsonConfig;
-  try {
-    config = { mcpServers: {}, ...JSON.parse(readFileSync(path, 'utf-8')) };
-  } catch {
-    return null;
-  }
+function stripRoutingHeaders(config: McpJsonConfig): boolean {
   let stripped = false;
   for (const server of Object.values(config.mcpServers)) {
     const headers = server.headers;
@@ -189,35 +197,43 @@ function withoutRoutingHeaders(path: string): { path: string; cleanup: () => voi
       }
     }
   }
-  if (!stripped) return null;
-  const tmpDir = join(tmpdir(), 'sb-mcp');
-  mkdirSync(tmpDir, { recursive: true });
-  const tmpPath = join(tmpDir, `mcp-routed-${process.pid}-${randomUUID()}.json`);
-  writeFileSync(tmpPath, JSON.stringify(config, null, 2));
-  return {
-    path: tmpPath,
-    cleanup: () => {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // Best-effort cleanup
-      }
-    },
-  };
+  return stripped;
 }
 
 /**
- * Build a merged MCP config that includes both the project's .mcp.json
- * and any skill-provided MCP servers. Also injects Inkwell session/studio
- * headers via the shared injectSessionHeaders utility.
+ * Write a config under `<tempDir>/sb-mcp`, one file per spawn: a parent and
+ * its shadow clones spawn from one process, and a shared name would let the
+ * first cleanup delete a config another backend has not read yet. A failed
+ * write removes any partial file before the error propagates.
+ */
+async function writeSpawnConfig(
+  tempDir: string,
+  prefix: string,
+  config: McpJsonConfig
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const dir = join(tempDir, 'sb-mcp');
+  const path = join(dir, `${prefix}-${process.pid}-${randomUUID()}.json`);
+  const cleanup = async (): Promise<void> => {
+    await rm(path, { force: true }).catch(() => undefined);
+  };
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(path, JSON.stringify(config, null, 2));
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { path, cleanup };
+}
+
+/**
+ * Build the MCP config a spawn is handed: the project's .mcp.json with
+ * Inkwell's session headers injected (the same applySessionHeaders the server
+ * runners use) and the skill servers the caller's host discovered merged in.
  *
- * Two layers:
- * 1. Session header injection (shared with server runners via @inklabs/shared)
- * 2. Skill MCP server merging, of the servers the caller's host discovered
- *    (the CLI's host uses discoverSkillMcpServers below)
- *
- * Returns the path to a temp file and a cleanup function.
- * When no modifications are needed, returns the original .mcp.json path.
+ * It is built in memory and written once, under `tempDir`, only when it
+ * differs from the project file; otherwise the project path is returned as
+ * is, and null when there is no project file. All IO is asynchronous.
  *
  * With `omitToolServers` (wholly-in-ink, ink-owned tool routing) the config
  * is CHANNEL-ONLY: every tool-bearing server (inkwell, supabase, github,
@@ -226,7 +242,7 @@ function withoutRoutingHeaders(path: string): { path: string; cleanup: () => voi
  * adapter pairs it with `--strict-mcp-config` so an empty config means "no
  * MCP servers at all".
  */
-export function buildMergedMcpConfig(
+export async function buildMergedMcpConfig(
   cwd: string,
   options: {
     /**
@@ -245,10 +261,12 @@ export function buildMergedMcpConfig(
     explicitSession?: boolean;
     /** Skill-provided servers to merge, as the host discovered them. */
     skillServers: SkillMcpServer[];
+    /** Where a written config goes (BackendHost.paths.tempDir). */
+    tempDir: string;
   }
-): {
+): Promise<{
   mcpConfigPath: string | null;
-  cleanup: () => void;
+  cleanup: () => Promise<void>;
   /**
    * Whether the FINAL config actually retains the inkmail channel bridge.
    * The channel flag (`--dangerously-load-development-channels
@@ -257,9 +275,17 @@ export function buildMergedMcpConfig(
    * against a strict config that no longer defines it.
    */
   hasChannelBridge: boolean;
-} {
+}> {
   const projectMcpPath = join(cwd, '.mcp.json');
-  const hasProjectConfig = existsSync(projectMcpPath);
+  const projectText = await readFile(projectMcpPath, 'utf-8').catch(() => undefined);
+  let parsed: Partial<McpJsonConfig> | null = null;
+  if (projectText !== undefined) {
+    try {
+      parsed = JSON.parse(projectText) as Partial<McpJsonConfig> | null;
+    } catch {
+      parsed = null;
+    }
+  }
 
   if (options.omitToolServers) {
     // Channel-only, deliberately: skill-provided MCP servers are NOT merged
@@ -274,125 +300,54 @@ export function buildMergedMcpConfig(
     // tool servers being dropped. Channel bridges get their context from the
     // spawn env (INK_CONTEXT), not from config headers.
     const config: McpJsonConfig = { mcpServers: {} };
-    if (hasProjectConfig) {
-      try {
-        const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
-        // The project entry is only an OPT-IN signal — its launcher, args,
-        // and path are NEVER copied. The retained entry is CONSTRUCTED from
-        // the init-generator's own resolver, so a squatting or lookalike
-        // entry (`node /tmp/evil.js packages/channel-plugin/index.ts`, an
-        // attacker path merely ending in the canonical suffix, `bash -c …`
-        // with a decoy argv) structurally cannot reach the provider —
-        // validation of attacker-controlled strings is replaced by not
-        // consuming them at all (Lumen, PR #462 review 4894572540). No
-        // resolvable plugin on disk → no bridge; fail closed costs inbox
-        // push, never the boundary.
-        if (parsed.mcpServers?.['inkmail']) {
-          const pluginPath = resolveChannelPluginPath(cwd);
-          if (pluginPath) {
-            config.mcpServers['inkmail'] = {
-              type: 'stdio',
-              command: 'npx',
-              args: ['tsx', pluginPath],
-            };
-          }
-        }
-      } catch {
-        // Unreadable project config — start from an empty server set.
+    // The project entry is only an OPT-IN signal — its launcher, args, and
+    // path are NEVER copied. The retained entry is CONSTRUCTED from the
+    // init-generator's own resolver, so a squatting or lookalike entry
+    // (`node /tmp/evil.js packages/channel-plugin/index.ts`, an attacker path
+    // merely ending in the canonical suffix, `bash -c …` with a decoy argv)
+    // structurally cannot reach the provider — validation of
+    // attacker-controlled strings is replaced by not consuming them at all
+    // (Lumen, PR #462 review 4894572540). No resolvable plugin on disk → no
+    // bridge; fail closed costs inbox push, never the boundary.
+    if (parsed?.mcpServers?.['inkmail']) {
+      const pluginPath = await findChannelPluginPath(cwd);
+      if (pluginPath) {
+        config.mcpServers['inkmail'] = { type: 'stdio', command: 'npx', args: ['tsx', pluginPath] };
       }
     }
-    const tmpDir = join(tmpdir(), 'sb-mcp');
-    mkdirSync(tmpDir, { recursive: true });
-    // One file per spawn, not per process: a parent and its shadow clones
-    // spawn from one process, and the first cleanup would otherwise delete a
-    // config another backend has not read yet.
-    const tmpPath = join(tmpDir, `mcp-local-${process.pid}-${randomUUID()}.json`);
-    writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+    const written = await writeSpawnConfig(options.tempDir, 'mcp-local', config);
     return {
-      mcpConfigPath: tmpPath,
+      mcpConfigPath: written.path,
       hasChannelBridge: 'inkmail' in config.mcpServers,
-      cleanup: () => {
-        try {
-          unlinkSync(tmpPath);
-        } catch {
-          // Best-effort cleanup
-        }
-      },
+      cleanup: written.cleanup,
     };
   }
 
   // Non-withholding path: the channel flag keys off the project config's own
   // inkmail entry (any shape — the full config passes through unchanged, so
   // whatever is defined there is what claude will see).
-  let hasChannelBridge = false;
-  if (hasProjectConfig) {
-    try {
-      const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
-      hasChannelBridge = Boolean(parsed.mcpServers?.['inkmail']);
-    } catch {
-      hasChannelBridge = false;
+  const hasChannelBridge = Boolean(parsed?.mcpServers?.['inkmail']);
+
+  const config: McpJsonConfig = { mcpServers: {}, ...(parsed ?? {}) } as McpJsonConfig;
+  let modified = false;
+  if (parsed) {
+    // injectSessionHeaders keeps a header the project config already sets.
+    // For a caller that named its session a configured one is stale routing:
+    // drop it, so the named ids are injected fresh, or stay absent when the
+    // caller named none.
+    if (options.explicitSession === true && stripRoutingHeaders(config)) modified = true;
+    // The x-ink-context header carries identity (sbSlug/studioId/runtime)
+    // even without a session; the session and studio headers only when named.
+    if (
+      applySessionHeaders(config, {
+        inkSessionId: options.inkSessionId,
+        studioId: options.studioId,
+      })
+    ) {
+      modified = true;
     }
   }
-
-  // ── Layer 1: Session header injection (shared logic) ──
-  // Delegates to the same injectSessionHeaders used by server runners.
-  const cleanups: Array<() => void> = [];
-  let effectivePath = hasProjectConfig ? projectMcpPath : null;
-
-  const explicit = options.explicitSession === true;
-  const sessionId = options.inkSessionId;
-  const studioId = options.studioId;
-
-  // injectSessionHeaders keeps a header the project config already sets. For
-  // an explicit caller a configured one is stale routing: drop it, so the
-  // named ids are injected fresh, or stay absent when the caller named none.
-  if (explicit && effectivePath) {
-    const sanitized = withoutRoutingHeaders(effectivePath);
-    if (sanitized) {
-      effectivePath = sanitized.path;
-      cleanups.push(sanitized.cleanup);
-    }
-  }
-
-  // Always run injection when we have a config path. The x-ink-context header
-  // still carries useful identity (sbSlug/studioId/runtime) even when the
-  // session ID isn't known yet — sessionId-specific headers are gated inside
-  // injectSessionHeaders.
-  if (effectivePath) {
-    const injection = injectSessionHeaders({
-      mcpConfigPath: effectivePath,
-      inkSessionId: sessionId,
-      studioId,
-    });
-    if (injection.modified) {
-      effectivePath = injection.mcpConfigPath;
-      cleanups.push(injection.cleanup);
-    }
-  }
-
-  // ── Layer 2: Skill MCP server merging ──
-  const skillServers = options.skillServers;
-  if (skillServers.length === 0) {
-    return {
-      mcpConfigPath: effectivePath,
-      hasChannelBridge,
-      cleanup: () => cleanups.forEach((fn) => fn()),
-    };
-  }
-
-  // Load config (from injection temp file or original)
-  let config: McpJsonConfig = { mcpServers: {} };
-  if (effectivePath) {
-    try {
-      const parsed = JSON.parse(readFileSync(effectivePath, 'utf-8'));
-      config = { mcpServers: {}, ...parsed };
-    } catch {
-      config = { mcpServers: {} };
-    }
-  }
-
-  let skillsModified = false;
-  for (const server of skillServers) {
+  for (const server of options.skillServers) {
     if (!config.mcpServers[server.name]) {
       config.mcpServers[server.name] = {
         type: 'stdio',
@@ -400,36 +355,17 @@ export function buildMergedMcpConfig(
         args: server.args,
         ...(server.env ? { env: server.env } : {}),
       };
-      skillsModified = true;
+      modified = true;
     }
   }
 
-  if (!skillsModified) {
+  if (!modified) {
     return {
-      mcpConfigPath: effectivePath,
+      mcpConfigPath: projectText !== undefined ? projectMcpPath : null,
       hasChannelBridge,
-      cleanup: () => cleanups.forEach((fn) => fn()),
+      cleanup: async () => undefined,
     };
   }
-
-  // Write final merged config (skills + headers) to temp file
-  const tmpDir = join(tmpdir(), 'sb-mcp');
-  mkdirSync(tmpDir, { recursive: true });
-  const tmpPath = join(tmpDir, `mcp-${process.pid}-${randomUUID()}.json`);
-  writeFileSync(tmpPath, JSON.stringify(config, null, 2));
-
-  // Clean up the injection temp file (if any) since we wrote a new one
-  cleanups.forEach((fn) => fn());
-
-  return {
-    mcpConfigPath: tmpPath,
-    hasChannelBridge,
-    cleanup: () => {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // Best-effort cleanup
-      }
-    },
-  };
+  const written = await writeSpawnConfig(options.tempDir, 'mcp', config);
+  return { mcpConfigPath: written.path, hasChannelBridge, cleanup: written.cleanup };
 }

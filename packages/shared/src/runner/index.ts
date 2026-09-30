@@ -18,6 +18,7 @@ export {
 
 export {
   injectSessionHeaders,
+  applySessionHeaders,
   buildSessionEnv,
   encodeContextToken,
   decodeContextToken,

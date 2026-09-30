@@ -20,11 +20,7 @@ export interface BackendHost {
     readonly inkFiles: string;
     /** The ephemeral-studio root: created if missing, and granted at spawn. */
     readonly studiosRoot: string;
-    /**
-     * Where the identity prompt and Gemini settings are written. Claude's MCP
-     * config is still written under the OS temp directory by the synchronous
-     * buildMergedMcpConfig; it moves here with that builder.
-     */
+    /** Where per-spawn files (identity prompt, settings, MCP configs) are written. */
     readonly tempDir: string;
   };
   /**

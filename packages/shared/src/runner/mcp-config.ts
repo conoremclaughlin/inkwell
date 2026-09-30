@@ -70,7 +70,7 @@ export interface InjectSessionHeadersResult {
 export function injectSessionHeaders(
   options: InjectSessionHeadersOptions
 ): InjectSessionHeadersResult {
-  const { mcpConfigPath, inkSessionId, studioId, accessToken } = options;
+  const { mcpConfigPath } = options;
 
   // Missing config file — nothing to inject into. Note: we still inject the
   // other headers (studio, context, authorization) when inkSessionId is
@@ -88,12 +88,48 @@ export function injectSessionHeaders(
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
+  if (!applySessionHeaders(config, options)) {
+    return { mcpConfigPath, cleanup: () => {}, modified: false };
+  }
+
+  // Write modified config to temp file (or outputDir for container execution)
+  const tmpDir = options.outputDir || join(tmpdir(), 'sb-mcp');
+  mkdirSync(tmpDir, { recursive: true });
+  // Unique per spawn: server runners spawn concurrently in one process, and a
+  // millisecond does not separate them.
+  const tmpPath = join(tmpDir, `mcp-server-${process.pid}-${randomUUID()}.json`);
+  writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+
+  return {
+    mcpConfigPath: tmpPath,
+    cleanup: () => {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Best-effort cleanup
+      }
+    },
+    modified: true,
+  };
+}
+
+/**
+ * The header injection itself, on a parsed config and without IO: adds the
+ * session, studio, authorization and context headers to the "inkwell"
+ * server where they are missing. Returns whether it changed anything. The
+ * file-based injectSessionHeaders above and the providers' asynchronous
+ * config builder both use it, so the two cannot drift.
+ */
+export function applySessionHeaders(
+  config: { mcpServers: Record<string, { headers?: Record<string, string> }> },
+  options: Pick<InjectSessionHeadersOptions, 'inkSessionId' | 'studioId' | 'accessToken'>
+): boolean {
+  const { inkSessionId, studioId, accessToken } = options;
+
   // Session headers are injected only into the canonical 'inkwell' server. The
   // legacy 'pcp' server name is retired — no code should create or feed it.
   const serverKey = 'inkwell';
-  if (!config.mcpServers[serverKey]) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
+  if (!config.mcpServers[serverKey]) return false;
 
   let modified = false;
 
@@ -137,29 +173,7 @@ export function injectSessionHeaders(
     modified = true;
   }
 
-  if (!modified) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
-
-  // Write modified config to temp file (or outputDir for container execution)
-  const tmpDir = options.outputDir || join(tmpdir(), 'sb-mcp');
-  mkdirSync(tmpDir, { recursive: true });
-  // Unique per spawn: server runners spawn concurrently in one process, and a
-  // millisecond does not separate them.
-  const tmpPath = join(tmpDir, `mcp-server-${process.pid}-${randomUUID()}.json`);
-  writeFileSync(tmpPath, JSON.stringify(config, null, 2));
-
-  return {
-    mcpConfigPath: tmpPath,
-    cleanup: () => {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // Best-effort cleanup
-      }
-    },
-    modified: true,
-  };
+  return modified;
 }
 
 // ─── Context Token ──────────────────────────────────────────

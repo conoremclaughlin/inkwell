@@ -24,6 +24,7 @@ vi.mock('fs/promises', async (importOriginal) => {
 import { CodexAdapter } from './codex.js';
 import { buildGeminiSettings, GeminiAdapter } from './gemini.js';
 import { createIdentityPromptFile } from './identity-prompt.js';
+import { buildMergedMcpConfig } from './skill-mcp.js';
 import type { BackendAdapter, BackendHost } from './types.js';
 
 /**
@@ -91,6 +92,17 @@ describe('a failed write leaves nothing behind', () => {
     faults.partialWriteOnce = true;
     await expect(createIdentityPromptFile(tempDir, 'wren')).rejects.toThrow('synthetic ENOSPC');
     expect(left()).toEqual({ files: [], identityDirs: [] });
+  });
+
+  it('the MCP config builder removes the partial file and rejects', async () => {
+    faults.partialWriteOnce = true;
+    await expect(
+      buildMergedMcpConfig(root, {
+        skillServers: [{ name: 'synthetic-skill', command: 'npx', args: [] }],
+        tempDir,
+      })
+    ).rejects.toThrow('synthetic ENOSPC');
+    expect(left().files).toEqual([]);
   });
 
   it('the Gemini settings remove the partial file and report no settings', async () => {

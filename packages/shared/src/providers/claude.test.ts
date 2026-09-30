@@ -352,6 +352,25 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
+  it('writes its MCP config under the host’s temp directory, and its cleanup removes it', async () => {
+    const prepared = await new ClaudeAdapter().prepare(
+      {
+        ...adapterDefaults(),
+        sbSlug: 'wren',
+        prompt: 'hello',
+        promptParts: ['hello'],
+        passthroughArgs: [],
+        toolRouting: 'local',
+      },
+      host
+    );
+    const path = prepared.args[prepared.args.indexOf('--mcp-config') + 1]!;
+    expect(path.startsWith(join(host.paths.tempDir, 'sb-mcp'))).toBe(true);
+    expect(existsSync(path)).toBe(true);
+    await prepared.cleanup();
+    expect(existsSync(path)).toBe(false);
+  });
+
   it('asks its host whether claude streams partial messages', async () => {
     for (const supported of [true, false]) {
       host = testHost({ claudeSupportsPartialMessages: async () => supported });

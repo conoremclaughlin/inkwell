@@ -253,7 +253,7 @@ export class ClaudeAdapter implements BackendAdapter {
       mcpConfigPath,
       hasChannelBridge,
       cleanup: mcpCleanup,
-    } = buildMergedMcpConfig(config.cwd, {
+    } = await buildMergedMcpConfig(config.cwd, {
       inkSessionId: config.explicitSession
         ? config.inkSessionId
         : config.inkSessionId || ambient.inkSessionId,
@@ -263,6 +263,7 @@ export class ClaudeAdapter implements BackendAdapter {
       // Withheld with the rest of the tool servers under local routing, so
       // only discovered when they can be used.
       skillServers: localRouting ? [] : await host.skillMcpServers(config.cwd),
+      tempDir: host.paths.tempDir,
     });
     if (mcpConfigPath) {
       args.push('--mcp-config', mcpConfigPath);
@@ -383,9 +384,7 @@ export class ClaudeAdapter implements BackendAdapter {
         // config may still load it — the pass-through path is not strict.
         ...(printMode ? PRINT_MODE_CHANNEL_ENV : {}),
       },
-      // buildMergedMcpConfig still removes its file synchronously; it moves to
-      // fs/promises with the builder itself.
-      cleanup: async () => mcpCleanup(),
+      cleanup: mcpCleanup,
       ...(stdinData ? { stdinData } : {}),
     };
   }
