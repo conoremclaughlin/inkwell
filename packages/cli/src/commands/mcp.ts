@@ -161,6 +161,16 @@ async function syncCommand(): Promise<void> {
   if (result.codex) {
     console.log(chalk.green('  wrote'), chalk.cyan('.codex/config.toml'));
   }
+  if (result.codexKeptOutside) {
+    console.log(
+      chalk.dim(
+        `  kept outside ink's block, as defined there: ${result.codexKeptOutside.join(', ')}`
+      )
+    );
+  }
+  for (const edit of result.codexHandEdit ?? []) {
+    console.log(chalk.yellow('  needs a hand edit:'), edit);
+  }
   if (result.gemini) {
     console.log(chalk.green('  wrote'), chalk.cyan('.gemini/settings.json'));
   }
@@ -180,7 +190,11 @@ async function syncCommand(): Promise<void> {
     }
   }
 
-  console.log(chalk.dim(`\nDone. All backends can now discover MCP servers.`));
+  console.log(
+    result.codexHandEdit
+      ? chalk.yellow(`\nDone, except the hand edit above: Codex may not start until it is made.`)
+      : chalk.dim(`\nDone. All backends can now discover MCP servers.`)
+  );
 }
 
 // ============================================================================

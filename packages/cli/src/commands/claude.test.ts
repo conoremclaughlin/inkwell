@@ -12,10 +12,11 @@ import {
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
+import { PARENT_OWNED_TURN_ENV } from '../lib/turn-owner.js';
 import { tmpdir } from 'os';
 import {
   buildBackendSessionOwnerIndex,
-  detachPrintModeExit,
+  detachOnChildExit,
   extractClaudeHistorySessionsForProject,
   extractBackendSessionOverrideId,
   extractLatestPreviewFromClaudeSessionJsonl,
@@ -1675,16 +1676,22 @@ describe('buildBackendSessionOwnerIndex', () => {
 // Under a print-mode host it stays inert, so the one-shot wrapper takes that
 // exit over; without it, the attachment the child's prompt hook set outlives
 // the process and triggers are delivered inline to nobody (PR #685).
-describe('detachPrintModeExit', () => {
-  const deps = (fetchImpl: typeof fetch) => ({
+describe('detachOnChildExit', () => {
+  // The wrapper's own environment is pinned, so a token in the shell that
+  // runs the tests cannot decide a row.
+  const deps = (fetchImpl: typeof fetch, parentEnv: NodeJS.ProcessEnv = {}) => ({
     fetchImpl,
     getServerUrl: () => 'http://ink.test',
     getToken: async () => 'tok',
+    parentEnv,
   });
+  const inkContext = (cliAttached: boolean) =>
+    Buffer.from(JSON.stringify({ sessionId: 'sess-1', cliAttached })).toString('base64url');
 
   it('detaches the session when a print-mode child exits', async () => {
     const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
-    const ok = await detachPrintModeExit(
+    const ok = await detachOnChildExit(
+      'claude',
       { ...PRINT_MODE_CHANNEL_ENV, SB_SLUG: 'wren' },
       'sess-1',
       'wren',
@@ -1702,10 +1709,11 @@ describe('detachPrintModeExit', () => {
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok');
   });
 
-  it('leaves an interactive child alone: its plugin still detaches itself', async () => {
+  it('leaves an interactive Claude alone: its plugin still detaches itself', async () => {
     const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
-    const ok = await detachPrintModeExit(
-      { SB_SLUG: 'wren' },
+    const ok = await detachOnChildExit(
+      'claude',
+      { SB_SLUG: 'wren', INK_CONTEXT: inkContext(true) },
       'sess-1',
       'wren',
       deps(fetchImpl as unknown as typeof fetch)
@@ -1714,12 +1722,70 @@ describe('detachPrintModeExit', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  // No plugin runs in either, and their stop hooks close a turn, not the
+  // process: Lumen's interactive Codex exited and a trigger 41s later went
+  // inline to it (Myra, #701 93c9def5; task ca307a72).
+  for (const backend of ['codex', 'gemini']) {
+    it(`detaches an interactive ${backend} its hooks marked attached, with or without a token`, async () => {
+      const cases: [Record<string, string>, NodeJS.ProcessEnv][] = [
+        [{ INK_CONTEXT: inkContext(true) }, {}],
+        [{}, {}],
+        // Run from an SB's shell, the wrapper's own env carries a headless
+        // token, but the child runs with the adapter's attached token over it
+        // and its hooks write true (Myra, #701 65619ac6).
+        [{ INK_CONTEXT: inkContext(true) }, { INK_CONTEXT: inkContext(false) }],
+      ];
+      for (const [spawnEnv, parentEnv] of cases) {
+        const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
+        const ok = await detachOnChildExit(
+          backend,
+          spawnEnv,
+          'sess-1',
+          'lumen',
+          deps(fetchImpl as unknown as typeof fetch, parentEnv)
+        );
+        expect(ok).toBe(true);
+        const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+        expect(url).toBe('http://ink.test/api/hooks/lifecycle');
+        expect(JSON.parse(String(init.body))).toEqual({
+          sessionId: 'sess-1',
+          cliAttached: false,
+          sbSlug: 'lumen',
+        });
+      }
+    });
+
+    it(`leaves a ${backend} its hooks never marked attached: a server spawn, or a child of ink chat`, async () => {
+      const cases: [Record<string, string>, NodeJS.ProcessEnv][] = [
+        // A server spawn wrote false itself, and its run owns the turn marker.
+        [{ INK_CONTEXT: inkContext(false) }, {}],
+        // The same token inherited from the wrapper's own environment.
+        [{}, { INK_CONTEXT: inkContext(false) }],
+        // A child of `ink chat`: its parent owns the attachment and is running.
+        [{ INK_CONTEXT: inkContext(false), ...PARENT_OWNED_TURN_ENV }, {}],
+      ];
+      for (const [spawnEnv, parentEnv] of cases) {
+        const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 }));
+        const ok = await detachOnChildExit(
+          backend,
+          spawnEnv,
+          'sess-1',
+          'lumen',
+          deps(fetchImpl as unknown as typeof fetch, parentEnv)
+        );
+        expect(ok).toBe(false);
+        expect(fetchImpl).not.toHaveBeenCalled();
+      }
+    });
+  }
+
   it('does nothing without a session, and never throws on a failed post', async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('ECONNREFUSED');
     });
     expect(
-      await detachPrintModeExit(
+      await detachOnChildExit(
+        'claude',
         { ...PRINT_MODE_CHANNEL_ENV },
         undefined,
         'wren',
@@ -1728,8 +1794,9 @@ describe('detachPrintModeExit', () => {
     ).toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(
-      await detachPrintModeExit(
-        { ...PRINT_MODE_CHANNEL_ENV },
+      await detachOnChildExit(
+        'codex',
+        {},
         'sess-1',
         'wren',
         deps(fetchImpl as unknown as typeof fetch)
@@ -1740,7 +1807,8 @@ describe('detachPrintModeExit', () => {
 
   // runClaude and runClaudeInteractive spawn and exit a real process, and
   // their harness (claude.integration.test.ts) is not in CI. Pin the wiring
-  // where CI can see it: every child close handler in the file detaches.
+  // where CI can see it: every child close handler in the file detaches, and
+  // names the backend it spawned.
   it('is called from every spawned child’s close handler', () => {
     const source = readFileSync(
       join(dirname(fileURLToPath(import.meta.url)), 'claude.ts'),
@@ -1749,8 +1817,8 @@ describe('detachPrintModeExit', () => {
     const handlers = source.split("child.on('close', async (code) => {").slice(1);
     expect(handlers.length).toBe(2);
     for (const body of handlers) {
-      const head = body.split('\n').slice(0, 5).join('\n');
-      expect(head).toContain('await detachPrintModeExit(prepared.env,');
+      const head = body.split('\n').slice(0, 8).join('\n');
+      expect(head).toMatch(/await detachOnChildExit\(\s*options\.backend,\s*prepared\.env,/);
     }
   });
 });

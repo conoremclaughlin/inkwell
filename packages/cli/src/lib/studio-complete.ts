@@ -517,17 +517,31 @@ export async function completeStudio(
       );
       const changedIndexes = targets.map((_, i) => i).filter((i) => before[i] !== after[i]);
       const allNew = changedIndexes.every((i) => before[i] === null);
-      const status: StepResult['status'] = !written.length
-        ? 'skipped'
-        : !changedIndexes.length
-          ? 'exists'
-          : allNew
-            ? 'created'
-            : 'updated';
+      // A part the sync could not repair is a failed step, whatever it wrote:
+      // the report must not claim a repair that did not happen (Myra, #701).
+      const handEdit = synced.codexHandEdit ?? [];
+      const keptOutside = synced.codexKeptOutside?.length
+        ? [
+            `kept outside ink's Codex block, as defined there: ${synced.codexKeptOutside.join(', ')}`,
+          ]
+        : [];
+      const status: StepResult['status'] = handEdit.length
+        ? 'failed'
+        : !written.length
+          ? 'skipped'
+          : !changedIndexes.length
+            ? 'exists'
+            : allNew
+              ? 'created'
+              : 'updated';
       steps.push({
         label: 'backend configs',
         status,
-        detail: written.length ? written.join(', ') : 'no servers to sync',
+        detail: [
+          written.length ? written.join(', ') : 'no servers to sync',
+          ...keptOutside,
+          ...handEdit,
+        ].join('; '),
       });
     } catch (error) {
       steps.push({

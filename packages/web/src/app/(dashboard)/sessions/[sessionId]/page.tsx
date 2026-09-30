@@ -205,6 +205,8 @@ function formatEntryContent(
   display: string;
   rawJson: string | null;
   kind: 'tool' | 'json' | 'text';
+  /** No summary was found, so the display is the whole object on one line. */
+  unsummarized?: boolean;
 } {
   const parsed = decodePossiblyDoubleEncodedJson(rawContent);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -221,7 +223,12 @@ function formatEntryContent(
 
   // Placeholder for future backend-specific formatting (codex/claude/gemini).
   // For now, non-tool JSON payloads share one presentation.
-  return { display: summary, rawJson, kind: 'json' };
+  return {
+    display: summary,
+    rawJson,
+    kind: 'json',
+    unsummarized: summary === stringifyCompact(parsedObj),
+  };
 }
 
 type SessionLogEntry = SessionLogsResponse['logs'][number];
@@ -293,7 +300,17 @@ function GenericLogCard({
           ) : (
             <TerminalSquare className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground/70" />
           )}
-          <p className="whitespace-pre-wrap break-words leading-relaxed">{formatted.display}</p>
+          {/* min-w-0: a flex item otherwise never shrinks below its longest
+              unbroken token, so a JSON blob ran past the card's edge. */}
+          {formatted.unsummarized && formatted.rawJson ? (
+            <pre className="max-h-72 min-w-0 flex-1 overflow-auto whitespace-pre-wrap font-mono text-xs leading-relaxed [overflow-wrap:anywhere]">
+              {formatted.rawJson}
+            </pre>
+          ) : (
+            <p className="min-w-0 flex-1 whitespace-pre-wrap leading-relaxed [overflow-wrap:anywhere]">
+              {formatted.display}
+            </p>
+          )}
         </div>
         {formatted.rawJson ? (
           <div className="flex justify-end">

@@ -353,7 +353,7 @@ export class ClaudeAdapter implements BackendAdapter {
     // prompt is the one that claims the turn epoch and renews the studio
     // lease. A headless `ink chat` declares false for its children, since the
     // server's run registry protects its turns. The one-shot wrapper keeps the
-    // default, and detaches when the child exits (detachPrintModeExit).
+    // default, and detaches when the child exits (detachOnChildExit).
     const contextToken = encodeContextToken({
       sessionId: config.inkSessionId || '',
       studioId: config.studioId || '',
