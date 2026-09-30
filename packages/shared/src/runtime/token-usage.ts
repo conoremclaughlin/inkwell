@@ -201,34 +201,59 @@ function parseJsonUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
   return null;
 }
 
-function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'source'> | null {
-  const inputMatch =
-    text.match(/(?:input|prompt)\s*(?:tokens?)?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i) ||
-    text.match(/([\d.,]+(?:\s*[kKmM])?)\s*(?:input|prompt)\s*tokens?/i);
-  const outputMatch =
-    text.match(
-      /(?:output|completion|candidate)\s*(?:tokens?)?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
-    ) || text.match(/([\d.,]+(?:\s*[kKmM])?)\s*(?:output|completion|candidate)\s*tokens?/i);
-  const totalMatch =
-    text.match(/(?:total|all)\s*(?:tokens?)?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i) ||
-    text.match(/([\d.,]+(?:\s*[kKmM])?)\s*total\s*tokens?/i);
-  const cacheReadMatch = text.match(
-    /(?:cache(?:d)?\s*(?:read|hit)?\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
-  );
-  const cacheWriteMatch = text.match(
-    /(?:cache\s*write\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
-  );
-  const reasoningMatch = text.match(/(?:reasoning\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
-  // Gemini's text summaries label thoughts apart from candidates; they add.
-  const thoughtsMatch = text.match(/(?:thoughts?\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
+/**
+ * For "1.2k input tokens", find the label first, then walk its numeric prefix
+ * once. An unanchored numeric regex retries at EVERY comma/digit when no label
+ * follows, making a long punctuation run quadratic. Each label's backward
+ * walk stops before another label, so these walks cannot multiply with input.
+ * `labels` is a fresh, function-local global regex; no lastIndex is shared.
+ */
+function numberBeforeLabel(text: string, labels: RegExp): string | undefined {
+  let label: RegExpExecArray | null;
+  while ((label = labels.exec(text)) !== null) {
+    let end = label.index;
+    while (end > 0 && /\s/.test(text[end - 1]!)) end--;
+    let start = end;
+    if (start > 0 && /[kKmM]/.test(text[start - 1]!)) {
+      start--;
+      while (start > 0 && /\s/.test(text[start - 1]!)) start--;
+    }
+    const digitsEnd = start;
+    while (start > 0 && /[\d.,]/.test(text[start - 1]!)) start--;
+    if (start < digitsEnd) return text.slice(start, end);
+  }
+  return undefined;
+}
 
-  const inputTokens = pick(inputMatch?.[1]);
-  const outputTokens = pick(outputMatch?.[1]);
-  const totalTokens = pick(totalMatch?.[1]);
-  const cacheReadTokens = pick(cacheReadMatch?.[1]);
-  const cacheWriteTokens = pick(cacheWriteMatch?.[1]);
-  const reasoningTokens = pick(reasoningMatch?.[1], thoughtsMatch?.[1]);
-  const separateThoughts = pick(thoughtsMatch?.[1]);
+function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'source'> | null {
+  // Keep optional words AND their following space in one group. Adjacent
+  // whitespace stars around an optional word partition a missing suffix in
+  // quadratically many ways (e.g. "input" followed only by spaces).
+  const input =
+    text.match(/(?:input|prompt)\s*(?:tokens?\s*)?[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i)?.[1] ??
+    numberBeforeLabel(text, /(?:input|prompt)\s*tokens?/gi);
+  const output =
+    text.match(
+      /(?:output|completion|candidate)\s*(?:tokens?\s*)?[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
+    )?.[1] ?? numberBeforeLabel(text, /(?:output|completion|candidate)\s*tokens?/gi);
+  const total =
+    text.match(/(?:total|all)\s*(?:tokens?\s*)?[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i)?.[1] ??
+    numberBeforeLabel(text, /total\s*tokens?/gi);
+  const cacheRead = text.match(
+    /cache(?:d)?\s*(?:(?:read|hit)\s*)?tokens?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
+  )?.[1];
+  const cacheWrite = text.match(/cache\s*write\s*tokens?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i)?.[1];
+  const reasoning = text.match(/reasoning\s*tokens?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i)?.[1];
+  // Gemini's text summaries label thoughts apart from candidates; they add.
+  const thoughts = text.match(/thoughts?\s*tokens?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i)?.[1];
+
+  const inputTokens = pick(input);
+  const outputTokens = pick(output);
+  const totalTokens = pick(total);
+  const cacheReadTokens = pick(cacheRead);
+  const cacheWriteTokens = pick(cacheWrite);
+  const reasoningTokens = pick(reasoning, thoughts);
+  const separateThoughts = pick(thoughts);
 
   if (
     inputTokens === undefined &&

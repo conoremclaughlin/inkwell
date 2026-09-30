@@ -190,3 +190,64 @@ describe('providerContextTokens — the context a request was handed, per backen
     expect(providerContextTokens('codex', { cacheReadTokens: 5 })).toBeUndefined();
   });
 });
+
+describe('text usage fallback — linear scans of provider output', () => {
+  it.each([
+    [
+      '1,200 input tokens; 450 output tokens; 1.65k total tokens',
+      { inputTokens: 1200, outputTokens: 450, totalTokens: 1650 },
+    ],
+    [
+      '1.2 K prompt tokens; .45 k completion tokens; 1.65 K total tokens',
+      { inputTokens: 1200, outputTokens: 450, totalTokens: 1650 },
+    ],
+    [
+      'input = 12; output: 3; all tokens = 15',
+      { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+    ],
+    [
+      'cached tokens: 2; cache hit token = 3; cache write tokens: 4; reasoning tokens: 5',
+      { cacheReadTokens: 2, cacheWriteTokens: 4, reasoningTokens: 5 },
+    ],
+    [
+      'input tokens have no number; 12 prompt tokens; 3 candidate tokens',
+      { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+    ],
+    ['1 input tokens; input tokens: 7', { inputTokens: 7 }],
+  ])('preserves usage formats and leading-label precedence: %s', (text, expected) => {
+    expect(extractBackendTokenUsage('codex', text, '')).toMatchObject({
+      source: 'text',
+      ...expected,
+    });
+  });
+
+  it.each(['input', 'cache'])('does not backtrack over a missing suffix after %s', (label) => {
+    const payload = label + ' '.repeat(16_000) + '!\noutput tokens: 7';
+    const started = performance.now();
+    expect(extractBackendTokenUsage('codex', payload, '')?.outputTokens).toBe(7);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  it.each([',', '1,'])('does not retry a numeric pattern at each character in %j runs', (unit) => {
+    const payload = unit.repeat(8_000) + '!\ninput tokens: 12; output tokens: 3';
+    const started = performance.now();
+    expect(extractBackendTokenUsage('codex', payload, '')).toMatchObject({
+      inputTokens: 12,
+      outputTokens: 3,
+    });
+    // Exercise the reverse total form on an otherwise unlabelled number run.
+    expect(extractBackendTokenUsage('codex', unit.repeat(8_000) + '!', '')).toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  it('does not lose a valid usage line after a long non-usage prefix', () => {
+    const prefix = ','.repeat(100_000) + '\n' + 'plain prose\n'.repeat(10_000);
+    expect(
+      extractBackendTokenUsage(
+        'gemini',
+        prefix + 'prompt tokens: 12, candidate tokens: 3, thoughts tokens: 2',
+        ''
+      )
+    ).toMatchObject({ inputTokens: 12, outputTokens: 3, reasoningTokens: 2, totalTokens: 17 });
+  });
+});
