@@ -244,6 +244,45 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(readJson(join(studio, '.ink', 'identity.json')).studioId).toBeUndefined();
   });
 
+  it('a Codex config the sync cannot repair fails the backend configs step, naming the hand edit, rather than reporting a repair (Myra, #701)', async () => {
+    const opts = baseOptions();
+    await completeStudio(studio, opts);
+    const codexPath = join(studio, '.codex', 'config.toml');
+    writeFileSync(
+      codexPath,
+      `${readFileSync(codexPath, 'utf-8')}\n[mcp_servers.inkwell]\nurl = "http://localhost:9999/stale"\n`
+    );
+
+    const again = await completeStudio(studio, opts);
+
+    const step = again.steps.find((s) => s.label === 'backend configs');
+    expect(step?.status).toBe('failed');
+    expect(step?.detail).toContain("kept outside ink's Codex block, as defined there: inkwell");
+    expect(step?.detail).toContain(
+      "defines the inkwell server outside ink's managed block, where the sync cannot update it"
+    );
+    expect(again.audit.missing).toEqual(['codex-mcp']);
+  });
+
+  it('names a server it kept outside the Codex block, and the studio stays complete (Myra, #701 73a3b6fd)', async () => {
+    const opts = baseOptions();
+    await completeStudio(studio, opts);
+    const codexPath = join(studio, '.codex', 'config.toml');
+    writeFileSync(
+      codexPath,
+      `${readFileSync(codexPath, 'utf-8')}\n[mcp_servers.trusted]\ncommand = "node"\n`
+    );
+
+    const again = await completeStudio(studio, opts);
+
+    const step = again.steps.find((s) => s.label === 'backend configs');
+    expect(step?.status).toBe('updated');
+    expect(step?.detail).toBe(
+      ".codex/, .gemini/; kept outside ink's Codex block, as defined there: trusted"
+    );
+    expect(again.audit.complete).toBe(true);
+  });
+
   it('never writes identity or settings through a symlink', async () => {
     mkdirSync(join(studio, '.ink'), { recursive: true });
     const outside = join(root, 'outside');
