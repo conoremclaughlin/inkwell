@@ -1,4 +1,4 @@
-import { spawnBackend, sessionEnvHandoff } from '@inklabs/shared';
+import { spawnBackend } from '@inklabs/shared';
 import { getBackend } from '../backends/index.js';
 import { PARENT_OWNED_TURN_ENV } from '../lib/turn-owner.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -13,6 +13,9 @@ import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.
  * 4-hour PROCESS_TIMEOUT_MS — a working turn should never die on wall-clock.
  */
 export const DEFAULT_TURN_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+
+/** Env names that say which session a child serves; only the request's ids set them. */
+const ROUTING_ENV_NAMES = ['INK_SESSION_ID', 'INK_STUDIO_ID', 'INK_CONTEXT'] as const;
 
 export interface BackendRunRequest {
   backend: string;
@@ -83,6 +86,31 @@ export interface BackendRunRequest {
    * write this value onto that session (see BackendConfig.cliAttached).
    */
   cliAttached: boolean;
+  /**
+   * Where the child runs, and the directory its adapter reads `.mcp.json`,
+   * skills and the channel plugin from. Required, with no default, so no
+   * caller inherits a directory by accident: `ink chat` passes its own studio,
+   * and a host serving several sessions passes each session's.
+   */
+  workingDirectory: string;
+  /**
+   * The session this turn serves, and the only source of the child's routing:
+   * INK_CONTEXT, INK_SESSION_ID/INK_STUDIO_ID, and the MCP routing headers. The
+   * key is required (the value may be undefined), so every caller decides; an
+   * undefined id stays absent and never falls back to the host process's env
+   * or to a header the project config carries.
+   */
+  inkSessionId: string | undefined;
+  studioId: string | undefined;
+  /**
+   * The session credentials the child is handed: `ink chat` passes
+   * `sessionEnvHandoff()`, its own; a host serving several sessions passes
+   * each spawn's own, never the host process's. Routing names in it
+   * (INK_SESSION_ID, INK_STUDIO_ID, INK_CONTEXT) are dropped in favour of the
+   * ids above. The adapter's prepared env and the turn-owner marker are
+   * applied on top.
+   */
+  sessionEnv: Record<string, string>;
 }
 
 export interface BackendRunResult {
@@ -132,7 +160,18 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     media: request.media,
     deliverMedia: request.deliverMedia,
     cliAttached: request.cliAttached,
+    cwd: request.workingDirectory,
+    explicitSession: true,
+    inkSessionId: request.inkSessionId,
+    studioId: request.studioId,
   });
+
+  // The request's ids are the only source of the child's routing. The adapter
+  // writes INK_CONTEXT, and INK_SESSION_ID/INK_STUDIO_ID when named, from
+  // them; the same names in sessionEnv are dropped, so an id the caller left
+  // undefined stays absent rather than arriving from wherever the env came.
+  const credentials: Record<string, string> = { ...(request.sessionEnv ?? {}) };
+  for (const name of ROUTING_ENV_NAMES) delete credentials[name];
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;
 
@@ -158,12 +197,12 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const { child, result } = spawnBackend({
     binary: prepared.binary,
     args: prepared.args,
-    // Every caller is `ink chat`, which owns the logical turn of the session
-    // this child inherits (lib/turn-owner.ts). The child serves THIS session,
-    // so this process hands it its own session credentials and identity by
-    // exact name (sessionEnvHandoff); buildCleanEnv inherits none of them on
-    // its own, and the adapter's prepared env still wins where it sets one.
-    env: { ...sessionEnvHandoff(), ...prepared.env, ...PARENT_OWNED_TURN_ENV },
+    cwd: request.workingDirectory,
+    // The caller owns the logical turn of the session this child serves
+    // (lib/turn-owner.ts), and hands it that session's credentials
+    // explicitly; buildCleanEnv inherits none of them on its own. A JavaScript
+    // caller that omits them gets none rather than the host's.
+    env: { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV },
     stdinData: prepared.stdinData,
     timeoutMs: request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS,
     idleTimeoutMs: request.idleTimeoutMs,

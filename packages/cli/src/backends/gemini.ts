@@ -39,7 +39,8 @@ export function buildGeminiSettings(
   cwd: string,
   contextToken: string,
   sessionId?: string,
-  studioId?: string
+  studioId?: string,
+  explicitSession = false
 ): { path: string; cleanup: () => void } | null {
   // Start from .mcp.json to preserve other MCP servers (supabase, github, etc.)
   const mcpJsonPath = join(cwd, '.mcp.json');
@@ -57,7 +58,17 @@ export function buildGeminiSettings(
   // The legacy 'pcp' server name is retired — never target or create it.
   const serverKey = 'inkwell';
   const serverConfig = (mcpServers[serverKey] || {}) as Record<string, unknown>;
-  const existingHeaders = (serverConfig.headers || {}) as Record<string, string>;
+  const existingHeaders = { ...((serverConfig.headers || {}) as Record<string, string>) };
+  // A caller that named the session owns the routing: a session or studio
+  // header the project config carries would otherwise survive whenever the
+  // caller named none (BackendConfig.explicitSession).
+  if (explicitSession) {
+    for (const name of Object.keys(existingHeaders)) {
+      if (['x-ink-session-id', 'x-ink-studio-id', 'x-ink-context'].includes(name.toLowerCase())) {
+        delete existingHeaders[name];
+      }
+    }
+  }
   mcpServers[serverKey] = {
     ...serverConfig,
     type: serverConfig.type || 'http',
@@ -156,10 +167,11 @@ export class GeminiAdapter implements BackendAdapter {
     // INK_ACCESS_TOKEN is set at the spawn site (after prepare) — the
     // ${INK_ACCESS_TOKEN} syntax in settings.json resolves at Gemini runtime.
     const settings = buildGeminiSettings(
-      process.cwd(),
+      config.cwd ?? process.cwd(),
       contextToken,
       config.inkSessionId,
-      config.studioId
+      config.studioId,
+      config.explicitSession === true
     );
     const cleanup = () => {
       identityCleanup();

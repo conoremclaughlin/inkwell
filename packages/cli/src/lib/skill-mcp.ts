@@ -159,6 +159,53 @@ export function resolveChannelPluginPath(cwd: string): string | null {
   return null;
 }
 
+/** Headers that say which session and studio a request serves. */
+const ROUTING_HEADERS: ReadonlySet<string> = new Set([
+  'x-ink-session-id',
+  'x-ink-studio-id',
+  'x-ink-context',
+]);
+
+/**
+ * A copy of the config at `path` with every routing header removed from every
+ * server, or null when it carries none. Header names match case-insensitively,
+ * as HTTP does.
+ */
+function withoutRoutingHeaders(path: string): { path: string; cleanup: () => void } | null {
+  let config: McpJsonConfig;
+  try {
+    config = { mcpServers: {}, ...JSON.parse(readFileSync(path, 'utf-8')) };
+  } catch {
+    return null;
+  }
+  let stripped = false;
+  for (const server of Object.values(config.mcpServers)) {
+    const headers = server.headers;
+    if (!headers) continue;
+    for (const name of Object.keys(headers)) {
+      if (ROUTING_HEADERS.has(name.toLowerCase())) {
+        delete headers[name];
+        stripped = true;
+      }
+    }
+  }
+  if (!stripped) return null;
+  const tmpDir = join(tmpdir(), 'sb-mcp');
+  mkdirSync(tmpDir, { recursive: true });
+  const tmpPath = join(tmpDir, `mcp-routed-${process.pid}-${randomUUID()}.json`);
+  writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+  return {
+    path: tmpPath,
+    cleanup: () => {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Best-effort cleanup
+      }
+    },
+  };
+}
+
 /**
  * Build a merged MCP config that includes both the project's .mcp.json
  * and any skill-provided MCP servers. Also injects Inkwell session/studio
@@ -180,7 +227,17 @@ export function resolveChannelPluginPath(cwd: string): string | null {
  */
 export function buildMergedMcpConfig(
   cwd: string,
-  options?: { inkSessionId?: string; studioId?: string; omitToolServers?: boolean }
+  options?: {
+    inkSessionId?: string;
+    studioId?: string;
+    omitToolServers?: boolean;
+    /**
+     * The caller named the session and studio, possibly as none: route by
+     * exactly those, never the process env, and drop any session, studio or
+     * context header the project config carries (see BackendConfig).
+     */
+    explicitSession?: boolean;
+  }
 ): {
   mcpConfigPath: string | null;
   cleanup: () => void;
@@ -276,8 +333,25 @@ export function buildMergedMcpConfig(
   const cleanups: Array<() => void> = [];
   let effectivePath = hasProjectConfig ? projectMcpPath : null;
 
-  const sessionId = options?.inkSessionId || process.env.INK_SESSION_ID;
-  const studioId = options?.studioId || process.env.INK_STUDIO_ID;
+  // A launcher runs in the user's own session and may learn it from the env.
+  // A caller that named the session routes by exactly what it named: a host
+  // serving other sessions would otherwise stamp its own onto theirs.
+  const explicit = options?.explicitSession === true;
+  const sessionId = explicit
+    ? options?.inkSessionId
+    : options?.inkSessionId || process.env.INK_SESSION_ID;
+  const studioId = explicit ? options?.studioId : options?.studioId || process.env.INK_STUDIO_ID;
+
+  // injectSessionHeaders keeps a header the project config already sets. For
+  // an explicit caller a configured one is stale routing: drop it, so the
+  // named ids are injected fresh, or stay absent when the caller named none.
+  if (explicit && effectivePath) {
+    const sanitized = withoutRoutingHeaders(effectivePath);
+    if (sanitized) {
+      effectivePath = sanitized.path;
+      cleanups.push(sanitized.cleanup);
+    }
+  }
 
   // Always run injection when we have a config path. The x-ink-context header
   // still carries useful identity (sbSlug/studioId/runtime) even when the

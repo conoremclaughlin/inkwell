@@ -215,6 +215,7 @@ import {
   encodeContextToken,
   mintDelegationToken,
   RUN_TURN_EPOCH_ENV,
+  sessionEnvHandoff,
   verifyDelegationToken,
   type DelegationTokenPayload,
 } from '@inklabs/shared';
@@ -3619,6 +3620,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // in their x-ink-context header (see InkClient construction above).
   currentInkSessionId = () => runtime.sessionId;
   currentInkStudioId = () => runtime.studioId || identity?.studioId;
+  // What every provider spawn of this chat serves: this chat's directory, its
+  // session, and its own session credentials (backend-runner.ts). Read at
+  // spawn time, because the session and studio can change after startup. The
+  // root checkout's 'main' is a sentinel, not a studio id, so it names no
+  // studio here, as in hooks.ts and turn-signal.ts.
+  const providerSpawnContext = (): Pick<
+    BackendRunRequest,
+    'workingDirectory' | 'inkSessionId' | 'studioId' | 'sessionEnv'
+  > => ({
+    workingDirectory: process.cwd(),
+    inkSessionId: runtime.sessionId,
+    studioId: runtime.studioId && runtime.studioId !== 'main' ? runtime.studioId : undefined,
+    sessionEnv: sessionEnvHandoff(),
+  });
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {
     runtime.contactId = options.contactId;
@@ -5347,6 +5362,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             idleTimeoutMs: runtime.backendIdleTimeoutMs,
             stream: true,
             cliAttached,
+            ...providerSpawnContext(),
           });
           const onAbort = (): void => summarizer.abort();
           signal?.addEventListener('abort', onAbort, { once: true });
@@ -6202,6 +6218,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       stream: true,
       toolRouting: cloneRouting,
       cliAttached,
+      ...providerSpawnContext(),
       ...sessionArgs,
     });
 
@@ -7457,6 +7474,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       media: turnMedia.length > 0 ? turnMedia : undefined,
       ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
       cliAttached,
+      ...providerSpawnContext(),
       // The session argument is the DECISION's, never derived from the live id:
       // a seed assigns the minted id before spawning, and deriving from it sent
       // a resume of a session that did not exist yet (Lumen, PR #577).
@@ -7518,6 +7536,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ? { backendSessionId: activeBackendSessionId }
             : {}),
           cliAttached,
+          ...providerSpawnContext(),
         });
         currentTurnAbort = turn.abort;
 
@@ -7593,6 +7612,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
             backendSessionSeedId: reseedId,
             cliAttached,
+            ...providerSpawnContext(),
           });
           currentTurnAbort = reseedTurn.abort;
           runResult = await reseedTurn.result.finally(() => {

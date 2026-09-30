@@ -35,6 +35,22 @@ export interface BackendConfig {
    * model_instructions_file, gemini: GEMINI_SYSTEM_MD).
    */
   systemPromptOverride?: string;
+  /**
+   * The directory the backend runs in, and the one its project config is read
+   * from: `.mcp.json`, skills, the channel plugin. A launcher that runs in the
+   * user's own directory may omit it (process.cwd()); a host that spawns for
+   * a session in another directory must set it, or the child reads the host's
+   * config and loads none of the studio's hooks.
+   */
+  cwd?: string;
+  /**
+   * The caller named this spawn's session and studio, possibly as none. The
+   * adapter then routes by exactly `inkSessionId` and `studioId`: no fallback
+   * to the process env, and no session, studio or context header carried over
+   * from the project config. Launchers that run in the user's own session
+   * leave it unset and keep both.
+   */
+  explicitSession?: boolean;
   inkSessionId?: string;
   backendSessionId?: string;
   backendSessionSeedId?: string;

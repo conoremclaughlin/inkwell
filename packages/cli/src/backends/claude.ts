@@ -271,10 +271,11 @@ export class ClaudeAdapter implements BackendAdapter {
       mcpConfigPath,
       hasChannelBridge,
       cleanup: mcpCleanup,
-    } = buildMergedMcpConfig(process.cwd(), {
+    } = buildMergedMcpConfig(config.cwd ?? process.cwd(), {
       inkSessionId: config.inkSessionId,
       studioId: config.studioId,
       omitToolServers: localRouting,
+      explicitSession: config.explicitSession,
     });
     if (mcpConfigPath) {
       args.push('--mcp-config', mcpConfigPath);
