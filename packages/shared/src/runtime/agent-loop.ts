@@ -5,11 +5,13 @@
  * emitted as text, execute them through ink's policy pipeline, feed the results
  * back, repeat until the agent is done.
  *
- * This module owns the *pure* pieces of that loop — tool-call extraction, the
- * stop predicate, display stripping — so they can be tested directly and reused
- * by callers other than the REPL (shadow clones; see
- * `ink://specs/ink-runtime-shadow-clones`). The stateful loop body still lives
- * in `commands/chat.ts` and moves here next.
+ * `runAgentLoop` is the loop itself; the host supplies everything it touches
+ * through `AgentLoopPorts`. The parent REPL and shadow clones already share it
+ * (see `ink://specs/ink-runtime-shadow-clones`), and it lives in
+ * `@inklabs/shared/runtime` so a host other than the CLI can import it (see
+ * `ink://specs/live-agent-surfaces`). Tool-call extraction, the stop predicate
+ * and display stripping sit beside it as pure functions so they can be tested
+ * directly.
  *
  * Tool calls travel as TEXT, not native tool-use blocks: backends like the
  * claude CLI expose their own tools, not ink's, so the runtime asks the model to

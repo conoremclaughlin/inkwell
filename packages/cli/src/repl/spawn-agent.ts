@@ -13,7 +13,7 @@
  * See `ink://specs/ink-runtime-shadow-clones`, Q3–Q5.
  */
 
-import type { LocalToolCall } from './agent-loop.js';
+import type { LocalToolCall } from '@inklabs/shared/runtime';
 
 export const SPAWN_AGENT_TOOL = 'spawn_agent';
 

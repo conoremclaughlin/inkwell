@@ -18,7 +18,11 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-import { runAgentLoop, type BackendTurnOutcome, type ToolResultRecord } from './agent-loop.js';
+import {
+  runAgentLoop,
+  type BackendTurnOutcome,
+  type ToolResultRecord,
+} from '@inklabs/shared/runtime';
 import { executeToolCalls } from './tool-call-executor.js';
 import { ToolPolicyState } from './tool-policy.js';
 import { applyToolApprovalChoice } from './tool-approval.js';

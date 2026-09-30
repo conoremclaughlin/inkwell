@@ -16,7 +16,7 @@
  * See `ink://specs/ink-runtime-shadow-clones`.
  */
 
-import type { AgentLoopStopReason } from './agent-loop.js';
+import type { AgentLoopStopReason } from '@inklabs/shared/runtime';
 
 export type CloneStatus = 'running' | 'completed' | 'failed' | 'aborted';
 
