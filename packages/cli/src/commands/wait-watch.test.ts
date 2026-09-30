@@ -12,9 +12,11 @@ import {
 // The fakes below follow the server contract read from
 // packages/api/src/mcp/tools/thread-handlers.ts and inbox-handlers.ts:
 // cursors and `newerThan`/`since` are strict (created_at >), cursor pages come
-// back oldest-first, `latestN` returns the newest N with `skippedOlderCount`,
-// and get_inbox selects oldest-first for status 'unread' and newest-first
-// otherwise, displaying newest-first either way.
+// back oldest-first in (created_at, id) order and a page that fills carries
+// the rest of its last timestamp (tie completion, #702), `latestN` returns
+// the newest N with `skippedOlderCount`, and get_inbox selects oldest-first
+// for status 'unread' and newest-first otherwise, displaying newest-first
+// either way.
 
 const BASE = Date.UTC(2026, 8, 30, 0, 0, 0);
 /** A server timestamp `ms` after the virtual epoch. One format, so string order is time order. */
@@ -25,6 +27,25 @@ interface Msg {
   createdAt: string;
   senderSlug: string;
   content: string;
+}
+
+/** The server's page order: created_at, then id. */
+const serverOrder = (a: Msg, b: Msg) =>
+  a.createdAt !== b.createdAt ? (a.createdAt < b.createdAt ? -1 : 1) : a.id < b.id ? -1 : 1;
+
+/**
+ * An oldest-first page as the server serves it: one that fills carries the
+ * rest of its last timestamp, so it never ends partway through one.
+ * `tieCompletion: false` is a server without that contract, for controls.
+ */
+function serverPage(pool: Msg[], limit: number, tieCompletion = true): Msg[] {
+  const page = pool.slice(0, limit);
+  if (!tieCompletion || page.length < limit || page.length === 0) return page;
+  const last = page[page.length - 1].createdAt;
+  for (let i = page.length; i < pool.length && pool[i].createdAt === last; i++) {
+    page.push(pool[i]);
+  }
+  return page;
 }
 
 type Event = [atMs: number, run: () => void];
@@ -92,7 +113,7 @@ function capture() {
   };
 }
 
-function threadServer(threadKey = 'pr:1', exists = true) {
+function threadServer(threadKey = 'pr:1', exists = true, { tieCompletion = true } = {}) {
   const messages: Msg[] = [];
   const calls: Array<{ tool: string; args: Record<string, unknown>; at: number }> = [];
   const faults: Array<string | undefined> = [];
@@ -119,7 +140,7 @@ function threadServer(threadKey = 'pr:1', exists = true) {
     if (fault) throw new Error(fault);
     if (!threadExists) return { success: false, error: `Thread not found: ${threadKey}` };
 
-    let pool = [...messages].sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    let pool = [...messages].sort(serverOrder);
     if (typeof args.afterMessageId === 'string') {
       const cursor = messages.find((m) => m.id === args.afterMessageId);
       if (cursor) pool = pool.filter((m) => m.createdAt > cursor.createdAt);
@@ -138,7 +159,7 @@ function threadServer(threadKey = 'pr:1', exists = true) {
         ...(skipped > 0 ? { skippedOlderCount: skipped } : {}),
       };
     }
-    return { success: true, messages: pool.slice(0, limit) };
+    return { success: true, messages: serverPage(pool, limit, tieCompletion) };
   };
 
   return {
@@ -535,7 +556,7 @@ interface ThreadState {
   lastReadAt?: string;
 }
 
-function inboxServer() {
+function inboxServer({ tieCompletion = true } = {}) {
   const legacy: Msg[] = [];
   let pointer: string | undefined;
   const threads = new Map<string, ThreadState>();
@@ -551,7 +572,7 @@ function inboxServer() {
     if (args.markRead !== false) throw new Error('watcher must not advance a read pointer');
     const t = threads.get(String(args.threadKey));
     if (!t) return { success: false, error: `Thread not found: ${String(args.threadKey)}` };
-    let pool = [...t.messages].sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    let pool = [...t.messages].sort(serverOrder);
     if (args.fullHistory !== true && t.lastReadAt) {
       const floor = t.lastReadAt;
       pool = pool.filter((m) => m.createdAt > floor);
@@ -565,7 +586,7 @@ function inboxServer() {
       const page = pool.slice(-limit);
       return { success: true, messages: page, skippedOlderCount: pool.length - page.length };
     }
-    return { success: true, messages: pool.slice(0, limit) };
+    return { success: true, messages: serverPage(pool, limit, tieCompletion) };
   };
 
   const call: WaitToolCall = async (tool, args) => {
@@ -574,18 +595,17 @@ function inboxServer() {
     if (args.markRead !== false) throw new Error('watcher must not drain the inbox');
     const since = typeof args.since === 'string' ? args.since : undefined;
     const limit = Number(args.limit ?? 20);
-    const byTime = (a: Msg, b: Msg) => (a.createdAt < b.createdAt ? -1 : 1);
     let messages: Msg[];
     if (args.status === 'unread') {
-      messages = unreadLegacy()
+      // Oldest-first selection, tie-completed, displayed newest-first.
+      const pool = unreadLegacy()
         .filter((m) => !since || m.createdAt > since)
-        .sort(byTime)
-        .slice(0, limit)
-        .reverse();
+        .sort(serverOrder);
+      messages = serverPage(pool, limit, tieCompletion).reverse();
     } else {
       messages = legacy
         .filter((m) => !since || m.createdAt > since)
-        .sort(byTime)
+        .sort(serverOrder)
         .reverse()
         .slice(0, limit);
     }
@@ -795,6 +815,65 @@ describe('#702 review regressions (Lumen)', () => {
     const { out, done } = run({ ...INBOX_FOLLOW, timeoutSec: 60 }, server.call, clock);
     await done;
     expect(out.batches).toEqual([]);
+  });
+
+  // Round two, at 1ab9e0da: a tie as large as the biggest page stalled every
+  // later poll. Exactly 200 was enough; past a thousand is the server's
+  // max_rows, which its completion must page through.
+  for (const tied of [200, 1200]) {
+    it(`thread continues to later arrivals after a ${tied}-message tie`, async () => {
+      const server = threadServer();
+      server.post('lumen', 'baseline', -1000);
+      const { clock } = virtualClock([
+        [
+          10000,
+          () => {
+            for (let i = 0; i < tied; i++) server.post('lumen', `tie ${i}`, 10000);
+          },
+        ],
+        [30000, () => server.post('lumen', 'later unique reply', 30000)],
+      ]);
+      const { out, done } = run({ ...FOLLOW, timeoutSec: 60 }, server.call, clock);
+      await done;
+      const lines = out.batches.flatMap(bodyOf);
+      expect(lines.filter((l) => l.includes(': tie '))).toHaveLength(tied);
+      expect(lines.join('\n')).toContain('later unique reply');
+    });
+
+    it(`legacy inbox continues to later arrivals after a ${tied}-message tie`, async () => {
+      const server = inboxServer();
+      server.deliver('lumen', 'baseline', -1000);
+      const { clock } = virtualClock([
+        [
+          10000,
+          () => {
+            for (let i = 0; i < tied; i++) server.deliver('lumen', `tie ${i}`, 10000);
+          },
+        ],
+        [30000, () => server.deliver('lumen', 'later unique reply', 30000)],
+      ]);
+      const { out, done } = run({ ...INBOX_FOLLOW, timeoutSec: 60 }, server.call, clock);
+      await done;
+      const lines = out.batches.flatMap(bodyOf);
+      expect(lines.filter((l) => l.includes(': tie '))).toHaveLength(tied);
+      expect(lines.join('\n')).toContain('later unique reply');
+    });
+  }
+
+  it('(control) against a server that ends a page mid-tie, the exclusive floor loses the rest', async () => {
+    const server = threadServer('pr:1', true, { tieCompletion: false });
+    server.post('lumen', 'baseline', -1000);
+    const { clock } = virtualClock([
+      [
+        10000,
+        () => {
+          for (let i = 0; i < WAIT_PAGE_SIZE + 1; i++) server.post('lumen', `tie ${i}`, 10000);
+        },
+      ],
+    ]);
+    const { out, done } = run({ ...FOLLOW, timeoutSec: 60 }, server.call, clock);
+    await done;
+    expect(out.batches.flatMap(bodyOf)).toHaveLength(WAIT_PAGE_SIZE);
   });
 
   // Round two, at 1ab9e0da.

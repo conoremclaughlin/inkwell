@@ -81,17 +81,21 @@ interface WatchSource {
 type Row = Record<string, unknown>;
 
 /**
- * Where a drain stands: the newest timestamp read, and the ids read at or
- * just below it.
+ * Where a drain stands: the newest timestamp read, verbatim as the server
+ * wrote it, and the ids read at it.
  *
- * The server's floors are strict (`created_at > floor`, for a thread's
- * `newerThan` and `afterMessageId` and for the inbox's `since`), and a thread
- * page is ordered by `created_at` alone. A cursor on the newest message read
- * therefore skips every other message sharing its timestamp, and rows written
- * in one transaction all share it. So each read starts one millisecond before
- * the newest timestamp seen, which the ids already read are filtered against.
- * Timestamps are compared as instants, never as strings: the server writes
- * microseconds and `+00:00` where a Date writes milliseconds and `Z`.
+ * Every floor the server takes is strict (`created_at >`: a thread's
+ * `newerThan`, the inbox's `since`), and a page that fills never ends partway
+ * through a timestamp: the server carries the rest of that timestamp with it.
+ * So the newest timestamp read is a safe exclusive floor, however many rows
+ * share it (Lumen, #702 r2: a client that overlapped reads instead stalled
+ * for good on a tie as large as its biggest page). The floor goes back
+ * exactly as the server wrote it, microseconds and all, because a Date would
+ * round it to milliseconds and move it. The ids at the boundary are kept
+ * only as a safety net against a row coming back twice.
+ *
+ * A row another transaction writes later with the very timestamp already
+ * read is still passed over. A timestamp cursor cannot see it.
  */
 interface DrainTail {
   boundary?: string;
@@ -103,13 +107,18 @@ type PageReader = (floor: string | undefined, limit: number) => Promise<Row[] | 
 
 const emptyTail = (): DrainTail => ({ seen: new Map() });
 
-function instantOf(row: Row): number {
-  return Date.parse(String(row.createdAt));
+/**
+ * A server timestamp in microseconds since the epoch. Date.parse keeps only
+ * milliseconds and the server writes microseconds, so two rows in one
+ * millisecond would otherwise compare equal.
+ */
+function micros(at: string): number {
+  const fraction = /\.(\d+)/.exec(at)?.[1] ?? '';
+  return Date.parse(at) * 1000 + Number(fraction.slice(3, 6).padEnd(3, '0'));
 }
 
-/** One millisecond before `at`: an inclusive floor for a strict `created_at >`. */
-function inclusiveFloor(at: string): string {
-  return new Date(Date.parse(at) - 1).toISOString();
+function microsOf(row: Row): number {
+  return micros(String(row.createdAt));
 }
 
 /** Record `rows` as read, moving the boundary to the newest of them. */
@@ -118,10 +127,10 @@ function absorb(tail: DrainTail, rows: Row[]): Row[] {
   for (const row of rows) {
     const id = String(row.id);
     if (tail.seen.has(id)) continue;
-    tail.seen.set(id, instantOf(row));
+    tail.seen.set(id, microsOf(row));
     unseen.push(row);
     const at = stringOf(row.createdAt);
-    if (at && (!tail.boundary || Date.parse(at) >= Date.parse(tail.boundary))) tail.boundary = at;
+    if (at && (!tail.boundary || micros(at) >= micros(tail.boundary))) tail.boundary = at;
   }
   return unseen;
 }
@@ -138,33 +147,29 @@ async function drainPast(
 ): Promise<{ fresh: Row[]; tail: DrainTail }> {
   const tail: DrainTail = { boundary: from.boundary, seen: new Map(from.seen) };
   const fresh: Row[] = [];
-  let limit = WAIT_PAGE_SIZE;
   for (let page = 0; page < MAX_PAGES_PER_POLL; page++) {
-    const rows = await read(tail.boundary ? inclusiveFloor(tail.boundary) : undefined, limit);
+    const rows = await read(tail.boundary, WAIT_PAGE_SIZE);
     if (!rows) break;
     const unseen = absorb(tail, rows);
     fresh.push(...unseen);
-    if (rows.length < limit) break;
+    // A page carrying a completed tie can be longer than the limit; only a
+    // short one means the drain has reached the end.
+    if (rows.length < WAIT_PAGE_SIZE) break;
     if (unseen.length === 0) {
-      // A full page of rows already read: a tie group at least a page long
-      // sits on the boundary. One larger page gets past it.
-      if (limit < WAIT_MAX_PAGE_SIZE) {
-        limit = WAIT_MAX_PAGE_SIZE;
-        continue;
-      }
+      // A full page past an exclusive floor with nothing new on it: the
+      // server is not keeping its page contract, and reading on would loop.
       warn(
-        `[ink wait] More than ${WAIT_MAX_PAGE_SIZE} messages share one timestamp; any past that page are not reported.`
+        '[ink wait] The server returned a full page of messages already read; ending this poll.'
       );
       break;
     }
-    limit = WAIT_PAGE_SIZE;
   }
-  // Only ids the next read can return again are worth remembering.
+  // Past an exclusive floor only rows at the boundary could come back.
   if (tail.boundary) {
-    const keepFrom = Date.parse(tail.boundary) - 1;
-    for (const [id, at] of tail.seen) if (at < keepFrom) tail.seen.delete(id);
+    const boundary = micros(tail.boundary);
+    for (const [id, at] of tail.seen) if (at < boundary) tail.seen.delete(id);
   }
-  fresh.sort((a, b) => instantOf(a) - instantOf(b));
+  fresh.sort((a, b) => microsOf(a) - microsOf(b));
   return { fresh, tail };
 }
 
@@ -361,9 +366,9 @@ class ThreadCursor {
   };
 
   /**
-   * Anchor at the thread's current end, so nothing already there is new:
-   * the newest message and every message sharing its timestamp. Returns the
-   * thread's length, or the server's reason when the thread is absent.
+   * Anchor at the thread's current end, so nothing already there is new.
+   * Returns the thread's length, or the server's reason when the thread is
+   * absent.
    */
   async anchorAtEnd(): Promise<{ total: number; anchor?: string } | { absent: string }> {
     const end = await this.readEnd();
@@ -388,11 +393,10 @@ class ThreadCursor {
     const messages = rowsOf(result.messages);
     const total = messages.length + (Number(result.skippedOlderCount) || 0);
     const newest = messages[messages.length - 1];
+    // Everything sharing the newest timestamp was there at the baseline too,
+    // so an exclusive floor on it passes over exactly what is not new.
     const tail = emptyTail();
     absorb(tail, messages.slice(-1));
-    if (tail.boundary) {
-      absorb(tail, (await this.readPage(inclusiveFloor(tail.boundary), WAIT_MAX_PAGE_SIZE)) ?? []);
-    }
     return { tail, total, anchor: newest ? String(newest.id) : undefined };
   }
 
@@ -569,20 +573,12 @@ class InboxActivityWatch implements WatchSource {
 
   async baseline(): Promise<void> {
     // status 'all' selects newest-first, so this is the newest legacy message
-    // whether or not it has been read, then everything sharing its timestamp.
+    // whether or not it has been read. As for a thread, everything sharing
+    // its timestamp was already there, and the exclusive floor passes it over.
     const result = await this.read({ status: 'all', limit: 1 });
     requireSuccess(result, 'get_inbox');
     const legacy = emptyTail();
     absorb(legacy, rowsOf(result.messages).slice(0, 1));
-    if (legacy.boundary) {
-      const ties = await this.read({
-        status: 'all',
-        since: inclusiveFloor(legacy.boundary),
-        limit: WAIT_MAX_PAGE_SIZE,
-      });
-      requireSuccess(ties, 'get_inbox');
-      absorb(legacy, rowsOf(ties.messages));
-    }
     // A thread with unread messages now is anchored at its end: what it
     // already holds is backlog, not arrival.
     const threads = new Map<string, ThreadCursor>();
