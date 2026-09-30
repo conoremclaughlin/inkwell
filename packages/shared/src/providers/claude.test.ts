@@ -312,6 +312,42 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
+  // Hosted parity for skills is the host's: whatever it discovers reaches the
+  // provider's config, and under local routing it is not asked at all
+  // (Myra's surviving `skillServers: []` mutant, P2b-2a review).
+  it('merges the skill servers its host discovers, and asks for none under local routing', async () => {
+    const skillMcpServers = vi.fn(async () => [
+      { name: 'synthetic-skill', command: 'npx', args: ['synthetic-skill-server'] },
+    ]);
+    host = testHost({ skillMcpServers });
+    const config = {
+      ...adapterDefaults(),
+      sbSlug: 'wren',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+    };
+
+    const provider = await new ClaudeAdapter().prepare(config, host);
+    try {
+      expect(skillMcpServers).toHaveBeenCalledWith(config.cwd);
+      expect(mcpConfigFrom(provider.args)).toMatchObject({
+        'synthetic-skill': { command: 'npx', args: ['synthetic-skill-server'] },
+      });
+    } finally {
+      provider.cleanup();
+    }
+
+    skillMcpServers.mockClear();
+    const local = await new ClaudeAdapter().prepare({ ...config, toolRouting: 'local' }, host);
+    try {
+      expect(skillMcpServers).not.toHaveBeenCalled();
+      expect(mcpConfigFrom(local.args)).not.toHaveProperty('synthetic-skill');
+    } finally {
+      local.cleanup();
+    }
+  });
+
   it('asks its host whether claude streams partial messages', async () => {
     for (const supported of [true, false]) {
       host = testHost({ claudeSupportsPartialMessages: async () => supported });
