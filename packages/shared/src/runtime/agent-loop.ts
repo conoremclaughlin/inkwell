@@ -1135,6 +1135,14 @@ export async function runAgentLoop(
       break;
     }
 
+    // A provider can resolve after cancellation (including a successful final
+    // frame racing abort). Do not hand its calls to a new host's executor.
+    // The executor must still fence each approval/commit/dispatch await.
+    if (input.signal?.aborted) {
+      stopReason = 'aborted';
+      break;
+    }
+
     const executed = await ports.tools.execute(calls, { iteration, signal: input.signal });
     allToolResults.push(...executed);
     for (const r of executed) ports.observe?.recordToolCall(r);

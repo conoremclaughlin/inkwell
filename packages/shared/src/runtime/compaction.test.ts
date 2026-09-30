@@ -104,7 +104,7 @@ describe('runCompaction', () => {
   });
 
   it('a summarizer that fails still has its usage recorded; an agent is told, the system hard-trims', async () => {
-    const failing = async () => ({
+    const failing: CompactionDeps['summarize'] = async () => ({
       text: '',
       usage: { backend: 'claude', source: 'json', outputTokens: 7 },
       error: 'boom',

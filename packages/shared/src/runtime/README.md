@@ -1,8 +1,8 @@
 # Runtime
 
 The ink runtime's host-independent pieces: the agent loop (`runAgentLoop`),
-text-tool grammar, context ledger, hook registry and built-in recall/budget
-hooks. The CLI's `ink chat` and its shadow
+text-tool grammar, context ledger, context tools, compaction policy, token
+accounting, hook registry and built-in recall/budget hooks. The CLI's `ink chat` and its shadow
 clones run it today; a server or desktop host is meant to import the same code
 rather than write another loop (`ink://specs/live-agent-surfaces`).
 
@@ -64,7 +64,11 @@ non-test source file in this directory.
 
 This is the existing ledger and hook implementation, not a complete hosted
 session. Prompt composition, hydration, compaction orchestration, skills,
-live controls and provider adapters still need their own host boundaries.
+live control delivery and provider adapters still need their own host boundaries.
+The context tools require an explicit status sink for each parent and clone;
+there is no process-global fallback. Compaction still uses the existing
+synchronous marker callback: moving the policy does not yet make its journal
+commit asynchronous or provide hosted recovery.
 Each ledger/registry/recall registration owns its own state. Hosts serialize
 hooks within one session; different sessions can await recall independently.
 

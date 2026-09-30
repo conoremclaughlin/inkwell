@@ -19,3 +19,7 @@ export {
 export * from './context-ledger.js';
 export * from './hook-registry.js';
 export * from './builtin-hooks.js';
+
+export * from './context-tools.js';
+export * from './compaction.js';
+export * from './token-usage.js';

@@ -643,6 +643,9 @@ describe('@inklabs/shared/runtime keeps its boundary', () => {
         'hook-registry.ts',
         'builtin-hooks.ts',
         'entry-ref-hash.ts',
+        'context-tools.ts',
+        'compaction.ts',
+        'token-usage.ts',
       ])
     );
   });

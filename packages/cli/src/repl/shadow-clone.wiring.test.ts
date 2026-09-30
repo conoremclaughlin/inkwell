@@ -29,13 +29,7 @@ import { applyToolApprovalChoice } from './tool-approval.js';
 import { deriveClonePolicy, isForbiddenInClone } from './clone-policy.js';
 import { ApprovalCoordinator, type ApprovalTicket } from './approval-coordinator.js';
 import { callPiTool, isPiTool } from './pi-tools.js';
-import {
-  createSignalSink,
-  getLastSignal,
-  clearLastSignal,
-  isClientLocalTool,
-  handleClientLocalTool,
-} from './context-tools.js';
+import { createSignalSink, isClientLocalTool, handleClientLocalTool } from './context-tools.js';
 import { ContextLedger } from './context-ledger.js';
 import { boundSummary, describeCloneToolResult, screenIteration } from './spawn-agent.js';
 import type { InkToolCallResult } from '../lib/ink-client.js';
@@ -69,7 +63,7 @@ const doneSignal = inkTool('signal_status', { status: 'completed' });
  */
 function buildClone(opts: {
   parent: ToolPolicyState;
-  coordinator: ApprovalCoordinator;
+  coordinator: ApprovalCoordinator<ToolPolicyState>;
   cloneId: string;
   cloneLabel: string;
   turns: string[];
@@ -84,7 +78,7 @@ function buildClone(opts: {
 
   const continuations: string[] = [];
   let backendTurns = 0;
-  // What chat.ts gives a clone: its own signal sink, never the process global.
+  // What chat.ts gives a clone: its own signal sink, never its parent's.
   const signalSink = createSignalSink();
   const runTurn = async (
     body: string,
@@ -199,7 +193,7 @@ function buildClone(opts: {
 describe('shadow clone wiring', () => {
   it('reads real files through the clone envelope and reports back', async () => {
     const parent = new ToolPolicyState('backend', { persist: false });
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       prompt: async () => false,
     });
@@ -227,7 +221,7 @@ describe('shadow clone wiring', () => {
   it('refuses write-shaped tools without ever reaching the filesystem', async () => {
     const parent = new ToolPolicyState('backend', { persist: false });
     let prompted = 0;
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       prompt: async () => {
         prompted += 1;
@@ -262,7 +256,10 @@ describe('shadow clone wiring', () => {
 
   it('cannot spawn further clones even when it names the tool directly', async () => {
     const parent = new ToolPolicyState('backend', { persist: false });
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => true });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async () => true,
+    });
 
     const clone = buildClone({
       parent,
@@ -281,7 +278,7 @@ describe('shadow clone wiring', () => {
     const parent = new ToolPolicyState('backend', { persist: false });
     // Outside the clone baseline and not hard-denied — it escalates.
     const tickets: ApprovalTicket[] = [];
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       prompt: async (ticket) => {
         tickets.push(ticket);
@@ -314,7 +311,7 @@ describe('shadow clone wiring', () => {
     let maxInFlight = 0;
     const asked: string[] = [];
 
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       prompt: async (ticket) => {
         inFlight += 1;
@@ -348,7 +345,7 @@ describe('shadow clone wiring', () => {
     const controller = new AbortController();
     let promptStarted = false;
 
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       // Stands in for the Ink input slot: it waits forever unless aborted.
       prompt: (ticket) =>
@@ -394,7 +391,7 @@ describe('shadow clone wiring', () => {
   it('does not start another backend turn after an abort during approval', async () => {
     const parent = new ToolPolicyState('backend', { persist: false });
     const controller = new AbortController();
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       prompt: (ticket) =>
         new Promise<boolean>((_resolve, reject) => {
@@ -429,7 +426,10 @@ describe('shadow clone wiring', () => {
 
   it('one clone failing does not discard its siblings summaries', async () => {
     const parent = new ToolPolicyState('backend', { persist: false });
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async () => false,
+    });
 
     const good = buildClone({
       parent,
@@ -461,7 +461,10 @@ describe('shadow clone wiring', () => {
 
   it('tells a clone what a thrown tool actually said', async () => {
     const parent = new ToolPolicyState('backend', { persist: false });
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async () => false,
+    });
 
     const clone = buildClone({
       parent,
@@ -486,7 +489,10 @@ describe('shadow clone wiring', () => {
     parent.addPromptTool('save_link');
     parent.grantTool('save_link', 1);
 
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async () => false,
+    });
     const clone = buildClone({
       parent,
       coordinator,
@@ -582,7 +588,7 @@ describe('shadow clone wiring', () => {
   it('sibling clones do not rewrite each other policy', async () => {
     const parent = new ToolPolicyState('backend', { persist: false });
     // The user answers "always" for the first clone that asks.
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       prompt: async () => true,
     });
@@ -606,9 +612,13 @@ describe('shadow clone wiring', () => {
 
 describe('shadow clone isolation from parent process state', () => {
   it('does not let a clone signal completion on behalf of the parent', async () => {
-    clearLastSignal();
+    const parentSignal = createSignalSink();
+    parentSignal.set({ status: 'continuing', signalledAt: 'fixture' });
     const parent = new ToolPolicyState('backend', { persist: false });
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async () => false,
+    });
 
     const clone = buildClone({
       parent,
@@ -623,17 +633,20 @@ describe('shadow clone isolation from parent process state', () => {
     // The clone's own loop stopped on the signal...
     expect(result.stopReason).toBe('terminal-signal');
     expect(clone.signalSink.get()?.status).toBe('completed');
-    // ...but runChat reads this global to decide whether the whole
-    // non-interactive run completed. Every clone is instructed to signal, so a
-    // shared sink lets a clone end its parent's run and lets concurrent clones
-    // race for it.
-    expect(getLastSignal()).toBeNull();
+    // A sibling/parent's completion state is untouched.
+    expect(parentSignal.get()?.status).toBe('continuing');
+    parentSignal.clear();
+    expect(clone.signalSink.get()?.status).toBe('completed');
   });
 
   it('keeps concurrent clones' + String.fromCharCode(39) + ' signals separate', async () => {
-    clearLastSignal();
+    const parentSignal = createSignalSink();
+    parentSignal.set({ status: 'continuing', signalledAt: 'fixture' });
     const parent = new ToolPolicyState('backend', { persist: false });
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async () => false,
+    });
 
     const done = buildClone({
       parent,
@@ -654,7 +667,7 @@ describe('shadow clone isolation from parent process state', () => {
 
     expect(done.signalSink.get()?.status).toBe('completed');
     expect(stuck.signalSink.get()?.status).toBe('blocked');
-    expect(getLastSignal()).toBeNull();
+    expect(parentSignal.get()?.status).toBe('continuing');
   });
 });
 
@@ -663,7 +676,7 @@ describe('shadow clone cancellation is authoritative', () => {
     const parent = new ToolPolicyState('backend', { persist: false });
     const controller = new AbortController();
 
-    const coordinator = new ApprovalCoordinator({
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
       concurrency: 1,
       prompt: (ticket) =>
         new Promise<boolean>((_resolve, reject) => {
@@ -705,7 +718,10 @@ describe('shadow clone cancellation is authoritative', () => {
     const controller = new AbortController();
     controller.abort();
 
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async () => false,
+    });
     const clone = buildClone({
       parent,
       coordinator,

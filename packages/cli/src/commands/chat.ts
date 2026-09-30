@@ -129,15 +129,12 @@ import {
   createSignalSink,
   isClientLocalTool,
   handleClientLocalTool,
-  globalSignalSink,
   parseCompactContextArgs,
   computeContextOccupancy,
   formatContextStamp,
   type ContextOccupancy,
   type ProviderContextMeasurement,
   type SignalSink,
-  getLastSignal,
-  clearLastSignal,
 } from '../repl/context-tools.js';
 import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provider-sample.js';
 import { assessContextPressure } from '../repl/context-pressure.js';
@@ -4277,6 +4274,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   };
 
   const ledger = new ContextLedger();
+  const sessionSignal = createSignalSink();
   const hookRegistry = new SbHookRegistry();
   let hookTurnCount = 0;
 
@@ -6487,12 +6485,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               } as InkToolCallResult;
             }
             if (isClientLocalTool(tool)) {
-              // A throwaway ledger AND a private signal sink. The sink is the
-              // load-bearing half: `signal_status` otherwise writes the module
-              // global that runChat reads to decide whether the whole
-              // non-interactive run completed — and every clone is instructed to
-              // signal when it finishes. A clone would end its parent's run, and
-              // concurrent clones would race for the same slot.
+              // A clone owns its ledger and signal state. Neither completion
+              // nor cancellation may change the parent's continuation decision.
               return handleClientLocalTool(
                 tool,
                 args,
@@ -6873,7 +6867,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // An eviction's persistent refs arrive on the hook, not in the
             // result the model reads — see EvictionHooks (#571).
             if (isClientLocalTool(tool)) {
-              return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+              return handleClientLocalTool(tool, args, ledger, sessionSignal, {
                 providerUsage: () => providerContextMeasurement(),
                 onEvict: (eviction) =>
                   recordEviction(
@@ -8310,7 +8304,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // spawns pass the originating channel, e.g. "heartbeat"), render as a
     // system message — it's harness-delivered, not typed by the human.
     const messageLabel = options.messageLabel?.trim();
-    clearLastSignal();
+    sessionSignal.clear();
     await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
     // Actual completed outer turns — reported instead of the configured cap,
     // which lies whenever signal_status halts the loop early.
@@ -8318,7 +8312,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // Check for signal or failure after turn 1
     let exitReason: string | undefined;
-    const signal1 = getLastSignal();
+    const signal1 = sessionSignal.get();
     if (signal1?.status === 'completed' || signal1?.status === 'blocked') {
       exitReason = `${signal1.status}${signal1.reason ? `: ${signal1.reason}` : ''}`;
     }
@@ -8329,7 +8323,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Turns 2..N: continuation prompts — the SB signals when it's done
     if (!exitReason) {
       for (let turn = 2; turn <= maxTurns; turn++) {
-        clearLastSignal();
+        sessionSignal.clear();
         await enqueueTurn(
           'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.',
           'system',
@@ -8337,7 +8331,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         );
         turnsCompleted += 1;
 
-        const signal = getLastSignal();
+        const signal = sessionSignal.get();
         if (signal?.status === 'completed' || signal?.status === 'blocked') {
           exitReason = `${signal.status}${signal.reason ? `: ${signal.reason}` : ''}`;
           break;
@@ -8357,7 +8351,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // Map the signal to a session phase. Don't end the session — leave it
     // resumable so the user or another SB can attach and follow up.
-    const finalSignal = getLastSignal();
+    const finalSignal = sessionSignal.get();
     const phase = isBackendFailure
       ? 'blocked:backend-error'
       : finalSignal?.status === 'blocked'
