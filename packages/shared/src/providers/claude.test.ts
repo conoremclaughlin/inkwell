@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import {
   existsSync,
   mkdirSync,
@@ -10,7 +11,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { decodeContextToken, PRINT_MODE_CHANNEL_ENV } from '../runner/mcp-config.js';
 import {
@@ -576,8 +577,8 @@ describe('encodeMediaBlocks (bounded IO, fail-closed rejection)', () => {
       return Buffer.alloc(size, 1);
     };
 
-  it('rejects unreadable and over-cap candidates instead of falling back', () => {
-    const out = encodeMediaBlocks(
+  it('rejects unreadable and over-cap candidates instead of falling back', async () => {
+    const out = await encodeMediaBlocks(
       [
         { path: '/big.png', mimeType: 'image/png' },
         { path: '/gone.png', mimeType: 'image/png' },
@@ -590,9 +591,9 @@ describe('encodeMediaBlocks (bounded IO, fail-closed rejection)', () => {
     expect(out.blocks).toHaveLength(1);
   });
 
-  it('enforces the running total cap across files', () => {
+  it('enforces the running total cap across files', async () => {
     const nineMb = 9 * 1024 * 1024;
-    const out = encodeMediaBlocks(
+    const out = await encodeMediaBlocks(
       [
         { path: '/one.png', mimeType: 'image/png' },
         { path: '/two.png', mimeType: 'image/png' },
@@ -616,21 +617,21 @@ describe('readMediaBounded (single-descriptor, regular files only)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('reads a regular file fully within the cap', () => {
+  it('reads a regular file fully within the cap', async () => {
     const p = join(dir, 'f.bin');
     writeFileSync(p, Buffer.alloc(1024, 7));
-    const buf = readMediaBounded(p, 2048);
+    const buf = await readMediaBounded(p, 2048);
     expect(buf?.byteLength).toBe(1024);
     expect(buf?.every((b) => b === 7)).toBe(true);
   });
 
-  it('returns null for oversize, missing, and non-regular paths', () => {
+  it('returns null for oversize, missing, and non-regular paths', async () => {
     const p = join(dir, 'f.bin');
     writeFileSync(p, Buffer.alloc(1024, 7));
-    expect(readMediaBounded(p, 1023)).toBeNull();
-    expect(readMediaBounded(join(dir, 'nope.bin'), 4096)).toBeNull();
+    expect(await readMediaBounded(p, 1023)).toBeNull();
+    expect(await readMediaBounded(join(dir, 'nope.bin'), 4096)).toBeNull();
     // A directory is not a regular file.
-    expect(readMediaBounded(dir, 4096)).toBeNull();
+    expect(await readMediaBounded(dir, 4096)).toBeNull();
   });
 
   it(
@@ -640,19 +641,26 @@ describe('readMediaBounded (single-descriptor, regular files only)', () => {
       // Opening a FIFO for read normally BLOCKS until a writer appears — a
       // hostile/accidental media path must not hang the spawn (Lumen, review
       // 4900202375). An in-worker vitest timeout cannot guard this: a
-      // blocking openSync freezes the worker's event loop and the timer
-      // never fires (review 4900276464). So the REAL readMediaBounded runs
-      // in a child process with an external kill timeout — an O_NONBLOCK
-      // regression hangs the CHILD, execSync kills it, and the assertion
-      // fails instead of the suite wedging.
+      // blocking open holds the worker (review 4900276464). So the REAL
+      // readMediaBounded runs in a child process with an external kill
+      // timeout — an O_NONBLOCK regression hangs the CHILD, the timeout
+      // SIGKILLs it, and the assertion fails instead of the suite wedging.
+      //
+      // The child is ONE node process, with tsx as an import loader. Through
+      // `npx tsx` the timeout reached only the outermost process, while the
+      // node grandchild stayed blocked in open() holding the output pipe,
+      // so the run hung instead of failing (measured with the O_NONBLOCK
+      // mutant, #701 P2b-2b part 3).
       const p = join(dir, 'pipe.fifo');
       execSync(`mkfifo ${JSON.stringify(p)}`);
       const moduleUrl = new URL('./claude.ts', import.meta.url).href;
       const script =
         `import(${JSON.stringify(moduleUrl)})` +
-        `.then((m) => console.log(JSON.stringify(m.readMediaBounded(${JSON.stringify(p)}, 4096))))`;
-      const out = execSync(`npx tsx -e ${JSON.stringify(script)}`, {
+        `.then(async (m) => console.log(JSON.stringify(await m.readMediaBounded(${JSON.stringify(p)}, 4096))))`;
+      const out = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
+        cwd: dirname(fileURLToPath(import.meta.url)),
         timeout: 15000,
+        killSignal: 'SIGKILL',
         encoding: 'utf-8',
       });
       expect(out.trim()).toBe('null');

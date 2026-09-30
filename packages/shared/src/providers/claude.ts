@@ -5,8 +5,8 @@
  * MCP config via --mcp-config <path>
  */
 
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from 'fs';
-import { mkdir, stat } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import { mkdir, open, stat, type FileHandle } from 'fs/promises';
 import { encodeContextToken, PRINT_MODE_CHANNEL_ENV } from '../runner/mcp-config.js';
 import { buildIdentityPrompt } from './identity-prompt.js';
 import { buildMergedMcpConfig } from './skill-mcp.js';
@@ -62,32 +62,34 @@ export function classifyMedia(media: TurnMedia[]): MediaClassification {
 
 /**
  * Bounded single-descriptor read: open once, verify it is a REGULAR file
- * within the cap via fstat on that same descriptor, then read it fully.
- * Special files (fifos, devices), oversize files, and IO errors all return
- * null — never a partial or unbounded read.
+ * within the cap via stat on that same handle, then read it fully. Special
+ * files (fifos, devices), oversize files, and IO errors all return null —
+ * never a partial or unbounded read. Asynchronous throughout, so a host
+ * serving many sessions never blocks on a turn's media.
  */
-export function readMediaBounded(path: string, maxBytes: number): Buffer | null {
-  let fd: number | undefined;
+export async function readMediaBounded(path: string, maxBytes: number): Promise<Buffer | null> {
+  let handle: FileHandle | undefined;
   try {
     // O_NONBLOCK: opening a FIFO for read BLOCKS until a writer appears —
-    // a media path pointing at one would hang the spawn indefinitely.
-    // Nonblocking open returns immediately; fstat then rejects it as
-    // non-regular. Regular-file reads are unaffected by the flag.
-    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
-    const st = fstatSync(fd);
+    // a media path pointing at one would hang the spawn indefinitely (and,
+    // asynchronously, hold a threadpool thread). Nonblocking open returns
+    // immediately; stat then rejects it as non-regular. Regular-file reads
+    // are unaffected by the flag.
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const st = await handle.stat();
     if (!st.isFile() || st.size > maxBytes) return null;
     const buf = Buffer.allocUnsafe(st.size);
     let offset = 0;
     while (offset < st.size) {
-      const n = readSync(fd, buf, offset, st.size - offset, offset);
-      if (n <= 0) break;
-      offset += n;
+      const { bytesRead } = await handle.read(buf, offset, st.size - offset, offset);
+      if (bytesRead <= 0) break;
+      offset += bytesRead;
     }
     return offset === st.size ? buf : null;
   } catch {
     return null;
   } finally {
-    if (fd !== undefined) closeSync(fd);
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -103,11 +105,17 @@ export interface EncodedMedia {
   rejected: Array<{ media: TurnMedia; reason: string }>;
 }
 
-/** Encode injection candidates; the read fn is injectable for unit tests. */
-export function encodeMediaBlocks(
+/**
+ * Encode injection candidates, one at a time so the turn's byte budget is
+ * spent in order; the read fn is injectable for unit tests.
+ */
+export async function encodeMediaBlocks(
   candidates: TurnMedia[],
-  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded
-): EncodedMedia {
+  readBounded: (
+    path: string,
+    maxBytes: number
+  ) => Promise<Buffer | null> | Buffer | null = readMediaBounded
+): Promise<EncodedMedia> {
   const out: EncodedMedia = { blocks: [], injected: [], rejected: [] };
   let totalBytes = 0;
   for (const m of candidates) {
@@ -115,7 +123,7 @@ export function encodeMediaBlocks(
       out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
       continue;
     }
-    const buf = readBounded(
+    const buf = await readBounded(
       m.path,
       Math.min(MAX_MEDIA_FILE_BYTES, MAX_MEDIA_TOTAL_BYTES - totalBytes)
     );
@@ -213,7 +221,7 @@ export class ClaudeAdapter implements BackendAdapter {
     const classified = classifyMedia(media);
     const encoded =
       config.prompt && config.deliverMedia && classified.candidates.length > 0
-        ? encodeMediaBlocks(classified.candidates)
+        ? await encodeMediaBlocks(classified.candidates)
         : undefined;
     // Fail-closed rejections must be LOUD where someone can see them: the
     // stderr warn is invisible on successful headless runs (InkRunner
