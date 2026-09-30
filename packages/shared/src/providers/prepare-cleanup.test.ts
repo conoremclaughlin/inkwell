@@ -76,6 +76,7 @@ function host(options: { failAfterWrite?: boolean } = {}): BackendHost {
     claudeSupportsPartialMessages: async () => false,
     skillMcpServers: async () => [],
     sessionEnv: async () => ({}),
+    baseEnv: async () => process.env,
     resolveBinary: async (name) => name,
     warn: () => undefined,
   };

@@ -34,8 +34,14 @@ export interface SpawnBackendOptions {
   binary: string;
   /** Arguments to pass to the binary */
   args: string[];
-  /** Additional env vars to merge (on top of cleaned process.env) */
+  /** Additional env vars to merge (on top of the cleaned parent env) */
   env?: Record<string, string>;
+  /**
+   * The env the child inherits from, filtered through
+   * SPAWN_ENV_INHERITED_NAMES. Defaults to this process's env; the providers
+   * runner always passes its host's (BackendHost.baseEnv).
+   */
+  parentEnv?: Readonly<Record<string, string | undefined>>;
   /** Working directory for the child process */
   cwd?: string;
   /** Whether to pipe stdin (default: false — stdin is 'ignore') */
@@ -342,7 +348,7 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
       binary: options.binary,
       args: options.args,
       cwd: options.cwd,
-      env: buildCleanEnv(options.env),
+      env: buildCleanEnv(options.env, options.parentEnv),
     };
   }
 
@@ -374,7 +380,7 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
     // cwd is inside the container (passed via --workdir), not on the host
     cwd: undefined,
     // Host env is clean but doesn't need the extra vars (they're inside the container)
-    env: buildCleanEnv(),
+    env: buildCleanEnv(undefined, options.parentEnv),
   };
 }
 

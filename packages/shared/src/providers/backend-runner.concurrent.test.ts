@@ -40,6 +40,8 @@ describe('overlapping provider turns in one process', () => {
     vi.stubEnv('INK_ACCESS_TOKEN', 'synthetic-host-token');
     vi.stubEnv('INK_SESSION_ID', 'synthetic-host-session');
     vi.stubEnv('INK_STUDIO_ID', 'synthetic-host-studio');
+    // This process's own HOME: a child must get its host's, never this.
+    vi.stubEnv('HOME', '/synthetic/runner-process-home');
   });
 
   afterEach(() => {
@@ -88,6 +90,14 @@ describe('overlapping provider turns in one process', () => {
           return [];
         },
         sessionEnv: async () => ({ INK_ACCESS_TOKEN: `synthetic-${name}-token` }),
+        // Each host's own base env: an allowlisted name with this host's
+        // value, a name the allowlist does not carry, and a credential the
+        // host holds but did not hand over through sessionEnv.
+        baseEnv: async () => ({
+          HOME: `/synthetic/${name}/home`,
+          SYNTHETIC_HOST_ONLY: 'synthetic-host-only',
+          INK_ACCESS_TOKEN: 'synthetic-host-base-token',
+        }),
         resolveBinary: async () => 'synthetic-provider-never-executed',
         warn: () => undefined,
       };
@@ -143,6 +153,10 @@ describe('overlapping provider turns in one process', () => {
           cliAttached: false,
         });
         expect(JSON.stringify(child.env)).not.toContain('synthetic-host');
+        // The base env is the host's, and only the allowlist crosses from it.
+        expect(child.env.HOME).toBe(`/synthetic/${request.sbSlug}/home`);
+        expect(child.env).not.toHaveProperty('SYNTHETIC_HOST_ONLY');
+        expect(JSON.stringify(child.env)).not.toContain('runner-process-home');
         const servers = JSON.parse(readFileSync(child.configPath, 'utf8')).mcpServers;
         expect(Object.keys(servers).sort()).toEqual([request.sbSlug, 'inkwell'].sort());
       }

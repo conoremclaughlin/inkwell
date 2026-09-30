@@ -73,6 +73,7 @@ const serverHost = (credentials: Record<string, string>): BackendHost => ({
   claudeSupportsPartialMessages: async () => true,
   skillMcpServers: async () => [],
   sessionEnv: async () => ({ ...credentials }),
+  baseEnv: async () => process.env,
   resolveBinary: async (name) => name,
   warn: () => undefined,
 });

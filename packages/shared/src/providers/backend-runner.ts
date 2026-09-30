@@ -255,6 +255,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         ...(await host.sessionEnv({ hardTimeoutMs: mintedCeilingMs })),
       };
       for (const name of ROUTING_ENV_NAMES) delete credentials[name];
+      const parentEnv = await host.baseEnv();
       const binary = await host.resolveBinary(prepared.binary);
       const command = `${binary} ${prepared.args.join(' ')}`;
       // Measured again at the spawn: time has passed since the mint, so the
@@ -274,6 +275,8 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         // (turn-owner.ts), and its host hands over that session's
         // credentials; buildCleanEnv inherits none of them on its own.
         env: { ...credentials, ...prepared.env, ...PARENT_OWNED_TURN_ENV },
+        // What the child inherits comes from the host, never from this process.
+        parentEnv,
         stdinData: prepared.stdinData,
         timeoutMs: hardTimeoutMs,
         idleTimeoutMs: request.idleTimeoutMs,

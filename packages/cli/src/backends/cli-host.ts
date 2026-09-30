@@ -56,6 +56,8 @@ export function createCliBackendHost(): BackendHost {
     // the port. The spawn's deadline is not used: a CLI child still gets
     // whatever token this process holds, however long the turn runs.
     sessionEnv: async () => sessionEnvHandoff(),
+    // The CLI host is its own session's process: the child inherits from it.
+    baseEnv: async () => process.env,
     // PATH lookup at spawn, as before.
     resolveBinary: async (name) => name,
     warn: (message) => console.warn(message),

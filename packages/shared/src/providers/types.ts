@@ -57,6 +57,15 @@ export interface BackendHost {
    * (see startBackendTurn).
    */
   sessionEnv(spawn: { hardTimeoutMs: number }): Promise<Record<string, string>>;
+  /**
+   * The environment the child inherits from, before the allowlist: HOME,
+   * PATH and the like. Only SPAWN_ENV_INHERITED_NAMES cross
+   * (runner/spawn-backend.ts), so a host key outside the list never reaches
+   * the child. The CLI host answers with its own process env; a host serving
+   * many sessions answers per session. This is the one source of the child's
+   * HOME, and so of every config read from it.
+   */
+  baseEnv(): Promise<Readonly<Record<string, string | undefined>>>;
   /** The executable to spawn for an adapter's binary name. */
   resolveBinary(name: string): Promise<string>;
   /** A warning an adapter raises, such as media it could not inject. */
