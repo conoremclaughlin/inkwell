@@ -65,3 +65,13 @@ export function promptTransportFor(name: string): 'stdin' | 'argv' {
   const factory = BACKENDS[name];
   return factory ? factory().promptTransport : 'argv';
 }
+
+/**
+ * Whether a backend's adapter embeds tool-captured images. Unknown backends
+ * answer no: saying an image was shown when it was not is the failure this
+ * guards against.
+ */
+export function acceptsContextImagesFor(name: string): boolean {
+  const factory = BACKENDS[name];
+  return factory ? factory().acceptsContextImages === true : false;
+}

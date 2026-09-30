@@ -76,6 +76,8 @@ export interface BackendRunRequest {
   media?: TurnMedia[];
   /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
   deliverMedia?: boolean;
+  /** Tool-captured images this spawn must carry (see BackendConfig.contextImages). */
+  contextImages?: TurnMedia[];
   /**
    * Whether the chat process that owns this turn is attached — an
    * interactive REPL, not `--non-interactive`/`--message`. Required: the
@@ -131,6 +133,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     toolRouting: request.toolRouting,
     media: request.media,
     deliverMedia: request.deliverMedia,
+    contextImages: request.contextImages,
     cliAttached: request.cliAttached,
   });
 

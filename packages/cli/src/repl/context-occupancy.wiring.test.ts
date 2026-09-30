@@ -234,7 +234,13 @@ describe('PR 639 resume-not-found recovery seed', () => {
       activeSkills: [],
     };
     let captured: { prompt: string } | undefined;
+    const imageTargets: Array<string | undefined> = [];
     const dependencies = {
+      // Which session the block asks for images for; it delivers none here.
+      contextImagesFor: (sessionId: string | undefined) => {
+        imageTargets.push(sessionId);
+        return undefined;
+      },
       providerSample,
       staleSession: STALE_SESSION,
       measuredTokens: MEASURED_TOKENS,
@@ -287,8 +293,15 @@ describe('PR 639 resume-not-found recovery seed', () => {
     const reseedStamp = new Function(...Object.keys(dependencies), js)(
       ...Object.values(dependencies)
     ) as string | undefined;
-    return { reseedStamp, captured };
+    return { reseedStamp, captured, imageTargets };
   };
+
+  it("asks for the images owed to the NEW session, never the dead one's", () => {
+    // A delivered-set recorded against the stale id must not excuse the
+    // reseed: the fresh session has seen nothing.
+    const { imageTargets } = runRecoveryBlock(RESEED_SESSION);
+    expect(imageTargets).toEqual([RESEED_SESSION]);
+  });
 
   it('stamps the recovery retry envelope', () => {
     const { reseedStamp, captured } = runRecoveryBlock(RESEED_SESSION);

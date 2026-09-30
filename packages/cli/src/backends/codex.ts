@@ -39,6 +39,8 @@ export class CodexAdapter implements BackendAdapter {
   readonly binary = 'codex';
   // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
   readonly promptTransport = 'argv' as const;
+  // Attached with `--image=` on every spawn, alongside the turn's own media.
+  readonly acceptsContextImages = true;
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(
@@ -125,7 +127,12 @@ export class CodexAdapter implements BackendAdapter {
       // prompt can never be consumed as an option value. Non-image media
       // stays on the prompt-text path (paths listed in the attachment
       // block).
-      const imageMedia = (config.media ?? []).filter((m) => m.mimeType?.startsWith('image/'));
+      // Tool-captured images ride the same flag. Being stateless, every spawn
+      // carries every image still on the ledger (the host sends them all).
+      const imageMedia = [
+        ...(config.media ?? []).filter((m) => m.mimeType?.startsWith('image/')),
+        ...(config.contextImages ?? []),
+      ];
       for (const m of imageMedia) {
         args.push(`--image=${m.path}`);
       }

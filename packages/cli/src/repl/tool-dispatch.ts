@@ -21,6 +21,7 @@
 import type { InkToolCallResult } from '../lib/ink-client.js';
 import { isPiTool } from './pi-tools.js';
 import { describeToolWithLocalSurface, type LocalToolAudience } from './local-tool-catalog.js';
+import { VIEW_IMAGE_TOOL, viewImage } from './view-image.js';
 
 export interface ToolDispatchContext {
   /** Cancels an in-flight tool. Reaches the tool itself, not just the wait. */
@@ -45,6 +46,12 @@ export interface LocalToolDispatchDeps {
   ) => Promise<InkToolCallResult>;
   /** Call a tool on the Inkwell server. */
   callInk: (tool: string, args: Record<string, unknown>) => Promise<InkToolCallResult>;
+  /** Run view_image. Injected for tests; defaults to the real tool. */
+  viewImage?: (
+    args: Record<string, unknown>,
+    cwd: string,
+    signal?: AbortSignal
+  ) => Promise<InkToolCallResult>;
   /**
    * Resolve `$VAR` / `${VAR}` references in args.
    *
@@ -112,7 +119,7 @@ function foreignNamespaceRefusal(tool: string): InkToolCallResult | null {
           `${tool} is not available: this runtime hosts no "${server}" MCP server, ` +
           `so no configuration or credential will make it resolve.\n\n` +
           `Reachable from here: Inkwell tools (called bare, with no "mcp__" prefix) ` +
-          `and in-process coding tools (read, edit, write, bash, grep, find, ls) ` +
+          `and in-process coding tools (read, edit, write, bash, grep, find, ls, view_image) ` +
           `scoped to the working directory.\n\n` +
           `Do not retry this as a bare name — dropping the prefix does not make a ` +
           `"${server}" tool into an Inkwell one, and the retry will fail the same way. ` +
@@ -210,6 +217,15 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
       // ctx.signal, not a captured variable: the executor hands it over per
       // call, and this is the only place either host reaches a Pi tool.
       return deps.callPi(name, args, deps.cwd, ctx.signal);
+    }
+
+    // In the shared tail for the same reason as Pi's tools. How the image then
+    // reaches the model is the capture step's business (tool-images.ts), which
+    // treats this result like an image from any other tool.
+    if (name === VIEW_IMAGE_TOOL) {
+      return deps.viewImage
+        ? deps.viewImage(args, deps.cwd, ctx.signal)
+        : viewImage(args, { cwd: deps.cwd, signal: ctx.signal });
     }
 
     // After the head and Pi tools, so a host that DOES serve a namespaced or

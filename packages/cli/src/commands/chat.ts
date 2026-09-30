@@ -19,7 +19,7 @@ import {
   saveRuntimePreferences,
   type RuntimePreferences,
 } from '../backends/identity.js';
-import { promptTransportFor } from '../backends/index.js';
+import { acceptsContextImagesFor, promptTransportFor } from '../backends/index.js';
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
 import {
@@ -145,6 +145,14 @@ import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { bareToolName, createLocalToolDispatcher } from '../repl/tool-dispatch.js';
+import {
+  imagesToDeliver,
+  processImageCacheDir,
+  takeCapturedImages,
+  withImageCapture,
+  type ContextImage,
+  type ImageDelivery,
+} from '../repl/tool-images.js';
 import { renderLocalToolGroup } from '../repl/local-tool-catalog.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import { requestToolApproval } from '../repl/approval-api.js';
@@ -3055,12 +3063,17 @@ export function ledgerEntryPromptBytes(entry: {
   role: string;
   content: string;
   source?: string;
+  images?: ReadonlyArray<{ approxTokens: number }>;
 }): number {
   return (
     utf8Bytes(entry.content) +
     utf8Bytes(entry.role) +
     utf8Bytes(entry.source ?? '') +
-    LEDGER_ENTRY_FRAME_BYTES
+    LEDGER_ENTRY_FRAME_BYTES +
+    // An image rides the spawn as a block, not as text, but it fills the
+    // window all the same. Its token estimate stands in for bytes here, which
+    // keeps the bound this function promises: never less than it costs.
+    (entry.images ?? []).reduce((sum, image) => sum + image.approxTokens, 0)
   );
 }
 
@@ -4798,6 +4811,48 @@ export async function runChat(options: ChatOptions): Promise<void> {
     printEvent(chalk.yellow(`  ⛁ provider session rolled — ${note}`));
   };
 
+  // ── Images a tool put in context (view_image, `read` on an image) ──
+  // The bytes never ride the text relay (tool-images.ts). They live on the
+  // ledger entry that recorded the call, and each spawn carries the ones its
+  // provider session has not been given: a resume only what is new, a seed
+  // (fresh, rolled, or re-seeded after a lost session) everything the ledger
+  // still holds, a stateless backend all of them every time. Evicting or
+  // compacting the entry rolls the session, so the next seed simply omits it.
+  const toolImageCacheDir = processImageCacheDir();
+  const parentImageDelivery = (): ImageDelivery =>
+    acceptsContextImagesFor(runtime.backend)
+      ? { deliverable: true }
+      : {
+          deliverable: false,
+          reason: `this session's backend (${runtime.backend}) cannot receive images`,
+        };
+  let deliveredImages: { sessionId: string | undefined; refs: Set<string> } = {
+    sessionId: undefined,
+    refs: new Set(),
+  };
+  /** The images a spawn into `targetSessionId` must carry (undefined: stateless). */
+  const contextImagesFor = (targetSessionId: string | undefined): ContextImage[] | undefined => {
+    if (!acceptsContextImagesFor(runtime.backend)) return undefined;
+    const images = imagesToDeliver(ledger.listImages(), deliveredImages, targetSessionId);
+    return images.length > 0 ? images : undefined;
+  };
+  /**
+   * Record what a spawn delivered — only on success, and only for a provider
+   * session that keeps it. A failed spawn may never have reached the model, so
+   * its images go again with the next one.
+   */
+  const noteImagesDelivered = (
+    targetSessionId: string | undefined,
+    images: readonly ContextImage[] | undefined,
+    success: boolean
+  ): void => {
+    if (!success || targetSessionId === undefined || !images || images.length === 0) return;
+    if (deliveredImages.sessionId !== targetSessionId) {
+      deliveredImages = { sessionId: targetSessionId, refs: new Set() };
+    }
+    for (const image of images) deliveredImages.refs.add(image.ref);
+  };
+
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, sbSlug);
@@ -6452,55 +6507,68 @@ export async function runChat(options: ChatOptions): Promise<void> {
         policy: opts.policy,
         sessionId: runtime.sessionId,
         signal: opts.signal,
-        callTool: createLocalToolDispatcher({
-          cwd: process.cwd(),
-          callPi: callPiTool,
-          callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
-          resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
-          // A clone asking what it can call gets its own narrower surface —
-          // the same one its prompt described, not the parent's.
-          audience: 'clone',
-          // And what its OWN policy will refuse, which is not the same thing:
-          // a derived clone policy inherits the parent's denials on top of the
-          // clone's, so a parent that denies `read` yields a clone that cannot
-          // read. inspectInkTool, never canCallInkTool — asking what exists must
-          // not spend the parent's one-use grants.
-          isHardDenied: (tool) => {
-            const decision = opts.policy.inspectInkTool(bareToolName(tool), runtime.sessionId);
-            return !decision.allowed && !decision.promptable;
-          },
-          head: (tool, args) => {
-            // Non-nesting is enforced HERE, not by omitting spawn_agent from the
-            // clone's prompt: tool calls travel as text, so a model can name any
-            // tool it likes regardless of what it was told.
-            if (isForbiddenInClone(tool)) {
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
-                  },
-                ],
-                isError: true,
-              } as InkToolCallResult;
-            }
-            if (isClientLocalTool(tool)) {
-              // A throwaway ledger AND a private signal sink. The sink is the
-              // load-bearing half: `signal_status` otherwise writes the module
-              // global that runChat reads to decide whether the whole
-              // non-interactive run completed — and every clone is instructed to
-              // signal when it finishes. A clone would end its parent's run, and
-              // concurrent clones would race for the same slot.
-              return handleClientLocalTool(
-                tool,
-                args,
-                cloneLedgerFor(opts.log.path),
-                opts.signalSink
-              );
-            }
-            return null;
-          },
-        }),
+        // A clone's turns never carry an image block, so an image one of its
+        // reads returns is replaced by a note saying so — never left as base64
+        // for its relay to stringify.
+        callTool: withImageCapture(
+          createLocalToolDispatcher({
+            cwd: process.cwd(),
+            callPi: callPiTool,
+            callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
+            resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
+            // A clone asking what it can call gets its own narrower surface —
+            // the same one its prompt described, not the parent's.
+            audience: 'clone',
+            // And what its OWN policy will refuse, which is not the same thing:
+            // a derived clone policy inherits the parent's denials on top of the
+            // clone's, so a parent that denies `read` yields a clone that cannot
+            // read. inspectInkTool, never canCallInkTool — asking what exists must
+            // not spend the parent's one-use grants.
+            isHardDenied: (tool) => {
+              const decision = opts.policy.inspectInkTool(bareToolName(tool), runtime.sessionId);
+              return !decision.allowed && !decision.promptable;
+            },
+            head: (tool, args) => {
+              // Non-nesting is enforced HERE, not by omitting spawn_agent from the
+              // clone's prompt: tool calls travel as text, so a model can name any
+              // tool it likes regardless of what it was told.
+              if (isForbiddenInClone(tool)) {
+                return {
+                  content: [
+                    {
+                      type: 'text',
+                      text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
+                    },
+                  ],
+                  isError: true,
+                } as InkToolCallResult;
+              }
+              if (isClientLocalTool(tool)) {
+                // A throwaway ledger AND a private signal sink. The sink is the
+                // load-bearing half: `signal_status` otherwise writes the module
+                // global that runChat reads to decide whether the whole
+                // non-interactive run completed — and every clone is instructed to
+                // signal when it finishes. A clone would end its parent's run, and
+                // concurrent clones would race for the same slot.
+                return handleClientLocalTool(
+                  tool,
+                  args,
+                  cloneLedgerFor(opts.log.path),
+                  opts.signalSink
+                );
+              }
+              return null;
+            },
+          }),
+          {
+            cacheDir: toolImageCacheDir,
+            delivery: () => ({
+              deliverable: false,
+              reason:
+                'a shadow clone cannot receive images; name the file in your summary so your parent can view it',
+            }),
+          }
+        ),
         promptForApproval: (tool, reason, args) =>
           approvalCoordinator
             .request({
@@ -6823,65 +6891,71 @@ export async function runChat(options: ChatOptions): Promise<void> {
       await executeToolCalls(calls, {
         policy: toolPolicy,
         signal: abortSignal,
-        callTool: createLocalToolDispatcher({
-          cwd: process.cwd(),
-          callPi: callPiTool,
-          callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
-          // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
-          // emits references; actual values are injected at the execution layer
-          // so credentials never enter transcripts or context.
-          resolveCredentials: (args) => {
-            const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
-              args,
-              buildResolverEnv()
-            );
-            if (resolutions.length > 0 && runtime.verbose) {
-              const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
-              printLine(
-                chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+        // Every result's images are taken out before anything below reads it:
+        // the preview, the transcript, the ledger and the relay all see the
+        // descriptor, and the bytes reach the model as an image block.
+        callTool: withImageCapture(
+          createLocalToolDispatcher({
+            cwd: process.cwd(),
+            callPi: callPiTool,
+            callInk: (bare, resolved) => inkClient.callTool(bare, resolved),
+            // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
+            // emits references; actual values are injected at the execution layer
+            // so credentials never enter transcripts or context.
+            resolveCredentials: (args) => {
+              const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+                args,
+                buildResolverEnv()
               );
-            }
-            return resolvedArgs;
-          },
-          audience: 'parent',
-          isHardDenied: (tool) => {
-            const decision = toolPolicy.inspectInkTool(bareToolName(tool), runtime.sessionId);
-            return !decision.allowed && !decision.promptable;
-          },
-          head: (tool, args, ctx) => {
-            // spawn_agent is NOT a client-local policy bypass. Unlike ledger
-            // tools it costs backend time and fans out authority, so it reaches
-            // here only after executeToolCalls has cleared it through policy.
-            if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
-              return runSpawnAgent(args, { signal: abortSignal });
-            }
-            if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
-              return runCollectAgents(args);
-            }
-            // The agent compacting its own window needs the host (summarizer
-            // turn, transcript event, provider-session roll) — answered here,
-            // before the generic client-local handler refuses it.
-            if (bareToolName(tool) === 'compact_context') {
-              return runSbCompaction(args, ctx);
-            }
-            // Client-local tools (context management) are handled in-process.
-            // An eviction's persistent refs arrive on the hook, not in the
-            // result the model reads — see EvictionHooks (#571).
-            if (isClientLocalTool(tool)) {
-              return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
-                providerUsage: () => providerContextMeasurement(),
-                onEvict: (eviction) =>
-                  recordEviction(
-                    'sb',
-                    compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
-                    eviction.tokensFreed,
-                    eviction.refs
-                  ),
-              });
-            }
-            return null;
-          },
-        }),
+              if (resolutions.length > 0 && runtime.verbose) {
+                const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+                printLine(
+                  chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+                );
+              }
+              return resolvedArgs;
+            },
+            audience: 'parent',
+            isHardDenied: (tool) => {
+              const decision = toolPolicy.inspectInkTool(bareToolName(tool), runtime.sessionId);
+              return !decision.allowed && !decision.promptable;
+            },
+            head: (tool, args, ctx) => {
+              // spawn_agent is NOT a client-local policy bypass. Unlike ledger
+              // tools it costs backend time and fans out authority, so it reaches
+              // here only after executeToolCalls has cleared it through policy.
+              if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
+                return runSpawnAgent(args, { signal: abortSignal });
+              }
+              if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
+                return runCollectAgents(args);
+              }
+              // The agent compacting its own window needs the host (summarizer
+              // turn, transcript event, provider-session roll) — answered here,
+              // before the generic client-local handler refuses it.
+              if (bareToolName(tool) === 'compact_context') {
+                return runSbCompaction(args, ctx);
+              }
+              // Client-local tools (context management) are handled in-process.
+              // An eviction's persistent refs arrive on the hook, not in the
+              // result the model reads — see EvictionHooks (#571).
+              if (isClientLocalTool(tool)) {
+                return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+                  providerUsage: () => providerContextMeasurement(),
+                  onEvict: (eviction) =>
+                    recordEviction(
+                      'sb',
+                      compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
+                      eviction.tokensFreed,
+                      eviction.refs
+                    ),
+                });
+              }
+              return null;
+            },
+          }),
+          { cacheDir: toolImageCacheDir, delivery: parentImageDelivery }
+        ),
         sessionId: runtime.sessionId,
         promptForApproval: (tool, reason, args) =>
           approvalCoordinator
@@ -7000,11 +7074,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // and undo the one-entry-per-fan-out guarantee that justifies clones
             // at all.
             if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
+              // The images this call put in context belong to its entry: they
+              // count toward it, re-seed with it and go when it is evicted.
+              // Named after the 500-character cut so the line always says
+              // which picture a re-seed's labelled image block is.
+              const images = takeCapturedImages(result.result);
               ledger.addEntry(
                 'system',
                 // A resolved failure is recorded as one (Lumen, PR #584 round 4).
-                compactForLedger(localToolLedgerLine(result.tool, result.result, resultJson), 500),
-                'local-tool'
+                compactForLedger(localToolLedgerLine(result.tool, result.result, resultJson), 500) +
+                  (images.length > 0
+                    ? ` [${images.map((image) => `${image.ref} ${image.width}x${image.height}`).join(', ')} attached]`
+                    : ''),
+                'local-tool',
+                undefined,
+                undefined,
+                images
               );
             }
             iterationResults.push({
@@ -7428,7 +7513,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     /** The continuation spawn's request; the budget measures the same shape. */
     const continuationRequest = (
       prompt: string,
-      spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false }
+      spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false },
+      contextImages?: ContextImage[]
     ): BackendRunRequest => ({
       backend: runtime.backend,
       sbSlug,
@@ -7451,6 +7537,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // stateless adapters re-attach from `media` regardless.
       media: turnMedia.length > 0 ? turnMedia : undefined,
       ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
+      ...(contextImages && contextImages.length > 0 ? { contextImages } : {}),
       cliAttached,
       // The session argument is the DECISION's, never derived from the live id:
       // a seed assigns the minted id before spawning, and deriving from it sent
@@ -7483,6 +7570,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ctx: { isContinuation: boolean }
     ): Promise<BackendTurnOutcome> => {
       if (!ctx.isContinuation) {
+        // The session this spawn lands in: the seed, the resumed session, or
+        // none for a stateless backend.
+        const openingSessionId =
+          seedProviderSessionId ??
+          (resumeProviderSession && activeBackendSessionId ? activeBackendSessionId : undefined);
+        const openingImages = contextImagesFor(openingSessionId);
         const ledgerIdBeforeSpawn = maxLedgerId();
         const generationBeforeSpawn = contextGeneration;
         beginSpawn();
@@ -7506,6 +7599,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // must reach the provider (heartbeat/reattach path).
           media: turnMedia.length > 0 ? turnMedia : undefined,
           ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+          ...(openingImages ? { contextImages: openingImages } : {}),
           // Seed a fresh provider session (first spawn) OR resume the live one
           // (subsequent turns). Tool-loop continuations always resume it.
           ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
@@ -7522,6 +7616,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           stopWaiting();
         });
         endSpawn();
+        noteImagesDelivered(openingSessionId, openingImages, runResult.success);
         // Recorded here, not after the reseed branch: a failed resume that
         // reported usage still spent those tokens, and the retry below
         // REASSIGNS runResult — recording once at the end would silently drop
@@ -7566,6 +7661,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const reseedStamp = formatContextStamp(
             turnContextOccupancy(ledger, runtime, providerContextMeasurement())
           );
+          // A fresh session: every image the ledger still holds goes with it.
+          const reseedImages = contextImagesFor(reseedId);
           beginSpawn();
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
@@ -7586,6 +7683,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // media so the full envelope carries the images too.
             media: turnMedia.length > 0 ? turnMedia : undefined,
             ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+            ...(reseedImages ? { contextImages: reseedImages } : {}),
             backendSessionSeedId: reseedId,
             cliAttached,
           });
@@ -7594,6 +7692,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             currentTurnAbort = null;
           });
           endSpawn();
+          noteImagesDelivered(reseedId, reseedImages, runResult.success);
           recordRunUsage(runResult.usage);
           sampleProviderContext(runResult.usage);
         }
@@ -7717,14 +7816,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // rendered this body itself.
       turnDialogue.push({ role: 'runtime', text: body });
 
+      const contSpawn = continuationSpawnArgs(decision, turnMedia.length > 0);
+      // Where a view_image result usually reaches the model: the relay
+      // describes the image, and this spawn carries it. A mid-turn seed gets
+      // every image the ledger holds.
+      const contSessionId =
+        contSpawn.sessionArgs.backendSessionId ?? contSpawn.sessionArgs.backendSessionSeedId;
+      const contImages = contextImagesFor(contSessionId);
+
       beginSpawn();
       const ledgerIdBeforeSpawn = maxLedgerId();
       const generationBeforeSpawn = contextGeneration;
       const contTurn = startBackendTurn(
-        continuationRequest(
-          continuationPrompt,
-          continuationSpawnArgs(decision, turnMedia.length > 0)
-        )
+        continuationRequest(continuationPrompt, contSpawn, contImages)
       );
       currentTurnAbort = contTurn.abort;
 
@@ -7732,6 +7836,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         currentTurnAbort = null;
       });
       endSpawn();
+      noteImagesDelivered(contSessionId, contImages, contResult.success);
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
