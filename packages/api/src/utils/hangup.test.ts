@@ -7,10 +7,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { handleHangup, HANGUP_REASON } from './hangup';
 
 describe('handleHangup', () => {
-  it('starts the shutdown with a reason that names the closed terminal', () => {
+  it('starts the shutdown with a reason that names the signal', () => {
     const shutdown = vi.fn();
     handleHangup(shutdown, [new EventEmitter(), new EventEmitter()]);
     expect(shutdown).toHaveBeenCalledWith(HANGUP_REASON);
+    expect(HANGUP_REASON).toMatch(/^SIGHUP\b/);
   });
 
   it('takes the error a console stream raises once its terminal is gone', () => {

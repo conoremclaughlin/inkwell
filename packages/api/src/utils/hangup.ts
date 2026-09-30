@@ -1,6 +1,8 @@
 import type { EventEmitter } from 'events';
 
-export const HANGUP_REASON = 'SIGHUP: the controlling terminal closed';
+// Names the signal and what usually sends it. It does not claim the terminal
+// closed: an explicit `kill -HUP` arrives the same way and logs the same line.
+export const HANGUP_REASON = 'SIGHUP (hangup, the signal a closing terminal sends)';
 
 /**
  * Turn a SIGHUP into the server's graceful shutdown.

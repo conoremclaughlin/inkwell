@@ -2020,8 +2020,8 @@ async function shutdown(reason: string): Promise<void> {
   }
 }
 
-// Handle shutdown signals. SIGHUP is the terminal the server runs in closing;
-// see handleHangup for why it needs more than a plain shutdown.
+// Handle shutdown signals. SIGHUP is what the terminal the server runs in sends
+// when it closes; see handleHangup for why it needs more than a plain shutdown.
 process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGHUP', () => handleHangup(shutdown));
