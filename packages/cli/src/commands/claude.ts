@@ -23,6 +23,7 @@ import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveSlug } from '../backends/index.js';
 import { createCliBackendHost } from '../backends/cli-host.js';
+import { onceAsync } from '../lib/once-async.js';
 import { classifyError, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
@@ -3815,13 +3816,10 @@ export async function runClaude(
     : undefined;
   let capturedBackendSessionId = sessionContext.backendSessionId;
   let stdoutLineBuffer = '';
-  let cleanedUp = false;
   let finalizedExecution = false;
-  const ensureCleanup = async (): Promise<void> => {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    await prepared.cleanup();
-  };
+  // One removal, shared: the close and error handlers can both run, and the
+  // second must wait for it rather than exit while it is pending.
+  const ensureCleanup = onceAsync(() => prepared.cleanup());
   const finalizeExecution = async (exitCode: number | null, error?: string): Promise<void> => {
     if (finalizedExecution) return;
     finalizedExecution = true;

@@ -545,9 +545,10 @@ describe('runBackendTurn', () => {
       }
     });
 
-    // Settled means the per-spawn files are gone: a hosted run releases on
-    // this result (Myra's R1, 72027fba review).
-    it('settles only once the per-spawn files have been removed', async () => {
+    // Settled means the per-spawn cleanup has finished its attempt: a hosted
+    // run releases on this result (Myra's R1, 72027fba review). Removal
+    // errors are swallowed, so it is not proof every file is gone.
+    it('settles only once its per-spawn cleanup has finished', async () => {
       spawnMock.mockReset().mockImplementation(() => createMockChild(0));
       state.cleanups = 0;
       let openGate!: () => void;

@@ -173,10 +173,14 @@ export interface PreparedBackend {
   args: string[];
   env: Record<string, string>;
   /**
-   * Removes every per-spawn file prepare() wrote. Asynchronous, so a host
-   * serving many sessions never blocks on it; callers await it once the
-   * child has stopped. A prepare() that rejects has already removed what it
-   * wrote.
+   * Attempts to remove every per-spawn file prepare() wrote. Asynchronous,
+   * so a host serving many sessions never blocks on it; callers await it
+   * once the child has stopped. A prepare() that rejects has already made
+   * the same attempt for what it wrote.
+   *
+   * Removal errors are swallowed, so a settled cleanup means the attempt
+   * finished, not that every file is proven absent. It is not evidence that
+   * anything the spawn held is released beyond the child having stopped.
    */
   cleanup: () => Promise<void>;
   /**
