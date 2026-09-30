@@ -237,8 +237,10 @@ export function getRuntimeBuildInfo(nowMs = Date.now()) {
     processManager: process.env.pm_id ? 'pm2' : 'direct',
     /**
      * `prod` for a built server (`yarn prod` and `yarn prod:direct` both set
-     * NODE_ENV=production), `dev` otherwise. A dev server reloads its own code
-     * as it changes, so the dashboard reports a stale build only for `prod`.
+     * NODE_ENV=production), `dev` otherwise. The dashboard reports a stale
+     * build only for `prod`, as Conor asked (2026-09-30). A dev server reloads
+     * code that changes on disk, but it never pulls, so a dev checkout that
+     * trails its upstream goes unreported.
      */
     runMode: process.env.NODE_ENV === 'production' ? 'prod' : 'dev',
   };

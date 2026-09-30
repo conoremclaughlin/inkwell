@@ -49,9 +49,11 @@ function behindPhrase(apiCount?: number | null, totalCount?: number | null): str
  * 2026-09-18 a server sat 6 API commits behind while the old banner, which
  * asked only the first question, showed nothing.
  *
- * Only for `runMode: 'prod'`. A dev server reloads its own code as it
- * changes, so neither question is worth a note there, and an API too old to
- * report its mode is treated the same way.
+ * Only for `runMode: 'prod'`, as Conor asked (2026-09-30). A dev server
+ * reloads code that changes on disk, which answers the first question there,
+ * but it never pulls, so a dev checkout can trail its upstream without a
+ * note: under `yarn dev`, pulling is left to whoever runs it. An API too old
+ * to report its mode is treated as dev.
  */
 export function SystemStatusNote() {
   const { data } = useApiQuery<HealthResponse>(['system-health'], '/api/system/health', {
