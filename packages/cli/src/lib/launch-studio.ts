@@ -77,7 +77,7 @@ async function lookupStudioByPath(worktreePath: string): Promise<LaunchStudioLoo
     const result = await callInkTool<{ studio?: { id?: string; sbSlug?: string } }>(
       'get_studio',
       { path: worktreePath },
-      { timeoutMs: 3000 }
+      { timeoutMs: 3000, idempotent: true }
     );
     if (result?.studio?.id) {
       return {
