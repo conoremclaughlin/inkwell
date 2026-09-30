@@ -41,6 +41,12 @@ describe('buildInteractiveSubcommandArgs', () => {
 });
 
 describe('extractArgs', () => {
+  it('keeps experimental Codex Inkmail opt-in out of native argv', () => {
+    expect(extractArgs([]).sbOptions.codexInkmail).toBe(false);
+    const result = extractArgs(['-b', 'codex', '--codex-inkmail']);
+    expect(result.sbOptions.codexInkmail).toBe(true);
+    expect(result.passthroughArgs).toEqual([]);
+  });
   it('parses prompt parts as positional args', () => {
     const result = extractArgs(['hello', 'world']);
     expect(result.promptParts).toEqual(['hello', 'world']);

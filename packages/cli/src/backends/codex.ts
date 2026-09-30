@@ -157,6 +157,7 @@ export class CodexAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
+        INK_CHANNEL_HOST: 'codex',
         SB_SLUG: config.sbSlug,
         AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,

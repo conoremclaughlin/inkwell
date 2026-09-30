@@ -161,12 +161,15 @@ async function runPlugin(extraEnv: Record<string, string>): Promise<{ stdout: st
       params: {
         protocolVersion: '2025-06-18',
         capabilities: {},
-        clientInfo: { name: 'host-mode-test', version: '0' },
+        clientInfo: { name: extraEnv.INK_TEST_CLIENT_NAME ?? 'host-mode-test', version: '0' },
       },
     }) + '\n'
   );
   proc.stdin!.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
 
+  proc.stdin!.write(
+    JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\n'
+  );
   await new Promise((r) => setTimeout(r, WINDOW_MS));
 
   const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
@@ -181,6 +184,22 @@ const tools = () => recorded.filter((r) => r.path === '/mcp').map((r) => r.tool)
 const lifecycle = () => recorded.filter((r) => r.path === '/api/hooks/lifecycle');
 
 describe('channel plugin host mode', () => {
+  it.each([{ INK_CHANNEL_HOST: 'codex' }, { INK_TEST_CLIENT_NAME: 'codex-mcp-client' }])(
+    'Codex is inert and completes generic tool discovery: %j',
+    async (env) => {
+      const { stdout } = await runPlugin(env as Record<string, string>);
+      expect(recorded).toEqual([]);
+      const response = stdout
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .find((r) => r.id === 2);
+      expect(response.result).toEqual({ tools: [] });
+      expect(stdout).not.toContain('notifications/claude/channel');
+    },
+    20_000
+  );
+
   it('control: an interactive host gets the push, and the plugin acks, stamps and detaches', async () => {
     const { stdout } = await runPlugin({});
 

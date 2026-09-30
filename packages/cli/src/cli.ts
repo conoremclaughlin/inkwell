@@ -62,6 +62,7 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
   '-m': { hasValue: true, key: 'model' },
   '--model': { hasValue: true, key: 'model' },
   '--sb-verbose': { hasValue: false, key: 'verbose' },
+  '--codex-inkmail': { hasValue: false, key: 'codexInkmail' },
   '--no-session': { hasValue: false, key: 'noSession' },
   '--session-candidates': { hasValue: false, key: 'sessionCandidates' },
   '--session-candidates-json': { hasValue: false, key: 'sessionCandidatesJson' },
@@ -88,6 +89,7 @@ interface ParsedArgs {
     sessionChoice: string | undefined;
     sbDebug: boolean;
     dangerous: boolean;
+    codexInkmail: boolean;
     /** True when the deprecated `--dangerous` spelling was the one used. */
     dangerousAlias: boolean;
   };
@@ -138,6 +140,7 @@ export function extractArgs(argv: string[]): ParsedArgs {
     sessionChoice: undefined,
     sbDebug: false,
     dangerous: false,
+    codexInkmail: false,
     dangerousAlias: false,
   };
   const passthroughArgs: string[] = [];
@@ -158,6 +161,7 @@ export function extractArgs(argv: string[]): ParsedArgs {
         if (flag.key === 'sessionChoice') sbOptions.sessionChoice = val;
       } else if (!flag.hasValue) {
         if (flag.key === 'noSession') sbOptions.session = false;
+        else if (flag.key === 'codexInkmail') sbOptions.codexInkmail = true;
         else if (flag.key === 'verbose') sbOptions.verbose = true;
         else if (flag.key === 'sessionCandidates') sbOptions.sessionCandidates = true;
         else if (flag.key === 'sessionCandidatesJson') sbOptions.sessionCandidatesJson = true;
@@ -214,6 +218,7 @@ program
     "AI backend (claude, codex, gemini, ink). Defaults to the -a agent's own backend."
   )
   .option('-m, --model <model>', 'Model to use (defaults to backend-specific)')
+  .option('--codex-inkmail', 'Experimental live mail in the native Codex terminal (0.159.2)')
   .option('--no-session', 'Disable session tracking')
   .option(
     '--session-candidates',
@@ -283,6 +288,17 @@ program
       promptParts,
       hasPrompt: Boolean(prompt),
     });
+
+    if (
+      resolvedOptions.codexInkmail &&
+      (resolvedOptions.backend !== 'codex' ||
+        !resolvedOptions.session ||
+        (prompt && !isBackendInteractiveSubcommand(resolvedOptions.backend, promptParts)))
+    ) {
+      throw new Error(
+        '--codex-inkmail requires an interactive Codex session with session tracking'
+      );
+    }
 
     // -b ink redirects to the first-class Ink chat runtime
     if (resolvedOptions.backend === 'ink') {
