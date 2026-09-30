@@ -2849,7 +2849,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // A headless child of `ink chat` writes neither value. Its parent owns the
   // turn and the attachment, and a false here would clear the turn marker
   // the parent opened while the parent is still running (lib/turn-owner.ts).
-  if (promptAttachmentWrite(isHeadlessSpawn) === null) {
+  if (promptAttachmentWrite(isHeadlessSpawn, process.env) === null) {
     hookLog('cli_attached_skipped', {
       sbSlug,
       backend: lifecycleBackend.name,

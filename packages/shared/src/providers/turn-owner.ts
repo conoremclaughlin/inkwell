@@ -32,8 +32,12 @@ export const PARENT_OWNED_TURN_ENV: Record<string, string> = {
   [TURN_OWNER_ENV]: PARENT_TURN_OWNER,
 };
 
-/** True when a parent `ink chat` process owns this process's logical turn. */
-export function parentOwnsTurn(env: NodeJS.ProcessEnv = process.env): boolean {
+/**
+ * True when a parent `ink chat` process owns the logical turn of the process
+ * whose env this is. The env is the caller's to name: a hook passes its own
+ * process's, and nothing on a spawn's preparation path reads one ambiently.
+ */
+export function parentOwnsTurn(env: NodeJS.ProcessEnv): boolean {
   return env[TURN_OWNER_ENV] === PARENT_TURN_OWNER;
 }
 
@@ -43,10 +47,7 @@ export function parentOwnsTurn(env: NodeJS.ProcessEnv = process.env): boolean {
  * attachment a crashed interactive process left behind), and null, meaning
  * no write, for a headless child of `ink chat`, whose parent declares it.
  */
-export function promptAttachmentWrite(
-  headless: boolean,
-  env: NodeJS.ProcessEnv = process.env
-): boolean | null {
+export function promptAttachmentWrite(headless: boolean, env: NodeJS.ProcessEnv): boolean | null {
   if (!headless) return true;
   return parentOwnsTurn(env) ? null : false;
 }
