@@ -11,6 +11,7 @@ export {
   type ContainerTarget,
   type SpawnBackendOptions,
   type SpawnBackendResult,
+  type SpawnedBackend,
 } from './spawn-backend.js';
 
 export {

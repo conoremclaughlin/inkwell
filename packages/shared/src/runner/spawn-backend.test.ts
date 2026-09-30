@@ -271,6 +271,7 @@ describe('spawnBackend (mocked process boundary)', () => {
     stderr: PassThrough;
     stdin: PassThrough;
     kill: ReturnType<typeof vi.fn>;
+    pid?: number;
   };
   beforeEach(() => {
     child = Object.assign(new EventEmitter(), {
@@ -323,23 +324,6 @@ describe('spawnBackend (mocked process boundary)', () => {
     });
   });
 
-  it.each(['hard', 'idle'] as const)(
-    'reports a %s timeout without starting or killing a real process',
-    async (kind) => {
-      vi.useFakeTimers();
-      const { result } = spawnBackend({
-        binary: 'codex',
-        args: [],
-        timeoutMs: kind === 'hard' ? 100 : 1000,
-        idleTimeoutMs: kind === 'idle' ? 100 : undefined,
-      });
-      await vi.advanceTimersByTimeAsync(100);
-      expect(await result).toMatchObject({ timedOut: true, timeoutType: kind, exitCode: 124 });
-      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-      vi.clearAllTimers();
-    }
-  );
-
   it('cleans process environment and merges explicit variables', async () => {
     vi.stubEnv('CLAUDECODE', '1');
     const { result } = spawnBackend({ binary: 'codex', args: [], env: { SYNTHETIC_TEST: 'yes' } });
@@ -368,6 +352,204 @@ describe('spawnBackend (mocked process boundary)', () => {
     ]);
     child.emit('close', 0);
     await result;
+  });
+
+  // The result settles when the child has stopped, never merely because a
+  // signal was sent: a host that releases a run on this promise must not free
+  // it while the process still runs, and the turn's temp files must outlive
+  // it (#701 P2). Every child here is a fake; no real process is started or
+  // signalled.
+  describe('settles only once the child has stopped', () => {
+    function track(promise: Promise<unknown>): () => boolean {
+      let settled = false;
+      void promise.then(() => {
+        settled = true;
+      });
+      return () => settled;
+    }
+
+    it.each(['hard', 'idle'] as const)(
+      'a %s timeout sends SIGTERM and settles on the close that follows',
+      async (kind) => {
+        vi.useFakeTimers();
+        const { result } = spawnBackend({
+          binary: 'codex',
+          args: [],
+          timeoutMs: kind === 'hard' ? 100 : 1000,
+          idleTimeoutMs: kind === 'idle' ? 100 : undefined,
+        });
+        const settled = track(result);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+        expect(settled()).toBe(false);
+
+        child.emit('exit', null, 'SIGTERM');
+        child.emit('close', null, 'SIGTERM');
+        expect(await result).toMatchObject({
+          timedOut: true,
+          timeoutType: kind,
+          exitCode: 124,
+          childExited: true,
+        });
+        // The close cancelled the SIGKILL.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+      }
+    );
+
+    it('a child that ignores SIGTERM gets SIGKILL after five seconds, and its close settles it', async () => {
+      vi.useFakeTimers();
+      const { result } = spawnBackend({ binary: 'codex', args: [], timeoutMs: 100 });
+      const settled = track(result);
+      await vi.advanceTimersByTimeAsync(100 + 4_999);
+      expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(child.kill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+      expect(settled()).toBe(false);
+
+      child.emit('close', null, 'SIGKILL');
+      expect(await result).toMatchObject({ timedOut: true, exitCode: 124, childExited: true });
+    });
+
+    it.each([
+      [false, 'nor its exit'],
+      [true, 'though it exited, as when a descendant holds its pipes'],
+    ])(
+      'a child whose close never comes settles five seconds after SIGKILL, childExited=%s (%s)',
+      async (exitSeen) => {
+        vi.useFakeTimers();
+        const chunks: string[] = [];
+        const { result } = spawnBackend({
+          binary: 'codex',
+          args: [],
+          timeoutMs: 100,
+          onStdout: (text) => chunks.push(text),
+          onStderr: (text) => chunks.push(text),
+        });
+        const settled = track(result);
+        await vi.advanceTimersByTimeAsync(100 + 5_000);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+        if (exitSeen) child.emit('exit', null, 'SIGKILL');
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(settled()).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(settled()).toBe(true);
+        expect(await result).toMatchObject({
+          timedOut: true,
+          exitCode: 124,
+          childExited: exitSeen,
+        });
+        // Nothing is delivered for a turn that has already settled.
+        child.stdout.emit('data', 'after the give-up\n');
+        child.stderr.emit('data', 'after the give-up\n');
+        expect(chunks).toEqual([]);
+      }
+    );
+
+    it('output during the grace is kept, and neither it nor the hard ceiling restarts the ladder', async () => {
+      vi.useFakeTimers();
+      const chunks: string[] = [];
+      const { result } = spawnBackend({
+        binary: 'codex',
+        args: [],
+        timeoutMs: 150,
+        idleTimeoutMs: 100,
+        onStdout: (text) => chunks.push(text),
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+
+      // A child's last words on SIGTERM arrive after the timeout fired.
+      child.stdout.emit('data', 'final words\n');
+      // Past a re-armed idle timer (100 ms) and the hard ceiling (150 ms).
+      await vi.advanceTimersByTimeAsync(200);
+      expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+
+      child.emit('close', null, 'SIGTERM');
+      expect(await result).toMatchObject({
+        timedOut: true,
+        timeoutType: 'idle',
+        stdout: 'final words',
+      });
+      expect(chunks).toEqual(['final words\n']);
+    });
+
+    it('an error from a started child (a signal it could not be sent) does not settle it', async () => {
+      vi.useFakeTimers();
+      child.pid = 4242;
+      const { result } = spawnBackend({ binary: 'codex', args: [] });
+      const settled = track(result);
+      child.emit('error', new Error('synthetic kill EPERM'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled()).toBe(false);
+
+      child.emit('close', 0);
+      expect(await result).toMatchObject({
+        exitCode: 0,
+        childExited: true,
+        stderr: expect.stringContaining('synthetic kill EPERM'),
+      });
+    });
+
+    it('a child that never started settles on its error at once', async () => {
+      const { result } = spawnBackend({ binary: 'codex', args: [] });
+      child.emit('error', new Error('synthetic ENOENT'));
+      expect(await result).toMatchObject({ exitCode: 1, childExited: true, timedOut: false });
+    });
+
+    it('stop() runs the same ladder with the grace it is given, and is not a timeout', async () => {
+      vi.useFakeTimers();
+      const { result, stop } = spawnBackend({ binary: 'codex', args: [] });
+      const settled = track(result);
+      stop(3_000);
+      stop(3_000);
+      expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+      await vi.advanceTimersByTimeAsync(2_999);
+      expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(child.kill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+      expect(settled()).toBe(false);
+
+      child.emit('close', null, 'SIGKILL');
+      expect(await result).toMatchObject({ timedOut: false, exitCode: 137, childExited: true });
+    });
+
+    it("neither output during a stop's grace nor the hard ceiling turns it into a timeout", async () => {
+      vi.useFakeTimers();
+      const { result, stop } = spawnBackend({
+        binary: 'codex',
+        args: [],
+        timeoutMs: 150,
+        idleTimeoutMs: 100,
+      });
+      stop(3_000);
+      child.stdout.emit('data', 'shutting down\n');
+      // Past a re-armed idle timer (100 ms) and the hard ceiling (150 ms).
+      await vi.advanceTimersByTimeAsync(200);
+      child.emit('close', null, 'SIGTERM');
+      const settled = await result;
+      expect(settled).toMatchObject({ timedOut: false, exitCode: 143, stdout: 'shutting down' });
+      expect(settled.timeoutType).toBeUndefined();
+    });
+
+    it('a stop that gives up reports the SIGKILL exit code and a child that may still run', async () => {
+      vi.useFakeTimers();
+      const { result, stop } = spawnBackend({ binary: 'codex', args: [] });
+      stop(3_000);
+      await vi.advanceTimersByTimeAsync(3_000 + 5_000);
+      expect(await result).toMatchObject({ timedOut: false, exitCode: 137, childExited: false });
+    });
+
+    it('stop() after the close signals nothing', async () => {
+      vi.useFakeTimers();
+      const { result, stop } = spawnBackend({ binary: 'codex', args: [] });
+      child.emit('close', 0);
+      await result;
+      stop();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(child.kill).not.toHaveBeenCalled();
+    });
   });
 });
 

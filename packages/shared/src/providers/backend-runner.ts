@@ -131,6 +131,11 @@ export interface BackendRunResult {
   /** Whether the process was reaped by a timeout, and which kind. */
   timedOut?: boolean;
   timeoutType?: 'idle' | 'hard';
+  /**
+   * Whether the provider process is known to have stopped. False only when
+   * a stop gave up waiting after SIGKILL; see SpawnBackendResult.childExited.
+   */
+  childExited: boolean;
 }
 
 export interface BackendTurnHandle {
@@ -194,7 +199,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     }
   };
 
-  const { child, result } = spawnBackend({
+  const { result, stop } = spawnBackend({
     binary: prepared.binary,
     args: prepared.args,
     cwd: request.workingDirectory,
@@ -238,18 +243,13 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         ...(resumeFailedNoSession ? { resumeFailedNoSession: true } : {}),
         timedOut: spawnResult.timedOut,
         timeoutType: spawnResult.timeoutType,
+        childExited: spawnResult.childExited,
       };
     }),
-    abort: () => {
-      try {
-        child.kill('SIGTERM');
-      } catch {}
-      setTimeout(() => {
-        try {
-          child.kill('SIGKILL');
-        } catch {}
-      }, 3000);
-    },
+    // The timeout's ladder with a shorter grace: an abort is a person or a
+    // parent waiting. The close cancels the SIGKILL, and the result, the
+    // temp-file cleanup with it, waits for the child to stop.
+    abort: () => stop(3000),
   };
 }
 

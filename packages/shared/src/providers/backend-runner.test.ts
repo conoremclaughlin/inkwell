@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({
   prepareCalls: [] as Array<{ backend: string; promptParts: string[] }>,
   prepareConfigs: [] as Array<Record<string, unknown>>,
+  cleanups: 0,
 }));
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -19,7 +20,9 @@ vi.mock('./registry.js', () => ({
         binary: 'mock-backend',
         args: [...config.promptParts],
         env: {},
-        cleanup: () => undefined,
+        cleanup: () => {
+          state.cleanups += 1;
+        },
       };
     },
   }),
@@ -31,6 +34,7 @@ vi.mock('child_process', () => ({
 
 import {
   runBackendTurn,
+  startBackendTurn,
   DEFAULT_TURN_HARD_TIMEOUT_MS,
   type BackendRunRequest,
 } from './backend-runner.js';
@@ -267,12 +271,128 @@ describe('runBackendTurn', () => {
       // …and reaped as a hard timeout once it crosses.
       await vi.advanceTimersByTimeAsync(2);
       expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      child.emit('close', null, 'SIGTERM');
       const result = await resultPromise;
       expect(result.timedOut).toBe(true);
       expect(result.timeoutType).toBe('hard');
       expect(result.exitCode).toBe(124);
+      expect(result.childExited).toBe(true);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // The turn is over when its child is, not when a signal was sent: the
+  // per-spawn files are removed after the close, and abort's SIGKILL is
+  // cancelled by it (#701 P2).
+  describe('lifetime', () => {
+    /** A child that closes only when the test says so, and records kill(). */
+    function createHeldChild() {
+      const stream = () => Object.assign(new EventEmitter(), { setEncoding: () => undefined });
+      return Object.assign(new EventEmitter(), {
+        stdout: stream(),
+        stderr: stream(),
+        kill: vi.fn(),
+      });
+    }
+
+    it('abort() sends SIGTERM, and the close cancels its SIGKILL', async () => {
+      vi.useFakeTimers();
+      try {
+        const child = createHeldChild();
+        spawnMock.mockReset().mockImplementation(() => child);
+        const turn = startBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+        });
+        turn.abort();
+        expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+        child.emit('close', null, 'SIGTERM');
+        const result = await turn.result;
+        expect(result).toMatchObject({ exitCode: 143, timedOut: false, childExited: true });
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+      } finally {
+        vi.useRealTimers();
+        spawnMock.mockReset();
+      }
+    });
+
+    it('abort() escalates to SIGKILL after three seconds', async () => {
+      vi.useFakeTimers();
+      try {
+        const child = createHeldChild();
+        spawnMock.mockReset().mockImplementation(() => child);
+        const turn = startBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+        });
+        turn.abort();
+        await vi.advanceTimersByTimeAsync(2_999);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+        child.emit('close', null, 'SIGKILL');
+        expect(await turn.result).toMatchObject({ exitCode: 137, childExited: true });
+      } finally {
+        vi.useRealTimers();
+        spawnMock.mockReset();
+      }
+    });
+
+    it('says so when it gave up on a child that never closed', async () => {
+      vi.useFakeTimers();
+      try {
+        const child = createHeldChild();
+        spawnMock.mockReset().mockImplementation(() => child);
+        const turn = startBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+        });
+        turn.abort();
+        await vi.advanceTimersByTimeAsync(3_000 + 5_000);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+        expect(await turn.result).toMatchObject({
+          success: false,
+          exitCode: 137,
+          childExited: false,
+        });
+      } finally {
+        vi.useRealTimers();
+        spawnMock.mockReset();
+      }
+    });
+
+    it('removes the per-spawn files only after the timed-out child has closed', async () => {
+      vi.useFakeTimers();
+      try {
+        state.cleanups = 0;
+        const child = createHeldChild();
+        spawnMock.mockReset().mockImplementation(() => child);
+        const turn = startBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+          timeoutMs: 100,
+        });
+        await vi.advanceTimersByTimeAsync(100);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+        expect(state.cleanups).toBe(0);
+
+        child.emit('close', null, 'SIGTERM');
+        expect(await turn.result).toMatchObject({ timedOut: true, exitCode: 124 });
+        expect(state.cleanups).toBe(1);
+      } finally {
+        vi.useRealTimers();
+        spawnMock.mockReset();
+      }
+    });
   });
 });
