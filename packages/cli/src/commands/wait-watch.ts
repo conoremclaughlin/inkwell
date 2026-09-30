@@ -22,6 +22,11 @@ export interface WaitClock {
   now(): number;
   /** Resolves after `ms`, or as soon as `signal` aborts. Never rejects. */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
+  /**
+   * Like sleep, but runs alongside whatever else the watcher is waiting on:
+   * the deadline uses it to end a call that is still in flight.
+   */
+  timer(ms: number, signal: AbortSignal): Promise<void>;
   /** Jitter source in [0, 1). */
   random(): number;
 }
@@ -78,9 +83,37 @@ export async function watchMessages(
   deps: MessageWaitDeps
 ): Promise<number> {
   const { clock, output, signal } = deps;
-  // A call still in flight at cancellation is abandoned, not awaited: Ctrl-C
-  // must not sit out a 30s fetch timeout.
-  const call: WaitToolCall = (tool, args) => untilAborted(deps.call(tool, args), signal);
+  const deadline =
+    opts.timeoutSec === undefined ? Number.POSITIVE_INFINITY : clock.now() + opts.timeoutSec * 1000;
+  // The deadline bounds everything, a call in flight included: a read that
+  // hangs would otherwise hold the watcher until the transport's own timeout,
+  // five minutes past a 30s deadline.
+  const expired = new AbortController();
+  const stopTimer = new AbortController();
+  if (Number.isFinite(deadline)) {
+    void clock.timer(deadline - clock.now(), stopTimer.signal).then(() => {
+      if (!stopTimer.signal.aborted) expired.abort('deadline');
+    });
+  }
+  const stopped = AbortSignal.any([signal, expired.signal]);
+  // A call still in flight at cancellation or at the deadline is abandoned,
+  // not awaited: Ctrl-C must not sit out a 30s fetch timeout.
+  const call: WaitToolCall = (tool, args) => untilAborted(deps.call(tool, args), stopped);
+  try {
+    return await watchUntilStopped(opts, deps, call, deadline, stopped);
+  } finally {
+    stopTimer.abort();
+  }
+}
+
+async function watchUntilStopped(
+  opts: MessageWaitOptions,
+  deps: MessageWaitDeps,
+  call: WaitToolCall,
+  deadline: number,
+  stopped: AbortSignal
+): Promise<number> {
+  const { clock, output, signal } = deps;
 
   const source: WatchSource = opts.threadKey
     ? new ThreadWatch(call, opts, opts.threadKey, output)
@@ -91,8 +124,6 @@ export async function watchMessages(
     ? new PendingWatch(call, new Date(clock.now()).toISOString())
     : undefined;
 
-  const deadline =
-    opts.timeoutSec === undefined ? Number.POSITIVE_INFINITY : clock.now() + opts.timeoutSec * 1000;
   const timing = opts.follow
     ? `follow, ${opts.timeoutSec === undefined ? 'no deadline' : `deadline: ${opts.timeoutSec}s`}, interval: ${opts.intervalSec}s`
     : `timeout: ${opts.timeoutSec}s, interval: ${opts.intervalSec}s`;
@@ -128,7 +159,7 @@ export async function watchMessages(
         baselined = true;
         consecutiveErrors = 0;
       } catch (error) {
-        if (signal.aborted) break;
+        if (stopped.aborted) break;
         consecutiveErrors += 1;
         lastError = { kind: 'Baseline error', message: messageOf(error) };
       }
@@ -145,7 +176,7 @@ export async function watchMessages(
             if (done) return 0;
           }
         } catch (error) {
-          if (signal.aborted) break;
+          if (stopped.aborted) break;
           const text = messageOf(error);
           if (text !== lastPendingError) {
             output.status(`[ink wait] --pending check failed: ${text.slice(0, 200)}`);
@@ -163,13 +194,13 @@ export async function watchMessages(
           output.status('[ink wait] No new messages yet...');
         }
       } catch (error) {
-        if (signal.aborted) break;
+        if (stopped.aborted) break;
         consecutiveErrors += 1;
         lastError = { kind: 'Poll error', message: messageOf(error) };
       }
     }
 
-    if (signal.aborted) break;
+    if (stopped.aborted) break;
     const remaining = deadline - clock.now();
     if (remaining <= 0) break;
 
@@ -181,8 +212,10 @@ export async function watchMessages(
         `[ink wait] ${lastError.kind} #${consecutiveErrors} (next retry in ~${Math.round(sleepMs / 1000)}s): ${lastError.message.slice(0, 100)}`
       );
     }
-    await clock.sleep(Math.min(sleepMs, remaining), signal);
-    if (signal.aborted) break;
+    await clock.sleep(Math.min(sleepMs, remaining), stopped);
+    // A sleep clamped to the deadline ends at it; the watch ends there too,
+    // rather than starting one more poll that the deadline has already passed.
+    if (stopped.aborted || clock.now() >= deadline) break;
   }
 
   if (signal.aborted) {

@@ -33,17 +33,47 @@ function virtualClock(events: Event[] = [], random = 0.5) {
   let now = 0;
   const sleeps: number[] = [];
   const queue = [...events].sort((a, b) => a[0] - b[0]);
+  // Timers run alongside whatever the watcher is waiting on, so they fire when
+  // virtual time passes them: through a sleep, or through advance() while a
+  // call is stuck. They fire a macrotask late, after a sleep that ended at the
+  // same instant has resumed: two real timers due together come in no
+  // guaranteed order, and this is the order that tests the watcher.
+  const timers: Array<{ at: number; fire: () => void }> = [];
+  const passTo = (target: number) => {
+    now = target;
+    while (queue.length > 0 && queue[0][0] <= now) queue.shift()![1]();
+    setImmediate(() => {
+      for (const timer of timers.filter((t) => t.at <= now)) {
+        timers.splice(timers.indexOf(timer), 1);
+        timer.fire();
+      }
+    });
+  };
   const clock: WaitClock = {
     now: () => now,
     random: () => random,
     sleep: async (ms, signal) => {
       sleeps.push(ms);
       if (signal.aborted) return;
-      now += ms;
-      while (queue.length > 0 && queue[0][0] <= now) queue.shift()![1]();
+      passTo(now + ms);
     },
+    timer: (ms, signal) =>
+      new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        const entry = { at: now + ms, fire: resolve };
+        timers.push(entry);
+        signal.addEventListener(
+          'abort',
+          () => {
+            const i = timers.indexOf(entry);
+            if (i >= 0) timers.splice(i, 1);
+            resolve();
+          },
+          { once: true }
+        );
+      }),
   };
-  return { clock, sleeps, now: () => now };
+  return { clock, sleeps, now: () => now, advance: (ms: number) => passTo(now + ms) };
 }
 
 function capture() {
@@ -328,6 +358,43 @@ describe('ink wait: thread, --follow', () => {
     const { done } = run(FOLLOW, call, clock, controller);
 
     expect(await done).toBe(130);
+  });
+
+  it('starts no poll at or after the deadline, in either mode', async () => {
+    for (const opts of [
+      { ...FOLLOW, timeoutSec: 60 },
+      { ...ONE_SHOT, timeoutSec: 60 },
+    ]) {
+      const server = threadServer();
+      const { clock, now } = virtualClock();
+      server.bindClock(now);
+      const { done } = run(opts, server.call, clock);
+
+      expect(await done).toBe(1);
+      expect(now()).toBe(60_000);
+      expect(server.calls.length).toBeGreaterThan(1);
+      expect(server.calls.filter((c) => c.at >= 60_000)).toEqual([]);
+    }
+  });
+
+  it('ends a call still in flight when the deadline passes, instead of waiting it out', async () => {
+    const { clock, now, advance } = virtualClock();
+    let calls = 0;
+    const quiet = threadServer();
+    const call: WaitToolCall = (tool, args) => {
+      calls += 1;
+      if (calls === 1) return quiet.call(tool, args); // the baseline, at 0s
+      // The first poll, at 15s, hangs as a fetch with a five-minute timeout
+      // can, while time runs on past the 30s deadline.
+      queueMicrotask(() => advance(60_000));
+      return new Promise(() => {});
+    };
+    const { out, done } = run({ ...FOLLOW, timeoutSec: 30 }, call, clock);
+
+    expect(await done).toBe(1);
+    expect(out.errors).toEqual(['[ink wait] Timed out after 30s with no new messages.']);
+    expect(calls).toBe(2);
+    expect(now()).toBe(75_000);
   });
 
   it('backs off on repeated failures with a bounded delay, never below the interval, and recovers', async () => {

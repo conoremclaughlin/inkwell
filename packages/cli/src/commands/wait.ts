@@ -40,22 +40,27 @@ function parseSeconds(value: string): number | undefined {
   return Number.isFinite(seconds) ? seconds : undefined;
 }
 
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener('abort', finish, { once: true });
+  });
+}
+
 const realClock: WaitClock = {
   now: () => Date.now(),
-  sleep: (ms, signal) =>
-    new Promise<void>((resolve) => {
-      if (signal.aborted) {
-        resolve();
-        return;
-      }
-      const finish = () => {
-        clearTimeout(timer);
-        signal.removeEventListener('abort', finish);
-        resolve();
-      };
-      const timer = setTimeout(finish, ms);
-      signal.addEventListener('abort', finish, { once: true });
-    }),
+  sleep: abortableDelay,
+  // Real timers already run alongside each other.
+  timer: abortableDelay,
   random: () => Math.random(),
 };
 
