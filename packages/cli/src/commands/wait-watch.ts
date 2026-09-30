@@ -402,21 +402,20 @@ class ThreadCursor {
    * drains on from its newest message.
    *
    * Another session can read the thread between the inbox listing it and
-   * this read. Then nothing past the pointer is left, nothing is new, and the
-   * position is the thread's end. Taking an empty position there instead
-   * would read the thread's whole history as new on its next arrival
-   * (Lumen, #702 r2). `keep` is false for a thread that is gone.
+   * this read, and then nothing past the pointer is left. That read gives no
+   * position to start from. An empty position would read the thread's whole
+   * history as new on its next arrival, and anchoring at the thread's end
+   * would swallow a reply landing between this read and the anchor (Lumen,
+   * #702 r2). So `keep` is false: the thread is not registered yet, and the
+   * next poll that lists it reads from its pointer again. The same goes for
+   * a thread that is gone.
    */
   async readFromPointer(): Promise<{ fresh: Row[]; commit: () => void; keep: boolean }> {
     const result = await this.call('get_thread_messages', this.args({ limit: WAIT_PAGE_SIZE }));
     if (threadAbsent(result)) return { fresh: [], commit: () => {}, keep: false };
     requireSuccess(result, 'get_thread_messages');
     const rows = rowsOf(result.messages);
-    if (rows.length === 0) {
-      const end = await this.readEnd();
-      if ('absent' in end) return { fresh: [], commit: () => {}, keep: false };
-      return { fresh: [], commit: () => (this.tail = end.tail), keep: true };
-    }
+    if (rows.length === 0) return { fresh: [], commit: () => {}, keep: false };
     const start = emptyTail();
     const first = absorb(start, rows);
     if (rows.length < WAIT_PAGE_SIZE) {

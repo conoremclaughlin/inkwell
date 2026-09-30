@@ -826,6 +826,38 @@ describe('#702 review regressions (Lumen)', () => {
     expect(received).not.toContain('reply consumed by another session');
   });
 
+  it('reports a reply that lands right after an empty discovery read', async () => {
+    const server = inboxServer();
+    server.postToThread('pr:5', 'lumen', 'old already read reply', -2000);
+    server.postToThread('pr:5', 'wren', 'old own post marks read', -1000);
+    let emptied = false;
+    const call: WaitToolCall = async (tool, args) => {
+      const discovery = tool === 'get_thread_messages' && args.fullHistory !== true && !emptied;
+      // Another session reads the thread just before this read, so it comes back empty...
+      if (discovery) server.postToThread('pr:5', 'wren', 'concurrent reader', 10001);
+      const result = await server.call(tool, args);
+      if (discovery) {
+        emptied = true;
+        // ...and a reply lands right after it, before anything else is read.
+        server.postToThread('pr:5', 'lumen', 'reply right after the empty read', 10002);
+      }
+      return result;
+    };
+    const { clock } = virtualClock([
+      [
+        10000,
+        () => server.postToThread('pr:5', 'lumen', 'reply consumed by another session', 10000),
+      ],
+    ]);
+    const { out, done } = run({ ...INBOX_FOLLOW, timeoutSec: 60 }, call, clock);
+    await done;
+    const received = out.batches.flat().join('\n');
+    expect(emptied).toBe(true);
+    expect(received).toContain('reply right after the empty read');
+    expect(received).not.toContain('old already read reply');
+    expect(received).not.toContain('reply consumed by another session');
+  });
+
   it('does not begin another poll once the deadline has been reached', async () => {
     const server = threadServer();
     const { clock, now } = virtualClock();
