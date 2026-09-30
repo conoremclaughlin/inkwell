@@ -134,9 +134,29 @@ describe('findGeminiSettingsRouting reads settings as Gemini 0.54.0 does (Myra, 
     ]);
   });
 
+  // Myra's probes on 802fcd78 (aebf2020), kept as rows.
+  it.each<[string, string, string]>([
+    [
+      'a string ending in an escaped backslash, then a line comment',
+      '{ "mcpServers": { "a": { "cwd": "C:\\\\", // c\n "headers": { "x-ink-context": "s" } } } }',
+      'x-ink-context',
+    ],
+    [
+      'CRLF line comments',
+      '{\r\n  // synthetic\r\n  "mcpServers": { "a": { "headers": { "X-Ink-Studio-Id": "s" } } }\r\n}\r\n',
+      'X-Ink-Studio-Id',
+    ],
+  ])('reads %s', async (_label, text, header) => {
+    const path = settingsFile('probe.json', text);
+    expect(await findGeminiSettingsRouting([path])).toEqual([
+      { path, kind: 'routing', headers: [header] },
+    ]);
+  });
+
   it.each([
     ['a trailing comma, which Gemini also rejects', '{ "mcpServers": {}, }'],
     ['a block comment that never closes', '{ "mcpServers": {} /* synthetic'],
+    ['a UTF-8 byte-order mark, which Gemini 0.54.0 rejects', '\uFEFF{ "mcpServers": {} }'],
   ])('still reports %s as unreadable', async (_label, text) => {
     const path = settingsFile('bad.json', text);
     expect(await findGeminiSettingsRouting([path])).toEqual([{ path, kind: 'unreadable' }]);
