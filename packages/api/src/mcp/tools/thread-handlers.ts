@@ -968,12 +968,13 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
               }
             : {}),
           // The page filled and this branch is oldest-first, so what came back
-          // is the START of the thread, not the latest of it.
+          // is the START of the thread, not the latest of it. A completed tie
+          // group can make the page longer than the limit; say what was sent.
           ...(truncatedNewer > 0
             ? {
                 truncatedNewerCount: truncatedNewer,
                 hint:
-                  `Returned the OLDEST ${effectiveLimit} messages; ${truncatedNewer} newer ` +
+                  `Returned the OLDEST ${messages?.length ?? effectiveLimit} messages; ${truncatedNewer} newer ` +
                   `ones were cut. Pass latestN to get the most recent instead.`,
               }
             : {}),
