@@ -15,7 +15,10 @@
  * parsed file, so a routing name in a value, a description or an env map is
  * not one, and no header value is ever read into a message. A file that is
  * absent carries nothing; one that exists and cannot be read or parsed is
- * refused, because what it would send is unknown.
+ * refused, because what it would send is unknown. It is parsed as Gemini
+ * parses it: `//` and block comments outside strings are removed, then the
+ * rest must be strict JSON, so a trailing comma is still unreadable (Myra,
+ * measured on gemini 0.54.0, #701 4705eab0).
  *
  * Only the files the caller names are checked. A layer Gemini reads from
  * elsewhere is not, so this guards those files and makes no claim about
@@ -56,6 +59,45 @@ export class BakedRoutingHeaderError extends Error {
   }
 }
 
+/**
+ * `text` with its `//` and block comments removed, outside strings only, so
+ * the `//` in a URL value stays. Each comment becomes a space, keeping
+ * tokens apart; a line comment keeps its newline. Undefined when a block
+ * comment never closes.
+ */
+function withoutComments(text: string): string | undefined {
+  let out = '';
+  let inString = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (inString) {
+      out += ch;
+      if (ch === '\\') {
+        // An escaped character, `\"` included, never ends the string.
+        i += 1;
+        out += text[i] ?? '';
+      } else if (ch === '"') {
+        inString = false;
+      }
+    } else if (ch === '"') {
+      inString = true;
+      out += ch;
+    } else if (ch === '/' && text[i + 1] === '/') {
+      const newline = text.indexOf('\n', i);
+      out += ' ';
+      i = (newline === -1 ? text.length : newline) - 1;
+    } else if (ch === '/' && text[i + 1] === '*') {
+      const close = text.indexOf('*/', i + 2);
+      if (close === -1) return undefined;
+      out += ' ';
+      i = close + 1;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -87,9 +129,11 @@ export async function findGeminiSettingsRouting(
       findings.push({ path, kind: 'unreadable' });
       continue;
     }
+    const json = withoutComments(text);
     let settings: unknown;
     try {
-      settings = JSON.parse(text);
+      if (json === undefined) throw new Error('unterminated comment');
+      settings = JSON.parse(json);
     } catch {
       findings.push({ path, kind: 'unreadable' });
       continue;

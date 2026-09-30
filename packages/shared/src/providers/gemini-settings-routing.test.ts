@@ -91,6 +91,58 @@ describe('findGeminiSettingsRouting', () => {
   });
 });
 
+describe('findGeminiSettingsRouting reads settings as Gemini 0.54.0 does (Myra, 4705eab0)', () => {
+  it('reads a commented file, leaving the `//` in a URL value alone', async () => {
+    const path = settingsFile(
+      'commented.json',
+      [
+        '{',
+        '  // synthetic user settings',
+        '  "mcpServers": {',
+        '    /* the local server */',
+        '    "inkwell": {',
+        '      "httpUrl": "http://localhost:3001/mcp", // a trailing line comment',
+        '      "headers": { "X-Ink-Context": "synthetic" }',
+        '    }',
+        '  }',
+        '}',
+      ].join('\n')
+    );
+    expect(await findGeminiSettingsRouting([path])).toEqual([
+      { path, kind: 'routing', headers: ['X-Ink-Context'] },
+    ]);
+  });
+
+  it('does not count a routing name that is only in a comment', async () => {
+    const path = settingsFile(
+      'comment-only.json',
+      '{ "mcpServers": { "inkwell": { "headers": { /* was x-ink-session-id */ "X-Custom": "v" } } } } // x-ink-context'
+    );
+    expect(await findGeminiSettingsRouting([path])).toEqual([]);
+  });
+
+  it('keeps comment markers and escaped quotes inside strings', async () => {
+    // One unpaired escaped quote: a reader that ended the string there would
+    // take the `//` after it for a comment and lose the rest of the line.
+    const path = settingsFile(
+      'strings.json',
+      '{ "mcpServers": { "a": { "description": "one \\" quote // not a comment /* nor this", ' +
+        '"headers": { "x-ink-studio-id": "synthetic" } } } }'
+    );
+    expect(await findGeminiSettingsRouting([path])).toEqual([
+      { path, kind: 'routing', headers: ['x-ink-studio-id'] },
+    ]);
+  });
+
+  it.each([
+    ['a trailing comma, which Gemini also rejects', '{ "mcpServers": {}, }'],
+    ['a block comment that never closes', '{ "mcpServers": {} /* synthetic'],
+  ])('still reports %s as unreadable', async (_label, text) => {
+    const path = settingsFile('bad.json', text);
+    expect(await findGeminiSettingsRouting([path])).toEqual([{ path, kind: 'unreadable' }]);
+  });
+});
+
 describe('refuseGeminiSettingsRouting', () => {
   it('resolves when nothing is found', async () => {
     const path = settingsFile('clean.json', { mcpServers: { inkwell: server({}) } });
