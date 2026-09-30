@@ -358,11 +358,9 @@ describe('SbHookRegistry: blocking', () => {
 
 describe('SbHookRegistry: error handling', () => {
   it('continues after a hook throws', async () => {
-    const registry = new SbHookRegistry();
+    const report = vi.fn();
+    const registry = new SbHookRegistry(report);
     const calls: string[] = [];
-
-    // Suppress console.warn in test
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     registry.register({
       name: 'crasher',
@@ -386,7 +384,31 @@ describe('SbHookRegistry: error handling', () => {
     expect(calls).toEqual(['survived']);
     expect(result.blocked).toBe(false);
 
-    warnSpy.mockRestore();
+    expect(report).toHaveBeenCalledWith('crasher', 'turn_end', expect.any(Error));
+  });
+
+  it('keeps diagnostics per registry, even when a reporter throws', async () => {
+    const reportA = vi.fn(() => {
+      throw new Error('fixture reporter failure');
+    });
+    const reportB = vi.fn();
+    const a = new SbHookRegistry(reportA);
+    const b = new SbHookRegistry(reportB);
+    const survivor = vi.fn(async () => {});
+    a.register({
+      name: 'fails',
+      event: 'turn_end',
+      handler: async () => {
+        throw new Error('fixture');
+      },
+    });
+    a.register({ name: 'survives', event: 'turn_end', handler: survivor });
+    await a.fire('turn_end', makeCtx());
+    expect(survivor).toHaveBeenCalledOnce();
+    expect(reportA).toHaveBeenCalledOnce();
+    expect(reportB).not.toHaveBeenCalled();
+    expect(b.listHooks()).toEqual([]);
+    expect(b.getFireLog()).toEqual([]);
   });
 
   it('handles hooks returning undefined gracefully', async () => {

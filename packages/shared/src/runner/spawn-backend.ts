@@ -34,8 +34,14 @@ export interface SpawnBackendOptions {
   binary: string;
   /** Arguments to pass to the binary */
   args: string[];
-  /** Additional env vars to merge (on top of cleaned process.env) */
+  /** Additional env vars to merge (on top of the cleaned parent env) */
   env?: Record<string, string>;
+  /**
+   * The env the child inherits from, filtered through
+   * SPAWN_ENV_INHERITED_NAMES. Defaults to this process's env; the providers
+   * runner always passes its host's (BackendHost.baseEnv).
+   */
+  parentEnv?: Readonly<Record<string, string | undefined>>;
   /** Working directory for the child process */
   cwd?: string;
   /** Whether to pipe stdin (default: false — stdin is 'ignore') */
@@ -71,7 +77,52 @@ export interface SpawnBackendResult {
   timedOut: boolean;
   /** If timed out, was it idle or hard ceiling? */
   timeoutType?: 'idle' | 'hard';
+  /**
+   * Whether the process is known to have stopped: its exit was observed, or
+   * it never started. False only when a stop gave up waiting after SIGKILL
+   * (a process the kernel cannot reap yet, or a `docker exec` client whose
+   * container process outlives it): it may still be running, so a caller
+   * must not treat what it holds as released.
+   *
+   * It speaks for the child alone. A descendant that inherited the child's
+   * pipes is neither signalled nor waited for: when the child exits and the
+   * descendant keeps the pipes open, the result settles at the stop's
+   * give-up with this true while the descendant may still run.
+   */
+  childExited: boolean;
 }
+
+export interface SpawnedBackend {
+  child: ChildProcess;
+  /** Settles once the child has stopped, never merely because it was signalled. */
+  result: Promise<SpawnBackendResult>;
+  /**
+   * Stop the child: SIGTERM now, SIGKILL after `graceMs`, and settle
+   * `result` on the close that follows, or STOP_GIVE_UP_MS after the
+   * SIGKILL if none comes. A timeout runs the same ladder, and a timed-out
+   * result reports 124 even when the child exits 0 during the grace. Once the
+   * child has closed, or a stop is already under way, this does nothing: the
+   * first stop's grace stands, so an abort during a timeout's grace does not
+   * shorten it.
+   */
+  stop: (graceMs?: number) => void;
+}
+
+/**
+ * Between the SIGTERM and the SIGKILL of a stop the caller did not time.
+ * Exported so a host sizes a credential's grace from the ladder itself.
+ */
+export const STOP_GRACE_MS = 5000;
+
+/**
+ * How long a stop waits for the close after SIGKILL before settling anyway.
+ * SIGKILL cannot be caught, so a child still open by then is one that cannot
+ * be reaped yet; the result says so rather than waiting forever.
+ */
+export const STOP_GIVE_UP_MS = 5000;
+
+/** What a shell reports for a process ended by SIGKILL. */
+const SIGKILL_EXIT_CODE = 128 + 9;
 
 // ─── Core ───────────────────────────────────────────────────────
 
@@ -297,7 +348,7 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
       binary: options.binary,
       args: options.args,
       cwd: options.cwd,
-      env: buildCleanEnv(options.env),
+      env: buildCleanEnv(options.env, options.parentEnv),
     };
   }
 
@@ -329,7 +380,7 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
     // cwd is inside the container (passed via --workdir), not on the host
     cwd: undefined,
     // Host env is clean but doesn't need the extra vars (they're inside the container)
-    env: buildCleanEnv(),
+    env: buildCleanEnv(undefined, options.parentEnv),
   };
 }
 
@@ -343,11 +394,14 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
  * When `options.container` is set, the binary runs inside the specified
  * Docker container via `docker exec`. The interface is identical — callers
  * don't need to know whether they're targeting host or container.
+ *
+ * The result settles when the child has stopped: on its close, on the error
+ * of a spawn that never started, or when a stop gives up after SIGKILL. A
+ * timeout signals the child and waits like any other stop, so a caller can
+ * treat the settled result as the end of the process's lifetime, and
+ * `childExited` says when it is not.
  */
-export function spawnBackend(options: SpawnBackendOptions): {
-  child: ChildProcess;
-  result: Promise<SpawnBackendResult>;
-} {
+export function spawnBackend(options: SpawnBackendOptions): SpawnedBackend {
   const started = Date.now();
   // stdinData implies pipeStdin (resolveSpawnTarget also checks it for docker -i)
   if (options.stdinData !== undefined && !options.pipeStdin) {
@@ -373,86 +427,120 @@ export function spawnBackend(options: SpawnBackendOptions): {
   let stdout = '';
   let stderr = '';
   let resolved = false;
+  let stopping = false;
+  let exited = false;
   let timedOut = false;
   let timeoutType: 'idle' | 'hard' | undefined;
   let hardTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let killTimer: ReturnType<typeof setTimeout> | null = null;
+  let giveUpTimer: ReturnType<typeof setTimeout> | null = null;
 
   child.stdout?.setEncoding('utf8');
   child.stderr?.setEncoding('utf8');
 
+  let settle!: (result: SpawnBackendResult) => void;
   const result = new Promise<SpawnBackendResult>((resolve) => {
-    const finalize = (exitCode: number) => {
-      if (resolved) return;
-      resolved = true;
-      if (hardTimer) clearTimeout(hardTimer);
-      if (idleTimer) clearTimeout(idleTimer);
-      resolve({
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        exitCode,
-        durationMs: Date.now() - started,
-        timedOut,
-        timeoutType,
-      });
-    };
-
-    // Hard ceiling timeout
-    const hardTimeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
-    hardTimer = setTimeout(() => {
-      timedOut = true;
-      timeoutType = 'hard';
-      child.kill('SIGTERM');
-      // Give 5s for graceful shutdown, then SIGKILL
-      const killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
-      killTimer.unref?.();
-      finalize(124);
-    }, hardTimeoutMs);
-    hardTimer.unref?.();
-
-    // Idle timeout (optional) — resets on any output
-    const resetIdleTimer = () => {
-      if (!options.idleTimeoutMs) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        timedOut = true;
-        timeoutType = 'idle';
-        child.kill('SIGTERM');
-        const killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
-        killTimer.unref?.();
-        finalize(124);
-      }, options.idleTimeoutMs);
-      idleTimer.unref?.();
-    };
-    resetIdleTimer();
-
-    child.stdout?.on('data', (chunk) => {
-      const str = String(chunk);
-      stdout += str;
-      options.onStdout?.(str);
-      resetIdleTimer();
-    });
-
-    child.stderr?.on('data', (chunk) => {
-      const str = String(chunk);
-      stderr += str;
-      options.onStderr?.(str);
-      resetIdleTimer();
-    });
-
-    child.on('error', (error) => {
-      stderr = `${stderr}\n${String(error)}`.trim();
-      finalize(1);
-    });
-
-    child.on('close', (code, signal) => {
-      if (code !== null) return finalize(code);
-      const SIG_CODES: Record<string, number> = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2 };
-      finalize(signal ? 128 + (SIG_CODES[signal] ?? 15) : 1);
-    });
+    settle = resolve;
   });
 
-  return { child, result };
+  const clearTimers = () => {
+    for (const timer of [hardTimer, idleTimer, killTimer, giveUpTimer]) {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  const finalize = (exitCode: number, childExited: boolean) => {
+    if (resolved) return;
+    resolved = true;
+    clearTimers();
+    settle({
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exitCode,
+      durationMs: Date.now() - started,
+      timedOut,
+      timeoutType,
+      childExited,
+    });
+  };
+
+  const stop = (graceMs = STOP_GRACE_MS) => {
+    if (resolved || stopping) return;
+    stopping = true;
+    // Only the ladder below runs from here: no timeout fires during a stop.
+    clearTimers();
+    child.kill('SIGTERM');
+    killTimer = setTimeout(() => {
+      child.kill('SIGKILL');
+      giveUpTimer = setTimeout(
+        () => finalize(timedOut ? 124 : SIGKILL_EXIT_CODE, exited),
+        STOP_GIVE_UP_MS
+      );
+      giveUpTimer.unref?.();
+    }, graceMs);
+    killTimer.unref?.();
+  };
+
+  const timeOut = (kind: 'idle' | 'hard') => {
+    timedOut = true;
+    timeoutType = kind;
+    stop();
+  };
+
+  // Hard ceiling timeout
+  const hardTimeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
+  hardTimer = setTimeout(() => timeOut('hard'), hardTimeoutMs);
+  hardTimer.unref?.();
+
+  // Idle timeout (optional) — resets on any output until a stop begins
+  const resetIdleTimer = () => {
+    if (!options.idleTimeoutMs || stopping) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => timeOut('idle'), options.idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+  resetIdleTimer();
+
+  // Output is delivered until the result settles, the grace of a stop
+  // included: a child's last words on SIGTERM are often its result.
+  child.stdout?.on('data', (chunk) => {
+    if (resolved) return;
+    const str = String(chunk);
+    stdout += str;
+    options.onStdout?.(str);
+    resetIdleTimer();
+  });
+
+  child.stderr?.on('data', (chunk) => {
+    if (resolved) return;
+    const str = String(chunk);
+    stderr += str;
+    options.onStderr?.(str);
+    resetIdleTimer();
+  });
+
+  child.on('error', (error) => {
+    stderr = `${stderr}\n${String(error)}`.trim();
+    // A spawn that failed has no process to wait for. A started child, with
+    // no IPC channel or abort signal here, reports an error only when a
+    // signal could not be delivered to it (EPERM from kill), so it is still
+    // running and its close settles the result.
+    if (child.pid === undefined) finalize(1, true);
+  });
+
+  child.on('exit', () => {
+    exited = true;
+  });
+
+  child.on('close', (code, signal) => {
+    if (timedOut) return finalize(124, true);
+    if (code !== null) return finalize(code, true);
+    const SIG_CODES: Record<string, number> = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2 };
+    finalize(signal ? 128 + (SIG_CODES[signal] ?? 15) : 1, true);
+  });
+
+  return { child, result, stop };
 }
 
 // ─── Line Buffer ────────────────────────────────────────────────

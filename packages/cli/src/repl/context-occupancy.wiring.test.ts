@@ -249,6 +249,12 @@ describe('PR 639 resume-not-found recovery seed', () => {
       sessionAttachmentDirs: [] as string[],
       turnMedia: [] as unknown[],
       cliAttached: false,
+      providerSpawnContext: () => ({
+        workingDirectory: '/synthetic/studio',
+        inkSessionId: undefined,
+        studioId: undefined,
+        sessionEnv: {},
+      }),
       printEvent: () => {},
       chalk: { yellow: (s: string) => s },
       beginSpawn: () => {},

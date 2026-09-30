@@ -24,6 +24,7 @@
 
 import { existsSync, lstatSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { readCodexStaticHeaderNames } from './codex-http-headers.js';
 
 export const STUDIO_CHECK_IDS = [
   'mcp-json',
@@ -134,6 +135,50 @@ function missingHooks(commands: string[], wanted: readonly string[]): string[] {
 function hasInkwellServer(config: Record<string, unknown> | null): boolean {
   const servers = config?.mcpServers;
   return !!servers && typeof servers === 'object' && 'inkwell' in (servers as object);
+}
+
+/**
+ * A routing header (which session and studio a request serves) belongs to the
+ * spawn, which sets it from its own env. Baked into a studio's backend config
+ * it is one session's value sent for every session that runs there: syncs
+ * wrote it until 2026-09-29, and `ink init` re-syncs without it.
+ */
+const ROUTING_HEADER_NAMES: ReadonlySet<string> = new Set([
+  'x-ink-session-id',
+  'x-ink-studio-id',
+  'x-ink-context',
+]);
+
+/**
+ * Whether the Codex config's static `http_headers` carry a routing header,
+ * read by header name (codex-http-headers.ts), so a routing name in a value,
+ * a comment or `env_http_headers` does not count. A form the reader cannot
+ * take apart counts as carrying one: the studio is sent to its repair rather
+ * than passed unread (Myra, #701 4d55a16d).
+ */
+function codexBakesRouting(toml: string): boolean {
+  const { names, unreadable } = readCodexStaticHeaderNames(toml);
+  return unreadable || names.some((name) => ROUTING_HEADER_NAMES.has(name.toLowerCase()));
+}
+
+/**
+ * The repair, both halves: `ink mcp sync` rewrites only ink's managed block
+ * (mergeCodexConfig), so a header written by hand outside it stays.
+ */
+const CODEX_ROUTING_DETAIL =
+  "carries a baked session routing header, or an http_headers form the checklist cannot read; run `ink mcp sync`, and if it remains, remove it by hand outside ink's managed block";
+
+function geminiBakesRouting(config: Record<string, unknown> | null): boolean {
+  const servers = config?.mcpServers;
+  if (!servers || typeof servers !== 'object') return false;
+  return Object.values(servers as Record<string, unknown>).some((server) => {
+    const headers = (server as { headers?: unknown } | null)?.headers;
+    return (
+      !!headers &&
+      typeof headers === 'object' &&
+      Object.keys(headers).some((name) => ROUTING_HEADER_NAMES.has(name.toLowerCase()))
+    );
+  });
 }
 
 export function auditStudio(worktreePath: string, options: { linked: boolean }): StudioAudit {
@@ -265,12 +310,19 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
   // hooks table `ink hooks install --backend codex` writes.
   const codex = readText(join(worktreePath, '.codex', 'config.toml'));
   const codexMcp = !!codex && /^\[mcp_servers\.inkwell\]\s*$/m.test(codex);
+  const codexRouting = !!codex && codexBakesRouting(codex);
   add(
     'codex-mcp',
     '.codex/config.toml inkwell MCP section',
     true,
-    codexMcp,
-    codexMcp ? 'inkwell server configured' : codex ? 'no [mcp_servers.inkwell]' : 'missing'
+    codexMcp && !codexRouting,
+    !codexMcp
+      ? codex
+        ? 'no [mcp_servers.inkwell]'
+        : 'missing'
+      : codexRouting
+        ? CODEX_ROUTING_DETAIL
+        : 'inkwell server configured'
   );
   const codexCommands = codex
     ? codex
@@ -294,13 +346,16 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
   // .gemini/settings.json — MCP section and hooks, as for Codex.
   const geminiPath = join(worktreePath, '.gemini', 'settings.json');
   const gemini = readJson(geminiPath);
+  const geminiRouting = geminiBakesRouting(gemini);
   add(
     'gemini-mcp',
     '.gemini/settings.json inkwell MCP section',
     true,
-    hasInkwellServer(gemini),
+    hasInkwellServer(gemini) && !geminiRouting,
     hasInkwellServer(gemini)
-      ? 'inkwell server configured'
+      ? geminiRouting
+        ? 'carries a baked session routing header'
+        : 'inkwell server configured'
       : gemini
         ? 'no inkwell server entry'
         : existsSync(geminiPath)

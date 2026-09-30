@@ -329,6 +329,7 @@ describe('pi-tools: integration with executeToolCalls', () => {
 
   function makeDeps(overrides: Partial<ToolCallExecutorDeps> = {}): ToolCallExecutorDeps {
     return {
+      commitIntent: async () => {},
       policy: {
         canCallInkTool: vi.fn().mockReturnValue({ allowed: true, reason: '' }),
       } as unknown as ToolCallExecutorDeps['policy'],

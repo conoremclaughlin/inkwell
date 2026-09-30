@@ -2,6 +2,27 @@ import { describe, expect, it } from 'vitest';
 import { entryRefHash, ContextLedger, estimateTokens } from './context-ledger.js';
 
 describe('ContextLedger', () => {
+  it('preserves content-addressed references, including Unicode', () => {
+    expect(entryRefHash('user', 'fixture')).toBe('sha1:c74ab28e9d7d5537');
+    expect(entryRefHash('inbox', 'memory 🌱')).toBe('sha1:b46b90b233a62d50');
+  });
+
+  it('keeps entries, IDs, bookmarks and compaction independent across sessions', () => {
+    const a = new ContextLedger();
+    const b = new ContextLedger();
+    expect(a.addEntry('user', 'a').id).toBe(1);
+    const bEntry = b.addEntry('user', 'b');
+    expect(bEntry.id).toBe(1);
+    const bMark = b.createBookmark();
+    a.createBookmark();
+    a.compactToSummary('summary', 0);
+    a.evictByRole('system');
+    expect(a.listEntries()).toEqual([]);
+    expect(b.listEntries()).toEqual([bEntry]);
+    expect(b.listBookmarks()).toEqual([bMark]);
+    expect(b.addEntry('assistant', 'reply').id).toBe(2);
+  });
+
   it('estimates tokens from content length', () => {
     expect(estimateTokens('')).toBe(0);
     expect(estimateTokens('abcd')).toBe(1);

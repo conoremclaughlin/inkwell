@@ -39,6 +39,16 @@
         "types": "./dist/cjs/runtime/index.d.ts",
         "default": "./dist/cjs/runtime/index.js"
       }
+    },
+    "./providers": {
+      "import": {
+        "types": "./dist/providers/index.d.ts",
+        "default": "./dist/providers/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/providers/index.d.ts",
+        "default": "./dist/cjs/providers/index.js"
+      }
     }
   },
   "scripts": {

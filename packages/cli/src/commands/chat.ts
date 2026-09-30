@@ -20,6 +20,7 @@ import {
   type RuntimePreferences,
 } from '../backends/identity.js';
 import { promptTransportFor } from '../backends/index.js';
+import { createCliBackendHost } from '../backends/cli-host.js';
 import { InkClient, type InkToolCallResult } from '../lib/ink-client.js';
 import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
 import {
@@ -52,6 +53,7 @@ import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purit
 import { completeStudioAtLaunch, type LaunchStudioDeps } from '../lib/launch-studio.js';
 import { detectWorktree } from './init.js';
 import { SessionLog } from '../session/session-log.js';
+import { toolIntentCommitter } from '../session/tool-intent.js';
 import {
   ensureBackendAuthReady,
   isBackendAuthBackend,
@@ -128,15 +130,12 @@ import {
   createSignalSink,
   isClientLocalTool,
   handleClientLocalTool,
-  globalSignalSink,
   parseCompactContextArgs,
   computeContextOccupancy,
   formatContextStamp,
   type ContextOccupancy,
   type ProviderContextMeasurement,
   type SignalSink,
-  getLastSignal,
-  clearLastSignal,
 } from '../repl/context-tools.js';
 import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provider-sample.js';
 import { assessContextPressure } from '../repl/context-pressure.js';
@@ -3621,6 +3620,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // in their x-ink-context header (see InkClient construction above).
   currentInkSessionId = () => runtime.sessionId;
   currentInkStudioId = () => runtime.studioId || identity?.studioId;
+  // What every provider spawn of this chat serves: this chat's directory, its
+  // session, and this process as its host, which hands over its own session
+  // credentials (backend-runner.ts, backends/cli-host.ts). Read at spawn
+  // time, because the session and studio can change after startup. The root
+  // checkout's 'main' is a sentinel, not a studio id, so it names no studio
+  // here, as in hooks.ts and turn-signal.ts.
+  const providerHost = createCliBackendHost();
+  const providerSpawnContext = (): Pick<
+    BackendRunRequest,
+    'workingDirectory' | 'inkSessionId' | 'studioId' | 'host'
+  > => ({
+    workingDirectory: process.cwd(),
+    inkSessionId: runtime.sessionId,
+    studioId: runtime.studioId && runtime.studioId !== 'main' ? runtime.studioId : undefined,
+    host: providerHost,
+  });
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {
     runtime.contactId = options.contactId;
@@ -4276,6 +4291,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   };
 
   const ledger = new ContextLedger();
+  const sessionSignal = createSignalSink();
   const hookRegistry = new SbHookRegistry();
   let hookTurnCount = 0;
 
@@ -5348,6 +5364,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             idleTimeoutMs: runtime.backendIdleTimeoutMs,
             stream: true,
             cliAttached,
+            ...providerSpawnContext(),
           });
           const onAbort = (): void => summarizer.abort();
           signal?.addEventListener('abort', onAbort, { once: true });
@@ -6203,6 +6220,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       stream: true,
       toolRouting: cloneRouting,
       cliAttached,
+      ...providerSpawnContext(),
       ...sessionArgs,
     });
 
@@ -6450,6 +6468,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     try {
       await executeToolCalls(calls, {
         policy: opts.policy,
+        commitIntent: toolIntentCommitter(opts.log),
         sessionId: runtime.sessionId,
         signal: opts.signal,
         callTool: createLocalToolDispatcher({
@@ -6485,12 +6504,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               } as InkToolCallResult;
             }
             if (isClientLocalTool(tool)) {
-              // A throwaway ledger AND a private signal sink. The sink is the
-              // load-bearing half: `signal_status` otherwise writes the module
-              // global that runChat reads to decide whether the whole
-              // non-interactive run completed — and every clone is instructed to
-              // signal when it finishes. A clone would end its parent's run, and
-              // concurrent clones would race for the same slot.
+              // A clone owns its ledger and signal state. Neither completion
+              // nor cancellation may change the parent's continuation decision.
               return handleClientLocalTool(
                 tool,
                 args,
@@ -6524,6 +6539,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             result.result === undefined ? undefined : JSON.stringify(result.result);
           opts.log.append({
             type: 'clone_tool_call',
+            invocationId: result.invocationId,
+            dispatchState: result.dispatchState,
             tool: result.tool,
             args: result.args,
             status: result.status,
@@ -6822,6 +6839,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     try {
       await executeToolCalls(calls, {
         policy: toolPolicy,
+        commitIntent: toolIntentCommitter(runtime.log),
         signal: abortSignal,
         callTool: createLocalToolDispatcher({
           cwd: process.cwd(),
@@ -6868,7 +6886,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // An eviction's persistent refs arrive on the hook, not in the
             // result the model reads — see EvictionHooks (#571).
             if (isClientLocalTool(tool)) {
-              return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+              return handleClientLocalTool(tool, args, ledger, sessionSignal, {
                 providerUsage: () => providerContextMeasurement(),
                 onEvict: (eviction) =>
                   recordEviction(
@@ -6902,6 +6920,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             );
             runtime.log.append({
               type: 'local_tool_call',
+              invocationId: result.invocationId,
+              dispatchState: result.dispatchState,
               tool: result.tool,
               args: result.args,
               status: result.status,
@@ -6985,6 +7005,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             }
             runtime.log.append({
               type: 'local_tool_call',
+              invocationId: result.invocationId,
+              dispatchState: result.dispatchState,
               tool: result.tool,
               args: result.args,
               status: result.status,
@@ -7022,6 +7044,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             );
             runtime.log.append({
               type: 'local_tool_call',
+              invocationId: result.invocationId,
+              dispatchState: result.dispatchState,
               tool: result.tool,
               args: result.args,
               status: 'error',
@@ -7452,6 +7476,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       media: turnMedia.length > 0 ? turnMedia : undefined,
       ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
       cliAttached,
+      ...providerSpawnContext(),
       // The session argument is the DECISION's, never derived from the live id:
       // a seed assigns the minted id before spawning, and deriving from it sent
       // a resume of a session that did not exist yet (Lumen, PR #577).
@@ -7513,6 +7538,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ? { backendSessionId: activeBackendSessionId }
             : {}),
           cliAttached,
+          ...providerSpawnContext(),
         });
         currentTurnAbort = turn.abort;
 
@@ -7588,6 +7614,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
             backendSessionSeedId: reseedId,
             cliAttached,
+            ...providerSpawnContext(),
           });
           currentTurnAbort = reseedTurn.abort;
           runResult = await reseedTurn.result.finally(() => {
@@ -8299,7 +8326,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // spawns pass the originating channel, e.g. "heartbeat"), render as a
     // system message — it's harness-delivered, not typed by the human.
     const messageLabel = options.messageLabel?.trim();
-    clearLastSignal();
+    sessionSignal.clear();
     await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
     // Actual completed outer turns — reported instead of the configured cap,
     // which lies whenever signal_status halts the loop early.
@@ -8307,7 +8334,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // Check for signal or failure after turn 1
     let exitReason: string | undefined;
-    const signal1 = getLastSignal();
+    const signal1 = sessionSignal.get();
     if (signal1?.status === 'completed' || signal1?.status === 'blocked') {
       exitReason = `${signal1.status}${signal1.reason ? `: ${signal1.reason}` : ''}`;
     }
@@ -8318,7 +8345,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Turns 2..N: continuation prompts — the SB signals when it's done
     if (!exitReason) {
       for (let turn = 2; turn <= maxTurns; turn++) {
-        clearLastSignal();
+        sessionSignal.clear();
         await enqueueTurn(
           'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.',
           'system',
@@ -8326,7 +8353,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         );
         turnsCompleted += 1;
 
-        const signal = getLastSignal();
+        const signal = sessionSignal.get();
         if (signal?.status === 'completed' || signal?.status === 'blocked') {
           exitReason = `${signal.status}${signal.reason ? `: ${signal.reason}` : ''}`;
           break;
@@ -8346,7 +8373,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // Map the signal to a session phase. Don't end the session — leave it
     // resumable so the user or another SB can attach and follow up.
-    const finalSignal = getLastSignal();
+    const finalSignal = sessionSignal.get();
     const phase = isBackendFailure
       ? 'blocked:backend-error'
       : finalSignal?.status === 'blocked'

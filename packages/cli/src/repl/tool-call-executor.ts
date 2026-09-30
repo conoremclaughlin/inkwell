@@ -8,6 +8,7 @@
  * - Future extension for remote approval
  */
 
+import { randomUUID } from 'crypto';
 import type { ToolPolicyState } from './tool-policy.js';
 import type { InkToolCallResult } from '../lib/ink-client.js';
 import { isClientLocalTool } from './context-tools.js';
@@ -26,11 +27,26 @@ export interface ToolCallResult {
   result?: InkToolCallResult;
   reason?: string;
   error?: string;
+  /** Present only when this invocation reached the pre-dispatch barrier. */
+  invocationId?: string;
+  /**
+   * `returned` means the dispatcher answered, NOT that an external effect
+   * succeeded. A thrown dispatcher may already have acted: its effect is
+   * `unknown`. Only never entering the dispatcher proves `not-dispatched`.
+   */
+  dispatchState?: 'not-dispatched' | 'returned' | 'unknown';
 }
 
 export interface ToolCallExecutorDeps {
   /** Policy engine for permission decisions */
   policy: ToolPolicyState;
+  /**
+   * Commit intent before entering callTool. Resolving must mean the record is
+   * written, not merely that an ID was reserved. Hosts supply their own sink;
+   * the CLI uses its session log. Required: missing wiring must fail closed.
+   * Receives original model args, before dispatch resolves credential refs.
+   */
+  commitIntent: (call: LocalToolCall, invocationId: string) => Promise<void>;
   /**
    * Execute a Inkwell MCP tool call.
    *
@@ -71,7 +87,7 @@ export interface ToolCallExecutorDeps {
  *
  * For each call:
  * 1. Check policy via canCallInkTool()
- * 2. If allowed → execute immediately
+ * 2. If allowed → await intent commitment, then execute
  * 3. If promptable → pause and call promptForApproval()
  *    - If approved → re-check policy (grant was applied) and execute
  *    - If denied → report as denied
@@ -109,7 +125,7 @@ async function executeOneToolCall(
   call: LocalToolCall,
   deps: ToolCallExecutorDeps
 ): Promise<ToolCallResult> {
-  const { policy, callTool, sessionId, promptForApproval } = deps;
+  const { policy, sessionId, promptForApproval } = deps;
 
   // Client-local tools (context management + signaling) always bypass policy.
   // They operate on the in-memory ledger — no external side effects, no Inkwell
@@ -117,7 +133,7 @@ async function executeOneToolCall(
   // retains the full immutable log. The SB must have full control over its own
   // context window without permission gates.
   if (isClientLocalTool(call.tool)) {
-    return executeTool(call, callTool, deps.signal);
+    return executeTool(call, deps);
   }
 
   // A structurally impossible call — a foreign MCP namespace, or a coding tool
@@ -141,8 +157,7 @@ async function executeOneToolCall(
   const decision = policy.canCallInkTool(policyToolName, sessionId);
 
   if (decision.allowed) {
-    // Allowed — execute immediately
-    return executeTool(call, callTool, deps.signal);
+    return executeTool(call, deps);
   }
 
   if (!decision.promptable) {
@@ -190,33 +205,51 @@ async function executeOneToolCall(
   }
 
   // Execute after approval
-  const result = await executeTool(call, callTool, deps.signal);
+  const result = await executeTool(call, deps);
   result.status = result.status === 'executed' ? 'approved' : result.status;
   return result;
 }
 
 async function executeTool(
   call: LocalToolCall,
-  callTool: (
-    tool: string,
-    args: Record<string, unknown>,
-    ctx: { signal?: AbortSignal }
-  ) => Promise<InkToolCallResult>,
-  signal?: AbortSignal
+  deps: ToolCallExecutorDeps
 ): Promise<ToolCallResult> {
+  const invocationId = randomUUID();
+  const identity = { tool: call.tool, args: call.args, invocationId };
   try {
-    const result = await callTool(call.tool, call.args, { signal });
+    await deps.commitIntent(call, invocationId);
+  } catch (err) {
+    // Even a lost commit acknowledgement is only uncertain RECORD state here:
+    // we know callTool was never reached. onResult may close the invocation in
+    // a still-writable log. No retry of the intent under a replacement ID.
     return {
-      tool: call.tool,
-      args: call.args,
+      ...identity,
+      status: 'error',
+      dispatchState: 'not-dispatched',
+      error: `Tool not dispatched: intent commitment failed (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+  if (deps.signal?.aborted) {
+    return {
+      ...identity,
+      status: 'denied',
+      dispatchState: 'not-dispatched',
+      reason: 'Cancelled after intent commitment; tool not dispatched',
+    };
+  }
+  try {
+    const result = await deps.callTool(call.tool, call.args, { signal: deps.signal });
+    return {
+      ...identity,
       status: 'executed',
+      dispatchState: 'returned',
       result,
     };
   } catch (err) {
     return {
-      tool: call.tool,
-      args: call.args,
+      ...identity,
       status: 'error',
+      dispatchState: 'unknown',
       error: err instanceof Error ? err.message : String(err),
     };
   }

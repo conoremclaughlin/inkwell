@@ -8,26 +8,12 @@
  * The key insight: Claude Code resolves ${VAR} in header values at runtime
  * from its own env. So we inject the header template AND set the env var
  * in the spawn env.
+ *
+ * Every provider's preparation imports this file, so it does no IO: the
+ * synchronous, file-based injectSessionHeaders is in mcp-config-file.ts.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
-
 // ─── Types ──────────────────────────────────────────────────────
-
-interface McpServerConfig {
-  type?: string;
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  url?: string;
-  headers?: Record<string, string>;
-}
-
-interface McpJsonConfig {
-  mcpServers: Record<string, McpServerConfig>;
-}
 
 export interface InjectSessionHeadersOptions {
   /** Path to the .mcp.json file to read as base config */
@@ -42,57 +28,25 @@ export interface InjectSessionHeadersOptions {
   outputDir?: string;
 }
 
-export interface InjectSessionHeadersResult {
-  /** Path to the (possibly temp) MCP config file with headers injected */
-  mcpConfigPath: string;
-  /** Call this to clean up any temp files */
-  cleanup: () => void;
-  /** Whether a temp file was created (vs returning original path) */
-  modified: boolean;
-}
-
 // ─── Core ───────────────────────────────────────────────────────
 
 /**
- * Inject Ink session headers into an MCP config file.
- *
- * Reads the given .mcp.json, adds x-ink-session-id (and optionally
- * x-ink-studio-id) headers to the "inkwell" server entry, and writes
- * a temp file if modifications were needed.
- *
- * The header values use ${VAR} interpolation so Claude Code resolves
- * them from the spawned process's env vars at runtime.
- *
- * If the config already has the headers, or the file doesn't exist,
- * or there's no "inkwell" server entry, returns the original path unchanged.
+ * The header injection itself, on a parsed config and without IO: adds the
+ * session, studio, authorization and context headers to the "inkwell"
+ * server where they are missing. Returns whether it changed anything. The
+ * file-based injectSessionHeaders (mcp-config-file.ts) and the providers'
+ * asynchronous config builder both use it, so the two cannot drift.
  */
-export function injectSessionHeaders(
-  options: InjectSessionHeadersOptions
-): InjectSessionHeadersResult {
-  const { mcpConfigPath, inkSessionId, studioId, accessToken } = options;
-
-  // Missing config file — nothing to inject into. Note: we still inject the
-  // other headers (studio, context, authorization) when inkSessionId is
-  // absent — x-ink-context carries sbSlug/studioId/runtime which are useful
-  // independently of session identity.
-  if (!mcpConfigPath || !existsSync(mcpConfigPath)) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
-
-  let config: McpJsonConfig;
-  try {
-    const parsed = JSON.parse(readFileSync(mcpConfigPath, 'utf-8'));
-    config = { mcpServers: {}, ...parsed };
-  } catch {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
+export function applySessionHeaders(
+  config: { mcpServers: Record<string, { headers?: Record<string, string> }> },
+  options: Pick<InjectSessionHeadersOptions, 'inkSessionId' | 'studioId' | 'accessToken'>
+): boolean {
+  const { inkSessionId, studioId, accessToken } = options;
 
   // Session headers are injected only into the canonical 'inkwell' server. The
   // legacy 'pcp' server name is retired — no code should create or feed it.
   const serverKey = 'inkwell';
-  if (!config.mcpServers[serverKey]) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
+  if (!config.mcpServers[serverKey]) return false;
 
   let modified = false;
 
@@ -136,27 +90,7 @@ export function injectSessionHeaders(
     modified = true;
   }
 
-  if (!modified) {
-    return { mcpConfigPath, cleanup: () => {}, modified: false };
-  }
-
-  // Write modified config to temp file (or outputDir for container execution)
-  const tmpDir = options.outputDir || join(tmpdir(), 'sb-mcp');
-  mkdirSync(tmpDir, { recursive: true });
-  const tmpPath = join(tmpDir, `mcp-server-${process.pid}-${Date.now()}.json`);
-  writeFileSync(tmpPath, JSON.stringify(config, null, 2));
-
-  return {
-    mcpConfigPath: tmpPath,
-    cleanup: () => {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // Best-effort cleanup
-      }
-    },
-    modified: true,
-  };
+  return modified;
 }
 
 // ─── Context Token ──────────────────────────────────────────

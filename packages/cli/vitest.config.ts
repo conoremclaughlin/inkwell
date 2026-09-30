@@ -9,6 +9,8 @@ export default defineConfig({
       // loop as of the last shared build rather than its source. The root
       // vitest.config.ts carries the same mapping and says why.
       '@inklabs/shared/runtime': path.resolve(__dirname, '../shared/src/runtime/index.ts'),
+      // The provider adapters and startBackendTurn, for the same reason.
+      '@inklabs/shared/providers': path.resolve(__dirname, '../shared/src/providers/index.ts'),
     },
   },
   test: {
