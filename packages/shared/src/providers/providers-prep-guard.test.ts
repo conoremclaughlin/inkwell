@@ -54,8 +54,10 @@ const HOST_MODULES: Record<string, ReadonlySet<string>> = {
 /**
  * Refused wherever they are referred to. The global object is one property
  * away from `process`; `eval`, `Function` and `require` run or load code this
- * check cannot read. (`window` and `self` are not globals in Node; reading
- * `.process` from them, or from anything, is refused below.)
+ * check cannot read, and so does `module.require` (`module` is the CommonJS
+ * free variable, which @types/node declares globally and the CJS build
+ * provides). `window` and `self` are not globals in Node; the members below
+ * are refused whatever they are read from.
  */
 const REFUSED_NAMES: ReadonlySet<string> = new Set([
   'globalThis',
@@ -63,10 +65,14 @@ const REFUSED_NAMES: ReadonlySet<string> = new Set([
   'eval',
   'Function',
   'require',
+  'module',
   // Reads the host env through its parameter's default. The CLI host calls
   // it for its own chat process (cli-host.ts); no preparation file may.
   'sessionEnvHandoff',
 ]);
+
+/** Members refused as `.name` whatever they are read from. */
+const REFUSED_MEMBERS: ReadonlySet<string> = new Set(['process', 'require']);
 
 /**
  * What the preparation path reads from its host anyway, keyed by
@@ -203,13 +209,13 @@ function prepViolations(fileName: string, text: string): Violation[] {
     } else if (ts.isIdentifier(node)) {
       const parent = node.parent;
       if (
-        node.text === 'process' &&
+        REFUSED_MEMBERS.has(node.text) &&
         ts.isPropertyAccessExpression(parent) &&
         parent.name === node
       ) {
-        // `.process` read from anything: the global object, an alias of it,
-        // or a `window` that is not one.
-        add(node, '.process');
+        // Read from anything: the global object, an alias of it, or a
+        // `window` that is not one.
+        add(node, `.${node.text}`);
       } else if (!isNameOnly(node)) {
         if (node.text === 'process') {
           // Any use of `process` other than an allowed member: env, cwd,
@@ -384,6 +390,10 @@ describe('preparation guard, against known answers', () => {
     ["const name = 'fs'; require(name);", 'require'],
     ["eval('process.env');", 'eval'],
     ["new Function('return process')();", 'Function'],
+    // The CommonJS free variable, typed globally by @types/node (Myra, #701).
+    ["module.require('fs');", 'module'],
+    ["const m = module; m.require('fs');", 'module'],
+    ["holder.require('fs');", '.require'],
     [
       "import { sessionEnvHandoff } from '../runner/spawn-backend.js'; sessionEnvHandoff();",
       'sessionEnvHandoff',
