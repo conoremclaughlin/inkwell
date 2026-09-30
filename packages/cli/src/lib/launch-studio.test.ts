@@ -180,7 +180,7 @@ describe('completeStudioForLaunch', () => {
     const d = deps({ runInit: vi.fn(async () => report(false)) });
     const result = await completeStudioForLaunch(studio, 'wren', d);
     const lines = describeLaunchStudioResult(result);
-    expect(lines[0]).toBe('Studio completed for lumen: identity, hooks (gemini)');
+    expect(lines[0]).toBe('Studio completed for lumen: created identity, hooks (gemini)');
     expect(lines[1]).toContain('studio-id');
     expect(lines[1]).toContain('ink init');
   });
@@ -188,8 +188,20 @@ describe('completeStudioForLaunch', () => {
   it('a completed run reports what it wrote, in one line', async () => {
     const result = await completeStudioForLaunch(studio, 'wren', deps());
     expect(describeLaunchStudioResult(result)).toEqual([
-      'Studio completed for lumen: identity, hooks (gemini)',
+      'Studio completed for lumen: created identity, hooks (gemini)',
     ]);
     expect(describeLaunchStudioResult({ ran: false })).toEqual([]);
+  });
+
+  it('a repaired file is reported as updated, apart from what was created', async () => {
+    // A hook file that carried the Inkwell hooks under an older ink path is
+    // rewritten; the line says it was updated, so a repair reads as one.
+    const repaired = report(true);
+    repaired.steps.push({ label: 'hooks (claude-code)', status: 'updated' });
+    const d = deps({ runInit: vi.fn(async () => repaired) });
+    const result = await completeStudioForLaunch(studio, 'wren', d);
+    expect(describeLaunchStudioResult(result)).toEqual([
+      'Studio completed for lumen: created identity, hooks (gemini); updated hooks (claude-code)',
+    ]);
   });
 });
