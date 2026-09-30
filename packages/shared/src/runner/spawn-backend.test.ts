@@ -590,6 +590,27 @@ describe('resolveSpawnTarget', () => {
     expect(target.args).toContain('--verbose');
   });
 
+  it("gives the docker client the caller's parent env, through the allowlist (Myra's W3, #701)", () => {
+    const parentEnv = {
+      HOME: '/synthetic/host-home',
+      PATH: '/synthetic/bin',
+      SYNTHETIC_HOST_ONLY: 'synthetic-host-only',
+    };
+    const container = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      parentEnv,
+      container: { containerName: 'test-container' },
+    });
+    expect(container.env.HOME).toBe('/synthetic/host-home');
+    expect(container.env.PATH).toBe('/synthetic/bin');
+    expect(container.env).not.toHaveProperty('SYNTHETIC_HOST_ONLY');
+    // The same parent reaches the host path the same way.
+    const host = resolveSpawnTarget({ binary: 'claude', args: [], parentEnv });
+    expect(host.env.HOME).toBe('/synthetic/host-home');
+    expect(host.env).not.toHaveProperty('SYNTHETIC_HOST_ONLY');
+  });
+
   it('passes cwd as --workdir to docker exec', () => {
     const target = resolveSpawnTarget({
       binary: 'claude',

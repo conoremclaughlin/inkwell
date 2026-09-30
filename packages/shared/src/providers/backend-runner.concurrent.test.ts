@@ -91,8 +91,10 @@ describe('overlapping provider turns in one process', () => {
         },
         sessionEnv: async () => ({ INK_ACCESS_TOKEN: `synthetic-${name}-token` }),
         // Each host's own base env: an allowlisted name with this host's
-        // value, a name the allowlist does not carry, and a credential the
-        // host holds but did not hand over through sessionEnv.
+        // value, and a name the allowlist does not carry. The base
+        // INK_ACCESS_TOKEN cannot show an allowlist slip here, since the
+        // session's own token is merged over it; spawn-backend.test's
+        // buildCleanEnv cases are what catch that (Myra, #701 b3d15e9d).
         baseEnv: async () => ({
           HOME: `/synthetic/${name}/home`,
           SYNTHETIC_HOST_ONLY: 'synthetic-host-only',
