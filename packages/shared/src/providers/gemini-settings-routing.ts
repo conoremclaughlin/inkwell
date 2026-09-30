@@ -26,6 +26,7 @@
  */
 
 import { readFile } from 'fs/promises';
+import { comparableOrigin, parseUrl } from './inkwell-origin.js';
 
 const ROUTING_HEADER_NAMES: ReadonlySet<string> = new Set([
   'x-ink-session-id',
@@ -35,7 +36,30 @@ const ROUTING_HEADER_NAMES: ReadonlySet<string> = new Set([
 
 export type GeminiSettingsFinding =
   | { path: string; kind: 'routing'; /** Header names as written. */ headers: string[] }
-  | { path: string; kind: 'unreadable' };
+  | { path: string; kind: 'unreadable' }
+  | { path: string; kind: 'foreign-session-env' };
+
+/**
+ * The session a spawn serves, for the rule on servers other than Inkwell:
+ * Gemini expands `$NAME` and `${NAME}` in a server's `headers` and `env`
+ * values from the env it runs with (Myra, measured on 0.54.0, #701
+ * aebf2020), so a foreign server whose values name a session var is handed
+ * the session's value.
+ */
+export interface GeminiSessionScope {
+  /** This session's Inkwell MCP server, from the host. */
+  inkwellMcpUrl: string;
+  /** The names of the env vars the spawn carries for the session. */
+  sessionEnvNames: Iterable<string>;
+}
+
+/** `$NAME` and `${NAME}` references in a string. */
+const ENV_REFERENCE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
+
+function referencedNames(value: unknown): string[] {
+  if (typeof value !== 'string') return [];
+  return [...value.matchAll(ENV_REFERENCE)].map((match) => (match[1] ?? match[2])!);
+}
 
 export class BakedRoutingHeaderError extends Error {
   constructor(
@@ -48,10 +72,13 @@ export class BakedRoutingHeaderError extends Error {
           .map((finding) =>
             finding.kind === 'routing'
               ? `${finding.path} sets ${finding.headers.join(', ')}`
-              : `${finding.path} cannot be read`
+              : finding.kind === 'foreign-session-env'
+                ? `${finding.path} has an MCP server other than Inkwell drawing a session value from the environment`
+                : `${finding.path} cannot be read`
           )
           .join('; ') +
-        '. A static routing header is one session’s value, sent for every session. ' +
+        '. A static routing header is one session’s value, sent for every session, and a ' +
+        'server other than Inkwell must not be handed the session’s credentials or routing. ' +
         'Repair a studio’s workspace settings with `ink init`; remove it by hand from ' +
         'user settings, which ink never rewrites.'
     );
@@ -115,9 +142,41 @@ function routingHeaderNames(settings: unknown): string[] {
   return [...found];
 }
 
-/** What each of `paths` would contribute that a named-session spawn refuses. */
+/**
+ * Whether any server other than Inkwell draws a session var through a
+ * `headers` or `env` value. A server is Inkwell when its `httpUrl` or `url`
+ * has the origin of the host's Inkwell URL, loopback aliases folded; one
+ * with no readable URL, a stdio server included, is not Inkwell.
+ */
+function drawsSessionEnvOffInkwell(settings: unknown, scope: GeminiSessionScope): boolean {
+  if (!isRecord(settings) || !isRecord(settings.mcpServers)) return false;
+  const inkwell = parseUrl(scope.inkwellMcpUrl);
+  const inkwellOrigin = inkwell ? comparableOrigin(inkwell) : undefined;
+  const sessionVars = new Set(scope.sessionEnvNames);
+  for (const server of Object.values(settings.mcpServers)) {
+    if (!isRecord(server)) continue;
+    const rawUrl = typeof server.httpUrl === 'string' ? server.httpUrl : server.url;
+    const url = typeof rawUrl === 'string' ? parseUrl(rawUrl) : undefined;
+    if (url && inkwellOrigin !== undefined && comparableOrigin(url) === inkwellOrigin) continue;
+    const values = [
+      ...(isRecord(server.headers) ? Object.values(server.headers) : []),
+      ...(isRecord(server.env) ? Object.values(server.env) : []),
+    ];
+    if (values.some((value) => referencedNames(value).some((name) => sessionVars.has(name)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * What each of `paths` would contribute that a named-session spawn refuses.
+ * With `scope`, a server other than Inkwell drawing a session var is one
+ * too.
+ */
 export async function findGeminiSettingsRouting(
-  paths: readonly string[]
+  paths: readonly string[],
+  scope?: GeminiSessionScope
 ): Promise<GeminiSettingsFinding[]> {
   const findings: GeminiSettingsFinding[] = [];
   for (const path of paths) {
@@ -140,6 +199,9 @@ export async function findGeminiSettingsRouting(
     }
     const headers = routingHeaderNames(settings);
     if (headers.length > 0) findings.push({ path, kind: 'routing', headers });
+    if (scope && drawsSessionEnvOffInkwell(settings, scope)) {
+      findings.push({ path, kind: 'foreign-session-env' });
+    }
   }
   return findings;
 }
