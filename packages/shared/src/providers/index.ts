@@ -21,4 +21,5 @@ export * from './identity-prompt.js';
 export * from './backend-runner.js';
 export * from './turn-owner.js';
 export * from './skill-mcp.js';
+export * from './skill-servers.js';
 export * from './skill-discovery.js';

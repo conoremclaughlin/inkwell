@@ -2,7 +2,8 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { parseSkillMcpConfig, buildMergedMcpConfig, discoverSkillMcpServers } from './skill-mcp.js';
+import { buildMergedMcpConfig } from './skill-mcp.js';
+import { parseSkillMcpConfig, discoverSkillMcpServers } from './skill-servers.js';
 
 // Mock discoverSkills so tests don't pick up user-installed skills from ~/.ink/skills/
 vi.mock('./skill-discovery.js', () => ({

@@ -1,130 +1,21 @@
 /**
- * Skill MCP Config Extraction
- *
- * Reads skills that provide MCP servers (via `mcp` field in YAML frontmatter)
- * and merges them into a temporary .mcp.json for the backend to consume.
- *
- * Session header injection is delegated to the shared `injectSessionHeaders`
- * utility (packages/shared) so the same logic runs in both CLI and server paths.
+ * The MCP config a spawn is handed: the project's .mcp.json with Inkwell's
+ * session headers applied (the same applySessionHeaders the server runners
+ * use) and the skill servers the caller's host discovered merged in. All IO
+ * here is asynchronous; the synchronous skill helpers the CLI uses live in
+ * skill-servers.ts.
  */
 
-import { existsSync, readFileSync } from 'fs';
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { applySessionHeaders } from '../runner/mcp-config.js';
-import { discoverSkills } from './skill-discovery.js';
 
 export interface SkillMcpServer {
   name: string;
   command: string;
   args: string[];
   env?: Record<string, string>;
-}
-
-/**
- * Parse the `mcp` field from a skill's YAML frontmatter.
- * Returns null if the skill doesn't provide an MCP server.
- */
-export function parseSkillMcpConfig(skillPath: string): SkillMcpServer | null {
-  const skillFile = join(skillPath, 'SKILL.md');
-  if (!existsSync(skillFile)) return null;
-
-  const content = readFileSync(skillFile, 'utf-8');
-
-  // Extract YAML frontmatter between --- delimiters
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
-
-  const frontmatter = match[1];
-
-  // Simple YAML parsing for the mcp block — avoids adding a yaml dependency.
-  // Looks for:
-  //   mcp:
-  //     name: <string>
-  //     command: <string>
-  //     args: [...]
-  //     env: {}
-  // `\n?` on the last line: the frontmatter capture strips the newline before
-  // the closing ---, so an mcp block that ends the frontmatter would otherwise
-  // silently lose its final property.
-  const mcpMatch = frontmatter.match(/^mcp:\s*\n((?:  .+\n?)*)/m);
-  if (!mcpMatch) return null;
-
-  const mcpBlock = mcpMatch[1];
-
-  const name = mcpBlock.match(/^\s*name:\s*(.+)/m)?.[1]?.trim();
-  const command = mcpBlock.match(/^\s*command:\s*(.+)/m)?.[1]?.trim();
-
-  if (!name || !command) return null;
-
-  // Parse args — inline [a, b] or block-style list (- a\n- b)
-  let args: string[] = [];
-  const argsInlineMatch = mcpBlock.match(/^\s*args:\s*\[([^\]]*)\]/m);
-  if (argsInlineMatch) {
-    args = argsInlineMatch[1]
-      .split(',')
-      .map((a) => a.trim().replace(/^["']|["']$/g, ''))
-      .filter(Boolean);
-  } else {
-    // Block-style: args:\n    - value1\n    - value2
-    const argsBlockMatch = mcpBlock.match(/^\s*args:\s*\n((?:\s+-\s+.+\n?)*)/m);
-    if (argsBlockMatch) {
-      args = argsBlockMatch[1]
-        .split('\n')
-        .map((line) =>
-          line
-            .replace(/^\s*-\s+/, '')
-            .trim()
-            .replace(/^["']|["']$/g, '')
-        )
-        .filter(Boolean);
-    }
-  }
-
-  // Parse env — inline {K: V} or block-style (K: V\n K2: V2)
-  const env: Record<string, string> = {};
-  const envInlineMatch = mcpBlock.match(/^\s*env:\s*\{([^}]*)\}/m);
-  if (envInlineMatch && envInlineMatch[1].trim()) {
-    envInlineMatch[1].split(',').forEach((pair) => {
-      const [k, v] = pair.split(':').map((s) => s.trim().replace(/^["']|["']$/g, ''));
-      if (k && v) env[k] = v;
-    });
-  } else {
-    // Block-style: env:\n    KEY: VALUE
-    const envBlockMatch = mcpBlock.match(/^\s*env:\s*\n((?:\s+\w+:.+\n?)*)/m);
-    if (envBlockMatch) {
-      envBlockMatch[1].split('\n').forEach((line) => {
-        const colonIdx = line.indexOf(':');
-        if (colonIdx === -1) return;
-        const k = line.slice(0, colonIdx).trim();
-        const v = line
-          .slice(colonIdx + 1)
-          .trim()
-          .replace(/^["']|["']$/g, '');
-        if (k && v) env[k] = v;
-      });
-    }
-  }
-
-  return { name, command, args, env: Object.keys(env).length > 0 ? env : undefined };
-}
-
-/**
- * Discover all skills that provide MCP servers.
- */
-export function discoverSkillMcpServers(cwd: string): SkillMcpServer[] {
-  const skills = discoverSkills(cwd);
-  const servers: SkillMcpServer[] = [];
-
-  for (const skill of skills) {
-    const mcpConfig = parseSkillMcpConfig(skill.path);
-    if (mcpConfig) {
-      servers.push(mcpConfig);
-    }
-  }
-
-  return servers;
 }
 
 interface McpJsonConfig {
@@ -141,28 +32,19 @@ interface McpJsonConfig {
   >;
 }
 
-/** Where the InkMail channel plugin may live, in the order they are tried. */
-function channelPluginCandidates(cwd: string): string[] {
+/**
+ * Where the InkMail channel plugin may live, in the order they are tried.
+ * Shared with the synchronous resolver `ink init` uses (skill-servers.ts), so
+ * the generator and the withholding boundary agree on what the plugin IS.
+ */
+export function channelPluginCandidates(cwd: string): string[] {
   return [
     join(cwd, 'packages', 'channel-plugin', 'index.ts'),
     join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
   ];
 }
 
-/**
- * Resolve the InkMail channel plugin's entrypoint on disk. Shared with
- * `ink init` (which generates the project entry from the same candidates) so
- * the generator and the withholding boundary can never disagree about what
- * the plugin IS. Returns null when no candidate exists.
- */
-export function resolveChannelPluginPath(cwd: string): string | null {
-  for (const p of channelPluginCandidates(cwd)) {
-    if (existsSync(p)) return p;
-  }
-  return null;
-}
-
-/** resolveChannelPluginPath without blocking, for a spawn's preparation. */
+/** The channel plugin's entrypoint on disk, found without blocking, or null. */
 async function findChannelPluginPath(cwd: string): Promise<string | null> {
   for (const p of channelPluginCandidates(cwd)) {
     const found = await stat(p).then(
