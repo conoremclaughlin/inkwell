@@ -23,3 +23,4 @@ export * from './builtin-hooks.js';
 export * from './context-tools.js';
 export * from './compaction.js';
 export * from './token-usage.js';
+export * from './session-log.js';

@@ -646,6 +646,7 @@ describe('@inklabs/shared/runtime keeps its boundary', () => {
         'context-tools.ts',
         'compaction.ts',
         'token-usage.ts',
+        'session-log.ts',
       ])
     );
   });

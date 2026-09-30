@@ -2,7 +2,7 @@
 
 The ink runtime's host-independent pieces: the agent loop (`runAgentLoop`),
 text-tool grammar, context ledger, context tools, compaction policy, token
-accounting, hook registry and built-in recall/budget hooks. The CLI's `ink chat` and its shadow
+accounting, session journal, hook registry and built-in recall/budget hooks. The CLI's `ink chat` and its shadow
 clones run it today; a server or desktop host is meant to import the same code
 rather than write another loop (`ink://specs/live-agent-surfaces`).
 
@@ -77,3 +77,16 @@ not populate its eviction map. Already-injected IDs therefore remain
 deduplicated even after eviction; the configured reinjection cooldown is not
 yet implemented. This relocation preserves that behavior rather than claiming
 the simulated recall tests prove the production tracker works.
+
+## Session journal
+
+`SessionLog` owns event IDs, serialized writes, flush/close, failure state and
+post-commit observer projection. Every shared-runtime caller supplies a sink;
+there is no implicit filesystem access. The CLI compatibility class supplies
+its existing synchronous JSONL default, and its opt-in async file sink stays
+in the CLI host. This extraction does not activate async CLI persistence.
+
+An append's returned ID is reserved, not a commit acknowledgment. Await
+`flush()` at a durability boundary. This preserves the existing sink contract;
+there is no added fsync/power-loss guarantee, replay engine, write-buffer bound
+or safe automatic replay of an unresolved external effect.
