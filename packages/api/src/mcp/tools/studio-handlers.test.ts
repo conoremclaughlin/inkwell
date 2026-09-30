@@ -437,6 +437,9 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(payload.lease).toEqual({ acquired: true, threadKey: 'pr:600' });
     expect(payload.ephemeral).toBe(true);
     expect(payload.provenance).toMatchObject({ sessionId: 'sess-1', logged: true });
+    // The name send_to_inbox routes on is readable from the response (routing spec §v19 C).
+    expect(created.slug).toBeTruthy();
+    expect(payload.studio.slug).toBe(created.slug);
     // Delivery: the thread gets a home — this agent's participant row points at
     // the creator's session, through the sanctioned writer, as an explicit anchor.
     expect(findOrCreateThreadMock).toHaveBeenCalledWith(
@@ -995,6 +998,10 @@ describe('create_studio / adopt_studio provenance', () => {
     );
     const payload = JSON.parse(result.content[0].text);
     expect(payload.success).toBe(true);
+    // The response names the studio by the key send_to_inbox matches on, and the
+    // folder separately: the two differ (routing spec §v19 C).
+    expect(payload.studio.slug).toBe('old-studio');
+    expect(payload.studio.worktreeFolder).toBe('old');
     expect(linkSession).toHaveBeenCalledWith(STUDIO, SESSION);
     // The thread key joins the existing patterns instead of replacing them.
     expect(update).toHaveBeenCalledWith(STUDIO, {
