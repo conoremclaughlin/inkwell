@@ -354,6 +354,9 @@ mcp:
     } finally {
       await cleanup();
     }
+    // The unchanged case hands back the project's own file; its cleanup must
+    // never remove it.
+    expect(existsSync(join(tmpDir, '.mcp.json'))).toBe(true);
   });
 
   it('preserves existing headers when injecting session id', async () => {
@@ -432,6 +435,45 @@ mcp:
     } finally {
       await cleanup();
     }
+    expect(existsSync(join(tmpDir, '.mcp.json'))).toBe(true);
+  });
+
+  // Skills merge whether or not the project has an inkwell server, and a
+  // merged config is a new file: the project's own stays as it was.
+  it('merges skill servers into a project config with no inkwell server', async () => {
+    const project = { mcpServers: { github: { type: 'http', url: 'https://api.github.com/mcp' } } };
+    writeFileSync(join(tmpDir, '.mcp.json'), JSON.stringify(project));
+
+    const { mcpConfigPath, cleanup } = await buildMergedMcpConfig(tmpDir, {
+      skillServers: [{ name: 'synthetic-skill', command: 'npx', args: ['synthetic-server'] }],
+      tempDir: tmpDir,
+    });
+    try {
+      expect(mcpConfigPath).not.toBe(join(tmpDir, '.mcp.json'));
+      const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(Object.keys(merged.mcpServers).sort()).toEqual(['github', 'synthetic-skill']);
+      expect(merged.mcpServers['synthetic-skill']).toEqual({
+        type: 'stdio',
+        command: 'npx',
+        args: ['synthetic-server'],
+      });
+      expect(JSON.parse(readFileSync(join(tmpDir, '.mcp.json'), 'utf-8'))).toEqual(project);
+    } finally {
+      await cleanup();
+    }
+    expect(existsSync(mcpConfigPath!)).toBe(false);
+  });
+
+  // A named session's project config must be read and parsed, or its stale
+  // routing headers could not be stripped. A launcher keeps the old
+  // pass-through.
+  it('refuses unparseable project JSON for a named session, and passes it through for a launcher', async () => {
+    writeFileSync(join(tmpDir, '.mcp.json'), '{ not json');
+    await expect(
+      buildMergedMcpConfig(tmpDir, { skillServers: [], tempDir: tmpDir, explicitSession: true })
+    ).rejects.toThrow('the project .mcp.json is not valid JSON');
+    const launcher = await buildMergedMcpConfig(tmpDir, { skillServers: [], tempDir: tmpDir });
+    expect(launcher.mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
   });
 });
 

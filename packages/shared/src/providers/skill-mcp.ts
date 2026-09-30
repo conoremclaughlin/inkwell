@@ -277,12 +277,23 @@ export async function buildMergedMcpConfig(
   hasChannelBridge: boolean;
 }> {
   const projectMcpPath = join(cwd, '.mcp.json');
-  const projectText = await readFile(projectMcpPath, 'utf-8').catch(() => undefined);
+  const explicit = options.explicitSession === true;
+  // Only a missing file is "no project config". For a spawn that named its
+  // session, a file that cannot be read or parsed is refused: its routing
+  // headers could not be stripped, and passing it through, or dropping it,
+  // would both be a guess. The reason is fixed; no file content is quoted.
+  const projectText = await readFile(projectMcpPath, 'utf-8').catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT' || !explicit) return undefined;
+    throw new Error(
+      `the project .mcp.json could not be read (${(error as NodeJS.ErrnoException)?.code ?? 'unknown error'})`
+    );
+  });
   let parsed: Partial<McpJsonConfig> | null = null;
   if (projectText !== undefined) {
     try {
       parsed = JSON.parse(projectText) as Partial<McpJsonConfig> | null;
     } catch {
+      if (explicit) throw new Error('the project .mcp.json is not valid JSON');
       parsed = null;
     }
   }
@@ -335,7 +346,7 @@ export async function buildMergedMcpConfig(
     // For a caller that named its session a configured one is stale routing:
     // drop it, so the named ids are injected fresh, or stay absent when the
     // caller named none.
-    if (options.explicitSession === true && stripRoutingHeaders(config)) modified = true;
+    if (explicit && stripRoutingHeaders(config)) modified = true;
     // The x-ink-context header carries identity (sbSlug/studioId/runtime)
     // even without a session; the session and studio headers only when named.
     if (

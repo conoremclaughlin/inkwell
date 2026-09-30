@@ -1,15 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 // A disk fault on demand: the next writeFile writes a partial file and then
 // fails, as a full disk does.
-const faults = vi.hoisted(() => ({ partialWriteOnce: false }));
+const faults = vi.hoisted(() => ({
+  partialWriteOnce: false,
+  /** When set, the next readFile fails with this errno code. */
+  readErrorCode: undefined as string | undefined,
+}));
 vi.mock('fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs/promises')>();
   return {
     ...actual,
+    readFile: async (...args: Parameters<typeof actual.readFile>) => {
+      const code = faults.readErrorCode;
+      if (code) {
+        faults.readErrorCode = undefined;
+        throw Object.assign(new Error(`synthetic ${code}`), { code });
+      }
+      return actual.readFile(...args);
+    },
     writeFile: async (...args: Parameters<typeof actual.writeFile>) => {
       if (faults.partialWriteOnce) {
         faults.partialWriteOnce = false;
@@ -45,6 +57,7 @@ beforeEach(() => {
 
 afterEach(() => {
   faults.partialWriteOnce = false;
+  faults.readErrorCode = undefined;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -84,6 +97,31 @@ function left(): { files: string[]; identityDirs: string[] } {
     identityDirs: readdirSync(tempDir).filter((name) => name.startsWith('sb-')),
   };
 }
+
+// Myra's a601d0d9 review: for a spawn that named its session, only a missing
+// .mcp.json is "no project config"; any other read error refuses.
+describe('a project MCP config that cannot be read', () => {
+  const build = (explicitSession: boolean) =>
+    buildMergedMcpConfig(root, { explicitSession, skillServers: [], tempDir });
+
+  it('refuses a named session with a fixed reason, and leaves nothing behind', async () => {
+    writeFileSync(join(root, '.mcp.json'), JSON.stringify({ mcpServers: {} }));
+    faults.readErrorCode = 'EACCES';
+    await expect(build(true)).rejects.toThrow('the project .mcp.json could not be read (EACCES)');
+    expect(left().files).toEqual([]);
+  });
+
+  it('treats a missing file as no project config, named session or not', async () => {
+    expect((await build(true)).mcpConfigPath).toBeNull();
+    expect((await build(false)).mcpConfigPath).toBeNull();
+  });
+
+  it('lets a launcher treat an unreadable file as absent, as before', async () => {
+    writeFileSync(join(root, '.mcp.json'), JSON.stringify({ mcpServers: {} }));
+    faults.readErrorCode = 'EACCES';
+    expect((await build(false)).mcpConfigPath).toBeNull();
+  });
+});
 
 // Myra's R2 and R3 (72027fba review): each writer removes what a failed
 // write left, before the failure reaches its caller.
