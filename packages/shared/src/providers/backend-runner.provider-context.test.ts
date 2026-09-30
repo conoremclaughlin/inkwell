@@ -7,7 +7,7 @@ import { decodeContextToken, encodeContextToken } from '../runner/mcp-config.js'
 
 /**
  * What a provider child is actually handed when a host spawns it for a
- * session: through the REAL adapters, with only the process spawn replaced.
+ * session: through the REAL adapters, with both OS process boundaries replaced.
  * The host process here carries its own, different session values, the way a
  * server hosting several sessions does, and none of them may reach the child.
  */
@@ -23,10 +23,11 @@ const spawned = vi.hoisted(
     }>
 );
 
-vi.mock('child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('child_process')>();
+const execFile = vi.hoisted(() => vi.fn());
+
+vi.mock('child_process', () => {
   return {
-    ...actual,
+    execFile,
     spawn: (
       _binary: string,
       args: string[],
@@ -82,6 +83,41 @@ const serverHost = (credentials: Record<string, string>): BackendHost => ({
 beforeEach(() => {
   spawned.length = 0;
   studio = mkdtempSync(join(tmpdir(), 'provider-context-'));
+  vi.stubEnv('HOME', studio);
+  vi.stubEnv('CODEX_HOME', join(studio, '.codex'));
+  execFile
+    .mockReset()
+    .mockImplementation(
+      (
+        _binary: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: null, stdout: string, stderr: string) => void
+      ) => {
+        // The effective-config guard still runs; only its listing process is
+        // replaced. Never invoke an installed provider from this unit harness.
+        callback(
+          null,
+          JSON.stringify([
+            {
+              name: 'inkwell',
+              enabled: true,
+              disabled_reason: null,
+              transport: {
+                type: 'streamable_http',
+                url: 'http://localhost:3001/mcp',
+                bearer_token_env_var: 'INK_ACCESS_TOKEN',
+                http_headers: null,
+                env_http_headers: null,
+                http_headers_helper: null,
+              },
+            },
+          ]),
+          ''
+        );
+        return {};
+      }
+    );
   // The host's own session, which a hosted spawn must never inherit.
   vi.stubEnv('INK_SESSION_ID', 'host-own-session');
   vi.stubEnv('INK_STUDIO_ID', 'host-own-studio');
@@ -118,8 +154,18 @@ describe('a provider spawned for a session', () => {
   it.each(['claude', 'codex'])(
     '%s: names that session, stays headless, and carries none of the host’s own values',
     async (backend) => {
-      await runBackendTurn(hosted(backend));
+      expect(await runBackendTurn(hosted(backend))).toMatchObject({ success: true });
       expect(spawned).toHaveLength(1);
+      if (backend === 'codex') {
+        expect(execFile).toHaveBeenCalledTimes(1);
+        const [binary, args, options] = execFile.mock.calls[0]!;
+        expect(binary).toBe('codex');
+        expect(args.slice(0, 3)).toEqual(['mcp', 'list', '--json']);
+        expect(options.cwd).toBe(studio);
+        expect(options.env.INK_ACCESS_TOKEN).toBeUndefined();
+      } else {
+        expect(execFile).not.toHaveBeenCalled();
+      }
       const [child] = spawned;
 
       expect(child.cwd).toBe(studio);
@@ -138,6 +184,23 @@ describe('a provider spawned for a session', () => {
       expect(JSON.stringify(child.env)).not.toContain('host-own');
     }
   );
+
+  it('codex: a failed config probe cannot reach even the fake provider spawn', async () => {
+    execFile.mockImplementationOnce(
+      (
+        _binary: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: null, stdout: string, stderr: string) => void
+      ) => {
+        callback(null, 'not a JSON listing', '');
+        return {};
+      }
+    );
+    expect(await runBackendTurn(hosted('codex'))).toMatchObject({ success: false, exitCode: 78 });
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(spawned).toHaveLength(0);
+  });
 
   it('reads its MCP config from the working directory, not the host’s', async () => {
     writeFileSync(
