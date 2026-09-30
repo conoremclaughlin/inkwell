@@ -23,6 +23,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { auditStudio, DEFAULT_CLAUDE_ALLOW_RULES } from '@inklabs/shared';
 import { completeStudio, type StepResult } from './studio-complete.js';
+import { installHooks } from '../commands/hooks.js';
 
 let root: string;
 let main: string;
@@ -83,6 +84,30 @@ const baseOptions = () => ({
       detail: 'stubbed',
     })
   ),
+});
+
+describe('completeStudio — hook steps say whether they created or repaired', () => {
+  it('a hook file that carried the Inkwell hooks under an older ink path reports updated, then exists', async () => {
+    installHooks(studio, { backend: 'claude-code' });
+    const configPath = join(studio, '.claude', 'settings.local.json');
+    const config = readJson(configPath);
+    const stale = JSON.parse(
+      JSON.stringify(config.hooks).replace(
+        /"command":"[^"]*? hooks /g,
+        '"command":"/old/checkout/ink hooks '
+      )
+    ) as Record<string, unknown>;
+    writeFileSync(configPath, JSON.stringify({ ...config, hooks: stale }, null, 2));
+
+    const first = await completeStudio(studio, baseOptions());
+    expect(statusOf(first.steps, 'hooks (claude-code)')).toBe('updated');
+    expect(statusOf(first.steps, 'hooks (codex)')).toBe('created');
+    expect(statusOf(first.steps, 'hooks (gemini)')).toBe('created');
+    expect(JSON.stringify(readJson(configPath).hooks)).not.toContain('/old/checkout/ink');
+
+    const second = await completeStudio(studio, baseOptions());
+    expect(statusOf(second.steps, 'hooks (claude-code)')).toBe('exists');
+  });
 });
 
 describe('completeStudio — a fresh linked worktree', () => {

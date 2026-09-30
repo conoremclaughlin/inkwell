@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { spawnSync } from 'child_process';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
@@ -20,6 +29,8 @@ import {
   getClaudeLocalSessionsForProject,
   getKnownClaudeSessionIds,
   getCodexLocalSessionsForProject,
+  getCodexLocalSessionsFromJsonl,
+  CODEX_JSONL_FALLBACK_MAX_FILES,
   getGeminiLocalSessionsForProject,
   hasBackendSessionOverride,
   renderSessionCandidatesTable,
@@ -1741,5 +1752,273 @@ describe('detachPrintModeExit', () => {
       const head = body.split('\n').slice(0, 5).join('\n');
       expect(head).toContain('await detachPrintModeExit(prepared.env,');
     }
+  });
+});
+
+/**
+ * The Codex local-session scan, after task 38af403e.
+ *
+ * Measured 2026-09-29 on this machine: 6,130 rollouts, 3.0 GB. The state DB
+ * was asked for the 200 newest threads across every cwd (170 ms) and, when
+ * none matched the launch cwd — every fresh studio — the jsonl fallback
+ * listed and stat'ed every file and read the newest thousand IN FULL,
+ * 1.26 GB in 9.9 s of blocked event loop, which is how the launcher's
+ * keep-alive socket went stale. Now the DB is asked for THIS cwd (10 ms on
+ * its (archived, cwd, updated_at) index), an empty answer is trusted, and
+ * the fallback is bounded and head-first. The DB tests need the sqlite3
+ * CLI the production path shells out to; they skip where it is absent.
+ */
+describe('getCodexLocalSessionsForProject asks the state DB for this cwd (task 38af403e)', () => {
+  const hasSqlite3 = spawnSync('sqlite3', ['-version'], { encoding: 'utf-8' }).status === 0;
+
+  function withTempHome<T>(run: (home: string) => T): T {
+    const home = mkdtempSync(join(tmpdir(), 'codex-state-db-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      return run(home);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * The columns the production query reads, in a DB the sqlite3 CLI made,
+   * with Codex's backfill_state row: 'complete' unless a test says otherwise,
+   * and no table at all for `null`.
+   */
+  function makeStateDb(
+    home: string,
+    rows: Array<{ id: string; cwd: string; updatedAt: number; rolloutPath?: string }>,
+    options: { backfill?: string | null } = {}
+  ): void {
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    const db = join(home, '.codex', 'state_5.sqlite');
+    const q = (v: string) => `'${v.replace(/'/g, "''")}'`;
+    const backfill = options.backfill === undefined ? 'complete' : options.backfill;
+    const sql = [
+      "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, git_branch TEXT, first_user_message TEXT NOT NULL DEFAULT '');",
+      ...(backfill === null
+        ? []
+        : [
+            'CREATE TABLE backfill_state (id INTEGER PRIMARY KEY CHECK (id = 1), status TEXT NOT NULL, last_watermark TEXT, last_success_at INTEGER, updated_at INTEGER NOT NULL);',
+            `INSERT INTO backfill_state (id, status, last_watermark, last_success_at, updated_at) VALUES (1, ${q(backfill)}, NULL, NULL, 1800000000);`,
+          ]),
+      ...rows.map(
+        (row) =>
+          `INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, first_user_message) VALUES (${q(row.id)}, ${q(row.rolloutPath ?? '')}, ${row.updatedAt}, ${row.updatedAt}, 'cli', 'openai', ${q(row.cwd)}, '', '', '', 'main', 'first prompt');`
+      ),
+    ].join('\n');
+    const made = spawnSync('sqlite3', [db, sql], { encoding: 'utf-8' });
+    if (made.status !== 0) throw new Error(`fixture sqlite3 failed: ${made.stderr}`);
+  }
+
+  function writeRollout(
+    home: string,
+    day: string,
+    id: string,
+    cwd: string,
+    extraLines: string[] = []
+  ): string {
+    const dir = join(home, '.codex', 'sessions', ...day.split('/'));
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `rollout-${day.replace(/\//g, '-')}T00-00-00-${id}.jsonl`);
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          timestamp: `${day.replace(/\//g, '-')}T00:00:00.000Z`,
+          type: 'session_meta',
+          payload: { id, cwd, timestamp: `${day.replace(/\//g, '-')}T00:00:00.000Z` },
+        }),
+        ...extraLines,
+      ].join('\n') + '\n'
+    );
+    return path;
+  }
+
+  it.skipIf(!hasSqlite3)(
+    'an empty answer from the DB is trusted: the jsonl files are not scanned',
+    () => {
+      withTempHome((home) => {
+        const project = join(home, 'repo');
+        mkdirSync(project);
+        makeStateDb(home, [
+          { id: 'other', cwd: join(home, 'elsewhere'), updatedAt: 1_800_000_000 },
+        ]);
+        // A rollout for this project exists on disk; before, the empty DB
+        // answer fell through to the scan and this is what it found.
+        writeRollout(home, '2026/09/29', '019a0000-0000-7000-8000-000000000001', project);
+        expect(getCodexLocalSessionsForProject(project, 10)).toEqual([]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'the DB is asked for this cwd, so a project older than the newest 200 threads is still found',
+    () => {
+      withTempHome((home) => {
+        const project = join(home, 'repo');
+        mkdirSync(project);
+        const others = Array.from({ length: 201 }, (_, i) => ({
+          id: `other-${i}`,
+          cwd: join(home, 'elsewhere'),
+          updatedAt: 1_800_000_000 + i,
+        }));
+        makeStateDb(home, [...others, { id: 'mine', cwd: project, updatedAt: 1_700_000_000 }]);
+        expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+          'mine',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a launch through a symlinked path finds the canonical path Codex records',
+    () => {
+      withTempHome((home) => {
+        // Codex canonicalises the cwd it stores; the launch may name an
+        // alias. The reverse (a row under an alias, a launch from the real
+        // path) is not covered, and the query comment says so.
+        const project = join(home, 'repo');
+        mkdirSync(project);
+        const alias = join(home, 'alias');
+        symlinkSync(project, alias);
+        makeStateDb(home, [{ id: 'real', cwd: realpathSync(project), updatedAt: 1_800_000_000 }]);
+        expect(getCodexLocalSessionsForProject(alias, 10).map((s) => s.sessionId)).toEqual([
+          'real',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a cwd with an apostrophe is decoded as the DB stored it (Lumen, #703: -tabs quoted it and the row was dropped)',
+    () => {
+      withTempHome((home) => {
+        const project = join(home, "repo's-root");
+        mkdirSync(project);
+        makeStateDb(home, [{ id: 'mine', cwd: project, updatedAt: 1_800_000_000 }]);
+        expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+          'mine',
+        ]);
+      });
+    }
+  );
+
+  it.skipIf(!hasSqlite3)(
+    'a DB whose backfill is not complete is not the record: the files are (Lumen, #703)',
+    () => {
+      for (const backfill of ['pending', 'interrupted', null]) {
+        withTempHome((home) => {
+          const project = join(home, 'repo');
+          mkdirSync(project);
+          // The DB has nothing for this cwd; the rollout on disk is the truth
+          // until the backfill says 'complete'. A missing table is the same.
+          makeStateDb(home, [{ id: 'other', cwd: join(home, 'elsewhere'), updatedAt: 1 }], {
+            backfill,
+          });
+          writeRollout(home, '2026/09/29', 'mine', project);
+          expect(getCodexLocalSessionsForProject(project, 10).map((s) => s.sessionId)).toEqual([
+            'mine',
+          ]);
+        });
+      }
+    }
+  );
+
+  it.skipIf(!hasSqlite3)('the preview is read from the tail of the transcript', () => {
+    withTempHome((home) => {
+      const project = join(home, 'repo');
+      mkdirSync(project);
+      const filler = JSON.stringify({
+        timestamp: '2026-09-29T00:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'x'.repeat(4000) }],
+        },
+      });
+      const rollout = writeRollout(home, '2026/09/29', 'mine', project, [
+        ...Array.from({ length: 200 }, () => filler),
+        JSON.stringify({
+          timestamp: '2026-09-29T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'the last word' }],
+          },
+        }),
+      ]);
+      makeStateDb(home, [
+        { id: 'mine', cwd: project, updatedAt: 1_800_000_000, rolloutPath: rollout },
+      ]);
+      const [session] = getCodexLocalSessionsForProject(project, 10);
+      expect(session?.latestPrompt).toContain('the last word');
+    });
+  });
+
+  it('the fallback is bounded and head-first: newest files by name, the first line of each, the tail of a match', () => {
+    withTempHome((home) => {
+      const project = join(home, 'repo');
+      mkdirSync(project);
+      const junk = JSON.stringify({ type: 'noise', payload: { text: 'j'.repeat(100 * 1024) } });
+      // 350 rollouts for other projects across three days, each 100 KB after
+      // its first line; the fallback may inspect at most the newest 300.
+      let n = 0;
+      for (const day of ['2026/09/27', '2026/09/28', '2026/09/29']) {
+        for (let i = 0; i < 116; i++) {
+          n += 1;
+          writeRollout(home, day, `other-${String(n).padStart(4, '0')}`, join(home, 'elsewhere'), [
+            junk,
+          ]);
+        }
+      }
+      // Ours is the newest file of the newest day.
+      writeRollout(home, '2026/09/29', 'zzzz-mine', project, [
+        JSON.stringify({
+          timestamp: '2026-09-29T00:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'found' }],
+          },
+        }),
+      ]);
+      const stats = { filesListed: 0, filesInspected: 0, headBytesRead: 0, tailBytesRead: 0 };
+      const sessions = getCodexLocalSessionsFromJsonl(project, 10, { stats });
+      expect(sessions.map((s) => s.sessionId)).toEqual(['zzzz-mine']);
+      expect(sessions[0]?.latestPrompt).toContain('found');
+      expect(stats.filesListed).toBe(CODEX_JSONL_FALLBACK_MAX_FILES);
+      expect(stats.filesInspected).toBeLessThanOrEqual(CODEX_JSONL_FALLBACK_MAX_FILES);
+      // Heads only: never the 100 KB junk that follows the first line.
+      expect(stats.headBytesRead).toBeLessThanOrEqual(stats.filesInspected * 32 * 1024);
+      expect(stats.headBytesRead).toBeLessThan(stats.filesInspected * 100 * 1024);
+      // One match, one tail.
+      expect(stats.tailBytesRead).toBeLessThanOrEqual(256 * 1024);
+      expect(stats.tailBytesRead).toBeGreaterThan(0);
+    });
+  });
+
+  it('a match older than the newest CODEX_JSONL_FALLBACK_MAX_FILES rollouts is beyond the fallback, by design', () => {
+    withTempHome((home) => {
+      const project = join(home, 'repo');
+      mkdirSync(project);
+      writeRollout(home, '2026/01/01', 'aaaa-mine-old', project);
+      for (let i = 0; i < CODEX_JSONL_FALLBACK_MAX_FILES; i++) {
+        writeRollout(
+          home,
+          '2026/09/29',
+          `other-${String(i).padStart(4, '0')}`,
+          join(home, 'elsewhere')
+        );
+      }
+      expect(getCodexLocalSessionsFromJsonl(project, 10)).toEqual([]);
+    });
   });
 });

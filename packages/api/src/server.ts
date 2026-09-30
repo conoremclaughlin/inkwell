@@ -66,6 +66,7 @@ import {
 } from './services/routing/thread-descriptor';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { logger } from './utils/logger';
+import { handleHangup } from './utils/hangup';
 import { resolveThreadTriggerScope } from './services/trigger-scope';
 import {
   handleTriggerFailure,
@@ -1947,12 +1948,14 @@ function printStatus(): void {
  * Graceful shutdown with force-kill timeout.
  * If graceful teardown hangs (open connections, polling loops, etc.),
  * force-exit after 10 seconds so tsx --watch can restart cleanly.
+ *
+ * `reason` is logged so a stop always says what caused it.
  */
-async function shutdown(): Promise<void> {
+async function shutdown(reason: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  logger.info('\nShutting down Inkwell Server...');
+  logger.info(`\nShutting down Inkwell Server (${reason})...`);
 
   // Force-kill safety net: if graceful shutdown hangs, exit anyway.
   const forceKillTimer = setTimeout(() => {
@@ -2017,14 +2020,16 @@ async function shutdown(): Promise<void> {
   }
 }
 
-// Handle shutdown signals
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+// Handle shutdown signals. SIGHUP is what the terminal the server runs in sends
+// when it closes; see handleHangup for why it needs more than a plain shutdown.
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGHUP', () => handleHangup(shutdown));
 
 // Handle uncaught errors
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught exception:', error);
-  shutdown();
+  void shutdown('uncaught exception');
 });
 
 process.on('unhandledRejection', (reason) => {

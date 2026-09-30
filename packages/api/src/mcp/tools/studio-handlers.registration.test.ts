@@ -347,6 +347,7 @@ describe('revival is coherent (Lumen, PR #692 round 3)', () => {
       userId: '00000000-0000-0000-0000-000000000001',
       sbSlug: 'wren',
       sbId: null,
+      slug: 'wren-old-fixture',
       worktreePath: actual,
       repoRoot: main,
       branch: 'wren/fix/old',
@@ -388,6 +389,10 @@ describe('revival is coherent (Lumen, PR #692 round 3)', () => {
       expect(existing.status).toBe('active');
       expect(payload.studio.branch).toBe('wren/fix/existing');
       expect(payload.studio.status).toBe('active');
+      // The revived row keeps its own slug, whatever this call asked for, and
+      // the response says so: it is the name send_to_inbox routes on
+      // (routing spec §v19 C).
+      expect(payload.studio.slug).toBe('wren-old-fixture');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

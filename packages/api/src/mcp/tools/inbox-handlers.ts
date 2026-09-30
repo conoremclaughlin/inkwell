@@ -108,7 +108,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .max(100)
     .optional()
     .describe(
-      'Recipient studio slug for routing (matches studios.slug). Pass "main" to target the user\'s root-repo studio. Preferred over recipientStudioHint — accepts any studio slug, not just "main".'
+      'Recipient studio slug for routing: the `slug` field list_studios and get_studio return, not `worktreeFolder` (the two often differ). Pass "main" to target the user\'s root-repo studio. recipientStudioId is unambiguous and preferred when you have it. Preferred over recipientStudioHint — accepts any studio slug, not just "main".'
     ),
   recipientStudioHint: z
     .enum(['main'])

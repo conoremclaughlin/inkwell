@@ -162,7 +162,8 @@ describe('installHooks: Claude Code', () => {
     );
 
     const { result } = installHooks(TEST_DIR, { force: true });
-    expect(result).toBe('installed');
+    // Hooks were there and were replaced: a repair, not a first install.
+    expect(result).toBe('updated');
 
     const config = JSON.parse(readFileSync(join(configDir, 'settings.local.json'), 'utf-8'));
     // Should now have Inkwell hooks, not the custom one
@@ -184,8 +185,41 @@ describe('installHooks: Claude Code', () => {
 
     // Re-install should work (only Inkwell hooks present, so no conflict)
     const { result } = installHooks(TEST_DIR);
-    // It won't match exactly, but all hooks are Inkwell, so it overwrites
-    expect(result).toBe('installed');
+    // It won't match exactly, but all hooks are Inkwell, so it overwrites —
+    // and says so: the hooks existed and were rewritten.
+    expect(result).toBe('updated');
+  });
+
+  it('reports updated, not installed, when the Inkwell hooks were there under an older ink path', () => {
+    // The wren-cli studio on 2026-09-29: every hook present, every command
+    // naming the ink binary by a different spelling. The launcher rewrote
+    // them and reported the file as created.
+    installHooks(TEST_DIR);
+    const configPath = join(TEST_DIR, '.claude', 'settings.local.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const stale = JSON.parse(
+      JSON.stringify(config.hooks).replace(
+        /"command":"[^"]*? hooks /g,
+        '"command":"/old/checkout/ink hooks '
+      )
+    );
+    writeFileSync(configPath, JSON.stringify({ ...config, hooks: stale }, null, 2));
+
+    const { result } = installHooks(TEST_DIR);
+    expect(result).toBe('updated');
+    const repaired = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(JSON.stringify(repaired.hooks)).not.toContain('/old/checkout/ink');
+    expect(installHooks(TEST_DIR).result).toBe('already-installed');
+  });
+
+  it('reports installed when the file has a hooks key with nothing under it', () => {
+    const configDir = join(TEST_DIR, '.claude');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: ['Bash(*)'] }, hooks: {} })
+    );
+    expect(installHooks(TEST_DIR).result).toBe('installed');
   });
 });
 
@@ -237,6 +271,39 @@ describe('installHooks: Gemini', () => {
     installHooks(TEST_DIR, { backend: 'gemini' });
     const { result } = installHooks(TEST_DIR, { backend: 'gemini' });
     expect(result).toBe('already-installed');
+  });
+
+  it('reports updated when the Inkwell hooks were there under an older ink path', () => {
+    installHooks(TEST_DIR, { backend: 'gemini' });
+    const configPath = join(TEST_DIR, '.gemini', 'settings.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const stale = JSON.parse(
+      JSON.stringify(config.hooks).replace(
+        /"command":"[^"]*? hooks /g,
+        '"command":"/old/checkout/ink hooks '
+      )
+    );
+    writeFileSync(configPath, JSON.stringify({ ...config, hooks: stale }, null, 2));
+
+    const { result } = installHooks(TEST_DIR, { backend: 'gemini' });
+    expect(result).toBe('updated');
+    const repaired = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(JSON.stringify(repaired.hooks)).not.toContain('/old/checkout/ink');
+    expect(installHooks(TEST_DIR, { backend: 'gemini' }).result).toBe('already-installed');
+  });
+
+  it('reports installed when only events Inkwell does not manage carry hooks', () => {
+    const configDir = join(TEST_DIR, '.gemini');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'settings.json'),
+      JSON.stringify({
+        hooks: { UnrelatedEvent: [{ hooks: [{ type: 'command', command: 'custom-tool' }] }] },
+      })
+    );
+    expect(installHooks(TEST_DIR, { backend: 'gemini' }).result).toBe('installed');
+    const config = JSON.parse(readFileSync(join(configDir, 'settings.json'), 'utf-8'));
+    expect(config.hooks.UnrelatedEvent[0].hooks[0].command).toBe('custom-tool');
   });
 
   it('should return conflict when non-Inkwell hooks exist', () => {
@@ -332,12 +399,12 @@ describe('installHooks: Codex', () => {
     expect(content).toContain('# ink-managed:hooks:start');
   });
 
-  it('should replace Inkwell section on re-install with force', () => {
+  it('should replace Inkwell section on re-install with force, and report it as updated', () => {
     installHooks(TEST_DIR, { backend: 'codex' });
 
     // Force re-install
     const { result } = installHooks(TEST_DIR, { backend: 'codex', force: true });
-    expect(result).toBe('installed');
+    expect(result).toBe('updated');
 
     // Should have exactly one start marker and one end marker (no duplicates)
     const content = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
