@@ -1,5 +1,25 @@
 import { describe, expect, it } from 'vitest';
+import { buildSessionEnv } from '../runner/mcp-config.js';
+import { INK_ENV_HEADERS } from './codex.js';
 import { CODEX_CONFIG_REFUSALS, judgeCodexMcpList } from './codex-mcp-list.js';
+
+/**
+ * The names a spawn's env carries for its session, taken from the real
+ * builder with every option set, so a var it gains is covered here too.
+ */
+const SESSION_ENV_NAMES = Object.keys(
+  buildSessionEnv({
+    inkSessionId: 'synthetic-session',
+    runtimeLinkId: 'synthetic-link',
+    studioId: 'synthetic-studio',
+    accessToken: 'synthetic-token',
+    delegationSecret: 'synthetic-secret',
+    sbSlug: 'synthetic-sb',
+    cliAttached: false,
+    runtime: 'codex',
+    repoRoot: '/synthetic/repo',
+  })
+);
 
 /**
  * The literal stdout of `codex mcp list --json` from codex-cli 0.158.0 over a
@@ -132,8 +152,16 @@ function http(name: string, url: string, overrides: Record<string, unknown> = {}
   } as Entry;
 }
 
-const judge = (entries: unknown, inkwell = INKWELL) =>
-  judgeCodexMcpList(JSON.stringify(entries), inkwell);
+const judgeText = (stdout: string, inkwell = INKWELL) =>
+  judgeCodexMcpList(stdout, { inkwellMcpUrl: inkwell, sessionEnvNames: SESSION_ENV_NAMES });
+
+const judge = (entries: unknown, inkwell = INKWELL) => judgeText(JSON.stringify(entries), inkwell);
+
+const stdio = (name: string, envVars: unknown) => ({
+  ...MEASURED_0_158[5]!,
+  name,
+  transport: { ...MEASURED_0_158[5]!.transport, env_vars: envVars },
+});
 
 describe('judgeCodexMcpList, on the 0.158.0 listing', () => {
   it('admits the measured listing once its helper server is gone', () => {
@@ -171,13 +199,6 @@ describe('judgeCodexMcpList, refusals', () => {
       disabled_reason: 'synthetic',
     };
     expect(judge([disabled])).toBe(CODEX_CONFIG_REFUSALS.staticRouting);
-  });
-
-  it('refuses env-drawn routing for a server that is not Inkwell', () => {
-    const foreign = http('someone_else', 'https://mcp.example.com/', {
-      env_http_headers: { 'X-Ink-Context': 'INK_CONTEXT' },
-    });
-    expect(judge([foreign])).toBe(CODEX_CONFIG_REFUSALS.foreignRouting);
   });
 
   it('refuses a static Authorization for Inkwell, and admits one for another origin', () => {
@@ -220,6 +241,55 @@ describe('judgeCodexMcpList, refusals', () => {
   });
 });
 
+describe('judgeCodexMcpList, the session env stays with Inkwell (Myra, 9bd3f8a9)', () => {
+  it('draws on the real session env, credentials and routing included', () => {
+    // Guards the rows below against a builder that stopped setting these.
+    expect(SESSION_ENV_NAMES).toEqual(
+      expect.arrayContaining(['INK_ACCESS_TOKEN', 'INK_DELEGATION_SECRET', 'INK_CONTEXT'])
+    );
+  });
+
+  it.each(SESSION_ENV_NAMES)('refuses a non-Inkwell server drawing %s, by any route', (name) => {
+    const foreign = 'https://mcp.example.com/';
+    expect(judge([http('bearer', foreign, { bearer_token_env_var: name })])).toBe(
+      CODEX_CONFIG_REFUSALS.foreignSessionEnv
+    );
+    expect(judge([http('header', foreign, { env_http_headers: { 'x-anything': name } })])).toBe(
+      CODEX_CONFIG_REFUSALS.foreignSessionEnv
+    );
+    expect(judge([stdio('local_tool', ['SYNTHETIC_OTHER', name])])).toBe(
+      CODEX_CONFIG_REFUSALS.foreignSessionEnv
+    );
+  });
+
+  it('admits a non-Inkwell server drawing only its own vars (control)', () => {
+    const foreign = http('own', 'https://mcp.example.com/', {
+      bearer_token_env_var: 'SYNTHETIC_BEARER_ENV_NAME',
+      env_http_headers: { 'X-Ink-Context': 'SYNTHETIC_HEADER_ENV_NAME' },
+    });
+    expect(judge([foreign, stdio('local_tool', ['SYNTHETIC_OTHER'])])).toBeUndefined();
+  });
+
+  it("admits on Inkwell exactly the adapter's own env headers, and other headers drawing session vars", () => {
+    const own = Object.fromEntries(INK_ENV_HEADERS.map(({ header, envVar }) => [header, envVar]));
+    const inkwell = http('inkwell', INKWELL, {
+      bearer_token_env_var: 'INK_ACCESS_TOKEN',
+      env_http_headers: { ...own, 'x-custom': 'INK_ACCESS_TOKEN' },
+    });
+    expect(judge([inkwell])).toBeUndefined();
+  });
+
+  it.each<[string, Record<string, string>]>([
+    ['a differently cased routing key', { 'X-Ink-Studio-Id': 'INK_STUDIO_ID' }],
+    ['a routing key drawn from another var', { 'x-ink-studio-id': 'SYNTHETIC_OTHER' }],
+    ["the adapter's agent header from another var", { 'x-ink-agent-id': 'SYNTHETIC_OTHER' }],
+    ['an env-drawn Authorization', { Authorization: 'INK_ACCESS_TOKEN' }],
+  ])('refuses on Inkwell %s, with the repair', (_label, envHeaders) => {
+    const inkwell = http('inkwell', INKWELL, { env_http_headers: envHeaders });
+    expect(judge([inkwell])).toBe(CODEX_CONFIG_REFUSALS.inkwellEnvHeader);
+  });
+});
+
 describe('judgeCodexMcpList, loopback aliases are one origin', () => {
   it.each([
     'http://localhost:3001/mcp',
@@ -250,7 +320,7 @@ describe('judgeCodexMcpList, loopback aliases are one origin', () => {
     const withAuth = http('x', 'https://ink.example.com:443/mcp', {
       http_headers: { Authorization: 'Bearer synthetic-token' },
     });
-    expect(judgeCodexMcpList(JSON.stringify([withAuth]), 'https://ink.example.com/mcp')).toBe(
+    expect(judge([withAuth], 'https://ink.example.com/mcp')).toBe(
       CODEX_CONFIG_REFUSALS.staticAuthorization
     );
   });
@@ -288,14 +358,22 @@ describe('judgeCodexMcpList, drift from 0.158.0 is refused, not guessed at', () 
         return [entry];
       },
     ],
+    [
+      'an env header drawn from something other than a var name',
+      () => {
+        const entry = measuredHttp();
+        entry.transport.env_http_headers = { 'x-anything': { var: 'INK_ACCESS_TOKEN' } };
+        return [entry];
+      },
+    ],
+    ['stdio env_vars missing', () => [stdio('local_tool', undefined)]],
+    ['stdio env_vars that are not names', () => [stdio('local_tool', [{ name: 'X' }])]],
   ])('%s', (_label, build) => {
     expect(judge(build())).toBe(CODEX_CONFIG_REFUSALS.drift);
   });
 
   it('refuses output that is not JSON', () => {
-    expect(judgeCodexMcpList('codex: unknown subcommand', INKWELL)).toBe(
-      CODEX_CONFIG_REFUSALS.drift
-    );
+    expect(judgeText('codex: unknown subcommand')).toBe(CODEX_CONFIG_REFUSALS.drift);
   });
 });
 
@@ -315,7 +393,7 @@ describe('judgeCodexMcpList never repeats what the listing printed', () => {
     ['malformed JSON around a value', `[{"name": "x", "transport": {"http_headers": "${SECRET}"`],
     ['a value in a drifted entry', JSON.stringify([{ name: SECRET, transport: SECRET }])],
   ])('%s', (_label, stdout) => {
-    const reason = judgeCodexMcpList(stdout, INKWELL);
+    const reason = judgeText(stdout);
     expect(reason).toBeDefined();
     expect(fixed.has(reason!)).toBe(true);
     expect(reason).not.toContain(SECRET);

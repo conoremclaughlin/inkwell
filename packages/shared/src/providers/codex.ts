@@ -24,8 +24,11 @@ import type { BackendAdapter, BackendConfig, BackendHost, PreparedBackend } from
  * Authorization is intentionally NOT here — it goes through codex's
  * `bearer_token_env_var` mechanism instead (see prepare()), which also stops
  * codex from running its own managed OAuth for the server.
+ *
+ * Exported for the effective-config check (codex-mcp-list.ts), which admits
+ * an env-drawn Inkwell header only when it is exactly one of these.
  */
-const INK_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
+export const INK_ENV_HEADERS: ReadonlyArray<{ header: string; envVar: string }> = [
   { header: 'x-ink-context', envVar: 'INK_CONTEXT' },
   { header: 'x-ink-agent-id', envVar: 'AGENT_ID' },
   { header: 'x-ink-session-id', envVar: 'INK_SESSION_ID' },
