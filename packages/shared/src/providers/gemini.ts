@@ -18,7 +18,18 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
-import type { BackendAdapter, BackendConfig, BackendHost, PreparedBackend } from './types.js';
+import { BakedRoutingHeaderError, findGeminiSettingsRouting } from './gemini-settings-routing.js';
+import type {
+  BackendAdapter,
+  BackendConfig,
+  BackendHost,
+  EffectiveConfigCheck,
+  PreparedBackend,
+} from './types.js';
+
+/** The refusal when the spawn's env names no home for Gemini's user settings. */
+export const GEMINI_NO_HOME_REFUSAL =
+  "the Gemini spawn's env names no home (GEMINI_CLI_HOME or HOME), so its user settings cannot be checked";
 
 /**
  * Build a temp Gemini settings.json that merges Inkwell auth + session headers
@@ -101,6 +112,43 @@ export class GeminiAdapter implements BackendAdapter {
   readonly binary = 'gemini';
   // Prompt rides argv (`-p <prompt>`) — bounded by OS ARG_MAX.
   readonly promptTransport = 'argv' as const;
+
+  /**
+   * The settings the spawn's Gemini will read its MCP servers from, judged
+   * before the spawn (gemini-settings-routing.ts). Measured on 0.54.0 (Myra,
+   * #701 9c94e5b3), four sources feed `mcpServers`:
+   *
+   * - user: `($GEMINI_CLI_HOME || $HOME)/.gemini/settings.json`, from the
+   *   env the spawn will get. With neither, the spawn is refused;
+   * - workspace: `<cwd>/.gemini/settings.json`, read whatever folder trust
+   *   decides, which errs toward refusing;
+   * - system: the file this adapter wrote for the spawn
+   *   (GEMINI_CLI_SYSTEM_SETTINGS_PATH, in the adapter's env). Its routing
+   *   headers are this spawn's own, so only the rule on servers other than
+   *   Inkwell applies to it. It carries the servers copied from `.mcp.json`;
+   * - system defaults: not read. The spawn never gets the path variable, and
+   *   the default location is unmeasured.
+   */
+  async checkEffectiveConfig(check: EffectiveConfigCheck): Promise<string | undefined> {
+    // What the spawn's env holds for a name: the adapter's own over the base.
+    const spawnValue = (name: string): string | undefined =>
+      check.adapterEnv[name] ?? check.probeEnv[name];
+    const home = spawnValue('GEMINI_CLI_HOME') || spawnValue('HOME');
+    if (!home) return GEMINI_NO_HOME_REFUSAL;
+    const scope = { inkwellMcpUrl: check.inkwellMcpUrl, sessionEnvNames: check.sessionEnvNames };
+    const findings = await findGeminiSettingsRouting(
+      [join(check.cwd, '.gemini', 'settings.json'), join(home, '.gemini', 'settings.json')],
+      scope
+    );
+    const systemPath = spawnValue('GEMINI_CLI_SYSTEM_SETTINGS_PATH');
+    if (systemPath) {
+      const system = await findGeminiSettingsRouting([systemPath], scope);
+      findings.push(...system.filter((finding) => finding.kind !== 'routing'));
+    }
+    return findings.length > 0
+      ? new BakedRoutingHeaderError('gemini', findings).message
+      : undefined;
+  }
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
     const identity = await createIdentityPromptFile(

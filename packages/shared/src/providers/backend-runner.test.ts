@@ -454,6 +454,8 @@ describe('runBackendTurn', () => {
           expect(Object.keys(check.probeEnv).every((name) => inherited.has(name))).toBe(true);
           expect(check.inkwellMcpUrl).toBe('http://localhost:3001/mcp');
           expect(check.binary).toBe('mock-backend');
+          // The adapter's own env, as prepared, for settings it passes that way.
+          expect(check.adapterEnv).toEqual(state.preparedEnv);
           expect(check.timeoutMs).toBeGreaterThan(0);
           expect(check.timeoutMs).toBeLessThanOrEqual(10_000);
           // Nothing the spawn would not get, and none of the session's own

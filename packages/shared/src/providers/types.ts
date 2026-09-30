@@ -266,6 +266,13 @@ export interface EffectiveConfigCheck {
    */
   probeEnv: Readonly<Record<string, string | undefined>>;
   /**
+   * The adapter's own env for this spawn (its PreparedBackend.env), which the
+   * spawn gets on top of the base env: where a setting the adapter passes
+   * that way is read from (Gemini's system settings path). Never for a
+   * probe's env.
+   */
+  adapterEnv: Readonly<Record<string, string>>;
+  /**
    * The names of the env vars the runner adds for this session on top of the
    * base env (credentials, the adapter's env, the turn-owner marker), less
    * the allowlisted basics. A server outside the session drawing any of them

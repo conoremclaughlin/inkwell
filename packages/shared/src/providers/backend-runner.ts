@@ -312,6 +312,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
             // nothing the spawn would not get; a host credential the
             // allowlist passes, an API key, reaches both alike.
             probeEnv: buildCleanEnv(undefined, parentEnv),
+            adapterEnv: prepared.env,
             sessionEnvNames: Object.keys(sessionAdditions).filter((name) => !inherited.has(name)),
             cwd: request.workingDirectory,
             signal: preSpawn.signal,

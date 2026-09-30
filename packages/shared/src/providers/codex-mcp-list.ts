@@ -66,8 +66,9 @@ export const CODEX_CONFIG_REFUSALS = {
   staticAuthorization: `a static Authorization header is configured for the Inkwell MCP server in the Codex config; ${CODEX_CONFIG_HAND_EDIT}`,
   helper: `an MCP server in the Codex config computes its headers with http_headers_helper, which cannot be checked; ${CODEX_CONFIG_HAND_EDIT}`,
   inkwellElsewhere: `the Codex config's \`inkwell\` MCP server is not this session's Inkwell server; ${CODEX_CONFIG_REPAIR}`,
-  unreadableUrl: 'an MCP server in the Codex config has a URL that cannot be read',
-  unreadableInkwellUrl: 'the Inkwell server URL this session was given cannot be read',
+  unreadableUrl: `an MCP server in the Codex config has a URL that cannot be read; ${CODEX_CONFIG_HAND_EDIT}`,
+  unreadableInkwellUrl:
+    'the Inkwell server URL this session was given cannot be read; check INK_SERVER_URL where the session was started',
 } as const;
 
 export type CodexConfigRefusal = (typeof CODEX_CONFIG_REFUSALS)[keyof typeof CODEX_CONFIG_REFUSALS];

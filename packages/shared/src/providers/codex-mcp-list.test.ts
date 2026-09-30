@@ -255,11 +255,14 @@ describe('judgeCodexMcpList, refusals', () => {
       CODEX_CONFIG_REFUSALS.foreignSessionEnv,
       CODEX_CONFIG_REFUSALS.staticAuthorization,
       CODEX_CONFIG_REFUSALS.helper,
+      CODEX_CONFIG_REFUSALS.unreadableUrl,
     ]) {
       expect(reason).toContain('remove it by hand');
       expect(reason).toContain('~/.codex/config.toml');
       expect(reason).not.toContain('ink mcp sync');
     }
+    // The host's own URL is repaired where the session was started.
+    expect(CODEX_CONFIG_REFUSALS.unreadableInkwellUrl).toContain('INK_SERVER_URL');
   });
 
   it('refuses when the host gives no readable Inkwell URL, and when a server URL is unreadable', () => {

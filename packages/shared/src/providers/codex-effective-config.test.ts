@@ -51,6 +51,7 @@ const http = (name: string, url: string, overrides: Record<string, unknown> = {}
 const check = (overrides: Partial<EffectiveConfigCheck> = {}): EffectiveConfigCheck => ({
   binary: '/synthetic/bin/codex',
   probeEnv: { HOME: '/synthetic/home', CODEX_HOME: '/synthetic/codex-home' },
+  adapterEnv: {},
   sessionEnvNames: ['INK_ACCESS_TOKEN', 'INK_DELEGATION_SECRET', 'INK_CONTEXT', 'AGENT_ID'],
   cwd: '/synthetic/studio',
   signal: new AbortController().signal,
