@@ -66,10 +66,39 @@ describe('readCodexStaticHeaderNames, near-misses', () => {
       unreadable: false,
     });
   });
+
+  it('reads a server with a multi-line args array, with an escape in it, as clean', () => {
+    // Continuation lines the reader does not parse, in scope but in no
+    // http_headers table: fail-closed must not reach them.
+    expect(
+      read([
+        '[mcp_servers.tool]',
+        'command = "/synthetic/tool"',
+        'args = [',
+        '  "--flag",',
+        '  "C:\\\\synthetic\\\\path",',
+        ']',
+      ])
+    ).toEqual({ names: [], unreadable: false });
+  });
 });
 
 describe('readCodexStaticHeaderNames never reports clean what it could not read', () => {
   it.each<[string, string[]]>([
+    // Escaped keys, which Codex decodes to a routing header (Myra, c41d867e).
+    [
+      'an escaped key in a sub-table',
+      ['[mcp_servers.x.http_headers]', '"x-ink-session\\u002did" = "v"'],
+    ],
+    ['an escaped dotted key', ['[mcp_servers.x]', 'http_headers."x-ink-studio\\u002Did" = "v"']],
+    [
+      'an escaped inline-table key',
+      ['[mcp_servers.x]', 'http_headers = { "x-ink-context\\u0020" = "v" }'],
+    ],
+    [
+      'an inline server keyed with an escape',
+      ['[mcp_servers]', 'x = { url = "u", "http\\u005fheaders" = { "X-A" = "v" } }'],
+    ],
     ['a multi-line inline table', ['[mcp_servers.x]', 'http_headers = {', '  "X-A" = "v"', '}']],
     [
       'a server written inline with its headers',

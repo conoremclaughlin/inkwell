@@ -28,7 +28,13 @@ export interface CodexStaticHeaderNames {
 
 const BARE_KEY = /^[A-Za-z0-9_-]+/;
 
-/** A key segment at the start of `text`: its name and the rest, or undefined. */
+/**
+ * A key segment at the start of `text`: its name and the rest, or undefined.
+ * A basic ("...") key with an escape in it is undefined, so the line it is on
+ * is not read as clean: Codex decodes `"x-ink-session-id"` to
+ * `x-ink-session-id` (Myra, measured on 0.158.0, #701 c41d867e), and this
+ * reader does not decode escapes.
+ */
 function readKeySegment(text: string): { name: string; rest: string } | undefined {
   const trimmed = text.trimStart();
   const quote = trimmed[0];
@@ -37,14 +43,8 @@ function readKeySegment(text: string): { name: string; rest: string } | undefine
     for (let i = 1; i < trimmed.length; i += 1) {
       const ch = trimmed[i]!;
       if (ch === quote) return { name, rest: trimmed.slice(i + 1) };
-      if (quote === '"' && ch === '\\') {
-        // An escape in a basic key; the checklist only compares names, so an
-        // escaped character is kept as written after the backslash.
-        i += 1;
-        name += trimmed[i] ?? '';
-      } else {
-        name += ch;
-      }
+      if (quote === '"' && ch === '\\') return undefined;
+      name += ch;
     }
     return undefined;
   }
@@ -148,7 +148,12 @@ export function readCodexStaticHeaderNames(toml: string): CodexStaticHeaderNames
 
     const key = readDottedKey(line);
     if (!key || !key.rest.startsWith('=')) {
-      if (inScope && mentionsHttpHeaders(line)) unreadable = true;
+      // Unread lines are common in scope (a multi-line `args` array), so only
+      // one that could set a header counts: it names http_headers, or it sits
+      // in an http_headers table.
+      if (inScope && (mentionsHttpHeaders(line) || table.includes('http_headers'))) {
+        unreadable = true;
+      }
       continue;
     }
     const path = [...table, ...key.path];
@@ -163,11 +168,12 @@ export function readCodexStaticHeaderNames(toml: string): CodexStaticHeaderNames
       else unreadable = true;
     } else if (
       path.includes('http_headers') ||
-      (value.trimStart().startsWith('{') && mentionsHttpHeaders(value))
+      (value.trimStart().startsWith('{') && (mentionsHttpHeaders(value) || value.includes('\\')))
     ) {
       // Deeper than a header, or a server written inline with its headers
-      // inside it: a form this reader does not take apart. A string value
-      // that merely mentions http_headers is neither.
+      // inside it, or one whose keys may be escaped (`"http_headers"`):
+      // a form this reader does not take apart. A string value that merely
+      // mentions http_headers is none of these.
       unreadable = true;
     }
   }
