@@ -27,7 +27,8 @@ export const OBS_PROJECTION_TYPES: ReadonlySet<string> = new Set([
 /**
  * Where a session log's entries are persisted. `line` is one complete,
  * newline-terminated JSON entry, with an extra leading newline after a
- * synchronous write failure to separate any partially written prior entry.
+ * synchronous write failure or reattach to separate any partially written
+ * prior entry.
  *
  * A synchronous sink reports failure by throwing, to the caller whose append
  * caused it. An asynchronous sink reports it by rejecting, after that caller
@@ -113,6 +114,10 @@ export class SessionLog {
       throw new Error(`session log seeded after its first append: ${this.path}`);
     }
     if (maxSeen > this.lastEid) this.lastEid = maxSeen;
+    // A previous process may have left an incomplete final line. Readers
+    // ignore blank lines, so one extra boundary on reattach is harmless even
+    // after a clean exit and avoids consulting the filesystem from this class.
+    this.needsLineBoundary = true;
   }
 
   /**

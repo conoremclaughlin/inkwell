@@ -164,6 +164,26 @@ describe('SessionLog — the ledger and its live mirror agree (spec:observer-att
     expect(log.append({ type: 'user' })).toBe(42);
   });
 
+  it('reattach separates the first new entry from a previous process torn tail', () => {
+    let bytes = '{"eid":41,"type":"tool_intent"';
+    const log = new SessionLog({
+      path: 'unused',
+      sink: {
+        write: (line) => {
+          bytes += line;
+        },
+      },
+    });
+    log.seed(40);
+    log.append({ type: 'user', content: 'next process' });
+    expect(bytes.split('\n')).toHaveLength(3);
+    expect(JSON.parse(bytes.split('\n')[1])).toMatchObject({
+      eid: 41,
+      type: 'user',
+      content: 'next process',
+    });
+  });
+
   it('a seed after the first append is refused: that append already took an eid the old log may hold', () => {
     setup();
     const path = join(dir, 'session.jsonl');
