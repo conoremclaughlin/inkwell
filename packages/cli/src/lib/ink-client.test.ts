@@ -298,6 +298,43 @@ describe('InkClient surfaces failed tool calls', () => {
       expect(result).toEqual({ result: [1, 2], content: [image] });
     });
 
+    // Lumen, PR #708 round 2: a payload's own `content` is application data,
+    // and merging images into it erased a string or object and blended them
+    // into an array. Every shape is kept whole under `result`.
+    it.each([
+      ['a string', 'synthetic-caption-marker'],
+      ['an object', { caption: 'synthetic-caption-marker' }],
+      ['an array', ['synthetic-caption-marker']],
+      ['null', null],
+    ])(
+      'beside a payload whose own content is %s: the payload is kept whole',
+      async (_label, own) => {
+        const payload = { success: true, content: own };
+        respond([{ type: 'text', text: JSON.stringify(payload) }, image]);
+        const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
+        expect(result).toEqual({ result: payload, content: [image] });
+      }
+    );
+
+    it('the kept payload survives capture: its data stays, only the image bytes go', async () => {
+      const payload = { success: true, content: 'synthetic-caption-marker' };
+      respond([{ type: 'text', text: JSON.stringify(payload) }, image]);
+      const parsed = await makeClient().callTool('render_chart', {});
+      const cacheDir = mkdtempSync(join(tmpdir(), 'ink-client-capture-'));
+      try {
+        const captured = await captureToolImages(parsed, {
+          cacheDir: async () => cacheDir,
+          delivery: () => ({ deliverable: true }),
+        });
+        const serialized = JSON.stringify(captured);
+        expect(serialized).toContain('synthetic-caption-marker');
+        expect(serialized).not.toContain(PNG_1X1.slice(0, 32));
+        expect(takeCapturedImages(captured)).toHaveLength(1);
+      } finally {
+        rmSync(cacheDir, { recursive: true, force: true });
+      }
+    });
+
     it('with no image, the payload is exactly what it always was', async () => {
       respond([{ type: 'text', text: JSON.stringify({ success: true }) }]);
       const result = await makeClient().callTool('render_chart', {});

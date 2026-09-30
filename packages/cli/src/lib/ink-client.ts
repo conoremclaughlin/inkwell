@@ -35,9 +35,15 @@ interface JsonRpcResponse {
  *
  * The text is the payload callers read, so it is unwrapped as it always was;
  * but a result can carry an image next to that text, and unwrapping alone
- * dropped it (Lumen, PR #708). The images go on `content`, where the chat
- * runtime's capture step looks, and are appended to one already there. With
- * no image blocks the payload is returned exactly as parsed.
+ * dropped it (Lumen, PR #708). The images go on a top-level `content`, where
+ * the chat runtime's capture step looks. With no image blocks the payload is
+ * returned exactly as parsed.
+ *
+ * The payload is never edited. `content` is added only to an object that has
+ * no `content` of its own; anything else — a JSON value that is not an object,
+ * or an object whose own `content` is application data of any shape — is kept
+ * whole under `result`. Merging into that key erased a string or object and
+ * blended image blocks into an array (Lumen, PR #708 round 2).
  */
 function withImageBlocks(
   parsed: unknown,
@@ -45,10 +51,13 @@ function withImageBlocks(
 ): InkToolCallResult {
   const images = (content ?? []).filter((item) => item?.type === 'image');
   if (images.length === 0) return parsed as InkToolCallResult;
-  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-    const payload = parsed as InkToolCallResult;
-    const existing = Array.isArray(payload.content) ? (payload.content as unknown[]) : [];
-    return { ...payload, content: [...existing, ...images] };
+  if (
+    parsed &&
+    typeof parsed === 'object' &&
+    !Array.isArray(parsed) &&
+    !Object.prototype.hasOwnProperty.call(parsed, 'content')
+  ) {
+    return { ...(parsed as InkToolCallResult), content: images };
   }
   return { result: parsed, content: images };
 }
