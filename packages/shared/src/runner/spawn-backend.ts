@@ -77,6 +77,11 @@ export interface SpawnBackendResult {
    * (a process the kernel cannot reap yet, or a `docker exec` client whose
    * container process outlives it): it may still be running, so a caller
    * must not treat what it holds as released.
+   *
+   * It speaks for the child alone. A descendant that inherited the child's
+   * pipes is neither signalled nor waited for: when the child exits and the
+   * descendant keeps the pipes open, the result settles at the stop's
+   * give-up with this true while the descendant may still run.
    */
   childExited: boolean;
 }
@@ -88,8 +93,11 @@ export interface SpawnedBackend {
   /**
    * Stop the child: SIGTERM now, SIGKILL after `graceMs`, and settle
    * `result` on the close that follows, or STOP_GIVE_UP_MS after the
-   * SIGKILL if none comes. A timeout runs the same ladder. Once the child
-   * has closed, or a stop is already under way, this does nothing.
+   * SIGKILL if none comes. A timeout runs the same ladder, and a timed-out
+   * result reports 124 even when the child exits 0 during the grace. Once the
+   * child has closed, or a stop is already under way, this does nothing: the
+   * first stop's grace stands, so an abort during a timeout's grace does not
+   * shorten it.
    */
   stop: (graceMs?: number) => void;
 }

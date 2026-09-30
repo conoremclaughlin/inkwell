@@ -508,15 +508,19 @@ describe('runBackendTurn', () => {
       }
     });
 
-    it('an abort during preparation spawns nothing and removes the per-spawn files', async () => {
+    it('an abort during preparation mints and spawns nothing, and removes the per-spawn files', async () => {
       spawnMock.mockReset().mockImplementation(() => createHeldChild());
       state.cleanups = 0;
+      // A minting host's credential for an aborted turn would stay live until
+      // its expiry (Myra, P2b-2a review).
+      const sessionEnv = vi.fn(async () => ({}));
       try {
         const turn = startBackendTurn({
           ...spawnContext,
           backend: 'claude',
           sbSlug: 'wren',
           prompt: 'synthetic',
+          host: fakeHost({ sessionEnv }),
         });
         turn.abort();
         expect(await turn.result).toMatchObject({
@@ -526,8 +530,32 @@ describe('runBackendTurn', () => {
           timedOut: false,
           childExited: true,
         });
+        expect(sessionEnv).not.toHaveBeenCalled();
         expect(spawnMock).not.toHaveBeenCalled();
         expect(state.cleanups).toBe(1);
+      } finally {
+        spawnMock.mockReset();
+      }
+    });
+
+    it('an abort during the mint spawns nothing', async () => {
+      spawnMock.mockReset().mockImplementation(() => createHeldChild());
+      let turn: ReturnType<typeof startBackendTurn> | undefined;
+      const sessionEnv = vi.fn(async () => {
+        turn!.abort();
+        return {};
+      });
+      try {
+        turn = startBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+          host: fakeHost({ sessionEnv }),
+        });
+        expect(await turn.result).toMatchObject({ exitCode: 143, childExited: true });
+        expect(sessionEnv).toHaveBeenCalledTimes(1);
+        expect(spawnMock).not.toHaveBeenCalled();
       } finally {
         spawnMock.mockReset();
       }

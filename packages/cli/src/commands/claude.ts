@@ -3770,13 +3770,14 @@ export async function runClaude(
       prompt,
       promptParts,
       passthroughArgs,
-      // A launcher runs in the user's own directory and terminal.
-      cwd: process.cwd(),
-      cliAttached: true,
       ...(startupContextBlock ? { startupContextBlock } : {}),
       ...sessionContext,
       ...(studioId ? { studioId } : {}),
       ...(options.dangerous ? { dangerous: true } : {}),
+      // A launcher runs in the user's own directory and terminal. Last, so
+      // no spread above can replace them with undefined.
+      cwd: process.cwd(),
+      cliAttached: true,
     },
     createCliBackendHost()
   );
@@ -4034,9 +4035,6 @@ export async function runClaudeInteractive(
         model: options.model,
         promptParts: [],
         passthroughArgs,
-        // A launcher runs in the user's own directory and terminal.
-        cwd: process.cwd(),
-        cliAttached: true,
         ...(startupContextBlock ? { startupContextBlock } : {}),
         ...sessionContext,
         ...(attemptBackendSessionId ? { backendSessionId: attemptBackendSessionId } : {}),
@@ -4045,6 +4043,10 @@ export async function runClaudeInteractive(
           : {}),
         ...(studioId ? { studioId } : {}),
         ...(options.dangerous ? { dangerous: true } : {}),
+        // A launcher runs in the user's own directory and terminal. Last, so
+        // no spread above can replace them with undefined.
+        cwd: process.cwd(),
+        cliAttached: true,
       },
       createCliBackendHost()
     );

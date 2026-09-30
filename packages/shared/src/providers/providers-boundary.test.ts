@@ -101,6 +101,59 @@ function providersSourceFiles(): string[] {
     .sort();
 }
 
+/** The relative module specifiers a file imports, in every form the checker reads. */
+function relativeSpecifiers(filePath: string, sourceText: string): string[] {
+  const source = ts.createSourceFile(filePath, sourceText, ts.ScriptTarget.ES2022, true);
+  const found: string[] = [];
+  const take = (specifier: ts.Expression | undefined): void => {
+    if (specifier && ts.isStringLiteralLike(specifier) && specifier.text.startsWith('.')) {
+      found.push(specifier.text);
+    }
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      take(node.moduleSpecifier);
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference)
+    ) {
+      take(node.moduleReference.expression);
+    } else if (
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
+    ) {
+      take(node.arguments[0]);
+    } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+      take(node.argument.literal);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+/**
+ * Every file the providers sources reach, following relative imports
+ * transitively: the runner and runtime modules they use, and whatever those
+ * import in turn. A rule checked only on the providers directory would admit
+ * anything one hop away.
+ */
+function closureFiles(): string[] {
+  const seen = new Set<string>();
+  const queue = providersSourceFiles();
+  while (queue.length > 0) {
+    const file = queue.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    for (const specifier of relativeSpecifiers(file, readFileSync(file, 'utf8'))) {
+      const target = resolve(dirname(file), specifier.replace(/\.js$/, '.ts'));
+      if (existsSync(target)) queue.push(target);
+    }
+  }
+  return [...seen].sort();
+}
+
 const check = (text: string) => importViolations(join(PROVIDERS_DIR, 'synthetic.ts'), text);
 const specifiers = (text: string) => check(text).map((v) => v.specifier);
 
@@ -161,6 +214,25 @@ describe('@inklabs/shared/providers keeps its closure', () => {
 
   it('imports nothing outside Node, its own files and the runner and runtime layers', () => {
     const found = files.flatMap((path) => importViolations(path, readFileSync(path, 'utf8')));
+    expect(found).toEqual([]);
+  });
+
+  // The same rule over everything reachable, not only the first hop (Myra,
+  // P2a review): a runner or runtime module the providers use is shipped
+  // with them, and so is whatever it imports.
+  it('reaches nothing outside Node and those three layers, however many hops away', () => {
+    const closure = closureFiles();
+    const reached = closure.map((path) => relative(SHARED_SRC, path));
+    // Known members, so a walker that stopped at the first hop would fail here.
+    expect(reached).toEqual(
+      expect.arrayContaining([
+        'providers/backend-runner.ts',
+        'runner/spawn-backend.ts',
+        'runner/mcp-config.ts',
+        'runtime/token-usage.ts',
+      ])
+    );
+    const found = closure.flatMap((path) => importViolations(path, readFileSync(path, 'utf8')));
     expect(found).toEqual([]);
   });
 });

@@ -232,6 +232,21 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         timeoutType: 'hard',
         childExited: true,
       });
+      const abortedBeforeSpawn = (command: string): BackendRunResult => ({
+        success: false,
+        stdout: '',
+        stderr: 'aborted before the backend was spawned',
+        exitCode: ABORTED_BEFORE_SPAWN_EXIT_CODE,
+        durationMs: 0,
+        command,
+        timedOut: false,
+        childExited: true,
+      });
+      // An abort during preparation ends the turn before anything is minted:
+      // a minting host's credential would otherwise outlive the turn.
+      if (abortRequested) {
+        return abortedBeforeSpawn(`${prepared.binary} ${prepared.args.join(' ')}`);
+      }
       const mintedCeilingMs = ceilingMs();
       if (mintedCeilingMs <= 0) {
         return deadlinePassed(`${prepared.binary} ${prepared.args.join(' ')}`);
@@ -247,18 +262,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       const hardTimeoutMs = Math.min(mintedCeilingMs, ceilingMs());
       if (hardTimeoutMs <= 0) return deadlinePassed(command);
 
-      if (abortRequested) {
-        return {
-          success: false,
-          stdout: '',
-          stderr: 'aborted before the backend was spawned',
-          exitCode: ABORTED_BEFORE_SPAWN_EXIT_CODE,
-          durationMs: 0,
-          command,
-          timedOut: false,
-          childExited: true,
-        };
-      }
+      // An abort during the mint or the lookup: the credential exists, but
+      // no child ever holds it.
+      if (abortRequested) return abortedBeforeSpawn(command);
 
       const spawned = spawnBackend({
         binary,
