@@ -135,4 +135,28 @@ describe('GeminiAdapter.checkEffectiveConfig', () => {
       await system?.cleanup();
     }
   });
+
+  // Myra's two pins on 72ffb53e (6ca84f50), through the real system file.
+  it.each<[string, Record<string, unknown>]>([
+    [
+      'a stdio server drawing the token through args',
+      { other: { command: '/synthetic/tool', args: ['--token', '$INK_ACCESS_TOKEN'] } },
+    ],
+    [
+      'an inkwell entry pointing elsewhere, whose own bearer then counts as foreign',
+      { inkwell: { type: 'http', url: 'https://inkwell.example.com/mcp' } },
+    ],
+  ])('refuses %s, copied from .mcp.json into the system file', async (_label, mcpServers) => {
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify({ mcpServers }));
+    const system = await buildGeminiSettings(join(root, 'tmp'), cwd, 'synthetic-context-token');
+    try {
+      expect(
+        await adapter.checkEffectiveConfig(
+          check({ adapterEnv: { GEMINI_CLI_SYSTEM_SETTINGS_PATH: system!.path } })
+        )
+      ).toContain('other than Inkwell');
+    } finally {
+      await system?.cleanup();
+    }
+  });
 });
