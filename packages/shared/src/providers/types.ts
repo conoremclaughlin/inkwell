@@ -22,6 +22,14 @@ export interface BackendHost {
     readonly studiosRoot: string;
   };
   /**
+   * The run's absolute deadline (epoch ms), when the host admitted one.
+   * Every spawn of the run, continuations and compaction included, ends by
+   * it: startBackendTurn clamps each spawn's hard ceiling to the time left
+   * and starts none once it has passed, so no spawn restarts the run's
+   * budget. The CLI's host has none.
+   */
+  readonly deadlineAt?: number;
+  /**
    * The routing a launcher inherits from the session it runs in. Read only
    * for a spawn that does not name its own (BackendConfig.explicitSession
    * unset), and then only for the MCP routing headers.
@@ -33,9 +41,9 @@ export interface BackendHost {
   skillMcpServers(cwd: string): Promise<SkillMcpServer[]>;
   /**
    * The credentials for one spawn, asked for after preparation, just before
-   * the spawn. `hardTimeoutMs` is the spawn's hard ceiling: a host that mints
-   * makes them last that long, within its own run's deadline, plus grace to
-   * settle. Routing names in the result are dropped (see startBackendTurn).
+   * the spawn. `hardTimeoutMs` is the spawn's hard ceiling, already clamped
+   * to `deadlineAt`: a host that mints makes them last that long, plus grace
+   * to settle. Routing names in the result are dropped (see startBackendTurn).
    */
   sessionEnv(spawn: { hardTimeoutMs: number }): Promise<Record<string, string>>;
   /** The executable to spawn for an adapter's binary name. */

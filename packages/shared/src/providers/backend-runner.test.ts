@@ -387,6 +387,127 @@ describe('runBackendTurn', () => {
     /** Preparation is asynchronous: the child exists once spawn was called. */
     const untilSpawned = () => vi.waitFor(() => expect(spawnMock).toHaveBeenCalled());
 
+    // One run, one deadline: a continuation late in the run gets the time
+    // left, and its credentials are minted for exactly that (Lumen, ff78c1b3).
+    it('ends a spawn by the run’s deadline, and mints for the time left', async () => {
+      vi.useFakeTimers();
+      try {
+        const child = createHeldChild();
+        spawnMock.mockReset().mockImplementation(() => child);
+        const deadlineAt = Date.now() + 1_000;
+        const asked: Array<{ hardTimeoutMs: number; leftAtMint: number }> = [];
+        const turn = startBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic continuation',
+          host: fakeHost({
+            deadlineAt,
+            sessionEnv: async ({ hardTimeoutMs }) => {
+              asked.push({ hardTimeoutMs, leftAtMint: deadlineAt - Date.now() });
+              // The mint takes 300 ms: the child still ends at the deadline.
+              vi.setSystemTime(Date.now() + 300);
+              return {};
+            },
+          }),
+        });
+        // waitFor moves the fake clock while it polls, so measure what is
+        // left rather than assume the whole second.
+        await untilSpawned();
+        expect(asked).toHaveLength(1);
+        expect(asked[0]!.hardTimeoutMs).toBe(asked[0]!.leftAtMint);
+        expect(asked[0]!.hardTimeoutMs).toBeGreaterThan(0);
+        expect(asked[0]!.hardTimeoutMs).toBeLessThanOrEqual(1_000);
+        const left = deadlineAt - Date.now();
+        await vi.advanceTimersByTimeAsync(left - 1);
+        expect(child.kill).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(child.kill.mock.calls).toEqual([['SIGTERM']]);
+        child.emit('close', null, 'SIGTERM');
+        expect(await turn.result).toMatchObject({ timedOut: true, timeoutType: 'hard' });
+      } finally {
+        vi.useRealTimers();
+        spawnMock.mockReset();
+      }
+    });
+
+    it('starts nothing when the deadline passes while its credentials are minted', async () => {
+      vi.useFakeTimers();
+      spawnMock.mockReset().mockImplementation(() => createHeldChild());
+      try {
+        const deadlineAt = Date.now() + 100;
+        const result = await runBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+          host: fakeHost({
+            deadlineAt,
+            sessionEnv: async () => {
+              vi.setSystemTime(deadlineAt + 1);
+              return {};
+            },
+          }),
+        });
+        expect(result).toMatchObject({ exitCode: 124, timedOut: true, childExited: true });
+        expect(spawnMock).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        spawnMock.mockReset();
+      }
+    });
+
+    it('keeps a spawn’s own ceiling when it is shorter than the time left', async () => {
+      spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+      const asked: number[] = [];
+      try {
+        await runBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+          timeoutMs: 500,
+          host: fakeHost({
+            deadlineAt: Date.now() + 60 * 60 * 1000,
+            sessionEnv: async ({ hardTimeoutMs }) => {
+              asked.push(hardTimeoutMs);
+              return {};
+            },
+          }),
+        });
+        expect(asked).toEqual([500]);
+      } finally {
+        spawnMock.mockReset();
+      }
+    });
+
+    it('starts nothing, and mints nothing, once the run’s deadline has passed', async () => {
+      spawnMock.mockReset().mockImplementation(() => createHeldChild());
+      state.cleanups = 0;
+      const sessionEnv = vi.fn(async () => ({}));
+      try {
+        const result = await runBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+          host: fakeHost({ deadlineAt: Date.now() - 1, sessionEnv }),
+        });
+        expect(result).toMatchObject({
+          success: false,
+          exitCode: 124,
+          timedOut: true,
+          timeoutType: 'hard',
+          childExited: true,
+        });
+        expect(spawnMock).not.toHaveBeenCalled();
+        expect(sessionEnv).not.toHaveBeenCalled();
+        expect(state.cleanups).toBe(1);
+      } finally {
+        spawnMock.mockReset();
+      }
+    });
+
     it('an abort during preparation spawns nothing and removes the per-spawn files', async () => {
       spawnMock.mockReset().mockImplementation(() => createHeldChild());
       state.cleanups = 0;

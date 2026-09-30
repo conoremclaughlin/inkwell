@@ -156,7 +156,13 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
   const streaming = Boolean(request.stream && adapter.createStreamParser);
   const parser = streaming ? adapter.createStreamParser!() : null;
-  const hardTimeoutMs = request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS;
+  const requestedCeilingMs = request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS;
+  // A spawn ends by the run's deadline, whatever ceiling it asked for: a
+  // continuation late in a run gets what is left, never a fresh budget.
+  const ceilingMs = (): number =>
+    host.deadlineAt === undefined
+      ? requestedCeilingMs
+      : Math.min(requestedCeilingMs, host.deadlineAt - Date.now());
 
   // Streaming accumulators, populated as events arrive.
   let accumulatedText = '';
@@ -215,10 +221,31 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
       // and the same names in the credentials are dropped, so an id the
       // caller left undefined stays absent rather than arriving from
       // wherever the credentials came.
-      const credentials: Record<string, string> = { ...(await host.sessionEnv({ hardTimeoutMs })) };
+      const deadlinePassed = (command: string): BackendRunResult => ({
+        success: false,
+        stdout: '',
+        stderr: "the run's deadline passed before the backend was spawned",
+        exitCode: 124,
+        durationMs: 0,
+        command,
+        timedOut: true,
+        timeoutType: 'hard',
+        childExited: true,
+      });
+      const mintedCeilingMs = ceilingMs();
+      if (mintedCeilingMs <= 0) {
+        return deadlinePassed(`${prepared.binary} ${prepared.args.join(' ')}`);
+      }
+      const credentials: Record<string, string> = {
+        ...(await host.sessionEnv({ hardTimeoutMs: mintedCeilingMs })),
+      };
       for (const name of ROUTING_ENV_NAMES) delete credentials[name];
       const binary = await host.resolveBinary(prepared.binary);
       const command = `${binary} ${prepared.args.join(' ')}`;
+      // Measured again at the spawn: time has passed since the mint, so the
+      // child's ceiling is never longer than the credentials it was handed.
+      const hardTimeoutMs = Math.min(mintedCeilingMs, ceilingMs());
+      if (hardTimeoutMs <= 0) return deadlinePassed(command);
 
       if (abortRequested) {
         return {
