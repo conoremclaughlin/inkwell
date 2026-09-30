@@ -44,22 +44,31 @@ interface JsonRpcResponse {
  * or an object whose own `content` is application data of any shape — is kept
  * whole under `result`. Merging into that key erased a string or object and
  * blended image blocks into an array (Lumen, PR #708 round 2).
+ *
+ * A wrapped payload's failure flags are copied up beside it, as they are.
+ * `success` and `isError` are read at the top level by every failure predicate
+ * (isSemanticFailure, isErrorPayload); nested under `result` a failed call read
+ * as a receipt (Lumen, PR #708 round 3). The predicates stay as they are:
+ * treating arbitrary nested data as a failure signal would be its own bug.
  */
+const FAILURE_FLAGS = ['success', 'isError'] as const;
+
 function withImageBlocks(
   parsed: unknown,
   content: JsonRpcToolResult['content']
 ): InkToolCallResult {
   const images = (content ?? []).filter((item) => item?.type === 'image');
   if (images.length === 0) return parsed as InkToolCallResult;
-  if (
-    parsed &&
-    typeof parsed === 'object' &&
-    !Array.isArray(parsed) &&
-    !Object.prototype.hasOwnProperty.call(parsed, 'content')
-  ) {
+  const isObject = Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
+  const own = (key: string) => isObject && Object.prototype.hasOwnProperty.call(parsed, key);
+  if (isObject && !own('content')) {
     return { ...(parsed as InkToolCallResult), content: images };
   }
-  return { result: parsed, content: images };
+  const flags: InkToolCallResult = {};
+  for (const key of FAILURE_FLAGS) {
+    if (own(key)) flags[key] = (parsed as InkToolCallResult)[key];
+  }
+  return { ...flags, result: parsed, content: images };
 }
 
 let jsonRpcId = 1;

@@ -6,12 +6,14 @@
  * fast, clearly-labelled error.
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { fetchWithTimeout, InkClient } from './ink-client';
 import { captureToolImages, takeCapturedImages } from '../repl/tool-images.js';
+import { isSemanticFailure, localToolLedgerLine } from '../repl/auto-evict.js';
+import { isErrorPayload } from '@inklabs/shared/runtime';
 
 const originalFetch = global.fetch;
 
@@ -312,9 +314,63 @@ describe('InkClient surfaces failed tool calls', () => {
         const payload = { success: true, content: own };
         respond([{ type: 'text', text: JSON.stringify(payload) }, image]);
         const result = (await makeClient().callTool('render_chart', {})) as Record<string, unknown>;
-        expect(result).toEqual({ result: payload, content: [image] });
+        // `success` is also copied up beside it (round 3, below).
+        expect(result).toEqual({ success: true, result: payload, content: [image] });
       }
     );
+
+    // Lumen, PR #708 round 3: nested under `result`, a failed call's flags were
+    // invisible to every failure predicate, and the ledger recorded a receipt.
+    // Checked with the production predicates, never a restatement of them.
+    describe("a wrapped payload's failure flags stay where the failure predicates read them", () => {
+      const call = async (payload: Record<string, unknown>) => {
+        respond([{ type: 'text', text: JSON.stringify(payload) }, image]);
+        const result = await makeClient().callTool('render_chart', {});
+        return { result, captured: await captureToolImages(result, captureOpts()) };
+      };
+      let cacheDir: string;
+      const captureOpts = () => ({
+        cacheDir: async () => cacheDir,
+        delivery: () => ({ deliverable: true }) as const,
+      });
+      beforeEach(() => {
+        cacheDir = mkdtempSync(join(tmpdir(), 'ink-client-flags-'));
+      });
+      afterEach(() => rmSync(cacheDir, { recursive: true, force: true }));
+
+      // The predicates first: they are the contract. The shape is how it holds.
+      it('success: false reads as a failure, and the ledger says so', async () => {
+        const payload = { success: false, error: 'render failed', content: 'diagnostic' };
+        const { result, captured } = await call(payload);
+        expect(isSemanticFailure(captured)).toBe(true);
+        expect(localToolLedgerLine('render_chart', captured, JSON.stringify(captured))).toMatch(
+          /^Local tool failed \(render_chart\)/
+        );
+        expect(result).toEqual({ success: false, result: payload, content: [image] });
+      });
+
+      it('isError: true reads as a declared error', async () => {
+        const payload = { isError: true, content: { detail: 'diagnostic' } };
+        const { result, captured } = await call(payload);
+        expect(isErrorPayload(captured)).toBe(true);
+        expect(isSemanticFailure(captured)).toBe(true);
+        expect(result).toEqual({ isError: true, result: payload, content: [image] });
+      });
+
+      it('success: true is carried as it is, and is no failure', async () => {
+        const payload = { success: true, content: 'caption' };
+        const { result, captured } = await call(payload);
+        expect(result).toEqual({ success: true, result: payload, content: [image] });
+        expect(isSemanticFailure(captured)).toBe(false);
+        expect(isErrorPayload(captured)).toBe(false);
+      });
+
+      it('a payload with no flags gains none', async () => {
+        const payload = { content: 'caption', note: 'no flags here' };
+        const { result } = await call(payload);
+        expect(result).toEqual({ result: payload, content: [image] });
+      });
+    });
 
     it('the kept payload survives capture: its data stays, only the image bytes go', async () => {
       const payload = { success: true, content: 'synthetic-caption-marker' };
