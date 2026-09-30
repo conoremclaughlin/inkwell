@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
 import type {
   InjectedContext,
   ClaudeRunnerConfig,
@@ -126,7 +127,9 @@ export class GeminiRunner implements IRunner {
 
       const settingsDir = config.container?.runtimeDir || join(tmpdir(), 'sb-gemini');
       mkdirSync(settingsDir, { recursive: true });
-      const settingsFilename = `settings-${process.pid}-${Date.now()}.json`;
+      // This file carries the session's own headers; concurrent spawns in one
+      // millisecond must not share it.
+      const settingsFilename = `settings-${process.pid}-${randomUUID()}.json`;
       const settingsFile = join(settingsDir, settingsFilename);
       try {
         writeFileSync(settingsFile, JSON.stringify({ mcpServers }, null, 2));

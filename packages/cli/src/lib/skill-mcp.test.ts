@@ -186,6 +186,44 @@ mcp:
     }
   });
 
+  it('gives each spawn its own merged file when skills add servers', () => {
+    const skillDir = join(tmpDir, '.ink', 'skills', 'playwright-mcp');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, 'SKILL.md'),
+      `---
+name: playwright-mcp
+description: Browser automation
+mcp:
+  name: playwright
+  command: npx
+  args: ["@playwright/mcp"]
+  env: {}
+---
+`
+    );
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
+      })
+    );
+
+    const first = buildMergedMcpConfig(tmpDir);
+    const second = buildMergedMcpConfig(tmpDir);
+    try {
+      expect(second.mcpConfigPath).not.toBe(first.mcpConfigPath);
+      first.cleanup();
+      expect(existsSync(second.mcpConfigPath!)).toBe(true);
+      expect(
+        JSON.parse(readFileSync(second.mcpConfigPath!, 'utf-8')).mcpServers.playwright
+      ).toBeDefined();
+    } finally {
+      first.cleanup();
+      second.cleanup();
+    }
+  });
+
   it('does not override existing MCP servers', () => {
     const skillDir = join(tmpDir, '.ink', 'skills', 'ink-override');
     mkdirSync(skillDir, { recursive: true });
@@ -597,5 +635,21 @@ mcp:
     expect(existsSync(mcpConfigPath!)).toBe(true);
     cleanup();
     expect(existsSync(mcpConfigPath!)).toBe(false);
+  });
+
+  // Two spawns in one process (a parent and its shadow clones, or two sessions
+  // in one host) each get their own file, so the first to finish cannot delete
+  // a config the second's backend has not read yet.
+  it('gives each spawn its own file, so one cleanup leaves the other config in place', () => {
+    const first = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const second = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    try {
+      expect(second.mcpConfigPath).not.toBe(first.mcpConfigPath);
+      first.cleanup();
+      expect(existsSync(second.mcpConfigPath!)).toBe(true);
+    } finally {
+      first.cleanup();
+      second.cleanup();
+    }
   });
 });

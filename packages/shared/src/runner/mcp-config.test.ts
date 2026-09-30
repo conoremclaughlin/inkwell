@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -20,6 +20,7 @@ function writeTempConfig(config: object): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   try {
     rmSync(testDir, { recursive: true, force: true });
   } catch {
@@ -28,6 +29,27 @@ afterEach(() => {
 });
 
 describe('injectSessionHeaders', () => {
+  // Server runners spawn concurrently in one process. Two injections in the
+  // same millisecond must not share a file: the first spawn's cleanup would
+  // delete the config the second's backend has not read yet.
+  it('gives each injection its own file, even within one millisecond', () => {
+    const configPath = writeTempConfig({
+      mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
+    });
+    vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+    const first = injectSessionHeaders({ mcpConfigPath: configPath, inkSessionId: 'session-a' });
+    const second = injectSessionHeaders({ mcpConfigPath: configPath, inkSessionId: 'session-b' });
+    vi.restoreAllMocks();
+    try {
+      expect(second.mcpConfigPath).not.toBe(first.mcpConfigPath);
+      first.cleanup();
+      expect(existsSync(second.mcpConfigPath)).toBe(true);
+    } finally {
+      first.cleanup();
+      second.cleanup();
+    }
+  });
+
   it('injects session and studio headers into inkwell server config', () => {
     const configPath = writeTempConfig({
       mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },

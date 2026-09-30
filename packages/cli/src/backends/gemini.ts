@@ -16,6 +16,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
+import { randomUUID } from 'crypto';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
@@ -34,7 +35,7 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  * for GitHub auth which works, but Inkwell headers haven't been verified end-to-end.
  * Live validation needed once Aster's quota resets.
  */
-function buildGeminiSettings(
+export function buildGeminiSettings(
   cwd: string,
   contextToken: string,
   sessionId?: string,
@@ -72,7 +73,7 @@ function buildGeminiSettings(
 
   const settingsDir = join(tmpdir(), 'ink-gemini');
   mkdirSync(settingsDir, { recursive: true });
-  const settingsFile = join(settingsDir, `settings-${process.pid}-${Date.now()}.json`);
+  const settingsFile = join(settingsDir, `settings-${process.pid}-${randomUUID()}.json`);
   try {
     writeFileSync(settingsFile, JSON.stringify({ mcpServers }, null, 2));
     return {

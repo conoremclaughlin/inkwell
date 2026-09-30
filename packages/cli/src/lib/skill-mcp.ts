@@ -11,6 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
 import { injectSessionHeaders } from '@inklabs/shared';
 import { discoverSkills } from '../repl/skills.js';
 
@@ -237,7 +238,10 @@ export function buildMergedMcpConfig(
     }
     const tmpDir = join(tmpdir(), 'sb-mcp');
     mkdirSync(tmpDir, { recursive: true });
-    const tmpPath = join(tmpDir, `mcp-local-${process.pid}.json`);
+    // One file per spawn, not per process: a parent and its shadow clones
+    // spawn from one process, and the first cleanup would otherwise delete a
+    // config another backend has not read yet.
+    const tmpPath = join(tmpDir, `mcp-local-${process.pid}-${randomUUID()}.json`);
     writeFileSync(tmpPath, JSON.stringify(config, null, 2));
     return {
       mcpConfigPath: tmpPath,
@@ -336,7 +340,7 @@ export function buildMergedMcpConfig(
   // Write final merged config (skills + headers) to temp file
   const tmpDir = join(tmpdir(), 'sb-mcp');
   mkdirSync(tmpDir, { recursive: true });
-  const tmpPath = join(tmpDir, `mcp-${process.pid}.json`);
+  const tmpPath = join(tmpDir, `mcp-${process.pid}-${randomUUID()}.json`);
   writeFileSync(tmpPath, JSON.stringify(config, null, 2));
 
   // Clean up the injection temp file (if any) since we wrote a new one

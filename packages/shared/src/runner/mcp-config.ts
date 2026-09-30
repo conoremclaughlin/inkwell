@@ -13,6 +13,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -143,7 +144,9 @@ export function injectSessionHeaders(
   // Write modified config to temp file (or outputDir for container execution)
   const tmpDir = options.outputDir || join(tmpdir(), 'sb-mcp');
   mkdirSync(tmpDir, { recursive: true });
-  const tmpPath = join(tmpDir, `mcp-server-${process.pid}-${Date.now()}.json`);
+  // Unique per spawn: server runners spawn concurrently in one process, and a
+  // millisecond does not separate them.
+  const tmpPath = join(tmpDir, `mcp-server-${process.pid}-${randomUUID()}.json`);
   writeFileSync(tmpPath, JSON.stringify(config, null, 2));
 
   return {
