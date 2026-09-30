@@ -42,13 +42,20 @@ const CLI_ONLY_MODULES: ReadonlySet<string> = new Set(['skill-servers.js', 'skil
 /** The only members of `process` a preparation file may touch. */
 const ALLOWED_PROCESS_MEMBERS: ReadonlySet<string> = new Set(['pid', 'stdout', 'stderr']);
 
-/** Host modules, and the value imports each may give a preparation file. */
+/**
+ * Host modules, and the value imports each may give a preparation file.
+ * `vm`, `worker_threads` and `inspector` run source text this check cannot
+ * read, as `eval` and `Function` do, so they give nothing.
+ */
 const HOST_MODULES: Record<string, ReadonlySet<string>> = {
   fs: new Set(['constants']),
   os: new Set(),
   child_process: new Set(),
   process: ALLOWED_PROCESS_MEMBERS,
   module: new Set(),
+  vm: new Set(),
+  worker_threads: new Set(),
+  inspector: new Set(),
 };
 
 /**
@@ -203,9 +210,10 @@ function prepViolations(fileName: string, text: string): Violation[] {
     } else if (
       ts.isElementAccessExpression(node) &&
       ts.isStringLiteralLike(node.argumentExpression) &&
-      node.argumentExpression.text === 'process'
+      REFUSED_MEMBERS.has(node.argumentExpression.text)
     ) {
-      add(node, "['process']");
+      // The computed twin of `.process` and `.require`.
+      add(node, `['${node.argumentExpression.text}']`);
     } else if (ts.isIdentifier(node)) {
       const parent = node.parent;
       if (
@@ -394,6 +402,13 @@ describe('preparation guard, against known answers', () => {
     ["module.require('fs');", 'module'],
     ["const m = module; m.require('fs');", 'module'],
     ["holder.require('fs');", '.require'],
+    // Code the check cannot read, and the computed twin of `.require` (Myra, ade5865f).
+    ["import { runInThisContext } from 'node:vm';", 'vm.runInThisContext'],
+    ["import vm from 'vm';", 'default import of vm'],
+    ["import { Worker } from 'node:worker_threads';", 'worker_threads.Worker'],
+    ["const m = import('node:inspector');", 'dynamic import of inspector'],
+    ["holder['require']('fs');", "['require']"],
+    ['holder[`require`]("fs");', "['require']"],
     [
       "import { sessionEnvHandoff } from '../runner/spawn-backend.js'; sessionEnvHandoff();",
       'sessionEnvHandoff',
