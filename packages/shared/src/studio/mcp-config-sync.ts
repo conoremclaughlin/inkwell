@@ -14,6 +14,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, lstatSync } from 'fs';
 import { join } from 'path';
+import { formatTomlPath, readTomlDefinitions, type TomlStatement } from './toml-definitions.js';
 
 export interface McpServerConfig {
   type?: string;
@@ -283,36 +284,75 @@ function managedBlockPattern(existing: string): RegExp | undefined {
   return new RegExp(`${escapeRegExp(startMarker)}[\\s\\S]*?${escapeRegExp(endMarker)}\\n?`, 'm');
 }
 
-/**
- * The tables a TOML file declares, each as its dotted path with quotes and
- * whitespace removed (`[ mcp_servers . "figma" ]` is `mcp_servers.figma`), in
- * file order. An array-of-tables header (`[[...]]`) is not a table and is
- * left out. Declaring the same table twice is a parse error for Codex.
- */
-export function tomlTableHeaders(toml: string): string[] {
-  const headers: string[] = [];
-  for (const line of toml.split('\n')) {
-    const match = /^\s*\[(?!\[)([^[\]]+)\]\s*(?:#.*)?$/.exec(line);
-    if (match) headers.push(match[1]!.replace(/["'\s]/g, ''));
+/** A Codex config read against ink's managed block. */
+export interface CodexConfigReading {
+  /** 1-based line of the statement that could not be read; nothing after it was judged. */
+  unreadableLine?: number;
+  /** Paths defined more than once, which Codex refuses to parse, as `a.b`. */
+  redefined: string[];
+  /** The same, where both definitions sit outside ink's managed block, so no sync removes either. */
+  redefinedOutsideBlock: string[];
+  /** Servers whose definition in the managed block collides with one outside it. */
+  collidingWithBlock: string[];
+  /** Whether the inkwell server's own table is defined, in any spelling. */
+  definesInkwell: boolean;
+  /** Whether that definition sits outside ink's managed block, in a file that has one. */
+  inkwellOutsideBlock: boolean;
+}
+
+/** 0-based lines of the managed block's markers, current markers first, as managedBlockPattern picks. */
+function managedBlockLines(lines: string[]): { start: number; end: number } | undefined {
+  for (const [startMarker, endMarker] of [
+    [CODEX_MANAGED_START, CODEX_MANAGED_END],
+    [CODEX_MANAGED_START_LEGACY, CODEX_MANAGED_END_LEGACY],
+  ] as const) {
+    const start = lines.findIndex((line) => line.trim() === startMarker);
+    const end =
+      start === -1 ? -1 : lines.findIndex((line, i) => i > start && line.trim() === endMarker);
+    if (end !== -1) return { start, end };
   }
-  return headers;
+  return undefined;
 }
 
 /**
- * The MCP servers a Codex config declares outside ink's managed block. The
- * sync rewrites only its block, so a server declared outside stays; the block
- * must not declare it again, or the file declares the table twice and Codex
- * refuses to start (lumen-alpha, 2026-09-29, #701). A file with no block has
- * its old generated sections stripped instead, so nothing outside survives.
+ * Read a Codex config by what its keys resolve to (readTomlDefinitions), and
+ * say which definitions sit inside ink's managed block. The sync rewrites
+ * only that block, so a server defined outside it stays; the block must not
+ * define it again, or Codex refuses the whole file (lumen-alpha, 2026-09-29,
+ * #701).
  */
-function codexServersOutsideBlock(existing: string | undefined): Set<string> {
-  const pattern = existing ? managedBlockPattern(existing) : undefined;
-  if (!existing || !pattern) return new Set();
-  return new Set(
-    tomlTableHeaders(existing.replace(pattern, ''))
-      .filter((header) => header.startsWith('mcp_servers.'))
-      .map((header) => header.split('.')[1]!)
-  );
+export function readCodexConfig(toml: string): CodexConfigReading {
+  const definitions = readTomlDefinitions(toml);
+  const block = managedBlockLines(toml.split('\n'));
+  // Statement lines are 1-based; the markers' are 0-based.
+  const inBlock = (statement: TomlStatement) =>
+    !!block && statement.line - 1 > block.start && statement.line - 1 < block.end;
+  const serverOf = (statement: TomlStatement) =>
+    statement.path[0] === 'mcp_servers' && statement.path.length > 1
+      ? statement.path[1]
+      : undefined;
+
+  const redefined = new Set<string>();
+  const redefinedOutsideBlock = new Set<string>();
+  const collidingWithBlock = new Set<string>();
+  for (const { path, first, second } of definitions.redefinitions) {
+    redefined.add(formatTomlPath(path));
+    const managed = [second, first].find(inBlock);
+    const server = managed ? serverOf(managed) : undefined;
+    if (server !== undefined) collidingWithBlock.add(server);
+    else if (!managed) redefinedOutsideBlock.add(formatTomlPath(path));
+  }
+  const inkwell = definitions.definedBy(['mcp_servers', 'inkwell']);
+  return {
+    ...(definitions.unreadableLine !== undefined
+      ? { unreadableLine: definitions.unreadableLine }
+      : {}),
+    redefined: [...redefined],
+    redefinedOutsideBlock: [...redefinedOutsideBlock],
+    collidingWithBlock: [...collidingWithBlock],
+    definesInkwell: !!inkwell,
+    inkwellOutsideBlock: !!inkwell && !!block && !inBlock(inkwell),
+  };
 }
 
 function mergeCodexConfig(existing: string | undefined, managedBlock: string): string {
@@ -427,14 +467,59 @@ function isSymlink(p: string): boolean {
   }
 }
 
+/**
+ * The managed block and the file it makes, leaving out every server whose
+ * definition collides with one outside the block. Each pass renders the
+ * block, reads the merged file as Codex would, and drops the servers it
+ * charges a redefinition to, until none is charged; dropping a definition
+ * never makes a new collision, so each pass drops at least one or ends.
+ */
+function mergeCodexServers(
+  existing: string | undefined,
+  servers: Record<string, McpServerConfig>
+): { merged: string; keptOutside: string[]; handEdit: string[] } {
+  const managed = { ...servers };
+  const keptOutside: string[] = [];
+  for (;;) {
+    const merged = mergeCodexConfig(existing, renderCodexManagedBlock(managed));
+    const reading = readCodexConfig(merged);
+    const colliding = reading.collidingWithBlock.filter((name) => Object.hasOwn(managed, name));
+    if (reading.unreadableLine === undefined && colliding.length > 0) {
+      for (const name of colliding) delete managed[name];
+      keptOutside.push(...colliding);
+      continue;
+    }
+    // Fixed strings, key paths and line numbers only: never a value.
+    const handEdit: string[] = [];
+    if (reading.unreadableLine !== undefined) {
+      handEdit.push(
+        `.codex/config.toml could not be read at line ${reading.unreadableLine}, so the sync could not check it for a server defined twice`
+      );
+    }
+    if (keptOutside.includes('inkwell')) {
+      handEdit.push(
+        ".codex/config.toml defines the inkwell server outside ink's managed block, where the sync cannot update it: remove that definition, then run `ink mcp sync`"
+      );
+    }
+    if (reading.redefinedOutsideBlock.length > 0) {
+      handEdit.push(
+        `.codex/config.toml defines [${reading.redefinedOutsideBlock.join('], [')}] more than once outside ink's managed block, which Codex cannot parse: remove one`
+      );
+    }
+    return { merged, keptOutside: keptOutside.sort(), handEdit };
+  }
+}
+
 export function syncMcpConfig(
   targetDir: string,
   options?: { sourceMcpPath?: string; sourceEnvPath?: string }
 ): {
   codex: boolean;
   gemini: boolean;
-  /** Servers the Codex block left out because the file declares them outside it. */
+  /** Servers the Codex block left out because the file defines them outside it. */
   codexKeptOutside?: string[];
+  /** What the sync could not repair in .codex/config.toml, for a human to edit. */
+  codexHandEdit?: string[];
 } {
   const mcpPath = options?.sourceMcpPath || join(targetDir, '.mcp.json');
 
@@ -464,20 +549,16 @@ export function syncMcpConfig(
   const codexPath = join(codexDir, 'config.toml');
   let codex = false;
   let codexKeptOutside: string[] = [];
+  let codexHandEdit: string[] = [];
   if (!isSymlink(codexDir) && !isSymlink(codexPath)) {
     mkdirSync(codexDir, { recursive: true });
     const existingCodex = existsSync(codexPath) ? readFileSync(codexPath, 'utf-8') : undefined;
-    // A server already declared outside the block keeps that declaration,
+    // A server already defined outside the block keeps that definition,
     // since the sync never rewrites outside its block; the block leaves it out.
-    const outside = codexServersOutsideBlock(existingCodex);
-    const managedServers = Object.fromEntries(
-      Object.entries(servers).filter(([name]) => !outside.has(name))
-    );
-    codexKeptOutside = Object.keys(servers)
-      .filter((name) => outside.has(name))
-      .sort();
-    const managedBlock = renderCodexManagedBlock(managedServers);
-    writeFileSync(codexPath, mergeCodexConfig(existingCodex, managedBlock));
+    const { merged, keptOutside, handEdit } = mergeCodexServers(existingCodex, servers);
+    codexKeptOutside = keptOutside;
+    codexHandEdit = handEdit;
+    writeFileSync(codexPath, merged);
     codex = true;
   }
 
@@ -507,5 +588,10 @@ export function syncMcpConfig(
     ensureGitignoreEntries(targetDir, ['.codex/', '.gemini/']);
   }
 
-  return { codex, gemini, ...(codexKeptOutside.length > 0 ? { codexKeptOutside } : {}) };
+  return {
+    codex,
+    gemini,
+    ...(codexKeptOutside.length > 0 ? { codexKeptOutside } : {}),
+    ...(codexHandEdit.length > 0 ? { codexHandEdit } : {}),
+  };
 }

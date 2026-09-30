@@ -24,7 +24,7 @@
 
 import { existsSync, lstatSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { tomlTableHeaders } from './mcp-config-sync.js';
+import { readCodexConfig } from './mcp-config-sync.js';
 
 export const STUDIO_CHECK_IDS = [
   'mcp-json',
@@ -264,26 +264,31 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
 
   // .codex/config.toml — the MCP section `ink mcp sync` writes and the
   // hooks table `ink hooks install --backend codex` writes.
+  // Read by what its keys resolve to, not by how a header is spelled: a
+  // table defined twice in any spelling is a parse error, and Codex refuses
+  // to start at all (lumen-alpha, 2026-09-29, #701).
   const codex = readText(join(worktreePath, '.codex', 'config.toml'));
-  const codexMcp = !!codex && /^\[mcp_servers\.inkwell\]\s*$/m.test(codex);
-  // A table declared twice is a parse error: Codex refuses to start at all
-  // (lumen-alpha, 2026-09-29, #701), so the studio goes to its repair.
-  const codexTables = codex ? tomlTableHeaders(codex) : [];
-  const codexDuplicates = [
-    ...new Set(codexTables.filter((table, i) => codexTables.indexOf(table) !== i)),
-  ];
+  const codexReading = codex === null ? undefined : readCodexConfig(codex);
   add(
     'codex-mcp',
     '.codex/config.toml inkwell MCP section',
     true,
-    codexMcp && codexDuplicates.length === 0,
-    !codexMcp
-      ? codex
-        ? 'no [mcp_servers.inkwell]'
-        : 'missing'
-      : codexDuplicates.length > 0
-        ? `declares [${codexDuplicates.join('], [')}] more than once, which Codex cannot parse; run \`ink mcp sync\``
-        : 'inkwell server configured'
+    !!codexReading &&
+      codexReading.unreadableLine === undefined &&
+      codexReading.redefined.length === 0 &&
+      codexReading.definesInkwell &&
+      !codexReading.inkwellOutsideBlock,
+    !codexReading
+      ? 'missing'
+      : codexReading.unreadableLine !== undefined
+        ? `could not be read at line ${codexReading.unreadableLine}`
+        : codexReading.redefined.length > 0
+          ? `defines [${codexReading.redefined.join('], [')}] more than once, which Codex cannot parse; run \`ink mcp sync\``
+          : !codexReading.definesInkwell
+            ? 'no [mcp_servers.inkwell]'
+            : codexReading.inkwellOutsideBlock
+              ? "defines [mcp_servers.inkwell] outside ink's managed block, where `ink mcp sync` cannot update it; remove that definition, then run `ink mcp sync`"
+              : 'inkwell server configured'
   );
   const codexCommands = codex
     ? codex
