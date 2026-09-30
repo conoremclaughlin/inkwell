@@ -168,6 +168,26 @@ describe('getRuntimeBuildInfo', () => {
 
     expect(info.processManager).toBe('pm2');
   });
+
+  it('reports the run mode as prod only under NODE_ENV=production, which both prod scripts set', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    const saved = process.env.NODE_ENV;
+    try {
+      for (const [nodeEnv, runMode] of [
+        ['production', 'prod'],
+        ['development', 'dev'],
+        ['test', 'dev'],
+        [undefined, 'dev'],
+      ] as const) {
+        if (nodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = nodeEnv;
+        expect(getRuntimeBuildInfo(20_000).runMode, String(nodeEnv)).toBe(runMode);
+      }
+    } finally {
+      process.env.NODE_ENV = saved;
+    }
+  });
 });
 
 /**

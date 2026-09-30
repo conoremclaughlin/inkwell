@@ -235,5 +235,11 @@ export function getRuntimeBuildInfo(nowMs = Date.now()) {
      */
     behindOriginApi: cachedApiBehindOrigin !== null && cachedApiBehindOrigin > 0,
     processManager: process.env.pm_id ? 'pm2' : 'direct',
+    /**
+     * `prod` for a built server (`yarn prod` and `yarn prod:direct` both set
+     * NODE_ENV=production), `dev` otherwise. A dev server reloads its own code
+     * as it changes, so the dashboard reports a stale build only for `prod`.
+     */
+    runMode: process.env.NODE_ENV === 'production' ? 'prod' : 'dev',
   };
 }
