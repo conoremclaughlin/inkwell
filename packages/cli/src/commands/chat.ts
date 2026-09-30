@@ -52,6 +52,7 @@ import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purit
 import { completeStudioAtLaunch, type LaunchStudioDeps } from '../lib/launch-studio.js';
 import { detectWorktree } from './init.js';
 import { SessionLog } from '../session/session-log.js';
+import { toolIntentCommitter } from '../session/tool-intent.js';
 import {
   ensureBackendAuthReady,
   isBackendAuthBackend,
@@ -6450,6 +6451,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     try {
       await executeToolCalls(calls, {
         policy: opts.policy,
+        commitIntent: toolIntentCommitter(opts.log),
         sessionId: runtime.sessionId,
         signal: opts.signal,
         callTool: createLocalToolDispatcher({
@@ -6524,6 +6526,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             result.result === undefined ? undefined : JSON.stringify(result.result);
           opts.log.append({
             type: 'clone_tool_call',
+            invocationId: result.invocationId,
+            dispatchState: result.dispatchState,
             tool: result.tool,
             args: result.args,
             status: result.status,
@@ -6822,6 +6826,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     try {
       await executeToolCalls(calls, {
         policy: toolPolicy,
+        commitIntent: toolIntentCommitter(runtime.log),
         signal: abortSignal,
         callTool: createLocalToolDispatcher({
           cwd: process.cwd(),
@@ -6902,6 +6907,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             );
             runtime.log.append({
               type: 'local_tool_call',
+              invocationId: result.invocationId,
+              dispatchState: result.dispatchState,
               tool: result.tool,
               args: result.args,
               status: result.status,
@@ -6985,6 +6992,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             }
             runtime.log.append({
               type: 'local_tool_call',
+              invocationId: result.invocationId,
+              dispatchState: result.dispatchState,
               tool: result.tool,
               args: result.args,
               status: result.status,
@@ -7022,6 +7031,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             );
             runtime.log.append({
               type: 'local_tool_call',
+              invocationId: result.invocationId,
+              dispatchState: result.dispatchState,
               tool: result.tool,
               args: result.args,
               status: 'error',

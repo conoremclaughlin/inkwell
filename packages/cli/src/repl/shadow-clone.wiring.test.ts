@@ -120,6 +120,7 @@ function buildClone(opts: {
           execute: async (calls, ctx) => {
             const results: ToolResultRecord[] = [];
             await executeToolCalls(calls, {
+              commitIntent: async () => {},
               policy,
               sessionId: 'sess-1',
               // Production threads the turn signal here; without it the
@@ -735,6 +736,7 @@ describe('shadow clone cancellation reaches the tools themselves', () => {
     const seen: Array<{ tool: string; signal?: AbortSignal }> = [];
 
     await executeToolCalls([{ tool: 'read', args: { path: 'auth.ts' }, raw: '' }], {
+      commitIntent: async () => {},
       policy,
       signal: controller.signal,
       callTool: async (tool, _args, callCtx) => {
@@ -758,6 +760,7 @@ describe('shadow clone cancellation reaches the tools themselves', () => {
     // A tool that only finishes when its signal fires — so this hangs rather
     // than passes if the signal never reaches it.
     const running = executeToolCalls([{ tool: 'bash', args: { command: 'sleep' }, raw: '' }], {
+      commitIntent: async () => {},
       policy,
       signal: controller.signal,
       callTool: (_tool, _args, callCtx) =>
@@ -788,6 +791,7 @@ describe('shadow clone cancellation reaches the tools themselves', () => {
         { tool: 'grep', args: {}, raw: '' },
       ],
       {
+        commitIntent: async () => {},
         policy,
         signal: controller.signal,
         callTool: async (tool) => {
