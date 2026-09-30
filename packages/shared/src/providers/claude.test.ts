@@ -28,7 +28,11 @@ afterAll(() => rmSync(hostRoot, { recursive: true, force: true }));
 
 function testHost(overrides: Partial<BackendHost> = {}): BackendHost {
   return {
-    paths: { inkFiles: join(hostRoot, 'files'), studiosRoot: join(hostRoot, 'studios') },
+    paths: {
+      inkFiles: join(hostRoot, 'files'),
+      studiosRoot: join(hostRoot, 'studios'),
+      tempDir: hostRoot,
+    },
     ambientSession: () => ({}),
     claudeSupportsPartialMessages: async () => false,
     skillMcpServers: async () => [],

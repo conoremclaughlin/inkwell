@@ -514,8 +514,9 @@ async function awakenCommand(options: {
     },
   });
 
-  child.on('close', (code) => {
-    prepared.cleanup();
+  child.on('close', async (code) => {
+    // Awaited: process.exit below would cut an unfinished removal short.
+    await prepared.cleanup();
     cleanup();
 
     console.log(chalk.bold('\nAwakening session ended.'));

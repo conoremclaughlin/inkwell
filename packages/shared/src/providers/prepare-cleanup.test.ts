@@ -1,0 +1,84 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { CodexAdapter } from './codex.js';
+import { GeminiAdapter } from './gemini.js';
+import type { BackendAdapter, BackendHost } from './types.js';
+
+/**
+ * Per-spawn files live under the host's temp directory, are removed by the
+ * prepared cleanup, and are removed by prepare() itself when it fails after
+ * writing them: nothing ever receives the cleanup of a prepare that rejected
+ * (Myra, P2b-2a review).
+ */
+
+let root: string;
+let tempDir: string;
+
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), 'prepare-cleanup-'));
+  tempDir = join(root, 'tmp');
+  mkdirSync(tempDir);
+});
+
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+/** A host whose studios root fails when read: a host call after the first write. */
+function host(options: { failAfterWrite?: boolean } = {}): BackendHost {
+  return {
+    paths: {
+      inkFiles: join(root, 'files'),
+      get studiosRoot(): string {
+        if (options.failAfterWrite) throw new Error('synthetic host failure');
+        return join(root, 'studios');
+      },
+      tempDir,
+    },
+    ambientSession: () => ({}),
+    claudeSupportsPartialMessages: async () => false,
+    skillMcpServers: async () => [],
+    sessionEnv: async () => ({}),
+    resolveBinary: async (name) => name,
+    warn: () => undefined,
+  };
+}
+
+const config = {
+  sbSlug: 'wren',
+  prompt: 'hello',
+  promptParts: ['hello'],
+  passthroughArgs: [],
+  cliAttached: false,
+};
+
+/** Every file under the temp directory, and the identity-prompt directories. */
+function left(): { files: string[]; identityDirs: string[] } {
+  const entries = readdirSync(tempDir, { recursive: true, withFileTypes: true });
+  return {
+    files: entries.filter((e) => e.isFile()).map((e) => e.name),
+    identityDirs: readdirSync(tempDir).filter((name) => name.startsWith('sb-')),
+  };
+}
+
+describe.each([
+  ['codex', () => new CodexAdapter()],
+  ['gemini', () => new GeminiAdapter()],
+] as Array<[string, () => BackendAdapter]>)('%s prepare', (_name, make) => {
+  it('writes under the host’s temp directory, and its cleanup removes what it wrote', async () => {
+    const prepared = await make().prepare({ ...config, cwd: root }, host());
+    expect(left().identityDirs).toHaveLength(1);
+    expect(left().files.length).toBeGreaterThan(0);
+    await prepared.cleanup();
+    expect(left()).toEqual({ files: [], identityDirs: [] });
+  });
+
+  it('removes what it wrote when a later host call fails', async () => {
+    await expect(
+      make().prepare({ ...config, cwd: root }, host({ failAfterWrite: true }))
+    ).rejects.toThrow('synthetic host failure');
+    expect(left()).toEqual({ files: [], identityDirs: [] });
+  });
+});

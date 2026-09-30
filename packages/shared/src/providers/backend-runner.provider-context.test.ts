@@ -64,7 +64,11 @@ let studio: string;
  * run: no installed provider runs in a unit test.
  */
 const serverHost = (credentials: Record<string, string>): BackendHost => ({
-  paths: { inkFiles: join(studio, '.host-files'), studiosRoot: join(studio, '.host-studios') },
+  paths: {
+    inkFiles: join(studio, '.host-files'),
+    studiosRoot: join(studio, '.host-studios'),
+    tempDir: studio,
+  },
   ambientSession: () => ({ inkSessionId: 'host-own-session', studioId: 'host-own-studio' }),
   claudeSupportsPartialMessages: async () => true,
   skillMcpServers: async () => [],

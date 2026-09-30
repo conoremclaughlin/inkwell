@@ -5,15 +5,8 @@
  * MCP config via --mcp-config <path>
  */
 
-import {
-  closeSync,
-  constants as fsConstants,
-  existsSync,
-  fstatSync,
-  mkdirSync,
-  openSync,
-  readSync,
-} from 'fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from 'fs';
+import { mkdir, stat } from 'fs/promises';
 import { encodeContextToken, PRINT_MODE_CHANNEL_ENV } from '../runner/mcp-config.js';
 import { buildIdentityPrompt } from './identity-prompt.js';
 import { buildMergedMcpConfig } from './skill-mcp.js';
@@ -311,7 +304,12 @@ export class ClaudeAdapter implements BackendAdapter {
     // read downloaded attachments (email, Telegram, etc.) via the native
     // Read tool. This is Inkwell's own directory, not arbitrary fs access.
     const inkFilesDir = host.paths.inkFiles;
-    if (existsSync(inkFilesDir)) {
+    if (
+      await stat(inkFilesDir).then(
+        () => true,
+        () => false
+      )
+    ) {
       args.push('--add-dir', inkFilesDir);
     }
 
@@ -320,11 +318,8 @@ export class ClaudeAdapter implements BackendAdapter {
     // a live session can never be granted a new directory. Created if
     // missing: Claude Code ignores a nonexistent --add-dir.
     const inkStudiosDir = host.paths.studiosRoot;
-    try {
-      mkdirSync(inkStudiosDir, { recursive: true });
-    } catch {
-      // Non-fatal — worst case the grant is a no-op until the dir exists.
-    }
+    // Non-fatal — worst case the grant is a no-op until the dir exists.
+    await mkdir(inkStudiosDir, { recursive: true }).catch(() => undefined);
     args.push('--add-dir', inkStudiosDir);
 
     // Inkwell channel plugin: enable real-time inbox push notifications.
@@ -388,7 +383,9 @@ export class ClaudeAdapter implements BackendAdapter {
         // config may still load it — the pass-through path is not strict.
         ...(printMode ? PRINT_MODE_CHANNEL_ENV : {}),
       },
-      cleanup: mcpCleanup,
+      // buildMergedMcpConfig still removes its file synchronously; it moves to
+      // fs/promises with the builder itself.
+      cleanup: async () => mcpCleanup(),
       ...(stdinData ? { stdinData } : {}),
     };
   }

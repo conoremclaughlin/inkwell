@@ -13,9 +13,8 @@
  * Docs: https://geminicli.com/docs/
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
+import { mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
@@ -35,23 +34,22 @@ import type { BackendAdapter, BackendConfig, BackendHost, PreparedBackend } from
  * for GitHub auth which works, but Inkwell headers haven't been verified end-to-end.
  * Live validation needed once Aster's quota resets.
  */
-export function buildGeminiSettings(
+export async function buildGeminiSettings(
+  tempDir: string,
   cwd: string,
   contextToken: string,
   sessionId?: string,
   studioId?: string,
   explicitSession = false
-): { path: string; cleanup: () => void } | null {
+): Promise<{ path: string; cleanup: () => Promise<void> } | null> {
   // Start from .mcp.json to preserve other MCP servers (supabase, github, etc.)
   const mcpJsonPath = join(cwd, '.mcp.json');
   let mcpServers: Record<string, unknown> = {};
-  if (existsSync(mcpJsonPath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-      mcpServers = parsed.mcpServers || {};
-    } catch {
-      // ignore parse errors
-    }
+  try {
+    const parsed = JSON.parse(await readFile(mcpJsonPath, 'utf-8'));
+    mcpServers = parsed.mcpServers || {};
+  } catch {
+    // missing or unparseable: start from no servers
   }
 
   // Merge Inkwell auth + session headers into the canonical 'inkwell' server.
@@ -82,22 +80,18 @@ export function buildGeminiSettings(
     },
   };
 
-  const settingsDir = join(tmpdir(), 'ink-gemini');
-  mkdirSync(settingsDir, { recursive: true });
+  const settingsDir = join(tempDir, 'ink-gemini');
   const settingsFile = join(settingsDir, `settings-${process.pid}-${randomUUID()}.json`);
+  const cleanup = async (): Promise<void> => {
+    await rm(settingsFile, { force: true }).catch(() => undefined);
+  };
   try {
-    writeFileSync(settingsFile, JSON.stringify({ mcpServers }, null, 2));
-    return {
-      path: settingsFile,
-      cleanup: () => {
-        try {
-          rmSync(settingsFile, { force: true });
-        } catch {
-          // best-effort
-        }
-      },
-    };
+    await mkdir(settingsDir, { recursive: true });
+    await writeFile(settingsFile, JSON.stringify({ mcpServers }, null, 2));
+    return { path: settingsFile, cleanup };
   } catch {
+    // A partial file is removed; the spawn goes ahead without the override.
+    await cleanup();
     return null;
   }
 }
@@ -109,12 +103,26 @@ export class GeminiAdapter implements BackendAdapter {
   readonly promptTransport = 'argv' as const;
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
-    const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(
+    const identity = await createIdentityPromptFile(
+      host.paths.tempDir,
       config.sbSlug,
       undefined,
       config.systemPromptOverride
     );
+    // A prepare that rejects leaves nothing behind (PreparedBackend.cleanup).
+    try {
+      return await this.prepareWith(config, host, identity);
+    } catch (error) {
+      await identity.cleanup();
+      throw error;
+    }
+  }
 
+  private async prepareWith(
+    config: BackendConfig,
+    host: BackendHost,
+    { promptFile, cleanup: identityCleanup }: { promptFile: string; cleanup: () => Promise<void> }
+  ): Promise<PreparedBackend> {
     const args: string[] = [];
 
     // Model (only if explicitly specified)
@@ -144,11 +152,8 @@ export class GeminiAdapter implements BackendAdapter {
     // workspace-grant equivalent of --add-dir, so studios minted mid-session
     // stay editable. Created if missing.
     const inkStudiosDir = host.paths.studiosRoot;
-    try {
-      mkdirSync(inkStudiosDir, { recursive: true });
-    } catch {
-      // Non-fatal — worst case the grant is a no-op until the dir exists.
-    }
+    // Non-fatal — worst case the grant is a no-op until the dir exists.
+    await mkdir(inkStudiosDir, { recursive: true }).catch(() => undefined);
     args.push('--include-directories', inkStudiosDir);
 
     // Passthrough flags
@@ -166,16 +171,16 @@ export class GeminiAdapter implements BackendAdapter {
     // Build temp settings.json with Inkwell auth + session headers.
     // INK_ACCESS_TOKEN is set at the spawn site (after prepare) — the
     // ${INK_ACCESS_TOKEN} syntax in settings.json resolves at Gemini runtime.
-    const settings = buildGeminiSettings(
+    const settings = await buildGeminiSettings(
+      host.paths.tempDir,
       config.cwd,
       contextToken,
       config.inkSessionId,
       config.studioId,
       config.explicitSession === true
     );
-    const cleanup = () => {
-      identityCleanup();
-      settings?.cleanup();
+    const cleanup = async (): Promise<void> => {
+      await Promise.all([identityCleanup(), settings?.cleanup()]);
     };
 
     return {

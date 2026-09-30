@@ -9,7 +9,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { sessionEnvHandoff } from '@inklabs/shared';
 import { discoverSkillMcpServers, type BackendHost } from '@inklabs/shared/providers';
@@ -41,6 +41,9 @@ export function createCliBackendHost(): BackendHost {
       },
       get studiosRoot() {
         return process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+      },
+      get tempDir() {
+        return tmpdir();
       },
     },
     ambientSession: () => ({

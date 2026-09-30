@@ -1,6 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir } from 'os';
 
 /**
  * Build the identity prompt content. Same across all backends.
@@ -65,30 +64,30 @@ ${toolPriority}`;
 }
 
 /**
- * Write the identity prompt to a temp file.
- * Returns the file path and a cleanup function.
+ * Write the identity prompt to its own directory under `tempDir` (the
+ * host's). Returns the file path and a cleanup that removes the directory.
+ * If the write fails, the directory is removed before the error propagates.
  */
-export function createIdentityPromptFile(
+export async function createIdentityPromptFile(
+  tempDir: string,
   sbSlug: string,
   startupContextBlock?: string,
   systemPromptOverride?: string
-): {
+): Promise<{
   promptFile: string;
-  cleanup: () => void;
-} {
+  cleanup: () => Promise<void>;
+}> {
   const content = buildIdentityPrompt(sbSlug, startupContextBlock, systemPromptOverride);
-  const tempDir = mkdtempSync(join(tmpdir(), 'sb-'));
-  const promptFile = join(tempDir, 'identity-prompt.md');
-  writeFileSync(promptFile, content);
-
-  return {
-    promptFile,
-    cleanup: () => {
-      try {
-        rmSync(tempDir, { recursive: true });
-      } catch {
-        /* ignore */
-      }
-    },
+  const dir = await mkdtemp(join(tempDir, 'sb-'));
+  const cleanup = async (): Promise<void> => {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   };
+  const promptFile = join(dir, 'identity-prompt.md');
+  try {
+    await writeFile(promptFile, content);
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { promptFile, cleanup };
 }

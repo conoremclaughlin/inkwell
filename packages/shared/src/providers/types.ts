@@ -20,6 +20,8 @@ export interface BackendHost {
     readonly inkFiles: string;
     /** The ephemeral-studio root: created if missing, and granted at spawn. */
     readonly studiosRoot: string;
+    /** Where per-spawn files (identity prompt, settings, MCP configs) are written. */
+    readonly tempDir: string;
   };
   /**
    * The run's absolute deadline (epoch ms), when the host admitted one.
@@ -170,7 +172,13 @@ export interface PreparedBackend {
   binary: string;
   args: string[];
   env: Record<string, string>;
-  cleanup: () => void;
+  /**
+   * Removes every per-spawn file prepare() wrote. Asynchronous, so a host
+   * serving many sessions never blocks on it; callers await it once the
+   * child has stopped. A prepare() that rejects has already removed what it
+   * wrote.
+   */
+  cleanup: () => Promise<void>;
   /**
    * Prompt data to pass via stdin instead of argv. Large transcripts exceed
    * the OS argv limit (~256KB on macOS → spawn E2BIG), so adapters that

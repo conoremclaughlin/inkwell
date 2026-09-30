@@ -7,7 +7,7 @@
  * Docs: https://developers.openai.com/codex/cli/
  */
 
-import { mkdirSync } from 'fs';
+import { mkdir } from 'fs/promises';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
 import type { BackendAdapter, BackendConfig, BackendHost, PreparedBackend } from './types.js';
@@ -39,12 +39,26 @@ export class CodexAdapter implements BackendAdapter {
   readonly promptTransport = 'argv' as const;
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
-    const { promptFile, cleanup } = createIdentityPromptFile(
+    const identity = await createIdentityPromptFile(
+      host.paths.tempDir,
       config.sbSlug,
       config.startupContextBlock,
       config.systemPromptOverride
     );
+    // A prepare that rejects leaves nothing behind (PreparedBackend.cleanup).
+    try {
+      return await this.prepareWith(config, host, identity);
+    } catch (error) {
+      await identity.cleanup();
+      throw error;
+    }
+  }
 
+  private async prepareWith(
+    config: BackendConfig,
+    host: BackendHost,
+    { promptFile, cleanup }: { promptFile: string; cleanup: () => Promise<void> }
+  ): Promise<PreparedBackend> {
     const args: string[] = [];
 
     // Resume MUST come before --config flags. Codex treats `resume` as a
@@ -63,11 +77,8 @@ export class CodexAdapter implements BackendAdapter {
     // the resume subcommand, and this push lands after `resume` when
     // resuming, so both shapes carry the grant. Created if missing.
     const inkStudiosDir = host.paths.studiosRoot;
-    try {
-      mkdirSync(inkStudiosDir, { recursive: true });
-    } catch {
-      // Non-fatal — worst case the grant is a no-op until the dir exists.
-    }
+    // Non-fatal — worst case the grant is a no-op until the dir exists.
+    await mkdir(inkStudiosDir, { recursive: true }).catch(() => undefined);
     args.push('--add-dir', inkStudiosDir);
 
     // Ink session headers — Codex resolves env var names to values at runtime.

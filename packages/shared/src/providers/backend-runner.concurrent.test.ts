@@ -72,7 +72,13 @@ describe('overlapping provider turns in one process', () => {
         })
       );
       const host: BackendHost = {
-        paths: { inkFiles: join(cwd, 'files'), studiosRoot: join(cwd, 'studios') },
+        paths: {
+          inkFiles: join(cwd, 'files'),
+          studiosRoot: join(cwd, 'studios'),
+          // One temp directory for both, as a server serving both sessions
+          // has: per-spawn file names must not collide within it.
+          tempDir: join(root, 'tmp'),
+        },
         ambientSession: () => {
           throw new Error('explicit hosts never use ambient routing');
         },

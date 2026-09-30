@@ -3817,10 +3817,10 @@ export async function runClaude(
   let stdoutLineBuffer = '';
   let cleanedUp = false;
   let finalizedExecution = false;
-  const ensureCleanup = (): void => {
+  const ensureCleanup = async (): Promise<void> => {
     if (cleanedUp) return;
     cleanedUp = true;
-    prepared.cleanup();
+    await prepared.cleanup();
   };
   const finalizeExecution = async (exitCode: number | null, error?: string): Promise<void> => {
     if (finalizedExecution) return;
@@ -3900,7 +3900,7 @@ export async function runClaude(
   child.on('close', async (code) => {
     await takeoverWatcher?.stop();
     await detachPrintModeExit(prepared.env, sessionContext.inkSessionId, sbSlug);
-    ensureCleanup();
+    await ensureCleanup();
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
       if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
@@ -3936,7 +3936,7 @@ export async function runClaude(
   });
 
   child.on('error', async (err) => {
-    ensureCleanup();
+    await ensureCleanup();
     await finalizeExecution(null, err.message || 'spawn failed');
     process.exit(1);
   });
@@ -4094,7 +4094,7 @@ export async function runClaudeInteractive(
       });
 
       child.on('close', async (code) => {
-        prepared.cleanup();
+        await prepared.cleanup();
         // `ink -b claude -p …` reaches here with the print flag in passthrough.
         await detachPrintModeExit(prepared.env, sessionContext.inkSessionId, sbSlug);
         finalCapturedBackendSessionId = await resolveCapturedBackendSessionIdWithRetry({
@@ -4118,7 +4118,7 @@ export async function runClaudeInteractive(
       });
 
       child.on('error', async (err) => {
-        prepared.cleanup();
+        await prepared.cleanup();
         const errorText = err.message || 'spawn failed';
         await logBackendExecutionResult({
           context: executionContext,

@@ -43,7 +43,11 @@ import type { BackendHost } from './types.js';
 /** A host that answers everything and touches nothing. */
 function fakeHost(overrides: Partial<BackendHost> = {}): BackendHost {
   return {
-    paths: { inkFiles: '/synthetic/ink-files', studiosRoot: '/synthetic/studios' },
+    paths: {
+      inkFiles: '/synthetic/ink-files',
+      studiosRoot: '/synthetic/studios',
+      tempDir: '/synthetic/tmp',
+    },
     ambientSession: () => ({}),
     claudeSupportsPartialMessages: async () => false,
     skillMcpServers: async () => [],

@@ -313,7 +313,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     } finally {
       // After the child has stopped (spawnBackend settles no sooner), or
       // after a failure before it was spawned.
-      prepared.cleanup();
+      await prepared.cleanup();
     }
   };
 
