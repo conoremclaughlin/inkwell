@@ -50,19 +50,20 @@ export const CODEX_MCP_LIST_MEASURED_AGAINST = 'codex-cli 0.158.0';
  * the merged result, not which file a key came from, so the reason names
  * both.
  */
-const CODEX_CONFIG_REPAIR =
-  "run `ink mcp sync` in this studio; if the refusal remains, remove it by hand from the studio's `.codex/config.toml` outside ink's managed block, or from `~/.codex/config.toml` (`$CODEX_HOME/config.toml`)";
+const CODEX_CONFIG_HAND_EDIT =
+  "remove it by hand from the studio's `.codex/config.toml` outside ink's managed block, or from `~/.codex/config.toml` (`$CODEX_HOME/config.toml`)";
+
+const CODEX_CONFIG_REPAIR = `run \`ink mcp sync\` in this studio; if the refusal remains, ${CODEX_CONFIG_HAND_EDIT}`;
 
 export const CODEX_CONFIG_REFUSALS = {
   drift: `\`codex mcp list --json\` did not have the shape measured against ${CODEX_MCP_LIST_MEASURED_AGAINST}; Codex was not started, because its MCP configuration could not be checked`,
   staticRouting: `a session routing header is configured in the Codex config; ${CODEX_CONFIG_REPAIR}`,
-  foreignSessionEnv:
-    'an MCP server other than Inkwell in the Codex config draws a session credential or routing value from the environment',
+  // The sync never writes these three, so only the hand edit repairs them
+  // (Myra, #701 5f569213).
+  foreignSessionEnv: `an MCP server other than Inkwell in the Codex config draws a session credential or routing value from the environment; ${CODEX_CONFIG_HAND_EDIT}`,
   inkwellEnvHeader: `the Codex config sets an Inkwell routing or Authorization header from the environment that ink does not own; ${CODEX_CONFIG_REPAIR}`,
-  staticAuthorization:
-    'a static Authorization header is configured for the Inkwell MCP server in the Codex config',
-  helper:
-    'an MCP server in the Codex config computes its headers with http_headers_helper, which cannot be checked',
+  staticAuthorization: `a static Authorization header is configured for the Inkwell MCP server in the Codex config; ${CODEX_CONFIG_HAND_EDIT}`,
+  helper: `an MCP server in the Codex config computes its headers with http_headers_helper, which cannot be checked; ${CODEX_CONFIG_HAND_EDIT}`,
   inkwellElsewhere: `the Codex config's \`inkwell\` MCP server is not this session's Inkwell server; ${CODEX_CONFIG_REPAIR}`,
   unreadableUrl: 'an MCP server in the Codex config has a URL that cannot be read',
   unreadableInkwellUrl: 'the Inkwell server URL this session was given cannot be read',

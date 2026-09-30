@@ -250,6 +250,18 @@ describe('judgeCodexMcpList, refusals', () => {
     }
   });
 
+  it('names only the hand edit where the sync cannot repair it (Myra, 5f569213)', () => {
+    for (const reason of [
+      CODEX_CONFIG_REFUSALS.foreignSessionEnv,
+      CODEX_CONFIG_REFUSALS.staticAuthorization,
+      CODEX_CONFIG_REFUSALS.helper,
+    ]) {
+      expect(reason).toContain('remove it by hand');
+      expect(reason).toContain('~/.codex/config.toml');
+      expect(reason).not.toContain('ink mcp sync');
+    }
+  });
+
   it('refuses when the host gives no readable Inkwell URL, and when a server URL is unreadable', () => {
     expect(judge(withoutHelper(), 'not a url')).toBe(CODEX_CONFIG_REFUSALS.unreadableInkwellUrl);
     expect(judge([http('broken', 'not a url')])).toBe(CODEX_CONFIG_REFUSALS.unreadableUrl);
