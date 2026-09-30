@@ -39,7 +39,7 @@
  * refused as drift rather than guessed at.
  */
 
-import { INK_ENV_HEADERS } from './codex.js';
+import { INK_ENV_HEADERS } from './codex-env-headers.js';
 
 export const CODEX_MCP_LIST_MEASURED_AGAINST = 'codex-cli 0.158.0';
 

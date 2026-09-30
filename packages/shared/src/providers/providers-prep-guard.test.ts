@@ -92,6 +92,11 @@ const HOST_BOUNDARY_EXCEPTIONS: ReadonlyArray<{ at: string; reason: string }> = 
       'The one spawn the runner exists to make. It runs after preparation, with the env preparation produced.',
   },
   {
+    at: 'runner/probe.ts (module) child_process.execFile',
+    reason:
+      "The effective-config probe (`codex mcp list --json`), asynchronous and bounded. It runs from startBackendTurn's check after preparation, never from prepare, on the host's base env through the allowlist, with no credential (Myra, #701 9bd3f8a9).",
+  },
+  {
     at: 'runner/spawn-backend.ts buildCleanEnv process.env',
     reason:
       "The default parent env, for the six callers outside this path that pass none: resolveSpawnTarget in api antigravity-runner.ts, claude-runner.ts, codex-runner.ts and gemini-runner.ts, and buildCleanEnv in api ink-runner.ts and cli lib/backend-auth.ts. startBackendTurn always passes its host's BackendHost.baseEnv as parentEnv, which backend-runner.concurrent.test proves; the default goes with those callers in the switchover (Myra, #701 9b4f0752).",

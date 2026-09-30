@@ -10,36 +10,68 @@
 import { mkdir } from 'fs/promises';
 import { createIdentityPromptFile } from './identity-prompt.js';
 import { encodeContextToken } from '../runner/mcp-config.js';
-import type { BackendAdapter, BackendConfig, BackendHost, PreparedBackend } from './types.js';
+import { runProbe, type ProbeFailure } from '../runner/probe.js';
+import { INK_ENV_HEADERS } from './codex-env-headers.js';
+import { judgeCodexMcpList } from './codex-mcp-list.js';
+import type {
+  BackendAdapter,
+  BackendConfig,
+  BackendHost,
+  EffectiveConfigCheck,
+  PreparedBackend,
+} from './types.js';
+
+export { INK_ENV_HEADERS };
 
 /**
- * Inkwell headers to inject as env_http_headers on the "inkwell" MCP server.
- * Each entry maps a header name to the env var that holds its value.
- * Codex resolves env var → value at runtime, so multiple sessions in
- * the same studio each get their own scoped headers.
- *
- * x-ink-context is the consolidated token (preferred). Individual headers
- * are kept for backward compat during migration.
- *
- * Authorization is intentionally NOT here — it goes through codex's
- * `bearer_token_env_var` mechanism instead (see prepare()), which also stops
- * codex from running its own managed OAuth for the server.
- *
- * Exported for the effective-config check (codex-mcp-list.ts), which admits
- * an env-drawn Inkwell header only when it is exactly one of these.
+ * Why a `codex mcp list --json` probe could not answer, from its failure
+ * kind alone: an exit code, a signal or an errno code, never the child's
+ * output, which prints static header values in the clear.
  */
-export const INK_ENV_HEADERS: ReadonlyArray<{ header: string; envVar: string }> = [
-  { header: 'x-ink-context', envVar: 'INK_CONTEXT' },
-  { header: 'x-ink-agent-id', envVar: 'AGENT_ID' },
-  { header: 'x-ink-session-id', envVar: 'INK_SESSION_ID' },
-  { header: 'x-ink-studio-id', envVar: 'INK_STUDIO_ID' },
-];
+export function codexProbeFailureReason(failure: ProbeFailure): string {
+  const cannot = '`codex mcp list --json` could not check the Codex MCP configuration';
+  switch (failure.kind) {
+    case 'no-time':
+      return `${cannot}: no time was left for it before the run's deadline`;
+    case 'timeout':
+      return `${cannot}: it did not finish in time`;
+    case 'aborted':
+      return `${cannot}: the turn was aborted`;
+    case 'overflow':
+      return `${cannot}: it printed more than a listing should`;
+    case 'exit':
+      return `${cannot}: it exited with code ${failure.exitCode}`;
+    case 'signal':
+      return `${cannot}: it was ended by ${failure.signal}`;
+    case 'spawn':
+      return `${cannot}: it could not start (${failure.code})`;
+  }
+}
 
 export class CodexAdapter implements BackendAdapter {
   readonly name = 'codex';
   readonly binary = 'codex';
   // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
   readonly promptTransport = 'argv' as const;
+
+  /**
+   * Codex's own view of its merged MCP config, judged before the spawn
+   * (codex-mcp-list.ts). The listing runs on the probe env, which carries no
+   * credential, and its output goes only to the judge.
+   */
+  async checkEffectiveConfig(check: EffectiveConfigCheck): Promise<string | undefined> {
+    const listing = await runProbe(check.binary, ['mcp', 'list', '--json'], {
+      env: check.probeEnv,
+      cwd: check.cwd,
+      signal: check.signal,
+      timeoutMs: check.timeoutMs,
+    });
+    if (!listing.ok) return codexProbeFailureReason(listing.failure);
+    return judgeCodexMcpList(listing.stdout, {
+      inkwellMcpUrl: check.inkwellMcpUrl,
+      sessionEnvNames: check.sessionEnvNames,
+    });
+  }
 
   async prepare(config: BackendConfig, host: BackendHost): Promise<PreparedBackend> {
     const identity = await createIdentityPromptFile(
