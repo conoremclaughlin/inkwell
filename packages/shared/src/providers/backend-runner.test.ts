@@ -5,6 +5,8 @@ const state = vi.hoisted(() => ({
   prepareCalls: [] as Array<{ backend: string; promptParts: string[] }>,
   prepareConfigs: [] as Array<Record<string, unknown>>,
   cleanups: 0,
+  /** When set, the prepared cleanup resolves only when this does. */
+  cleanupGate: undefined as Promise<void> | undefined,
 }));
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -20,8 +22,9 @@ vi.mock('./registry.js', () => ({
         binary: 'mock-backend',
         args: [...config.promptParts],
         env: {},
-        cleanup: () => {
+        cleanup: async () => {
           state.cleanups += 1;
+          await state.cleanupGate;
         },
       };
     },
@@ -538,6 +541,39 @@ describe('runBackendTurn', () => {
         expect(spawnMock).not.toHaveBeenCalled();
         expect(state.cleanups).toBe(1);
       } finally {
+        spawnMock.mockReset();
+      }
+    });
+
+    // Settled means the per-spawn files are gone: a hosted run releases on
+    // this result (Myra's R1, 72027fba review).
+    it('settles only once the per-spawn files have been removed', async () => {
+      spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+      state.cleanups = 0;
+      let openGate!: () => void;
+      state.cleanupGate = new Promise<void>((resolve) => {
+        openGate = resolve;
+      });
+      try {
+        let settled = false;
+        const result = runBackendTurn({
+          ...spawnContext,
+          backend: 'claude',
+          sbSlug: 'wren',
+          prompt: 'synthetic',
+        }).then((value) => {
+          settled = true;
+          return value;
+        });
+        await vi.waitFor(() => expect(state.cleanups).toBe(1));
+        // The child has closed and cleanup has begun, but not finished.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(settled).toBe(false);
+
+        openGate();
+        expect(await result).toMatchObject({ success: true, childExited: true });
+      } finally {
+        state.cleanupGate = undefined;
         spawnMock.mockReset();
       }
     });

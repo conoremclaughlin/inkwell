@@ -1,9 +1,29 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+
+// A disk fault on demand: the next writeFile writes a partial file and then
+// fails, as a full disk does.
+const faults = vi.hoisted(() => ({ partialWriteOnce: false }));
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...actual,
+    writeFile: async (...args: Parameters<typeof actual.writeFile>) => {
+      if (faults.partialWriteOnce) {
+        faults.partialWriteOnce = false;
+        await actual.writeFile(args[0], String(args[1]).slice(0, 8));
+        throw new Error('synthetic ENOSPC');
+      }
+      return actual.writeFile(...args);
+    },
+  };
+});
+
 import { CodexAdapter } from './codex.js';
-import { GeminiAdapter } from './gemini.js';
+import { buildGeminiSettings, GeminiAdapter } from './gemini.js';
+import { createIdentityPromptFile } from './identity-prompt.js';
 import type { BackendAdapter, BackendHost } from './types.js';
 
 /**
@@ -23,6 +43,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  faults.partialWriteOnce = false;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -62,6 +83,22 @@ function left(): { files: string[]; identityDirs: string[] } {
     identityDirs: readdirSync(tempDir).filter((name) => name.startsWith('sb-')),
   };
 }
+
+// Myra's R2 and R3 (72027fba review): each writer removes what a failed
+// write left, before the failure reaches its caller.
+describe('a failed write leaves nothing behind', () => {
+  it('the identity prompt removes its directory and the partial file', async () => {
+    faults.partialWriteOnce = true;
+    await expect(createIdentityPromptFile(tempDir, 'wren')).rejects.toThrow('synthetic ENOSPC');
+    expect(left()).toEqual({ files: [], identityDirs: [] });
+  });
+
+  it('the Gemini settings remove the partial file and report no settings', async () => {
+    faults.partialWriteOnce = true;
+    expect(await buildGeminiSettings(tempDir, root, 'synthetic-context')).toBeNull();
+    expect(left().files).toEqual([]);
+  });
+});
 
 describe.each([
   ['codex', () => new CodexAdapter()],
