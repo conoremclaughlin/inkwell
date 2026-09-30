@@ -38,6 +38,24 @@ export function parentOwnsTurn(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
+ * Whether the INK_CONTEXT token in `env` declares a headless spawn
+ * (`cliAttached:false`), as a server spawn's does. No token, or one that does
+ * not decode, is an interactive process.
+ */
+export function contextDeclaresHeadless(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.INK_CONTEXT?.trim();
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString()) as {
+      cliAttached?: unknown;
+    };
+    return parsed.cliAttached === false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The `cli_attached` value a backend's on-prompt hook writes to its session:
  * true for an interactive process, false for a server spawn (it clears an
  * attachment a crashed interactive process left behind), and null, meaning

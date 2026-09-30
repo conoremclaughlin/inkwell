@@ -35,7 +35,7 @@ import {
 } from '../session/runtime.js';
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
-import { promptAttachmentWrite } from '../lib/turn-owner.js';
+import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
 import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
@@ -463,16 +463,10 @@ function writeRuntimeFile(cwd: string, filename: string, content: string): void 
  * Decodes the INK_CONTEXT token set by the runner at spawn time — if cliAttached is
  * explicitly false, this is a triggered session that should NOT mark itself CLI-attached.
  * When there's no INK_CONTEXT (interactive `claude` invocation), defaults to true (attached).
+ * The wrapper reads the same token to decide whether a child's exit detaches.
  */
 export function isHeadlessSession(): boolean {
-  const raw = process.env.INK_CONTEXT?.trim();
-  if (!raw) return false;
-  try {
-    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString());
-    return parsed.cliAttached === false;
-  } catch {
-    return false;
-  }
+  return contextDeclaresHeadless(process.env);
 }
 
 function normalizeSessionBackend(backendName: string): string {
