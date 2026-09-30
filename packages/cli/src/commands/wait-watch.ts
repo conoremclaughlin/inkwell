@@ -366,6 +366,16 @@ class ThreadCursor {
    * thread's length, or the server's reason when the thread is absent.
    */
   async anchorAtEnd(): Promise<{ total: number; anchor?: string } | { absent: string }> {
+    const end = await this.readEnd();
+    if ('absent' in end) return end;
+    this.tail = end.tail;
+    return { total: end.total, anchor: end.anchor };
+  }
+
+  /** The position at the thread's current end, without taking it. */
+  private async readEnd(): Promise<
+    { tail: DrainTail; total: number; anchor?: string } | { absent: string }
+  > {
     // latestN returns the newest message, so the anchor is the true end of
     // the thread however long it is. `limit: 200` is what a server predating
     // latestN falls back to: the anchor lands on message #200, as it used to.
@@ -383,27 +393,37 @@ class ThreadCursor {
     if (tail.boundary) {
       absorb(tail, (await this.readPage(inclusiveFloor(tail.boundary), WAIT_MAX_PAGE_SIZE)) ?? []);
     }
-    this.tail = tail;
-    return { total, anchor: newest ? String(newest.id) : undefined };
+    return { tail, total, anchor: newest ? String(newest.id) : undefined };
   }
 
   /**
    * For a thread first seen after the baseline: it had nothing unread then,
    * so everything past its read pointer arrived since. Reads that, then
    * drains on from its newest message.
+   *
+   * Another session can read the thread between the inbox listing it and
+   * this read. Then nothing past the pointer is left, nothing is new, and the
+   * position is the thread's end. Taking an empty position there instead
+   * would read the thread's whole history as new on its next arrival
+   * (Lumen, #702 r2). `keep` is false for a thread that is gone.
    */
-  async readFromPointer(): Promise<{ fresh: Row[]; commit: () => void }> {
+  async readFromPointer(): Promise<{ fresh: Row[]; commit: () => void; keep: boolean }> {
     const result = await this.call('get_thread_messages', this.args({ limit: WAIT_PAGE_SIZE }));
-    if (threadAbsent(result)) return { fresh: [], commit: () => {} };
+    if (threadAbsent(result)) return { fresh: [], commit: () => {}, keep: false };
     requireSuccess(result, 'get_thread_messages');
     const rows = rowsOf(result.messages);
+    if (rows.length === 0) {
+      const end = await this.readEnd();
+      if ('absent' in end) return { fresh: [], commit: () => {}, keep: false };
+      return { fresh: [], commit: () => (this.tail = end.tail), keep: true };
+    }
     const start = emptyTail();
     const first = absorb(start, rows);
     if (rows.length < WAIT_PAGE_SIZE) {
-      return { fresh: first, commit: () => (this.tail = start) };
+      return { fresh: first, commit: () => (this.tail = start), keep: true };
     }
     const { fresh, tail } = await drainPast(start, this.readPage, this.warn);
-    return { fresh: [...first, ...fresh], commit: () => (this.tail = tail) };
+    return { fresh: [...first, ...fresh], commit: () => (this.tail = tail), keep: true };
   }
 
   /** Everything past the position, oldest first; applied only by `commit`. */
@@ -601,8 +621,9 @@ class InboxActivityWatch implements WatchSource {
         read = await cursor.drain();
       } else {
         cursor = this.cursorFor(threadKey);
-        read = await cursor.readFromPointer();
-        discovered.push(cursor);
+        const first = await cursor.readFromPointer();
+        read = first;
+        if (first.keep) discovered.push(cursor);
       }
       commits.push(read.commit);
       const fromOthers = read.fresh.filter((m) => m.senderSlug !== this.opts.sbSlug);

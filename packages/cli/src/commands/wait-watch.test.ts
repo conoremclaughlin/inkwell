@@ -797,6 +797,35 @@ describe('#702 review regressions (Lumen)', () => {
     expect(out.batches).toEqual([]);
   });
 
+  // Round two, at 1ab9e0da.
+  it('does not replay history after a newly discovered thread is consumed before its first read', async () => {
+    const server = inboxServer();
+    server.postToThread('pr:5', 'lumen', 'old already read reply', -2000);
+    server.postToThread('pr:5', 'wren', 'old own post marks read', -1000);
+    let raced = false;
+    const call: WaitToolCall = async (tool, args) => {
+      if (tool === 'get_thread_messages' && args.fullHistory !== true && !raced) {
+        raced = true;
+        // Another session reads and answers between the inbox listing and this fetch.
+        server.postToThread('pr:5', 'wren', 'concurrent reader', 10001);
+      }
+      return server.call(tool, args);
+    };
+    const { clock } = virtualClock([
+      [
+        10000,
+        () => server.postToThread('pr:5', 'lumen', 'reply consumed by another session', 10000),
+      ],
+      [30000, () => server.postToThread('pr:5', 'lumen', 'genuinely new reply', 30000)],
+    ]);
+    const { out, done } = run({ ...INBOX_FOLLOW, timeoutSec: 60 }, call, clock);
+    await done;
+    const received = out.batches.flat().join('\n');
+    expect(received).toContain('genuinely new reply');
+    expect(received).not.toContain('old already read reply');
+    expect(received).not.toContain('reply consumed by another session');
+  });
+
   it('does not begin another poll once the deadline has been reached', async () => {
     const server = threadServer();
     const { clock, now } = virtualClock();
