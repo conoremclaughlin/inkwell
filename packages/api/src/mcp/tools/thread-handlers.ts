@@ -30,6 +30,7 @@ import {
 } from '../../services/principals';
 import { assertWriteRole, resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
 import { THREAD_TITLE_MAX, THREAD_SUMMARY_MAX, threadMessageSubject } from './thread-bounds.js';
+import { readTieRemainder } from './tie-completion.js';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -699,24 +700,50 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   if (!newestFirst) {
     const { data, error } = await buildQuery('*')
       .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
       .limit(effectiveLimit);
     if (error) {
       throw new Error(`Failed to get thread messages: ${error.message}`);
     }
-    messages = data;
+    let page: Record<string, unknown>[] = data ?? [];
 
-    if ((messages?.length ?? 0) === effectiveLimit) {
-      // The page filled exactly, so newer messages may exist past it. This
-      // branch is oldest-first, so a truncated page silently hands back the
-      // WRONG END of the thread — the caller asked what is going on and got
-      // the beginning of the conversation.
+    // A page never ends partway through a timestamp. Rows written together
+    // (one transaction, say) share one created_at, and every floor here is
+    // strict (`created_at >`, for newerThan and afterMessageId alike). A page
+    // cut inside that group would leave its remainder behind the next cursor
+    // for good (Lumen, #702). Completing the group makes the page's last
+    // timestamp a safe exclusive floor.
+    if (page.length === effectiveLimit && page.length > 0) {
+      const last = page[page.length - 1] as { created_at: string; id: string };
+      page = [
+        ...page,
+        ...(await readTieRemainder((afterId, withCount) => {
+          let q = threadTable(supabase, 'inbox_thread_messages')
+            .select('*', withCount ? { count: 'exact' } : undefined)
+            .eq('thread_id', thread.id)
+            .eq('created_at', last.created_at)
+            .gt('id', afterId)
+            .order('id', { ascending: true });
+          if (!includeSystemEvents) q = q.neq('message_type', 'system');
+          return q;
+        }, last.id)),
+      ];
+    }
+
+    messages = page;
+
+    if (page.length >= effectiveLimit) {
+      // The page filled, so newer messages may exist past it. This branch is
+      // oldest-first, so a truncated page silently hands back the WRONG END
+      // of the thread — the caller asked what is going on and got the
+      // beginning of the conversation.
       const { count, error: truncErr } = await buildQuery('id', true);
       if (truncErr) {
         // An unknown count must not read as a complete page. Say the number is
         // missing rather than implying there is nothing past the end.
         diagnosticsUnavailable = truncErr.message;
       } else {
-        truncatedNewer = Math.max(0, (count ?? 0) - effectiveLimit);
+        truncatedNewer = Math.max(0, (count ?? 0) - page.length);
       }
     }
   } else {
