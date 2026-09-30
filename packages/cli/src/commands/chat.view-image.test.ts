@@ -306,6 +306,34 @@ describe('images from tools reach the model as images', () => {
     expect(nextTurn!.contextImages?.map((i) => i.width)).toEqual([320]);
   });
 
+  // The other half of Lumen's case: the rejection note says to view the file
+  // again, and a re-view hashes to the same ref. Before the fix that ref was
+  // already marked seen, so the re-view delivered nothing either.
+  it('re-viewing a refused image delivers it once, and then it counts as seen', async () => {
+    writeFileSync(join(testCwd, 'second.png'), makePng(320, 240));
+    scriptBackend(
+      [
+        toolCall('view_image', { path: 'shot.png' }),
+        toolCall('view_image', { path: 'second.png' }),
+        toolCall('view_image', { path: 'second.png' }),
+        'Seen now.',
+        'Next turn.',
+      ],
+      (offered, spawn) => (spawn === 2 ? [] : offered)
+    );
+    testState.inputs = ['look at both', 'and now?', '/quit'];
+    await runChat({ agent: 'myra', backend: 'claude', toolRouting: 'local', pollSeconds: '999' });
+
+    const [, , refused, afterReview, nextTurn] = spawns();
+    expect(refused!.contextImages?.map((i) => i.width)).toEqual([320]);
+    // Two ledger entries now name the same picture; it goes once.
+    expect(afterReview!.contextImages?.map((i) => i.width)).toEqual([320]);
+    expect(afterReview!.contextImages?.[0]?.ref).toBe(refused!.contextImages?.[0]?.ref);
+    // Carried this time, so the next turn has nothing to add.
+    expect(nextTurn!.backendSessionId).toBe(afterReview!.backendSessionId);
+    expect(nextTurn!.contextImages).toBeUndefined();
+  });
+
   it('a re-seeded session is given every image the ledger still holds', async () => {
     scriptBackend([
       toolCall('view_image', { path: 'shot.png' }),
