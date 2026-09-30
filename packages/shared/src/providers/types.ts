@@ -205,7 +205,18 @@ export interface PreparedBackend {
    * prompt from args.
    */
   stdinData?: string;
+  /**
+   * What of this launch affects the backend's configuration, for its
+   * effective-config check to apply as the spawn will: the arguments in
+   * launch order, or a fixed reason they cannot be applied to a check.
+   * Built from the adapter's own flags and the caller's pass-through, never
+   * from prompt text. Absent means the launch carries none.
+   */
+  launchConfig?: LaunchConfig;
 }
+
+/** A launch's config-affecting arguments (PreparedBackend.launchConfig). */
+export type LaunchConfig = { args: readonly string[] } | { refusal: string };
 
 export interface BackendAdapter {
   readonly name: string;
@@ -286,4 +297,10 @@ export interface EffectiveConfigCheck {
   timeoutMs: number;
   /** This session's Inkwell MCP server, from the host (BackendHost.inkwellMcpUrl). */
   inkwellMcpUrl: string;
+  /**
+   * The spawn's own config-affecting arguments (PreparedBackend.launchConfig),
+   * so the check sees the configuration the spawn will run with and not only
+   * what its files say (Lumen, #701 cb80aa4b).
+   */
+  launchConfig: LaunchConfig;
 }

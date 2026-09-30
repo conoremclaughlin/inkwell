@@ -318,6 +318,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
             signal: preSpawn.signal,
             timeoutMs: checkBudgetMs,
             inkwellMcpUrl: host.inkwellMcpUrl,
+            // What the spawn's own arguments change, so the check judges the
+            // config the spawn runs with (Lumen, #701 cb80aa4b).
+            launchConfig: prepared.launchConfig ?? { args: [] },
           });
         } catch {
           // A check that rejects has not vouched for the config.

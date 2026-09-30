@@ -39,6 +39,7 @@ const check = (overrides: Partial<EffectiveConfigCheck> = {}): EffectiveConfigCh
   signal: new AbortController().signal,
   timeoutMs: 10_000,
   inkwellMcpUrl: 'http://localhost:3001/mcp',
+  launchConfig: { args: [] },
   ...overrides,
 });
 

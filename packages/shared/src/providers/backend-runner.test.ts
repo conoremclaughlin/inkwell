@@ -11,6 +11,8 @@ const state = vi.hoisted(() => ({
   check: undefined as undefined | ((check: EffectiveConfigCheck) => Promise<string | undefined>),
   /** The env the adapter prepares, for the check's session names. */
   preparedEnv: {} as Record<string, string>,
+  /** The launch config the adapter prepares, when it prepares one. */
+  preparedLaunchConfig: undefined as undefined | { args: string[] } | { refusal: string },
 }));
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -26,6 +28,7 @@ vi.mock('./registry.js', () => ({
         binary: 'mock-backend',
         args: [...config.promptParts],
         env: { ...state.preparedEnv },
+        ...(state.preparedLaunchConfig ? { launchConfig: state.preparedLaunchConfig } : {}),
         cleanup: async () => {
           state.cleanups += 1;
           await state.cleanupGate;
@@ -467,6 +470,41 @@ describe('runBackendTurn', () => {
         } finally {
           state.check = undefined;
           state.preparedEnv = {};
+          spawnMock.mockReset();
+        }
+      });
+
+      it('is given the launch config the adapter prepared, and an empty one when it prepared none (Lumen, #701 cb80aa4b)', async () => {
+        const seen: EffectiveConfigCheck[] = [];
+        state.check = async (check) => {
+          seen.push(check);
+          return undefined;
+        };
+        spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+        try {
+          state.preparedLaunchConfig = { args: ['-c', 'synthetic.key=1'] };
+          await runBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            host: credentialHost(),
+          });
+          state.preparedLaunchConfig = undefined;
+          await runBackendTurn({
+            ...spawnContext,
+            backend: 'codex',
+            sbSlug: 'wren',
+            prompt: 'synthetic',
+            host: credentialHost(),
+          });
+          expect(seen.map((check) => check.launchConfig)).toEqual([
+            { args: ['-c', 'synthetic.key=1'] },
+            { args: [] },
+          ]);
+        } finally {
+          state.check = undefined;
+          state.preparedLaunchConfig = undefined;
           spawnMock.mockReset();
         }
       });

@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 /**
  * CodexAdapter.checkEffectiveConfig against a recorded fake probe: execFile
@@ -26,7 +29,8 @@ vi.mock('child_process', () => ({
 
 import { CodexAdapter, codexProbeFailureReason } from './codex.js';
 import { CODEX_CONFIG_REFUSALS } from './codex-mcp-list.js';
-import type { EffectiveConfigCheck } from './types.js';
+import { CODEX_LAUNCH_REFUSALS } from './codex-launch-config.js';
+import type { BackendHost, EffectiveConfigCheck } from './types.js';
 
 const CANARY = 'synthetic-canary-5b2e90';
 
@@ -57,6 +61,7 @@ const check = (overrides: Partial<EffectiveConfigCheck> = {}): EffectiveConfigCh
   signal: new AbortController().signal,
   timeoutMs: 10_000,
   inkwellMcpUrl: 'http://localhost:3001/mcp',
+  launchConfig: { args: [] },
   ...overrides,
 });
 
@@ -128,5 +133,179 @@ describe('CodexAdapter.checkEffectiveConfig', () => {
       codexProbeFailureReason({ kind: 'no-time' })
     );
     expect(probe.calls).toHaveLength(0);
+  });
+
+  it("runs the listing with the launch's overrides after the subcommand, in launch order", async () => {
+    const launchConfig = { args: ['-c', 'a.b=1', '-c', 'a.b=2'] };
+    expect(await new CodexAdapter().checkEffectiveConfig(check({ launchConfig }))).toBeUndefined();
+    expect(probe.calls[0]!.args).toEqual(['mcp', 'list', '--json', '-c', 'a.b=1', '-c', 'a.b=2']);
+  });
+
+  it('refuses a launch it cannot check without starting a listing', async () => {
+    const launchConfig = { refusal: CODEX_LAUNCH_REFUSALS.profile };
+    expect(await new CodexAdapter().checkEffectiveConfig(check({ launchConfig }))).toBe(
+      CODEX_LAUNCH_REFUSALS.profile
+    );
+    expect(probe.calls).toHaveLength(0);
+  });
+});
+
+/**
+ * From prepare() to the check, against a fake Codex whose listing follows the
+ * `-c` overrides it is run with, applied in order as Codex applies them, for
+ * the keys the judge reads. A config file that is clean on its own must not
+ * pass once the launch's pass-through adds a routing header or moves the
+ * Inkwell server (Lumen, #701 cb80aa4b).
+ */
+describe("CodexAdapter: the check judges the launch's own configuration", () => {
+  const INKWELL_URL = 'http://127.0.0.1:3001/mcp';
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'codex-launch-config-'));
+    mkdirSync(join(root, 'tmp'));
+    // The file's config: Inkwell alone, clean.
+    probe.answer = (callback) => callback(null, JSON.stringify(listingFor(lastArgs())), '');
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const lastArgs = () => probe.calls[probe.calls.length - 1]!.args;
+  const unquote = (value: string) => value.replace(/^"(.*)"$/, '$1');
+
+  /** Codex's merge, for the keys the judge reads, over a clean file. */
+  function listingFor(args: string[]): unknown[] {
+    let inkwell: ReturnType<typeof http> | undefined = http('inkwell', INKWELL_URL);
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i] !== '-c') continue;
+      const override = args[i + 1]!;
+      const eq = override.indexOf('=');
+      const key = override.slice(0, eq);
+      const value = unquote(override.slice(eq + 1));
+      if (key === 'mcp_servers' && value === '{}') inkwell = undefined;
+      if (!inkwell || !key.startsWith('mcp_servers.inkwell.')) continue;
+      const [field, header] = key.slice('mcp_servers.inkwell.'.length).split(/\.(.*)/s);
+      const transport = inkwell.transport as Record<string, unknown>;
+      if (field === 'url') transport.url = value;
+      if (field === 'bearer_token_env_var') transport.bearer_token_env_var = value;
+      if (field === 'http_headers' || field === 'env_http_headers') {
+        transport[field] = { ...((transport[field] as object | null) ?? {}), [header!]: value };
+      }
+    }
+    return inkwell ? [inkwell] : [];
+  }
+
+  async function launch(passthroughArgs: string[], backendSessionId?: string) {
+    const host: BackendHost = {
+      paths: {
+        inkFiles: join(root, 'files'),
+        studiosRoot: join(root, 'studios'),
+        tempDir: join(root, 'tmp'),
+      },
+      ambientSession: () => ({}),
+      claudeSupportsPartialMessages: async () => false,
+      skillMcpServers: async () => [],
+      sessionEnv: async () => ({}),
+      baseEnv: async () => ({}),
+      inkwellMcpUrl: 'http://localhost:3001/mcp',
+      resolveBinary: async (name) => name,
+      warn: () => undefined,
+    };
+    const prepared = await new CodexAdapter().prepare(
+      {
+        sbSlug: 'wren',
+        prompt: 'hello',
+        promptParts: ['exec', 'hello'],
+        passthroughArgs,
+        cliAttached: false,
+        cwd: root,
+        ...(backendSessionId ? { backendSessionId } : {}),
+      },
+      host
+    );
+    try {
+      return await new CodexAdapter().checkEffectiveConfig(
+        check({ launchConfig: prepared.launchConfig ?? { args: [] } })
+      );
+    } finally {
+      await prepared.cleanup();
+    }
+  }
+
+  it("admits a clean launch, the adapter's own overrides included, fresh or resumed (control)", async () => {
+    expect(await launch([])).toBeUndefined();
+    expect(lastArgs()).toContain('mcp_servers.inkwell.bearer_token_env_var="INK_ACCESS_TOKEN"');
+    expect(await launch([], 'synthetic-thread-1')).toBeUndefined();
+  });
+
+  it('refuses a pass-through override that adds a static routing header', async () => {
+    expect(await launch(['-c', 'mcp_servers.inkwell.http_headers.x-ink-session-id="s"'])).toBe(
+      CODEX_CONFIG_REFUSALS.staticRouting
+    );
+  });
+
+  it("refuses a pass-through override of the adapter's own header: it comes later in the launch, so it wins there", async () => {
+    expect(
+      await launch(['-c', 'mcp_servers.inkwell.env_http_headers.x-ink-context="SYNTHETIC_OTHER"'])
+    ).toBe(CODEX_CONFIG_REFUSALS.inkwellEnvHeader);
+  });
+
+  it('refuses a pass-through override that moves the Inkwell server, in every --config spelling', async () => {
+    const elsewhere = 'mcp_servers.inkwell.url="http://127.0.0.1:4001/mcp"';
+    for (const passthrough of [
+      ['--config', elsewhere],
+      [`--config=${elsewhere}`],
+      [`-c${elsewhere}`],
+    ]) {
+      expect(await launch(passthrough), passthrough.join(' ')).toBe(
+        CODEX_CONFIG_REFUSALS.inkwellElsewhere
+      );
+    }
+  });
+
+  it('keeps the launch order, so the last override of a key decides in the check as in the spawn', async () => {
+    const elsewhere = 'mcp_servers.inkwell.url="http://127.0.0.1:4001/mcp"';
+    const home = `mcp_servers.inkwell.url="${INKWELL_URL}"`;
+    expect(await launch(['-c', elsewhere, '--config', home])).toBeUndefined();
+    expect(await launch(['-c', home, '--config', elsewhere])).toBe(
+      CODEX_CONFIG_REFUSALS.inkwellElsewhere
+    );
+  });
+
+  it("admits ink chat's strict-tools pass-through, which disables every MCP server", async () => {
+    const strict = [
+      '--color',
+      'never',
+      '--sandbox',
+      'read-only',
+      '--skip-git-repo-check',
+      '--config',
+      'features.apps=false',
+      '--config',
+      'mcp_servers.inkwell.enabled=false',
+      '--config',
+      'mcp_servers={}',
+    ];
+    expect(await launch(strict)).toBeUndefined();
+    expect(lastArgs()).toContain('mcp_servers={}');
+    // Options that do not touch the config are not carried into the listing.
+    expect(lastArgs()).not.toContain('--sandbox');
+  });
+
+  it('refuses a profile, a working directory, a feature switch or an unknown option, before any listing', async () => {
+    const cases: [string[], string][] = [
+      [['-p', 'work'], CODEX_LAUNCH_REFUSALS.profile],
+      [['--profile=work'], CODEX_LAUNCH_REFUSALS.profile],
+      [['-C', '/synthetic/elsewhere'], CODEX_LAUNCH_REFUSALS.directory],
+      [['--cd=/synthetic/elsewhere'], CODEX_LAUNCH_REFUSALS.directory],
+      [['--enable', 'apps'], CODEX_LAUNCH_REFUSALS.feature],
+      [[`--api-key=${CANARY}`], CODEX_LAUNCH_REFUSALS.unclassified],
+    ];
+    for (const [passthrough, reason] of cases) {
+      const calls = probe.calls.length;
+      const refusal = await launch(passthrough);
+      expect(refusal, passthrough.join(' ')).toBe(reason);
+      expect(refusal).not.toContain(CANARY);
+      expect(probe.calls.length, passthrough.join(' ')).toBe(calls);
+    }
   });
 });

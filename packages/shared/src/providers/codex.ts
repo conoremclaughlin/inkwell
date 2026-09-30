@@ -13,6 +13,7 @@ import { encodeContextToken } from '../runner/mcp-config.js';
 import { runProbe, type ProbeFailure } from '../runner/probe.js';
 import { INK_ENV_HEADERS } from './codex-env-headers.js';
 import { judgeCodexMcpList } from './codex-mcp-list.js';
+import { classifyCodexPassthrough } from './codex-launch-config.js';
 import type {
   BackendAdapter,
   BackendConfig,
@@ -58,15 +59,22 @@ export class CodexAdapter implements BackendAdapter {
    * Codex's own view of its merged MCP config, judged before the spawn
    * (codex-mcp-list.ts). The listing runs on the probe env, which carries
    * none of the session's credentials and nothing the spawn would not get,
-   * and its output goes only to the judge.
+   * and its output goes only to the judge. It runs with every override the
+   * launch carries, in launch order, so it judges the config the spawn will
+   * run with (codex-launch-config.ts).
    */
   async checkEffectiveConfig(check: EffectiveConfigCheck): Promise<string | undefined> {
-    const listing = await runProbe(check.binary, ['mcp', 'list', '--json'], {
-      env: check.probeEnv,
-      cwd: check.cwd,
-      signal: check.signal,
-      timeoutMs: check.timeoutMs,
-    });
+    if ('refusal' in check.launchConfig) return check.launchConfig.refusal;
+    const listing = await runProbe(
+      check.binary,
+      ['mcp', 'list', '--json', ...check.launchConfig.args],
+      {
+        env: check.probeEnv,
+        cwd: check.cwd,
+        signal: check.signal,
+        timeoutMs: check.timeoutMs,
+      }
+    );
     if (!listing.ok) return codexProbeFailureReason(listing.failure);
     return judgeCodexMcpList(listing.stdout, {
       inkwellMcpUrl: check.inkwellMcpUrl,
@@ -96,6 +104,12 @@ export class CodexAdapter implements BackendAdapter {
     { promptFile, cleanup }: { promptFile: string; cleanup: () => Promise<void> }
   ): Promise<PreparedBackend> {
     const args: string[] = [];
+    // Every `-c` this adapter adds, in order, for the effective-config check.
+    const ownConfig: string[] = [];
+    const pushConfig = (value: string) => {
+      args.push('-c', value);
+      ownConfig.push('-c', value);
+    };
 
     // Resume MUST come before --config flags. Codex treats `resume` as a
     // subcommand with its own `-c` flag — config flags before `resume`
@@ -106,7 +120,7 @@ export class CodexAdapter implements BackendAdapter {
 
     // Identity injection via config override (uses -c which works both
     // as root --config and as resume's -c flag)
-    args.push('-c', `model_instructions_file=${promptFile}`);
+    pushConfig(`model_instructions_file=${promptFile}`);
 
     // Ephemeral-studio root (spec:studio-materialization v8): writable
     // alongside the workspace. --add-dir exists on both the root command and
@@ -120,7 +134,7 @@ export class CodexAdapter implements BackendAdapter {
     // Ink session headers — Codex resolves env var names to values at runtime.
     // Server key must match what's in .codex/config.toml (mcp_servers.inkwell).
     for (const { header, envVar } of INK_ENV_HEADERS) {
-      args.push('-c', `mcp_servers.inkwell.env_http_headers.${header}="${envVar}"`);
+      pushConfig(`mcp_servers.inkwell.env_http_headers.${header}="${envVar}"`);
     }
 
     // Auth: use codex's static-bearer mechanism, NOT an Authorization
@@ -131,7 +145,7 @@ export class CodexAdapter implements BackendAdapter {
     // once that refresh token expires the server returns `invalid_grant` and
     // codex aborts MCP init, even though ink injected a perfectly good bearer.
     // Point at INK_ACCESS_TOKEN (raw) — codex prepends "Bearer " itself.
-    args.push('-c', `mcp_servers.inkwell.bearer_token_env_var="INK_ACCESS_TOKEN"`);
+    pushConfig(`mcp_servers.inkwell.bearer_token_env_var="INK_ACCESS_TOKEN"`);
 
     // Model (only if explicitly specified by user)
     if (config.model) {
@@ -198,9 +212,18 @@ export class CodexAdapter implements BackendAdapter {
     // INK_ACCESS_TOKEN (raw token) is provided at the spawn site via authEnv;
     // the adapter references it by name through bearer_token_env_var above.
 
+    // The adapter's overrides come first in the launch, as they do here, so a
+    // pass-through override of the same key wins in both.
+    const passthroughConfig = classifyCodexPassthrough(config.passthroughArgs);
+    const launchConfig =
+      'refusal' in passthroughConfig
+        ? passthroughConfig
+        : { args: [...ownConfig, ...passthroughConfig.args] };
+
     return {
       binary: this.binary,
       args,
+      launchConfig,
       env: {
         SB_SLUG: config.sbSlug,
         AGENT_ID: config.sbSlug,
