@@ -246,8 +246,10 @@ export class ClaudeAdapter implements BackendAdapter {
         console.warn(`[media] context image not injected (${r.reason}): ${r.media.path}`);
       }
       rejectionNote +=
-        '\n\n[image note] These image(s), named in your context, could NOT be attached, ' +
-        'so you have not seen them. View the file again if you still need it:\n' +
+        '\n\n[image note] These image(s), named in your context, could NOT be attached to ' +
+        'this message, so you have not seen them. Each goes again with your next message ' +
+        'while it stays in your context; evict it if you no longer need it, or view the ' +
+        'file again if the reason is that it is unreadable:\n' +
         encodedContext.rejected
           .map((r) => {
             const ref = (r.media as { ref?: unknown }).ref;
@@ -447,6 +449,12 @@ export class ClaudeAdapter implements BackendAdapter {
       },
       cleanup: mcpCleanup,
       ...(stdinData ? { stdinData } : {}),
+      // Encoded images ride the stream-json message above (encoding needs a
+      // prompt, and a prompt with blocks always switches to stream-json), so
+      // what was injected is exactly what this spawn carries.
+      ...(encodedContext && encodedContext.injected.length > 0
+        ? { contextImagesDelivered: encodedContext.injected }
+        : {}),
     };
   }
 

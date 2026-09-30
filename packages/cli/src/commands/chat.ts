@@ -4837,20 +4837,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return images.length > 0 ? images : undefined;
   };
   /**
-   * Record what a spawn delivered — only on success, and only for a provider
-   * session that keeps it. A failed spawn may never have reached the model, so
-   * its images go again with the next one.
+   * Record what a spawn delivered: the images the ADAPTER reports its input
+   * carried, never the list the host offered. An adapter can refuse part of
+   * that list (the request's media budget, a file gone from disk), and
+   * counting a refused image as seen suppressed it for the rest of the
+   * session, however often it was viewed again (Lumen, PR #708). Only on
+   * success, and only for a provider session that keeps it: a failed spawn may
+   * never have reached the model, so its images go again with the next one.
    */
   const noteImagesDelivered = (
     targetSessionId: string | undefined,
-    images: readonly ContextImage[] | undefined,
-    success: boolean
+    result: Pick<BackendRunResult, 'success' | 'contextImagesDelivered'>
   ): void => {
-    if (!success || targetSessionId === undefined || !images || images.length === 0) return;
+    const carried = result.contextImagesDelivered ?? [];
+    if (!result.success || targetSessionId === undefined || carried.length === 0) return;
     if (deliveredImages.sessionId !== targetSessionId) {
       deliveredImages = { sessionId: targetSessionId, refs: new Set() };
     }
-    for (const image of images) deliveredImages.refs.add(image.ref);
+    for (const image of carried) {
+      const ref = (image as Partial<ContextImage>).ref;
+      if (typeof ref === 'string') deliveredImages.refs.add(ref);
+    }
   };
 
   let historyHydration: HistoryHydrationResult | null = null;
@@ -7616,7 +7623,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           stopWaiting();
         });
         endSpawn();
-        noteImagesDelivered(openingSessionId, openingImages, runResult.success);
+        noteImagesDelivered(openingSessionId, runResult);
         // Recorded here, not after the reseed branch: a failed resume that
         // reported usage still spent those tokens, and the retry below
         // REASSIGNS runResult — recording once at the end would silently drop
@@ -7692,7 +7699,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             currentTurnAbort = null;
           });
           endSpawn();
-          noteImagesDelivered(reseedId, reseedImages, runResult.success);
+          noteImagesDelivered(reseedId, runResult);
           recordRunUsage(runResult.usage);
           sampleProviderContext(runResult.usage);
         }
@@ -7836,7 +7843,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         currentTurnAbort = null;
       });
       endSpawn();
-      noteImagesDelivered(contSessionId, contImages, contResult.success);
+      noteImagesDelivered(contSessionId, contResult);
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);

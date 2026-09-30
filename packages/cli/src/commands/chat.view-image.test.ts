@@ -140,16 +140,32 @@ interface SpawnRequest {
 const toolCall = (tool: string, args: Record<string, unknown>) =>
   '```ink-tool\n' + JSON.stringify({ tool, args }) + '\n```';
 
-/** Script the backend: one reply per spawn, in order; 'done' once they run out. */
-function scriptBackend(replies: string[]): void {
-  testState.runBackendImpl.mockImplementation(async () => ({
-    success: true,
-    stdout: replies.shift() ?? 'done',
-    stderr: '',
-    exitCode: 0,
-    durationMs: 5,
-    command: 'mock',
-  }));
+/**
+ * Script the backend: one reply per spawn, in order; 'done' once they run out.
+ *
+ * Like a real adapter, it reports which offered images its input carried.
+ * `carry` picks them (default: all); the host must record only those.
+ */
+function scriptBackend(
+  replies: string[],
+  carry: (offered: NonNullable<SpawnRequest['contextImages']>, spawn: number) => unknown[] = (
+    offered
+  ) => offered
+): void {
+  let spawn = 0;
+  testState.runBackendImpl.mockImplementation(async (request: SpawnRequest) => {
+    const carried = request.contextImages ? carry(request.contextImages, spawn) : [];
+    spawn += 1;
+    return {
+      success: true,
+      stdout: replies.shift() ?? 'done',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 5,
+      command: 'mock',
+      ...(carried.length > 0 ? { contextImagesDelivered: carried } : {}),
+    };
+  });
 }
 
 const spawns = (): SpawnRequest[] =>
@@ -241,6 +257,53 @@ describe('images from tools reach the model as images', () => {
     expect(afterEvict!.backendSessionSeedId).toBeDefined();
     expect(afterEvict!.backendSessionSeedId).not.toBe(viewed!.backendSessionId);
     expect(afterEvict!.contextImages).toBeUndefined();
+  });
+
+  // Control for the refusal case below: the same script, with the second
+  // image carried, leaves nothing to offer on the next turn.
+  it('an image the backend carried is not offered again (control)', async () => {
+    writeFileSync(join(testCwd, 'second.png'), makePng(320, 240));
+    scriptBackend([
+      toolCall('view_image', { path: 'shot.png' }),
+      toolCall('view_image', { path: 'second.png' }),
+      'Seen both.',
+      'Next turn.',
+    ]);
+    testState.inputs = ['look at both', 'and now?', '/quit'];
+    await runChat({ agent: 'myra', backend: 'claude', toolRouting: 'local', pollSeconds: '999' });
+
+    const [, afterFirst, afterSecond, nextTurn] = spawns();
+    expect(afterFirst!.contextImages?.map((i) => i.width)).toEqual([640]);
+    // Only the new image: the session already holds the first.
+    expect(afterSecond!.contextImages?.map((i) => i.width)).toEqual([320]);
+    expect(nextTurn!.backendSessionId).toBe(afterSecond!.backendSessionId);
+    expect(nextTurn!.contextImages).toBeUndefined();
+  });
+
+  // Lumen, PR #708: an adapter that refuses part of what it is offered (the
+  // request's media budget, a file gone from disk) must not have the refused
+  // images recorded as seen. Before the fix the host marked everything it
+  // offered, and a refused image was suppressed for the rest of the session.
+  it('an image the backend refused is offered again on the next spawn, not recorded as seen', async () => {
+    writeFileSync(join(testCwd, 'second.png'), makePng(320, 240));
+    scriptBackend(
+      [
+        toolCall('view_image', { path: 'shot.png' }),
+        toolCall('view_image', { path: 'second.png' }),
+        'Seen what arrived.',
+        'Next turn.',
+      ],
+      // The spawn after the second view refuses everything it is offered.
+      (offered, spawn) => (spawn === 2 ? [] : offered)
+    );
+    testState.inputs = ['look at both', 'and now?', '/quit'];
+    await runChat({ agent: 'myra', backend: 'claude', toolRouting: 'local', pollSeconds: '999' });
+
+    const [, , refusedSpawn, nextTurn] = spawns();
+    expect(refusedSpawn!.contextImages?.map((i) => i.width)).toEqual([320]);
+    // Same session, and the refused image is offered again.
+    expect(nextTurn!.backendSessionId).toBe(refusedSpawn!.backendSessionId);
+    expect(nextTurn!.contextImages?.map((i) => i.width)).toEqual([320]);
   });
 
   it('a re-seeded session is given every image the ledger still holds', async () => {

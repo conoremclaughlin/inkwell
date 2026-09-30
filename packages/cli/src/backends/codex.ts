@@ -12,7 +12,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
-import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+import type { BackendAdapter, BackendConfig, PreparedBackend, TurnMedia } from './types.js';
 
 /**
  * Inkwell headers to inject as env_http_headers on the "inkwell" MCP server.
@@ -114,6 +114,7 @@ export class CodexAdapter implements BackendAdapter {
     // Preserve general behavior for non-exec prompt parts, but when promptParts
     // starts with `exec`, place passthrough args immediately after `exec`.
     const promptParts = config.promptParts || [];
+    let contextImagesDelivered: TurnMedia[] = [];
     if (promptParts.length > 0 && promptParts[0]?.toLowerCase() === 'exec') {
       args.push(promptParts[0]);
       args.push(...config.passthroughArgs);
@@ -140,6 +141,7 @@ export class CodexAdapter implements BackendAdapter {
         args.push('--');
       }
       args.push(...promptParts.slice(1));
+      contextImagesDelivered = [...(config.contextImages ?? [])];
     } else {
       // Passthrough flags
       args.push(...config.passthroughArgs);
@@ -171,6 +173,8 @@ export class CodexAdapter implements BackendAdapter {
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },
       cleanup,
+      // Only the exec form carries --image flags; any other shape carried none.
+      ...(contextImagesDelivered.length > 0 ? { contextImagesDelivered } : {}),
     };
   }
 }

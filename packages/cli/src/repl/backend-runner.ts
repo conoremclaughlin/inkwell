@@ -105,6 +105,12 @@ export interface BackendRunResult {
   /** Whether the process was reaped by a timeout, and which kind. */
   timedOut?: boolean;
   timeoutType?: 'idle' | 'hard';
+  /**
+   * The requested `contextImages` this spawn's input actually carried, as the
+   * adapter reported them (PreparedBackend.contextImagesDelivered). Absent
+   * means none — so nothing may be recorded as seen.
+   */
+  contextImagesDelivered?: TurnMedia[];
 }
 
 export interface BackendTurnHandle {
@@ -202,6 +208,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         ...(resumeFailedNoSession ? { resumeFailedNoSession: true } : {}),
         timedOut: spawnResult.timedOut,
         timeoutType: spawnResult.timeoutType,
+        ...(prepared.contextImagesDelivered
+          ? { contextImagesDelivered: prepared.contextImagesDelivered }
+          : {}),
       };
     }),
     abort: () => {

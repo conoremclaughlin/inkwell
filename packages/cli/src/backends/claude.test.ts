@@ -725,6 +725,39 @@ describe('ClaudeAdapter prepare — images a tool put in context', () => {
       expect(prepared.stdinData).toContain('[image note]');
       expect(prepared.stdinData).toContain('img:feedfacefeedface');
       expect(prepared.stdinData).toContain('you have not seen them');
+      expect(prepared.stdinData).toContain('goes again with your next message');
+      expect(prepared).not.toHaveProperty('contextImagesDelivered');
+    } finally {
+      warn.mockRestore();
+      prepared.cleanup();
+    }
+  });
+
+  it('reports only the images its input carries, so a refused one is not counted as seen', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const adapter = new ClaudeAdapter();
+    const carried = { path: pngPath, mimeType: 'image/png', ref: 'img:0000000000000001' };
+    const refused = {
+      path: join(tmpDir, 'gone.png'),
+      mimeType: 'image/png',
+      ref: 'img:0000000000000002',
+    };
+    const prepared = adapter.prepare({
+      sbSlug: 'myra',
+      prompt: 'continue',
+      promptParts: [],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      contextImages: [carried, refused] as never,
+    });
+    try {
+      expect(prepared.contextImagesDelivered).toEqual([carried]);
+      const line = JSON.parse(prepared.stdinData!.trim());
+      const labels = line.message.content
+        .filter((b: { type: string; text?: string }) => b.type === 'text')
+        .map((b: { text: string }) => b.text);
+      expect(labels).toContain('[image img:0000000000000001]');
+      expect(labels.join('\n')).not.toContain('[image img:0000000000000002]');
     } finally {
       warn.mockRestore();
       prepared.cleanup();

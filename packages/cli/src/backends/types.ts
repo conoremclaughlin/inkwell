@@ -118,6 +118,14 @@ export interface PreparedBackend {
    * prompt from args.
    */
   stdinData?: string;
+  /**
+   * The `contextImages` this spawn's input actually carries — never merely
+   * the ones it was offered. An adapter can refuse some (the request's media
+   * budget, a file gone from disk), and the host records delivery from this
+   * list alone: an image offered but not carried must go again with the next
+   * spawn, not be counted as seen.
+   */
+  contextImagesDelivered?: TurnMedia[];
 }
 
 export interface BackendAdapter {

@@ -12,7 +12,7 @@ vi.mock('../backends/index.js', () => ({
   getBackend: (backend: string) => ({
     name: backend,
     binary: 'mock-backend',
-    prepare: (config: { promptParts: string[] }) => {
+    prepare: (config: { promptParts: string[]; contextImages?: unknown[] }) => {
       state.prepareCalls.push({ backend, promptParts: [...config.promptParts] });
       state.prepareConfigs.push({ ...config });
       return {
@@ -20,6 +20,11 @@ vi.mock('../backends/index.js', () => ({
         args: [...config.promptParts],
         env: {},
         cleanup: () => undefined,
+        // An adapter that carries only the first image it is offered, the way
+        // a request budget or a vanished file makes a real one refuse the rest.
+        ...(config.contextImages?.length
+          ? { contextImagesDelivered: config.contextImages.slice(0, 1) }
+          : {}),
       };
     },
   }),
@@ -146,6 +151,34 @@ describe('runBackendTurn', () => {
       await runBackendTurn({ backend: 'claude', sbSlug: 'myra', prompt: 'ping', cliAttached });
       expect(state.prepareConfigs[0]?.cliAttached).toBe(cliAttached);
     }
+  });
+
+  // The host records an image as seen from this report alone (PR #708): the
+  // offered list is what it asked for, not what the provider received.
+  it('reports the context images the adapter carried, not the ones it was offered', async () => {
+    spawnMock.mockImplementation(() => createMockChild(0));
+    state.prepareConfigs = [];
+    const offered = [
+      { path: '/virtual/a.png', mimeType: 'image/png' },
+      { path: '/virtual/b.png', mimeType: 'image/png' },
+    ];
+    const result = await runBackendTurn({
+      backend: 'claude',
+      sbSlug: 'myra',
+      prompt: 'ping',
+      contextImages: offered,
+      cliAttached: false,
+    });
+    expect(state.prepareConfigs[0]?.contextImages).toEqual(offered);
+    expect(result.contextImagesDelivered).toEqual([offered[0]]);
+
+    const none = await runBackendTurn({
+      backend: 'claude',
+      sbSlug: 'myra',
+      prompt: 'ping',
+      cliAttached: false,
+    });
+    expect(none).not.toHaveProperty('contextImagesDelivered');
   });
 
   // The child's on-prompt hook reads this. Without it, a headless child's
