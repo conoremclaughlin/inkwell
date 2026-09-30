@@ -235,6 +235,21 @@ describe('judgeCodexMcpList, refusals', () => {
     expect(judge([helper, baked])).toBe(CODEX_CONFIG_REFUSALS.staticRouting);
   });
 
+  it('names the hand edit wherever it offers the sync, since the sync rewrites only its managed block', () => {
+    const offersSync = Object.values(CODEX_CONFIG_REFUSALS).filter((reason) =>
+      reason.includes('ink mcp sync')
+    );
+    expect(offersSync).toEqual([
+      CODEX_CONFIG_REFUSALS.staticRouting,
+      CODEX_CONFIG_REFUSALS.inkwellEnvHeader,
+      CODEX_CONFIG_REFUSALS.inkwellElsewhere,
+    ]);
+    for (const reason of offersSync) {
+      expect(reason).toContain("outside ink's managed block");
+      expect(reason).toContain('~/.codex/config.toml');
+    }
+  });
+
   it('refuses when the host gives no readable Inkwell URL, and when a server URL is unreadable', () => {
     expect(judge(withoutHelper(), 'not a url')).toBe(CODEX_CONFIG_REFUSALS.unreadableInkwellUrl);
     expect(judge([http('broken', 'not a url')])).toBe(CODEX_CONFIG_REFUSALS.unreadableUrl);

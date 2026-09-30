@@ -43,20 +43,27 @@ import { INK_ENV_HEADERS } from './codex.js';
 
 export const CODEX_MCP_LIST_MEASURED_AGAINST = 'codex-cli 0.158.0';
 
+/**
+ * The repair, both halves. `ink mcp sync` rewrites only ink's managed block
+ * in the studio's `.codex/config.toml` (mergeCodexConfig keeps everything
+ * outside it), and never touches the user's own config. The listing shows
+ * the merged result, not which file a key came from, so the reason names
+ * both.
+ */
+const CODEX_CONFIG_REPAIR =
+  "run `ink mcp sync` in this studio; if the refusal remains, remove it by hand from the studio's `.codex/config.toml` outside ink's managed block, or from `~/.codex/config.toml` (`$CODEX_HOME/config.toml`)";
+
 export const CODEX_CONFIG_REFUSALS = {
   drift: `\`codex mcp list --json\` did not have the shape measured against ${CODEX_MCP_LIST_MEASURED_AGAINST}; Codex was not started, because its MCP configuration could not be checked`,
-  staticRouting:
-    'a session routing header is configured in the Codex config; run `ink mcp sync` in this studio',
+  staticRouting: `a session routing header is configured in the Codex config; ${CODEX_CONFIG_REPAIR}`,
   foreignSessionEnv:
     'an MCP server other than Inkwell in the Codex config draws a session credential or routing value from the environment',
-  inkwellEnvHeader:
-    'the Codex config sets an Inkwell routing or Authorization header from the environment that ink does not own; run `ink mcp sync` in this studio',
+  inkwellEnvHeader: `the Codex config sets an Inkwell routing or Authorization header from the environment that ink does not own; ${CODEX_CONFIG_REPAIR}`,
   staticAuthorization:
     'a static Authorization header is configured for the Inkwell MCP server in the Codex config',
   helper:
     'an MCP server in the Codex config computes its headers with http_headers_helper, which cannot be checked',
-  inkwellElsewhere:
-    "the Codex config's `inkwell` MCP server is not this session's Inkwell server; run `ink mcp sync` in this studio",
+  inkwellElsewhere: `the Codex config's \`inkwell\` MCP server is not this session's Inkwell server; ${CODEX_CONFIG_REPAIR}`,
   unreadableUrl: 'an MCP server in the Codex config has a URL that cannot be read',
   unreadableInkwellUrl: 'the Inkwell server URL this session was given cannot be read',
 } as const;
