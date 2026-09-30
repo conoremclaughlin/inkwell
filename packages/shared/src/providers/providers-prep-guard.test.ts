@@ -94,7 +94,7 @@ const HOST_BOUNDARY_EXCEPTIONS: ReadonlyArray<{ at: string; reason: string }> = 
   {
     at: 'runner/spawn-backend.ts buildCleanEnv process.env',
     reason:
-      "The child's base env: the SPAWN_ENV_INHERITED_NAMES allowlist, read from the host by default and reached through spawnBackend. P2c moves the base env onto BackendHost.",
+      "The default parent env, for spawnBackend's callers outside this path (the API runners through resolveSpawnTarget, the CLI's backend-auth). startBackendTurn always passes its host's BackendHost.baseEnv as parentEnv, which backend-runner.concurrent.test proves; the default goes when those callers move onto the providers path.",
   },
   {
     at: 'runner/spawn-backend.ts sessionEnvHandoff process.env',
