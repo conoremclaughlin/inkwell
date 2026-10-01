@@ -214,7 +214,12 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
     expect(relaunch.session?.reusedBy).toBe('backendSessionId');
   });
 
+  // Scoped by a thread key of their own: the suite's other tests leave live
+  // rows under the same agent, and a live row rightly outranks a crashed one,
+  // so the crash cases need a scope in which the rows they create are the
+  // only candidates.
   it('a plain relaunch after a crash, with no backend id, reuses the crashed row', async () => {
+    const threadKey = `thread:it-crash-${randomUUID()}`;
     const firstId = randomUUID();
     const first = parse(
       await handleStartSession(
@@ -224,6 +229,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
           backend: 'claude',
           forceNew: true,
           sessionId: firstId,
+          threadKey,
         },
         dataComposer
       )
@@ -238,7 +244,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
 
     const relaunch = parse(
       await handleStartSession(
-        { userId: INTEGRATION_TEST_USER_ID, sbSlug: SUITE_AGENT, backend: 'claude' },
+        { userId: INTEGRATION_TEST_USER_ID, sbSlug: SUITE_AGENT, backend: 'claude', threadKey },
         dataComposer
       )
     );
@@ -248,6 +254,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
   });
 
   it('a newer crashed row does not displace an older live row on a plain relaunch', async () => {
+    const threadKey = `thread:it-order-${randomUUID()}`;
     const liveId = randomUUID();
     createdSessionIds.push(liveId);
     await handleStartSession(
@@ -257,6 +264,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
         backend: 'claude',
         forceNew: true,
         sessionId: liveId,
+        threadKey,
       },
       dataComposer
     );
@@ -269,6 +277,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
         backend: 'claude',
         forceNew: true,
         sessionId: crashedId,
+        threadKey,
       },
       dataComposer
     );
@@ -280,7 +289,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
 
     const relaunch = parse(
       await handleStartSession(
-        { userId: INTEGRATION_TEST_USER_ID, sbSlug: SUITE_AGENT, backend: 'claude' },
+        { userId: INTEGRATION_TEST_USER_ID, sbSlug: SUITE_AGENT, backend: 'claude', threadKey },
         dataComposer
       )
     );
