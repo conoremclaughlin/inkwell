@@ -47,6 +47,7 @@ export async function startCodexMailGateway(options: {
   let stopped = false;
   let healthy = true;
   let initialized = false;
+  let boundThreadId: string | undefined;
   let serial = 0;
   const pending = new Map<
     string,
@@ -116,9 +117,20 @@ export async function startCodexMailGateway(options: {
           nativeRequests.delete(key);
           message.id = request.id;
           if (!message.error && request.method === 'initialize') initialized = true;
-          if (!message.error && request.bindsThread && message.result?.thread?.ephemeral !== true) {
+          if (
+            !message.error &&
+            message.result?.thread?.ephemeral !== true &&
+            (request.bindsThread ||
+              (boundThreadId &&
+                typeof message.result?.thread?.id === 'string' &&
+                message.result.thread.id !== boundThreadId))
+          ) {
             const threadId = message.result?.thread?.id;
             if (typeof threadId !== 'string') throw new Error('Missing native thread identity');
+            // Start/resume establishes ownership. Any later native response
+            // naming another persistent thread conservatively signals a
+            // switch (fork and future methods included), not a new binding.
+            boundThreadId ??= threadId;
             await options.onBound(threadId);
           }
         }

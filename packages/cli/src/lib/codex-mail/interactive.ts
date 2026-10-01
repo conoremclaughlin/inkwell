@@ -4,7 +4,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getValidAccessToken } from '../../auth/tokens.js';
 import { callInkTool, getInkServerUrl } from '../ink-mcp.js';
-import { CodexMailDelivery, PendingCodexDelivery } from './delivery.js';
+import { CodexMailDelivery } from './delivery.js';
+import { CodexMailDiagnostics } from './diagnostics.js';
 import { startCodexMailGateway } from './gateway.js';
 import { pulseCodexMail } from './heartbeat.js';
 import { splitCodexMailArgs } from './launch.js';
@@ -51,12 +52,10 @@ export async function runCodexMailInteractive(options: {
   let stamping = false;
   let lastDiscovery = 0;
   let hooksReady = false;
-  const warnings = new Set<string>();
-  const warn = (message: string) => {
-    if (warnings.has(message)) return;
-    warnings.add(message);
-    options.onStderr(Buffer.from(`\nInkwell Inkmail: ${message}\n`));
-  };
+  const diagnostics = new CodexMailDiagnostics((message) =>
+    options.onStderr(Buffer.from(`\nInkwell Inkmail: ${message}\n`))
+  );
+  const warn = (message: string) => diagnostics.warn(message);
   const gateway = await startCodexMailGateway({
     ...options,
     serverArgs: launch.serverArgs,
@@ -108,14 +107,7 @@ export async function runCodexMailInteractive(options: {
         return;
       }
       if (typeof message.id !== 'string') throw new Error('Inkmail row has no message identity');
-      try {
-        await delivery!.deliver(message.id, content, meta);
-      } catch (error) {
-        if (!(error instanceof PendingCodexDelivery)) {
-          warn(error instanceof Error ? error.message : 'delivery failed; mail left unread');
-        }
-        throw error;
-      }
+      await diagnostics.deliver(delivery!, message.id, content, meta);
     },
     log: (level, message) => {
       // Shared drain reports normal pending receipts as emit failures too.

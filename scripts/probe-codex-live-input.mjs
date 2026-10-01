@@ -53,6 +53,7 @@ const report = (check, data = {}) => {
   records.push(row);
   console.log(JSON.stringify(row));
 };
+const shellQuote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(check, label, timeout = 12000) {
   const end = Date.now() + timeout;
@@ -325,7 +326,7 @@ try {
     const hookPath = path.join(root, 'record-hook.cjs');
     fs.writeFileSync(
       hookPath,
-      `const fs=require('fs');let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>fs.appendFileSync(${JSON.stringify(path.join(root, 'hooks.jsonl'))},JSON.stringify({event:process.argv[2],input,cwd:process.cwd()})+'\\n'));`
+      `const fs=require('fs');let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>fs.appendFileSync(process.argv[2],JSON.stringify({event:process.argv[3],input,cwd:process.cwd()})+'\\n'));`
     );
     fs.appendFileSync(path.join(ch, 'config.toml'), '\n[features]\nhooks=true\n');
     for (const event of ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) {
@@ -336,7 +337,11 @@ try {
           ']]\n[[hooks.' +
           event +
           '.hooks]]\ntype="command"\ncommand=' +
-          JSON.stringify(process.execPath + ' ' + hookPath + ' ' + event) +
+          JSON.stringify(
+            [process.execPath, hookPath, path.join(root, 'hooks.jsonl'), event]
+              .map(shellQuote)
+              .join(' ')
+          ) +
           '\n'
       );
     }
@@ -396,16 +401,46 @@ user_prompt = "ink hooks on-prompt --backend codex"
     const driver = path.join(root, 'wrapper.mjs');
     const moduleUrl = new URL('../packages/cli/dist/lib/codex-mail/interactive.js', import.meta.url)
       .href;
+    const wrapperConfig = path.join(root, 'wrapper-options.json');
+    fs.writeFileSync(
+      wrapperConfig,
+      JSON.stringify({
+        binary: 'codex',
+        args: [
+          '-c',
+          'model_instructions_file=' + JSON.stringify(instructionsPath),
+          '--sandbox',
+          'read-only',
+          '--add-dir',
+          work,
+          '--no-alt-screen',
+        ],
+        cwd: work,
+        sbSlug: 'fixture',
+        sessionId: fixtureSession,
+        studioId: fixtureStudio,
+      })
+    );
+    // Paths are data, never interpolated into executable source.
     fs.writeFileSync(
       driver,
-      `import {runCodexMailInteractive} from ${JSON.stringify(moduleUrl)};
-import fs from 'node:fs';
-const result=await runCodexMailInteractive({binary:'codex',args:['-c',${JSON.stringify('model_instructions_file=' + JSON.stringify(instructionsPath))},'--sandbox','read-only','--add-dir',${JSON.stringify(work)},'--no-alt-screen'],cwd:${JSON.stringify(work)},env:process.env,sbSlug:'fixture',sessionId:${JSON.stringify(fixtureSession)},studioId:${JSON.stringify(fixtureStudio)},onBound:async(id)=>fs.writeFileSync(${JSON.stringify(path.join(root, 'bound.txt'))},id),onStderr:(c)=>process.stderr.write(c)});
+      `import fs from 'node:fs';
+const {runCodexMailInteractive}=await import(process.argv[2]);
+const options=JSON.parse(fs.readFileSync(process.argv[3],'utf8'));
+const result=await runCodexMailInteractive({...options,env:process.env,onBound:async(id)=>fs.writeFileSync(process.argv[4],id),onStderr:(c)=>process.stderr.write(c)});
 process.exitCode=result.code??1;`
     );
     tui = spawn(
       'python3',
-      ['-u', path.join(base, 'fixtures/codex-live-input-pty.py'), process.execPath, driver],
+      [
+        '-u',
+        path.join(base, 'fixtures/codex-live-input-pty.py'),
+        process.execPath,
+        driver,
+        moduleUrl,
+        wrapperConfig,
+        path.join(root, 'bound.txt'),
+      ],
       { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] }
     );
     children.push(tui);
@@ -581,6 +616,10 @@ process.exitCode=result.code??1;`
         } catch (error) {
           if (!(error instanceof PendingCodexDelivery) && !error.message.includes('uncertain'))
             throw error;
+          report('receipt_reconciliation_pending', {
+            id,
+            kind: error instanceof PendingCodexDelivery ? 'queued' : 'not-visible-yet',
+          });
           await delay(300);
         }
       }

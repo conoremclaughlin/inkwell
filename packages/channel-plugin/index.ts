@@ -88,7 +88,8 @@ const hostRendersChannel = !['print', 'codex'].includes(process.env.INK_CHANNEL_
 // A directly launched Codex MCP client may not inherit the ink wrapper env.
 // Do not consume mail for a host that cannot render Claude channel pushes.
 function canDeliverChannel(): boolean {
-  return hostRendersChannel && !/codex/i.test(mcp.getClientVersion()?.name ?? '');
+  const client = mcp.getClientVersion();
+  return hostRendersChannel && Boolean(client?.name) && !/codex/i.test(client!.name);
 }
 
 function resolveEmail(): string | undefined {

@@ -65,12 +65,19 @@ export function modernCodexMailHooks(content: string, commandPrefix: string) {
         ).test(line)
       )
     );
-  if (!legacy) throw new Error('Codex Inkmail will not overwrite a modified hook block');
+  if (!legacy)
+    throw new Error(
+      'Codex Inkmail will not overwrite a modified hook block. Review/back up custom hooks first; ' +
+        'to regenerate Ink hooks after changing the node binary or CLI checkout, run ' +
+        'ink hooks install --backend codex --force, then relaunch --codex-inkmail and review hook trust again'
+    );
   return { content: content.slice(0, start) + block + content.slice(end + END.length), hooks };
 }
 
 export function prepareCodexMailHooks(cwd: string) {
   const path = join(cwd, '.codex', 'config.toml');
+  if (!existsSync(join(cwd, '.codex')))
+    throw new Error('Missing Codex project config; run ink init first');
   if (
     lstatSync(join(cwd, '.codex')).isSymbolicLink() ||
     (existsSync(path) && lstatSync(path).isSymbolicLink())

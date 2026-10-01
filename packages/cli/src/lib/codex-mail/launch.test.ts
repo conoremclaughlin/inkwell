@@ -1,6 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { splitCodexMailArgs } from './launch.js';
-import { hasTrustedCodexMailHooks, modernCodexMailHooks } from './hooks.js';
+import { hasTrustedCodexMailHooks, modernCodexMailHooks, prepareCodexMailHooks } from './hooks.js';
+
+const dirs: string[] = [];
+afterEach(() => {
+  vi.unstubAllEnvs();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 const id = '00000000-0000-4000-8000-000000000001';
 describe('native Codex live-mail launch mapping', () => {
@@ -72,6 +81,51 @@ describe('native Codex live-mail launch mapping', () => {
       '--config=model="fixture"',
     ]);
   });
+  it.each([false, true])('accepts real interactive adapter output, resume=%s', async (resume) => {
+    const dir = mkdtempSync(join(tmpdir(), 'ink-mail-adapter-'));
+    dirs.push(dir);
+    vi.stubEnv('HOME', dir);
+    vi.stubEnv('TMPDIR', dir);
+    vi.stubEnv('INK_STUDIOS_ROOT', join(dir, 'studios'));
+    const { CodexAdapter } = await import('../../backends/codex.js');
+    const prepared = new CodexAdapter().prepare({
+      sbSlug: 'fixture',
+      inkSessionId: id,
+      studioId: id,
+      cliAttached: true,
+      systemPromptOverride: 'Synthetic fixture identity',
+      model: 'fixture-model',
+      promptParts: [],
+      passthroughArgs: ['--no-alt-screen'],
+      dangerous: true,
+      ...(resume ? { backendSessionId: id } : {}),
+    });
+    try {
+      const result = splitCodexMailArgs(prepared.args, dir);
+      expect(result.tuiArgs).toEqual(
+        resume ? ['--no-alt-screen', 'resume', id] : ['--no-alt-screen']
+      );
+      expect(result.serverArgs).toContain(
+        'mcp_servers.inkwell.bearer_token_env_var="INK_ACCESS_TOKEN"'
+      );
+      expect(result.serverArgs.some((arg) => arg.startsWith('model_instructions_file='))).toBe(
+        true
+      );
+      expect(result.threadOverrides).toMatchObject({
+        model: 'fixture-model',
+        sandbox: 'danger-full-access',
+        approvalPolicy: 'never',
+        runtimeWorkspaceRoots: [dir, join(dir, 'studios')],
+      });
+      expect(prepared.env).toMatchObject({
+        INK_SESSION_ID: id,
+        INK_STUDIO_ID: id,
+        INK_CHANNEL_HOST: 'codex',
+      });
+    } finally {
+      prepared.cleanup();
+    }
+  });
 });
 const legacy = `model="fixture"\n# ink-managed:hooks:start\n[hooks]\nsession_start = "ink hooks on-session-start --backend codex"\nsession_end = "ink hooks on-stop --backend codex"\nuser_prompt = "ink hooks on-prompt --backend codex"\n# ink-managed:hooks:end\n[custom]\nvalue=true\n`;
 describe('opt-in modern hook migration', () => {
@@ -94,6 +148,17 @@ describe('opt-in modern hook migration', () => {
     ]) {
       expect(() => modernCodexMailHooks(value, 'node fixture')).toThrow();
     }
+  });
+  it('names the force reinstall and re-trust recovery when a previous launcher path differs', () => {
+    const old = modernCodexMailHooks(legacy, "'node-old' '/old/cli.js'").content;
+    expect(() => modernCodexMailHooks(old, "'node-new' '/new/cli.js'")).toThrow(
+      'ink hooks install --backend codex --force'
+    );
+  });
+  it('reports missing project setup without a raw filesystem error', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ink-mail-no-config-'));
+    dirs.push(dir);
+    expect(() => prepareCodexMailHooks(dir)).toThrow('run ink init first');
   });
   it('requires exactly one enabled and trusted copy of each required handler', () => {
     const expected = modernCodexMailHooks(legacy, 'node fixture').hooks;

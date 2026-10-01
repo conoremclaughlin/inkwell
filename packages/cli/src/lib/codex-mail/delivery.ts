@@ -178,7 +178,7 @@ export class CodexMailDelivery {
     // An event may have arrived during either scan.
     if (this.load(messageId)?.state === 'delivered') return;
     throw new Error(
-      'Inkmail acceptance is uncertain; left unread and will not resend automatically'
+      'Inkmail acceptance is uncertain: no completed receipt or queued row visible yet; left unread and will not resend automatically'
     );
   }
 }

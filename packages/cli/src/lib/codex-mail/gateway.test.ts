@@ -123,6 +123,19 @@ describe('owned native Codex gateway', () => {
       'decline'
     );
   });
+  it('detects persistent thread changes from unfamiliar native responses without treating them as initial ownership', async () => {
+    const f = await setup();
+    await f.call('fixture/thread-response', { threadId: 'foreign-before-start' });
+    expect(f.bound).toEqual([]);
+    await f.call('thread/start');
+    await f.call('fixture/thread-response', { threadId: 'title', ephemeral: true });
+    await f.call('fixture/thread-response', { threadId: 'fixture-thread' });
+    expect(f.bound).toEqual(['fixture-thread']);
+    const params = { threadId: 'forked-thread', custom: 'untouched' };
+    const response = await f.call('fixture/thread-response', params);
+    expect(response.result.received).toEqual(params);
+    expect(f.bound).toEqual(['fixture-thread', 'forked-thread']);
+  });
   it('rejects a second frontend without replacing the first owner', async () => {
     const f = await setup();
     const other = new WebSocket(`ws+unix://${f.gateway.endpoint.slice(7)}:/`);
@@ -150,9 +163,9 @@ describe('owned native Codex gateway', () => {
       const args = useGuardian ? [guardian, process.execPath, fake, pidPath] : [fake, pidPath];
       writeFileSync(
         wrapperPath,
-        `const {spawn}=require('node:child_process');\nconst p=spawn(process.execPath,${JSON.stringify(args)},{detached:true,stdio:['pipe','ignore','ignore'],env:{PATH:process.env.PATH,HOME:${JSON.stringify(dir)}}});\nsetTimeout(()=>process.exit(0),15000);\n`
+        `const {spawn}=require('node:child_process');\nconst p=spawn(process.execPath,JSON.parse(process.argv[2]),{detached:true,stdio:['pipe','ignore','ignore'],env:{PATH:process.env.PATH,HOME:process.env.HOME}});\nsetTimeout(()=>process.exit(0),15000);\n`
       );
-      const wrapper = spawn(process.execPath, [wrapperPath], {
+      const wrapper = spawn(process.execPath, [wrapperPath, JSON.stringify(args)], {
         env: { PATH: process.env.PATH, HOME: dir },
         stdio: 'ignore',
       });

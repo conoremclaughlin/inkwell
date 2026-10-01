@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexMailDelivery, digest, PendingCodexDelivery } from './delivery.js';
 import { createCodexMailPoller } from './poller.js';
+import { CodexMailDiagnostics } from './diagnostics.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -47,6 +48,10 @@ function fixture() {
     },
     deliveredInHistory: () => {
       items = [{ item: receipt().params.item, turnId: 'turn', completedAtMs: 1 }];
+      queue = [];
+    },
+    setHistory: (value: any[]) => {
+      items = value;
       queue = [];
     },
     missingEverywhere: () => {
@@ -102,6 +107,23 @@ describe('Codex Inkmail receipt boundary', () => {
     await expect(f.make().deliver('message', 'hello', meta)).rejects.toThrow('uncertain');
     expect(f.added).toHaveLength(1);
   });
+  it.each(['foreign-client', 'missing-completion', 'null-completion'])(
+    'rejects matching content in history without an exact completed receipt: %s',
+    async (kind) => {
+      const f = fixture();
+      await expect(f.make().deliver('message', 'hello', meta)).rejects.toThrow();
+      const entry: any = { item: f.receipt().params.item, completedAtMs: 1 };
+      if (kind === 'foreign-client') entry.item.clientId = 'another-client';
+      if (kind === 'missing-completion') delete entry.completedAtMs;
+      if (kind === 'null-completion') entry.completedAtMs = null;
+      f.setHistory([entry]);
+      await expect(f.make().deliver('message', 'hello', meta)).rejects.toThrow('uncertain');
+      expect(f.added).toHaveLength(1);
+      f.deliveredInHistory();
+      await f.make().deliver('message', 'hello', meta);
+      expect(f.added).toHaveLength(1);
+    }
+  );
   it('durable receipt survives restart and ACK failure without any more Codex calls', async () => {
     const f = fixture(),
       d = f.make();
@@ -187,4 +209,102 @@ describe('Codex Inkmail receipt boundary', () => {
     );
     expect(f.added).toHaveLength(1);
   });
+
+  it.each(['thread', 'legacy'])(
+    'holds later %s mail across polls/restart after an ambiguous non-accepted add; exact receipts unblock it',
+    async (mode) => {
+      const f = fixture();
+      let receiptAvailable = false;
+      const attempts: any[] = [];
+      const rpc = {
+        request: async (method: string, params: any) => {
+          if (method === 'thread/queue/add') {
+            attempts.push(params);
+            if (!receiptAvailable) throw new Error('timeout before acceptance');
+            return {};
+          }
+          if (method === 'thread/items/list')
+            return {
+              data: receiptAvailable
+                ? attempts.map((p) => ({
+                    completedAtMs: 1,
+                    item: {
+                      type: 'userMessage',
+                      clientId: p.clientUserMessageId,
+                      content: p.input,
+                    },
+                  }))
+                : [],
+            };
+          if (method === 'thread/queue/list') return { data: [] };
+          throw new Error('unexpected RPC');
+        },
+      };
+      const make = () =>
+        new CodexMailDelivery({
+          directory: f.directory,
+          scope: 'wedge-fixture',
+          threadId: 'codex-thread',
+          rpc,
+        });
+      let delivery = make();
+      const rows = ['m1', 'm2'].map((id, i) => ({
+        id,
+        content: id,
+        senderSlug: 'peer',
+        createdAt: `2026-01-01T00:00:0${i}Z`,
+      }));
+      const ink = vi.fn(async (tool: string) => {
+        if (tool === 'get_inbox')
+          return {
+            success: true,
+            messages: mode === 'legacy' ? rows : [],
+            threadsWithUnread:
+              mode === 'thread' ? [{ threadKey: 'thread:fixture', unreadCount: 2 }] : [],
+          };
+        if (tool === 'get_thread_messages') return { success: true, messages: rows };
+        return { success: true };
+      });
+      const warnings: string[] = [];
+      const diagnostics = new CodexMailDiagnostics((m) => warnings.push(m));
+      const notify = vi.fn(
+        async (
+          content: string,
+          metadata: Record<string, unknown>,
+          msg?: Record<string, unknown>
+        ) => {
+          if (msg) await diagnostics.deliver(delivery, String(msg.id), content, metadata);
+        }
+      );
+      const poll = createCodexMailPoller({
+        sbSlug: 'fixture',
+        studioId: 'studio',
+        callInk: ink,
+        notify,
+        log: () => {},
+      });
+      for (let i = 0; i < 5; i++) {
+        if (i === 2) delivery = make(); // Restart loads the same intent; no resend.
+        const result = await poll();
+        expect((mode === 'thread' ? result.threadResult : result.legacyResult).emitFailures).toBe(
+          1
+        );
+      }
+      expect(attempts).toHaveLength(1);
+      expect(notify.mock.calls.map(([, , row]) => row?.id)).toEqual(['m1', 'm1', 'm1', 'm1', 'm1']);
+      expect(ink.mock.calls.filter(([tool]) => tool.startsWith('mark_'))).toEqual([]);
+      expect(warnings[0]).toContain('message m1');
+      expect(warnings[0]).toContain(mode === 'thread' ? 'thread:fixture' : 'legacy inbox');
+      // Control: a delayed exact context receipt is sufficient to release the
+      // boundary. Both mail IDs advance, but m1 was still submitted only once.
+      receiptAvailable = true;
+      await poll();
+      expect(attempts).toHaveLength(2);
+      expect(ink).toHaveBeenCalledWith(
+        mode === 'thread' ? 'mark_thread_read' : 'mark_inbox_read',
+        expect.objectContaining({ throughMessageId: 'm2' })
+      );
+      expect(warnings.at(-1)).toContain('Exact receipt confirmed for message m1');
+    }
+  );
 });

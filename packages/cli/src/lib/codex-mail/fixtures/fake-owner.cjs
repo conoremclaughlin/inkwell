@@ -33,6 +33,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
               },
               received: request.params,
             }
-          : { received: request.params },
+          : request.method === 'fixture/thread-response'
+            ? {
+                thread: { id: request.params.threadId, ephemeral: request.params.ephemeral },
+                received: request.params,
+              }
+            : { received: request.params },
     });
 });
