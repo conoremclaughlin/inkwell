@@ -1724,6 +1724,12 @@ export class MemoryRepository {
     if (input.contactId) {
       insertData.contact_id = input.contactId;
     }
+    if (input.backendSessionId) {
+      // Both columns, as updateSession writes them: readers still fall back
+      // to claude_session_id for rows older than the backend rename.
+      insertData.backend_session_id = input.backendSessionId;
+      insertData.claude_session_id = input.backendSessionId;
+    }
 
     const { data, error } = await this.supabase
       .from('sessions')
@@ -2015,8 +2021,10 @@ export class MemoryRepository {
    * conversation. Both link columns are read: rows written since the backend
    * rename carry both, older rows only claude_session_id. Crashed rows
    * (lifecycle 'failed') count: relaunching the transcript is how a crashed
-   * session resumes. Ended rows do not: ended_at is a fence the caller must
-   * lift deliberately (update_session_state reopen), never by resolution.
+   * session resumes. Ended rows do not, nor rows whose lifecycle or status
+   * says completed with ended_at still null: those are fences the caller
+   * must lift deliberately (update_session_state reopen), never by
+   * resolution.
    * Newest-updated first, so of several live rows for one conversation (the
    * duplicates this lookup now prevents) the one being written to wins.
    */
@@ -2035,6 +2043,13 @@ export class MemoryRepository {
       .select('*')
       .eq('user_id', userId)
       .is('ended_at', null)
+      // The same fences the pickers apply (isSessionResumable,
+      // isAttachableSessionSummary): a row whose lifecycle or status says
+      // completed is finished even with ended_at null, and handing it back
+      // would resume into a session every picker rejects. 'failed' passes.
+      .neq('lifecycle', 'completed')
+      .or('status.is.null,status.not.ilike.completed')
+      .or('status.is.null,status.not.ilike.completed:*')
       .or(`backend_session_id.eq.${backendSessionId},claude_session_id.eq.${backendSessionId}`)
       .order('updated_at', { ascending: false })
       .limit(1);

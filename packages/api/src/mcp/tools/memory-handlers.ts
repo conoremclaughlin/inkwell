@@ -1355,6 +1355,9 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     model: params.model,
     metadata: params.metadata,
     contactId: contactScope,
+    // Written with the row: a link added by a later update leaves a window
+    // in which a second start for the same transcript creates a second row.
+    backendSessionId: params.backendSessionId,
   });
 
   // Persist CLI-attached flag from request context to session record.

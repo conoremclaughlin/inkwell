@@ -171,6 +171,14 @@ export interface SessionCreateInput {
   threadKey?: string;
   contactId?: string;
   backend?: string;
+  /**
+   * The backend conversation this session runs (Claude Code session id,
+   * Codex thread id). Written to both link columns on insert so the row is
+   * findable by it from its first moment — a link written by a later
+   * best-effort update leaves a window in which a second start for the same
+   * transcript creates a second row (Lumen, #716).
+   */
+  backendSessionId?: string;
   model?: string;
   metadata?: Record<string, unknown>;
 }

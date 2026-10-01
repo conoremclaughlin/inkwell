@@ -84,6 +84,68 @@ describe('MemoryRepository', () => {
       expect(isCalls).toContainEqual(['ended_at', null]);
     });
 
+    it('getActiveSessionByBackendSessionId fences on the completed lifecycle and status, keeping crashed rows', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByBackendSessionId('user-1', 'claude-abc', 'myra');
+
+      const neqCalls = (
+        mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(neqCalls).toContainEqual(['lifecycle', 'completed']);
+      expect(neqCalls).not.toContainEqual(['lifecycle', 'failed']);
+      const orCalls = (mockSupabase._queryBuilder.or as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls;
+      expect(orCalls).toContainEqual(['status.is.null,status.not.ilike.completed']);
+      expect(orCalls).toContainEqual(['status.is.null,status.not.ilike.completed:*']);
+    });
+
+    it('startSession writes the supplied backend conversation to both link columns', async () => {
+      mockSupabase._setReturnData({
+        id: 's2',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        sb_id: 'sb-myra',
+        backend_session_id: 'claude-abc',
+        claude_session_id: 'claude-abc',
+        started_at: '2026-10-01T00:00:00Z',
+      });
+
+      await repo.startSession({
+        userId: 'user-1',
+        sbSlug: 'myra',
+        sbId: 'sb-myra',
+        backendSessionId: 'claude-abc',
+      });
+
+      const insertCalls = (
+        mockSupabase._queryBuilder.insert as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(insertCalls).toHaveLength(1);
+      expect(insertCalls[0][0]).toMatchObject({
+        backend_session_id: 'claude-abc',
+        claude_session_id: 'claude-abc',
+      });
+    });
+
+    it('startSession leaves both link columns alone when no conversation is supplied', async () => {
+      mockSupabase._setReturnData({
+        id: 's3',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        sb_id: 'sb-myra',
+        started_at: '2026-10-01T00:00:00Z',
+      });
+
+      await repo.startSession({ userId: 'user-1', sbSlug: 'myra', sbId: 'sb-myra' });
+
+      const insertCalls = (
+        mockSupabase._queryBuilder.insert as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(insertCalls[0][0]).not.toHaveProperty('backend_session_id');
+      expect(insertCalls[0][0]).not.toHaveProperty('claude_session_id');
+    });
+
     it('getActiveSessionByBackendSessionId falls back to agent_id without a canonical owner', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 

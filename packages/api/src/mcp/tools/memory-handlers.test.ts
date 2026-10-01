@@ -2286,6 +2286,11 @@ describe('handleStartSession - threadKey matching', () => {
     expect(parsed.session.id).toBe('session-new');
     expect(parsed.session.isExisting).toBeUndefined();
     expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledTimes(1);
+    // The link is written with the row, not by a later best-effort update:
+    // a second start for the same transcript must find this row (Lumen, #716).
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ backendSessionId: 'claude-new' })
+    );
   });
 
   it('does not consult the backend link when the caller names no conversation', async () => {

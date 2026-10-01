@@ -104,6 +104,100 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
     expect(minted).toBeNull();
   });
 
+  it('a second start for the same transcript reuses the first row with no link step in between', async () => {
+    const transcript = `it-${randomUUID()}`;
+    const firstId = randomUUID();
+    const first = parse(
+      await handleStartSession(
+        {
+          userId: INTEGRATION_TEST_USER_ID,
+          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          backend: 'claude',
+          forceNew: true,
+          sessionId: firstId,
+          backendSessionId: transcript,
+        },
+        dataComposer
+      )
+    );
+    createdSessionIds.push(firstId);
+    expect(first.session?.id).toBe(firstId);
+    expect(first.session?.backendSessionId).toBe(transcript);
+
+    const second = parse(
+      await handleStartSession(
+        {
+          userId: INTEGRATION_TEST_USER_ID,
+          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          backend: 'claude',
+          forceNew: true,
+          sessionId: randomUUID(),
+          backendSessionId: transcript,
+        },
+        dataComposer
+      )
+    );
+
+    expect(second.session?.id).toBe(firstId);
+    expect(second.session?.reusedBy).toBe('backendSessionId');
+  });
+
+  it('control: a lifecycle-completed row with ended_at still null is not reused', async () => {
+    const transcript = `it-${randomUUID()}`;
+    const completedId = await startLinkedRow(transcript);
+    await dataComposer
+      .getClient()
+      .from('sessions')
+      .update({ lifecycle: 'completed' })
+      .eq('id', completedId);
+
+    const relaunchId = randomUUID();
+    const relaunch = parse(
+      await handleStartSession(
+        {
+          userId: INTEGRATION_TEST_USER_ID,
+          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          backend: 'claude',
+          forceNew: true,
+          sessionId: relaunchId,
+          backendSessionId: transcript,
+        },
+        dataComposer
+      )
+    );
+    createdSessionIds.push(relaunchId);
+
+    expect(relaunch.session?.id).toBe(relaunchId);
+    expect(relaunch.session?.isExisting).toBeUndefined();
+  });
+
+  it('a crashed row (lifecycle failed, ended_at null) is the one its relaunch resumes', async () => {
+    const transcript = `it-${randomUUID()}`;
+    const crashedId = await startLinkedRow(transcript);
+    await dataComposer
+      .getClient()
+      .from('sessions')
+      .update({ lifecycle: 'failed' })
+      .eq('id', crashedId);
+
+    const relaunch = parse(
+      await handleStartSession(
+        {
+          userId: INTEGRATION_TEST_USER_ID,
+          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          backend: 'claude',
+          forceNew: true,
+          sessionId: randomUUID(),
+          backendSessionId: transcript,
+        },
+        dataComposer
+      )
+    );
+
+    expect(relaunch.session?.id).toBe(crashedId);
+    expect(relaunch.session?.reusedBy).toBe('backendSessionId');
+  });
+
   it('control: a transcript no live row carries still creates the requested row', async () => {
     const transcript = `it-${randomUUID()}`;
     const freshId = randomUUID();
