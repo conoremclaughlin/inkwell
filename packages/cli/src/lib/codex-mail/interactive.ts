@@ -57,6 +57,9 @@ export async function runCodexMailInteractive(
     threadOverrides: launch.threadOverrides,
     env: bridgeEnv,
     onBound: async (id) => {
+      // A switch is a one-way pause for this wrapper, even if the TUI later
+      // returns to the original thread. Do not publish or rebind again.
+      if (switched) return;
       if (threadId && threadId !== id) {
         switched = true;
         binding.revoke();
