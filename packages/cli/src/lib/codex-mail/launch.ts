@@ -48,7 +48,7 @@ export function splitCodexMailArgs(args: string[], cwd: string) {
         throw new Error('Codex Inkmail requires an exact resume UUID');
     } else {
       throw new Error(
-        `Codex Inkmail does not yet support ${arg}; omit --codex-inkmail to use the normal launcher`
+        `Codex Inkmail does not yet support ${arg}; use --no-codex-inkmail for the normal launcher`
       );
     }
   }

@@ -16,7 +16,8 @@ const base = path.dirname(fileURLToPath(import.meta.url));
 const defaultSocket = process.argv.includes('--default-socket');
 const unix = process.argv.includes('--unix') || defaultSocket;
 const permissionsProbe = process.argv.includes('--permissions-probe');
-const wrapperMode = process.argv.includes('--wrapper');
+const launcherMode = process.argv.includes('--launcher');
+const wrapperMode = process.argv.includes('--wrapper') || launcherMode;
 const gatewayMode = process.argv.includes('--gateway');
 const launchOverrides = process.argv.includes('--launch-overrides') || gatewayMode;
 let gateway;
@@ -36,6 +37,7 @@ const env = {
 };
 const inkCalls = [];
 let mailboxUnread = true;
+let fixtureBackendId;
 const fixtureSession = '00000000-0000-4000-8000-000000000001';
 const fixtureStudio = '00000000-0000-4000-8000-000000000002';
 const fixtureMessage = '00000000-0000-4000-8000-000000000003';
@@ -176,7 +178,28 @@ const provider = http.createServer(async (req, res) => {
         success: true,
         session: { id: fixtureSession, activeThreadKey: 'thread:fixture' },
       };
-    if (name === 'list_sessions') result = { success: true, sessions: [] };
+    if (name === 'list_sessions')
+      result = {
+        success: true,
+        sessions: launcherMode
+          ? [
+              {
+                id: fixtureSession,
+                sbSlug: 'fixture',
+                backend: 'codex',
+                studioId: fixtureStudio,
+                workingDir: fs.realpathSync(work),
+                lifecycle: 'idle',
+                currentPhase: 'active',
+                backendSessionId: fixtureBackendId,
+              },
+            ]
+          : [],
+      };
+    if (launcherMode && name === 'update_session_state' && body.params.arguments.backendSessionId) {
+      fixtureBackendId = body.params.arguments.backendSessionId;
+      fs.writeFileSync(path.join(root, 'bound.txt'), fixtureBackendId);
+    }
     if (name === 'bootstrap')
       result = { success: true, identityFiles: { self: 'Synthetic fixture identity.' } };
     res.end(
@@ -430,30 +453,48 @@ const options=JSON.parse(fs.readFileSync(process.argv[3],'utf8'));
 const result=await runCodexMailInteractive({...options,env:process.env,onBound:async(id)=>fs.writeFileSync(process.argv[4],id),onStderr:(c)=>process.stderr.write(c)});
 process.exitCode=result.code??1;`
     );
-    tui = spawn(
-      'python3',
-      [
-        '-u',
-        path.join(base, 'fixtures/codex-live-input-pty.py'),
-        process.execPath,
-        driver,
-        moduleUrl,
-        wrapperConfig,
-        path.join(root, 'bound.txt'),
-      ],
-      { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-    children.push(tui);
-    let buffer = '';
-    tui.stdout.on('data', (chunk) => {
-      buffer += chunk;
-      let at;
-      while ((at = buffer.indexOf('\n')) >= 0) {
-        const row = JSON.parse(buffer.slice(0, at));
-        buffer = buffer.slice(at + 1);
-        if (row.output) tuiText += row.output;
-      }
-    });
+    if (launcherMode)
+      fs.appendFileSync(
+        path.join(ch, 'config.toml'),
+        '\n[mcp_servers.inkwell]\nurl=' + JSON.stringify(inkUrl + '/mcp') + '\nenabled=false\n'
+      );
+    // --launcher exercises extractArgs, session selection, the real adapter,
+    // default-on preflight and the wrapper branch, with NO Inkmail CLI flag.
+    const launchArgs = launcherMode
+      ? [
+          process.execPath,
+          fileURLToPath(new URL('../packages/cli/dist/cli.js', import.meta.url)),
+          '-b',
+          'codex',
+          '-a',
+          'fixture',
+          '--session-choice',
+          'ink:' + fixtureSession,
+          '--sandbox',
+          'read-only',
+          '--no-alt-screen',
+        ]
+      : [process.execPath, driver, moduleUrl, wrapperConfig, path.join(root, 'bound.txt')];
+    const startWrapper = () => {
+      tuiText = '';
+      tui = spawn(
+        'python3',
+        ['-u', path.join(base, 'fixtures/codex-live-input-pty.py'), ...launchArgs],
+        { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+      children.push(tui);
+      let buffer = '';
+      tui.stdout.on('data', (chunk) => {
+        buffer += chunk;
+        let at;
+        while ((at = buffer.indexOf('\n')) >= 0) {
+          const row = JSON.parse(buffer.slice(0, at));
+          buffer = buffer.slice(at + 1);
+          if (row.output) tuiText += row.output;
+        }
+      });
+    };
+    startWrapper();
     await until(() => tuiText.includes('Hooks need review'), 'wrapper hook review', 20000);
     await delay(500);
     tui.stdin.write(JSON.stringify({ write: '\u001b[B\r' }) + '\n');
@@ -492,8 +533,11 @@ process.exitCode=result.code??1;`
       inkCalls.some((c) => c.body.cliAttached === true),
       'missing attachment'
     );
+    if (launcherMode)
+      assert.ok(tuiText.includes('live delivery enabled'), 'default-on launcher bypassed');
     report('wrapper_assertions_passed', {
       root,
+      fullLauncher: launcherMode,
       mailboxAck: true,
       scopedFetch: true,
       promptAndStop: true,
@@ -502,6 +546,25 @@ process.exitCode=result.code??1;`
     // Exit the actual native TUI normally, allowing the runner to stop its owner.
     tui.stdin.write(JSON.stringify({ write: '\u0004' }) + '\n');
     await until(() => tui.exitCode !== null, 'wrapper normal exit', 15000);
+    if (launcherMode) {
+      const original = fs.readFileSync(path.join(root, 'bound.txt'), 'utf8');
+      const beforeResume = inkCalls.length;
+      startWrapper();
+      await until(
+        () =>
+          inkCalls
+            .slice(beforeResume)
+            .some((c) => c.path === '/api/hooks/lifecycle' && c.body.cliPollAt),
+        'resumed bridge freshness after exact binding',
+        30000
+      );
+      assert.ok(tuiText.includes('live delivery enabled'), 'resume did not use the bridge');
+      assert.equal(fixtureBackendId, original, 'resume replaced the native thread');
+      await until(() => tuiText.includes('SYNTHETIC_WRAPPER_MAIL'), 'restored conversation', 15000);
+      report('launcher_resume_assertions_passed', { sameThread: true, historyRestored: true });
+      tui.stdin.write(JSON.stringify({ write: '\u0004' }) + '\n');
+      await until(() => tui.exitCode !== null, 'resumed launcher normal exit', 15000);
+    }
     // The trusted project migration persists after detach. A server-shaped
     // exec must invoke the guarded commands but make NO lifecycle/intake calls,
     // even with an inherited bridge flag. No real server or provider is used.

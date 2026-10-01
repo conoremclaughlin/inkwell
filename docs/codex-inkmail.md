@@ -1,7 +1,9 @@
 # Live Inkmail in the native Codex terminal (experimental)
 
 ```sh
-ink -b codex --codex-inkmail
+ink -b codex                     # live mail automatically on supported terminals
+ink -b codex --no-codex-inkmail  # opt out
+ink -b codex --codex-inkmail     # require it; fail instead of falling back
 ```
 
 Requires **codex-cli 0.159.2**, macOS/Linux, a registered studio, and session
@@ -10,10 +12,21 @@ Inkwell hooks in Codex's native hook-trust prompt (or `/hooks`). The launcher
 **does not grant hook trust**. Until the three hooks are enabled and trusted,
 mail remains unread and live delivery is paused.
 
-This is opt-in. Without the flag, the existing launcher path is unchanged, but
-the **project hook migration persists** (see Lifecycle and limits). It does
-not connect an already-running embedded terminal, change the desktop app, use
-or configure the shared daemon, relink `ink`, or restart an Inkwell server.
+Live mail is the default for interactive, session-tracked Codex terminals with
+supported arguments and the measured version. Unsupported versions/arguments,
+missing scope or nonstandard hooks produce a visible fallback to the unchanged
+native invocation, with live mail off. `--codex-inkmail` makes these failures
+fatal instead; `--no-codex-inkmail` skips preflight and hook migration entirely.
+One-shot prompts, piped/non-terminal runs, `--no-session` and other backends
+keep their normal path. User sandbox, approval and feature overrides are not
+weakened. A failure after the bridge starts never falls back to a second owner.
+
+The **project hook migration persists**, but its guarded commands are inert
+outside an attached bridge (see Lifecycle and limits). This does not connect an
+already-running embedded terminal, change the desktop app, use or configure the
+shared daemon, relink `ink`, or restart an Inkwell server. To adopt it for an
+existing conversation, restart `ink` and select that same session; no new
+conversation is required.
 
 ## Delivery
 
@@ -21,10 +34,11 @@ The wrapper runs a private App Server and attaches the **native Codex TUI** via
 a private Unix WebSocket gateway. The original identity, MCP authentication,
 context headers and other `-c` overrides stay on the App Server. Model,
 approval/sandbox options and additional workspace roots travel on the native
-thread start/resume request. Unknown launch options are refused instead of
+thread start/resume request. Unknown launch options fall back intact in automatic
+mode, or are refused when live mail is explicitly required; they are never
 silently discarded. The initial supported subset is in `codex-mail/launch.ts`;
 profiles, alternate remotes, picker-style native `resume`, and one-shot `exec`
-are not supported by this opt-in path.
+are not supported by the bridge path.
 
 The gateway binds mail to the exact persistent thread returned to its one TUI.
 It ignores ephemeral title-generation threads. It passes approvals to the TUI
@@ -59,6 +73,8 @@ once per minute per message, and report when an exact receipt is recovered.
 There can be a brief gap between dequeue and a completed context item: "not
 visible yet" is not proof of loss. Keep the original Codex thread open or resume
 it to allow the receipt to arrive. Normal visible queue backpressure is quiet.
+A not-visible scan gap is also quiet for its first 15 seconds; read acknowledgement stays blocked throughout.
+Transport/journal failures still warn immediately.
 
 If the intent never landed, or a queued row was deliberately deleted, this
 version cannot prove that from bounded history and will not resend. Recovery
@@ -89,21 +105,29 @@ is reported, not silently treated as working delivery.
 
 ## Lifecycle and limits
 
-- Opt-in upgrades only the recognized, marked legacy hook stanza in the local
+- A supported launch upgrades only the recognized, marked legacy hook stanza
+  (or the exact prior bridge stanza for the same launcher) in local
   `.codex/config.toml` to modern `SessionStart`, `UserPromptSubmit`, and `Stop`
   handlers. Other configuration is preserved. Symlinked or modified hook
   configurations are refused; trust is still the human's decision.
-- **The migration affects the whole studio**, not just this invocation. Once
-  enabled and trusted, modern hooks also apply to ordinary Codex launches and
-  headless `codex exec` there. Without the bridge environment, existing hook
-  inbox intake resumes. Server-shaped headless lifecycle/finalize compatibility
-  after this migration has **not** been end-to-end validated by this PR; avoid
-  enabling it in a studio concurrently used by a headless runner until that
-  validation is complete. The native wrapper probe is not a substitute for it.
+- **The migration affects the whole studio**, but the three commands now carry
+  `--codex-inkmail-only`. Before any identity/session reconciliation, lifecycle
+  write or inbox read, they require the bridge flag plus an explicitly attached
+  Codex context matching session, studio and SB environment fields. Headless
+  server contexts, parent-owned provider steps, absent/malformed context and
+  ordinary launches skip the handlers. Only a diagnostic is appended to the
+  local hook log. Existing server finalization remains the lifecycle owner;
+  no hook rollback is needed after a guarded bridge session.
+- This is a routing guard, not authentication or a sandbox. A manually spawned
+  child inheriting the entire attached bridge environment is still declaring
+  itself attached; server and Ink provider launchers must keep declaring their
+  actual headless/parent-owned context. Custom hooks are not rewritten or fenced.
 - Hook commands are pinned to the node binary and CLI checkout used to migrate.
   If either changes, review/back up custom hooks, run
   `ink hooks install --backend codex --force` using the intended CLI build,
-  then relaunch with `--codex-inkmail` and review native hook trust again.
+  then relaunch and review native hook trust again. A pre-existing unguarded
+  bridge block with a different launcher path needs this repair before it gains
+  the new guard; automatic fallback does not rewrite that custom/unknown block.
 - Hook inbox intake stands down while this bridge owns delivery. Hook lifecycle,
   turn epoch and lease behavior remain in the existing handlers.
 - TUI exit stops and reaps the App Server before detach/identity-file cleanup.
@@ -128,15 +152,26 @@ CLI):
 
 ```sh
 yarn workspace @inklabs/cli build
-yarn workspace @inklabs/cli exec vitest run src/lib/codex-mail
+test_home=$(mktemp -d /tmp/ink-mail-tests-XXXXXX)
+(cd packages/cli && env -i PATH="$PATH" HOME="$test_home" \
+  CODEX_HOME="$test_home/codex" INK_SERVER_URL=http://127.0.0.1:9 NODE_ENV=test \
+  node ../../node_modules/vitest/vitest.mjs run src/lib/codex-mail src/cli.test.ts)
 node scripts/probe-codex-live-input.mjs --gateway --permissions-probe
 node scripts/probe-codex-live-input.mjs --wrapper
+node scripts/probe-codex-live-input.mjs --launcher
 ```
 
 The opt-in probes use a fresh HOME/CODEX_HOME/cwd, a synthetic local provider,
 no credentials, and no model-executed tools. `--wrapper` also uses a stub Inkwell
 API and the actual Inkwell lifecycle hooks; its trust keystrokes apply **only**
-to hooks in the disposable fixture. Evidence stays outside git. Unit tests cover
+to hooks in the disposable fixture. It then runs native `codex exec` in the
+same migrated/trusted project with a server-shaped context, proving all three
+hook guards execute without any Inkwell API calls. `--launcher` additionally
+exercises the actual `ink` entry point, session selection and adapter with no
+Inkmail CLI flag, then resumes that same conversation and verifies the reader
+is fresh again with history preserved. This is structural no-interference
+evidence, not a shared-DB
+server-finalization integration test. Evidence stays outside git. Unit tests cover
 ambiguous acceptance, restart/ACK failure, exact receipts, scope, approvals,
 permission mapping, heartbeat failure and direct-node parent death, including
 a helper-disabled negative control with a self-terminating fake owner.

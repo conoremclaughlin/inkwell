@@ -85,6 +85,7 @@ describe('native Codex live-mail launch mapping', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ink-mail-adapter-'));
     dirs.push(dir);
     vi.stubEnv('HOME', dir);
+    vi.stubEnv('INK_CODEX_INKMAIL', '1');
     vi.stubEnv('TMPDIR', dir);
     vi.stubEnv('INK_STUDIOS_ROOT', join(dir, 'studios'));
     const { CodexAdapter } = await import('../../backends/codex.js');
@@ -121,6 +122,7 @@ describe('native Codex live-mail launch mapping', () => {
         INK_SESSION_ID: id,
         INK_STUDIO_ID: id,
         INK_CHANNEL_HOST: 'codex',
+        INK_CODEX_INKMAIL: '0',
       });
     } finally {
       prepared.cleanup();

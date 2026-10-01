@@ -72,11 +72,13 @@ describe('guarded hook CLI entry points', () => {
         ...(mode === 'parent' ? { INK_TURN_OWNER: 'parent' } : {}),
       };
       for (const hook of ['on-session-start', 'on-prompt', 'on-stop']) {
-        const { stdout, stderr } = await run(
+        const running = run(
           process.execPath,
           [cli, 'hooks', hook, '--backend', 'codex', '--codex-inkmail-only'],
           { env, cwd, timeout: 12000 }
         );
+        running.child.stdin?.end('{}');
+        const { stdout, stderr } = await running;
         expect(stdout).toBe('');
         expect(stderr).toBe('');
       }

@@ -21,6 +21,8 @@ type Intent = {
   state: 'sending' | 'delivered';
 };
 export class PendingCodexDelivery extends Error {}
+/** Diagnostic scan gap; never a receipt or permission to resend. */
+export class UnconfirmedCodexDelivery extends Error {}
 export const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 
 /** A write-ahead intent is NOT a receipt. Codex 0.159.2 does not deduplicate
@@ -177,7 +179,7 @@ export class CodexMailDelivery {
     }
     // An event may have arrived during either scan.
     if (this.load(messageId)?.state === 'delivered') return;
-    throw new Error(
+    throw new UnconfirmedCodexDelivery(
       'Inkmail acceptance is uncertain: no completed receipt or queued row visible yet; left unread and will not resend automatically'
     );
   }
