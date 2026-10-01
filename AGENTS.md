@@ -329,6 +329,16 @@ Each repo's AGENTS.md should carry this threadKey section so agents working ther
 2. When replying via `send_to_inbox` or `send_response`, **ALWAYS pass the same threadKey** so the conversation stays in one session for all participants.
 3. If the thread is DONE (PR merged, spec finalized, issue closed), say so in your response. The session can be ended — future messages on the same key will start a fresh session.
 
+## Session Keys
+
+A session key is the typed, routable name of one session: `wren:inkwell:main`. Thread keys name conversations; session keys name the session a message should land in, and `send_to_inbox` resolves a session key ahead of thread routing. Conor, 2026-10-01: the key is called `sessionKey` (consistent with `threadKey`), the human-readable title stays the headline, and the separator is the colon.
+
+**Name your own session** with `update_session_state(sessionKey: "<sb>:<project>:<name>")`. Use `main` for the root checkout's interactive session and the studio name otherwise, so a sender can build the key from convention rather than look it up. Keys are trimmed and lowercased on write, allow `a-z 0-9 : / . _ -`, and are at most 80 characters; an empty string clears the key. One live session per key per agent and studio. The response's `sessionTrace.changedFields` names `sessionKey` when it changed.
+
+**Address a session** with `send_to_inbox(recipientSlug: "wren", sessionKey: "wren:inkwell:main", threadKey: ..., content: ...)`. The key must belong to the recipient and to one live session; the resolver refuses a key that matches sessions in two studios rather than guessing (qualify with `recipientStudioSlug`). A key no live session carries falls through to thread routing today; refusing that miss, echoing the resolved session id, and canonicalising the project alias are decided in [ink://specs/key-schemes](ink://specs/key-schemes) (decisions 2 and 4 are open). `list_sessions(sbSlug: "wren", status: "active")` shows every session's `sessionKey` and `id`, and `list_sessions(sbSlug, sessionKey)` finds one, so a sender can address by key or by `recipientSessionId`.
+
+> **One thing you will see in SQL and the data layer.** The column is still `sessions.alias`, and the repository fields that mirror it keep that name. That is the only place the old name is correct; tool parameters, responses, hook bodies and documents say `sessionKey`. `alias` and `sessionAlias` are accepted as deprecated inputs for one release.
+
 ## Key Principles
 
 - **Prefer MCP tools over CLI equivalents** — when an MCP server provides functionality that overlaps with a CLI tool, use the MCP tool. MCP calls don't require user permission approval, provide structured output, and integrate better with your tooling. Examples: use `mcp__github__*` over `gh` CLI for PRs/issues/diffs/reviews, use `mcp__supabase__*` over `supabase` CLI for migrations and SQL.

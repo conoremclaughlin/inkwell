@@ -2167,6 +2167,8 @@ export class MemoryRepository {
       filterNullStudio?: boolean;
       backend?: string;
       status?: SessionStatusFilter;
+      /** Exact match on the session key (the `alias` column), already normalised. */
+      sessionKey?: string;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -2187,6 +2189,10 @@ export class MemoryRepository {
 
     if (options.backend) {
       query = query.eq('backend', options.backend);
+    }
+
+    if (options.sessionKey) {
+      query = query.eq('alias', options.sessionKey);
     }
 
     if (options.status) {
@@ -2593,6 +2599,7 @@ export class MemoryRepository {
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,
+      alias: row.alias || undefined,
       lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,
       currentPhase: row.current_phase || undefined,

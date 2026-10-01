@@ -178,7 +178,7 @@ export interface Session {
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
 
-  // Human-readable alias for explicit routing (e.g., "main", "review")
+  // The session key for explicit routing (e.g., "wren:inkwell:main"); stored in the `alias` column
   alias?: string;
 
   // Whether a CLI process with a channel plugin is attached to this session
@@ -252,8 +252,8 @@ export interface SessionRequest {
     // unlike recipientSessionId: honoured only while that session can safely
     // take the turn, otherwise the message routes unanchored.
     replyToSessionId?: string;
-    // Target a session by alias (e.g., "main", "review")
-    sessionAlias?: string;
+    // Target a session by its key (e.g., "wren:inkwell:main"), normalised by the sender
+    sessionKey?: string;
     // For task sessions
     sessionType?: SessionType;
     taskDescription?: string;

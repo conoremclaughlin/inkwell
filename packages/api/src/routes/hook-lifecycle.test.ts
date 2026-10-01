@@ -177,6 +177,23 @@ describe('hook-lifecycle CLI turn signal', () => {
     return updateSession.mock.calls.at(-1)?.[1] as Record<string, unknown>;
   }
 
+  it('a sessionKey-only update writes the key, normalised, to the alias column', async () => {
+    const updates = await post({ sessionKey: ' Wren:Inkwell:Main ' });
+    expect(updates).toMatchObject({ alias: 'wren:inkwell:main' });
+    expect('lifecycle' in updates).toBe(false);
+  });
+
+  it('a sessionKey the route cannot normalise is a 400 and writes nothing', async () => {
+    const before = updateSession.mock.calls.length;
+    const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+      body: JSON.stringify({ sessionId: SESSION_ID, sessionKey: 'has space' }),
+    });
+    expect(resp.status).toBe(400);
+    expect(updateSession.mock.calls.length).toBe(before);
+  });
+
   it('a non-UUID sessionId is rejected before it reaches the database', async () => {
     // "sess-1"-shaped ids (test fixtures leaking from integration runs, or
     // any malformed caller) used to reach Postgres, raise 22P02, and

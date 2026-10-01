@@ -21,6 +21,7 @@ import {
 } from '../../utils/request-context';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { isTerminalPhaseMarker } from '../../services/sessions/phase-markers';
+import { normaliseSessionKey } from '../../services/sessions/session-key';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import {
   currentWorkAudience,
@@ -592,6 +593,13 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
       }
     ),
   backend: z.string().optional().describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
+  sessionKey: z
+    .string()
+    .max(80)
+    .optional()
+    .describe(
+      'Filter to the session carrying this key (e.g., "wren:inkwell:main"). Case-insensitive; exact match after normalisation.'
+    ),
   // `ink attach` and `ink mission` have always passed status: 'active' here.
   // The parameter was never declared, so zod stripped it and every caller
   // silently received unfiltered results. Declaring it without honouring it
@@ -676,12 +684,16 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe('Whether a human is attached to the CLI session (interactive REPL)'),
-  alias: z
+  sessionKey: z
     .string()
+    .max(80)
     .optional()
     .describe(
-      'Human-readable session alias for explicit routing (e.g., "main", "review"). Unique per agent among active sessions. Use to name a session so messages can be routed to it by alias.'
+      'Name this session so others can route to it: send_to_inbox(recipientSlug, sessionKey) resolves it ahead of thread routing. ' +
+        'Convention <sb>:<project>:<name>, e.g. "wren:inkwell:main"; lowercase letters, digits, ":", "/", ".", "_", "-"; at most 80 characters; ' +
+        "trimmed and lowercased on write; empty string clears. Unique among this agent's live sessions in a studio. Shown by list_sessions and get_session."
     ),
+  alias: z.string().optional().describe('Deprecated spelling of sessionKey; use sessionKey.'),
   activeThreadKey: z
     .string()
     .optional()
@@ -1663,6 +1675,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               currentPhase: session.currentPhase || null,
               threadKey: session.threadKey || null,
               activeThreadKey: session.activeThreadKey || null,
+              sessionKey: session.alias || null,
               ...describeCurrentWork(session, currentWorkAudience(session, user.id, caller)),
               // Withheld for the same reason as logs, and omitted rather than
               // nulled so an unauthorized read is byte-identical to main's,
@@ -1707,6 +1720,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
     filterNullStudio,
     backend: params.backend,
     status: params.status,
+    ...(params.sessionKey ? { sessionKey: params.sessionKey.trim().toLowerCase() } : {}),
     limit: params.limit,
   });
 
@@ -1748,6 +1762,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
                 currentPhase: s.currentPhase || null,
                 threadKey: s.threadKey || null,
                 activeThreadKey: s.activeThreadKey || null,
+                sessionKey: s.alias || null,
                 status: s.status || null,
                 backend: s.backend || null,
                 provider: (s.metadata?.provider as string) || null,
@@ -1879,7 +1894,8 @@ type SessionTraceField =
   | 'backendSessionId'
   | 'workingDir'
   | 'context'
-  | 'activeThreadKey';
+  | 'activeThreadKey'
+  | 'sessionKey';
 
 interface SessionTraceSnapshot {
   sbSlug: string | null;
@@ -1890,6 +1906,7 @@ interface SessionTraceSnapshot {
   workingDir: string | null;
   context: string | null;
   activeThreadKey: string | null;
+  sessionKey: string | null;
 }
 
 const SESSION_TRACE_FIELDS: SessionTraceField[] = [
@@ -1901,6 +1918,7 @@ const SESSION_TRACE_FIELDS: SessionTraceField[] = [
   'workingDir',
   'context',
   'activeThreadKey',
+  'sessionKey',
 ];
 
 function normalizeTraceString(value: string | null | undefined, truncateAt = 240): string | null {
@@ -1920,6 +1938,7 @@ function toSessionTraceSnapshot(session: Session | null | undefined): SessionTra
     workingDir: normalizeTraceString(session?.workingDir),
     context: normalizeTraceString(session?.context),
     activeThreadKey: normalizeTraceString(session?.activeThreadKey),
+    sessionKey: normalizeTraceString(session?.alias),
   };
 }
 
@@ -1953,6 +1972,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     !params.workingDir &&
     params.cliAttached === undefined &&
     params.alias === undefined &&
+    params.sessionKey === undefined &&
     params.activeThreadKey === undefined &&
     // `reopen: true` is a complete request on its own — it supplies its own
     // live lifecycle below. Omitting it here rejected the one call that has
@@ -2152,8 +2172,22 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.workingDir !== undefined) {
     updates.workingDir = params.workingDir;
   }
-  if (params.alias !== undefined) {
-    updates.alias = params.alias || null;
+  const sessionKeyInput = params.sessionKey !== undefined ? params.sessionKey : params.alias;
+  let sessionKeyValue: string | null | undefined;
+  if (sessionKeyInput !== undefined) {
+    const normalised = normaliseSessionKey(sessionKeyInput);
+    if (!normalised.ok) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({ success: false, error: normalised.reason }, null, 2),
+          },
+        ],
+      };
+    }
+    sessionKeyValue = normalised.value || null;
+    updates.alias = sessionKeyValue;
   }
   if (params.activeThreadKey !== undefined) {
     updates.activeThreadKey = params.activeThreadKey || null;
@@ -2198,7 +2232,8 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.backendSessionId) messageParts.push('backendSessionId set');
   if (params.context) messageParts.push('context updated');
   if (params.workingDir) messageParts.push('workingDir updated');
-  if (params.alias !== undefined) messageParts.push(`alias → ${params.alias || '(cleared)'}`);
+  if (sessionKeyValue !== undefined)
+    messageParts.push(`sessionKey → ${sessionKeyValue || '(cleared)'}`);
   if (params.activeThreadKey !== undefined)
     messageParts.push(`activeThreadKey → ${params.activeThreadKey || '(cleared)'}`);
 
@@ -2218,6 +2253,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
       // the fence is clear whether or not it is — which turns the check into
       // another proxy for the thing it was meant to confirm (PR #541).
       status: updated.status || null,
+      sessionKey: updated.alias || null,
       endedAt: updated.endedAt ? updated.endedAt.toISOString() : null,
     },
   };

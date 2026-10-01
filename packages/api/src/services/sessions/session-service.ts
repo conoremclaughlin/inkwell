@@ -212,7 +212,7 @@ function sessionRoutingOptions(request: SessionRequest, turnEpochCandidate: stri
     taskDescription: metadata?.taskDescription,
     parentSessionId: metadata?.parentSessionId,
     threadKey: metadata?.threadKey,
-    alias: metadata?.sessionAlias,
+    alias: metadata?.sessionKey,
     studioId: metadata?.studioId,
     studioHint: metadata?.studioHint,
     recipientSessionId: metadata?.recipientSessionId,

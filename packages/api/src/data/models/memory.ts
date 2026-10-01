@@ -126,6 +126,8 @@ export interface Session {
   studioId?: string;
   threadKey?: string;
   activeThreadKey?: string;
+  /** The session key (`wren:inkwell:main`), stored in the `alias` column under its older name. */
+  alias?: string;
   /** Runtime lifecycle state: running, idle, completed, failed */
   lifecycle?: SessionLifecycle;
   /** @deprecated Use lifecycle. Kept for backward compat. */
@@ -246,6 +248,8 @@ export interface SessionRow {
   contact_id?: string | null;
   studio_id: string | null;
   thread_key: string | null;
+  /** The session key, under the column's older name. */
+  alias?: string | null;
   active_thread_key?: string | null;
   lifecycle?: string | null;
   status?: string | null;

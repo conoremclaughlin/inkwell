@@ -32,6 +32,7 @@ import {
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { boundThreadTitle } from './thread-bounds.js';
 import { getEffectiveSlug } from '../../auth/enforce-identity';
+import { normaliseSessionKey } from '../../services/sessions/session-key';
 import { logger } from '../../utils/logger';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../../data/supabase/types';
@@ -117,14 +118,21 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .describe(
       'DEPRECATED — use recipientStudioSlug instead. Kept for backward compatibility with callers that pass the literal string "main".'
     ),
+  sessionKey: z
+    .string()
+    .min(1)
+    .max(80)
+    .optional()
+    .describe(
+      'Route to the recipient session carrying this key (e.g., "wren:inkwell:main"), ahead of thread routing. ' +
+        'Case-insensitive. The recipient must have a live session with this key (list_sessions shows keys); single-recipient sends only.'
+    ),
   sessionAlias: z
     .string()
     .min(1)
-    .max(64)
+    .max(80)
     .optional()
-    .describe(
-      'Target a recipient session by alias (e.g., "main", "review"). The recipient agent must have an active session with this alias.'
-    ),
+    .describe('Deprecated spelling of sessionKey; use sessionKey.'),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('When this message expires'),
@@ -403,6 +411,18 @@ export async function handleSendToInbox(
     sessionAlias,
   } = parsed;
 
+  // One spelling on the wire: sessionKey, with sessionAlias accepted for a
+  // release. Normalised here so the key the resolver sees is the key the
+  // setter stored; a key it cannot normalise is refused before anything is
+  // written or triggered.
+  let sessionKey: string | undefined;
+  const sessionKeyInput = parsed.sessionKey ?? sessionAlias;
+  if (sessionKeyInput !== undefined) {
+    const normalised = normaliseSessionKey(sessionKeyInput);
+    if (!normalised.ok) throw new Error(normalised.reason);
+    if (normalised.value) sessionKey = normalised.value;
+  }
+
   // Merge recipientStudioSlug (preferred) and recipientStudioHint (legacy alias).
   // Downstream code treats these uniformly — both resolve via resolveStudioHint,
   // which does isMainStudio + slug lookup. If both are provided, slug wins.
@@ -420,10 +440,10 @@ export async function handleSendToInbox(
   }
   if (
     recipients &&
-    (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionAlias)
+    (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionKey)
   ) {
     throw new Error(
-      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint/sessionAlias are only valid for single-recipient sends'
+      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint/sessionKey are only valid for single-recipient sends'
     );
   }
 
@@ -816,7 +836,7 @@ export async function handleSendToInbox(
     const explicitSelfTarget = !!(
       senderSlug &&
       allRecipients.includes(senderSlug) &&
-      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionAlias)
+      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionKey)
     );
     if (sender.kind !== 'system' && threadMessage?.id && !explicitSelfTarget) {
       await advanceThreadReadPointer(supabase, {
@@ -1011,7 +1031,7 @@ export async function handleSendToInbox(
         // recipientSessionId is a continuity hint, never an overwrite.
         const explicitRecipientTarget = !!(
           isAddressedRecipient &&
-          (recipientSessionId || sessionAlias || recipientStudioId || recipientStudioSlugOrHint)
+          (recipientSessionId || sessionKey || recipientStudioId || recipientStudioSlugOrHint)
         );
         const payload: AgentTriggerPayload = {
           fromSlug: triggerSenderId,
@@ -1032,7 +1052,7 @@ export async function handleSendToInbox(
           // metadata.pcp.sender.studioId — never caller body data.
           ...senderRoutingContext(senderIsBridge),
           ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
-          ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
+          ...(isAddressedRecipient && sessionKey ? { sessionKey } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
             : {}),
@@ -1230,7 +1250,7 @@ export async function handleSendToInbox(
       priority,
       recipientSessionId: effectiveRecipientSessionId,
       ...senderRoutingContext(senderIsBridge),
-      sessionAlias,
+      sessionKey,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,
       // v18 S3: explicit spawn admission for strategy dispatches (see the

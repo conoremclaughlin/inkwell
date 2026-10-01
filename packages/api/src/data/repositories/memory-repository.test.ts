@@ -146,6 +146,14 @@ describe('MemoryRepository', () => {
       expect(insertCalls[0][0]).not.toHaveProperty('claude_session_id');
     });
 
+    it('listSessions filters on the alias column when given a sessionKey', async () => {
+      mockSupabase._setReturnData([]);
+
+      await repo.listSessions('user-1', { sbSlug: 'wren', sessionKey: 'wren:inkwell:main' });
+
+      expect(eqCalls()).toContainEqual(['alias', 'wren:inkwell:main']);
+    });
+
     it('getActiveSessionByBackendSessionId falls back to agent_id without a canonical owner', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 
