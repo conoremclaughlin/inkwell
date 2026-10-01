@@ -18,9 +18,19 @@ import { getDataComposer, type DataComposer } from '../../data/composer';
 import { handleStartSession } from '../../mcp/tools/memory-handlers';
 import {
   ensureEchoIntegrationFixture,
+  ensureSuiteIdentity,
   INTEGRATION_TEST_USER_ID,
-  INTEGRATION_TEST_AGENT_ID,
 } from '../../test/integration-fixtures';
+
+/**
+ * A suite-owned identity rather than the shared `echo` fixture agent. These
+ * tests leave rows live for the duration of a test, and the DB suite runs
+ * files in parallel: a live `echo` row here was picked up by another file's
+ * "active session for echo" lookup (CI at 10bb171f,
+ * session-current-work.integration.test.ts). Rows under this slug are
+ * invisible to every `echo` query.
+ */
+const SUITE_AGENT = 'echo-one-row-per-conversation';
 
 function parse(result: { content: Array<{ text: string }> }): {
   success: boolean;
@@ -31,21 +41,27 @@ function parse(result: { content: Array<{ text: string }> }): {
 
 describe('start_session: one backend conversation is one Inkwell session', () => {
   let dataComposer: DataComposer;
+  let suiteSbId: string | undefined;
   const createdSessionIds: string[] = [];
 
   beforeAll(async () => {
     dataComposer = await getDataComposer();
-    await ensureEchoIntegrationFixture(dataComposer);
+    const fixture = await ensureEchoIntegrationFixture(dataComposer);
+    suiteSbId = await ensureSuiteIdentity(dataComposer, fixture, SUITE_AGENT);
   });
 
   afterAll(async () => {
+    const supabase = dataComposer.getClient();
     if (createdSessionIds.length > 0) {
-      await dataComposer
-        .getClient()
-        .from('sessions')
-        .update({ ended_at: new Date().toISOString() })
-        .in('id', createdSessionIds);
+      await supabase.from('sessions').delete().in('id', createdSessionIds);
     }
+    // Belt and braces: nothing under the suite slug may outlive the suite.
+    await supabase
+      .from('sessions')
+      .delete()
+      .eq('user_id', INTEGRATION_TEST_USER_ID)
+      .eq('agent_id', SUITE_AGENT);
+    if (suiteSbId) await supabase.from('agent_identities').delete().eq('id', suiteSbId);
   });
 
   async function startLinkedRow(backendSessionId: string): Promise<string> {
@@ -54,7 +70,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: id,
@@ -79,7 +95,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: relaunchId,
@@ -111,7 +127,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: firstId,
@@ -128,7 +144,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: randomUUID(),
@@ -156,7 +172,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: relaunchId,
@@ -184,7 +200,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: randomUUID(),
@@ -205,7 +221,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: freshId,
@@ -235,7 +251,7 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
       await handleStartSession(
         {
           userId: INTEGRATION_TEST_USER_ID,
-          sbSlug: INTEGRATION_TEST_AGENT_ID,
+          sbSlug: SUITE_AGENT,
           backend: 'claude',
           forceNew: true,
           sessionId: relaunchId,
