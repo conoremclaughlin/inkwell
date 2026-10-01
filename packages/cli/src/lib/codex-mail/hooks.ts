@@ -9,9 +9,8 @@ export const CODEX_MAIL_HOOKS = [
 ] as const;
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 
-/** Migration of OUR marked legacy or previous bridge stanza only. Custom hooks, config
- * and trust records are never replaced; changed commands require native trust
- * review. Normal launch/install remains compatible with older Codex builds. */
+/** Pure historical migration renderer retained for regression fixtures/probes.
+ * Production launch does not call this or rewrite project hook configuration. */
 export function modernCodexMailHooks(content: string, commandPrefix: string) {
   const makeHooks = (prefix: string, guarded: boolean) =>
     CODEX_MAIL_HOOKS.map(([event, eventName, hook]) => ({
@@ -37,9 +36,7 @@ export function modernCodexMailHooks(content: string, commandPrefix: string) {
   const start = content.indexOf(START),
     end = content.indexOf(END);
   if (start < 0 || end < start || content.indexOf(START, start + 1) >= 0) {
-    throw new Error(
-      'Codex Inkmail needs the standard ink-managed hook block; run ink hooks install --backend codex first'
-    );
+    throw new Error('Historical hook fixture needs a complete standard ink-managed hook block');
   }
   const oldBlock = content.slice(start, end + END.length);
   if (oldBlock === block) return { content, hooks };
@@ -85,9 +82,7 @@ export function modernCodexMailHooks(content: string, commandPrefix: string) {
   }
   if (!legacy && !knownPrevious)
     throw new Error(
-      'Codex Inkmail will not overwrite a modified hook block. Review/back up custom hooks first; ' +
-        'to deliberately regenerate Ink hooks with the current CLI build, run ' +
-        'ink hooks install --backend codex --force, then relaunch --codex-inkmail and review hook trust again'
+      'Historical hook fixture will not overwrite a modified hook block. Review custom hooks separately.'
     );
   return { content: content.slice(0, start) + block + content.slice(end + END.length), hooks };
 }

@@ -40,24 +40,27 @@ function expectReaped(pid: number) {
   expect(() => process.kill(pid, 0)).toThrow(); // Liveness query only; never signals an arbitrary process.
 }
 describe('read-only native hook preflight', () => {
-  it('uses only configuration methods, disables inherited bridge activation, and reaps its owner', async () => {
-    const f = setup();
-    expect(await probeCodexMailHooks(f.options)).toEqual({
-      enabled: true,
-      sessionHooks: true,
-      hooks: { data: [{ hooks: [], errors: [] }] },
-    });
-    const [owner, ...calls] = f.rows();
-    expect(owner.bridge).toBe('0');
-    expect(calls.map((c) => c.method)).toEqual([
-      'initialize',
-      'initialized',
-      'config/read',
-      'hooks/list',
-    ]);
-    expect(calls[2].params).toEqual({ cwd: f.options.cwd, includeLayers: true });
-    expectReaped(owner.pid);
-  });
+  it.each(['ok', 'collision'])(
+    'uses only configuration methods, ignores server request IDs, and reaps its %s owner',
+    async (mode) => {
+      const f = setup(mode);
+      expect(await probeCodexMailHooks(f.options)).toEqual({
+        enabled: true,
+        sessionHooks: true,
+        hooks: { data: [{ hooks: [], errors: [] }] },
+      });
+      const [owner, ...calls] = f.rows();
+      expect(owner.bridge).toBe('0');
+      expect(calls.map((c) => c.method)).toEqual([
+        'initialize',
+        'initialized',
+        'config/read',
+        'hooks/list',
+      ]);
+      expect(calls[2].params).toEqual({ cwd: f.options.cwd, includeLayers: true });
+      expectReaped(owner.pid);
+    }
+  );
   it.each(['error', 'exit', 'hang'])(
     'fails closed and reaps the %s peer without leaking raw config errors',
     async (mode) => {

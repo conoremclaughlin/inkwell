@@ -183,6 +183,40 @@ describe('default Codex Inkmail selection', () => {
       expect(readFileSync(f.path, 'utf8')).toBe(legacy);
     }
   );
+  it.each(['different-build', 'unguarded'])(
+    'refuses %s commands even when all three events are present and trusted',
+    async (mode) => {
+      const f = fixture();
+      vi.mocked(probeCodexMailHooks).mockResolvedValue({
+        enabled: true,
+        sessionHooks: false,
+        hooks: {
+          data: [
+            {
+              hooks: codexMailHooks().map((h) => ({
+                ...h,
+                enabled: true,
+                trustStatus: 'trusted',
+                command:
+                  mode === 'different-build'
+                    ? h.command.replace(
+                        /^.*? hooks /,
+                        "'fixture-node' '/fixture/other-build/cli.js' hooks "
+                      )
+                    : h.command.replace(' --codex-inkmail-only', ''),
+              })),
+            },
+          ],
+        },
+      });
+      expect(await selectCodexMailLaunch(f.options)).toMatchObject({
+        kind: 'native',
+        reason: expect.stringContaining('conflicting or duplicate'),
+      });
+      expect(probeCodexMailHooks).toHaveBeenCalledOnce();
+      expect(readFileSync(f.path, 'utf8')).toBe(legacy);
+    }
+  );
   it('preserves an explicit hooks disable override by refusing live mail', async () => {
     const f = fixture();
     expect(

@@ -14,6 +14,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   if (mode === 'hang') return;
+  if (mode === 'collision') {
+    process.stdout.write(JSON.stringify({ id: request.id, method: 'fixture/request', params: {} }) + '\n');
+  }
   const result = request.method === 'config/read'
     ? { config: { features: { hooks: true } }, layers: [{ name: { type: 'sessionFlags' }, config: { hooks: {} } }] }
     : request.method === 'hooks/list' ? { data: [{ hooks: [], errors: [] }] } : {};

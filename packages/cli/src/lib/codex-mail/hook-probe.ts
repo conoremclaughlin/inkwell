@@ -58,7 +58,7 @@ export async function probeCodexMailHooks(options: {
         reject(error);
       };
       receive = (message) => {
-        if (message.id !== id) return;
+        if (message.id !== id || message.method) return;
         clearTimeout(timer);
         // Never echo native error/config text: it may contain private overrides.
         if (message.error) reject(new Error(`Codex refused the ${method} hook probe`));

@@ -37,6 +37,8 @@ export async function runCodexMailInteractive(
   let stopped = false;
   let switched = false;
   let polling = false;
+  let pollerFailed = false;
+  const pollerWarningKeys = new Set<string>();
   let stamping = false;
   let lastDiscovery = 0;
   let hooksReady = false;
@@ -128,8 +130,12 @@ export async function runCodexMailInteractive(
     },
     log: (level, message) => {
       // Shared drain reports normal pending receipts as emit failures too.
-      if (level === 'error' && !message.includes('emit') && !message.includes('notification'))
-        warn(message);
+      if (level === 'error' && !message.includes('emit') && !message.includes('notification')) {
+        pollerFailed = true;
+        const key = 'poller:' + message;
+        pollerWarningKeys.add(key);
+        warn(message, key);
+      }
     },
   });
   const pollTimer = setInterval(() => {
@@ -152,9 +158,16 @@ export async function runCodexMailInteractive(
         return;
       }
       diagnostics.clearWarning('hooks', 'Hooks are ready; live mail delivery can resume.');
+      pollerFailed = false;
       const drained = await poll();
       if (drained.threadResult.fetchFailures > 0) lastDiscovery = 0;
-      else diagnostics.clearWarning('mailbox');
+      else {
+        diagnostics.clearWarning('mailbox');
+        if (!pollerFailed) {
+          for (const key of pollerWarningKeys) diagnostics.clearWarning(key);
+          pollerWarningKeys.clear();
+        }
+      }
     })()
       .catch(() => {
         hooksReady = false;
@@ -187,9 +200,13 @@ export async function runCodexMailInteractive(
         if (!response.ok) throw new Error('Heartbeat refused');
       },
     })
+      .then((stamped) => {
+        if (stamped) diagnostics.clearWarning('heartbeat');
+      })
       .catch(() =>
         warn(
-          'delivery heartbeat failed; terminal ownership must not be inferred from a stale stamp.'
+          'delivery heartbeat failed; terminal ownership must not be inferred from a stale stamp.',
+          'heartbeat'
         )
       )
       .finally(() => {
