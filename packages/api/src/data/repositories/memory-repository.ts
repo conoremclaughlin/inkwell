@@ -1975,50 +1975,58 @@ export class MemoryRepository {
      */
     options?: { includeFailed?: boolean }
   ): Promise<Session | null> {
-    let query = this.supabase
-      .from('sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .is('ended_at', null)
-      .order('started_at', { ascending: false })
-      .limit(1);
-    if (!options?.includeFailed) {
-      query = query.neq('lifecycle', 'failed');
-    }
+    // Live first, crashed as the fallback. One ordered query over both would
+    // let a newer crashed row outrank an older live one under started_at
+    // DESC, and a relaunch would land on the crash instead of the
+    // conversation still running (Lumen, #718).
+    const run = async (lifecycle: 'live' | 'failed'): Promise<Session | null> => {
+      let query = this.supabase
+        .from('sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .is('ended_at', null)
+        .order('started_at', { ascending: false })
+        .limit(1);
+      query =
+        lifecycle === 'live' ? query.neq('lifecycle', 'failed') : query.eq('lifecycle', 'failed');
 
-    // Prefer the canonical owner; the slug is the fallback for callers that
-    // have no canonical identity.
-    if (sbId) {
-      query = query.eq('sb_id', sbId);
-    } else if (sbSlug) {
-      query = query.eq('agent_id', sbSlug);
-    }
-
-    if (studioId !== undefined) {
-      if (studioId === null) {
-        query = query.is('studio_id', null);
-      } else {
-        query = query.eq('studio_id', studioId);
+      // Prefer the canonical owner; the slug is the fallback for callers that
+      // have no canonical identity.
+      if (sbId) {
+        query = query.eq('sb_id', sbId);
+      } else if (sbSlug) {
+        query = query.eq('agent_id', sbSlug);
       }
-    }
 
-    // Per-sender isolation: always scope by contact to prevent collision.
-    // Contact sessions match their contact; owner sessions match NULL.
-    if (contactId) {
-      query = query.eq('contact_id', contactId);
-    } else {
-      query = query.is('contact_id', null);
-    }
+      if (studioId !== undefined) {
+        if (studioId === null) {
+          query = query.is('studio_id', null);
+        } else {
+          query = query.eq('studio_id', studioId);
+        }
+      }
 
-    const { data, error } = await query.single();
+      // Per-sender isolation: always scope by contact to prevent collision.
+      // Contact sessions match their contact; owner sessions match NULL.
+      if (contactId) {
+        query = query.eq('contact_id', contactId);
+      } else {
+        query = query.is('contact_id', null);
+      }
+      const { data, error } = await query.single();
 
-    if (error) {
-      if (error.code === 'PGRST116') return null;
-      logger.error('Failed to get active session:', error);
-      throw new Error(`Failed to get active session: ${error.message}`);
-    }
+      if (error) {
+        if (error.code === 'PGRST116') return null;
+        logger.error('Failed to get active session:', error);
+        throw new Error(`Failed to get active session: ${error.message}`);
+      }
 
-    return data ? this.rowToSession(data) : null;
+      return data ? this.rowToSession(data) : null;
+    };
+
+    const live = await run('live');
+    if (live || !options?.includeFailed) return live;
+    return run('failed');
   }
 
   /**
@@ -2096,47 +2104,52 @@ export class MemoryRepository {
     /** See getActiveSession: start_session keeps crashed rows, nothing else does. */
     options?: { includeFailed?: boolean }
   ): Promise<Session | null> {
-    let query = this.supabase
-      .from('sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('thread_key', threadKey)
-      .is('ended_at', null)
-      .order('started_at', { ascending: false })
-      .limit(1);
-    if (!options?.includeFailed) {
-      query = query.neq('lifecycle', 'failed');
-    }
+    // Live first, crashed as the fallback; see getActiveSession.
+    const run = async (lifecycle: 'live' | 'failed'): Promise<Session | null> => {
+      let query = this.supabase
+        .from('sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('thread_key', threadKey)
+        .is('ended_at', null)
+        .order('started_at', { ascending: false })
+        .limit(1);
+      query =
+        lifecycle === 'live' ? query.neq('lifecycle', 'failed') : query.eq('lifecycle', 'failed');
 
-    // Prefer the canonical owner; the slug is the fallback for callers that
-    // have no canonical identity.
-    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
+      // Prefer the canonical owner; the slug is the fallback for callers that
+      // have no canonical identity.
+      query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
-    if (studioId !== undefined) {
-      if (studioId === null) {
-        query = query.is('studio_id', null);
-      } else {
-        query = query.eq('studio_id', studioId);
+      if (studioId !== undefined) {
+        if (studioId === null) {
+          query = query.is('studio_id', null);
+        } else {
+          query = query.eq('studio_id', studioId);
+        }
       }
-    }
 
-    // Per-sender isolation: always scope by contact to prevent collision.
-    // Contact sessions match their contact; owner sessions match NULL.
-    if (contactId) {
-      query = query.eq('contact_id', contactId);
-    } else {
-      query = query.is('contact_id', null);
-    }
+      // Per-sender isolation: always scope by contact to prevent collision.
+      // Contact sessions match their contact; owner sessions match NULL.
+      if (contactId) {
+        query = query.eq('contact_id', contactId);
+      } else {
+        query = query.is('contact_id', null);
+      }
+      const { data, error } = await query.single();
 
-    const { data, error } = await query.single();
+      if (error) {
+        if (error.code === 'PGRST116') return null;
+        logger.error('Failed to get active session by threadKey:', error);
+        throw new Error(`Failed to get active session by threadKey: ${error.message}`);
+      }
 
-    if (error) {
-      if (error.code === 'PGRST116') return null;
-      logger.error('Failed to get active session by threadKey:', error);
-      throw new Error(`Failed to get active session by threadKey: ${error.message}`);
-    }
+      return data ? this.rowToSession(data) : null;
+    };
 
-    return data ? this.rowToSession(data) : null;
+    const live = await run('live');
+    if (live || !options?.includeFailed) return live;
+    return run('failed');
   }
 
   /**
