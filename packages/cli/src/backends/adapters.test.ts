@@ -177,7 +177,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('media-free exec turns get no --image flags and no -- terminator', async () => {
+  it('media-free exec turns get no --image flags, and the prompt still follows a -- terminator', async () => {
     const adapter = new CodexAdapter();
     const prepared = await adapter.prepare(
       {
@@ -190,8 +190,63 @@ describe('backend adapters session resume wiring', () => {
       cliHost
     );
     try {
-      expect(prepared.args).not.toContain('--');
+      expect(prepared.args.slice(-3)).toEqual(['exec', '--', 'plain work']);
       expect(prepared.args.some((a) => a.startsWith('--image='))).toBe(false);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  // A dash-leading prompt with no `--` before it is read as an option:
+  // `--config=…` becomes a config override the effective-config check never
+  // saw (Lumen, #701, measured on codex 0.159.2).
+  it('keeps a dash-leading exec prompt behind the -- terminator, with or without images', async () => {
+    const prompt = '--config=mcp_servers.inkwell.url="http://127.0.0.1:4001/mcp"';
+    for (const media of [undefined, [{ path: '/tmp/photo.png', mimeType: 'image/png' }]]) {
+      const prepared = await new CodexAdapter().prepare(
+        {
+          ...LAUNCHER_DEFAULTS,
+          sbSlug: 'lumen',
+          model: undefined,
+          promptParts: ['exec', prompt],
+          passthroughArgs: [],
+          ...(media ? { media } : {}),
+        },
+        cliHost
+      );
+      try {
+        expect(prepared.args.slice(-2)).toEqual(['--', prompt]);
+        expect(prepared.args.filter((a) => a === '--')).toHaveLength(1);
+        // Data, so not part of the configuration the check is run with.
+        expect(JSON.stringify(prepared.launchConfig)).not.toContain('4001');
+      } finally {
+        prepared.cleanup();
+      }
+    }
+  });
+
+  it('takes a pass-through -- as the terminator: images before it, its positionals after, never a second --', async () => {
+    const prepared = await new CodexAdapter().prepare(
+      {
+        ...LAUNCHER_DEFAULTS,
+        sbSlug: 'lumen',
+        model: undefined,
+        promptParts: ['exec', 'do work'],
+        passthroughArgs: ['--skip-git-repo-check', '--', 'extra'],
+        media: [{ path: '/tmp/photo.png', mimeType: 'image/png' }],
+      },
+      cliHost
+    );
+    try {
+      const execIndex = prepared.args.indexOf('exec');
+      expect(prepared.args.slice(execIndex)).toEqual([
+        'exec',
+        '--skip-git-repo-check',
+        '--image=/tmp/photo.png',
+        '--',
+        'extra',
+        'do work',
+      ]);
     } finally {
       prepared.cleanup();
     }
@@ -213,11 +268,12 @@ describe('backend adapters session resume wiring', () => {
     try {
       const execIndex = prepared.args.indexOf('exec');
       expect(execIndex).toBeGreaterThanOrEqual(0);
-      expect(prepared.args.slice(execIndex, execIndex + 5)).toEqual([
+      expect(prepared.args.slice(execIndex, execIndex + 6)).toEqual([
         'exec',
         '--sandbox',
         'read-only',
         '--skip-git-repo-check',
+        '--',
         'do work',
       ]);
     } finally {

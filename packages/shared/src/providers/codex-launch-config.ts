@@ -23,10 +23,10 @@
  * - Any other option is refused as unclassified: an option the check does not
  *   know could be one that changes the config.
  *
- * Only the pass-through is read. The adapter's own flags are its own, and the
- * prompt is never classified: the runner places it after `exec` with no `--`,
- * so prompt text that begins with a dash would read as an option. A refusal
- * never quotes the token, which could carry a value (`--api-key=…`).
+ * Only the pass-through is read, up to its first `--`. The adapter's own flags
+ * are its own, and the prompt is never classified: the adapter places it after
+ * a `--`, so Codex reads it as the prompt whatever it begins with (codex.ts).
+ * A refusal never quotes the token, which could carry a value (`--api-key=…`).
  */
 
 import type { LaunchConfig } from './types.js';
@@ -90,7 +90,7 @@ const REFUSED_OPTIONS: ReadonlyMap<string, string> = new Map([
 
 /**
  * An option token split into its name and an attached value, if it has one:
- * `--config=V` and the short form `-cV` both attach one.
+ * `--config=V`, and the short forms `-cV` and `-c=V`, all attach one.
  */
 function splitOption(token: string): { name: string; attached?: string } {
   if (token.startsWith('--')) {
@@ -99,8 +99,11 @@ function splitOption(token: string): { name: string; attached?: string } {
       ? { name: token }
       : { name: token.slice(0, eq), attached: token.slice(eq + 1) };
   }
-  // A short option is one letter; anything after it is its value.
-  return token.length > 2 ? { name: token.slice(0, 2), attached: token.slice(2) } : { name: token };
+  // A short option is one letter; anything after it is its value, less one
+  // `=` separator: Codex reads `-c=K=V` as `K=V` (Lumen, measured on 0.159.2).
+  if (token.length <= 2) return { name: token };
+  const rest = token.slice(2);
+  return { name: token.slice(0, 2), attached: rest.startsWith('=') ? rest.slice(1) : rest };
 }
 
 /**

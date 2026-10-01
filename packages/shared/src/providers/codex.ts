@@ -172,25 +172,31 @@ export class CodexAdapter implements BackendAdapter {
     // starts with `exec`, place passthrough args immediately after `exec`.
     const promptParts = config.promptParts || [];
     if (promptParts.length > 0 && promptParts[0]?.toLowerCase() === 'exec') {
+      // The prompt is data, and always follows one `--`: without it, prompt
+      // text beginning with a dash reads as an option, and `--config=…` as a
+      // config override the effective-config check never saw (Lumen, #701,
+      // measured on 0.159.2). A pass-through `--` is that terminator, so the
+      // options before it come first and whatever follows it stays after.
+      const terminator = config.passthroughArgs.indexOf('--');
+      const passthroughOptions =
+        terminator === -1 ? config.passthroughArgs : config.passthroughArgs.slice(0, terminator);
+      const passthroughPositionals =
+        terminator === -1 ? [] : config.passthroughArgs.slice(terminator + 1);
       args.push(promptParts[0]);
-      args.push(...config.passthroughArgs);
+      args.push(...passthroughOptions);
       // Media injection (spec:provider-media-injection): codex attaches
       // images to the initial prompt natively — an exec-scoped option, so
-      // it must sit after `exec`. Codex is stateless per spawn, so media is
-      // (re)attached on every spawn of the logical turn. Two parse-safety
-      // measures (Lumen, review 4900120086 — variadic `-i <FILE>...`
-      // swallows the following positional prompt): the single-value
-      // `--image=<path>` binding, plus a `--` options terminator so the
-      // prompt can never be consumed as an option value. Non-image media
-      // stays on the prompt-text path (paths listed in the attachment
-      // block).
+      // it must sit after `exec` and before the `--`. Codex is stateless per
+      // spawn, so media is (re)attached on every spawn of the logical turn.
+      // The single-value `--image=<path>` binding keeps each flag to one
+      // path (Lumen, review 4900120086 — variadic `-i <FILE>...` swallows
+      // the following positional prompt). Non-image media stays on the
+      // prompt-text path (paths listed in the attachment block).
       const imageMedia = (config.media ?? []).filter((m) => m.mimeType?.startsWith('image/'));
       for (const m of imageMedia) {
         args.push(`--image=${m.path}`);
       }
-      if (imageMedia.length > 0) {
-        args.push('--');
-      }
+      args.push('--', ...passthroughPositionals);
       args.push(...promptParts.slice(1));
     } else {
       // Passthrough flags
