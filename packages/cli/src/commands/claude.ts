@@ -5,6 +5,7 @@
  * passthrough flags, and session tracking.
  */
 
+import { runCodexMailInteractive } from '../lib/codex-mail/interactive.js';
 import { spawn, spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
@@ -50,6 +51,7 @@ export interface SbOptions {
   sessionCandidatesAll?: boolean;
   sessionChoice?: string;
   dangerous?: boolean;
+  codexInkmail?: boolean;
 }
 
 interface InkUserConfig {
@@ -4263,6 +4265,64 @@ export async function runClaudeInteractive(
     };
     const executionStartedAt = Date.now();
     const backendStartActivityId = await logBackendExecutionStart(executionContext);
+
+    if (options.codexInkmail) {
+      let stderrText = '';
+      let code: number | null = 1;
+      try {
+        if (options.backend !== 'codex' || !sessionContext.inkSessionId || !studioId) {
+          throw new Error('Codex Inkmail requires an exact Inkwell session and studio');
+        }
+        const result = await runCodexMailInteractive({
+          binary: prepared.binary,
+          args: prepared.args,
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            ...authEnv,
+            ...prepared.env,
+            INK_RUNTIME_LINK_ID: runtimeLinkId,
+            ...(startupContextBlock ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
+          },
+          sbSlug,
+          sessionId: sessionContext.inkSessionId,
+          studioId,
+          onBound: async (backendSessionId) => {
+            finalCapturedBackendSessionId = backendSessionId;
+            await persistBackendSessionLink({
+              inkSessionId: sessionContext.inkSessionId,
+              backendSessionId,
+              backend: options.backend,
+              sbSlug,
+              runtimeLinkId,
+              studioId,
+              sbId,
+              email: inkConfig?.email,
+            });
+          },
+          onStderr: (chunk) => {
+            stderrText += chunk.toString();
+            process.stderr.write(chunk);
+          },
+        });
+        code = result.code;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Codex Inkmail launch failed';
+        stderrText += message;
+        console.error(message);
+      } finally {
+        prepared.cleanup();
+        await detachOnChildExit(options.backend, prepared.env, sessionContext.inkSessionId, sbSlug);
+        await logBackendExecutionResult({
+          context: executionContext,
+          parentActivityId: backendStartActivityId,
+          exitCode: code,
+          durationMs: Date.now() - executionStartedAt,
+          backendSessionId: finalCapturedBackendSessionId,
+        });
+      }
+      return { code, stderrText };
+    }
 
     return await new Promise<{ code: number | null; stderrText: string }>((resolve) => {
       let stderrText = '';
