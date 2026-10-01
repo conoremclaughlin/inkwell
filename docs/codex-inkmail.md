@@ -19,7 +19,8 @@ native invocation, with live mail off. `--codex-inkmail` makes these failures
 fatal instead; `--no-codex-inkmail` skips preflight and hook migration entirely.
 One-shot prompts, piped/non-terminal runs, `--no-session` and other backends
 keep their normal path. User sandbox, approval and feature overrides are not
-weakened. A failure after the bridge starts never falls back to a second owner.
+weakened. A failure after the bridge starts never falls back to a second owner;
+relaunch with `--no-codex-inkmail` to use the normal path.
 
 The **project hook migration persists**, but its guarded commands are inert
 outside an attached bridge (see Lifecycle and limits). This does not connect an
@@ -106,28 +107,32 @@ is reported, not silently treated as working delivery.
 ## Lifecycle and limits
 
 - A supported launch upgrades only the recognized, marked legacy hook stanza
-  (or the exact prior bridge stanza for the same launcher) in local
-  `.codex/config.toml` to modern `SessionStart`, `UserPromptSubmit`, and `Stop`
-  handlers. Other configuration is preserved. Symlinked or modified hook
-  configurations are refused; trust is still the human's decision.
-- **The migration affects the whole studio**, but the three commands now carry
+  or exact generated prior bridge shape in local `.codex/config.toml` to modern
+  `SessionStart`, `UserPromptSubmit`, and `Stop` handlers. Known generated blocks
+  can migrate across node/checkout relocations. Custom fields, commands or
+  symlinked configurations are refused; unrelated config is preserved and
+  changed commands still need the human's native trust review.
+- **The migration affects the whole studio**, but the commands carry
   `--codex-inkmail-only`. Before any identity/session reconciliation, lifecycle
-  write or inbox read, they require the bridge flag plus an explicitly attached
-  Codex context matching session, studio and SB environment fields. Headless
-  server contexts, parent-owned provider steps, absent/malformed context and
-  ordinary launches skip the handlers. Only a diagnostic is appended to the
-  local hook log. Existing server finalization remains the lifecycle owner;
-  no hook rollback is needed after a guarded bridge session.
-- This is a routing guard, not authentication or a sandbox. A manually spawned
-  child inheriting the entire attached bridge environment is still declaring
-  itself attached; server and Ink provider launchers must keep declaring their
-  actual headless/parent-owned context. Custom hooks are not rewritten or fenced.
-- Hook commands are pinned to the node binary and CLI checkout used to migrate.
-  If either changes, review/back up custom hooks, run
-  `ink hooks install --backend codex --force` using the intended CLI build,
-  then relaunch and review native hook trust again. A pre-existing unguarded
-  bridge block with a different launcher path needs this repair before it gains
-  the new guard; automatic fallback does not rewrite that custom/unknown block.
+  write or inbox read, they require an explicitly attached Codex context matching
+  the session/studio/SB environment and a private, live-wrapper binding to the
+  **exact native `session_id` in hook stdin**. The binding is published only from
+  the TUI's persistent start/resume response. Pre-bind `SessionStart` is inert:
+  the wrapper already provides startup context and owns the initial backend link.
+- Subagent payloads carrying `agent_id`, `agent_type` or `agent_transcript_path`
+  are refused even when `session_id` matches. On measured Codex 0.159.2, a
+  subagent's `UserPromptSubmit` uses the **parent** session ID plus agent fields;
+  thread equality alone is insufficient. This is version-specific evidence,
+  not a promise about future native payloads.
+- Headless, parent-owned, unbound, malformed and foreign-thread hooks skip all
+  business handlers, appending only a local diagnostic. Nested raw `codex exec`
+  may inherit the bridge environment but cannot claim the parent through a
+  different thread ID. Binding is revoked on thread switch, connection failure
+  and teardown. This is routing isolation, not authentication against a local
+  actor forging context/payloads or rewriting files. Custom hooks are not fenced.
+- If a custom/unknown hook block causes fallback, review/back it up first. To
+  deliberately regenerate it, use `ink hooks install --backend codex --force`
+  with the intended CLI build, then relaunch and review native trust again.
 - Hook inbox intake stands down while this bridge owns delivery. Hook lifecycle,
   turn epoch and lease behavior remain in the existing handlers.
 - TUI exit stops and reaps the App Server before detach/identity-file cleanup.
@@ -135,8 +140,10 @@ is reported, not silently treated as working delivery.
   that pipe and terminates its own child. It never kills processes by name or
   guesses a previous owner's PID.
 - Switching persistent threads inside the TUI pauses mail. Besides start/resume,
-  any native response naming a different persistent thread conservatively
-  triggers the guard (including fork or an unfamiliar method). Relaunch `ink` and
+  native responses naming a different persistent thread conservatively
+  trigger the guard (including fork or an unfamiliar method). Read-only
+  `thread/read` metadata is exempt: the TUI reads other threads while restoring
+  history; those reads never establish or transfer ownership. Relaunch `ink` and
   select the intended session. The initial version does not guess how to move
   Inkwell ownership between native `/new` or `/resume` operations.
 - Server `forceSpawn` requests still bypass inline delivery and can collide with
@@ -154,24 +161,30 @@ CLI):
 yarn workspace @inklabs/cli build
 test_home=$(mktemp -d /tmp/ink-mail-tests-XXXXXX)
 (cd packages/cli && env -i PATH="$PATH" HOME="$test_home" \
-  CODEX_HOME="$test_home/codex" INK_SERVER_URL=http://127.0.0.1:9 NODE_ENV=test \
+  CODEX_HOME="$test_home/codex" TMPDIR="$test_home" INK_SERVER_URL=http://127.0.0.1:9 NODE_ENV=test \
   node ../../node_modules/vitest/vitest.mjs run src/lib/codex-mail src/cli.test.ts)
 node scripts/probe-codex-live-input.mjs --gateway --permissions-probe
 node scripts/probe-codex-live-input.mjs --wrapper
 node scripts/probe-codex-live-input.mjs --launcher
+node scripts/probe-codex-live-input.mjs --nested-probe
 ```
 
 The opt-in probes use a fresh HOME/CODEX_HOME/cwd, a synthetic local provider,
-no credentials, and no model-executed tools. `--wrapper` also uses a stub Inkwell
+no credentials. The ordinary modes execute no model tools. `--wrapper` also uses a stub Inkwell
 API and the actual Inkwell lifecycle hooks; its trust keystrokes apply **only**
 to hooks in the disposable fixture. It then runs native `codex exec` in the
 same migrated/trusted project with a server-shaped context, proving all three
 hook guards execute without any Inkwell API calls. `--launcher` additionally
 exercises the actual `ink` entry point, session selection and adapter with no
 Inkmail CLI flag, then resumes that same conversation and verifies the reader
-is fresh again with history preserved. This is structural no-interference
-evidence, not a shared-DB
-server-finalization integration test. Evidence stays outside git. Unit tests cover
+is fresh again with history preserved. `--nested-probe` adds deterministic
+synthetic tool calls: a bounded native `codex exec` child and an in-process
+subagent, both against the same loopback provider. Its workspace-write roots are
+inside the fixture, with networking enabled for that provider; it never runs
+model-selected or destructive shell payloads. It captures native hook payloads,
+asserts the parent's backend link/epoch calls remain exclusive, and resumes the
+parent while other native threads exist. This is structural no-interference
+evidence, not a shared-DB server-finalization integration test. Evidence stays outside git. Unit tests cover
 ambiguous acceptance, restart/ACK failure, exact receipts, scope, approvals,
 permission mapping, heartbeat failure and direct-node parent death, including
 a helper-disabled negative control with a self-terminating fake owner.

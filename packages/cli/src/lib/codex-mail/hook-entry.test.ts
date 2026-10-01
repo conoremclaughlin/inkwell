@@ -22,9 +22,13 @@ afterEach(async () => {
 });
 
 describe('guarded hook CLI entry points', () => {
-  it.each(['server', 'plain', 'parent'])(
-    'leaves %s lifecycle and intake entirely to its existing owner',
-    async (mode) => {
+  it.each(
+    ['server', 'plain', 'parent', 'nested', 'subagent', 'prebind', 'bridge'].flatMap((mode) =>
+      ['on-session-start', 'on-prompt', 'on-stop'].map((hook) => [mode, hook])
+    )
+  )(
+    '%s context: %s admits only the exact bound bridge thread',
+    async (mode, hook) => {
       const root = mkdtempSync(join(tmpdir(), 'ink-hook-entry-'));
       dirs.push(root);
       const home = join(root, 'home'),
@@ -46,6 +50,20 @@ describe('guarded hook CLI entry points', () => {
         join(cwd, '.ink', 'identity.json'),
         JSON.stringify({ sbSlug: 'fixture', studioId: context.studioId })
       );
+      const bindingPath = join(root, 'binding.json');
+      if (mode !== 'prebind')
+        writeFileSync(
+          bindingPath,
+          JSON.stringify({
+            version: 1,
+            sessionId: context.sessionId,
+            studioId: context.studioId,
+            sbSlug: context.sbSlug,
+            threadId: 'parent-thread',
+            ownerPid: process.pid,
+          }),
+          { mode: 0o600 }
+        );
       const calls: string[] = [];
       const server = createServer((req, res) => {
         calls.push(req.url || '');
@@ -67,30 +85,44 @@ describe('guarded hook CLI entry points', () => {
         INK_SESSION_ID: context.sessionId,
         INK_STUDIO_ID: context.studioId,
         SB_SLUG: context.sbSlug,
+        INK_CODEX_INKMAIL_BINDING: bindingPath,
         INK_CONTEXT: Buffer.from(JSON.stringify(context)).toString('base64url'),
         ...(mode !== 'plain' ? { INK_CODEX_INKMAIL: '1' } : {}),
         ...(mode === 'parent' ? { INK_TURN_OWNER: 'parent' } : {}),
       };
-      for (const hook of ['on-session-start', 'on-prompt', 'on-stop']) {
-        const running = run(
-          process.execPath,
-          [cli, 'hooks', hook, '--backend', 'codex', '--codex-inkmail-only'],
-          { env, cwd, timeout: 12000 }
-        );
-        running.child.stdin?.end('{}');
-        const { stdout, stderr } = await running;
+      const running = run(
+        process.execPath,
+        [cli, 'hooks', hook, '--backend', 'codex', '--codex-inkmail-only'],
+        { env, cwd, timeout: 12000 }
+      );
+      running.child.stdin?.end(
+        JSON.stringify({
+          session_id: mode === 'nested' ? 'child-thread' : 'parent-thread',
+          ...(mode === 'subagent' ? { agent_id: 'child-thread', agent_type: 'default' } : {}),
+        })
+      );
+      const { stdout, stderr } = await running;
+      if (mode === 'bridge') {
+        // Positive control for EVERY handler; an always-skip guard must fail CI.
+        expect(calls.length).toBeGreaterThan(0);
+      } else {
         expect(stdout).toBe('');
         expect(stderr).toBe('');
+        expect(calls).toEqual([]);
+        expect(readdirSync(join(cwd, '.ink'))).toEqual(['identity.json']);
+        expect(readdirSync(join(home, '.ink')).sort()).toEqual(['config.json', 'logs']);
       }
-      expect(calls).toEqual([]);
-      expect(readdirSync(join(cwd, '.ink'))).toEqual(['identity.json']);
-      expect(readdirSync(join(home, '.ink')).sort()).toEqual(['config.json', 'logs']);
       const logs = readFileSync(join(home, '.ink', 'logs', 'hooks.log'), 'utf8')
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line));
-      expect(logs.map((row) => row.event)).toEqual(Array(3).fill('codex_inkmail_hook_skipped'));
-      expect(logs.map((row) => row.hook)).toEqual(['on-session-start', 'on-prompt', 'on-stop']);
+      if (mode === 'bridge') {
+        expect(logs.some((row) => row.event === 'codex_inkmail_hook_skipped')).toBe(false);
+        expect(logs.some((row) => row.event === hook.replaceAll('-', '_'))).toBe(true);
+      } else {
+        expect(logs.map((row) => row.event)).toEqual(['codex_inkmail_hook_skipped']);
+        expect(logs[0].hook).toBe(hook);
+      }
     },
     45000
   );

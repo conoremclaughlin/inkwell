@@ -161,12 +161,24 @@ describe('guarded modern hook migration', () => {
       expect(() => modernCodexMailHooks(value, 'node fixture')).toThrow();
     }
   });
-  it('names the force reinstall and re-trust recovery when a previous launcher path differs', () => {
-    const old = modernCodexMailHooks(legacy, "'node-old' '/old/cli.js'").content;
-    expect(() => modernCodexMailHooks(old, "'node-new' '/new/cli.js'")).toThrow(
-      'ink hooks install --backend codex --force'
-    );
-  });
+  it.each([false, true])(
+    'regenerates the exact known modern shape after launcher relocation, guarded=%s',
+    (guarded) => {
+      const previous = modernCodexMailHooks(legacy, "'node-old' '/old/cli.js'").content;
+      const old = guarded ? previous : previous.replaceAll(' --codex-inkmail-only', '');
+      const moved = modernCodexMailHooks(old, "'node-new' '/new/cli.js'");
+      expect(moved.content).toBe(modernCodexMailHooks(legacy, "'node-new' '/new/cli.js'").content);
+      for (const custom of [
+        old.replace('timeout = 60', 'timeout = 30'),
+        old.replace('on-stop', 'custom-stop'),
+        old.replace('# ink-managed:hooks:end', '# custom\n# ink-managed:hooks:end'),
+      ]) {
+        expect(() => modernCodexMailHooks(custom, "'node-new' '/new/cli.js'")).toThrow(
+          'will not overwrite'
+        );
+      }
+    }
+  );
   it('reports missing project setup without a raw filesystem error', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ink-mail-no-config-'));
     dirs.push(dir);

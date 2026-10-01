@@ -4336,6 +4336,9 @@ export async function runClaudeInteractive(
         const message = error instanceof Error ? error.message : 'Codex Inkmail launch failed';
         stderrText += message;
         console.error(message);
+        if (options.codexInkmail !== true && mailSelection.kind === 'mail') {
+          console.error('To use the normal Codex launcher, rerun with --no-codex-inkmail.');
+        }
       } finally {
         prepared.cleanup();
         await detachOnChildExit(options.backend, prepared.env, sessionContext.inkSessionId, sbSlug);

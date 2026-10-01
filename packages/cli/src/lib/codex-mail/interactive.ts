@@ -9,6 +9,7 @@ import { startCodexMailGateway } from './gateway.js';
 import { pulseCodexMail } from './heartbeat.js';
 import { hasTrustedCodexMailHooks } from './hooks.js';
 import { prepareCodexMailLaunch, type CodexMailLaunch } from './preflight.js';
+import { createCodexMailHookBinding } from './hook-binding.js';
 import { createCodexMailPoller } from './poller.js';
 
 /** Experimental native-terminal adapter. Does not affect `codex exec`, the
@@ -43,14 +44,22 @@ export async function runCodexMailInteractive(
     options.onStderr(Buffer.from(`\nInkwell Inkmail: ${message}\n`))
   );
   const warn = (message: string) => diagnostics.warn(message);
+  const binding = createCodexMailHookBinding(options);
+  const bridgeEnv = {
+    ...options.env,
+    ...binding.env,
+    INK_CODEX_INKMAIL: '1',
+    INK_CHANNEL_HOST: 'codex',
+  };
   const gateway = await startCodexMailGateway({
     ...options,
     serverArgs: launch.serverArgs,
     threadOverrides: launch.threadOverrides,
-    env: { ...options.env, INK_CODEX_INKMAIL: '1', INK_CHANNEL_HOST: 'codex' },
+    env: bridgeEnv,
     onBound: async (id) => {
       if (threadId && threadId !== id) {
         switched = true;
+        binding.revoke();
         warn(
           'terminal changed Codex threads; live mail is paused. Relaunch ink for the selected thread.'
         );
@@ -58,6 +67,7 @@ export async function runCodexMailInteractive(
       }
       threadId = id;
       await options.onBound(id);
+      binding.bind(id);
       delivery = new CodexMailDelivery({
         directory: join(homedir(), '.ink', 'codex-mail'),
         scope: JSON.stringify([serverUrl, options.sbSlug, options.sessionId, options.studioId]),
@@ -66,8 +76,13 @@ export async function runCodexMailInteractive(
       });
     },
     onEvent: (event) => delivery?.observe(event),
-    onUnhealthy: () =>
-      warn('live delivery disconnected; unconfirmed messages stay unread. Relaunch to recover.'),
+    onUnhealthy: () => {
+      binding.revoke();
+      warn('live delivery disconnected; unconfirmed messages stay unread. Relaunch to recover.');
+    },
+  }).catch((error) => {
+    binding.dispose();
+    throw error;
   });
   const usable = () =>
     !stopped && !switched && hooksReady && Boolean(delivery) && gateway.isHealthy();
@@ -162,7 +177,7 @@ export async function runCodexMailInteractive(
   try {
     const child = spawn(options.binary, ['--remote', gateway.endpoint, ...launch.tuiArgs], {
       cwd: options.cwd,
-      env: { ...options.env, INK_CODEX_INKMAIL: '1', INK_CHANNEL_HOST: 'codex' },
+      env: bridgeEnv,
       stdio: ['inherit', 'inherit', 'pipe'],
     });
     child.stderr.on('data', options.onStderr);
@@ -177,6 +192,11 @@ export async function runCodexMailInteractive(
     clearInterval(heartbeatTimer);
     // Caller detaches and removes the identity prompt ONLY after the owner
     // has exited. The guardian also enforces this on abrupt wrapper death.
-    await gateway.stop();
+    binding.revoke();
+    try {
+      await gateway.stop();
+    } finally {
+      binding.dispose();
+    }
   }
 }
