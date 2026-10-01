@@ -33,7 +33,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
               },
               received: request.params,
             }
-          : request.method === 'fixture/thread-response'
+          : ['fixture/thread-response', 'thread/read'].includes(request.method)
             ? {
                 thread: { id: request.params.threadId, ephemeral: request.params.ephemeral },
                 received: request.params,

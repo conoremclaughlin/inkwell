@@ -41,8 +41,16 @@ describe('buildInteractiveSubcommandArgs', () => {
 });
 
 describe('extractArgs', () => {
-  it('keeps experimental Codex Inkmail opt-in out of native argv', () => {
-    expect(extractArgs([]).sbOptions.codexInkmail).toBe(false);
+  it('keeps automatic/default, explicit require and opt-out separate from native argv', () => {
+    expect(extractArgs([]).sbOptions.codexInkmail).toBeUndefined();
+    expect(extractArgs(['--no-codex-inkmail']).sbOptions.codexInkmail).toBe(false);
+    expect(extractArgs(['--no-codex-inkmail']).passthroughArgs).toEqual([]);
+    expect(extractArgs(['--codex-inkmail', '--no-codex-inkmail']).sbOptions.codexInkmail).toBe(
+      false
+    );
+    expect(extractArgs(['--no-codex-inkmail', '--codex-inkmail']).sbOptions.codexInkmail).toBe(
+      true
+    );
     const result = extractArgs(['-b', 'codex', '--codex-inkmail']);
     expect(result.sbOptions.codexInkmail).toBe(true);
     expect(result.passthroughArgs).toEqual([]);

@@ -1,5 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { getValidAccessToken } from '../../auth/tokens.js';
@@ -8,41 +7,30 @@ import { CodexMailDelivery } from './delivery.js';
 import { CodexMailDiagnostics } from './diagnostics.js';
 import { startCodexMailGateway } from './gateway.js';
 import { pulseCodexMail } from './heartbeat.js';
-import { splitCodexMailArgs } from './launch.js';
-import { prepareCodexMailHooks, hasTrustedCodexMailHooks } from './hooks.js';
+import { hasTrustedCodexMailHooks } from './hooks.js';
+import { prepareCodexMailLaunch, type CodexMailLaunch } from './preflight.js';
+import { createCodexMailHookBinding } from './hook-binding.js';
 import { createCodexMailPoller } from './poller.js';
 
 /** Experimental native-terminal adapter. Does not affect `codex exec`, the
- * desktop app, the global daemon, or any session not explicitly opted in. */
-export async function runCodexMailInteractive(options: {
-  binary: string;
-  args: string[];
-  env: NodeJS.ProcessEnv;
-  cwd: string;
-  sbSlug: string;
-  sessionId: string;
-  studioId: string;
-  onBound(threadId: string): Promise<void>;
-  onStderr(chunk: Buffer): void;
-}): Promise<{ code: number | null; backendSessionId?: string }> {
-  // Codex's hook trust keys include source paths. The TUI canonicalizes cwd;
-  // use the same spelling for config/metadata queries (not /tmp vs /private/tmp).
-  options = { ...options, cwd: realpathSync(options.cwd) };
-  const version = spawnSync(options.binary, ['--version'], {
-    env: options.env,
-    cwd: options.cwd,
-    encoding: 'utf8',
-    timeout: 5000,
-  });
-  // Experimental queue/receipt schemas are measured on this version only.
-  if (version.status !== 0 || !/^codex-cli 0\.159\.2\s*$/.test(version.stdout)) {
-    throw new Error('Experimental Codex Inkmail currently requires codex-cli 0.159.2');
-  }
-  const launch = splitCodexMailArgs(options.args, options.cwd);
-  const expectedHooks = prepareCodexMailHooks(options.cwd);
-  // User feature overrides still follow this default; declining trust or
-  // disabling hooks pauses delivery rather than bypassing that choice.
-  launch.serverArgs.splice(1, 0, '--enable', 'hooks');
+ * desktop app, the global daemon, or ordinary launches outside the bridge. */
+export async function runCodexMailInteractive(
+  options: {
+    binary: string;
+    args: string[];
+    env: NodeJS.ProcessEnv;
+    cwd: string;
+    sbSlug: string;
+    sessionId: string;
+    studioId: string;
+    onBound(threadId: string): Promise<void>;
+    onStderr(chunk: Buffer): void;
+  },
+  prepared?: CodexMailLaunch
+): Promise<{ code: number | null; backendSessionId?: string }> {
+  const launch = prepared ?? prepareCodexMailLaunch(options);
+  options = { ...options, cwd: launch.cwd };
+  const expectedHooks = launch.expectedHooks;
   const serverUrl = getInkServerUrl();
   let threadId: string | undefined;
   let delivery: CodexMailDelivery | undefined;
@@ -56,14 +44,25 @@ export async function runCodexMailInteractive(options: {
     options.onStderr(Buffer.from(`\nInkwell Inkmail: ${message}\n`))
   );
   const warn = (message: string) => diagnostics.warn(message);
+  const binding = createCodexMailHookBinding(options);
+  const bridgeEnv = {
+    ...options.env,
+    ...binding.env,
+    INK_CODEX_INKMAIL: '1',
+    INK_CHANNEL_HOST: 'codex',
+  };
   const gateway = await startCodexMailGateway({
     ...options,
     serverArgs: launch.serverArgs,
     threadOverrides: launch.threadOverrides,
-    env: { ...options.env, INK_CODEX_INKMAIL: '1', INK_CHANNEL_HOST: 'codex' },
+    env: bridgeEnv,
     onBound: async (id) => {
+      // A switch is a one-way pause for this wrapper, even if the TUI later
+      // returns to the original thread. Do not publish or rebind again.
+      if (switched) return;
       if (threadId && threadId !== id) {
         switched = true;
+        binding.revoke();
         warn(
           'terminal changed Codex threads; live mail is paused. Relaunch ink for the selected thread.'
         );
@@ -71,6 +70,7 @@ export async function runCodexMailInteractive(options: {
       }
       threadId = id;
       await options.onBound(id);
+      binding.bind(id);
       delivery = new CodexMailDelivery({
         directory: join(homedir(), '.ink', 'codex-mail'),
         scope: JSON.stringify([serverUrl, options.sbSlug, options.sessionId, options.studioId]),
@@ -79,8 +79,13 @@ export async function runCodexMailInteractive(options: {
       });
     },
     onEvent: (event) => delivery?.observe(event),
-    onUnhealthy: () =>
-      warn('live delivery disconnected; unconfirmed messages stay unread. Relaunch to recover.'),
+    onUnhealthy: () => {
+      binding.revoke();
+      warn('live delivery disconnected; unconfirmed messages stay unread. Relaunch to recover.');
+    },
+  }).catch((error) => {
+    binding.dispose();
+    throw error;
   });
   const usable = () =>
     !stopped && !switched && hooksReady && Boolean(delivery) && gateway.isHealthy();
@@ -175,7 +180,7 @@ export async function runCodexMailInteractive(options: {
   try {
     const child = spawn(options.binary, ['--remote', gateway.endpoint, ...launch.tuiArgs], {
       cwd: options.cwd,
-      env: { ...options.env, INK_CODEX_INKMAIL: '1', INK_CHANNEL_HOST: 'codex' },
+      env: bridgeEnv,
       stdio: ['inherit', 'inherit', 'pipe'],
     });
     child.stderr.on('data', options.onStderr);
@@ -190,6 +195,11 @@ export async function runCodexMailInteractive(options: {
     clearInterval(heartbeatTimer);
     // Caller detaches and removes the identity prompt ONLY after the owner
     // has exited. The guardian also enforces this on abrupt wrapper death.
-    await gateway.stop();
+    binding.revoke();
+    try {
+      await gateway.stop();
+    } finally {
+      binding.dispose();
+    }
   }
 }

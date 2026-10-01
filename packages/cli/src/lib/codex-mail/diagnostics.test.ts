@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CodexMailDiagnostics } from './diagnostics.js';
-import { PendingCodexDelivery } from './delivery.js';
+import { PendingCodexDelivery, UnconfirmedCodexDelivery } from './delivery.js';
 
 describe('Codex mail diagnostics', () => {
   it('names each held message/thread, repeats after one minute, and reports recovery', async () => {
@@ -53,6 +53,61 @@ describe('Codex mail diagnostics', () => {
     };
     await expect(diagnostics.deliver(lost, 'm1', 'hello', {})).rejects.toThrow();
     expect(messages[0]).toContain('legacy inbox (global read pointer)');
+  });
+  it('keeps a brief not-visible scan gap and its recovery quiet, without accepting delivery', async () => {
+    const messages: string[] = [];
+    let now = 0,
+      receipt = false;
+    const diagnostics = new CodexMailDiagnostics(
+      (m) => messages.push(m),
+      () => now
+    );
+    const delivery = {
+      deliver: async () => {
+        if (!receipt) throw new UnconfirmedCodexDelivery('not visible yet');
+      },
+    };
+    const send = () => diagnostics.deliver(delivery, 'm1', 'hello', {});
+    await expect(send()).rejects.toThrow();
+    now = 5000;
+    await expect(send()).rejects.toThrow();
+    receipt = true;
+    await send();
+    expect(messages).toEqual([]);
+  });
+  it('warns after 15 seconds of missing receipts and immediately on other failures', async () => {
+    const messages: string[] = [];
+    let now = 0;
+    const diagnostics = new CodexMailDiagnostics(
+      (m) => messages.push(m),
+      () => now
+    );
+    const absent = {
+      deliver: async () => {
+        throw new UnconfirmedCodexDelivery('uncertain');
+      },
+    };
+    const send = () => diagnostics.deliver(absent, 'm1', 'hello', {});
+    await expect(send()).rejects.toThrow();
+    now = 14999;
+    await expect(send()).rejects.toThrow();
+    expect(messages).toEqual([]);
+    now = 15000;
+    await expect(send()).rejects.toThrow();
+    expect(messages[0]).toContain('message m1');
+    await expect(
+      diagnostics.deliver(
+        {
+          deliver: async () => {
+            throw new Error('transport lost');
+          },
+        },
+        'm2',
+        'hello',
+        {}
+      )
+    ).rejects.toThrow();
+    expect(messages[1]).toContain('transport lost');
   });
   it('rate-limits generic transport warnings instead of suppressing them forever', () => {
     const messages: string[] = [];

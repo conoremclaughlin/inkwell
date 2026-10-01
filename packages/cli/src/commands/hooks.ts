@@ -36,6 +36,7 @@ import {
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
+import { admitsCodexMailHook } from '../lib/codex-mail/hook-binding.js';
 import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
@@ -2281,8 +2282,15 @@ export async function hydrateThreadKeyFromServer(
   return inkThreadKey;
 }
 
-async function onSessionStartHandler(options?: { backend?: string }): Promise<void> {
+async function onSessionStartHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-session-start' });
+    return;
+  }
   const cwd = process.cwd();
   const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
@@ -2767,8 +2775,15 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   process.exit(1);
 }
 
-async function onPromptHandler(options?: { backend?: string }): Promise<void> {
+async function onPromptHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-prompt' });
+    return;
+  }
   const cwd = process.cwd();
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
   sbDebugLog('hooks', 'on_prompt_begin', {
@@ -3026,8 +3041,15 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   }
 }
 
-async function onStopHandler(options?: { backend?: string }): Promise<void> {
+async function onStopHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-stop' });
+    return;
+  }
   const cwd = process.cwd();
 
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
@@ -3275,6 +3297,7 @@ export function registerHooksCommands(program: Command): void {
     .command('on-session-start')
     .description('Hook: bootstrap identity and context at session start')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onSessionStartHandler(opts));
 
   hooks
@@ -3287,11 +3310,13 @@ export function registerHooksCommands(program: Command): void {
     .command('on-prompt')
     .description('Hook: periodic inbox check on user prompt')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onPromptHandler(opts));
 
   hooks
     .command('on-stop')
     .description('Hook: session nudge and inbox check on stop')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onStopHandler(opts));
 }

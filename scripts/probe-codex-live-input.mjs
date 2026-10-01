@@ -1,5 +1,5 @@
 // Codex live-input experiment. ONLY a synthetic loopback provider, fresh HOME,
-// no credentials, no real tools. Uses Node 22, Python stdlib, and existing ws
+// no credentials. Nested probe runs only bounded synthetic Codex children. Uses Node 22, Python stdlib, and existing ws
 // dependency for Unix mode. Opt-in; this launches the installed Codex binary.
 // Run from repo root: node scripts/probe-codex-live-input.mjs [--unix|--default-socket]
 // All generated evidence stays in the private temporary directory, outside git.
@@ -16,9 +16,13 @@ const base = path.dirname(fileURLToPath(import.meta.url));
 const defaultSocket = process.argv.includes('--default-socket');
 const unix = process.argv.includes('--unix') || defaultSocket;
 const permissionsProbe = process.argv.includes('--permissions-probe');
-const wrapperMode = process.argv.includes('--wrapper');
+const nestedProbe = process.argv.includes('--nested-probe');
+const launcherMode = process.argv.includes('--launcher') || nestedProbe;
+const wrapperMode = process.argv.includes('--wrapper') || launcherMode;
 const gatewayMode = process.argv.includes('--gateway');
-const launchOverrides = process.argv.includes('--launch-overrides') || gatewayMode;
+const launchOverrides = process.argv.includes('--launch-overrides') || gatewayMode || nestedProbe;
+let nestedIssued = false,
+  subagentIssued = false;
 let gateway;
 // Darwin's default tmpdir is too long for the default Unix control socket.
 const root = fs.mkdtempSync(path.join('/tmp', 'ink-codex-live-'));
@@ -36,6 +40,7 @@ const env = {
 };
 const inkCalls = [];
 let mailboxUnread = true;
+let fixtureBackendId;
 const fixtureSession = '00000000-0000-4000-8000-000000000001';
 const fixtureStudio = '00000000-0000-4000-8000-000000000002';
 const fixtureMessage = '00000000-0000-4000-8000-000000000003';
@@ -68,15 +73,25 @@ function child(args, extra = {}) {
   children.push(p);
   return p;
 }
-function respond(res, n) {
+function respond(res, n, tool) {
   const id = `resp_fixture_${n}`,
-    item = {
-      id: `msg_fixture_${n}`,
-      type: 'message',
-      role: 'assistant',
-      status: 'completed',
-      content: [{ type: 'output_text', text: `FIXTURE_RESPONSE_${n}`, annotations: [] }],
-    };
+    item = tool
+      ? {
+          id: `fc_fixture_${n}`,
+          type: 'function_call',
+          call_id: `call_fixture_${n}`,
+          name: tool.name,
+          ...(tool.namespace ? { namespace: tool.namespace } : {}),
+          arguments: JSON.stringify(tool.args),
+          status: 'completed',
+        }
+      : {
+          id: `msg_fixture_${n}`,
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: `FIXTURE_RESPONSE_${n}`, annotations: [] }],
+        };
   let seq = 0;
   const event = (type, extra) =>
     res.write(
@@ -89,30 +104,32 @@ function respond(res, n) {
     output_index: 0,
     item: { ...item, status: 'in_progress', content: [] },
   });
-  event('response.content_part.added', {
-    item_id: item.id,
-    output_index: 0,
-    content_index: 0,
-    part: { type: 'output_text', text: '', annotations: [] },
-  });
-  event('response.output_text.delta', {
-    item_id: item.id,
-    output_index: 0,
-    content_index: 0,
-    delta: item.content[0].text,
-  });
-  event('response.output_text.done', {
-    item_id: item.id,
-    output_index: 0,
-    content_index: 0,
-    text: item.content[0].text,
-  });
-  event('response.content_part.done', {
-    item_id: item.id,
-    output_index: 0,
-    content_index: 0,
-    part: item.content[0],
-  });
+  if (!tool) {
+    event('response.content_part.added', {
+      item_id: item.id,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: '', annotations: [] },
+    });
+    event('response.output_text.delta', {
+      item_id: item.id,
+      output_index: 0,
+      content_index: 0,
+      delta: item.content[0].text,
+    });
+    event('response.output_text.done', {
+      item_id: item.id,
+      output_index: 0,
+      content_index: 0,
+      text: item.content[0].text,
+    });
+    event('response.content_part.done', {
+      item_id: item.id,
+      output_index: 0,
+      content_index: 0,
+      part: item.content[0],
+    });
+  }
   event('response.output_item.done', { output_index: 0, item });
   event('response.completed', {
     response: {
@@ -176,7 +193,28 @@ const provider = http.createServer(async (req, res) => {
         success: true,
         session: { id: fixtureSession, activeThreadKey: 'thread:fixture' },
       };
-    if (name === 'list_sessions') result = { success: true, sessions: [] };
+    if (name === 'list_sessions')
+      result = {
+        success: true,
+        sessions: launcherMode
+          ? [
+              {
+                id: fixtureSession,
+                sbSlug: 'fixture',
+                backend: 'codex',
+                studioId: fixtureStudio,
+                workingDir: fs.realpathSync(work),
+                lifecycle: 'idle',
+                currentPhase: 'active',
+                backendSessionId: fixtureBackendId,
+              },
+            ]
+          : [],
+      };
+    if (launcherMode && name === 'update_session_state' && body.params.arguments.backendSessionId) {
+      fixtureBackendId = body.params.arguments.backendSessionId;
+      fs.writeFileSync(path.join(root, 'bound.txt'), fixtureBackendId);
+    }
     if (name === 'bootstrap')
       result = { success: true, identityFiles: { self: 'Synthetic fixture identity.' } };
     res.end(
@@ -204,6 +242,36 @@ const provider = http.createServer(async (req, res) => {
   if (holdNext) {
     holdNext = false;
     held = () => respond(res, requests.indexOf(body) + 1);
+  } else if (
+    nestedProbe &&
+    !nestedIssued &&
+    JSON.stringify(body.input).includes('SYNTHETIC_NESTED_PARENT')
+  ) {
+    nestedIssued = true;
+    respond(res, requests.length, {
+      name: 'exec_command',
+      args: {
+        cmd: [process.execPath, path.join(work, 'nested-fixture.cjs')].map(shellQuote).join(' '),
+        workdir: work,
+        login: false,
+        yield_time_ms: 10000,
+        max_output_tokens: 1000,
+      },
+    });
+  } else if (
+    nestedProbe &&
+    !subagentIssued &&
+    JSON.stringify(body.input).includes('SYNTHETIC_SUBAGENT_PARENT')
+  ) {
+    subagentIssued = true;
+    respond(res, requests.length, {
+      name: 'spawn_agent',
+      namespace: 'multi_agent_v1',
+      args: {
+        message: 'SYNTHETIC_SUBAGENT_CHILD: synthetic lifecycle fixture only; no tools.',
+        fork_context: false,
+      },
+    });
   } else respond(res, requests.length);
 });
 
@@ -310,6 +378,11 @@ try {
     path.join(ch, 'config.toml'),
     `model_provider="fixture"\nmodel="fixture-model"\napproval_policy="never"\nsandbox_mode="read-only"\ncheck_for_update_on_startup=false\n[analytics]\nenabled=false\n[feedback]\nenabled=false\n[model_providers.fixture]\nname="Synthetic local provider"\nbase_url="http://127.0.0.1:${provider.address().port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n`
   );
+  if (nestedProbe)
+    fs.appendFileSync(
+      path.join(ch, 'config.toml'),
+      '\n[sandbox_workspace_write]\nnetwork_access=true\n'
+    );
   if (permissionsProbe) {
     for (const p of ['baseline', 'extra']) fs.mkdirSync(path.join(root, p));
     fs.appendFileSync(
@@ -329,7 +402,13 @@ try {
       `const fs=require('fs');let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>fs.appendFileSync(process.argv[2],JSON.stringify({event:process.argv[3],input,cwd:process.cwd()})+'\\n'));`
     );
     fs.appendFileSync(path.join(ch, 'config.toml'), '\n[features]\nhooks=true\n');
-    for (const event of ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) {
+    for (const event of [
+      'SessionStart',
+      'UserPromptSubmit',
+      'Stop',
+      'SessionEnd',
+      ...(nestedProbe ? ['SubagentStart', 'SubagentStop'] : []),
+    ]) {
       fs.appendFileSync(
         path.join(ch, 'config.toml'),
         '\n[[hooks.' +
@@ -430,30 +509,63 @@ const options=JSON.parse(fs.readFileSync(process.argv[3],'utf8'));
 const result=await runCodexMailInteractive({...options,env:process.env,onBound:async(id)=>fs.writeFileSync(process.argv[4],id),onStderr:(c)=>process.stderr.write(c)});
 process.exitCode=result.code??1;`
     );
-    tui = spawn(
-      'python3',
-      [
-        '-u',
-        path.join(base, 'fixtures/codex-live-input-pty.py'),
-        process.execPath,
-        driver,
-        moduleUrl,
-        wrapperConfig,
-        path.join(root, 'bound.txt'),
-      ],
-      { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-    children.push(tui);
-    let buffer = '';
-    tui.stdout.on('data', (chunk) => {
-      buffer += chunk;
-      let at;
-      while ((at = buffer.indexOf('\n')) >= 0) {
-        const row = JSON.parse(buffer.slice(0, at));
-        buffer = buffer.slice(at + 1);
-        if (row.output) tuiText += row.output;
-      }
-    });
+    if (launcherMode)
+      fs.appendFileSync(
+        path.join(ch, 'config.toml'),
+        '\n[mcp_servers.inkwell]\nurl=' + JSON.stringify(inkUrl + '/mcp') + '\nenabled=false\n'
+      );
+    // --launcher exercises extractArgs, session selection, the real adapter,
+    // default-on preflight and the wrapper branch, with NO Inkmail CLI flag.
+    const launchArgs = launcherMode
+      ? [
+          process.execPath,
+          fileURLToPath(new URL('../packages/cli/dist/cli.js', import.meta.url)),
+          '-b',
+          'codex',
+          '-a',
+          'fixture',
+          '--session-choice',
+          'ink:' + fixtureSession,
+          '--sandbox',
+          nestedProbe ? 'workspace-write' : 'read-only',
+          ...(nestedProbe ? ['--add-dir', root] : []),
+          '--no-alt-screen',
+        ]
+      : [process.execPath, driver, moduleUrl, wrapperConfig, path.join(root, 'bound.txt')];
+    const startWrapper = () => {
+      tuiText = '';
+      tui = spawn(
+        'python3',
+        ['-u', path.join(base, 'fixtures/codex-live-input-pty.py'), ...launchArgs],
+        { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+      children.push(tui);
+      let buffer = '';
+      tui.stdout.on('data', (chunk) => {
+        buffer += chunk;
+        let at;
+        while ((at = buffer.indexOf('\n')) >= 0) {
+          const row = JSON.parse(buffer.slice(0, at));
+          buffer = buffer.slice(at + 1);
+          if (row.output) tuiText += row.output;
+        }
+      });
+    };
+    if (nestedProbe)
+      fs.writeFileSync(
+        path.join(work, 'nested-fixture.cjs'),
+        `
+const fs=require('fs'), cp=require('child_process');
+const names=['INK_CODEX_INKMAIL','INK_CODEX_INKMAIL_BINDING','INK_CONTEXT','INK_SESSION_ID','INK_STUDIO_ID','SB_SLUG'];
+fs.writeFileSync('nested-env.json',JSON.stringify(Object.fromEntries(names.map(n=>[n,process.env[n]]))));
+try {
+ const output=cp.execFileSync('codex',['--enable','hooks','exec','--json','--skip-git-repo-check','--sandbox','read-only','SYNTHETIC_NESTED_CHILD'],{encoding:'utf8',timeout:20000});
+ fs.writeFileSync('nested-output.jsonl',output);
+ fs.writeFileSync('nested-result.json',JSON.stringify({ok:true}));
+} catch(e) {fs.writeFileSync('nested-result.json',JSON.stringify({ok:false,message:e.message})); process.exitCode=1;}
+`
+      );
+    startWrapper();
     await until(() => tuiText.includes('Hooks need review'), 'wrapper hook review', 20000);
     await delay(500);
     tui.stdin.write(JSON.stringify({ write: '\u001b[B\r' }) + '\n');
@@ -492,16 +604,209 @@ process.exitCode=result.code??1;`
       inkCalls.some((c) => c.body.cliAttached === true),
       'missing attachment'
     );
+    if (launcherMode)
+      assert.ok(tuiText.includes('live delivery enabled'), 'default-on launcher bypassed');
     report('wrapper_assertions_passed', {
       root,
+      fullLauncher: launcherMode,
       mailboxAck: true,
       scopedFetch: true,
       promptAndStop: true,
       freshness: true,
     });
+    if (nestedProbe) {
+      const parentId = fs.readFileSync(path.join(root, 'bound.txt'), 'utf8');
+      const submit = async (text) => {
+        tui.stdin.write(JSON.stringify({ write: text }) + '\n');
+        await delay(500);
+        tui.stdin.write(JSON.stringify({ write: '\r' }) + '\n');
+      };
+      const lifecycleCounts = () =>
+        ['prompt', 'stop'].map(
+          (event) =>
+            inkCalls.filter((c) => c.path === '/api/hooks/lifecycle' && c.body.event === event)
+              .length
+        );
+      const skips = () =>
+        fs
+          .readFileSync(path.join(home, '.ink', 'logs', 'hooks.log'), 'utf8')
+          .trim()
+          .split('\n')
+          .map(JSON.parse)
+          .filter((r) => r.event === 'codex_inkmail_hook_skipped').length;
+      const beforeNested = lifecycleCounts(),
+        skipsBeforeNested = skips();
+      await submit('SYNTHETIC_NESTED_PARENT');
+      await until(
+        () => fs.existsSync(path.join(work, 'nested-result.json')),
+        'nested raw exec from native tool shell',
+        30000
+      );
+      assert.equal(
+        JSON.parse(fs.readFileSync(path.join(work, 'nested-result.json'), 'utf8')).ok,
+        true
+      );
+      const inherited = JSON.parse(fs.readFileSync(path.join(work, 'nested-env.json'), 'utf8'));
+      assert.equal(inherited.INK_CODEX_INKMAIL, '1');
+      assert.ok(inherited.INK_CODEX_INKMAIL_BINDING);
+      assert.equal(
+        JSON.parse(fs.readFileSync(inherited.INK_CODEX_INKMAIL_BINDING, 'utf8')).threadId,
+        parentId
+      );
+      assert.equal(fixtureBackendId, parentId, 'nested exec replaced parent backend link');
+      await until(
+        () => lifecycleCounts()[1] === beforeNested[1] + 1,
+        'parent stop after nested tool'
+      );
+      assert.deepEqual(
+        lifecycleCounts(),
+        beforeNested.map((n) => n + 1),
+        'nested child claimed/finalized parent epoch'
+      );
+      assert.equal(
+        skips() - skipsBeforeNested,
+        3,
+        'nested child must run and skip all three hooks'
+      );
+      report('nested_exec_assertions_passed', {
+        parentId,
+        inheritedBridge: true,
+        skippedHooks: 3,
+        parentEpochOnly: true,
+      });
+      const beforeSubagent = lifecycleCounts(),
+        skipsBeforeSubagent = skips();
+      await delay(1500);
+      await submit('SYNTHETIC_SUBAGENT_PARENT');
+      await until(
+        () =>
+          fs.existsSync(path.join(root, 'hooks.jsonl')) &&
+          fs.readFileSync(path.join(root, 'hooks.jsonl'), 'utf8').includes('SubagentStop'),
+        'native in-process synthetic subagent',
+        20000
+      );
+      await delay(2000);
+      const hookRows = fs
+        .readFileSync(path.join(root, 'hooks.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map(JSON.parse)
+        .map((r) => ({ ...r, payload: JSON.parse(r.input) }));
+      fs.writeFileSync(path.join(root, 'nested-hooks.json'), JSON.stringify(hookRows, null, 2));
+      const agentRows = hookRows.filter((r) => r.payload.agent_id);
+      assert.ok(agentRows.some((r) => r.event === 'SubagentStart'));
+      assert.ok(
+        agentRows.some(
+          (r) =>
+            r.event === 'UserPromptSubmit' && r.payload.prompt.includes('SYNTHETIC_SUBAGENT_CHILD')
+        )
+      );
+      assert.ok(agentRows.some((r) => r.event === 'SubagentStop'));
+      assert.ok(
+        agentRows.every((r) => r.payload.session_id === parentId),
+        'subagent did not exercise parent session_id'
+      );
+      assert.deepEqual(
+        lifecycleCounts(),
+        beforeSubagent.map((n) => n + 1),
+        'subagent claimed/finalized parent epoch'
+      );
+      assert.equal(skips() - skipsBeforeSubagent, 1, 'subagent prompt hook must run and skip');
+      assert.ok(
+        inkCalls
+          .filter((c) => c.body.params?.name === 'update_session_state')
+          .every(
+            (c) =>
+              !c.body.params.arguments.backendSessionId ||
+              c.body.params.arguments.backendSessionId === parentId
+          )
+      );
+      report('subagent_guard_assertions_passed', {
+        parentSessionId: true,
+        agentField: true,
+        skippedPrompt: true,
+        parentEpochOnly: true,
+      });
+      assert.equal(fixtureBackendId, parentId, 'subagent replaced parent backend link');
+    }
     // Exit the actual native TUI normally, allowing the runner to stop its owner.
     tui.stdin.write(JSON.stringify({ write: '\u0004' }) + '\n');
     await until(() => tui.exitCode !== null, 'wrapper normal exit', 15000);
+    if (launcherMode) {
+      const original = fs.readFileSync(path.join(root, 'bound.txt'), 'utf8');
+      const beforeResume = inkCalls.length;
+      startWrapper();
+      await until(
+        () =>
+          inkCalls
+            .slice(beforeResume)
+            .some((c) => c.path === '/api/hooks/lifecycle' && c.body.cliPollAt),
+        'resumed bridge freshness after exact binding',
+        30000
+      );
+      assert.ok(tuiText.includes('live delivery enabled'), 'resume did not use the bridge');
+      assert.equal(fixtureBackendId, original, 'resume replaced the native thread');
+      await until(() => tuiText.includes('SYNTHETIC_WRAPPER_MAIL'), 'restored conversation', 15000);
+      report('launcher_resume_assertions_passed', { sameThread: true, historyRestored: true });
+      tui.stdin.write(JSON.stringify({ write: '\u0004' }) + '\n');
+      await until(() => tui.exitCode !== null, 'resumed launcher normal exit', 15000);
+    }
+    // The trusted project migration persists after detach. A server-shaped
+    // exec must invoke the guarded commands but make NO lifecycle/intake calls,
+    // even with an inherited bridge flag. No real server or provider is used.
+    const beforeHeadlessCalls = inkCalls.length;
+    const hookLogPath = path.join(home, '.ink', 'logs', 'hooks.log');
+    const beforeHeadlessLogs = fs.readFileSync(hookLogPath, 'utf8').trim().split('\n').length;
+    const headless = child(
+      [
+        '--enable',
+        'hooks',
+        'exec',
+        '--skip-git-repo-check',
+        '--sandbox',
+        'read-only',
+        'SYNTHETIC_HEADLESS',
+      ],
+      {
+        env: {
+          ...env,
+          INK_CODEX_INKMAIL: '1',
+          INK_CONTEXT: Buffer.from(
+            JSON.stringify({
+              sessionId: fixtureSession,
+              studioId: fixtureStudio,
+              sbSlug: 'fixture',
+              runtime: 'codex',
+              cliAttached: false,
+            })
+          ).toString('base64url'),
+        },
+      }
+    );
+    let headlessOutput = '';
+    headless.stdout.on('data', (c) => (headlessOutput += c));
+    headless.stderr.on('data', (c) => fs.appendFileSync(path.join(root, 'headless.stderr'), c));
+    headless.stdin.end();
+    await until(() => headless.exitCode !== null, 'headless completed', 30000);
+    assert.equal(headless.exitCode, 0);
+    assert.ok(headlessOutput.includes('FIXTURE_RESPONSE_'));
+    assert.equal(inkCalls.length, beforeHeadlessCalls, 'headless hook touched Inkwell');
+    const skipped = fs
+      .readFileSync(hookLogPath, 'utf8')
+      .trim()
+      .split('\n')
+      .slice(beforeHeadlessLogs)
+      .map(JSON.parse)
+      .filter((row) => row.event === 'codex_inkmail_hook_skipped');
+    for (const hook of ['on-session-start', 'on-prompt', 'on-stop'])
+      assert.ok(
+        skipped.some((row) => row.hook === hook),
+        'headless hook guard was not exercised: ' + hook
+      );
+    report('headless_guard_assertions_passed', {
+      invoked: skipped.map((row) => row.hook),
+      inkCalls: 0,
+    });
     fs.writeFileSync(path.join(root, 'ink-calls.json'), JSON.stringify(inkCalls, null, 2));
   } else if (gatewayMode) {
     const { startCodexMailGateway } =

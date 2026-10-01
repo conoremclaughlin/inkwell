@@ -85,6 +85,7 @@ describe('native Codex live-mail launch mapping', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ink-mail-adapter-'));
     dirs.push(dir);
     vi.stubEnv('HOME', dir);
+    vi.stubEnv('INK_CODEX_INKMAIL', '1');
     vi.stubEnv('TMPDIR', dir);
     vi.stubEnv('INK_STUDIOS_ROOT', join(dir, 'studios'));
     const { CodexAdapter } = await import('../../backends/codex.js');
@@ -121,6 +122,7 @@ describe('native Codex live-mail launch mapping', () => {
         INK_SESSION_ID: id,
         INK_STUDIO_ID: id,
         INK_CHANNEL_HOST: 'codex',
+        INK_CODEX_INKMAIL: '0',
       });
     } finally {
       prepared.cleanup();
@@ -128,7 +130,7 @@ describe('native Codex live-mail launch mapping', () => {
   });
 });
 const legacy = `model="fixture"\n# ink-managed:hooks:start\n[hooks]\nsession_start = "ink hooks on-session-start --backend codex"\nsession_end = "ink hooks on-stop --backend codex"\nuser_prompt = "ink hooks on-prompt --backend codex"\n# ink-managed:hooks:end\n[custom]\nvalue=true\n`;
-describe('opt-in modern hook migration', () => {
+describe('guarded modern hook migration', () => {
   it('changes only the known managed legacy stanza and is idempotent', () => {
     const result = modernCodexMailHooks(legacy, "'node' '/fixture/cli.js'");
     expect(result.content).toContain('[[hooks.UserPromptSubmit.hooks]]');
@@ -138,6 +140,16 @@ describe('opt-in modern hook migration', () => {
     expect(modernCodexMailHooks(result.content, "'node' '/fixture/cli.js'").content).toBe(
       result.content
     );
+  });
+  it('upgrades the exact previous unguarded bridge block without touching other config', () => {
+    const prefix = "'node' '/fixture/cli.js'";
+    const current = modernCodexMailHooks(legacy, prefix);
+    const previous = current.content.replaceAll(' --codex-inkmail-only', '');
+    expect(modernCodexMailHooks(previous, prefix).content).toBe(current.content);
+    expect(current.hooks.every((h) => h.command.endsWith('--codex-inkmail-only'))).toBe(true);
+    expect(() =>
+      modernCodexMailHooks(previous.replace('timeout = 60', 'timeout = 30'), prefix)
+    ).toThrow('modified hook block');
   });
   it('refuses missing, custom, incomplete, or modified blocks', () => {
     for (const value of [
@@ -149,12 +161,24 @@ describe('opt-in modern hook migration', () => {
       expect(() => modernCodexMailHooks(value, 'node fixture')).toThrow();
     }
   });
-  it('names the force reinstall and re-trust recovery when a previous launcher path differs', () => {
-    const old = modernCodexMailHooks(legacy, "'node-old' '/old/cli.js'").content;
-    expect(() => modernCodexMailHooks(old, "'node-new' '/new/cli.js'")).toThrow(
-      'ink hooks install --backend codex --force'
-    );
-  });
+  it.each([false, true])(
+    'regenerates the exact known modern shape after launcher relocation, guarded=%s',
+    (guarded) => {
+      const previous = modernCodexMailHooks(legacy, "'node-old' '/old/cli.js'").content;
+      const old = guarded ? previous : previous.replaceAll(' --codex-inkmail-only', '');
+      const moved = modernCodexMailHooks(old, "'node-new' '/new/cli.js'");
+      expect(moved.content).toBe(modernCodexMailHooks(legacy, "'node-new' '/new/cli.js'").content);
+      for (const custom of [
+        old.replace('timeout = 60', 'timeout = 30'),
+        old.replace('on-stop', 'custom-stop'),
+        old.replace('# ink-managed:hooks:end', '# custom\n# ink-managed:hooks:end'),
+      ]) {
+        expect(() => modernCodexMailHooks(custom, "'node-new' '/new/cli.js'")).toThrow(
+          'will not overwrite'
+        );
+      }
+    }
+  );
   it('reports missing project setup without a raw filesystem error', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ink-mail-no-config-'));
     dirs.push(dir);

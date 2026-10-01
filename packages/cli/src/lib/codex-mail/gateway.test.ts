@@ -136,6 +136,19 @@ describe('owned native Codex gateway', () => {
     expect(response.result.received).toEqual(params);
     expect(f.bound).toEqual(['fixture-thread', 'forked-thread']);
   });
+  it('does not confuse resume-time metadata reads of other threads with a TUI switch', async () => {
+    const f = await setup();
+    await f.call('thread/read', { threadId: 'foreign-before-start' });
+    expect(f.bound).toEqual([]);
+    await f.call('thread/resume');
+    const response = await f.call('thread/read', { threadId: 'nested-exec' });
+    expect(response.result.thread.id).toBe('nested-exec');
+    expect(f.bound).toEqual(['fixture-thread']);
+    expect(f.gateway.isHealthy()).toBe(true);
+    // An actual future/fork response still trips the conservative switch fence.
+    await f.call('fixture/thread-response', { threadId: 'forked-thread' });
+    expect(f.bound).toEqual(['fixture-thread', 'forked-thread']);
+  });
   it('rejects a second frontend without replacing the first owner', async () => {
     const f = await setup();
     const other = new WebSocket(`ws+unix://${f.gateway.endpoint.slice(7)}:/`);

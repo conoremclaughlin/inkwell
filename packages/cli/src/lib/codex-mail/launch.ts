@@ -47,9 +47,7 @@ export function splitCodexMailArgs(args: string[], cwd: string) {
       if (!/^[0-9a-f-]{36}$/i.test(resumeId))
         throw new Error('Codex Inkmail requires an exact resume UUID');
     } else {
-      throw new Error(
-        `Codex Inkmail does not yet support ${arg}; omit --codex-inkmail to use the normal launcher`
-      );
+      throw new Error(`Codex Inkmail does not yet support ${arg}`);
     }
   }
   if (roots.length) threadOverrides.runtimeWorkspaceRoots = [...new Set([resolve(cwd), ...roots])];

@@ -122,6 +122,7 @@ export async function startCodexMailGateway(options: {
             message.result?.thread?.ephemeral !== true &&
             (request.bindsThread ||
               (boundThreadId &&
+                request.method !== 'thread/read' &&
                 typeof message.result?.thread?.id === 'string' &&
                 message.result.thread.id !== boundThreadId))
           ) {
@@ -130,6 +131,8 @@ export async function startCodexMailGateway(options: {
             // Start/resume establishes ownership. Any later native response
             // naming another persistent thread conservatively signals a
             // switch (fork and future methods included), not a new binding.
+            // thread/read is metadata only: the TUI reads other recent
+            // threads while restoring history; that is not a selection.
             boundThreadId ??= threadId;
             await options.onBound(threadId);
           }

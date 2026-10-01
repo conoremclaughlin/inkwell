@@ -6,6 +6,7 @@
  */
 
 import { runCodexMailInteractive } from '../lib/codex-mail/interactive.js';
+import { selectCodexMailLaunch } from '../lib/codex-mail/preflight.js';
 import { spawn, spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
@@ -4266,50 +4267,78 @@ export async function runClaudeInteractive(
     const executionStartedAt = Date.now();
     const backendStartActivityId = await logBackendExecutionStart(executionContext);
 
-    if (options.codexInkmail) {
+    const mailEnv = {
+      ...process.env,
+      ...authEnv,
+      ...prepared.env,
+      INK_RUNTIME_LINK_ID: runtimeLinkId,
+      ...(startupContextBlock ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
+    };
+    const mailSelection = selectCodexMailLaunch({
+      mode: options.codexInkmail,
+      backend: options.backend,
+      sessionTracked: options.session,
+      interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
+      sessionId: sessionContext.inkSessionId,
+      studioId,
+      binary: prepared.binary,
+      args: prepared.args,
+      env: mailEnv,
+      cwd: process.cwd(),
+    });
+    if (mailSelection.kind === 'native' && mailSelection.reason) {
+      console.error(
+        `Inkwell Inkmail unavailable: ${mailSelection.reason}. Using the normal Codex launcher; live mail is off.`
+      );
+    }
+    if (mailSelection.kind !== 'native') {
       let stderrText = '';
       let code: number | null = 1;
       try {
-        if (options.backend !== 'codex' || !sessionContext.inkSessionId || !studioId) {
+        if (mailSelection.kind === 'error') throw new Error(mailSelection.reason);
+        if (!sessionContext.inkSessionId || !studioId) {
           throw new Error('Codex Inkmail requires an exact Inkwell session and studio');
         }
-        const result = await runCodexMailInteractive({
-          binary: prepared.binary,
-          args: prepared.args,
-          cwd: process.cwd(),
-          env: {
-            ...process.env,
-            ...authEnv,
-            ...prepared.env,
-            INK_RUNTIME_LINK_ID: runtimeLinkId,
-            ...(startupContextBlock ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
+        console.error(
+          'Inkwell Inkmail: live delivery enabled (use --no-codex-inkmail to opt out).'
+        );
+        const result = await runCodexMailInteractive(
+          {
+            binary: prepared.binary,
+            args: prepared.args,
+            cwd: process.cwd(),
+            env: mailEnv,
+            sbSlug,
+            sessionId: sessionContext.inkSessionId,
+            studioId,
+            onBound: async (backendSessionId) => {
+              finalCapturedBackendSessionId = backendSessionId;
+              await persistBackendSessionLink({
+                inkSessionId: sessionContext.inkSessionId,
+                backendSessionId,
+                backend: options.backend,
+                sbSlug,
+                runtimeLinkId,
+                studioId,
+                sbId,
+                email: inkConfig?.email,
+              });
+            },
+            onStderr: (chunk) => {
+              stderrText += chunk.toString();
+              process.stderr.write(chunk);
+            },
           },
-          sbSlug,
-          sessionId: sessionContext.inkSessionId,
-          studioId,
-          onBound: async (backendSessionId) => {
-            finalCapturedBackendSessionId = backendSessionId;
-            await persistBackendSessionLink({
-              inkSessionId: sessionContext.inkSessionId,
-              backendSessionId,
-              backend: options.backend,
-              sbSlug,
-              runtimeLinkId,
-              studioId,
-              sbId,
-              email: inkConfig?.email,
-            });
-          },
-          onStderr: (chunk) => {
-            stderrText += chunk.toString();
-            process.stderr.write(chunk);
-          },
-        });
+          mailSelection.launch
+        );
         code = result.code;
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Codex Inkmail launch failed';
         stderrText += message;
         console.error(message);
+        if (options.codexInkmail !== true && mailSelection.kind === 'mail') {
+          console.error('To use the normal Codex launcher, rerun with --no-codex-inkmail.');
+        }
       } finally {
         prepared.cleanup();
         await detachOnChildExit(options.backend, prepared.env, sessionContext.inkSessionId, sbSlug);
