@@ -1022,6 +1022,35 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
     );
   });
 
+  // The uniqueness index is case-sensitive and the lookup is not (#717), so
+  // `Main` and `main` can both be live in one studio and both match. The
+  // index no longer proves a pinned lookup unique; choosing the newest row
+  // would route into whichever variant was written last (Lumen, #717 r2).
+  it('refuses two matching rows in one studio, even when the studio is pinned', async () => {
+    const { supabase } = aliasSupabase([
+      { ...row('sess-upper', 'studio-1'), alias: 'Main' },
+      { ...row('sess-lower', 'studio-1'), alias: 'main' },
+    ]);
+    const repo = new SessionRepository(supabase);
+
+    await expect(repo.findByAlias('user-1', 'wren', 'main', 'studio-1')).rejects.toThrow(
+      /ambiguous/i
+    );
+    await expect(repo.findByAlias('user-1', 'wren', 'main')).rejects.toThrow(/ambiguous/i);
+  });
+
+  it('names each candidate by its stored spelling so a same-studio clash is fixable', async () => {
+    const { supabase } = aliasSupabase([
+      { ...row('sess-upper', 'studio-1'), alias: 'Main' },
+      { ...row('sess-lower', 'studio-1'), alias: 'main' },
+    ]);
+    const repo = new SessionRepository(supabase);
+
+    await expect(repo.findByAlias('user-1', 'wren', 'main', 'studio-1')).rejects.toThrow(
+      /sess-uppe.*"Main".*sess-lowe.*"main"|"Main".*"main"/s
+    );
+  });
+
   it('pins the query to the studio when one is named, and does not refuse', async () => {
     const { supabase, filters } = aliasSupabase([row('sess-a', 'studio-1')]);
     const repo = new SessionRepository(supabase);
