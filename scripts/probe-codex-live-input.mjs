@@ -502,6 +502,59 @@ process.exitCode=result.code??1;`
     // Exit the actual native TUI normally, allowing the runner to stop its owner.
     tui.stdin.write(JSON.stringify({ write: '\u0004' }) + '\n');
     await until(() => tui.exitCode !== null, 'wrapper normal exit', 15000);
+    // The trusted project migration persists after detach. A server-shaped
+    // exec must invoke the guarded commands but make NO lifecycle/intake calls,
+    // even with an inherited bridge flag. No real server or provider is used.
+    const beforeHeadlessCalls = inkCalls.length;
+    const headless = child(
+      [
+        '--enable',
+        'hooks',
+        'exec',
+        '--skip-git-repo-check',
+        '--sandbox',
+        'read-only',
+        'SYNTHETIC_HEADLESS',
+      ],
+      {
+        env: {
+          ...env,
+          INK_CODEX_INKMAIL: '1',
+          INK_CONTEXT: Buffer.from(
+            JSON.stringify({
+              sessionId: fixtureSession,
+              studioId: fixtureStudio,
+              sbSlug: 'fixture',
+              runtime: 'codex',
+              cliAttached: false,
+            })
+          ).toString('base64url'),
+        },
+      }
+    );
+    let headlessOutput = '';
+    headless.stdout.on('data', (c) => (headlessOutput += c));
+    headless.stderr.on('data', (c) => fs.appendFileSync(path.join(root, 'headless.stderr'), c));
+    headless.stdin.end();
+    await until(() => headless.exitCode !== null, 'headless completed', 30000);
+    assert.equal(headless.exitCode, 0);
+    assert.ok(headlessOutput.includes('FIXTURE_RESPONSE_'));
+    assert.equal(inkCalls.length, beforeHeadlessCalls, 'headless hook touched Inkwell');
+    const skipped = fs
+      .readFileSync(path.join(home, '.ink', 'logs', 'hooks.log'), 'utf8')
+      .trim()
+      .split('\n')
+      .map(JSON.parse)
+      .filter((row) => row.event === 'codex_inkmail_hook_skipped');
+    for (const hook of ['on-session-start', 'on-prompt', 'on-stop'])
+      assert.ok(
+        skipped.some((row) => row.hook === hook),
+        'headless hook guard was not exercised: ' + hook
+      );
+    report('headless_guard_assertions_passed', {
+      invoked: skipped.map((row) => row.hook),
+      inkCalls: 0,
+    });
     fs.writeFileSync(path.join(root, 'ink-calls.json'), JSON.stringify(inkCalls, null, 2));
   } else if (gatewayMode) {
     const { startCodexMailGateway } =

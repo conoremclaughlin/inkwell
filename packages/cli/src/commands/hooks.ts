@@ -36,6 +36,7 @@ import {
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
+import { isCodexMailHookScope } from '../lib/codex-mail/hook-scope.js';
 import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
@@ -3275,7 +3276,14 @@ export function registerHooksCommands(program: Command): void {
     .command('on-session-start')
     .description('Hook: bootstrap identity and context at session start')
     .option('--backend <name>', 'Backend context for this hook invocation')
-    .action((opts) => onSessionStartHandler(opts));
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
+    .action((opts) => {
+      if (opts.codexInkmailOnly && (opts.backend !== 'codex' || !isCodexMailHookScope())) {
+        hookLog('codex_inkmail_hook_skipped', { hook: 'on-session-start' });
+        return;
+      }
+      return onSessionStartHandler(opts);
+    });
 
   hooks
     .command('on-tool-approval')
@@ -3287,11 +3295,25 @@ export function registerHooksCommands(program: Command): void {
     .command('on-prompt')
     .description('Hook: periodic inbox check on user prompt')
     .option('--backend <name>', 'Backend context for this hook invocation')
-    .action((opts) => onPromptHandler(opts));
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
+    .action((opts) => {
+      if (opts.codexInkmailOnly && (opts.backend !== 'codex' || !isCodexMailHookScope())) {
+        hookLog('codex_inkmail_hook_skipped', { hook: 'on-prompt' });
+        return;
+      }
+      return onPromptHandler(opts);
+    });
 
   hooks
     .command('on-stop')
     .description('Hook: session nudge and inbox check on stop')
     .option('--backend <name>', 'Backend context for this hook invocation')
-    .action((opts) => onStopHandler(opts));
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
+    .action((opts) => {
+      if (opts.codexInkmailOnly && (opts.backend !== 'codex' || !isCodexMailHookScope())) {
+        hookLog('codex_inkmail_hook_skipped', { hook: 'on-stop' });
+        return;
+      }
+      return onStopHandler(opts);
+    });
 }

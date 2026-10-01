@@ -128,7 +128,7 @@ describe('native Codex live-mail launch mapping', () => {
   });
 });
 const legacy = `model="fixture"\n# ink-managed:hooks:start\n[hooks]\nsession_start = "ink hooks on-session-start --backend codex"\nsession_end = "ink hooks on-stop --backend codex"\nuser_prompt = "ink hooks on-prompt --backend codex"\n# ink-managed:hooks:end\n[custom]\nvalue=true\n`;
-describe('opt-in modern hook migration', () => {
+describe('guarded modern hook migration', () => {
   it('changes only the known managed legacy stanza and is idempotent', () => {
     const result = modernCodexMailHooks(legacy, "'node' '/fixture/cli.js'");
     expect(result.content).toContain('[[hooks.UserPromptSubmit.hooks]]');
@@ -138,6 +138,16 @@ describe('opt-in modern hook migration', () => {
     expect(modernCodexMailHooks(result.content, "'node' '/fixture/cli.js'").content).toBe(
       result.content
     );
+  });
+  it('upgrades the exact previous unguarded bridge block without touching other config', () => {
+    const prefix = "'node' '/fixture/cli.js'";
+    const current = modernCodexMailHooks(legacy, prefix);
+    const previous = current.content.replaceAll(' --codex-inkmail-only', '');
+    expect(modernCodexMailHooks(previous, prefix).content).toBe(current.content);
+    expect(current.hooks.every((h) => h.command.endsWith('--codex-inkmail-only'))).toBe(true);
+    expect(() =>
+      modernCodexMailHooks(previous.replace('timeout = 60', 'timeout = 30'), prefix)
+    ).toThrow('modified hook block');
   });
   it('refuses missing, custom, incomplete, or modified blocks', () => {
     for (const value of [

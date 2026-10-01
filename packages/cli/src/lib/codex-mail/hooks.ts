@@ -19,14 +19,14 @@ export const CODEX_MAIL_HOOKS = [
 ] as const;
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 
-/** Opt-in migration of OUR marked legacy stanza only. Custom hooks, config
+/** Migration of OUR marked legacy or previous bridge stanza only. Custom hooks, config
  * and trust records are never replaced; changed commands require native trust
  * review. Normal launch/install remains compatible with older Codex builds. */
 export function modernCodexMailHooks(content: string, commandPrefix: string) {
   const hooks = CODEX_MAIL_HOOKS.map(([event, eventName, hook]) => ({
     event,
     eventName,
-    command: `${commandPrefix} hooks ${hook} --backend codex`,
+    command: `${commandPrefix} hooks ${hook} --backend codex --codex-inkmail-only`,
   }));
   const block = [
     START,
@@ -65,7 +65,11 @@ export function modernCodexMailHooks(content: string, commandPrefix: string) {
         ).test(line)
       )
     );
-  if (!legacy)
+  // The previous bridge wrote this exact unguarded shape. Upgrade only the
+  // same launcher path; arbitrary commands and trust records stay untouched.
+  const previous = block.replaceAll(' --codex-inkmail-only', '');
+  const knownPrevious = content.slice(start, end + END.length) === previous;
+  if (!legacy && !knownPrevious)
     throw new Error(
       'Codex Inkmail will not overwrite a modified hook block. Review/back up custom hooks first; ' +
         'to regenerate Ink hooks after changing the node binary or CLI checkout, run ' +
