@@ -10,6 +10,7 @@
  */
 
 import { Router, type Request, type Response } from 'express';
+import { normaliseSessionKey } from '../services/sessions/session-key';
 import type { DataComposer } from '../data/composer';
 import { InkAuthProvider } from '../mcp/auth/ink-auth-provider';
 import { StudioLeaseService } from '../services/studio-lease.service';
@@ -57,6 +58,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached,
         cliPollAt,
         alias,
+        sessionKey,
         studioId,
         headless,
         reclaimOf,
@@ -80,6 +82,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached?: boolean;
         cliPollAt?: string;
         alias?: string;
+        sessionKey?: string;
         /** Caller's worktree studio, for the fenced lease-held report. */
         studioId?: string;
         /**
@@ -150,7 +153,8 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         (!lifecycle || !VALID_LIFECYCLES.includes(lifecycle as Lifecycle)) &&
         cliAttached === undefined &&
         cliPollAt === undefined &&
-        alias === undefined
+        alias === undefined &&
+        sessionKey === undefined
       ) {
         res.status(400).json({
           success: false,
@@ -183,7 +187,15 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (workingDir) updates.workingDir = workingDir;
       if (cliAttached !== undefined) updates.cliAttached = cliAttached;
       if (cliPollAt) updates.cliPollAt = cliPollAt;
-      if (alias !== undefined) updates.alias = alias || null;
+      const sessionKeyInput = sessionKey !== undefined ? sessionKey : alias;
+      if (sessionKeyInput !== undefined) {
+        const normalised = normaliseSessionKey(sessionKeyInput);
+        if (!normalised.ok) {
+          res.status(400).json({ success: false, error: normalised.reason });
+          return;
+        }
+        updates.alias = normalised.value || null;
+      }
 
       // Hook-owned CLI turn signal: on-prompt opens the turn, and ONLY the
       // real on-stop closes it (post-compact 'idle' leaves it set — the same

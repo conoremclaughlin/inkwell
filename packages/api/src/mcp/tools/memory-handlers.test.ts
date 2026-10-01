@@ -13,6 +13,7 @@ import {
   handleUpdateSessionState,
   handleStartSession,
   handleGetSession,
+  handleListSessions,
   handleCompactSession,
   handleEndSession,
   curateRecallSchema,
@@ -96,6 +97,10 @@ function createMockDataComposer() {
     verifySessionOwnership: vi.fn().mockResolvedValue(true),
   };
 
+  const mockStudiosRepo = {
+    listByIds: vi.fn().mockResolvedValue([]),
+  };
+
   const mockProjectsRepo = {
     findAllByWorkspace: vi.fn(),
   };
@@ -123,6 +128,7 @@ function createMockDataComposer() {
     repositories: {
       memory: mockMemoryRepo,
       projects: mockProjectsRepo,
+      studios: mockStudiosRepo,
       tasks: mockProjectTasksRepo,
       activityStream: mockActivityStreamRepo,
       recallFeedback: mockRecallFeedbackRepo,
@@ -329,6 +335,15 @@ describe('startSessionSchema', () => {
 });
 
 describe('listSessionsSchema', () => {
+  it('accepts a sessionKey filter', () => {
+    const result = listSessionsSchema.safeParse({
+      sbSlug: 'wren',
+      sessionKey: 'wren:inkwell:main',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.sessionKey).toBe('wren:inkwell:main');
+  });
+
   it('should accept studioId as optional UUID', () => {
     const result = listSessionsSchema.safeParse({
       email: 'test@test.com',
@@ -380,6 +395,13 @@ describe('listSessionsSchema', () => {
 });
 
 describe('updateSessionStateSchema', () => {
+  it('accepts sessionKey, and still accepts the deprecated alias spelling', () => {
+    expect(updateSessionStateSchema.safeParse({ sessionKey: 'wren:inkwell:main' }).success).toBe(
+      true
+    );
+    expect(updateSessionStateSchema.safeParse({ alias: 'main' }).success).toBe(true);
+  });
+
   it('should accept phase only', () => {
     const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
@@ -532,6 +554,90 @@ describe('handleUpdateSessionState', () => {
     // Default: the caller owns the session it resolves/names.
     mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([mockSession]);
     mockDataComposer.repositories.memory.getSession.mockResolvedValue(mockSession);
+  });
+
+  // ---------------------------------------------------
+  // sessionKey: the typed, routable name of a session
+  // ---------------------------------------------------
+  describe('sessionKey', () => {
+    it('sets the key, normalised, and reports it in the message and the trace', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        alias: 'wren:inkwell:main',
+      });
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionKey: '  Wren:Inkwell:Main ' },
+        mockDataComposer as never
+      );
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.success).toBe(true);
+      expect(parsed.message).toContain('sessionKey → wren:inkwell:main');
+      expect(parsed.session.sessionKey).toBe('wren:inkwell:main');
+      // Myra, 2026-08-24: the write landed but changedFields listed only
+      // currentPhase, so an agent trusting the trace concluded the rename
+      // failed and would retry forever.
+      expect(parsed.sessionTrace.changedFields).toContain('sessionKey');
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({ alias: 'wren:inkwell:main' })
+      );
+    });
+
+    it('still honours the deprecated alias spelling', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        alias: 'main',
+      });
+
+      await handleUpdateSessionState(
+        { email: 'test@test.com', alias: 'main' },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({ alias: 'main' })
+      );
+    });
+
+    it('clears the key with an empty string', async () => {
+      const keyed = { ...mockSession, alias: 'wren:inkwell:main' };
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(keyed);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(keyed);
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([keyed]);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionKey: '' },
+        mockDataComposer as never
+      );
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.message).toContain('sessionKey → (cleared)');
+      expect(parsed.sessionTrace.changedFields).toContain('sessionKey');
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({ alias: null })
+      );
+    });
+
+    it('refuses a key it cannot normalise, and writes nothing', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionKey: 'has space' },
+        mockDataComposer as never
+      );
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('sessionKey');
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
   });
 
   // ---------------------------------------------------
@@ -1543,6 +1649,85 @@ describe('handleUpdateSessionState', () => {
 // caller does not own. They share a shape: an identity check that consults
 // something weaker than the verified request identity.
 // =====================================================
+
+describe('sessionKey surfaces in listings', () => {
+  let mockDataComposer: ReturnType<typeof createMockDataComposer>;
+  const SESSION_UUID = '7a2f0b5e-1c3d-4e8f-9a0b-1c2d3e4f5a6b';
+  const keyed = {
+    id: SESSION_UUID,
+    userId: 'user-123',
+    sbSlug: 'wren',
+    sbId: 'sb-wren',
+    studioId: undefined,
+    alias: 'wren:inkwell:main',
+    startedAt: new Date('2026-10-01T20:56:56Z'),
+    endedAt: undefined,
+    metadata: {},
+  };
+
+  beforeEach(() => {
+    mockDataComposer = createMockDataComposer();
+    vi.clearAllMocks();
+    callerIsAgent('wren', 'sb-wren');
+    mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([keyed]);
+    mockDataComposer.repositories.memory.getSession.mockResolvedValue(keyed);
+  });
+
+  it('list_sessions returns the key and passes a sessionKey filter to the repository', async () => {
+    mockDataComposer.repositories.memory.listSessions.mockResolvedValue([keyed]);
+
+    const result = await handleListSessions(
+      { email: 'test@test.com', sbSlug: 'wren', sessionKey: 'Wren:Inkwell:Main' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.sessions[0].sessionKey).toBe('wren:inkwell:main');
+    expect(mockDataComposer.repositories.memory.listSessions).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({ sessionKey: 'wren:inkwell:main' })
+    );
+  });
+
+  it('list_sessions refuses a blank key filter rather than listing everything', async () => {
+    mockDataComposer.repositories.memory.listSessions.mockResolvedValue([keyed]);
+
+    const result = await handleListSessions(
+      { email: 'test@test.com', sbSlug: 'wren', sessionKey: '   ' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('sessionKey');
+    expect(mockDataComposer.repositories.memory.listSessions).not.toHaveBeenCalled();
+  });
+
+  it('list_sessions reports null for a session with no key', async () => {
+    mockDataComposer.repositories.memory.listSessions.mockResolvedValue([
+      { ...keyed, alias: undefined },
+    ]);
+
+    const result = await handleListSessions(
+      { email: 'test@test.com', sbSlug: 'wren' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.sessions[0].sessionKey).toBeNull();
+  });
+
+  it('get_session returns the key', async () => {
+    const result = await handleGetSession(
+      { email: 'test@test.com', sessionId: SESSION_UUID },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.session.sessionKey).toBe('wren:inkwell:main');
+  });
+});
 
 describe('session authorization boundary', () => {
   let mockDataComposer: ReturnType<typeof createMockDataComposer>;

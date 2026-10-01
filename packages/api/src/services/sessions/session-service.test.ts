@@ -1213,7 +1213,7 @@ describe('SessionService', () => {
       const resolveSpy = vi.spyOn(sessionService, 'getOrCreateSession');
       const metadata = {
         contactId: 'contact-1',
-        sessionAlias: 'main',
+        sessionKey: 'main',
         repoRoot: '/repo',
         recipientSessionId: 'session-123',
         replyToSessionId: 'session-456',
@@ -3306,7 +3306,7 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(
         createMockRequest({
-          metadata: { sessionAlias: 'main' },
+          metadata: { sessionKey: 'main' },
         })
       );
 
@@ -3324,7 +3324,7 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(
         createMockRequest({
-          metadata: { sessionAlias: 'nonexistent', threadKey: 'pr:42' },
+          metadata: { sessionKey: 'nonexistent', threadKey: 'pr:42' },
         })
       );
 
@@ -3356,7 +3356,7 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(
         createMockRequest({
-          metadata: { sessionAlias: 'main', threadKey: 'pr:42' },
+          metadata: { sessionKey: 'main', threadKey: 'pr:42' },
         })
       );
 
@@ -3463,7 +3463,7 @@ describe('SessionService', () => {
       await serviceWithSupabase.handleMessage(
         createMockRequest({
           metadata: {
-            sessionAlias: 'review',
+            sessionKey: 'review',
             // A slug that resolves to nothing — stale, cleaned, or another
             // agent's studio.
             studioHint: 'no-such-studio',

@@ -7,7 +7,7 @@ import { logger } from '../../utils/logger';
  * Spec: ink://specs/inkmail-read-state §3a (approved v9, 2026-08-08).
  *
  * Semantics:
- * - **Explicit anchor** (caller passed recipientSessionId/sessionAlias):
+ * - **Explicit anchor** (caller passed recipientSessionId/sessionKey):
  *   authorized overwrite — the anchor IS the deliberate-retarget signal.
  * - **Otherwise, first assignment is a CAS**: write only where
  *   `session_id IS NULL`. If the claim loses, reread the winner and route
@@ -35,7 +35,7 @@ export interface AssignParams {
   sbId: string;
   /** The session the router resolved for this delivery. */
   candidateSessionId: string;
-  /** Caller passed recipientSessionId/sessionAlias — authorized overwrite. */
+  /** Caller passed recipientSessionId/sessionKey — authorized overwrite. */
   explicitAnchor: boolean;
   /**
    * Project repair (PR #681 round 3): replace ONLY this stamp — the winner

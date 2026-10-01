@@ -146,6 +146,18 @@ describe('MemoryRepository', () => {
       expect(insertCalls[0][0]).not.toHaveProperty('claude_session_id');
     });
 
+    it('listSessions matches the key case-insensitively on the alias column, with metacharacters escaped', async () => {
+      mockSupabase._setReturnData([]);
+
+      await repo.listSessions('user-1', { sbSlug: 'wren', sessionKey: 'pr_716' });
+
+      const ilikeCalls = (
+        mockSupabase._queryBuilder.ilike as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(ilikeCalls).toContainEqual(['alias', 'pr\\_716']);
+      expect(eqCalls().some((c) => c[0] === 'alias')).toBe(false);
+    });
+
     it('getActiveSessionByBackendSessionId falls back to agent_id without a canonical owner', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 

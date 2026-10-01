@@ -3,6 +3,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { sessionKeyMatchPattern } from '../../services/sessions/session-key';
 import type { Database, TablesInsert } from '../supabase/types';
 import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
@@ -2167,6 +2168,8 @@ export class MemoryRepository {
       filterNullStudio?: boolean;
       backend?: string;
       status?: SessionStatusFilter;
+      /** Exact match on the session key (the `alias` column), already normalised. */
+      sessionKey?: string;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -2187,6 +2190,11 @@ export class MemoryRepository {
 
     if (options.backend) {
       query = query.eq('backend', options.backend);
+    }
+
+    if (options.sessionKey) {
+      // Exact but case-insensitive: see sessionKeyMatchPattern.
+      query = query.ilike('alias', sessionKeyMatchPattern(options.sessionKey));
     }
 
     if (options.status) {
@@ -2593,6 +2601,7 @@ export class MemoryRepository {
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,
+      alias: row.alias || undefined,
       lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,
       currentPhase: row.current_phase || undefined,

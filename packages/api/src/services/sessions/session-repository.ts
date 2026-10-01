@@ -6,6 +6,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
+import { sessionKeyMatchPattern } from './session-key';
 import type { Database, Json } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -32,13 +33,22 @@ export class AmbiguousAliasError extends Error {
   constructor(
     readonly alias: string,
     readonly sbSlug: string,
-    readonly candidates: Array<{ sessionId: string; studioId: string | null }>
+    readonly candidates: Array<{ sessionId: string; studioId: string | null; alias?: string }>
   ) {
-    const studios = candidates.map((c) => c.studioId ?? '(no studio)').join(', ');
+    const distinctStudios = new Set(candidates.map((c) => c.studioId ?? null));
+    const described = candidates
+      .map(
+        (c) =>
+          `${c.sessionId.slice(0, 8)} ("${c.alias ?? alias}" in ${c.studioId ?? '(no studio)'})`
+      )
+      .join(', ');
+    const fix =
+      distinctStudios.size > 1
+        ? 'Qualify the address with recipientStudioSlug or recipientStudioId.'
+        : 'Two live sessions carry this key in different spellings; end or rename one (update_session_state sessionKey).';
     super(
-      `Session alias "${alias}" for agent "${sbSlug}" is ambiguous — it matches ` +
-        `${candidates.length} active sessions across studios: ${studios}. ` +
-        `Qualify the address with recipientStudioSlug or recipientStudioId.`
+      `Session key "${alias}" for agent "${sbSlug}" is ambiguous — it matches ` +
+        `${candidates.length} live sessions: ${described}. ${fix}`
     );
     this.name = 'AmbiguousAliasError';
   }
@@ -354,7 +364,10 @@ export class SessionRepository implements ISessionRepository {
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('alias', alias)
+      // Case-insensitive, exact: keys are normalised to lowercase on write
+      // since #717, but rows the earlier setter stored as written must stay
+      // addressable by the normalised spelling (Lumen, #717 review).
+      .ilike('alias', sessionKeyMatchPattern(alias))
       .is('ended_at', null)
       .neq('lifecycle', 'failed');
     query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
@@ -376,16 +389,21 @@ export class SessionRepository implements ISessionRepository {
     const rows = data ?? [];
     if (rows.length === 0) return null;
 
-    // A studio-pinned lookup is unique by index, so anything past the first
-    // row would mean the index is gone. Take it and move on.
-    if (studioId !== undefined) return mapDbToSession(rows[0]);
-
-    const distinctStudios = new Set(rows.map((r) => r.studio_id ?? null));
-    if (distinctStudios.size > 1) {
+    // More than one match is a refusal, pinned or not. The uniqueness index
+    // is case-sensitive and this lookup is not (#717), so `Main` and `main`
+    // can both be live in one studio; the index used to prove a pinned
+    // lookup unique and no longer does. Choosing the newest row would route
+    // into whichever spelling was written last, and the caller could not
+    // tell (Lumen, #717 round 2).
+    if (rows.length > 1) {
       throw new AmbiguousAliasError(
         alias,
         sbSlug,
-        rows.map((r) => ({ sessionId: r.id, studioId: r.studio_id ?? null }))
+        rows.map((r) => ({
+          sessionId: r.id,
+          studioId: r.studio_id ?? null,
+          alias: ((r as Record<string, unknown>).alias as string | undefined) ?? undefined,
+        }))
       );
     }
 
