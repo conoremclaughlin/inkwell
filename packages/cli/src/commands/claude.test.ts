@@ -25,6 +25,8 @@ import {
   filterUntrackedLocalBackendSessions,
   filterInkSessionsForContext,
   filterUntrackedLocalClaudeSessions,
+  isSessionResumable,
+  dedupeInkSessionsByBackendId,
   buildSessionPickerLabel,
   getBackendLocalSessionsForProject,
   getClaudeLocalSessionsForProject,
@@ -374,6 +376,68 @@ describe('filterUntrackedLocalClaudeSessions', () => {
     ]);
 
     expect(filtered.map((session) => session.sessionId)).toEqual(['claude-2']);
+  });
+});
+
+describe('isSessionResumable', () => {
+  const base = { id: 'ink-1', startedAt: '2026-10-01T00:00:00.000Z' };
+
+  // The row is the conversation's identity. Hiding it from the picker for a
+  // reason the server does not share makes its transcript look untracked, and
+  // the launcher then starts a second row for the same conversation
+  // (2026-10-01: four live rows for one Claude session in the root checkout).
+  it('keeps a row whose agent-set work phase is complete', () => {
+    expect(isSessionResumable({ ...base, currentPhase: 'complete' })).toBe(true);
+    expect(isSessionResumable({ ...base, currentPhase: 'complete:merged' })).toBe(true);
+    expect(isSessionResumable({ ...base, currentPhase: '  Complete  ' })).toBe(true);
+  });
+
+  it('keeps live and crashed rows', () => {
+    expect(isSessionResumable({ ...base })).toBe(true);
+    expect(isSessionResumable({ ...base, lifecycle: 'idle', status: 'active' })).toBe(true);
+    expect(isSessionResumable({ ...base, lifecycle: 'failed' })).toBe(true);
+    expect(isSessionResumable({ ...base, currentPhase: 'implementing' })).toBe(true);
+  });
+
+  it('drops rows the server considers finished', () => {
+    expect(isSessionResumable({ ...base, endedAt: '2026-10-01T01:00:00.000Z' })).toBe(false);
+    expect(isSessionResumable({ ...base, lifecycle: 'completed' })).toBe(false);
+    expect(isSessionResumable({ ...base, status: 'completed' })).toBe(false);
+    expect(isSessionResumable({ ...base, status: 'completed:merged' })).toBe(false);
+    expect(isSessionResumable({ ...base, status: ' COMPLETED ' })).toBe(false);
+  });
+});
+
+describe('dedupeInkSessionsByBackendId', () => {
+  const at = (iso: string) => ({ startedAt: iso, backend: 'claude' });
+
+  it('keeps one row per backend conversation, the first in list order', () => {
+    const rows = [
+      { id: 'newest', ...at('2026-10-01T20:56:56Z'), backendSessionId: 'claude-A' },
+      { id: 'older', ...at('2026-10-01T06:28:04Z'), backendSessionId: 'claude-A' },
+      { id: 'other', ...at('2026-09-30T00:00:00Z'), backendSessionId: 'claude-B' },
+    ];
+    expect(dedupeInkSessionsByBackendId(rows).map((row) => row.id)).toEqual(['newest', 'other']);
+  });
+
+  it('never collapses rows that have no backend conversation yet', () => {
+    const rows = [
+      { id: 'fresh-1', ...at('2026-10-01T00:00:00Z') },
+      { id: 'fresh-2', ...at('2026-10-01T00:00:01Z') },
+    ];
+    expect(dedupeInkSessionsByBackendId(rows).map((row) => row.id)).toEqual(['fresh-1', 'fresh-2']);
+  });
+
+  it('reads the backend id through the resolver when the row itself has none', () => {
+    const rows = [
+      { id: 'linked-by-runtime', ...at('2026-10-01T00:00:02Z') },
+      { id: 'linked-by-row', ...at('2026-10-01T00:00:01Z'), claudeSessionId: 'claude-C' },
+    ];
+    const resolve = (row: { id: string }) =>
+      row.id === 'linked-by-runtime' ? 'claude-C' : undefined;
+    expect(dedupeInkSessionsByBackendId(rows, resolve).map((row) => row.id)).toEqual([
+      'linked-by-runtime',
+    ]);
   });
 });
 

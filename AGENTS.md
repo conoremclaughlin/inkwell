@@ -76,6 +76,8 @@ remember(userId: "...", content: "Decided to use X approach because...", sbSlug:
 
 **Note**: Session lifecycle (`start_session`, `end_session`) is managed automatically by hooks — SBs should not call these manually. Use `remember()` for important context and `update_session_state()` for work status.
 
+**One backend conversation is one Inkwell session.** A Claude Code session id, a Codex thread id, maps to exactly one Inkwell session row, and that row is the conversation's identity for routing, aliases and history. A launcher that resumes a transcript names it to `start_session` as `backendSessionId`, and the server returns the live row already linked to it — `forceNew` included — rather than minting a second one. The agent-set work phase is not a lifecycle: `update_session_state(phase: "complete")` closes a piece of work, not the session, and nothing may read it as finished. Until 2026-10-01 both session pickers and the server's `attachable` listing did, hid the row, and started a fresh row for the same transcript on every relaunch, so one Claude session accumulated four live rows and nineteen of Wren's conversations carried two to five each. Only `ended_at`, lifecycle `completed` and status `completed` mean finished; a crashed row (lifecycle `failed`) is the one its agent resumes next.
+
 **Note**: Runtime account identifiers come from config or environment, never tracked fixtures. Public contributor attribution is different from private account/contact data — see [Private data and public contributor attribution](#private-data-and-public-contributor-attribution-ironclad) under Testing.
 
 ## Security (CRITICAL)
