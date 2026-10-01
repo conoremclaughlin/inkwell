@@ -4,22 +4,24 @@ import {
   type CodexMailDelivery,
 } from './delivery.js';
 
-/** Rate-limit noisy polls, not the lifetime of a failure. Separate mail gets
- * separate diagnostics; an exact receipt clears and reports its recovery. */
+/** Report state changes, not repeated polls. An exact receipt clears and
+ * reports its recovery; a new failure after recovery is visible again. */
 export class CodexMailDiagnostics {
   private firstMissing = new Map<string, number>();
-  private lastWarning = new Map<string, number>();
+  private lastWarning = new Map<string, string>();
   constructor(
     private emit: (message: string) => void,
     private now: () => number = Date.now
   ) {}
 
   warn(message: string, key = message) {
-    const at = this.now();
-    const last = this.lastWarning.get(key);
-    if (last !== undefined && at - last < 60_000) return;
-    this.lastWarning.set(key, at);
+    if (this.lastWarning.get(key) === message) return;
+    this.lastWarning.set(key, message);
     this.emit(message);
+  }
+
+  clearWarning(key: string, recovery?: string) {
+    if (this.lastWarning.delete(key) && recovery) this.emit(recovery);
   }
 
   async deliver(

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { splitCodexMailArgs } from './launch.js';
-import { hasTrustedCodexMailHooks, modernCodexMailHooks, prepareCodexMailHooks } from './hooks.js';
+import { hasTrustedCodexMailHooks, modernCodexMailHooks, codexMailHooks } from './hooks.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -179,10 +179,13 @@ describe('guarded modern hook migration', () => {
       }
     }
   );
-  it('reports missing project setup without a raw filesystem error', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ink-mail-no-config-'));
-    dirs.push(dir);
-    expect(() => prepareCodexMailHooks(dir)).toThrow('run ink init first');
+  it('generates guarded session hooks without requiring or writing a project file', () => {
+    expect(codexMailHooks().map((h) => h.event)).toEqual([
+      'SessionStart',
+      'UserPromptSubmit',
+      'Stop',
+    ]);
+    expect(codexMailHooks().every((h) => h.command.endsWith('--codex-inkmail-only'))).toBe(true);
   });
   it('requires exactly one enabled and trusted copy of each required handler', () => {
     const expected = modernCodexMailHooks(legacy, 'node fixture').hooks;

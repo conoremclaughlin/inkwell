@@ -6,13 +6,13 @@ import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const mocks = vi.hoisted(() => ({ spawn: vi.fn(), gateway: vi.fn() }));
+const mocks = vi.hoisted(() => ({ spawn: vi.fn(), gateway: vi.fn(), poll: vi.fn() }));
 vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),
   spawn: mocks.spawn,
 }));
 vi.mock('./gateway.js', () => ({ startCodexMailGateway: mocks.gateway }));
-vi.mock('./poller.js', () => ({ createCodexMailPoller: () => vi.fn() }));
+vi.mock('./poller.js', () => ({ createCodexMailPoller: () => mocks.poll }));
 vi.mock('../ink-mcp.js', () => ({
   getInkServerUrl: () => 'http://127.0.0.1:9',
   callInkTool: vi.fn(),
@@ -39,6 +39,7 @@ describe('interactive bridge ownership', () => {
     const stop = vi.fn(async () => {});
     mocks.gateway.mockResolvedValue({
       request: vi.fn(),
+      warn: vi.fn(() => true),
       isHealthy: () => true,
       stop,
       endpoint: 'unix://fixture',
@@ -76,5 +77,84 @@ describe('interactive bridge ownership', () => {
       await running;
     }
     expect(stop).toHaveBeenCalledOnce();
+  });
+  it('renders one native warning per hook state, never writes over the TUI, and resumes after trust', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ink-interactive-'));
+    dirs.push(root);
+    vi.stubEnv('HOME', root);
+    vi.stubEnv('CODEX_HOME', join(root, 'codex'));
+    vi.stubEnv('TMPDIR', root);
+    vi.useFakeTimers();
+    const { runCodexMailInteractive } = await import('./interactive.js');
+    const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter() });
+    mocks.spawn.mockReturnValue(child);
+    const expected = [
+      {
+        event: 'SessionStart',
+        eventName: 'sessionStart',
+        command: 'ink hooks on-session-start --backend codex --codex-inkmail-only',
+      },
+    ];
+    let state = 'missing';
+    const nativeWarning = vi.fn(() => true),
+      onStderr = vi.fn();
+    mocks.poll.mockResolvedValue({ threadResult: { fetchFailures: 0 } });
+    mocks.gateway.mockResolvedValue({
+      endpoint: 'unix://fixture',
+      isHealthy: () => true,
+      stop: vi.fn(),
+      warn: nativeWarning,
+      request: vi.fn(async (method) =>
+        method === 'config/read'
+          ? { config: { features: { hooks: true } } }
+          : {
+              data: [
+                {
+                  hooks:
+                    state === 'missing'
+                      ? []
+                      : expected.map((h) => ({ ...h, enabled: true, trustStatus: state })),
+                },
+              ],
+            }
+      ),
+    });
+    const running = runCodexMailInteractive(
+      {
+        binary: 'fixture-only',
+        args: [],
+        env: {},
+        cwd: root,
+        sbSlug: 'fixture',
+        sessionId: 'fixture-session',
+        studioId: 'fixture-studio',
+        onBound: async () => {},
+        onStderr,
+      },
+      { cwd: root, serverArgs: [], tuiArgs: [], threadOverrides: {}, expectedHooks: expected }
+    );
+    try {
+      await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalledOnce());
+      await mocks.gateway.mock.calls[0][0].onBound('parent-thread');
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(nativeWarning).toHaveBeenCalledOnce();
+      expect(nativeWarning.mock.calls[0][0]).toContain('did not load');
+      expect(nativeWarning.mock.calls[0][0]).toContain('--no-codex-inkmail');
+      expect(mocks.poll).not.toHaveBeenCalled();
+      state = 'untrusted';
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(nativeWarning).toHaveBeenCalledTimes(2);
+      expect(nativeWarning.mock.calls[1][0]).toContain('review and trust');
+      expect(mocks.poll).not.toHaveBeenCalled();
+      state = 'trusted';
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(mocks.poll).toHaveBeenCalledOnce();
+      expect(nativeWarning.mock.calls[2][0]).toContain('can resume');
+      expect(onStderr).not.toHaveBeenCalled();
+    } finally {
+      child.emit('close', 0);
+      await running;
+    }
+    expect(onStderr).not.toHaveBeenCalled();
   });
 });

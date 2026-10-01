@@ -7,7 +7,7 @@ import { CodexMailDelivery } from './delivery.js';
 import { CodexMailDiagnostics } from './diagnostics.js';
 import { startCodexMailGateway } from './gateway.js';
 import { pulseCodexMail } from './heartbeat.js';
-import { hasTrustedCodexMailHooks } from './hooks.js';
+import { codexMailHookState, codexMailHookWarning } from './hooks.js';
 import { prepareCodexMailLaunch, type CodexMailLaunch } from './preflight.js';
 import { createCodexMailHookBinding } from './hook-binding.js';
 import { createCodexMailPoller } from './poller.js';
@@ -28,7 +28,7 @@ export async function runCodexMailInteractive(
   },
   prepared?: CodexMailLaunch
 ): Promise<{ code: number | null; backendSessionId?: string }> {
-  const launch = prepared ?? prepareCodexMailLaunch(options);
+  const launch = prepared ?? (await prepareCodexMailLaunch(options));
   options = { ...options, cwd: launch.cwd };
   const expectedHooks = launch.expectedHooks;
   const serverUrl = getInkServerUrl();
@@ -40,10 +40,19 @@ export async function runCodexMailInteractive(
   let stamping = false;
   let lastDiscovery = 0;
   let hooksReady = false;
-  const diagnostics = new CodexMailDiagnostics((message) =>
-    options.onStderr(Buffer.from(`\nInkwell Inkmail: ${message}\n`))
-  );
-  const warn = (message: string) => diagnostics.warn(message);
+  // No wrapper diagnostics may write over the native terminal. If its frontend
+  // is unavailable, retain a bounded summary until after the child closes.
+  const deferredWarnings = new Set<string>();
+  let frontend: { warn(message: string): boolean } | undefined;
+  const diagnostics = new CodexMailDiagnostics((message) => {
+    if (!frontend?.warn(message) && deferredWarnings.size < 100) deferredWarnings.add(message);
+  });
+  const warn = (message: string, key?: string) => diagnostics.warn(message, key);
+  const flushWarnings = () => {
+    for (const message of deferredWarnings) {
+      if (frontend?.warn(message)) deferredWarnings.delete(message);
+    }
+  };
   const binding = createCodexMailHookBinding(options);
   const bridgeEnv = {
     ...options.env,
@@ -57,6 +66,7 @@ export async function runCodexMailInteractive(
     threadOverrides: launch.threadOverrides,
     env: bridgeEnv,
     onBound: async (id) => {
+      flushWarnings();
       // A switch is a one-way pause for this wrapper, even if the TUI later
       // returns to the original thread. Do not publish or rebind again.
       if (switched) return;
@@ -81,12 +91,14 @@ export async function runCodexMailInteractive(
     onEvent: (event) => delivery?.observe(event),
     onUnhealthy: () => {
       binding.revoke();
-      warn('live delivery disconnected; unconfirmed messages stay unread. Relaunch to recover.');
+      if (!stopped)
+        warn('live delivery disconnected; unconfirmed messages stay unread. Relaunch to recover.');
     },
   }).catch((error) => {
     binding.dispose();
     throw error;
   });
+  frontend = gateway;
   const usable = () =>
     !stopped && !switched && hooksReady && Boolean(delivery) && gateway.isHealthy();
   const poll = createCodexMailPoller({
@@ -124,23 +136,30 @@ export async function runCodexMailInteractive(
     if (stopped || switched || !delivery || !gateway.isHealthy() || polling) return;
     polling = true;
     (async () => {
+      flushWarnings();
       const config = await gateway.request('config/read', {
         cwd: options.cwd,
         includeLayers: false,
       });
       const hooks = await gateway.request('hooks/list', { cwds: [options.cwd] });
-      hooksReady =
-        config.config?.features?.hooks === true && hasTrustedCodexMailHooks(hooks, expectedHooks);
+      const state =
+        config.config?.features?.hooks === true
+          ? codexMailHookState(hooks, expectedHooks)
+          : 'feature-disabled';
+      hooksReady = state === 'ready';
       if (!hooksReady) {
-        warn(
-          `review and trust the Inkwell hooks with /hooks before live mail can run; unread mail is untouched (feature: ${config.config?.features?.hooks === true ? 'enabled' : 'disabled'}, trusted handlers: ${hasTrustedCodexMailHooks(hooks, expectedHooks) ? 'yes' : 'no'}).`
-        );
+        warn(codexMailHookWarning(state, hooks), 'hooks');
         return;
       }
+      diagnostics.clearWarning('hooks', 'Hooks are ready; live mail delivery can resume.');
       const drained = await poll();
       if (drained.threadResult.fetchFailures > 0) lastDiscovery = 0;
+      else diagnostics.clearWarning('mailbox');
     })()
-      .catch(() => warn('mailbox poll failed; will retry without advancing unread pointers.'))
+      .catch(() => {
+        hooksReady = false;
+        warn('mailbox poll failed; will retry without advancing unread pointers.', 'mailbox');
+      })
       .finally(() => {
         polling = false;
       });
@@ -200,6 +219,9 @@ export async function runCodexMailInteractive(
       await gateway.stop();
     } finally {
       binding.dispose();
+      frontend = undefined;
+      for (const message of deferredWarnings)
+        options.onStderr(Buffer.from(`\nInkwell Inkmail: ${message}\n`));
     }
   }
 }

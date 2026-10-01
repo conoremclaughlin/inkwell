@@ -3,7 +3,7 @@ import { CodexMailDiagnostics } from './diagnostics.js';
 import { PendingCodexDelivery, UnconfirmedCodexDelivery } from './delivery.js';
 
 describe('Codex mail diagnostics', () => {
-  it('names each held message/thread, repeats after one minute, and reports recovery', async () => {
+  it('names each held message/thread once until state changes, and reports recovery', async () => {
     const messages: string[] = [];
     let now = 0;
     const diagnostics = new CodexMailDiagnostics(
@@ -27,14 +27,14 @@ describe('Codex mail diagnostics', () => {
     expect(messages[1]).toContain('message m2 in thread:other');
     now = 60_000;
     await expect(send()).rejects.toThrow();
-    expect(messages).toHaveLength(3);
+    expect(messages).toHaveLength(2);
     // A transient scan gap can recover on the very next receipt. Do not keep
     // presenting its initial absence as a permanent loss.
     uncertain = false;
     await send();
-    expect(messages[3]).toContain('Exact receipt confirmed for message m1 in thread:fixture');
+    expect(messages[2]).toContain('Exact receipt confirmed for message m1 in thread:fixture');
     await send();
-    expect(messages).toHaveLength(4);
+    expect(messages).toHaveLength(3);
   });
   it('keeps ordinary queue backpressure quiet and identifies the global legacy boundary', async () => {
     const messages: string[] = [];
@@ -109,7 +109,7 @@ describe('Codex mail diagnostics', () => {
     ).rejects.toThrow();
     expect(messages[1]).toContain('transport lost');
   });
-  it('rate-limits generic transport warnings instead of suppressing them forever', () => {
+  it('suppresses stable failures indefinitely, but reports changes and failures after recovery', () => {
     const messages: string[] = [];
     let now = 100;
     const diagnostics = new CodexMailDiagnostics(
@@ -121,6 +121,13 @@ describe('Codex mail diagnostics', () => {
     expect(messages).toHaveLength(1);
     now += 60_000;
     diagnostics.warn('mailbox poll failed');
+    expect(messages).toHaveLength(1);
+    diagnostics.clearWarning('mailbox poll failed');
+    diagnostics.warn('mailbox poll failed');
     expect(messages).toHaveLength(2);
+    diagnostics.warn('hooks missing', 'hooks');
+    diagnostics.warn('hooks untrusted', 'hooks');
+    diagnostics.warn('hooks untrusted', 'hooks');
+    expect(messages.slice(2)).toEqual(['hooks missing', 'hooks untrusted']);
   });
 });

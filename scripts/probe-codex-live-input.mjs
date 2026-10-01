@@ -17,7 +17,8 @@ const defaultSocket = process.argv.includes('--default-socket');
 const unix = process.argv.includes('--unix') || defaultSocket;
 const permissionsProbe = process.argv.includes('--permissions-probe');
 const nestedProbe = process.argv.includes('--nested-probe');
-const launcherMode = process.argv.includes('--launcher') || nestedProbe;
+const linkedWorktree = process.argv.includes('--linked-worktree');
+const launcherMode = process.argv.includes('--launcher') || nestedProbe || linkedWorktree;
 const wrapperMode = process.argv.includes('--wrapper') || launcherMode;
 const gatewayMode = process.argv.includes('--gateway');
 const launchOverrides = process.argv.includes('--launch-overrides') || gatewayMode || nestedProbe;
@@ -251,7 +252,7 @@ const provider = http.createServer(async (req, res) => {
     respond(res, requests.length, {
       name: 'exec_command',
       args: {
-        cmd: [process.execPath, path.join(work, 'nested-fixture.cjs')].map(shellQuote).join(' '),
+        cmd: [process.execPath, path.join(work, 'nested-fixture.cjs'), path.join(root, 'hook-args.json')].map(shellQuote).join(' '),
         workdir: work,
         login: false,
         yield_time_ms: 10000,
@@ -373,6 +374,17 @@ async function queue(endpoint, threadId, marker) {
 }
 
 try {
+  if (linkedWorktree) {
+    const main = path.join(root, 'main');
+    const git = (...args) => execFileSync('git', args, { cwd: root, env: { ...env, GIT_CONFIG_NOSYSTEM: '1' }, stdio: 'pipe' });
+    git('init', main);
+    const msg = path.join(root, 'commit.txt');
+    fs.writeFileSync(msg, 'test: synthetic native linked-worktree fixture\n');
+    git('-C', main, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', 'commit', '--allow-empty', '-F', msg);
+    git('-C', main, 'worktree', 'add', '--detach', work, 'HEAD');
+    fs.mkdirSync(path.join(main, '.codex'));
+    fs.writeFileSync(path.join(main, '.codex/config.toml'), '[hooks]\nsession_start="echo synthetic legacy hook"\n');
+  }
   await new Promise((r) => provider.listen(0, '127.0.0.1', r));
   fs.writeFileSync(
     path.join(ch, 'config.toml'),
@@ -437,6 +449,9 @@ try {
   const instructionsPath = path.join(root, 'instructions.txt');
   fs.writeFileSync(instructionsPath, 'SYNTHETIC_INSTRUCTIONS: Only synthetic text. No tools.');
   if (wrapperMode) {
+    const { codexMailHooks, codexMailHookArgs } = await import('../packages/cli/dist/lib/codex-mail/hooks.js');
+    const hookArgs = codexMailHookArgs(codexMailHooks());
+    fs.writeFileSync(path.join(root, 'hook-args.json'), JSON.stringify(hookArgs));
     fs.closeSync(err);
     fs.mkdirSync(path.join(work, '.codex'), { recursive: true });
     fs.mkdirSync(path.join(work, '.ink'), { recursive: true });
@@ -559,7 +574,8 @@ const fs=require('fs'), cp=require('child_process');
 const names=['INK_CODEX_INKMAIL','INK_CODEX_INKMAIL_BINDING','INK_CONTEXT','INK_SESSION_ID','INK_STUDIO_ID','SB_SLUG'];
 fs.writeFileSync('nested-env.json',JSON.stringify(Object.fromEntries(names.map(n=>[n,process.env[n]]))));
 try {
- const output=cp.execFileSync('codex',['--enable','hooks','exec','--json','--skip-git-repo-check','--sandbox','read-only','SYNTHETIC_NESTED_CHILD'],{encoding:'utf8',timeout:20000});
+ const hookArgs=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
+ const output=cp.execFileSync('codex',['--enable','hooks',...hookArgs,'exec','--json','--skip-git-repo-check','--sandbox','read-only','SYNTHETIC_NESTED_CHILD'],{encoding:'utf8',timeout:20000});
  fs.writeFileSync('nested-output.jsonl',output);
  fs.writeFileSync('nested-result.json',JSON.stringify({ok:true}));
 } catch(e) {fs.writeFileSync('nested-result.json',JSON.stringify({ok:false,message:e.message})); process.exitCode=1;}
@@ -732,6 +748,10 @@ try {
     // Exit the actual native TUI normally, allowing the runner to stop its owner.
     tui.stdin.write(JSON.stringify({ write: '\u0004' }) + '\n');
     await until(() => tui.exitCode !== null, 'wrapper normal exit', 15000);
+    if (linkedWorktree) {
+      assert.equal(fs.readFileSync(path.join(root, 'main/.codex/config.toml'), 'utf8'), '[hooks]\nsession_start="echo synthetic legacy hook"\n');
+      report('linked_worktree_source_untouched');
+    }
     if (launcherMode) {
       const original = fs.readFileSync(path.join(root, 'bound.txt'), 'utf8');
       const beforeResume = inkCalls.length;
@@ -747,13 +767,14 @@ try {
       assert.ok(tuiText.includes('live delivery enabled'), 'resume did not use the bridge');
       assert.equal(fixtureBackendId, original, 'resume replaced the native thread');
       await until(() => tuiText.includes('SYNTHETIC_WRAPPER_MAIL'), 'restored conversation', 15000);
-      report('launcher_resume_assertions_passed', { sameThread: true, historyRestored: true });
+      assert.ok(!tuiText.includes('Hooks need review'), 'session-hook trust did not persist');
+      report('launcher_resume_assertions_passed', { sameThread: true, historyRestored: true, hookTrustPersisted: true });
       tui.stdin.write(JSON.stringify({ write: '\u0004' }) + '\n');
       await until(() => tui.exitCode !== null, 'resumed launcher normal exit', 15000);
     }
-    // The trusted project migration persists after detach. A server-shaped
-    // exec must invoke the guarded commands but make NO lifecycle/intake calls,
-    // even with an inherited bridge flag. No real server or provider is used.
+    // Deliberately pass the same trusted guarded session handlers to a headless
+    // fixture: even this inherited configuration must make NO lifecycle/intake
+    // calls. Normal headless launches do not inherit the session-only hooks.
     const beforeHeadlessCalls = inkCalls.length;
     const hookLogPath = path.join(home, '.ink', 'logs', 'hooks.log');
     const beforeHeadlessLogs = fs.readFileSync(hookLogPath, 'utf8').trim().split('\n').length;
@@ -761,6 +782,7 @@ try {
       [
         '--enable',
         'hooks',
+        ...hookArgs,
         'exec',
         '--skip-git-repo-check',
         '--sandbox',
@@ -878,6 +900,19 @@ try {
     }
     await until(() => tid, 'exact native thread binding', 20000);
     report('gateway_binding', { root, tid, healthy: gateway.isHealthy() });
+    await delay(500);
+    const beforeWarningText = tuiText.length;
+    assert.equal(gateway.warn('SYNTHETIC_UI_WARNING'), true);
+    const newWarningUi = () => tuiText.slice(beforeWarningText).replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+    await until(() => newWarningUi().includes('f2') && newWarningUi().includes('1 warning'), 'native warning badge');
+    tui.stdin.write(JSON.stringify({ write: '\u001bOQ' }) + '\n');
+    await until(() => tuiText.includes('SYNTHETIC_UI_WARNING'), 'native warning UI rendering');
+    tui.stdin.write(JSON.stringify({ write: '\u001b' }) + '\n');
+    await delay(500);
+    const history = await gateway.request('thread/items/list', { threadId: tid, limit: 100 });
+    assert.ok(!JSON.stringify(history).includes('SYNTHETIC_UI_WARNING'));
+    assert.ok(!events.some((e) => JSON.stringify(e).includes('SYNTHETIC_UI_WARNING')));
+    report('native_warning_is_ui_only', { badgeAppeared: true, drawerContainsWarning: true, nativeHistoryUnaffected: true });
     const config = await gateway.request('config/read', { cwd: work, includeLayers: false });
     assert.equal(config.config?.features?.hooks, true, 'effective hook feature missing');
     const hookMetadata = await gateway.request('hooks/list', { cwds: [work] });
@@ -1000,6 +1035,7 @@ try {
         .every((r) => r.instructions?.includes('SYNTHETIC_INSTRUCTIONS'))
     );
     assert.equal(unhealthy, false);
+    assert.ok(!JSON.stringify(requests).includes('SYNTHETIC_UI_WARNING'), 'warning reached model context');
     fs.writeFileSync(path.join(root, 'events.json'), JSON.stringify(events, null, 2));
     report('gateway_assertions_passed', {
       root,
