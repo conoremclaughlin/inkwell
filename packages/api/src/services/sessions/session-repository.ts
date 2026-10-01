@@ -368,8 +368,12 @@ export class SessionRepository implements ISessionRepository {
       // since #717, but rows the earlier setter stored as written must stay
       // addressable by the normalised spelling (Lumen, #717 review).
       .ilike('alias', sessionKeyMatchPattern(alias))
-      .is('ended_at', null)
-      .neq('lifecycle', 'failed');
+      .is('ended_at', null);
+    // No lifecycle exclusion: `failed` is a lifecycle, not an ending (see
+    // findByUserAndAgent). A crashed session is the one its agent resumes
+    // next, and a key is how a sender names that transcript; excluding it
+    // here made a crashed session unaddressable by its own key and sent the
+    // message through thread routing instead (finished-session audit, row 4).
     query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
     if (studioId !== undefined) {

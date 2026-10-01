@@ -167,6 +167,49 @@ describe('MemoryRepository', () => {
       expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
     });
 
+    // start_session passes includeFailed so a plain relaunch after a crash
+    // reuses the crashed row instead of minting a second one for the same
+    // transcript (finished-session audit, rows 10 and 11). Everything else
+    // keeps the exclusion: a crashed session is not what a badge means by
+    // "active".
+    it('getActiveSession keeps crashed rows only when asked to', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSession('user-1', 'myra');
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+
+      vi.clearAllMocks();
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSession('user-1', 'myra', undefined, undefined, undefined, {
+        includeFailed: true,
+      });
+      expect(neqCalls()).not.toContainEqual(['lifecycle', 'failed']);
+    });
+
+    it('getActiveSessionByThreadKey keeps crashed rows only when asked to', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSessionByThreadKey('user-1', 'myra', 'pr:501');
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+
+      vi.clearAllMocks();
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSessionByThreadKey(
+        'user-1',
+        'myra',
+        'pr:501',
+        undefined,
+        undefined,
+        undefined,
+        { includeFailed: true }
+      );
+      expect(neqCalls()).not.toContainEqual(['lifecycle', 'failed']);
+    });
+
     it('getActiveSessionByThreadKey filters on sb_id and not agent_id', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 

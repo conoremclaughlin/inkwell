@@ -937,6 +937,7 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
   /** Mock whose select chain resolves to `rows`, recording the .eq filters. */
   function aliasSupabase(rows: Array<Record<string, unknown>>) {
     const filters: Record<string, unknown> = {};
+    const exclusions: Array<[string, unknown]> = [];
     const chain: Record<string, unknown> = {};
 
     Object.assign(chain, {
@@ -946,7 +947,10 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
         return chain;
       }),
       is: vi.fn(() => chain),
-      neq: vi.fn(() => chain),
+      neq: vi.fn((col: string, val: unknown) => {
+        exclusions.push([col, val]);
+        return chain;
+      }),
       ilike: vi.fn((col: string, val: unknown) => {
         filters[col] = val;
         return chain;
@@ -958,6 +962,7 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
     return {
       supabase: { from: vi.fn(() => chain) } as never,
       filters,
+      exclusions,
     };
   }
 
@@ -980,6 +985,23 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
       metadata: {},
     };
   }
+
+  // A crashed session is a transcript its agent resumes next; a key is how a
+  // sender names that transcript. Excluding lifecycle 'failed' here made a
+  // crashed session unaddressable by its own key, so a send to it fell
+  // through to thread routing and could land elsewhere (finished-session
+  // audit, row 4; Conor, 2026-10-01: "it can always be resumed").
+  it('finds a crashed session by its key: lifecycle failed is not an ending', async () => {
+    const { supabase, exclusions } = aliasSupabase([
+      { ...row('sess-crashed', 'studio-1'), lifecycle: 'failed' },
+    ]);
+    const repo = new SessionRepository(supabase);
+
+    const found = await repo.findByAlias('user-1', 'wren', 'wren:inkwell:main');
+
+    expect(found?.id).toBe('sess-crashed');
+    expect(exclusions).not.toContainEqual(['lifecycle', 'failed']);
+  });
 
   it('matches the key case-insensitively, with ilike metacharacters escaped', async () => {
     const { supabase, filters } = aliasSupabase([row('sess-a', 'studio-1')]);

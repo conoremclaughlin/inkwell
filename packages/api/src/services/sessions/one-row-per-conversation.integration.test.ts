@@ -214,6 +214,39 @@ describe('start_session: one backend conversation is one Inkwell session', () =>
     expect(relaunch.session?.reusedBy).toBe('backendSessionId');
   });
 
+  it('a plain relaunch after a crash, with no backend id, reuses the crashed row', async () => {
+    const firstId = randomUUID();
+    const first = parse(
+      await handleStartSession(
+        {
+          userId: INTEGRATION_TEST_USER_ID,
+          sbSlug: SUITE_AGENT,
+          backend: 'claude',
+          forceNew: true,
+          sessionId: firstId,
+        },
+        dataComposer
+      )
+    );
+    createdSessionIds.push(firstId);
+    expect(first.session?.id).toBe(firstId);
+    await dataComposer
+      .getClient()
+      .from('sessions')
+      .update({ lifecycle: 'failed' })
+      .eq('id', firstId);
+
+    const relaunch = parse(
+      await handleStartSession(
+        { userId: INTEGRATION_TEST_USER_ID, sbSlug: SUITE_AGENT, backend: 'claude' },
+        dataComposer
+      )
+    );
+
+    expect(relaunch.session?.id).toBe(firstId);
+    expect(relaunch.session?.isExisting).toBe(true);
+  });
+
   it('control: a transcript no live row carries still creates the requested row', async () => {
     const transcript = `it-${randomUUID()}`;
     const freshId = randomUUID();

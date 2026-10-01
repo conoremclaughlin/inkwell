@@ -1966,16 +1966,25 @@ export class MemoryRepository {
      * unique only per (user_id, workspace_id), so matching on it alone can
      * return a same-named identity's session from another workspace.
      */
-    sbId?: string
+    sbId?: string,
+    /**
+     * Keep crashed rows (lifecycle 'failed'). start_session passes this so a
+     * plain relaunch after a crash lands on the crashed row rather than
+     * minting a second one for the same transcript; nothing else does,
+     * because a crashed session is not what a badge means by "active".
+     */
+    options?: { includeFailed?: boolean }
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+    if (!options?.includeFailed) {
+      query = query.neq('lifecycle', 'failed');
+    }
 
     // Prefer the canonical owner; the slug is the fallback for callers that
     // have no canonical identity.
@@ -2083,7 +2092,9 @@ export class MemoryRepository {
     studioId?: string | null,
     contactId?: string,
     /** Canonical owner; replaces the slug filter when supplied. */
-    sbId?: string
+    sbId?: string,
+    /** See getActiveSession: start_session keeps crashed rows, nothing else does. */
+    options?: { includeFailed?: boolean }
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
@@ -2091,9 +2102,11 @@ export class MemoryRepository {
       .eq('user_id', userId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+    if (!options?.includeFailed) {
+      query = query.neq('lifecycle', 'failed');
+    }
 
     // Prefer the canonical owner; the slug is the fallback for callers that
     // have no canonical identity.
