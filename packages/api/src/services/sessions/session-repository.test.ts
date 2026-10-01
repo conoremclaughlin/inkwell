@@ -947,6 +947,10 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
       }),
       is: vi.fn(() => chain),
       neq: vi.fn(() => chain),
+      ilike: vi.fn((col: string, val: unknown) => {
+        filters[col] = val;
+        return chain;
+      }),
       // findByAlias awaits the order() call directly — resolve to the row set.
       order: vi.fn(() => Promise.resolve({ data: rows, error: null })),
     });
@@ -976,6 +980,13 @@ describe('SessionRepository.findByAlias — studio scoping', () => {
       metadata: {},
     };
   }
+
+  it('matches the key case-insensitively, with ilike metacharacters escaped', async () => {
+    const { supabase, filters } = aliasSupabase([row('sess-a', 'studio-1')]);
+    const repo = new SessionRepository(supabase);
+    await repo.findByAlias('user-1', 'wren', 'pr_716');
+    expect(filters.alias).toBe('pr\\_716');
+  });
 
   it('returns the single match when the alias is unique', async () => {
     const { supabase } = aliasSupabase([row('sess-a', 'studio-1')]);

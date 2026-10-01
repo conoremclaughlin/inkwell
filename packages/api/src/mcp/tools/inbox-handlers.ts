@@ -420,7 +420,15 @@ export async function handleSendToInbox(
   if (sessionKeyInput !== undefined) {
     const normalised = normaliseSessionKey(sessionKeyInput);
     if (!normalised.ok) throw new Error(normalised.reason);
-    if (normalised.value) sessionKey = normalised.value;
+    // A blank key is not "no key": the caller asked to target a session and
+    // named none. Sending anyway would dispatch without its target and
+    // report success (Lumen, #717 review).
+    if (normalised.value === '') {
+      throw new Error(
+        'sessionKey must not be blank: pass a key such as "wren:inkwell:main", or omit it'
+      );
+    }
+    sessionKey = normalised.value;
   }
 
   // Merge recipientStudioSlug (preferred) and recipientStudioHint (legacy alias).

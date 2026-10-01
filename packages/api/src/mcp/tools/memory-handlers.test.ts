@@ -1690,6 +1690,20 @@ describe('sessionKey surfaces in listings', () => {
     );
   });
 
+  it('list_sessions refuses a blank key filter rather than listing everything', async () => {
+    mockDataComposer.repositories.memory.listSessions.mockResolvedValue([keyed]);
+
+    const result = await handleListSessions(
+      { email: 'test@test.com', sbSlug: 'wren', sessionKey: '   ' },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('sessionKey');
+    expect(mockDataComposer.repositories.memory.listSessions).not.toHaveBeenCalled();
+  });
+
   it('list_sessions reports null for a session with no key', async () => {
     mockDataComposer.repositories.memory.listSessions.mockResolvedValue([
       { ...keyed, alias: undefined },

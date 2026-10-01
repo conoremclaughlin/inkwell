@@ -3,6 +3,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { sessionKeyMatchPattern } from '../../services/sessions/session-key';
 import type { Database, TablesInsert } from '../supabase/types';
 import { resolveSbId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
@@ -2192,7 +2193,8 @@ export class MemoryRepository {
     }
 
     if (options.sessionKey) {
-      query = query.eq('alias', options.sessionKey);
+      // Exact but case-insensitive: see sessionKeyMatchPattern.
+      query = query.ilike('alias', sessionKeyMatchPattern(options.sessionKey));
     }
 
     if (options.status) {

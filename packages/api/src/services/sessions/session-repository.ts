@@ -6,6 +6,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
+import { sessionKeyMatchPattern } from './session-key';
 import type { Database, Json } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -354,7 +355,10 @@ export class SessionRepository implements ISessionRepository {
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('alias', alias)
+      // Case-insensitive, exact: keys are normalised to lowercase on write
+      // since #717, but rows the earlier setter stored as written must stay
+      // addressable by the normalised spelling (Lumen, #717 review).
+      .ilike('alias', sessionKeyMatchPattern(alias))
       .is('ended_at', null)
       .neq('lifecycle', 'failed');
     query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);

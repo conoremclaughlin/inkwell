@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { normaliseSessionKey, SESSION_KEY_MAX_LENGTH } from './session-key.js';
+import {
+  normaliseSessionKey,
+  sessionKeyMatchPattern,
+  SESSION_KEY_MAX_LENGTH,
+} from './session-key.js';
 
 /**
  * A session key is the typed, routable name of a session (`wren:inkwell:main`).
@@ -40,6 +44,12 @@ describe('normaliseSessionKey', () => {
       expect(result.ok, key).toBe(false);
       if (!result.ok) expect(result.reason).toContain('sessionKey');
     }
+  });
+
+  it('builds an exact ilike pattern, escaping the metacharacters a key may carry', () => {
+    expect(sessionKeyMatchPattern('wren:inkwell:main')).toBe('wren:inkwell:main');
+    expect(sessionKeyMatchPattern('pr_716')).toBe('pr\\_716');
+    expect(sessionKeyMatchPattern('a%b\\c')).toBe('a\\%b\\\\c');
   });
 
   it('refuses a key longer than the limit', () => {

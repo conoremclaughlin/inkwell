@@ -1714,13 +1714,41 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   const studioId = typeof scope === 'string' ? scope : undefined;
   const filterNullStudio = scope === null;
 
+  // A key filter is normalised like a key write, and a blank or invalid
+  // filter is an error rather than "no filter": widening a targeted lookup
+  // into every session is the wrong surprise (Lumen, #717 review).
+  let sessionKeyFilter: string | undefined;
+  if (params.sessionKey !== undefined) {
+    const normalised = normaliseSessionKey(params.sessionKey);
+    if (!normalised.ok || normalised.value === '') {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              {
+                success: false,
+                error: normalised.ok
+                  ? 'sessionKey filter must not be blank: pass a key such as "wren:inkwell:main", or omit it'
+                  : normalised.reason,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    sessionKeyFilter = normalised.value;
+  }
+
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     sbSlug: params.sbSlug,
     studioId,
     filterNullStudio,
     backend: params.backend,
     status: params.status,
-    ...(params.sessionKey ? { sessionKey: params.sessionKey.trim().toLowerCase() } : {}),
+    ...(sessionKeyFilter ? { sessionKey: sessionKeyFilter } : {}),
     limit: params.limit,
   });
 

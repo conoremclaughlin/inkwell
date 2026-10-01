@@ -1895,6 +1895,33 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     expect(advances).toHaveLength(0);
   });
 
+  it('refuses a blank sessionKey rather than sending without its target', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-892',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientSlug: 'wren',
+          senderSlug: 'lumen',
+          sessionKey: '   ',
+          threadKey: 'thread:blank-key',
+          content: 'never sent',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow(/sessionKey/);
+    expect(mockSb.getRpcCalls()).toHaveLength(0);
+  });
+
   it('refuses a sessionKey it cannot normalise before anything is sent', async () => {
     const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue(undefined as never);

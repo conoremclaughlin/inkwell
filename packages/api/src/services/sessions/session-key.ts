@@ -13,8 +13,9 @@
  * the only place that name survives; in TypeScript, tool schemas and
  * documents the pair is `sessionKey` / `sessionAlias` (deprecated input).
  *
- * The separator question (colons, slashes, ids) is open in
- * ink://specs/key-schemes; this accepts both until Conor decides.
+ * Separator: colons (Conor, 2026-10-01, ink://specs/key-schemes v3). A
+ * slash is still an allowed character inside a name (branch-like names), not
+ * a separator.
  */
 export const SESSION_KEY_MAX_LENGTH = 80;
 
@@ -45,4 +46,18 @@ export function normaliseSessionKey(input: string): SessionKeyNormalisation {
     };
   }
   return { ok: true, value };
+}
+
+/**
+ * The `ilike` pattern for an exact, case-insensitive match on a stored key.
+ *
+ * Lookups must match keys the previous setter stored unnormalised (`Main`)
+ * when addressed by their normalised spelling (`main`); the DB has no
+ * case-insensitive equality, and `ilike` is the PostgREST operator that
+ * gives one once the pattern metacharacters a key may contain (`_`, and the
+ * escape itself) are escaped. `%` is not a key character, but escaping it
+ * costs nothing and makes the helper safe for any string.
+ */
+export function sessionKeyMatchPattern(key: string): string {
+  return key.replace(/[\\%_]/g, (char) => `\\${char}`);
 }
