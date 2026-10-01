@@ -2205,23 +2205,33 @@ export class MemoryRepository {
         // trigger routing and wrong for attach.
         query = query.is('ended_at', null).neq('lifecycle', 'completed');
 
-        // The agent-declared terminal markers belong here too, not just in
-        // the client predicate. `update_session_state({ phase: 'complete' })`
-        // writes current_phase alone — no ended_at, no lifecycle change — so
-        // a filter that stops at the authoritative columns hands back rows
-        // the caller is about to discard, and `range()` has already spent the
-        // page on them. That is the same limit-before-filter defect as
-        // filtering entirely client-side, one column further in.
+        // The agent-declared terminal STATUS belongs here too, not just in
+        // the client predicate: a filter that stops at the authoritative
+        // columns hands back rows the caller is about to discard, and
+        // `range()` has already spent the page on them — the same
+        // limit-before-filter defect as filtering entirely client-side, one
+        // column further in.
+        //
+        // The agent-set work PHASE is deliberately not read. `update_session_
+        // state({ phase: 'complete' })` closes a piece of work, not the
+        // conversation: ended_at stays null, lifecycle stays 'idle', and the
+        // row is still the identity of a live backend transcript. This branch
+        // used to exclude phase 'complete' as well, the client predicates
+        // agreed, and the row then vanished from every picker while its
+        // transcript lived on; the launcher read the transcript as untracked
+        // and minted a second Inkwell session for the same conversation on
+        // every relaunch (2026-10-01: four live rows for one Claude session;
+        // nineteen conversations with two to five each). Mirrors
+        // isAttachableSessionSummary (chat.ts) and isSessionResumable
+        // (claude.ts), which read the same three columns.
         //
         // Each exclusion is paired with an explicit NULL allowance: a session
-        // that never declared a phase is attachable, but SQL's `col <> x`
+        // that never declared a status is attachable, but SQL's `col <> x`
         // over NULL yields NULL and would drop it. `ilike` rather than `like`
         // to match the client predicate's lowercasing; the client also trims,
-        // which SQL does not, so a phase stored with surrounding whitespace
+        // which SQL does not, so a status stored with surrounding whitespace
         // still relies on the backstop.
         query = query
-          .or('current_phase.is.null,current_phase.not.ilike.complete')
-          .or('current_phase.is.null,current_phase.not.ilike.complete:*')
           .or('status.is.null,status.not.ilike.completed')
           .or('status.is.null,status.not.ilike.completed:*');
       } else {
