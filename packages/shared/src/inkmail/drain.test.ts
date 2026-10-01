@@ -5,7 +5,7 @@ import {
   drainLegacyInbox,
   POLL_BUDGET,
   type PollDeps,
-} from './poll-core.js';
+} from './drain.js';
 
 let msgClock = 0;
 function mkMsg(id: string, sender = 'lumen') {
@@ -137,6 +137,20 @@ describe('drainThreads — cold-fetch ack protocol (spec §1)', () => {
     expect(h.ackArgs).toEqual([
       expect.objectContaining({ threadKey: 'pr:x', throughMessageId: 'm-3' }),
     ]);
+  });
+
+  // A reader that renders its own form (the ink chat REPL) needs the row,
+  // not the plugin's `From x: y` string. Thread rows carry no thread key of
+  // their own, so the drain adds the one it fetched them under.
+  it('hands each reader the raw row, with its thread key, alongside the formatted notice', async () => {
+    const msg = mkMsg('m-1');
+    const h = createHarness({ 'pr:x': { messages: [msg] } });
+    await drainThreads(h.deps, createThreadDrainState(), [mkThread('pr:x', 1)]);
+    expect(h.deps.notify).toHaveBeenCalledWith(
+      'From lumen: content m-1',
+      expect.objectContaining({ thread_key: 'pr:x', message_id: 'm-1' }),
+      { ...msg, threadKey: 'pr:x' }
+    );
   });
 
   it('cursored incremental fetch is ALSO markRead:false and acks (uniform §7 protocol)', async () => {
@@ -339,6 +353,12 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
 
     expect(res.injected).toBe(3);
     expect(notifications).toHaveLength(3);
+    // Each reader also gets the raw row, oldest first.
+    expect((deps.notify as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[2]?.id)).toEqual([
+      'm1',
+      'm2',
+      'm3',
+    ]);
     // Delivered oldest-first; the ack is the newest processed id.
     expect(ackArgs).toHaveLength(1);
     expect(ackArgs[0]).toMatchObject({ sbSlug: 'wren', throughMessageId: 'm3' });

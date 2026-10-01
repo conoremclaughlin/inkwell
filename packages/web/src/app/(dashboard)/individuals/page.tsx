@@ -67,6 +67,10 @@ interface Session {
   status: string;
   currentPhase: string | null;
   context: string | null;
+  currentWork: string | null;
+  currentWorkAt: string | null;
+  /** null means UNKNOWN age, never recent — render nothing rather than "just now". */
+  currentWorkAgeLabel: string | null;
   summary: string | null;
   updatedAt: string;
 }
@@ -198,7 +202,12 @@ function AgentSummaryCard({
   const descriptionContent = identity.description || 'No description provided.';
   const primaryContent = constitutionContent || descriptionContent;
 
-  const currentFocus = activeSession?.context || activeSession?.summary;
+  // Prefer the rendered current-work line: it is bounded, it reports whether it
+  // came from a purpose-written headline or a truncated scratch note, and it
+  // arrives with an age. Falling straight back to `context` here is what made
+  // this card able to state a four-day-old note as the agent's present focus.
+  const currentFocus = activeSession?.currentWork || activeSession?.summary;
+  const currentFocusAge = activeSession?.currentWork ? activeSession.currentWorkAgeLabel : null;
 
   return (
     <Card className="group overflow-hidden border-l-4 border-l-transparent transition-all duration-200 hover:border-l-purple-500 hover:shadow-md">
@@ -276,6 +285,14 @@ function AgentSummaryCard({
                   <span className="text-[10px] font-bold uppercase tracking-wider text-yellow-700">
                     Current focus
                   </span>
+                  {currentFocusAge && (
+                    <span
+                      className="text-[10px] font-medium text-yellow-700/70"
+                      title={activeSession?.currentWorkAt || undefined}
+                    >
+                      · {currentFocusAge}
+                    </span>
+                  )}
                 </div>
                 <p className="line-clamp-2 text-xs text-gray-600">{currentFocus}</p>
               </div>

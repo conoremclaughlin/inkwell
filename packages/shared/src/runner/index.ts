@@ -1,5 +1,9 @@
 export {
   buildCleanEnv,
+  SPAWN_ENV_INHERITED_NAMES,
+  SESSION_ENV_HANDOFF_NAMES,
+  RUN_TURN_EPOCH_ENV,
+  sessionEnvHandoff,
   resolveSpawnTarget,
   spawnBackend,
   LineBuffer,
@@ -14,6 +18,7 @@ export {
   buildSessionEnv,
   encodeContextToken,
   decodeContextToken,
+  PRINT_MODE_CHANNEL_ENV,
   type InjectSessionHeadersOptions,
   type InjectSessionHeadersResult,
   type InkContextToken,

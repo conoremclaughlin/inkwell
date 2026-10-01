@@ -173,6 +173,20 @@ describe('injectSessionHeaders', () => {
 });
 
 describe('buildSessionEnv', () => {
+  // Phase 0 of spec:sender-token-binding: the ink chat child used to verify and
+  // mint delegation tokens with JWT_SECRET inherited from the server. The
+  // server now hands it a DERIVED delegation secret explicitly, and never the key.
+  it('sets INK_DELEGATION_SECRET only when a delegation secret is provided', () => {
+    const withSecret = buildSessionEnv({
+      inkSessionId: 'sess-1',
+      sbSlug: 'wren',
+      delegationSecret: 'synthetic-derived-secret',
+    });
+    expect(withSecret.INK_DELEGATION_SECRET).toBe('synthetic-derived-secret');
+    const without = buildSessionEnv({ inkSessionId: 'sess-1', sbSlug: 'wren' });
+    expect('INK_DELEGATION_SECRET' in without).toBe(false);
+  });
+
   it('includes INK_ACCESS_TOKEN (raw) when accessToken provided', () => {
     const env = buildSessionEnv({
       inkSessionId: 'sess-123',

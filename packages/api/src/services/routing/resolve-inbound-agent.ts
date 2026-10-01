@@ -5,7 +5,8 @@
  * precedence order and stopping at the first one that matches:
  *
  *   1. @mention      — a deliberate address written in the new message
- *   2. reply author  — the message being answered, for group and DM alike
+ *   2. reply author  — the message being answered, for group and DM alike; also
+ *                      anchors the session that wrote it, while that is open
  *   3. channel_routes — the configured default for this account/chat
  *   4. the server's AGENT_ID, when nothing above matched
  *
@@ -22,7 +23,11 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../../utils/logger';
 import { resolveAgentFromMention } from './resolve-mention';
-import { resolveReplyAuthorship, type ReplyAuthorshipFailure } from './resolve-reply-authorship';
+import {
+  resolveReplyAuthorship,
+  type ReplyAuthorshipFailure,
+  type ReplySessionFailure,
+} from './resolve-reply-authorship';
 import { resolveRouteSlug } from './resolve-route';
 
 /** Which tier selected the SB. `default` means no tier matched. */
@@ -34,8 +39,21 @@ export interface InboundAgentResolution {
   source: InboundAgentSource;
   studioHint: string | null;
   routeId: string | null;
-  /** Present only when the message was a reply, so a misroute stays diagnosable. */
-  replyRouting?: { resolved: true } | { resolved: false; reason: ReplyAuthorshipFailure };
+  /**
+   * The open session that wrote the message being replied to, so the reply
+   * resumes the conversation it answers rather than whichever session of the
+   * SB is newest. Open when looked up here; session routing admits it again
+   * when the message is actually placed, because it may not be by then.
+   */
+  replyToSessionId?: string;
+  /**
+   * Present only when the message was a reply, so a misroute stays diagnosable.
+   * `session` says whether the reply was anchored to its authoring session or,
+   * if not, why that session could not take it.
+   */
+  replyRouting?:
+    | { resolved: true; session: 'authoring' | ReplySessionFailure }
+    | { resolved: false; reason: ReplyAuthorshipFailure };
 }
 
 export interface InboundAgentInput {
@@ -102,19 +120,34 @@ export async function resolveInboundAgent(
   );
 
   if (authorship.resolved) {
+    const { session } = authorship;
     logger.info('[Route] Resolved agent from reply authorship', {
       platform,
       sbSlug: authorship.sbSlug,
       sbId: authorship.sbId,
       replyToMessageId,
+      authoringSessionId: session.sessionId,
+      session: session.routable ? 'authoring' : session.reason,
     });
+    if (!session.routable) {
+      // The SB is still the author, so it still takes the reply. What is lost
+      // is the conversation: the reply lands wherever the SB's unaddressed
+      // messages go (its home session), and that session did not write it.
+      logger.warn('[Route] Reply cannot resume its authoring session — routing it unanchored', {
+        platform,
+        sbSlug: authorship.sbSlug,
+        authoringSessionId: session.sessionId,
+        reason: session.reason,
+      });
+    }
     return {
       sbSlug: authorship.sbSlug,
       sbId: authorship.sbId ?? undefined,
       source: 'reply',
       studioHint: null,
       routeId: null,
-      replyRouting: { resolved: true },
+      ...(session.routable ? { replyToSessionId: session.sessionId } : {}),
+      replyRouting: { resolved: true, session: session.routable ? 'authoring' : session.reason },
     };
   }
 

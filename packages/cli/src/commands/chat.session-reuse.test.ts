@@ -27,13 +27,14 @@ import {
   spawnDialogueText,
   continuationSpawnArgs,
 } from './chat.js';
-import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
+import { MAX_RELAY_BYTES } from '@inklabs/shared/runtime';
+import { SessionLog } from '../session/session-log.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import {
   findImitatedToolResults,
   isPotentialImitationPrefix,
   MAX_RELAY_CHARS,
-} from '../repl/agent-loop.js';
+} from '@inklabs/shared/runtime';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
@@ -569,7 +570,7 @@ describe('applyModelSelection — /model transitions invalidate detection (PR #4
       detectedModel: undefined,
       backendTokenWindow: 200_000,
       maxContextTokens: 170_000,
-      transcriptPath,
+      log: new SessionLog({ path: transcriptPath }),
       ...over,
     }) as unknown as RT;
 
@@ -688,7 +689,7 @@ describe('one-turn process recovery sequence — detection outlives the seed (PR
       detectedModel: undefined,
       backendTokenWindow: 200_000,
       maxContextTokens: 170_000,
-      transcriptPath,
+      log: new SessionLog({ path: transcriptPath }),
     }) as unknown as RT;
 
   it('process A seeds narrow, detects Fable 5, exits — process B reseeds instead of resuming', () => {

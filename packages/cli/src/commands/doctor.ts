@@ -8,6 +8,9 @@ import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSy
 import { basename, dirname, join, parse as parsePath, resolve } from 'path';
 import { homedir } from 'os';
 import { normalizeIdentityJson } from '../backends/identity.js';
+import { auditStudio, type StudioAudit } from '@inklabs/shared';
+import { detectWorktree } from './init.js';
+import { callInkTool } from '../lib/ink-mcp.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
 
@@ -23,6 +26,94 @@ interface DoctorResult {
   expectedTarget?: string;
   resolvedTarget?: string;
   checks: DoctorCheck[];
+}
+
+/**
+ * What the server knows about the studio this worktree claims to be.
+ * `unrecorded`: a row exists for this path but identity.json does not carry
+ * its id — the shape of every studio created before the checklist, which
+ * used to read as "no studio row" although the server had one.
+ */
+export type StudioRegistration =
+  | 'registered'
+  | 'unrecorded'
+  | 'unregistered'
+  | 'unreachable'
+  | 'not-applicable';
+
+/**
+ * The studio checklist as doctor checks (task c3b34be8): every item the
+ * shared audit judges, plus the one item only the server can answer — that
+ * the studio id in identity.json names a row it still has. A required item
+ * that is missing fails; a reported-only item warns. The repair is always
+ * the same command, so it is named once, below the list.
+ */
+export function studioChecksFrom(
+  audit: StudioAudit,
+  registration: StudioRegistration
+): DoctorCheck[] {
+  const checks: DoctorCheck[] = audit.checks.map((check) => ({
+    name: `Studio: ${check.label}`,
+    status: check.ok ? 'ok' : check.required ? 'fail' : 'warn',
+    detail: check.ok ? check.detail : `${check.detail} — repair: ${check.repair}`,
+  }));
+  if (registration !== 'not-applicable') {
+    checks.push({
+      name: 'Studio: registered on the server',
+      status:
+        registration === 'registered' ? 'ok' : registration === 'unreachable' ? 'warn' : 'fail',
+      detail:
+        registration === 'registered'
+          ? 'the studio id in identity.json names a row the server has'
+          : registration === 'unreachable'
+            ? 'server not reachable; could not confirm the studio row'
+            : registration === 'unrecorded'
+              ? 'the server has a studio row for this worktree, but identity.json does not record its id — repair: ink init'
+              : 'no studio row for this worktree — repair: ink init',
+    });
+  }
+  return checks;
+}
+
+/**
+ * Ask the server whether the studio is registered; never throws. With an id
+ * from identity.json, that id must name a row. Without one, the worktree
+ * path is looked up the way the launcher does, so a row the server has is
+ * reported as such rather than as missing.
+ */
+export async function probeRegistration(
+  studioId: string | undefined,
+  worktreePath: string,
+  call: typeof callInkTool = callInkTool
+): Promise<StudioRegistration> {
+  const found = (result: Record<string, unknown> | undefined) =>
+    !!result && (!!result.studio || result.success === true);
+  try {
+    if (studioId) {
+      return found(await call('get_studio', { studioId }, { idempotent: true }))
+        ? 'registered'
+        : 'unregistered';
+    }
+    return found(await call('get_studio', { path: worktreePath }, { idempotent: true }))
+      ? 'unrecorded'
+      : 'unregistered';
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return /not found|no studio|unknown studio/i.test(message) ? 'unregistered' : 'unreachable';
+  }
+}
+
+async function buildStudioChecks(cwd: string): Promise<DoctorCheck[]> {
+  const placement = detectWorktree(cwd);
+  if (!placement.toplevel) return [];
+  const audit = auditStudio(placement.toplevel, { linked: placement.linked });
+  let registration: StudioRegistration = 'not-applicable';
+  if (placement.linked) {
+    const identity = audit.checks.find((c) => c.id === 'studio-id');
+    const studioId = identity?.ok ? identity.detail.replace(/^studioId /, '') : undefined;
+    registration = await probeRegistration(studioId, placement.toplevel);
+  }
+  return studioChecksFrom(audit, registration);
 }
 
 interface DoctorFs {
@@ -353,6 +444,8 @@ async function doctorCommand(options: {
   if (migrationCheck) {
     result.checks.push(migrationCheck);
   }
+  const studioChecks = await buildStudioChecks(process.cwd());
+  result.checks.push(...studioChecks);
 
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -384,7 +477,19 @@ async function doctorCommand(options: {
   const hasStudioMismatch = result.checks.some(
     (check) => check.name === 'Studio target match' && check.status === 'warn'
   );
-  const needsFix = hasFailure || hasStudioMismatch;
+  const studioIncomplete = studioChecks.some((check) => check.status === 'fail');
+  const linkNeedsFix =
+    result.checks.some((check) => !check.name.startsWith('Studio: ') && check.status === 'fail') ||
+    hasStudioMismatch;
+  const needsFix = linkNeedsFix;
+
+  if (studioIncomplete) {
+    console.log(chalk.bold('Studio repair'));
+    console.log(
+      chalk.dim('  This worktree is missing studio items. From inside it, run:\n  ink init')
+    );
+    console.log('');
+  }
 
   if (needsFix) {
     const fixCmd = buildFixCommand(result.binaryName);

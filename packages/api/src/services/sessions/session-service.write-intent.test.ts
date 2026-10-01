@@ -49,6 +49,7 @@ vi.mock('../../utils/logger.js', () => ({
 
 import { SessionService } from './session-service.js';
 import type { Session } from './types.js';
+import { workspaceOfSb } from '../principals.js';
 
 function threadChain(result: { data?: unknown; error?: { message: string } | null }) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -171,6 +172,7 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
     (service as any).resolveThreadBehavior('user-1', null, 'spec:some-design') as Promise<{
       writeIntent: string;
       studioPolicy: string;
+      project: unknown;
     }>;
 
   it('resolves intent AND policy from the STORED pinned key_type via the registry', async () => {
@@ -179,6 +181,7 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
     await expect(resolve(service)).resolves.toEqual({
       writeIntent: 'presence',
       studioPolicy: 'reuse-only',
+      project: null,
     });
     // Resolved in the WORKSPACE, never under the user (§1b).
     expect(typeBehaviorMock).toHaveBeenCalledWith('ws-1', 'spec');
@@ -190,6 +193,7 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
     await expect(resolve(service)).resolves.toEqual({
       writeIntent: 'write',
       studioPolicy: 'provision',
+      project: null,
     });
   });
 
@@ -199,6 +203,7 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
     await expect(resolve(service)).resolves.toEqual({
       writeIntent: 'write',
       studioPolicy: 'reuse-only',
+      project: null,
     });
     expect(typeBehaviorMock).toHaveBeenCalledWith('ws-1', null);
   });
@@ -210,6 +215,7 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
     await expect(resolve(service)).resolves.toEqual({
       writeIntent: 'write',
       studioPolicy: 'reuse-only',
+      project: null,
     });
   });
 
@@ -219,6 +225,164 @@ describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)
     await expect(resolve(service)).resolves.toEqual({
       writeIntent: 'write',
       studioPolicy: 'reuse-only',
+      project: null,
+    });
+  });
+});
+
+describe('resolveThreadBehavior — the pinned project and its repo (task b5c71bc3)', () => {
+  /*
+   * The same single pre-routing resolution now also carries the project the
+   * key was pinned to (inbox_threads.key_project) and the repo that project
+   * names, read by (workspace_id, slug). It is what routing scopes every
+   * inferred rung to, so the contract here is what keeps a project-prefixed
+   * thread out of another project's checkout.
+   */
+  beforeEach(() => {
+    typeBehaviorMock.mockReset();
+    typeBehaviorMock.mockResolvedValue({ writeIntent: 'write', studioPolicy: 'provision' });
+  });
+
+  function serviceWithTables(tables: {
+    inbox_threads: { data?: unknown; error?: { message: string } | null };
+    projects?: { data?: unknown; error?: { message: string } | null };
+  }) {
+    const chains: Record<string, ReturnType<typeof threadChain>> = {};
+    const supabase = {
+      from: vi.fn().mockImplementation((table: string) => {
+        const row =
+          table === 'inbox_threads'
+            ? tables.inbox_threads
+            : table === 'projects'
+              ? (tables.projects ?? { data: null })
+              : { data: null };
+        chains[table] = threadChain(row);
+        return chains[table];
+      }),
+    };
+    const service = new SessionService(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { update: vi.fn() } as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {} as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {} as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { addEntry: vi.fn() } as any,
+      { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {} as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      supabase as any
+    );
+    return { service, supabase, chains };
+  }
+
+  const resolve = (service: SessionService, key = 'inktrade:pr:1') =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (service as any).resolveThreadBehavior('user-1', null, key) as Promise<unknown>;
+
+  it('resolves the pinned project to its repo by (workspace_id, slug)', async () => {
+    const { service, chains } = serviceWithTables({
+      inbox_threads: { data: { key_type: 'pr', key_project: 'inktrade' } },
+      projects: { data: { slug: 'inktrade', repo_root: '/repos/inktrade' } },
+    });
+    await expect(resolve(service)).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'provision',
+      project: { slug: 'inktrade', repoRoot: '/repos/inktrade' },
+    });
+    expect(chains.projects.eq).toHaveBeenCalledWith('workspace_id', 'ws-1');
+    expect(chains.projects.eq).toHaveBeenCalledWith('slug', 'inktrade');
+  });
+
+  it('names the cause when the project has no repo, is gone, or cannot be read', async () => {
+    const cases = [
+      [{ data: { slug: 'inktrade', repo_root: null } }, 'unset'],
+      [{ data: null }, 'unresolved'],
+      [{ error: { message: 'projects down' } }, 'unreadable'],
+    ] as const;
+    for (const [projects, cause] of cases) {
+      const { service } = serviceWithTables({
+        inbox_threads: { data: { key_type: 'pr', key_project: 'inktrade' } },
+        projects,
+      });
+      await expect(resolve(service)).resolves.toMatchObject({
+        project: { slug: 'inktrade', repoRoot: null, cause },
+      });
+    }
+  });
+
+  it('an unprefixed key carries no project and never reads the projects table', async () => {
+    const { service, supabase } = serviceWithTables({
+      inbox_threads: { data: { key_type: 'pr', key_project: null } },
+    });
+    await expect(resolve(service, 'pr:1')).resolves.toMatchObject({ project: null });
+    expect(supabase.from).not.toHaveBeenCalledWith('projects');
+  });
+
+  it('an unreadable thread row holds a key that MAY carry a prefix, and degrades a two-segment key', async () => {
+    // Routing an unreadable `inktrade:pr:1` by the sender's repo is the
+    // mis-repo outcome; `pr:1` has no prefix to lose and keeps the degrade.
+    const { service: prefixed } = serviceWithTables({
+      inbox_threads: { error: { message: 'db down' } },
+    });
+    await expect(resolve(prefixed)).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+      project: { slug: 'inktrade', repoRoot: null, cause: 'unreadable' },
+    });
+    const { service: plain } = serviceWithTables({
+      inbox_threads: { error: { message: 'db down' } },
+    });
+    await expect(resolve(plain, 'pr:1')).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+      project: null,
+    });
+  });
+
+  it('a workspace lookup THROW holds a key that may carry a prefix; a null workspace keeps the degrade', async () => {
+    // A failed scope lookup is not proof that a pin cannot exist (Lumen,
+    // #681 round 1): one transient exception must not route `inktrade:pr:1`
+    // by the sender's repo. An identity with NO workspace is a positive
+    // answer — no thread row can have been pinned in one — and degrades.
+    vi.mocked(workspaceOfSb).mockRejectedValueOnce(new Error('transient lookup failure'));
+    const { service: thrown } = serviceWithTables({
+      inbox_threads: { data: { key_type: 'pr', key_project: 'inktrade' } },
+      projects: { data: { slug: 'inktrade', repo_root: '/repos/inktrade' } },
+    });
+    await expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (thrown as any).resolveThreadBehavior('user-1', 'sb-1', 'inktrade:pr:1')
+    ).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+      project: { slug: 'inktrade', repoRoot: null, cause: 'unreadable' },
+    });
+
+    vi.mocked(workspaceOfSb).mockResolvedValueOnce(null);
+    const { service: none } = serviceWithTables({
+      inbox_threads: { data: { key_type: 'pr', key_project: 'inktrade' } },
+    });
+    await expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (none as any).resolveThreadBehavior('user-1', 'sb-1', 'inktrade:pr:1')
+    ).resolves.toEqual({ writeIntent: 'write', studioPolicy: 'reuse-only', project: null });
+  });
+
+  it('a registry THROW degrades intent and policy but keeps the readable pin', async () => {
+    // The placement probe's key has no registered type and its registry
+    // read throws; that is a behaviour degrade, not an unreadable pin.
+    typeBehaviorMock.mockRejectedValue(new Error('registry down'));
+    const { service } = serviceWithTables({
+      inbox_threads: { data: { key_type: 'pr', key_project: 'inktrade' } },
+      projects: { data: { slug: 'inktrade', repo_root: '/repos/inktrade' } },
+    });
+    await expect(resolve(service)).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+      project: { slug: 'inktrade', repoRoot: '/repos/inktrade' },
     });
   });
 });

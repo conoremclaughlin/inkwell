@@ -18,6 +18,7 @@ import { homedir } from 'os';
 import { createInterface } from 'readline/promises';
 import { callInkTool, getInkServerUrl } from '../lib/ink-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
+import { formatCurrentWork } from '../lib/current-work.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 
 export interface Session {
@@ -30,6 +31,10 @@ export interface Session {
   startedAt: string;
   endedAt?: string;
   summary?: string;
+  /** What this session says it is working on, as rendered by the server. */
+  currentWork?: string | null;
+  /** null means the age is UNKNOWN, never recent — see `formatCurrentWork`. */
+  currentWorkAgeLabel?: string | null;
   backendSessionId?: string;
   claudeSessionId?: string;
   studioId?: string;
@@ -430,6 +435,13 @@ function formatSessionLine(session: Session): string[] {
     chalk.dim(`      Thread:  ${thread}`),
     chalk.dim(`      Attach:  ink chat -a ${session.sbSlug || 'wren'} --attach ${session.id}`),
   ];
+
+  // Above Summary on purpose: `summary` describes a session that has finished,
+  // current work describes one that has not, and the live answer leads.
+  const currentWork = formatCurrentWork(session);
+  if (currentWork) {
+    lines.splice(1, 0, chalk.dim(`      Now:     ${currentWork}`));
+  }
 
   if (session.summary) {
     const summary =

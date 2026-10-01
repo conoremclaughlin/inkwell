@@ -25,11 +25,12 @@ import {
   writeRuntimeSessionHint,
   resolveSpawnTarget,
   CONTAINER_RUNNER_FILES,
+  PRINT_MODE_CHANNEL_ENV,
 } from '@inklabs/shared';
 import { homedir } from 'os';
 import { join } from 'path';
 import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
-import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
+import { applyPermissionOverlay } from '../studio-settings.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
@@ -437,18 +438,9 @@ export class ClaudeRunner implements IRunner {
           })
         : null;
 
-    // Safety net: ensure .claude/settings.local.json exists before spawning.
-    // Non-fatal — if it fails, Claude still spawns with default permissions.
-    if (config.workingDirectory) {
-      try {
-        await ensureStudioSettings(config.workingDirectory);
-      } catch (err) {
-        logger.debug('ensureStudioSettings pre-spawn check failed (non-fatal)', {
-          cwd: config.workingDirectory,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
+    // The studio checklist ran here until 2026-09-29, for Claude spawns only.
+    // It now runs in the session service before EVERY runner (task
+    // 2841c7a9), so a Codex or Gemini SB's studio is completed too.
 
     // Apply per-session permission overlay (from strategy config or 2FA grant).
     // The restore function is called after the process exits to revert the overlay.
@@ -482,9 +474,9 @@ export class ClaudeRunner implements IRunner {
     }
 
     return new Promise((resolve, reject) => {
-      // Strip CLAUDECODE to prevent "nested session" detection when Inkwell is
-      // launched from inside a Claude Code session (e.g., via PM2).
-      const { CLAUDECODE, ...cleanEnv } = process.env;
+      // The child inherits an allowlist of the server's env (resolveSpawnTarget
+      // → buildCleanEnv), never the whole of it: spec:sender-token-binding
+      // Phase 0. What it needs beyond that is set here, explicitly.
       const spawnEnv: Record<string, string> = {
         // Ensure Claude Code uses correct paths
         HOME: process.env.HOME || '',
@@ -500,10 +492,15 @@ export class ClaudeRunner implements IRunner {
           runtimeLinkId: config.inkSessionId ? runtimeLinkId : undefined,
           studioId: config.studioId,
           accessToken: config.inkAccessToken,
+          delegationSecret: config.inkDelegationSecret,
           sbSlug: config.sbSlug,
           runtime: 'claude',
           repoRoot: config.repoRoot,
         }),
+        // buildArgs always passes --print, which cannot show a channel
+        // notification. The project config still loads the inkmail plugin;
+        // this keeps it from acking messages that arrive during the turn.
+        ...PRINT_MODE_CHANNEL_ENV,
       };
 
       // Route through container or host — resolveSpawnTarget handles the
@@ -519,7 +516,7 @@ export class ClaudeRunner implements IRunner {
 
       const proc = spawn(target.binary, target.args, {
         cwd: target.cwd,
-        env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
+        env: target.env,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
   prepareCalls: [] as Array<{ backend: string; promptParts: string[] }>,
+  prepareConfigs: [] as Array<Record<string, unknown>>,
 }));
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -13,6 +14,7 @@ vi.mock('../backends/index.js', () => ({
     binary: 'mock-backend',
     prepare: (config: { promptParts: string[] }) => {
       state.prepareCalls.push({ backend, promptParts: [...config.promptParts] });
+      state.prepareConfigs.push({ ...config });
       return {
         binary: 'mock-backend',
         args: [...config.promptParts],
@@ -58,6 +60,46 @@ function createMockChild(exitCode = 0): EventEmitter & {
 }
 
 describe('runBackendTurn', () => {
+  // spec:sender-token-binding Phase 0 (Lumen, #694 r1). The provider child
+  // serves this same session: the ink chat process hands it its own session
+  // credentials and identity explicitly, and never the server's secrets (which
+  // are not in this process after Phase 0, and would not cross regardless).
+  // The FINAL env handed to spawn is asserted, through the real shared
+  // spawnBackend, with the adapter's own env winning where it sets a name.
+  it('hands the provider child this session’s credentials and identity, and nothing secret', async () => {
+    state.prepareCalls = [];
+    spawnMock.mockImplementation(() => createMockChild(0));
+    vi.stubEnv('INK_ACCESS_TOKEN', 'child-session-token');
+    vi.stubEnv('INK_DELEGATION_SECRET', 'synthetic-derived-secret');
+    vi.stubEnv('INK_SESSION_ID', 'sess-from-parent');
+    vi.stubEnv('INK_STUDIO_ID', 'studio-from-parent');
+    vi.stubEnv('INK_CONTEXT', 'context-from-parent');
+    vi.stubEnv('JWT_SECRET', 'synthetic-jwt-secret');
+    vi.stubEnv('SUPABASE_SECRET_KEY', 'synthetic-service-key');
+    try {
+      await runBackendTurn({
+        backend: 'claude',
+        sbSlug: 'wren',
+        prompt: 'ping',
+      });
+      const [, , options] = spawnMock.mock.calls[0] as [
+        string,
+        string[],
+        { env: Record<string, string> },
+      ];
+      expect(options.env.INK_ACCESS_TOKEN).toBe('child-session-token');
+      expect(options.env.INK_DELEGATION_SECRET).toBe('synthetic-derived-secret');
+      expect(options.env.INK_SESSION_ID).toBe('sess-from-parent');
+      expect(options.env.INK_STUDIO_ID).toBe('studio-from-parent');
+      expect(options.env.INK_CONTEXT).toBe('context-from-parent');
+      expect('JWT_SECRET' in options.env).toBe(false);
+      expect('SUPABASE_SECRET_KEY' in options.env).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      spawnMock.mockReset();
+    }
+  });
+
   it('uses codex exec mode for non-interactive turns', async () => {
     state.prepareCalls = [];
     spawnMock.mockImplementation(() => createMockChild(0));
@@ -92,6 +134,31 @@ describe('runBackendTurn', () => {
       ['ping'],
       expect.objectContaining({ stdio: ['ignore', 'pipe', 'pipe'] })
     );
+  });
+
+  // The adapter writes this into the child's INK_CONTEXT, and the child's
+  // hooks write it onto the chat's session. Dropped here, every adapter falls
+  // back to its own default and a headless run marks itself attached.
+  it('passes the chat process attachment through to the adapter', async () => {
+    spawnMock.mockImplementation(() => createMockChild(0));
+    for (const cliAttached of [false, true]) {
+      state.prepareConfigs = [];
+      await runBackendTurn({ backend: 'claude', sbSlug: 'myra', prompt: 'ping', cliAttached });
+      expect(state.prepareConfigs[0]?.cliAttached).toBe(cliAttached);
+    }
+  });
+
+  // The child's on-prompt hook reads this. Without it, a headless child's
+  // cliAttached:false is a detach, and the route clears the turn marker the
+  // chat process opened while that process is still running (PR #685 r2).
+  it('marks every child as a turn owned by the parent chat process', async () => {
+    for (const cliAttached of [false, true]) {
+      spawnMock.mockReset();
+      spawnMock.mockImplementation(() => createMockChild(0));
+      await runBackendTurn({ backend: 'claude', sbSlug: 'myra', prompt: 'ping', cliAttached });
+      const env = (spawnMock.mock.calls[0]?.[2] as { env?: Record<string, string> })?.env;
+      expect(env?.INK_TURN_OWNER).toBe('parent');
+    }
   });
 
   it('default hard backstop is the 4h runaway ceiling, not the old 20-minute cap', async () => {

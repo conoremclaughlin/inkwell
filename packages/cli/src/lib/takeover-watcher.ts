@@ -17,7 +17,8 @@
  * nothing may claim after it.
  */
 
-import { mkdirSync, readFileSync, rmSync, watch, writeFileSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from 'fs';
 import { join } from 'path';
 
 export const TAKEOVER_MARKER_MAX_AGE_MS = 10 * 60 * 1000;
@@ -46,9 +47,58 @@ export function takeoverMarkerPath(cwd: string, generation?: string): string {
  * wrapper watcher, for reclaims) writes this file; the on-stop hook reads
  * its OWN session's record, sends the epoch with the stop event, and clears
  * the file. A foreign session's record is never sent or cleared.
+ *
+ * OWNERSHIP (task c07f35c8). One file per (sessionId, wrapperGeneration):
+ * `.ink/cli-turn-epoch.<sessionId>[.<generation>].json`. Every session in a
+ * checkout, and every wrapper generation of one session, keeps its own
+ * evidence; nothing reads another owner's. Before this there was ONE file
+ * per checkout, so a sibling's prompt replaced the record a stop was about
+ * to send: the stop reported turnEpochMissing, the server (fail closed) left
+ * the turn open, and the lease sweep, which treats an open turn as live,
+ * renewed that studio's lease for days after its PR had merged (pr:498,
+ * pr:499). Same-session collisions were the fork/resume case: two wrapper
+ * generations of one session, a delayed write from the older one erasing the
+ * successor's evidence — hence the generation in the key, as for the marker.
+ *
+ * The generation-less path `.ink/cli-turn-epoch.json` is the LEGACY single
+ * file, and migration away from it is MONOTONIC (Lumen, PR #691 rounds 1-2).
+ * It is read only while its exact owner — same session, same generation, a
+ * generation-less pair matching only a generation-less pair — has no file in
+ * its own namespace at all: an owner file that exists, even malformed,
+ * retired, or naming someone else, never falls through to it. The legacy
+ * file is SHARED, so the new writer never deletes it: an unlink can fail or
+ * be lost to a crash, and another owner's old-format writer can replace the
+ * file between a read and the unlink, which would delete their evidence.
+ * Instead the owner's namespace shadows it durably. EVERY clear retires in
+ * the owner's own file: a live record is replaced by a RETIRED tombstone,
+ * never deleted, and a legacy-only record is retired by creating that
+ * tombstone (exclusively, so a newer owner-format record that appeared
+ * meanwhile is never overwritten). The decision never consults the shared
+ * file for permission (round 3): a read failure there, or an old-format
+ * writer publishing this owner's old epoch AFTER the cleanup, must not
+ * reopen the fallback, so the tombstone is unconditional and lasts until
+ * the owner's next live write replaces it. Nobody writes the legacy file,
+ * imports it into an owner file, or deletes anything from it — it is only
+ * ever read, and only by an owner with no file of its own.
+ *
+ * Writes replace atomically (temp file + rename) so a reader never sees a
+ * partial record. That is all the atomicity there is: read/check/unlink is
+ * not a cross-process CAS; ownership is what keeps two processes off one
+ * file.
  */
-export function cliTurnEpochPath(cwd: string): string {
-  return join(cwd, '.ink', 'cli-turn-epoch.json');
+export interface TurnEpochOwner {
+  sessionId: string;
+  wrapperGeneration?: string;
+}
+
+export function cliTurnEpochPath(cwd: string, owner?: TurnEpochOwner): string {
+  if (!owner) return join(cwd, '.ink', 'cli-turn-epoch.json');
+  // Both parts are UUIDs in practice; encoding keeps any other value inside
+  // one file name (a slash or a dot sequence cannot leave `.ink/`).
+  const session = encodeURIComponent(owner.sessionId);
+  const generation =
+    owner.wrapperGeneration === undefined ? '' : `.${encodeURIComponent(owner.wrapperGeneration)}`;
+  return join(cwd, '.ink', `cli-turn-epoch.${session}${generation}.json`);
 }
 
 export interface CliTurnEpochRecord {
@@ -57,6 +107,42 @@ export interface CliTurnEpochRecord {
   at?: string;
   /** Round 18: which wrapper generation claimed this epoch — see Marker. */
   wrapperGeneration?: string;
+  /**
+   * A tombstone: this owner has moved to its own namespace and its record
+   * was cleared; the legacy single file is not to be read for it again.
+   */
+  retired?: boolean;
+}
+
+function readRecordFile(path: string): CliTurnEpochRecord | null {
+  try {
+    return JSON.parse(readFileSync(path, 'utf-8')) as CliTurnEpochRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Exact ownership: the session AND the generation, generation-less only with generation-less. */
+function ownedBy(
+  record: CliTurnEpochRecord | null,
+  owner: TurnEpochOwner
+): record is CliTurnEpochRecord {
+  return (
+    record !== null &&
+    record.sessionId === owner.sessionId &&
+    (record.wrapperGeneration ?? undefined) === (owner.wrapperGeneration ?? undefined)
+  );
+}
+
+/** A record that names an epoch to end: not a tombstone, not a stub. */
+function isLive(record: CliTurnEpochRecord | null): record is CliTurnEpochRecord {
+  return record !== null && typeof record.turnEpoch === 'string' && record.retired !== true;
+}
+
+function writeAtomic(target: string, body: unknown): void {
+  const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temp, JSON.stringify(body));
+  renameSync(temp, target);
 }
 
 export function writeCliTurnEpoch(
@@ -65,10 +151,9 @@ export function writeCliTurnEpoch(
 ): boolean {
   try {
     mkdirSync(join(cwd, '.ink'), { recursive: true });
-    writeFileSync(
-      cliTurnEpochPath(cwd),
-      JSON.stringify({ ...record, at: new Date().toISOString() })
-    );
+    // Only the owner's own file is written; the shared legacy file is left
+    // exactly as it is (see the header: deleting it is not safe).
+    writeAtomic(cliTurnEpochPath(cwd, record), { ...record, at: new Date().toISOString() });
     return true;
   } catch {
     // Round 11: NOT silently best-effort — the caller must know. A lost
@@ -79,41 +164,71 @@ export function writeCliTurnEpoch(
   }
 }
 
-export function readCliTurnEpoch(cwd: string): CliTurnEpochRecord | null {
-  try {
-    return JSON.parse(readFileSync(cliTurnEpochPath(cwd), 'utf-8')) as CliTurnEpochRecord;
-  } catch {
-    return null;
+/**
+ * The owner's record. An owner file that exists decides on its own: valid
+ * and owned, it is the record; malformed or naming another owner, there is
+ * no record (turnEpochMissing, fail closed) — never a fall-through to the
+ * legacy file. Only an owner with no file at all reads the legacy single
+ * file, and only when that file is exactly its own.
+ */
+export function readCliTurnEpoch(cwd: string, owner: TurnEpochOwner): CliTurnEpochRecord | null {
+  const ownPath = cliTurnEpochPath(cwd, owner);
+  if (existsSync(ownPath)) {
+    const own = readRecordFile(ownPath);
+    return ownedBy(own, owner) && isLive(own) ? own : null;
   }
+  const legacy = readRecordFile(cliTurnEpochPath(cwd));
+  return ownedBy(legacy, owner) && isLive(legacy) ? legacy : null;
 }
 
 /**
- * Clear the record only when it belongs to the given session — and, when
- * `expected` fields are provided, only when they still match (round 19:
- * compare-and-delete; a record replaced by a successor generation during an
- * awaited request must not be deleted by the stale reader).
+ * Clear the record only when it belongs to the given owner — the session and
+ * the generation named in `expected` (a generation-less caller owns only the
+ * generation-less record) — and, when `expected.turnEpoch` is given, only
+ * when it still matches (round 19: compare-and-delete; a record replaced by
+ * a successor during an awaited request must not be deleted by the stale
+ * reader). Retirement is unconditional and lives in the owner's own file:
+ * a live owner record becomes a tombstone; a legacy-only record (the owner
+ * has no file yet) is retired by creating the tombstone exclusively, so a
+ * newer owner-format record is never overwritten and the shared legacy
+ * file is never touched (see the header).
  */
 export function clearCliTurnEpoch(
   cwd: string,
   sessionId: string,
   expected?: { turnEpoch?: string; wrapperGeneration?: string }
 ): void {
-  const record = readCliTurnEpoch(cwd);
-  if (record?.sessionId !== sessionId) return;
-  if (expected?.turnEpoch !== undefined && record.turnEpoch !== expected.turnEpoch) return;
-  if (
-    expected !== undefined &&
-    'wrapperGeneration' in expected &&
-    (record.wrapperGeneration ?? undefined) !== (expected.wrapperGeneration ?? undefined) &&
-    record.wrapperGeneration !== undefined &&
-    expected.wrapperGeneration !== undefined
-  ) {
+  const owner: TurnEpochOwner = { sessionId, wrapperGeneration: expected?.wrapperGeneration };
+  const ownPath = cliTurnEpochPath(cwd, owner);
+  const tombstone = {
+    sessionId,
+    ...(owner.wrapperGeneration !== undefined
+      ? { wrapperGeneration: owner.wrapperGeneration }
+      : {}),
+    retired: true,
+    at: new Date().toISOString(),
+  };
+  const matches = (record: CliTurnEpochRecord | null): boolean =>
+    ownedBy(record, owner) &&
+    isLive(record) &&
+    (expected?.turnEpoch === undefined || record.turnEpoch === expected.turnEpoch);
+
+  if (existsSync(ownPath)) {
+    if (!matches(readRecordFile(ownPath))) return;
+    try {
+      writeAtomic(ownPath, tombstone);
+    } catch {
+      // Best-effort: an unretired live record is re-sent by a later stop.
+    }
     return;
   }
+  if (!matches(readRecordFile(cliTurnEpochPath(cwd)))) return;
   try {
-    rmSync(cliTurnEpochPath(cwd), { force: true });
+    // Exclusive create: if an owner-format record appeared meanwhile it is
+    // newer than the legacy one being retired, and it wins.
+    writeFileSync(ownPath, JSON.stringify(tombstone), { flag: 'wx' });
   } catch {
-    // Best-effort.
+    // Best-effort, or a newer owner record exists.
   }
 }
 
@@ -329,13 +444,14 @@ export function startTakeoverWatcher(opts: {
       await tickOnce();
       let finalized = !opts.finalizeScope;
       if (opts.finalizeScope) {
-        const record = readCliTurnEpoch(opts.cwd);
-        const ownRecord =
-          record?.sessionId === opts.expectedSessionId &&
-          (opts.generation === undefined ||
-            record.wrapperGeneration === undefined ||
-            record.wrapperGeneration === opts.generation);
-        const claimedEpoch = ownRecord ? record?.turnEpoch : undefined;
+        // Task c07f35c8: the read is by OWNER (session and this wrapper's
+        // generation, exactly), so a sibling session's or a successor
+        // generation's record is never mistaken for ours.
+        const record = readCliTurnEpoch(opts.cwd, {
+          sessionId: opts.expectedSessionId,
+          wrapperGeneration: opts.generation,
+        });
+        const claimedEpoch = record?.turnEpoch;
         // A generation that never attempted a claim has nothing parked in
         // the server — and its tombstone could wrongly refuse a successor
         // wrapper's reclaim of an OLDER marker (round 18).

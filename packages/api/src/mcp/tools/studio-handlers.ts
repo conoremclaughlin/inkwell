@@ -17,8 +17,8 @@ import type { DataComposer } from '../../data/composer';
 import type { Json } from '../../data/supabase/types';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
-import { ensureStudioSettings } from '../../services/studio-settings';
+import { isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
+import { completeStudioViaCli, ensureStudioComplete } from '../../services/studio-complete';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { resolveCaller, resolveImplicitSession } from './memory-handlers';
 import {
@@ -114,6 +114,23 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default(false)
     .describe('If true, skip git worktree creation (useful when worktree already exists)'),
+  worktreePath: z
+    .string()
+    .refine((p) => path.isAbsolute(p) && !p.includes('\0'), 'worktreePath must be an absolute path')
+    .optional()
+    .describe(
+      'With skipGitOperations: the worktree as it is. Recorded instead of a sibling path derived from the slug, and an existing row at this path is reused (a repair). Ignored when the server creates the worktree itself.'
+    ),
+  branch: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine(
+      (b) => !b.startsWith('-') && !/[\s~^:?*\[\\]/.test(b) && !b.includes('..'),
+      'branch must be a plausible git ref'
+    )
+    .optional()
+    .describe('With skipGitOperations: the branch the worktree is on. Ignored otherwise.'),
 });
 
 const listStudiosSchema = userIdentifierBaseSchema.extend({
@@ -723,10 +740,86 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     mainRoot = path.resolve(repoRoot);
   }
 
-  // Derive branch name and worktree path (sibling of the main repo root)
+  // Derive branch name and worktree path (sibling of the main repo root).
+  // With the git work already done, the row records the worktree AS IT IS:
+  // a bare checkout at any path or branch used to be recorded at an
+  // invented sibling path on a `feat` branch (Lumen, PR #692 round 1).
   const abbrev = WORK_TYPE_ABBREV[workType] || 'other';
-  const branch = `${actor.sbSlug}/${abbrev}/${slug}`;
-  const worktreePath = studioSiblingPath(mainRoot, slug);
+  const branch =
+    skipGitOperations && parsed.branch ? parsed.branch : `${actor.sbSlug}/${abbrev}/${slug}`;
+  const worktreePath =
+    skipGitOperations && parsed.worktreePath
+      ? path.resolve(parsed.worktreePath)
+      : studioSiblingPath(mainRoot, slug);
+
+  // A repair: the worktree already has a row of the CALLER's. Reuse it
+  // rather than register a second studio at the same path. Rows at one path
+  // may exist per SB, so the lookup is scoped to the caller's slug and the
+  // row is held to the same canonical-ownership rule adopt_studio applies:
+  // another workspace's "wren" is not this caller, and its row is not
+  // reused (Lumen, PR #692 round 2). A cleaned or archived row at a
+  // checkout that exists again is revived deliberately — the session
+  // resolver refuses a cleaned id, so handing one out would read complete
+  // and route nowhere.
+  if (skipGitOperations) {
+    const candidate = await dataComposer.repositories.studios.findByPath(worktreePath, {
+      userId: resolved.user.id,
+      sbSlug: actor.sbSlug,
+    });
+    const existing = candidate && !studioOwnershipMismatch(candidate, actor) ? candidate : null;
+    if (existing) {
+      const revived = existing.status === 'cleaned' || existing.status === 'archived';
+      // Revival tells one coherent story, as the overflow service's does:
+      // the row describes THIS checkout, is neither cleaned nor archived,
+      // and an ephemeral one gets a fresh expiry — status alone would have
+      // left an expired ephemeral row eligible for the sweep's teardown the
+      // moment it came back (Lumen, PR #692 round 3). The response carries
+      // the row as persisted.
+      const studio = revived
+        ? await dataComposer.repositories.studios.update(existing.id, {
+            status: 'active',
+            worktreePath,
+            branch,
+            cleanedAt: null,
+            archivedAt: null,
+            expiresAt: existing.ephemeral
+              ? new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString()
+              : null,
+          })
+        : existing;
+      logger.info(
+        revived
+          ? 'Studio row at this worktree revived for the caller'
+          : 'Studio already registered at this worktree; reusing the row',
+        { studioId: studio.id, worktreePath, sbSlug: actor.sbSlug, previousStatus: existing.status }
+      );
+      return successResponse({
+        message: revived
+          ? `Studio revived at ${worktreePath}`
+          : `Studio already registered at ${worktreePath}`,
+        reused: true,
+        revived,
+        studio: {
+          id: studio.id,
+          studioId: studio.id,
+          slug: studio.slug ?? null,
+          sbSlug: studio.sbSlug,
+          branch: studio.branch,
+          worktreeFolder: path.basename(studio.worktreePath),
+          worktreePath: studio.worktreePath,
+          repoRoot: studio.repoRoot,
+          baseBranch: studio.baseBranch,
+          purpose: studio.purpose,
+          workType: studio.workType,
+          roleTemplate: studio.roleTemplate,
+          defaultProjectId: studio.defaultProjectId,
+          status: studio.status,
+          sessionId: studio.sessionId,
+          createdAt: studio.createdAt,
+        },
+      });
+    }
+  }
 
   // Perform git operations if not skipped
   if (!skipGitOperations) {
@@ -751,46 +844,11 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
           maxBuffer: 20 * 1024 * 1024,
         });
       }
-
-      // Seed local config the same way `ink studio new` does. .mcp.json and
-      // .env.local are gitignored, so `git worktree add` brings neither —
-      // without this the studio has no MCP config at all: Claude sessions get
-      // no tools, and Codex spawns against a partial [mcp_servers.inkwell]
-      // and dies on "invalid transport". Copy from the resolved main root, not
-      // the caller's repoRoot — a linked-worktree caller would otherwise seed
-      // the new studio from its own (possibly customised or missing) config.
-      // Best-effort; a studio that fails to bootstrap is still a usable
-      // worktree.
-      try {
-        const result = bootstrapStudio(mainRoot, worktreePath);
-        logger.info('Bootstrapped studio config', {
-          worktreePath,
-          copied: result.copied,
-          codex: result.codex,
-          gemini: result.gemini,
-        });
-      } catch (bootstrapError) {
-        logger.warn('Studio config bootstrap failed', {
-          worktreePath,
-          error: bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError),
-        });
-      }
     } catch (gitError) {
       const errorMessage = gitError instanceof Error ? gitError.message : String(gitError);
       logger.error('Git worktree creation failed', { error: errorMessage, branch, worktreePath });
       return errorResponse(`Failed to create git worktree: ${errorMessage}`);
     }
-  }
-
-  // Generate .claude/settings.local.json with default permissions + hooks
-  try {
-    await ensureStudioSettings(worktreePath);
-  } catch (settingsError) {
-    // Non-fatal — studio is usable without auto-generated settings
-    logger.warn('Failed to generate studio settings', {
-      worktreePath,
-      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
-    });
   }
 
   // Insert studio record into the database
@@ -813,6 +871,9 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       ephemeral,
       expiresAt,
       metadata: { createdVia: 'create_studio', createdBySessionId: creatorSessionId ?? null },
+      // The chosen slug, explicitly: a worktree at an arbitrary path (the
+      // repair case) derives none from its name.
+      slug,
     });
   } catch (dbError) {
     // If DB insert fails but git succeeded, attempt cleanup
@@ -829,6 +890,19 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     }
     const errorMessage = dbError instanceof Error ? dbError.message : String(dbError);
     return errorResponse(`Failed to save studio record: ${errorMessage}`);
+  }
+
+  // The one routine every creator runs (task c3b34be8): `ink init` in the
+  // new worktree with the row it now has — identity, permissions, hooks and
+  // backend config for every backend, root config synced from the main
+  // worktree. A CLI-created studio registering its row (skipGitOperations)
+  // has already run it itself.
+  if (!skipGitOperations) {
+    await completeStudioViaCli(worktreePath, {
+      sbSlug: actor.sbSlug,
+      studioId: studio.id,
+      ...(purpose ? { purpose } : {}),
+    });
   }
 
   const provenance = await recordStudioProvenance(dataComposer, {
@@ -869,6 +943,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studio: {
       id: studio.id,
       studioId: studio.id,
+      slug: studio.slug ?? null,
       sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
@@ -916,6 +991,7 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
     studios: studios.map((w) => ({
       id: w.id,
       studioId: w.id,
+      slug: w.slug ?? null,
       sbSlug: w.sbSlug,
       branch: w.branch,
       worktreePath: w.worktreePath,
@@ -965,6 +1041,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
     studio: {
       id: studio.id,
       studioId: studio.id,
+      slug: studio.slug ?? null,
       sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
@@ -1064,6 +1141,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     studio: {
       id: updated.id,
       studioId: updated.id,
+      slug: updated.slug ?? null,
       sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),
@@ -1361,15 +1439,12 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     );
   }
 
-  // Ensure settings exist in the worktree (may be first time adopting an old studio)
-  try {
-    await ensureStudioSettings(studio.worktreePath);
-  } catch (settingsError) {
-    logger.warn('Failed to ensure studio settings on adopt', {
-      worktreePath: studio.worktreePath,
-      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
-    });
-  }
+  // An old studio may predate the checklist: complete it now, cheaply when
+  // it is already complete.
+  await ensureStudioComplete(studio.worktreePath, {
+    sbSlug: studio.sbSlug ?? actor.sbSlug,
+    studioId: studio.id,
+  });
 
   // Link session and set to active
   let updated = await studiosRepo.linkSession(studio.id, sessionId);
@@ -1409,6 +1484,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     studio: {
       id: updated.id,
       studioId: updated.id,
+      slug: updated.slug ?? null,
       sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),

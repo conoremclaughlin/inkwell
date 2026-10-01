@@ -213,6 +213,26 @@ export function decodeContextToken(header: string | undefined | null): InkContex
   }
 }
 
+// ─── Channel Host Mode ──────────────────────────────────────
+
+/**
+ * Env a print-mode Claude process (`claude -p` / `--print`) hands its MCP
+ * servers, telling the InkMail channel plugin that its host cannot render a
+ * channel notification.
+ *
+ * A print-mode host accepts the notification and never shows it to the
+ * model. A plugin polling there would still ack each message it pushed — the
+ * ack is the only consumption — and stamp `cli_poll_at`, which steers the
+ * trigger handler to inline delivery instead of queueing a turn. Messages
+ * sent while such a turn ran were read by nobody and reported as delivered
+ * (task 2f892701). Under this env the plugin stays inert.
+ *
+ * Every spawner that runs Claude in print mode must pass it. The plugin reads
+ * the same literal; channel-plugin/host-mode.test.ts launches the real plugin
+ * with this constant, so a rename on either side fails there.
+ */
+export const PRINT_MODE_CHANNEL_ENV = { INK_CHANNEL_HOST: 'print' } as const;
+
 // ─── Session Env ────────────────────────────────────────────
 
 /**
@@ -228,6 +248,12 @@ export function buildSessionEnv(options: {
   runtimeLinkId?: string;
   studioId?: string;
   accessToken?: string;
+  /**
+   * The secret the ink chat child verifies and mints delegation tokens with.
+   * Derived by the server from its signing key; the key itself never crosses
+   * (spec:sender-token-binding v3 §4 Phase 0).
+   */
+  delegationSecret?: string;
   sbSlug?: string;
   cliAttached?: boolean;
   runtime?: string;
@@ -247,6 +273,9 @@ export function buildSessionEnv(options: {
   }
   if (options.accessToken) {
     env.INK_ACCESS_TOKEN = options.accessToken;
+  }
+  if (options.delegationSecret) {
+    env.INK_DELEGATION_SECRET = options.delegationSecret;
   }
 
   // Consolidated context token (new — Phase 1)

@@ -11,8 +11,24 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { decodeJwtPayload, isTokenExpired, loadAuth } from '../auth/tokens.js';
 import { resolveSlug, resolveBackend } from '../backends/index.js';
-import { readIdentityJson } from '../backends/identity.js';
+import { readIdentityJson, type IdentityJson } from '../backends/identity.js';
 import { getInkServerUrl } from '../lib/ink-mcp.js';
+import { detectWorktree, type WorktreePlacement } from './init.js';
+
+/**
+ * The one line that names the repair when a studio has no identity file.
+ * "Agent: unresolved" used to be the whole report, and the reader was left
+ * to guess that `ink init` was the answer (Lumen's Inktrade studio,
+ * 2026-09-29). Null when there is nothing to repair here: the main worktree
+ * resolves identity from ~/.ink/config.json and needs no identity file.
+ */
+export function studioRepairHint(
+  placement: Pick<WorktreePlacement, 'linked'>,
+  identity: Pick<IdentityJson, 'sbSlug'> | null
+): string | null {
+  if (!placement.linked || identity?.sbSlug) return null;
+  return 'This studio has no .ink/identity.json, so sessions here are booked to the root studio. Repair: ink init';
+}
 
 type StatusBackend = 'claude' | 'codex' | 'gemini';
 
@@ -203,6 +219,8 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
 
   console.log(chalk.bold('\nSB Status\n'));
   console.log(`  ${chalk.bold('Agent:')}   ${sbSlug}`);
+  const repairHint = studioRepairHint(detectWorktree(cwd), identity);
+  if (repairHint) console.log(chalk.yellow(`  ⚠ ${repairHint}`));
   console.log(`  ${chalk.bold('Backend:')} ${backend}`);
   if (identity?.sbId) {
     console.log(`  ${chalk.bold('Identity:')} ${chalk.dim(identity.sbId)}`);

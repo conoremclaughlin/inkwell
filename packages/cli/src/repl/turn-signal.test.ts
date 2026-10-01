@@ -18,6 +18,7 @@ function makeDeps(overrides: Partial<TurnSignalDeps> = {}) {
   const deps: TurnSignalDeps = {
     getSessionId: () => 'sess-1',
     sbSlug: 'wren',
+    cliAttached: true,
     getServerUrl: () => 'http://localhost:3001/',
     getToken: async () => 'tok-abc',
     workingDir: '/work/tree',
@@ -148,6 +149,47 @@ describe('createTurnSignal', () => {
     await createTurnSignal(deps).open();
     const init = fetchImpl.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
+  });
+});
+
+/**
+ * PR #685 r3 (Lumen): a headless chat's provider children no longer write
+ * the attachment, so the owner must. It declares cliAttached:false in the
+ * same request that opens the turn, never in a separate detach.
+ */
+describe('the owner declares its attachment when it opens a turn', () => {
+  it('a headless owner declares cliAttached:false in its prompt request', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false });
+    await expect(createTurnSignal(deps).open()).resolves.toBe(true);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(bodyOf(fetchImpl)).toEqual({
+      sessionId: 'sess-1',
+      lifecycle: 'running',
+      event: 'prompt',
+      sbSlug: 'wren',
+      workingDir: '/work/tree',
+      cliAttached: false,
+    });
+  });
+
+  it('an attached owner writes no attachment when it opens (its children still do)', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: true });
+    await createTurnSignal(deps).open();
+    expect(bodyOf(fetchImpl)).not.toHaveProperty('cliAttached');
+  });
+
+  it('a headless owner declares it at every open and never on its stop', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false });
+    const signal = createTurnSignal(deps);
+    await signal.open();
+    await signal.close();
+    await signal.open();
+
+    expect(bodyOf(fetchImpl, 0)).toMatchObject({ event: 'prompt', cliAttached: false });
+    expect(bodyOf(fetchImpl, 1).event).toBe('stop');
+    expect(bodyOf(fetchImpl, 1)).not.toHaveProperty('cliAttached');
+    expect(bodyOf(fetchImpl, 2)).toMatchObject({ event: 'prompt', cliAttached: false });
   });
 });
 
@@ -310,5 +352,59 @@ describe('turn-epoch round-trip (round 11)', () => {
     expect(lastBody.event).toBe('stop');
     expect(lastBody.turnEpochMissing).toBe(true);
     expect('turnEpoch' in lastBody).toBe(false);
+  });
+});
+
+/**
+ * A chat the server spawned for one run names that run's epoch instead of
+ * claiming its own. Claiming fenced the run out of its own finalize on every
+ * ink-backed run (2026-09-29). The route side is pinned by
+ * api/src/routes/hook-lifecycle.server-run.test.ts.
+ */
+describe("a server run's chat (runTurnEpoch)", () => {
+  it('declares itself headless and names the run epoch on open, close and detach', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false, runTurnEpoch: 'run-epoch' });
+    const signal = createTurnSignal(deps);
+
+    await expect(signal.open()).resolves.toBe(true);
+    await expect(signal.close()).resolves.toBe(true);
+    await expect(signal.detach()).resolves.toBe(true);
+
+    for (const call of [0, 1, 2]) {
+      expect(bodyOf(fetchImpl, call)).toMatchObject({ headless: true, turnEpoch: 'run-epoch' });
+    }
+    expect(bodyOf(fetchImpl, 0).event).toBe('prompt');
+    expect(bodyOf(fetchImpl, 1).event).toBe('stop');
+    expect('turnEpochMissing' in bodyOf(fetchImpl, 1)).toBe(false);
+  });
+
+  it('keeps naming the run epoch when a response carries another', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => ({ success: true, turnEpoch: 'someone-elses' }),
+        }) as Response
+    );
+    const { deps } = makeDeps({ fetchImpl, cliAttached: false, runTurnEpoch: 'run-epoch' });
+    const signal = createTurnSignal(deps);
+
+    await signal.open();
+    await signal.close();
+
+    expect(bodyOf(fetchImpl, 1).turnEpoch).toBe('run-epoch');
+  });
+
+  it('control: without a run epoch nothing declares headless, and the stop sends what open claimed', async () => {
+    const { deps, fetchImpl } = makeDeps({ cliAttached: false, runTurnEpoch: '  ' });
+    const signal = createTurnSignal(deps);
+
+    await signal.open();
+    await signal.close();
+    await signal.detach();
+
+    for (const call of [0, 1, 2]) expect('headless' in bodyOf(fetchImpl, call)).toBe(false);
+    expect(bodyOf(fetchImpl, 1).turnEpochMissing).toBe(true);
   });
 });

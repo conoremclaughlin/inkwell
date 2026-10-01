@@ -6,3 +6,4 @@ export * from './runner/index.js';
 export * from './identity.js';
 export * from './studio/index.js';
 export * from './google/index.js';
+export * from './inkmail/index.js';

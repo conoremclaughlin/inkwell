@@ -135,3 +135,97 @@ describe('analyzeCliLink', () => {
     expect(result.checks.some((check) => check.name === 'Studio target match')).toBe(true);
   });
 });
+
+describe('studio checklist as doctor checks (task c3b34be8)', () => {
+  const audit = (overrides: Partial<{ ok: boolean; required: boolean }>[]) => ({
+    worktreePath: '/w',
+    linked: true,
+    checks: overrides.map((o, i) => ({
+      id: 'mcp-json' as const,
+      label: `item ${i}`,
+      ok: o.ok ?? true,
+      required: o.required ?? true,
+      detail: o.ok === false ? 'missing' : 'present',
+      repair: 'ink init',
+    })),
+    missing: [],
+    complete: overrides.every((o) => o.ok !== false || o.required === false),
+  });
+
+  it('a required missing item fails, a reported-only one warns, and each names the repair', async () => {
+    const { studioChecksFrom } = await import('./doctor.js');
+    const checks = studioChecksFrom(
+      audit([{ ok: true }, { ok: false }, { ok: false, required: false }]),
+      'not-applicable'
+    );
+    expect(checks.map((c) => c.status)).toEqual(['ok', 'fail', 'warn']);
+    expect(checks[1].detail).toContain('ink init');
+    expect(checks[2].detail).toContain('ink init');
+    expect(checks.every((c) => c.name.startsWith('Studio: '))).toBe(true);
+  });
+
+  it('registration is a check of its own for a linked worktree and absent for the main one', async () => {
+    const { studioChecksFrom } = await import('./doctor.js');
+    const base = audit([{ ok: true }]);
+    expect(studioChecksFrom(base, 'not-applicable').map((c) => c.name)).toEqual(['Studio: item 0']);
+    expect(studioChecksFrom(base, 'registered').at(-1)?.status).toBe('ok');
+    expect(studioChecksFrom(base, 'unregistered').at(-1)?.status).toBe('fail');
+    expect(studioChecksFrom(base, 'unreachable').at(-1)?.status).toBe('warn');
+  });
+});
+
+describe('doctor: the registration probe (task 2841c7a9)', () => {
+  const row = { success: true, studio: { id: '191b7705-85bd-4c76-b622-43f655bf7fd6' } };
+
+  it('an id from identity.json is checked as that id', async () => {
+    const { probeRegistration } = await import('./doctor.js');
+    const call = vi.fn(async () => row);
+    expect(
+      await probeRegistration('191b7705-85bd-4c76-b622-43f655bf7fd6', '/repo--alpha', call)
+    ).toBe('registered');
+    expect(call).toHaveBeenCalledWith(
+      'get_studio',
+      { studioId: '191b7705-85bd-4c76-b622-43f655bf7fd6' },
+      { idempotent: true }
+    );
+  });
+
+  it('without an id, a row the server has for this path is "unrecorded", not "no studio row"', async () => {
+    // Lumen's Inktrade studio on 2026-09-29: created by the server, never
+    // given an identity file. `ink doctor` said the server had no row for it
+    // while `get_studio` by path returned one.
+    const { probeRegistration } = await import('./doctor.js');
+    const call = vi.fn(async () => row);
+    expect(await probeRegistration(undefined, '/repo--alpha', call)).toBe('unrecorded');
+    expect(call).toHaveBeenCalledWith('get_studio', { path: '/repo--alpha' }, { idempotent: true });
+  });
+
+  it('without an id and without a row it is unregistered; a server failure is unreachable', async () => {
+    const { probeRegistration } = await import('./doctor.js');
+    const notFound = vi.fn(async () => {
+      throw new Error('Inkwell tool error: Studio not found');
+    });
+    expect(await probeRegistration(undefined, '/repo--alpha', notFound)).toBe('unregistered');
+    const down = vi.fn(async () => {
+      throw new Error('Inkwell fetch failed for http://localhost:3001/mcp: fetch failed');
+    });
+    expect(await probeRegistration(undefined, '/repo--alpha', down)).toBe('unreachable');
+  });
+
+  it('"unrecorded" fails the check and names identity.json and the repair', async () => {
+    const { studioChecksFrom } = await import('./doctor.js');
+    const check = studioChecksFrom(
+      {
+        worktreePath: '/repo--alpha',
+        linked: true,
+        checks: [],
+        missing: [],
+        complete: true,
+      },
+      'unrecorded'
+    ).at(-1);
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toContain('identity.json');
+    expect(check?.detail).toContain('ink init');
+  });
+});

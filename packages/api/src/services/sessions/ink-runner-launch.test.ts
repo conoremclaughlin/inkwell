@@ -27,6 +27,9 @@ vi.mock('../ink-cli', async (importOriginal) => ({
 vi.mock('@inklabs/shared', () => ({
   injectSessionHeaders: vi.fn(() => null),
   buildSessionEnv: vi.fn(() => ({})),
+  // Passthrough: this file is about the launch command, not the env allowlist
+  // (that is ink-runner.spawn-env.test.ts, on the real builder).
+  buildCleanEnv: vi.fn((extra?: Record<string, string>) => ({ ...extra })),
   writeRuntimeSessionHint: vi.fn(),
 }));
 

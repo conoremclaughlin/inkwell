@@ -50,7 +50,6 @@ vi.mock('../studio-paths.js', () => ({
   ensureInkStudiosRoot: vi.fn(async () => {}),
 }));
 vi.mock('../studio-settings.js', () => ({
-  ensureStudioSettings: vi.fn(async () => {}),
   applyPermissionOverlay: vi.fn(async () => async () => {}),
 }));
 

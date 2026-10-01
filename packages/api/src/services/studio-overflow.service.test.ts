@@ -38,6 +38,51 @@ import type { StudioLeaseService, StudioLease } from './studio-lease.service';
 import { readCheckoutPin } from './studio-lease.service';
 import { ephemeralWorktreePath } from './studio-paths';
 
+/**
+ * The completion routine (`ink init` through this checkout's CLI, task
+ * c3b34be8) is mocked: its file writes are pinned in its own suites, and
+ * running the real CLI here would reach a live server for skills. What this
+ * suite pins is the boundary — that it runs after the row exists and, for a
+ * review checkout, after the PR-supplied startup config was quarantined.
+ */
+const completion = vi.hoisted(() => ({
+  calls: [] as Array<{
+    worktreePath: string;
+    studioId?: string;
+    sbSlug: string;
+    present: string[];
+  }>,
+}));
+vi.mock('./studio-complete', async () => {
+  const { lstat: lstatAt } = await import('fs/promises');
+  const pathMod = await import('path');
+  return {
+    completeStudioViaCli: vi.fn(
+      async (worktreePath: string, opts: { sbSlug: string; studioId?: string }) => {
+        const present: string[] = [];
+        for (const rel of ['.mcp.json', '.env.local', '.env', '.claude', '.codex', '.gemini']) {
+          if (
+            await lstatAt(pathMod.join(worktreePath, rel)).then(
+              () => true,
+              () => false
+            )
+          ) {
+            present.push(rel);
+          }
+        }
+        completion.calls.push({
+          worktreePath,
+          studioId: opts.studioId,
+          sbSlug: opts.sbSlug,
+          present,
+        });
+        return { ok: true, complete: true, missing: [] };
+      }
+    ),
+    ensureStudioComplete: vi.fn(async () => ({ ok: true, complete: true, missing: [] })),
+  };
+});
+
 // Every ephemeral mint in this file materializes under an isolated root —
 // never the real ~/.ink/studios. Restored so parallel-worker siblings that
 // share this process env are unaffected after the file completes.
@@ -883,6 +928,155 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
   });
 });
 
+describe('StudioOverflowService.ensureParentStudio — a closed home is revived', () => {
+  /**
+   * A studios repository over ONE row: findBySlug reads the row as it stands
+   * and update applies the patch it receives, so a second ensure sees what
+   * the first one wrote rather than a stale fixture.
+   */
+  function oneRowStudios(row: Studio) {
+    let current = row;
+    const updates: Array<Record<string, unknown>> = [];
+    const studios = {
+      findById: vi.fn(),
+      findBySlug: vi.fn(async (_userId: string, slug: string) =>
+        slug === current.slug ? current : null
+      ),
+      findByRepoRoot: vi.fn().mockResolvedValue(null),
+      create: vi.fn(),
+      update: vi.fn(async (id: string, patch: Record<string, unknown>) => {
+        updates.push(patch);
+        if (id !== current.id) throw new Error(`no studio ${id}`);
+        current = { ...current, ...(patch as Partial<Studio>) };
+        return current;
+      }),
+    } as unknown as StudiosRepository;
+    return { studios, updates, current: () => current };
+  }
+
+  /** The home the 2026-09-28 PR session closed: cleaned, its branch kept. */
+  async function closedHome(repoRoot: string, overrides: Partial<Studio> = {}): Promise<Studio> {
+    await execFileAsync('git', ['branch', 'lumen/studio/lumen'], { cwd: repoRoot });
+    const slug = `${path.basename(repoRoot)}--lumen`;
+    return makeStudio({
+      id: 'home-1',
+      sbSlug: 'lumen',
+      sbId: 'sb-lumen',
+      repoRoot,
+      slug,
+      worktreePath: path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--${slug}`),
+      branch: 'lumen/studio/lumen',
+      purpose: 'Home studio for lumen (auto-created)',
+      defaultProjectId: null,
+      status: 'cleaned',
+      cleanedAt: '2026-09-28T08:57:57.069Z',
+      metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
+      ...overrides,
+    });
+  }
+
+  async function removeWorktree(repoRoot: string, worktreePath: string): Promise<void> {
+    await execFileAsync('git', ['worktree', 'remove', '--force', worktreePath], {
+      cwd: repoRoot,
+    }).catch(() => undefined);
+  }
+
+  it('revives its own cleaned home onto a fresh worktree on the surviving branch', async () => {
+    const repoRoot = await makeGitRepo();
+    const home = await closedHome(repoRoot);
+    const { studios, updates } = oneRowStudios(home);
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    completion.calls.length = 0;
+    try {
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureParentStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        repoRoot,
+        sbId: 'sb-lumen',
+      });
+
+      expect(result?.id).toBe('home-1');
+      expect(result?.status).toBe('active');
+      expect(studios.create).not.toHaveBeenCalled();
+      // The whole revive transition, not a status flip.
+      expect(updates).toEqual([
+        {
+          status: 'active',
+          worktreePath: home.worktreePath,
+          branch: 'lumen/studio/lumen',
+          cleanedAt: null,
+          archivedAt: null,
+          expiresAt: null,
+        },
+      ]);
+      // A real checkout, attached to the branch the teardown kept.
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: home.worktreePath,
+      });
+      expect(stdout.trim()).toBe('lumen/studio/lumen');
+      // Completed as a new home is, against the revived row's id.
+      expect(completion.calls).toEqual([
+        expect.objectContaining({ worktreePath: home.worktreePath, studioId: 'home-1' }),
+      ]);
+    } finally {
+      await removeWorktree(repoRoot, home.worktreePath);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('two concurrent ensures for one closed home converge on the single revived row', async () => {
+    const repoRoot = await makeGitRepo();
+    const home = await closedHome(repoRoot);
+    const { studios, updates } = oneRowStudios(home);
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    try {
+      const service = new StudioOverflowService(studios, leases);
+      const ensure = () =>
+        service.ensureParentStudio({
+          userId: 'user-1',
+          sbSlug: 'lumen',
+          repoRoot,
+          sbId: 'sb-lumen',
+        });
+      const [first, second] = await Promise.all([ensure(), ensure()]);
+
+      // Held triggers are not retried, so the loser of a git race must not
+      // come back null: it finds the winner's live row and reuses it.
+      expect(first?.id).toBe('home-1');
+      expect(second?.id).toBe('home-1');
+      expect(updates).toHaveLength(1);
+    } finally {
+      await removeWorktree(repoRoot, home.worktreePath);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("still refuses a cleaned row at the slug that is another identity's", async () => {
+    const repoRoot = await makeGitRepo();
+    const home = await closedHome(repoRoot, { sbId: 'sb-another-lumen' });
+    const { studios } = oneRowStudios(home);
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    try {
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureParentStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        repoRoot,
+        sbId: 'sb-lumen',
+      });
+
+      expect(result).toBeNull();
+      expect(studios.update).not.toHaveBeenCalled();
+      expect(studios.create).not.toHaveBeenCalled();
+      await expect(access(home.worktreePath)).rejects.toThrow();
+    } finally {
+      await removeWorktree(repoRoot, home.worktreePath);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
   it('refuses to tear down a non-ephemeral studio', async () => {
     const studios = { markCleaned: vi.fn() } as unknown as StudiosRepository;
@@ -1399,6 +1593,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         logEvent: vi.fn(),
       } as unknown as StudioLeaseService);
 
+      completion.calls.length = 0;
       const revived = await service.ensureOverflowStudio({
         userId: 'user-1',
         sbSlug: 'lumen',
@@ -1415,6 +1610,12 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         note: 'keep me',
         checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
       });
+      // The revived row sits on a FRESH worktree, so it is completed exactly
+      // as a created one is: with the row's id, after the row was updated.
+      // Every review round after the first takes this path (task 2841c7a9).
+      expect(completion.calls).toEqual([
+        expect.objectContaining({ worktreePath: worktree, studioId: 'stale-row', sbSlug: 'lumen' }),
+      ]);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1586,22 +1787,19 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       });
       expect(result?.id).toBe('new-primary');
 
-      // The PR's MCP server is gone; the main root's trusted copy is in place.
-      const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
-      expect(Object.keys(mcp.mcpServers)).toEqual(['trusted']);
-      // The PR's hook is gone; our generated settings stand alone.
-      const settings = JSON.parse(
-        await readFile(path.join(worktree, '.claude', 'settings.local.json'), 'utf8')
-      );
-      expect(JSON.stringify(settings)).not.toContain('PR-HOOK-RAN');
-      expect(settings.permissions?.allow?.length).toBeGreaterThan(0);
-      // Per-backend configs were regenerated from the trusted copy, not the PR's.
-      const codex = await readFile(path.join(worktree, '.codex', 'config.toml'), 'utf8');
-      expect(codex).not.toContain('pr-trap');
-      const gemini = await readFile(path.join(worktree, '.gemini', 'settings.json'), 'utf8');
-      expect(gemini).not.toContain('pr-trap');
-      // The PR's root .env is gone too: Gemini would have loaded it at startup.
-      await expect(access(path.join(worktree, '.env'))).rejects.toBeDefined();
+      // Every PR-supplied startup path is gone from the checkout — the MCP
+      // server, the hook, the per-backend configs, the root .env Gemini
+      // would have loaded — and the completion routine ran AFTER that, on
+      // a checkout holding none of them, with the row it now has. Its own
+      // suites pin that what it then writes comes from the main worktree.
+      for (const rel of ['.mcp.json', '.claude', '.codex', '.gemini', '.env']) {
+        await expect(access(path.join(worktree, rel))).rejects.toBeDefined();
+      }
+      const ran = completion.calls.find((c) => c.worktreePath === worktree);
+      expect(ran).toBeDefined();
+      expect(ran?.studioId).toBe('new-primary');
+      expect(ran?.sbSlug).toBe('lumen');
+      expect(ran?.present).toEqual([]);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1637,13 +1835,12 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       expect(result?.id).toBe('new-primary');
       // Nothing was written where the link pointed.
       await expect(access(path.join(outside, 'settings.local.json'))).rejects.toBeDefined();
-      // The checkout's .claude is a real directory of ours, not the PR's link.
-      const entry = await lstat(path.join(worktree, '.claude'));
-      expect(entry.isSymbolicLink()).toBe(false);
-      expect(entry.isDirectory()).toBe(true);
-      await expect(
-        access(path.join(worktree, '.claude', 'settings.local.json'))
-      ).resolves.toBeUndefined();
+      // The PR's link is gone by the time the completion routine runs, so
+      // the settings it writes land in a real directory of ours (its own
+      // suites pin that it refuses to write through a link that survives).
+      await expect(lstat(path.join(worktree, '.claude'))).rejects.toBeDefined();
+      const ran = completion.calls.find((c) => c.worktreePath === worktree);
+      expect(ran?.present).not.toContain('.claude');
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1691,12 +1888,127 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
       expect(Object.keys(mcp.mcpServers)).toEqual(['base-own']);
       expect(await readFile(path.join(worktree, '.env'), 'utf8')).toBe('BASE_OWN=1\n');
+      // The routine ran on a checkout that kept its trusted config.
+      const ran = completion.calls.find((c) => c.worktreePath === worktree);
+      expect(ran?.present).toEqual(expect.arrayContaining(['.mcp.json', '.env']));
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
       }).catch(() => undefined);
       await rm(repoRoot, { recursive: true, force: true });
       await rm(origin, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('StudioOverflowService — the parent must be in the thread’s project repo (task b5c71bc3)', () => {
+  /*
+   * Thread `inktrade:pr:1` routed to an Inkwell studio, and this service minted
+   * its checkout from that parent's repo — detached at inkwell's
+   * refs/pull/1/head, the wrong repository's PR #1. Routing now resolves the
+   * project's repo and passes it here as `expectedRepoRoot`; a parent in any
+   * other repo is refused outright, before a slug is read or a worktree is
+   * touched. Null is the documented "hold the message" outcome.
+   */
+  function doubles() {
+    const studios = {
+      findBySlug: vi.fn(),
+      findById: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    return { studios, leases };
+  }
+
+  it('ensureOverflowStudio refuses a parent outside the expected repo without reading or minting anything', async () => {
+    const { studios, leases } = doubles();
+    const service = new StudioOverflowService(studios, leases);
+
+    const result = await service.ensureOverflowStudio({
+      userId: 'user-1',
+      sbSlug: 'lumen',
+      parentStudio: makeStudio({ repoRoot: '/ws/pcp/inkwell' }),
+      threadKey: 'inktrade:pr:1',
+      expectedRepoRoot: '/ws/inktrade',
+    });
+
+    expect(result).toBeNull();
+    expect(studios.findBySlug).not.toHaveBeenCalled();
+    expect(studios.create).not.toHaveBeenCalled();
+    expect(studios.update).not.toHaveBeenCalled();
+    expect(leases.logEvent).not.toHaveBeenCalled();
+  });
+
+  it('ensureOverflowStudio proceeds when the parent is in the expected repo', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-project-'));
+    try {
+      const existing = makeStudio({
+        id: 'eph-inktrade-1',
+        slug: 'review-inktrade--inktrade-pr-1',
+        repoRoot: '/ws/inktrade',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'inktrade:pr:1',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const { studios, leases } = doubles();
+      (studios.findBySlug as ReturnType<typeof vi.fn>).mockResolvedValue(existing);
+      const service = new StudioOverflowService(studios, leases);
+
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ slug: 'review-inktrade', repoRoot: '/ws/inktrade' }),
+        threadKey: 'inktrade:pr:1',
+        expectedRepoRoot: '/ws/inktrade',
+      });
+
+      expect(result?.id).toBe('eph-inktrade-1');
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  it('findOverflowStudio never hands back an overflow hanging off a parent in another repo', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-project-find-'));
+    try {
+      // The mis-repo overflow row from the incident: live, matching thread,
+      // parent in inkwell. Without the guard it is "the placement" and the
+      // reviewer lands in inkwell PR #1 again.
+      const wrongRepo = makeStudio({
+        id: 'eph-wrong-repo',
+        slug: 'lumen-review--inktrade-pr-1',
+        repoRoot: '/ws/pcp/inkwell',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'inktrade:pr:1',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const { studios, leases } = doubles();
+      (studios.findBySlug as ReturnType<typeof vi.fn>).mockResolvedValue(wrongRepo);
+      const service = new StudioOverflowService(studios, leases);
+
+      const unguarded = await service.findOverflowStudio({
+        userId: 'user-1',
+        parentStudio: makeStudio({ repoRoot: '/ws/pcp/inkwell' }),
+        threadKey: 'inktrade:pr:1',
+      });
+      // Control: the same row IS found when no repo is expected, so the null
+      // below is the guard and not a fixture that matches nothing.
+      expect(unguarded?.id).toBe('eph-wrong-repo');
+
+      const guarded = await service.findOverflowStudio({
+        userId: 'user-1',
+        parentStudio: makeStudio({ repoRoot: '/ws/pcp/inkwell' }),
+        threadKey: 'inktrade:pr:1',
+        expectedRepoRoot: '/ws/inktrade',
+      });
+      expect(guarded).toBeNull();
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
     }
   });
 });

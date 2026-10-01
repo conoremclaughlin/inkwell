@@ -1,5 +1,6 @@
-import { spawnBackend } from '@inklabs/shared';
+import { spawnBackend, sessionEnvHandoff } from '@inklabs/shared';
 import { getBackend } from '../backends/index.js';
+import { PARENT_OWNED_TURN_ENV } from '../lib/turn-owner.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import type { TurnMedia } from '../backends/types.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
@@ -75,6 +76,13 @@ export interface BackendRunRequest {
   media?: TurnMedia[];
   /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
   deliverMedia?: boolean;
+  /**
+   * Whether the chat process that owns this turn is attached — an
+   * interactive REPL, not `--non-interactive`/`--message`. Required: the
+   * spawned backend inherits the parent's INK_SESSION_ID, and its hooks
+   * write this value onto that session (see BackendConfig.cliAttached).
+   */
+  cliAttached: boolean;
 }
 
 export interface BackendRunResult {
@@ -123,6 +131,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     toolRouting: request.toolRouting,
     media: request.media,
     deliverMedia: request.deliverMedia,
+    cliAttached: request.cliAttached,
   });
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;
@@ -149,7 +158,12 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const { child, result } = spawnBackend({
     binary: prepared.binary,
     args: prepared.args,
-    env: prepared.env,
+    // Every caller is `ink chat`, which owns the logical turn of the session
+    // this child inherits (lib/turn-owner.ts). The child serves THIS session,
+    // so this process hands it its own session credentials and identity by
+    // exact name (sessionEnvHandoff); buildCleanEnv inherits none of them on
+    // its own, and the adapter's prepared env still wins where it sets one.
+    env: { ...sessionEnvHandoff(), ...prepared.env, ...PARENT_OWNED_TURN_ENV },
     stdinData: prepared.stdinData,
     timeoutMs: request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS,
     idleTimeoutMs: request.idleTimeoutMs,

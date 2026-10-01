@@ -62,3 +62,54 @@ describe('handleTriggerAgent — authenticated-user stamping (PR #487)', () => {
     expect(dispatchTrigger.mock.calls[0][0]).not.toHaveProperty('recipientUserId');
   });
 });
+
+describe('handleTriggerAgent — anchor provenance (PR #681 round 3)', () => {
+  // A recipientSessionId / studio the CALLER passes here is addressing, the
+  // same way it is on send_to_inbox. Without the flag the trigger handler
+  // reads it as an inferred continuity hint and, on a project-pinned thread,
+  // drops a genuinely explicit session that sits outside the project repo.
+  it('marks a caller-passed recipientSessionId as an explicit target', async () => {
+    dispatchTrigger.mockClear();
+    resolveUserMock.mockResolvedValue({ user: { id: 'user-123' }, resolvedBy: 'token' });
+    await handleTriggerAgent(
+      {
+        toSlug: 'aster',
+        fromSlug: 'wren',
+        triggerType: 'message',
+        threadKey: 'inktrade:pr:1',
+        priority: 'normal',
+        recipientSessionId: '00000000-0000-4000-8000-000000000681',
+      } as never,
+      {} as never
+    );
+    expect(dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientSessionId: '00000000-0000-4000-8000-000000000681',
+        explicitRecipientTarget: true,
+      })
+    );
+  });
+
+  it('marks a caller-passed studio as an explicit target, and a bare trigger as none', async () => {
+    dispatchTrigger.mockClear();
+    resolveUserMock.mockResolvedValue({ user: { id: 'user-123' }, resolvedBy: 'token' });
+    await handleTriggerAgent(
+      {
+        toSlug: 'aster',
+        fromSlug: 'wren',
+        triggerType: 'message',
+        priority: 'normal',
+        studioHint: 'aster-main',
+      } as never,
+      {} as never
+    );
+    expect(dispatchTrigger.mock.calls[0][0]).toMatchObject({ explicitRecipientTarget: true });
+
+    dispatchTrigger.mockClear();
+    await handleTriggerAgent(
+      { toSlug: 'aster', fromSlug: 'wren', triggerType: 'message', priority: 'normal' } as never,
+      {} as never
+    );
+    expect(dispatchTrigger.mock.calls[0][0]).not.toHaveProperty('explicitRecipientTarget');
+  });
+});

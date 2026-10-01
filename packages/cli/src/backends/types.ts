@@ -84,6 +84,16 @@ export interface BackendConfig {
    * (server heartbeat/reattach) — the latter MUST embed.
    */
   deliverMedia?: boolean;
+  /**
+   * Whether a human-facing process that can deliver inline messages owns
+   * this spawn's session — carried in the INK_CONTEXT token the backend's
+   * hooks read. The spawner knows; the adapter cannot. A child of a headless
+   * `ink chat` inherits its parent's INK_SESSION_ID, so a child that claims
+   * attachment marks the parent's session attached, and the trigger handler
+   * then skips the spawn and delivers inline to nobody. Undefined keeps the
+   * adapters' default: attached.
+   */
+  cliAttached?: boolean;
 }
 
 export interface PreparedBackend {

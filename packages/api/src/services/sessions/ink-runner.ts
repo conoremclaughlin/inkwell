@@ -30,6 +30,8 @@ import { resolveInkCli, inkCliSpawn } from '../ink-cli.js';
 import {
   injectSessionHeaders,
   buildSessionEnv,
+  buildCleanEnv,
+  RUN_TURN_EPOCH_ENV,
   writeRuntimeSessionHint,
   describeExitResult,
   type ErrorClassification,
@@ -434,10 +436,13 @@ export class InkRunner implements IRunner {
       inkSessionId: config.inkSessionId,
       studioId: config.studioId,
       sbSlug: config.sbSlug,
+      delegationSecret: config.inkDelegationSecret,
     });
 
-    const env: Record<string, string> = {
-      ...process.env,
+    // The child inherits an allowlist of the server's env (buildCleanEnv),
+    // never the whole of it: spec:sender-token-binding Phase 0. Everything
+    // else it needs is set here, explicitly.
+    const env = buildCleanEnv({
       ...sessionEnv,
       PATH: spawnPath,
       SB_SLUG: config.sbSlug || '',
@@ -448,10 +453,11 @@ export class InkRunner implements IRunner {
       // (bootstrap, tools) without depending on the human's ~/.ink/auth.json.
       // getValidAccessToken() checks INK_ACCESS_TOKEN before any file source.
       ...(config.inkAccessToken ? { INK_ACCESS_TOKEN: config.inkAccessToken } : {}),
-    } as Record<string, string>;
-
-    // Strip CLAUDECODE to prevent nested-session detection
-    delete env.CLAUDECODE;
+      // The run's own epoch. The chat's turn signal names it on every
+      // lifecycle request; without it the chat claimed a fresh epoch at each
+      // outer turn and this run's finalize matched zero rows.
+      ...(config.turnEpoch ? { [RUN_TURN_EPOCH_ENV]: config.turnEpoch } : {}),
+    }) as Record<string, string>;
 
     // Turn-scope the observer replay tail: drop anything buffered from a prior
     // turn so an attach mid-turn replays only THIS turn's events, and an attach

@@ -20,7 +20,7 @@
  * onto the screen (Lumen, PR #575 round 3). One coordinate system, no
  * heuristics.
  */
-import { fenceOpenAtEnd } from './imitation-grammar.js';
+import { fenceOpenAtEnd } from '@inklabs/shared/runtime';
 
 export interface ParagraphSpan {
   /** The paragraph, trimmed — exactly `raw.slice(start, end)`. */

@@ -1,22 +1,17 @@
 /**
- * Studio Bootstrap
- *
- * One entry point for making a freshly-created worktree usable by an agent.
+ * Studio bootstrap files
  *
  * `.mcp.json` and `.env.local` are gitignored, so `git worktree add` brings
- * neither — a new studio starts with no MCP configuration at all. Whoever
- * creates the worktree has to seed it, and there are two creators: `ink studio
- * new` in the CLI and the `create_studio` MCP tool on the server. Only the CLI
- * ever did, which left agent-created studios with no `.mcp.json` (so Claude
- * sessions got no MCP tools) and no `.codex/config.toml` (so Codex spawned
- * against a partial `[mcp_servers.inkwell]` and died on "invalid transport").
- *
- * Both callers go through bootstrapStudio() so the two can't drift again.
+ * neither — a new studio starts with no MCP configuration at all. Copying
+ * them from the main worktree is the first step of completing a studio, and
+ * it lives here because both the CLI's completion routine (`ink init`,
+ * packages/cli/src/lib/studio-complete.ts) and this package's config sync
+ * need it. The routine itself, which every creator runs, is `ink init`; the
+ * server reaches it through packages/api/src/services/studio-complete.ts.
  */
 
 import { existsSync, cpSync, lstatSync } from 'fs';
 import { join } from 'path';
-import { syncMcpConfig } from './mcp-config-sync.js';
 
 /** Local-only files a worktree needs but git will never provide. */
 export const BOOTSTRAP_FILES = ['.mcp.json', '.env.local'] as const;
@@ -61,20 +56,4 @@ export function copyBootstrapFiles(sourceRoot: string, studioPath: string): stri
     copied.push(file);
   }
   return copied;
-}
-
-/**
- * Seed a new studio's local config, then generate the per-backend files.
- *
- * Order matters: syncMcpConfig reads `.mcp.json` from the studio, so the copy
- * has to land first or the sync silently no-ops and the studio ships without a
- * `.codex/config.toml`.
- *
- * Best-effort by design — a studio that fails to bootstrap is still a usable
- * worktree, and callers should not abort worktree creation over it.
- */
-export function bootstrapStudio(sourceRoot: string, studioPath: string): BootstrapStudioResult {
-  const copied = copyBootstrapFiles(sourceRoot, studioPath);
-  const { codex, gemini } = syncMcpConfig(studioPath);
-  return { copied, codex, gemini };
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { isTerminalSignalToolResult } from './chat.js';
-import { toolLoopStopReason } from '../repl/agent-loop.js';
+import { toolLoopStopReason } from '@inklabs/shared/runtime';
 
 /**
  * Regression for the per-heartbeat multiplication: one ink spawn was emitting
@@ -47,7 +47,7 @@ describe('isTerminalSignalToolResult', () => {
 
 // The loop's stop decision: stop on a terminal signal OR when no tool executed
 // OR at the iteration cap. This calls the REAL predicate the loop runs
-// (../repl/agent-loop.js) rather than a local mirror — a mirrored copy can pass
+// (@inklabs/shared/runtime) rather than a local mirror — a mirrored copy can pass
 // while the loop it claims to guard has drifted, which is exactly the failure
 // mode this regression exists to catch.
 function shouldStop(

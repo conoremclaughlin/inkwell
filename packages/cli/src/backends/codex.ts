@@ -146,7 +146,7 @@ export class CodexAdapter implements BackendAdapter {
       sessionId: config.inkSessionId || '',
       studioId: config.studioId || '',
       sbSlug: config.sbSlug,
-      cliAttached: true,
+      cliAttached: config.cliAttached ?? true,
       runtime: 'codex',
     });
 
@@ -157,6 +157,10 @@ export class CodexAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
+        INK_CHANNEL_HOST: 'codex',
+        // Only the live-mail owner sets this. Nested ordinary/opt-out launches
+        // must not inherit a parent's claim that its guarded hooks are active.
+        INK_CODEX_INKMAIL: '0',
         SB_SLUG: config.sbSlug,
         AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,

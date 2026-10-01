@@ -90,6 +90,27 @@ jobs:
       - name: Migration ledger wrapper, status parser, and startup preflight
         run: sh scripts/db-migrate.test.sh
 
+      # Every migration file must pass the judgement `apply` makes before it
+      # connects. `yarn dev` applies the pending set through the wrapper, so a
+      # merged file it refuses stops the main server's restart on the
+      # operator's machine. The integration-DB job cannot catch this: its stack
+      # applies files with `supabase db reset`, which tolerates a top-level
+      # BEGIN/COMMIT pair (2026-09-27, 20260924070106). The two files excluded
+      # here predate the wrapper and were applied without it; nothing else is
+      # exempt.
+      - name: Migration files pass the wrapper's scan
+        run: |
+          set -eu
+          set --
+          for f in supabase/migrations/*.sql; do
+            case "$f" in
+              */20260507235413_rename_identity_id_to_sb_id.sql) ;;
+              */20260923010634_tasks_priority_status_vocabulary.sql) ;;
+              *) set -- "$@" "$f" ;;
+            esac
+          done
+          sh scripts/db-migrate.sh scan "$@"
+
       # The integration-DB harness's endpoint isolation. Mock-only: synthetic
       # `supabase status` payloads, no Docker and no database. CI has no
       # ambient Supabase env, so the contamination this covers cannot arise
@@ -97,6 +118,11 @@ jobs:
       # rather than by running the harness.
       - name: Integration-DB harness endpoint isolation
         run: sh scripts/test-integration-db-local.test.sh
+
+      # The harness turns off Kong's upstream keepalive in the isolated stack
+      # (task 388ae17e). Mock-only: a stub docker on PATH, no container.
+      - name: Integration-DB harness Kong keepalive step
+        run: sh scripts/test-disable-kong-upstream-keepalive.test.sh
 
       - name: Integration stack lifecycle (mock-only)
         run: |
@@ -116,6 +142,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # The stack publishes 55421-55426 (scripts/lib/integration-stack.py),
+      # inside Linux's ephemeral range. Any outbound connection this job makes
+      # (checkout, yarn install, image pulls) can be handed one of them as its
+      # local port, and on Linux that socket blocks the harness's bind probe
+      # while it is open AND while it sits in TIME_WAIT. The preflight then
+      # refuses with "owner unavailable" (exit 75) before a test runs: 6224599b
+      # on main and 6b87c0a1 on the release branch, both on 55424. Reserving the
+      # ports stops the kernel handing them out; explicit binds still succeed.
+      # First step, so it runs before checkout and every later step. It cannot
+      # cover sockets opened before any step runs: the runner's own, and the
+      # action-package downloads made during "Set up job".
+      - name: Reserve the integration stack's ports from the ephemeral range
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=55421-55426
+          sysctl net.ipv4.ip_local_port_range
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -162,6 +204,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Same stack, same ports: see the first step of integration-db-local.
+      - name: Reserve the integration stack's ports from the ephemeral range
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=55421-55426
+          sysctl net.ipv4.ip_local_port_range
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4

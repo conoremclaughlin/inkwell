@@ -26,6 +26,9 @@
 #     supabase/config.toml is never consulted, however divergent
 #   - a file outside supabase/migrations, misnamed, or carrying its own
 #     BEGIN/COMMIT is refused before psql
+#   - `scan` makes the name and transaction-control judgement with no
+#     database at all (CI's job), one refusal line shared with apply, and
+#     without psql on the PATH; psql is asked for by apply, pending and status
 #   - a stopped stack, or a missing psql, is refused before psql; the hint
 #     names `supabase start`, never the setup script that resets the database
 #   - `status` counts pending files and rows applied from other checkouts
@@ -454,6 +457,58 @@ for loc in C ${utf8:-}; do
     bad "under LC_ALL=$loc: a non-ASCII identifier and a non-ASCII dollar tag are accepted" "exit $rc: $out"
 done
 
+# --- scan: the same judgement, with no database behind it -------------------
+# CI runs it over every file in supabase/migrations. `yarn dev` applies the
+# pending set through `apply`, so a merged file the scanner refuses stops the
+# main server's restart on the operator's machine: on 2026-09-27 a top-level
+# BEGIN/COMMIT pair in 20260924070106 did exactly that, three days after it
+# had passed CI, because the integration stack applies files with
+# `supabase db reset`, which tolerates the pair. No stack, no ledger, no psql.
+out=$(cd "$tc" && sh "$script" scan 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && ok "scan without a file is a usage error" || bad "scan without a file is a usage error" "exit $rc: $out"
+
+reset_log
+out=$(cd "$tc" && STUB_NO_STACK=1 sh "$script" scan supabase/migrations/20260214000000_dollar_body.sql 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'scanned 1 file' && [ -z "$(calls)" ] &&
+  ok "scan: a clean file exits 0 with no stack and no call to supabase or psql" ||
+  bad "scan: a clean file exits 0 with no stack and no call to supabase or psql" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+
+reset_log
+out=$(cd "$tc" && STUB_NO_STACK=1 sh "$script" scan supabase/migrations/20260201000000_commit_work.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q '20260201000000_commit_work.sql' && echo "$out" | grep -q 'transaction control: COMMIT WORK' && [ -z "$(calls)" ] &&
+  ok "scan: top-level transaction control exits 2 and names the file and the statement, with no call to supabase or psql" ||
+  bad "scan: top-level transaction control exits 2 and names the file and the statement, with no call to supabase or psql" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+
+reset_log
+out=$(cd "$tc" && STUB_NO_STACK=1 sh "$script" scan supabase/migrations/20260201000000_commit_work.sql supabase/migrations/20260214000000_dollar_body.sql supabase/migrations/20260207000000_meta.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q '20260201000000_commit_work.sql' && echo "$out" | grep -q '20260207000000_meta.sql' &&
+  ! echo "$out" | grep -q '20260214000000_dollar_body.sql' && [ "$(echo "$out" | grep -c 'remove it')" -eq 2 ] &&
+  ok "scan: every file is judged; each offender is named once, the clean one is not, and the first refusal does not end the scan" ||
+  bad "scan: every file is judged; each offender is named once, the clean one is not, and the first refusal does not end the scan" "exit $rc: $out"
+
+out=$(cd "$tc" && sh "$script" scan supabase/migrations/20260299000000_absent.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'no such file' && ok "scan: a missing file is a refusal" || bad "scan: a missing file is a refusal" "exit $rc: $out"
+
+printf 'SELECT 1;\n' > "$tcm/no_version.sql"
+printf 'SELECT 1;\n' > "$tcm/20260232000000_bad-name.sql"
+out=$(cd "$tc" && sh "$script" scan supabase/migrations/no_version.sql supabase/migrations/20260232000000_bad-name.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'YYYYMMDDHHmmss' && echo "$out" | grep -q 'letters, digits and underscores' &&
+  ok "scan: a file apply would refuse by name is refused by name, both shapes in one run" ||
+  bad "scan: a file apply would refuse by name is refused by name, both shapes in one run" "exit $rc: $out"
+rm -f "$tcm/no_version.sql" "$tcm/20260232000000_bad-name.sql"
+
+# One judgement, whichever entry point made it: the refusal line is the same.
+out_apply=$(cd "$tc" && STUB_LEDGER="$work/ledger-tc.txt" sh "$script" apply supabase/migrations/20260201000000_commit_work.sql 2>&1)
+out_scan=$(cd "$tc" && sh "$script" scan supabase/migrations/20260201000000_commit_work.sql 2>&1)
+[ -n "$(echo "$out_scan" | grep 'remove it')" ] && [ "$(echo "$out_apply" | grep 'remove it')" = "$(echo "$out_scan" | grep 'remove it')" ] &&
+  ok "scan and apply refuse the same file with the same line" || bad "scan and apply refuse the same file with the same line" "apply: $out_apply; scan: $out_scan"
+
 reset_log
 out=$(cd "$repo" && STUB_NO_STACK=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)
 rc=$?
@@ -472,6 +527,28 @@ if [ "$rc" -eq 2 ] && ! calls | grep -q '^psql' && echo "$out" | grep -q 'psql n
 else
   bad "a missing psql is refused with an install hint (hermetic PATH)" "exit $rc: $out"
 fi
+
+# psql is a prerequisite of the modes that run it, not of the script: scan
+# judges files with no database executable at all (Lumen, PR #688 review).
+for m in pending status; do
+  reset_log
+  out=$(cd "$repo" && PATH="$work/stubs-nopsql:$work/tools" sh "$script" $m 2>&1)
+  rc=$?
+  [ "$rc" -eq 2 ] && [ -z "$(calls)" ] && echo "$out" | grep -q 'psql not found' &&
+    ok "$m without psql is refused with the install hint before any call" ||
+    bad "$m without psql is refused with the install hint before any call" "exit $rc: $out; calls: $(calls | tr '\n' ' ')"
+done
+reset_log
+out=$(cd "$tc" && PATH="$work/stubs-nopsql:$work/tools" sh "$script" scan supabase/migrations/20260214000000_dollar_body.sql 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'scanned 1 file' && [ -z "$(calls)" ] &&
+  ok "scan without psql on PATH: a clean file exits 0" ||
+  bad "scan without psql on PATH: a clean file exits 0" "exit $rc: $out"
+out=$(cd "$tc" && PATH="$work/stubs-nopsql:$work/tools" sh "$script" scan supabase/migrations/20260201000000_commit_work.sql 2>&1)
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'transaction control: COMMIT WORK' && ! echo "$out" | grep -q 'psql not found' &&
+  ok "scan without psql on PATH: transaction control is still named, and psql is not asked for" ||
+  bad "scan without psql on PATH: transaction control is still named, and psql is not asked for" "exit $rc: $out"
 
 reset_log
 out=$(cd "$repo" && STUB_PRECHECK_RC=1 sh "$script" apply supabase/migrations/20260101000000_one.sql 2>&1)

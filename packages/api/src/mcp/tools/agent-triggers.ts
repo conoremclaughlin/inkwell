@@ -62,7 +62,7 @@ export const triggerAgentSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Convenience studio routing hint (e.g., "main" for shared main studio, or a studio name)'
+      'Convenience studio routing hint: "main" for the shared main studio, or a studio `slug` as list_studios and get_studio return it (not `worktreeFolder`). studioId is unambiguous and preferred when you have it.'
     ),
   recipientSessionId: z
     .string()
@@ -136,6 +136,14 @@ export async function handleTriggerAgent(
       studioId: args.studioId,
       studioHint: args.studioHint,
       recipientSessionId: args.recipientSessionId,
+      // A session or studio the CALLER passes here is addressing (spec §3b.1),
+      // the same signal send_to_inbox sends. Without it the trigger handler
+      // reads recipientSessionId as an inferred continuity hint and, on a
+      // project-pinned thread, drops a genuinely explicit session that sits
+      // outside the project repo (Lumen, PR #681 round 3).
+      ...(args.recipientSessionId || args.studioId || args.studioHint
+        ? { explicitRecipientTarget: true }
+        : {}),
       // Caller-repo inference degrades silently to refuse-and-hold on any
       // dispatch path that forgets this (Lumen, PR #514 round 1).
       ...senderRoutingContext(senderIsBridge),

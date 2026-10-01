@@ -12,7 +12,8 @@
  * degrades to presence heuristics for the whole turn (PR #506 P1, Lumen).
  *
  * The server route (`/api/hooks/lifecycle`) stays the single writer:
- *   - `open()`   → `event: 'prompt'` — sets `cli_turn_at`, renews the lease
+ *   - `open()`   → `event: 'prompt'` — sets `cli_turn_at`, renews the lease;
+ *     a headless owner adds `cliAttached: false` to the same request
  *   - `close()`  → `event: 'stop'`   — clears it and runs the lease boundary,
  *     which is what completes a release the turn itself requested
  *   - `detach()` → `cliAttached: false` — process-proof that this process
@@ -39,6 +40,29 @@ export interface TurnSignalDeps {
   /** Live ref — the worktree studio this REPL runs in, for the lease fence. */
   getStudioId?: () => string | undefined;
   sbSlug: string;
+  /**
+   * Whether this process is an attached CLI: an interactive REPL, not a
+   * one-shot `--message`/`--non-interactive` run. A headless owner declares
+   * `cliAttached:false` in the same request that opens each turn. Its
+   * provider children leave the attachment alone (lib/turn-owner.ts), and
+   * without this a `cli_attached:true` left by a crashed interactive process
+   * stays on the session. Every prompt refreshes `updated_at`, so delivery
+   * keeps reading that flag as a live inline consumer, and nothing here
+   * consumes inline messages (PR #685 r3, Lumen). A prompt request stamps
+   * the marker whatever else it carries, so this is not a detach.
+   */
+  cliAttached: boolean;
+  /**
+   * The epoch of the server run that spawned this process, when one did
+   * (INK_RUN_TURN_EPOCH). The run already owns the session's turn: it wrote
+   * `running` and this epoch before spawning, and it finishes with a write
+   * fenced on the same epoch. So this process claims nothing. It declares
+   * itself headless and names the run's epoch on every request, and the
+   * route fences each write on it. Claiming here fenced the run out of its
+   * own finalize on every ink-backed run (2026-09-29). Absent for a chat a
+   * person started, which still claims its own turn.
+   */
+  runTurnEpoch?: string;
   /** Resolved per post so config changes and lazy imports stay cheap. */
   getServerUrl: () => Promise<string> | string;
   getToken: (serverUrl: string) => Promise<string | null | undefined>;
@@ -179,6 +203,11 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
     workingDir: deps.workingDir,
   });
 
+  // A server run's child names the run's epoch on every request, open,
+  // close and detach alike, so each write is fenced on the run's turn.
+  const runEpoch = deps.runTurnEpoch?.trim() || undefined;
+  const runChild: PostBody = runEpoch ? { headless: true, turnEpoch: runEpoch } : {};
+
   return {
     async open() {
       const sessionId = deps.getSessionId();
@@ -192,6 +221,11 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       const body: PostBody = {
         ...lifecycleBody('prompt', sessionId),
         ...(studioId ? { studioId } : {}),
+        // Rides the prompt's claim: the route writes it fenced on the epoch
+        // this open claims, so a refused takeover declares nothing. For a
+        // server run's child, fenced on the run's epoch instead.
+        ...(deps.cliAttached ? {} : { cliAttached: false }),
+        ...runChild,
       };
       return post('open', body, ackedAndHeld);
     },
@@ -200,10 +234,12 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       if (!sessionId) return true;
       // Round 11: name the epoch this stop ends, or admit it is missing —
       // never masquerade as a legacy sender whose stop releases unfenced.
-      const body: PostBody = {
-        ...lifecycleBody('stop', sessionId),
-        ...(lastTurnEpoch ? { turnEpoch: lastTurnEpoch } : { turnEpochMissing: true }),
-      };
+      const body: PostBody = runEpoch
+        ? { ...lifecycleBody('stop', sessionId), ...runChild }
+        : {
+            ...lifecycleBody('stop', sessionId),
+            ...(lastTurnEpoch ? { turnEpoch: lastTurnEpoch } : { turnEpochMissing: true }),
+          };
       lastTurnEpoch = undefined;
       return post('close', body);
     },
@@ -212,7 +248,7 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       if (!sessionId) return true;
       // cliAttached:false is the route's process-proof detach — it clears the
       // marker without needing a lifecycle value.
-      return post('detach', { sessionId, cliAttached: false, sbSlug: deps.sbSlug });
+      return post('detach', { sessionId, cliAttached: false, sbSlug: deps.sbSlug, ...runChild });
     },
   };
 }

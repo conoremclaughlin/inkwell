@@ -200,16 +200,21 @@ describe('CLI turn-epoch record (round 10)', () => {
       await import('./takeover-watcher.js');
 
     writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'epoch-a' });
-    expect(readCliTurnEpoch(dir)).toMatchObject({ sessionId: 's1', turnEpoch: 'epoch-a' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1' })).toMatchObject({
+      sessionId: 's1',
+      turnEpoch: 'epoch-a',
+    });
 
     // A different session cannot clear s1's record — the stop that ends
     // s1's turn still needs it.
     clearCliTurnEpoch(dir, 's2');
-    expect(existsSync(cliTurnEpochPath(dir))).toBe(true);
+    expect(existsSync(cliTurnEpochPath(dir, { sessionId: 's1' }))).toBe(true);
 
+    // Retirement leaves a tombstone in the owner's namespace (PR #691
+    // round 3): the file stays, the record reads as none.
     clearCliTurnEpoch(dir, 's1');
-    expect(existsSync(cliTurnEpochPath(dir))).toBe(false);
-    expect(readCliTurnEpoch(dir)).toBeNull();
+    expect(existsSync(cliTurnEpochPath(dir, { sessionId: 's1' }))).toBe(true);
+    expect(readCliTurnEpoch(dir, { sessionId: 's1' })).toBeNull();
   });
 });
 
@@ -673,15 +678,19 @@ describe('close-race enforcement and compare-and-delete (round 19)', () => {
     // A stale reader expecting ITS epoch/generation must not delete the
     // replacement.
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-a', wrapperGeneration: 'gen-a' });
-    expect(readCliTurnEpoch(dir)).toMatchObject({ turnEpoch: 'e-b' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-b' })).toMatchObject({
+      turnEpoch: 'e-b',
+    });
 
     // The EPOCH check binds independently of the generation check: same
     // generation, replaced epoch → still refused.
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-a', wrapperGeneration: 'gen-b' });
-    expect(readCliTurnEpoch(dir)).toMatchObject({ turnEpoch: 'e-b' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-b' })).toMatchObject({
+      turnEpoch: 'e-b',
+    });
 
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-b', wrapperGeneration: 'gen-b' });
-    expect(readCliTurnEpoch(dir)).toBeNull();
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-b' })).toBeNull();
   });
 });
 
@@ -735,5 +744,259 @@ describe('per-generation marker files (round 20)', () => {
     expect(existsSync(pb)).toBe(false);
     await watcherA.stop();
     await watcherB.stop();
+  });
+});
+
+describe('per-owner epoch record files (task c07f35c8)', () => {
+  it('the path is owned by session and wrapper generation, with the legacy path preserved', async () => {
+    const { cliTurnEpochPath } = await import('./takeover-watcher.js');
+    expect(cliTurnEpochPath('/w', { sessionId: 's1' })).toBe('/w/.ink/cli-turn-epoch.s1.json');
+    expect(cliTurnEpochPath('/w', { sessionId: 's1', wrapperGeneration: 'gen-a' })).toBe(
+      '/w/.ink/cli-turn-epoch.s1.gen-a.json'
+    );
+    expect(cliTurnEpochPath('/w')).toBe('/w/.ink/cli-turn-epoch.json');
+  });
+
+  it('two sessions sharing a checkout keep their own records — a sibling prompt cannot strand a stop', async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch, cliTurnEpochPath } =
+      await import('./takeover-watcher.js');
+    // The pr:498 shape: session A opens a turn, then a second session in the
+    // same checkout opens its own. With one shared file B's write replaced
+    // A's; A's stop found a foreign record, sent turnEpochMissing, and A's
+    // turn — and the lease it held — stayed open for days.
+    expect(writeCliTurnEpoch(dir, { sessionId: 'sA', turnEpoch: 'e-A' })).toBe(true);
+    expect(writeCliTurnEpoch(dir, { sessionId: 'sB', turnEpoch: 'e-B' })).toBe(true);
+    expect(readCliTurnEpoch(dir, { sessionId: 'sA' })).toMatchObject({
+      sessionId: 'sA',
+      turnEpoch: 'e-A',
+    });
+    expect(readCliTurnEpoch(dir, { sessionId: 'sB' })).toMatchObject({
+      sessionId: 'sB',
+      turnEpoch: 'e-B',
+    });
+    // B's stop retires only B's evidence.
+    clearCliTurnEpoch(dir, 'sB', { turnEpoch: 'e-B' });
+    expect(readCliTurnEpoch(dir, { sessionId: 'sB' })).toBeNull();
+    expect(existsSync(cliTurnEpochPath(dir, { sessionId: 'sA' }))).toBe(true);
+    expect(readCliTurnEpoch(dir, { sessionId: 'sA' })).toMatchObject({ turnEpoch: 'e-A' });
+  });
+
+  it('two generations of one session coexist; a delayed write, stop or cleanup of one never erases the other', async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } =
+      await import('./takeover-watcher.js');
+    writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-1', wrapperGeneration: 'gen-1' });
+    writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-2', wrapperGeneration: 'gen-2' });
+    // A delayed rewrite by the older generation lands after the successor's.
+    writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-1b', wrapperGeneration: 'gen-1' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-2' })).toMatchObject({
+      turnEpoch: 'e-2',
+    });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toMatchObject({
+      turnEpoch: 'e-1b',
+    });
+    // A generation-less reader of the same session owns neither.
+    expect(readCliTurnEpoch(dir, { sessionId: 's1' })).toBeNull();
+    // gen-1's stop retires gen-1's evidence only.
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-1b', wrapperGeneration: 'gen-1' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toBeNull();
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-2' })).toMatchObject({
+      turnEpoch: 'e-2',
+    });
+    // A compare-and-delete naming the wrong epoch is refused.
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-stale', wrapperGeneration: 'gen-2' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-2' })).toMatchObject({
+      turnEpoch: 'e-2',
+    });
+  });
+
+  it('a legacy single-file record is read only by its exact owner and is never imported or deleted otherwise', async () => {
+    const { readCliTurnEpoch, clearCliTurnEpoch, writeCliTurnEpoch, cliTurnEpochPath } =
+      await import('./takeover-watcher.js');
+    const legacy = cliTurnEpochPath(dir);
+    writeFileSync(
+      legacy,
+      JSON.stringify({
+        sessionId: 's1',
+        turnEpoch: 'e-legacy',
+        wrapperGeneration: 'gen-1',
+        at: new Date().toISOString(),
+      })
+    );
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toMatchObject({
+      turnEpoch: 'e-legacy',
+    });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-2' })).toBeNull();
+    expect(readCliTurnEpoch(dir, { sessionId: 's1' })).toBeNull();
+    expect(readCliTurnEpoch(dir, { sessionId: 's2', wrapperGeneration: 'gen-1' })).toBeNull();
+    // Reads import nothing: no owner file appeared and the legacy file is intact.
+    expect(existsSync(cliTurnEpochPath(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' }))).toBe(
+      false
+    );
+    expect(JSON.parse(readFileSync(legacy, 'utf-8'))).toMatchObject({ turnEpoch: 'e-legacy' });
+    // A foreign clear leaves it alone.
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-legacy', wrapperGeneration: 'gen-2' });
+    clearCliTurnEpoch(dir, 's2', { turnEpoch: 'e-legacy', wrapperGeneration: 'gen-1' });
+    expect(existsSync(legacy)).toBe(true);
+    // An owner-format record wins over the legacy file.
+    writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-new', wrapperGeneration: 'gen-1' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toMatchObject({
+      turnEpoch: 'e-new',
+    });
+    // Migration is monotonic (Lumen, PR #691 rounds 1-2): the legacy file is
+    // shared and is never deleted by the new writer; the owner's namespace
+    // shadows it instead, and the shadow survives the owner's own cleanup,
+    // so an acknowledged new turn can never resurrect the older epoch.
+    expect(existsSync(legacy)).toBe(true);
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-new', wrapperGeneration: 'gen-1' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-1' })).toBeNull();
+    expect(existsSync(legacy)).toBe(true);
+    // A fully generation-less pair still matches (older hooks); a generation
+    // never matches a generation-less record, nor the reverse.
+    writeFileSync(
+      legacy,
+      JSON.stringify({ sessionId: 's3', turnEpoch: 'e-old', at: new Date().toISOString() })
+    );
+    expect(readCliTurnEpoch(dir, { sessionId: 's3' })).toMatchObject({ turnEpoch: 'e-old' });
+    expect(readCliTurnEpoch(dir, { sessionId: 's3', wrapperGeneration: 'gen-9' })).toBeNull();
+  });
+
+  it('the watcher finalizes with its OWN owner record while a sibling generation writes beside it', async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch } = await import('./takeover-watcher.js');
+    const finalizeA = vi.fn(async () => undefined);
+    const claimA = vi.fn(async () => {
+      writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-A', wrapperGeneration: 'gen-a' });
+      return 'ok' as const;
+    });
+    writeFileSync(
+      takeoverMarkerPath(dir, 'gen-a'),
+      JSON.stringify({ sessionId: 's1', at: new Date().toISOString(), wrapperGeneration: 'gen-a' })
+    );
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      generation: 'gen-a',
+      claim: claimA,
+      finalizeScope: finalizeA,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(claimA).toHaveBeenCalled(), { timeout: 2000 });
+    // A sibling generation of the SAME session records its own epoch after
+    // A's claim and before A's scope ends — with one shared file this
+    // replaced A's evidence and A finalized without its epoch.
+    writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-B', wrapperGeneration: 'gen-b' });
+    await watcher.stop();
+    expect(finalizeA).toHaveBeenCalledWith('e-A', []);
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-a' })).toBeNull();
+    expect(readCliTurnEpoch(dir, { sessionId: 's1', wrapperGeneration: 'gen-b' })).toMatchObject({
+      turnEpoch: 'e-B',
+    });
+  });
+});
+
+describe('migration is monotonic (Lumen, PR #691 round 1)', () => {
+  const owner = {
+    sessionId: '11111111-1111-4111-8111-111111111111',
+    wrapperGeneration: '22222222-2222-4222-8222-222222222222',
+  };
+  const seedLegacy = async () => {
+    const { cliTurnEpochPath } = await import('./takeover-watcher.js');
+    writeFileSync(cliTurnEpochPath(dir), JSON.stringify({ ...owner, turnEpoch: 'epoch-old' }));
+  };
+
+  it.each([
+    ['malformed', '{broken'],
+    [
+      'foreign',
+      JSON.stringify({
+        ...owner,
+        sessionId: '33333333-3333-4333-8333-333333333333',
+        turnEpoch: 'x',
+      }),
+    ],
+  ])(
+    'an existing owner file that is %s never falls back to a valid legacy record',
+    async (_k, body) => {
+      const { cliTurnEpochPath, readCliTurnEpoch } = await import('./takeover-watcher.js');
+      await seedLegacy();
+      writeFileSync(cliTurnEpochPath(dir, owner), body);
+      expect(readCliTurnEpoch(dir, owner)).toBeNull();
+    }
+  );
+
+  it("an owner's own write shadows its legacy copy without deleting it, and a foreign legacy record is left alone", async () => {
+    const { cliTurnEpochPath, writeCliTurnEpoch, readCliTurnEpoch } =
+      await import('./takeover-watcher.js');
+    await seedLegacy();
+    expect(writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' })).toBe(true);
+    // The shared file is not this writer's to delete (round 2): it stays, shadowed.
+    expect(existsSync(cliTurnEpochPath(dir))).toBe(true);
+    expect(readCliTurnEpoch(dir, owner)).toMatchObject({ turnEpoch: 'epoch-new' });
+    // Another owner's legacy record is neither read nor touched.
+    const other = { sessionId: '55555555-5555-4555-8555-555555555555' };
+    writeFileSync(cliTurnEpochPath(dir), JSON.stringify({ ...other, turnEpoch: 'epoch-other' }));
+    writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-newer' });
+    expect(readCliTurnEpoch(dir, other)).toMatchObject({ turnEpoch: 'epoch-other' });
+    expect(readCliTurnEpoch(dir, owner)).toMatchObject({ turnEpoch: 'epoch-newer' });
+  });
+
+  it('an acknowledged new turn never resurrects an older legacy epoch', async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } =
+      await import('./takeover-watcher.js');
+    await seedLegacy();
+    expect(writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' })).toBe(true);
+    clearCliTurnEpoch(dir, owner.sessionId, {
+      turnEpoch: 'epoch-new',
+      wrapperGeneration: owner.wrapperGeneration,
+    });
+    expect(readCliTurnEpoch(dir, owner)).toBeNull();
+  });
+
+  it('a scope closing after a migrated turn fences a later uncertain attempt instead of finalizing the legacy epoch', async () => {
+    const { writeCliTurnEpoch, clearCliTurnEpoch } = await import('./takeover-watcher.js');
+    await seedLegacy();
+    writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' });
+    clearCliTurnEpoch(dir, owner.sessionId, {
+      turnEpoch: 'epoch-new',
+      wrapperGeneration: owner.wrapperGeneration,
+    });
+    writeFileSync(
+      takeoverMarkerPath(dir, owner.wrapperGeneration),
+      JSON.stringify({ ...owner, at: new Date().toISOString(), attemptId: 'attempt-new' })
+    );
+    const claim = vi.fn(async () => 'failed' as const);
+    const finalizeScope = vi.fn(async () => undefined);
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: owner.sessionId,
+      generation: owner.wrapperGeneration,
+      claim,
+      finalizeScope,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(claim).toHaveBeenCalled(), { timeout: 2000 });
+    await watcher.stop();
+    // The stale legacy epoch, acknowledged, would have retired the marker
+    // without fencing attempt-new; a delayed claim could then land after exit.
+    expect(finalizeScope).toHaveBeenCalledWith(undefined, ['attempt-new']);
+  });
+
+  it("an unacknowledged epoch-bearing finalize retains its own record and a sibling generation's", async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch } = await import('./takeover-watcher.js');
+    writeCliTurnEpoch(dir, { ...owner, turnEpoch: 'epoch-new' });
+    const sibling = { ...owner, wrapperGeneration: '44444444-4444-4444-8444-444444444444' };
+    writeCliTurnEpoch(dir, { ...sibling, turnEpoch: 'epoch-sibling' });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: owner.sessionId,
+      generation: owner.wrapperGeneration,
+      claim: async () => 'failed' as const,
+      finalizeScope: async () => {
+        throw new Error('synthetic 500');
+      },
+      intervalMs: 60_000,
+    });
+    await watcher.stop();
+    expect(readCliTurnEpoch(dir, owner)?.turnEpoch).toBe('epoch-new');
+    expect(readCliTurnEpoch(dir, sibling)?.turnEpoch).toBe('epoch-sibling');
   });
 });

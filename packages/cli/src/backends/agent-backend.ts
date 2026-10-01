@@ -286,6 +286,7 @@ export async function fetchAgentBackends(): Promise<AgentBackendFetch> {
     {
       timeoutMs: FETCH_TIMEOUT_MS,
       callerProfile: 'runtime',
+      idempotent: true,
       onCredential: (token) => {
         authenticatedAs = principalOf(token);
       },

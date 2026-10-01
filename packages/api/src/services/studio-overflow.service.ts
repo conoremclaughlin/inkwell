@@ -57,10 +57,10 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { access, lstat, rm } from 'fs/promises';
-import { bootstrapStudio, isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
+import { isSafeStudioComponent, studioSiblingPath } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
 import { ephemeralWorktreePath } from './studio-paths';
-import { ensureStudioSettings } from './studio-settings';
+import { completeStudioViaCli } from './studio-complete';
 import {
   StudioLeaseService,
   captureWorktreeState,
@@ -117,9 +117,13 @@ export function overflowSlug(parentStudio: Studio, threadKey: string, variant?: 
  * Commits reachable from a remote-tracking ref already live on the remote, so
  * the teardown rescue (`captureWorktreeState`) leaves them alone.
  *
- * Grammar: `pr:<n>` or `<project>:pr:<n>`; only the trailing two segments
- * matter, so no project-slug lookup is needed here. A mis-detection costs one
- * failed fetch and falls back to the base branch — never a wrong checkout.
+ * Grammar: `pr:<n>` or `<project>:pr:<n>`. The project prefix decides WHICH
+ * repository's PR this is, and that decision is made upstream: routing
+ * resolves the thread's pinned project to its repo and hands this service a
+ * parent in that repo (`expectedRepoRoot`, task b5c71bc3). Here only the
+ * trailing two segments matter, because `refs/pull/<n>/head` is fetched from
+ * the parent's own origin. A mis-detection costs one failed fetch and falls
+ * back to the base branch — never a wrong checkout.
  */
 export interface PullRequestDetachTarget {
   number: number;
@@ -395,11 +399,38 @@ export class StudioOverflowService {
     userId: string;
     parentStudio: Studio;
     threadKey: string;
+    /** The thread's project repo; a parent elsewhere yields no placement. */
+    expectedRepoRoot?: string;
   }): Promise<Studio | null> {
     const { userId, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    if (!this.parentInExpectedRepo(parentStudio, opts.expectedRepoRoot, threadKey)) return null;
     const states = await this.loadVariantStates(userId, parentStudio, threadKey);
     return this.firstLiveMatch(states, threadKey);
+  }
+
+  /**
+   * A project-pinned thread names its repo — routing resolves it from the
+   * thread's pinned project — and the parent this service mints from must be
+   * in that repo. On 2026-09-24 `inktrade:pr:1` was routed to an Inkwell studio
+   * and the checkout minted here was detached at inkwell's refs/pull/1/head:
+   * the wrong repository's PR #1, handed to a reviewer as an inktrade review
+   * (task b5c71bc3). A mismatch is refused before a slug is read or a
+   * worktree is touched; null is the caller's "hold the message" outcome.
+   */
+  private parentInExpectedRepo(
+    parentStudio: Studio,
+    expectedRepoRoot: string | undefined,
+    threadKey: string
+  ): boolean {
+    if (!expectedRepoRoot || parentStudio.repoRoot === expectedRepoRoot) return true;
+    logger.error("[StudioOverflow] Parent studio is not in the thread's project repo; refusing", {
+      threadKey,
+      parentStudioId: parentStudio.id,
+      parentRepoRoot: parentStudio.repoRoot,
+      expectedRepoRoot,
+    });
+    return false;
   }
 
   /**
@@ -413,9 +444,12 @@ export class StudioOverflowService {
     sbSlug: string;
     parentStudio: Studio;
     threadKey: string;
+    /** The thread's project repo; a parent elsewhere is refused, never minted from. */
+    expectedRepoRoot?: string;
   }): Promise<Studio | null> {
     const { userId, sbSlug, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    if (!this.parentInExpectedRepo(parentStudio, opts.expectedRepoRoot, threadKey)) return null;
     // Same-thread ensures in this process take turns END TO END — preflight,
     // worktree, setup (up to the dependency install), row — so the second
     // arrival finds the first's row at preflight and reuses it. Racing them
@@ -488,6 +522,17 @@ export class StudioOverflowService {
             archivedAt: null,
             expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
           });
+          // A revived row sits on a FRESH worktree, and a fresh worktree
+          // carries none of the studio files: the routine has to run here as
+          // it does for a created one. Until 2026-09-29 it did not, so every
+          // review round after the first — the row is closed between rounds
+          // and revived for the next — spawned into a bare checkout with no
+          // identity, no permissions and no backend config (task 2841c7a9).
+          await completeStudioViaCli(created.worktreePath, {
+            sbSlug,
+            studioId: revived.id,
+            purpose: revived.purpose ?? undefined,
+          });
           await this.leases.logEvent(userId, revived.id, 'overflow', {
             threadKey,
             sbSlug,
@@ -533,6 +578,11 @@ export class StudioOverflowService {
           // Root-based paths don't encode the slug — pass it explicitly or
           // the derived fallback is null and reuse-by-slug silently breaks.
           slug: s.slug,
+        });
+        await completeStudioViaCli(created.worktreePath, {
+          sbSlug,
+          studioId: studio.id,
+          purpose: studio.purpose ?? undefined,
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
@@ -613,6 +663,15 @@ export class StudioOverflowService {
    * convention, and inventing one here would silently start capturing threads
    * the operator never assigned.
    *
+   * A home its owner closed is REVIVED, not refused. Closing a studio is the
+   * documented end of a PR ("routing knows how to route back and recreate
+   * what it needs — closing costs nothing"), and the home is a working studio,
+   * so the PR that ran in it closes it. The cleaned row keeps the slug, so
+   * refusing it held every later thread for this (project, agent) with no
+   * way back: on 2026-09-28 a PR session closed `inktrade--wren` at merge,
+   * and each inktrade PR trigger to Wren after that was held as a slug
+   * "collision" with its own home.
+   *
    * Returns null when provisioning fails or the slug is already taken by an
    * unrelated studio; the caller then refuses rather than guessing.
    */
@@ -626,29 +685,51 @@ export class StudioOverflowService {
     const { userId, sbSlug, repoRoot, sbId } = opts;
     if (!isSafeStudioComponent(sbSlug)) throw new Error('Invalid SB path component');
     const slug = `${path.basename(repoRoot)}--${sbSlug}`;
+    // Same-home ensures in this process take turns end to end, as overflow
+    // ensures do: the second arrival then finds the first's row live at
+    // preflight and reuses it, instead of losing the race in git and being
+    // held.
+    return withKeyedLock(`parent-ensure:${userId}:${slug}`, () =>
+      this.ensureParentStudioExclusive(userId, sbSlug, repoRoot, slug, sbId ?? null)
+    );
+  }
 
+  private async ensureParentStudioExclusive(
+    userId: string,
+    sbSlug: string,
+    repoRoot: string,
+    slug: string,
+    sbId: string | null
+  ): Promise<Studio | null> {
+    let closedHome: Studio | null = null;
     const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
     if (existing) {
       // Reuse only a genuine match. A slug collision with an unrelated studio
       // must never be adopted — same reasoning as overflow reuse, and the
       // consequence here is worse because this row is durable.
-      // Reuse only a studio a runner can ACTUALLY use (Lumen, PR #514 round 1).
-      //
-      // The earlier predicate accepted any non-ephemeral match, including an
-      // archived or cleaned row, or one whose worktree is gone from disk.
-      // Handing one back creates a session that acquire() then refuses
-      // (spec §The five invariants #5: a cleaned studio is never re-leased,
-      // a configured-but-absent worktree is retired) — and the caller diverts
-      // to overflow or the default cwd instead of holding, which is the
-      // silent-wrong-place outcome this phase removes.
-      const reusable =
+      const ours =
         !existing.ephemeral &&
         existing.userId === userId &&
         existing.repoRoot === repoRoot &&
-        (sbId ? existing.sbId === sbId : existing.sbSlug === sbSlug) &&
-        (existing.status === 'active' || existing.status === 'idle');
+        (sbId ? existing.sbId === sbId : existing.sbSlug === sbSlug);
 
-      if (reusable) {
+      if (!ours) {
+        logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
+          slug,
+          repoRoot,
+          sbSlug,
+          collidingStudioId: existing.id,
+        });
+        return null;
+      }
+
+      // Reuse only a studio a runner can ACTUALLY use (Lumen, PR #514 round 1).
+      // Handing back a cleaned row, or one whose worktree is gone, creates a
+      // session that acquire() then refuses (spec §The five invariants #5: a
+      // cleaned studio is never re-leased, a configured-but-absent worktree
+      // is retired) — and the caller diverts to overflow or the default cwd
+      // instead of holding, the silent-wrong-place outcome Phase 3b removed.
+      if (existing.status === 'active' || existing.status === 'idle') {
         const present = await access(existing.worktreePath)
           .then(() => true)
           .catch(() => false);
@@ -660,27 +741,33 @@ export class StudioOverflowService {
         });
         return null;
       }
-      logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
-        slug,
-        repoRoot,
-        sbSlug,
-        collidingStudioId: existing.id,
-      });
-      return null;
+
+      // Cleaned or archived: this agent's own home, closed. It is revived
+      // below with a fresh worktree, never handed back as it stands.
+      closedHome = existing;
     }
 
     // Seed from a studio that already knows this repo, so worktree creation
-    // runs against a real checkout with the right base branch.
-    const seed = await this.studios.findByRepoRoot(userId, repoRoot).catch(() => null);
+    // runs against a real checkout with the right base branch. A closed home
+    // already records its own.
+    const seed = closedHome
+      ? null
+      : await this.studios.findByRepoRoot(userId, repoRoot).catch(() => null);
     const parentLike = {
       repoRoot,
-      baseBranch: seed?.baseBranch || 'main',
+      baseBranch: closedHome?.baseBranch || seed?.baseBranch || 'main',
     } as Studio;
 
+    // A closed home's branch normally survives its teardown (close_studio
+    // keeps branches); createWorktree reattaches to it.
     const created = await this.createWorktree(parentLike, slug, {
       branch: `${sbSlug}/studio/${sbSlug}`,
     });
     if (!created) return null;
+
+    if (closedHome) {
+      return this.reviveParentStudio(closedHome, created, { userId, sbSlug, repoRoot });
+    }
 
     try {
       const studio = await this.studios.create({
@@ -695,6 +782,11 @@ export class StudioOverflowService {
         ephemeral: false,
         defaultProjectId: seed?.defaultProjectId ?? null,
         metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
+      });
+      await completeStudioViaCli(created.worktreePath, {
+        sbSlug,
+        studioId: studio.id,
+        purpose: studio.purpose ?? undefined,
       });
       logger.info('[StudioOverflow] Created parent studio', {
         studioId: studio.id,
@@ -712,6 +804,56 @@ export class StudioOverflowService {
       });
       await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
         cwd: repoRoot,
+      }).catch(() => undefined);
+      return null;
+    }
+  }
+
+  /**
+   * Bring a closed home back onto a fresh worktree. Revival is the whole
+   * transition the other two revive paths make (ephemeral overflow above,
+   * create_studio registration): the row describes THIS checkout, is neither
+   * cleaned nor archived, and a durable row carries no expiry. Flipping
+   * status alone would leave `cleaned_at` telling the old story to the next
+   * reader. The row is then completed exactly as a new home is.
+   */
+  private async reviveParentStudio(
+    closedHome: Studio,
+    created: WorktreeCreation,
+    ctx: { userId: string; sbSlug: string; repoRoot: string }
+  ): Promise<Studio | null> {
+    try {
+      const studio = await this.studios.update(closedHome.id, {
+        status: 'active',
+        worktreePath: created.worktreePath,
+        branch: created.branch,
+        cleanedAt: null,
+        archivedAt: null,
+        expiresAt: null,
+      });
+      await completeStudioViaCli(created.worktreePath, {
+        sbSlug: ctx.sbSlug,
+        studioId: studio.id,
+        purpose: studio.purpose ?? undefined,
+      });
+      logger.info('[StudioOverflow] Revived closed parent studio', {
+        studioId: studio.id,
+        slug: studio.slug,
+        repoRoot: ctx.repoRoot,
+        sbSlug: ctx.sbSlug,
+        previousStatus: closedHome.status,
+        worktreePath: created.worktreePath,
+      });
+      return studio;
+    } catch (err) {
+      logger.error('[StudioOverflow] Parent studio revive failed; removing worktree', {
+        slug: closedHome.slug,
+        studioId: closedHome.id,
+        worktreePath: created.worktreePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+        cwd: ctx.repoRoot,
       }).catch(() => undefined);
       return null;
     }
@@ -766,7 +908,7 @@ export class StudioOverflowService {
           return null;
         }
       }
-      return this.finishWorktreeSetup(mainRoot, worktreePath, branch, undefined, {
+      return this.finishWorktreeSetup(worktreePath, branch, undefined, {
         installDependencies: true,
       });
     }
@@ -887,7 +1029,6 @@ export class StudioOverflowService {
     // sentinel says "no branch, cut from <ref>" and can never collide with
     // branch-based routing lookups.
     return this.finishWorktreeSetup(
-      mainRoot,
       worktreePath,
       `detached:${label}`,
       { mode: 'detached', ref: label, commit },
@@ -904,7 +1045,6 @@ export class StudioOverflowService {
   }
 
   private async finishWorktreeSetup(
-    mainRoot: string,
     worktreePath: string,
     branch: string,
     checkout: DetachedCheckout | undefined,
@@ -929,16 +1069,9 @@ export class StudioOverflowService {
       );
     }
 
-    try {
-      bootstrapStudio(mainRoot, worktreePath);
-    } catch (err) {
-      logger.warn('[StudioOverflow] bootstrapStudio failed (non-fatal)', {
-        worktreePath,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    await ensureStudioSettings(worktreePath).catch(() => undefined);
-
+    // Completion (identity, permissions, hooks, backend config) runs once the
+    // studio row exists, so the worktree can carry its own id: see the two
+    // callers.
     return checkout ? { worktreePath, branch, checkout } : { worktreePath, branch };
   }
 

@@ -14,7 +14,7 @@ import {
   screenIteration,
   selectOutcomesToLedger,
 } from './spawn-agent.js';
-import type { LocalToolCall } from './agent-loop.js';
+import type { LocalToolCall } from '@inklabs/shared/runtime';
 
 function call(tool: string): LocalToolCall {
   return { tool, args: {}, raw: `\`\`\`ink-tool\n{"tool":"${tool}"}\n\`\`\`` };

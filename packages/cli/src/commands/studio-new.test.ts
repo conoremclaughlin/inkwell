@@ -10,7 +10,7 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { copyClaudePermissionsFromSource, installHooksForAllBackends } from './studio.js';
+import { completeStudio } from '../lib/studio-complete.js';
 
 const TEST_DIR = join(tmpdir(), 'ink-ws-new-test-' + Date.now());
 const TEST_REPO = join(TEST_DIR, 'test-repo');
@@ -335,47 +335,43 @@ describe('Config directory copying', () => {
     expect(existsSync(join(wsPath, '.gemini'))).toBe(false);
   });
 
-  it('should inherit Claude permissions while preserving existing hook config', () => {
-    const sourceRoot = join(realDir(realRepo), 'source-perms');
-    const wsPath = join(realDir(realRepo), `test-repo--inherit-perms`);
-    mkdirSync(join(sourceRoot, '.claude'), { recursive: true });
+  it('the completion routine gives a new worktree the source permissions and hooks for every backend', async () => {
+    const wsPath = join(realDir(realRepo), `test-repo--complete`);
+    mkdirSync(join(realRepo, '.claude'), { recursive: true });
     writeFileSync(
-      join(sourceRoot, '.claude', 'settings.local.json'),
+      join(realRepo, '.claude', 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: ['Bash(ls:*)'] } })
+    );
+    writeFileSync(
+      join(realRepo, '.mcp.json'),
       JSON.stringify({
-        permissions: { allow: ['Bash(ls:*)'] },
+        mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
       })
     );
+    git(`worktree add -b "wren/studio/complete" "${wsPath}"`, realRepo);
 
-    git(`worktree add -b "wren/studio/inherit-perms" "${wsPath}"`, realRepo);
-    mkdirSync(join(wsPath, '.claude'), { recursive: true });
-    writeFileSync(
-      join(wsPath, '.claude', 'settings.local.json'),
-      JSON.stringify({
-        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'ink hooks on-stop' }] }] },
-      })
-    );
+    const report = await completeStudio(wsPath, {
+      sbSlug: 'wren',
+      mainRoot: realRepo,
+      studioName: 'complete',
+      branch: 'wren/studio/complete',
+      register: async () => '191b7705-85bd-4c76-b622-43f655bf7fd6',
+      syncSkills: async () => ({ label: 'skills sync', status: 'skipped', detail: 'stubbed' }),
+    });
 
-    const copied = copyClaudePermissionsFromSource(sourceRoot, wsPath);
-    expect(copied).toBe(true);
-
-    const merged = JSON.parse(
+    expect(report.audit.complete, report.audit.missing.join(',')).toBe(true);
+    const settings = JSON.parse(
       readFileSync(join(wsPath, '.claude', 'settings.local.json'), 'utf-8')
     );
-    expect(merged.permissions).toEqual({ allow: ['Bash(ls:*)'] });
-    expect(merged.hooks).toBeDefined();
-  });
-
-  it('should install hooks for all supported backends in the new studio', () => {
-    const wsPath = join(realDir(realRepo), `test-repo--hooks-all`);
-    git(`worktree add -b "wren/studio/hooks-all" "${wsPath}"`, realRepo);
-
-    const hookResults = installHooksForAllBackends(wsPath);
-    const backendNames = hookResults.map((h) => h.backend).sort();
-
-    expect(backendNames).toEqual(['claude-code', 'codex', 'gemini']);
-    expect(existsSync(join(wsPath, '.claude', 'settings.local.json'))).toBe(true);
+    expect(settings.permissions).toEqual({ allow: ['Bash(ls:*)'] });
+    expect(settings.hooks).toBeDefined();
     expect(existsSync(join(wsPath, '.codex', 'config.toml'))).toBe(true);
     expect(existsSync(join(wsPath, '.gemini', 'settings.json'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(wsPath, '.ink', 'identity.json'), 'utf-8'))).toMatchObject({
+      sbSlug: 'wren',
+      studio: 'complete',
+      studioId: '191b7705-85bd-4c76-b622-43f655bf7fd6',
+    });
   });
 });
 

@@ -720,6 +720,35 @@ describe('SessionService', () => {
     });
 
     /**
+     * Park the next turn inside its runner, and wait until it is actually
+     * there. The path from handleMessage to runner.run awaits real I/O (the
+     * studio checklist's stat, PR #699) as well as fake timers, so one
+     * advanceTimersByTimeAsync(0) is not a runner-entry barrier: it was on
+     * this machine and not on the CI runner. untilEntered keeps flushing
+     * the fake clock and yielding to the loop until the flag the mock sets
+     * on entry is true, however long the I/O takes; a path that never
+     * enters fails by the test timeout, with this name on it.
+     */
+    function parkNextRun() {
+      let release!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      let entered = false;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(() => {
+        entered = true;
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      });
+      return {
+        async untilEntered() {
+          while (!entered) await vi.advanceTimersByTimeAsync(0);
+        },
+        release(v: ReturnType<typeof createMockClaudeResult>) {
+          release(v);
+        },
+      };
+    }
+
+    /**
      * Round 8 (Lumen): a QUEUED next turn renews the lease before the
      * processing lock — invisible to every DB fence. The boundary consults
      * the in-process queue/lock instead of a heartbeat cutoff (which had
@@ -731,20 +760,13 @@ describe('SessionService', () => {
       const service = makeStatefulService(db.repo);
 
       // Park A inside its runner so B can queue behind the lock.
-      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
-      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseRunner = resolve;
-          })
-      );
-
+      const parked = parkNextRun();
       const aPromise = service.handleMessage(createMockRequest());
-      await vi.advanceTimersByTimeAsync(0); // A reaches the runner
+      await parked.untilEntered(); // A is inside the runner
       const bPromise = service.handleMessage(createMockRequest()); // queues
       await vi.advanceTimersByTimeAsync(0);
 
-      releaseRunner(createMockClaudeResult());
+      parked.release(createMockClaudeResult());
       const a = await aPromise;
       expect(a.success).toBe(true);
 
@@ -766,15 +788,9 @@ describe('SessionService', () => {
       await service.handleMessage(createMockRequest()); // turn A
 
       // Turn B enters and parks inside its runner — it holds the lock.
-      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
-      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseRunner = resolve;
-          })
-      );
+      const parked = parkNextRun();
       const bPromise = service.handleMessage(createMockRequest());
-      await vi.advanceTimersByTimeAsync(0);
+      await parked.untilEntered(); // B is inside the runner
 
       // A's retry fires from the background while B holds the lock. The row
       // is B's? No — B is parked BEFORE its running write? It wrote running
@@ -783,7 +799,7 @@ describe('SessionService', () => {
       // boundary effects either way.
       await vi.advanceTimersByTimeAsync(10_000);
 
-      releaseRunner(createMockClaudeResult());
+      parked.release(createMockClaudeResult());
       const b = await bPromise;
       expect(b.success).toBe(true);
       expect(activeRunCount()).toBe(0);
@@ -1176,6 +1192,191 @@ describe('SessionService', () => {
 
       // Should have been processed in order
       expect(processedContents).toEqual(['Message 1', 'Message 2', 'Message 3']);
+    });
+
+    it('re-resolves a queued message with the routing options it arrived with', async () => {
+      // A queued message resolves twice: on arrival, and when the queue reaches
+      // it. contactId, alias and repoRoot were each added to the first call
+      // only, so a queued per-sender message re-resolved into the OWNER's
+      // session. A queued reply must also keep its anchor, because dequeue is
+      // where its admission is checked a second time.
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let release!: () => void;
+      const parked = new Promise<void>((resolve) => (release = resolve));
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        await parked;
+        return createMockClaudeResult();
+      });
+
+      const resolveSpy = vi.spyOn(sessionService, 'getOrCreateSession');
+      const metadata = {
+        contactId: 'contact-1',
+        sessionAlias: 'main',
+        repoRoot: '/repo',
+        recipientSessionId: 'session-123',
+        replyToSessionId: 'session-456',
+      };
+
+      const first = sessionService.handleMessage(createMockRequest({ metadata }));
+      await vi.waitFor(() => expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1));
+      const second = sessionService.handleMessage(
+        createMockRequest({ content: 'second', metadata })
+      );
+      // Released only once the second message is actually queued; releasing
+      // earlier lets it take the free lock and skip the re-resolution.
+      await vi.waitFor(() =>
+        expect(
+          (sessionService as unknown as { pendingQueues: Map<string, unknown[]> }).pendingQueues
+            .size
+        ).toBe(1)
+      );
+      release();
+      await Promise.all([first, second]);
+
+      // Arrival of each message, then the queued re-resolution.
+      expect(resolveSpy).toHaveBeenCalledTimes(3);
+      for (const [, , options] of resolveSpy.mock.calls) {
+        expect(options).toMatchObject({
+          contactId: 'contact-1',
+          alias: 'main',
+          repoRoot: '/repo',
+          recipientSessionId: 'session-123',
+          replyToSessionId: 'session-456',
+        });
+      }
+      // The re-resolution runs under the SECOND message's own candidate, the
+      // one its arrival resolution already stamped leases with.
+      const [firstArrival, secondArrival, dequeued] = resolveSpy.mock.calls.map(
+        ([, , options]) => options?.turnEpochCandidate
+      );
+      expect(dequeued).toBe(secondArrival);
+      expect(dequeued).not.toBe(firstArrival);
+    });
+
+    describe('a queued message that re-resolves to a different session', () => {
+      // Re-resolution at dequeue can choose a session other than the one the
+      // message queued behind: a reply's anchor declined because its session
+      // ended while the reply waited, or general reuse moving on. The lock it
+      // waited on serializes turns in the session it names, and in no other.
+      function rerouteRig() {
+        const sessions: Record<string, Session> = {
+          'session-a': createMockSession({ id: 'session-a', backendSessionId: 'backend-a' }),
+          'session-b': createMockSession({ id: 'session-b', backendSessionId: 'backend-b' }),
+        };
+        // 'moves' resolves to A on arrival and to B at dequeue.
+        let movesResolved = 0;
+        vi.spyOn(sessionService, 'getOrCreateSession').mockImplementation(
+          async (_userId, _sbSlug, options) => {
+            const target = options?.recipientSessionId;
+            if (target === 'moves')
+              return sessions[movesResolved++ === 0 ? 'session-a' : 'session-b'];
+            return sessions[target!];
+          }
+        );
+
+        // Every turn parks until its gate opens, and each backend's peak
+        // number of simultaneous turns is recorded.
+        const gates = new Map<string, () => void>();
+        const running = new Map<string, number>();
+        const peak = new Map<string, number>();
+        const started: string[] = [];
+        vi.mocked(mockClaudeRunner.run).mockImplementation(async (message: string, config) => {
+          const backend = (config as { backendSessionId: string }).backendSessionId;
+          const turn = /turn-\w+/.exec(message)![0];
+          started.push(turn);
+          running.set(backend, (running.get(backend) ?? 0) + 1);
+          peak.set(backend, Math.max(peak.get(backend) ?? 0, running.get(backend)!));
+          await new Promise<void>((resolve) => gates.set(turn, resolve));
+          running.set(backend, running.get(backend)! - 1);
+          return createMockClaudeResult({ backendSessionId: backend });
+        });
+
+        const internals = sessionService as unknown as {
+          pendingQueues: Map<string, unknown[]>;
+          processingLocks: Set<string>;
+        };
+        return {
+          gates,
+          peak,
+          started,
+          queued: (lockKey: string) => internals.pendingQueues.get(lockKey)?.length ?? 0,
+          locks: () => [...internals.processingLocks].sort(),
+          send: (recipientSessionId: string, turn: string) =>
+            sessionService.handleMessage(
+              createMockRequest({ content: turn, metadata: { recipientSessionId } })
+            ),
+        };
+      }
+
+      it("waits for the new session's running turn, and frees the old session's lock", async () => {
+        const { gates, peak, started, queued, locks, send } = rerouteRig();
+        const first = send('session-a', 'turn-a');
+        await vi.waitFor(() => expect(gates.has('turn-a')).toBe(true));
+        const running = send('session-b', 'turn-b');
+        await vi.waitFor(() => expect(gates.has('turn-b')).toBe(true));
+        const moved = send('moves', 'turn-moved');
+        await vi.waitFor(() => expect(queued('myra:session-a')).toBe(1));
+
+        gates.get('turn-a')!();
+        // Either it runs now, beside B's turn, or it has joined B's queue.
+        await vi.waitFor(() =>
+          expect(gates.has('turn-moved') || queued('myra:session-b') === 1).toBe(true)
+        );
+        expect(peak.get('backend-b')).toBe(1);
+        // A's lock is free, and A's first message settles without waiting on B.
+        await vi.waitFor(() => expect(locks()).toEqual(['myra:session-b']));
+        await first;
+
+        gates.get('turn-b')!();
+        await vi.waitFor(() => expect(gates.has('turn-moved')).toBe(true));
+        gates.get('turn-moved')!();
+        const [, movedResult] = await Promise.all([running, moved]);
+
+        expect(movedResult).toMatchObject({
+          success: true,
+          sessionId: 'session-b',
+          admitted: true,
+        });
+        expect(started).toEqual(['turn-a', 'turn-b', 'turn-moved']);
+        expect(peak.get('backend-b')).toBe(1);
+        expect(locks()).toEqual([]);
+      });
+
+      it("takes the new session's lock when it is idle, so the next message there queues", async () => {
+        const { gates, peak, started, queued, locks, send } = rerouteRig();
+        const first = send('session-a', 'turn-a');
+        await vi.waitFor(() => expect(gates.has('turn-a')).toBe(true));
+        const moved = send('moves', 'turn-moved');
+        await vi.waitFor(() => expect(queued('myra:session-a')).toBe(1));
+
+        gates.get('turn-a')!();
+        await vi.waitFor(() => expect(gates.has('turn-moved')).toBe(true));
+        // It runs under B's lock, and A's is free.
+        await vi.waitFor(() => expect(locks()).toEqual(['myra:session-b']));
+        await first;
+
+        const next = send('session-b', 'turn-next');
+        // Either it runs now, beside the moved turn, or it queues behind it.
+        await vi.waitFor(() =>
+          expect(gates.has('turn-next') || queued('myra:session-b') === 1).toBe(true)
+        );
+        expect(peak.get('backend-b')).toBe(1);
+
+        gates.get('turn-moved')!();
+        await vi.waitFor(() => expect(gates.has('turn-next')).toBe(true));
+        gates.get('turn-next')!();
+        const [movedResult] = await Promise.all([moved, next]);
+
+        expect(movedResult).toMatchObject({
+          success: true,
+          sessionId: 'session-b',
+          admitted: true,
+        });
+        expect(started).toEqual(['turn-a', 'turn-moved', 'turn-next']);
+        expect(locks()).toEqual([]);
+      });
     });
 
     it('should queue heartbeat when telegram message is processing (race condition fix)', async () => {
@@ -2421,6 +2622,385 @@ describe('SessionService', () => {
       expect(mockRepository.findById).toHaveBeenCalledWith('nonexistent-session');
       // Falls through to normal creation
       expect(mockRepository.create).toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * A Telegram reply anchors to the session that wrote the message it answers
+   * (replyToSessionId). Nothing upstream has planned delivery to that session,
+   * so admitReplyAnchor checks it on every resolution and declines it, routing
+   * the reply unanchored, whenever it cannot safely take the turn (Lumen,
+   * PR #682). These run over the fake database and the real lease service:
+   * two of the checks ARE the trigger path's delivery decision and the lease
+   * service's acquire, and a mock of either would only restate the code.
+   */
+  describe('Reply anchors — replyToSessionId', () => {
+    const stamp = (msAgo = 0) => new Date(Date.now() - msAgo).toISOString();
+
+    function foreignLease(overrides: Row = {}): Row {
+      return {
+        sessionId: 'another-writer',
+        threadKey: 'pr:900002',
+        threadKeys: ['pr:900002'],
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        acquiredAt: stamp(),
+        heartbeatAt: stamp(),
+        ...overrides,
+      };
+    }
+
+    function replyFixture(
+      opts: {
+        authoring?: Partial<Session>;
+        /** Overrides on the authoring session's DB row (attachment columns). */
+        authoringRow?: Row;
+        lease?: Row | null;
+      } = {}
+    ) {
+      const authoring = createMockSession({
+        id: 'authoring',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        backendSessionId: 'backend-authoring',
+        ...opts.authoring,
+      });
+      const home = createMockSession({
+        id: 'home',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        backendSessionId: 'backend-home',
+      });
+      vi.mocked(mockRepository.findById).mockImplementation(async (id: string) =>
+        id === authoring.id ? authoring : id === home.id ? home : null
+      );
+      // General reuse: what an unanchored reply lands in.
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(home);
+
+      const tables: Record<string, Row[]> = {
+        agent_identities: [
+          {
+            id: 'sb-wren',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            workspace_id: 'ws-1',
+            updated_at: stamp(),
+          },
+        ],
+        sessions: [
+          {
+            id: 'authoring',
+            user_id: 'user-456',
+            sb_id: 'sb-wren',
+            agent_id: 'wren',
+            studio_id: authoring.studioId ?? null,
+            ended_at: null,
+            cli_attached: false,
+            cli_poll_at: null,
+            updated_at: stamp(),
+            ...opts.authoringRow,
+          },
+        ],
+        studios: [
+          {
+            id: 'studio-pr',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            sb_id: 'sb-wren',
+            status: 'active',
+            route_patterns: [],
+            ephemeral: false,
+            worktree_path: tmpdir(),
+            lease: opts.lease ?? null,
+          },
+        ],
+        inbox_threads: [
+          { id: 'thread-pr', workspace_id: 'ws-1', thread_key: 'pr:900001', key_type: 'pr' },
+          {
+            id: 'thread-talk',
+            workspace_id: 'ws-1',
+            thread_key: 'thread:talk',
+            key_type: 'thread',
+          },
+        ],
+        thread_key_types: [
+          {
+            id: 'tkt-pr',
+            workspace_id: null,
+            type: 'pr',
+            write_intent: 'write',
+            studio_policy: 'provision',
+            description: null,
+            created_at: stamp(),
+            updated_at: stamp(),
+          },
+          {
+            id: 'tkt-thread',
+            workspace_id: null,
+            type: 'thread',
+            write_intent: 'presence',
+            studio_policy: 'reuse-only',
+            description: null,
+            created_at: stamp(),
+            updated_at: stamp(),
+          },
+        ],
+        studio_lease_events: [],
+      };
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        makeFakeSupabase(tables) as never
+      );
+      return { service, tables, authoring };
+    }
+
+    /** The studio-bound PR session a reply most often answers. */
+    const inPrStudio = { studioId: 'studio-pr', threadKey: 'pr:900001' };
+
+    const reply = (service: SessionService, options: Record<string, unknown> = {}) =>
+      service.getOrCreateSession('user-456', 'wren', { replyToSessionId: 'authoring', ...options });
+
+    it('resumes the open session that wrote the message', async () => {
+      const { service } = replyFixture();
+
+      const session = await reply(service);
+
+      expect(session.id).toBe('authoring');
+      // Chosen by the anchor: general reuse was never asked.
+      expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
+    });
+
+    it('declines a session belonging to another identity of the same slug', async () => {
+      const { service } = replyFixture({ authoring: { sbId: 'sb-other-wren' } });
+
+      expect((await reply(service)).id).toBe('home');
+    });
+
+    describe('per-sender isolation, in both directions, as general reuse applies it', () => {
+      it("declines an owner session for a contact's reply", async () => {
+        const { service } = replyFixture();
+
+        const session = await reply(service, { contactId: 'contact-1' });
+
+        expect(session.id).toBe('home');
+        expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+          'user-456',
+          'wren',
+          expect.objectContaining({ contactId: 'contact-1' })
+        );
+      });
+
+      it("declines another contact's session", async () => {
+        const { service } = replyFixture({ authoring: { contactId: 'contact-2' } });
+
+        expect((await reply(service, { contactId: 'contact-1' })).id).toBe('home');
+      });
+
+      it("resumes the contact's own session", async () => {
+        const { service } = replyFixture({ authoring: { contactId: 'contact-1' } });
+
+        expect((await reply(service, { contactId: 'contact-1' })).id).toBe('authoring');
+      });
+
+      it('declines a contact session for an owner-scoped reply', async () => {
+        // General reuse would never pick a contact's session for an owner
+        // request, so the anchor may not either.
+        const { service } = replyFixture({ authoring: { contactId: 'contact-1' } });
+
+        expect((await reply(service)).id).toBe('home');
+      });
+    });
+
+    it('declines a session that ended after the reply lookup, and routes without its studio', async () => {
+      // Finding 3 of the review, at the unit: no reuse match, so the reply
+      // creates. The anchor used to pin its studio first, and the new session
+      // was created inside it.
+      const { service } = replyFixture({ authoring: { ...inPrStudio, endedAt: new Date() } });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      const session = await reply(service);
+
+      expect(session.id).not.toBe('authoring');
+      expect(mockRepository.create).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(mockRepository.create).mock.calls[0][0].studioId).not.toBe('studio-pr');
+      expect(vi.mocked(mockRepository.findByUserAndAgent).mock.calls[0][2]).not.toMatchObject({
+        studioId: 'studio-pr',
+      });
+    });
+
+    describe("a live terminal on the session, by the trigger path's delivery decision", () => {
+      it('declines while a CLI is polling it', async () => {
+        const { service } = replyFixture({ authoringRow: { cli_poll_at: stamp() } });
+
+        expect((await reply(service)).id).toBe('home');
+      });
+
+      it('declines while it is attached and recently updated', async () => {
+        const { service } = replyFixture({
+          authoringRow: { cli_attached: true, updated_at: stamp() },
+        });
+
+        expect((await reply(service)).id).toBe('home');
+      });
+
+      it('resumes it once the attachment has gone stale, as the trigger path would spawn', async () => {
+        const { service } = replyFixture({
+          authoringRow: { cli_attached: true, updated_at: stamp(11 * 60 * 1000) },
+        });
+
+        expect((await reply(service)).id).toBe('authoring');
+      });
+
+      it('declines when the attachment cannot be read', async () => {
+        const { service, tables } = replyFixture();
+        tables.sessions = [];
+
+        expect((await reply(service)).id).toBe('home');
+      });
+    });
+
+    describe("its studio, under its own thread's contract", () => {
+      it('takes the write lease when the studio is free, stamped with the turn', async () => {
+        const { service, tables } = replyFixture({ authoring: inPrStudio });
+
+        const session = await reply(service, { turnEpochCandidate: 'epoch-1' });
+
+        expect(session.id).toBe('authoring');
+        expect(tables.studios[0].lease).toMatchObject({
+          sessionId: 'authoring',
+          threadKey: 'pr:900001',
+          turnEpoch: 'epoch-1',
+        });
+      });
+
+      it('declines, without diverting or holding, while another session holds it', async () => {
+        const { service, tables, authoring } = replyFixture({
+          authoring: inPrStudio,
+          lease: foreignLease(),
+        });
+        const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+
+        const session = await reply(service);
+
+        expect(session.id).toBe('home');
+        expect(tables.studios[0].lease).toMatchObject({ sessionId: 'another-writer' });
+        expect(tables.studios[0].status).toBe('active');
+        expect(authoring.studioId).toBe('studio-pr');
+        expect(mockRepository.update).not.toHaveBeenCalled();
+        expect(overflowSpy).not.toHaveBeenCalled();
+        overflowSpy.mockRestore();
+      });
+
+      it('resumes a session that holds the lease itself', async () => {
+        const { service } = replyFixture({
+          authoring: inPrStudio,
+          lease: foreignLease({
+            sessionId: 'authoring',
+            threadKey: 'pr:900001',
+            threadKeys: ['pr:900001'],
+          }),
+        });
+
+        expect((await reply(service)).id).toBe('authoring');
+      });
+
+      it('binds a presence thread without the lease, whoever holds it', async () => {
+        const { service, tables } = replyFixture({
+          authoring: { studioId: 'studio-pr', threadKey: 'thread:talk' },
+          lease: foreignLease(),
+        });
+
+        expect((await reply(service)).id).toBe('authoring');
+        expect(tables.studios[0].lease).toMatchObject({ sessionId: 'another-writer' });
+      });
+
+      it('acquires nothing on a plan resolution', async () => {
+        const { service, tables } = replyFixture({ authoring: inPrStudio });
+
+        expect((await reply(service, { planOnly: true })).id).toBe('authoring');
+        expect(tables.studios[0].lease).toBeNull();
+      });
+
+      describe('a studio-bound session with no thread, which has no contract to meet', () => {
+        it('declines while another session holds the studio', async () => {
+          const { service, tables } = replyFixture({
+            authoring: { studioId: 'studio-pr' },
+            lease: foreignLease(),
+          });
+
+          expect((await reply(service)).id).toBe('home');
+          expect(tables.studios[0].lease).toMatchObject({ sessionId: 'another-writer' });
+        });
+
+        it('declines while the studio is free, since no lease can be taken for it', async () => {
+          const { service, tables } = replyFixture({ authoring: { studioId: 'studio-pr' } });
+
+          expect((await reply(service)).id).toBe('home');
+          expect(tables.studios[0].lease).toBeNull();
+        });
+
+        it('declines on a plan resolution too: it is a decision, not an acquisition', async () => {
+          const { service } = replyFixture({ authoring: { studioId: 'studio-pr' } });
+
+          expect((await reply(service, { planOnly: true })).id).toBe('home');
+        });
+      });
+    });
+
+    /**
+     * A reply that queues behind its own session's running turn is admitted
+     * twice. Both outcomes are pinned: the dequeue check must be able to say
+     * yes as well as no, or a check that always declined would pass the
+     * second case alone.
+     */
+    async function queueTwoReplies(opts: { endWhileQueued: boolean }) {
+      const { service, authoring } = replyFixture();
+      let release!: () => void;
+      const parked = new Promise<void>((resolve) => (release = resolve));
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        await parked;
+        return createMockClaudeResult();
+      });
+      const metadata = { replyToSessionId: 'authoring' };
+
+      const first = service.handleMessage(createMockRequest({ sbSlug: 'wren', metadata }));
+      await vi.waitFor(() => expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1));
+      const second = service.handleMessage(
+        createMockRequest({ sbSlug: 'wren', content: 'second', metadata })
+      );
+      await vi.waitFor(() =>
+        expect(
+          (service as unknown as { pendingQueues: Map<string, unknown[]> }).pendingQueues.size
+        ).toBe(1)
+      );
+      // Admitted on arrival: it queued behind its own session.
+      if (opts.endWhileQueued) authoring.endedAt = new Date();
+      release();
+      const [, queued] = await Promise.all([first, second]);
+
+      const resumed = vi
+        .mocked(mockClaudeRunner.run)
+        .mock.calls.map(([, config]) => (config as { backendSessionId?: string }).backendSessionId);
+      return { resumed, queued };
+    }
+
+    it('checks again at dequeue: a queued reply still resumes a session that can take it', async () => {
+      const { resumed, queued } = await queueTwoReplies({ endWhileQueued: false });
+
+      expect(resumed).toEqual(['backend-authoring', 'backend-authoring']);
+      expect(queued.sessionId).toBe('authoring');
+    });
+
+    it('checks again at dequeue: a queued reply does not resume a session that ended meanwhile', async () => {
+      const { resumed, queued } = await queueTwoReplies({ endWhileQueued: true });
+
+      expect(resumed).toEqual(['backend-authoring', 'backend-home']);
+      expect(queued.sessionId).toBe('home');
     });
   });
 
@@ -5965,6 +6545,574 @@ describe('SessionService', () => {
       );
       expect(senderLookup).toBeUndefined();
     });
+    describe('project-pinned threads route by the project repo, never the sender repo (task b5c71bc3)', () => {
+      /*
+       * Thread `inktrade:pr:1` (2026-09-24) routed to an Inkwell studio through the
+       * caller-repo tier — the sender was in the inkwell checkout — and the
+       * overflow service then minted the review checkout from that parent's
+       * repo, detached at inkwell's refs/pull/1/head: the wrong repository's
+       * PR #1, handed to the reviewer as an inktrade review.
+       *
+       * The thread row carries the project its key was pinned to
+       * (inbox_threads.key_project, thread-key-grammar v4). That pin, and the
+       * project's repo_root, decide the repo for every INFERRED tier —
+       * continuity, route patterns, main, reuse, D1 creation — and the
+       * sender's ambient repo is not consulted at all. A pinned project with
+       * no repo_root holds, with a reason that names the fix.
+       */
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+      const eqArg = (calls: RecordedCall[], col: string) =>
+        calls.find((c) => c.method === 'eq' && c.args[0] === col)?.args[1];
+
+      function projectRoutingSupabase(opts: {
+        /** The projects row for the pinned slug; null = no row; 'error' = unreadable. */
+        project: { slug: string; repo_root: string | null } | null | 'error';
+        /** inbox_threads.key_project; defaults to 'inktrade'. */
+        keyProject?: string | null;
+        /** The recipient's non-ephemeral studio per repo_root. */
+        studiosByRepo?: Record<string, string>;
+        /** An active session on this thread, bound to a studio in that repo. */
+        continuity?: { studioId: string; repoRoot: string };
+        /** Studios carrying route patterns, with the repo each lives in. */
+        patternStudios?: Array<{ id: string; route_patterns: string[]; repo_root: string }>;
+        /** Repo of a studio looked up by id (the continuity / reuse repo check). */
+        studioRepos?: Record<string, string>;
+        /** Studio of a session looked up by id (the recipient-session anchor tier). */
+        sessionStudios?: Record<string, string>;
+      }) {
+        const queries: Array<{ table: string; calls: RecordedCall[] }> = [];
+        const from = vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          queries.push({ table, calls });
+          if (table === 'sessions') {
+            return createFilterAwareChain((c) => {
+              // Provenance for the caller-repo tier, should it run.
+              if (has(c, 'id', 'sender-session-1')) {
+                return { data: { studio_id: 'sender-studio-1' } };
+              }
+              const anchor = Object.entries(opts.sessionStudios ?? {}).find(([id]) =>
+                has(c, 'id', id)
+              );
+              if (anchor) return { data: { studio_id: anchor[1] } };
+              // Tier 2 continuity: the live session already on this thread.
+              if (opts.continuity && has(c, 'thread_key') && !has(c, 'studio_id')) {
+                return {
+                  data: { studio_id: opts.continuity.studioId, updated_at: '2026-09-24T00:00:00Z' },
+                };
+              }
+              return { data: null };
+            }, calls);
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(
+              () => ({
+                data: {
+                  key_type: 'pr',
+                  key_project: opts.keyProject === undefined ? 'inktrade' : opts.keyProject,
+                },
+              }),
+              calls
+            );
+          }
+          if (table === 'thread_key_types') {
+            return createFilterAwareChain(
+              () => ({ data: [threadKeyTemplate('pr', 'write', 'provision')] }),
+              calls
+            );
+          }
+          if (table === 'projects') {
+            return createFilterAwareChain(
+              () =>
+                opts.project === 'error'
+                  ? { data: null, error: { message: 'projects unreadable' } }
+                  : { data: opts.project },
+              calls
+            );
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+              if (opts.continuity && has(c, 'id', opts.continuity.studioId)) {
+                return { data: { repo_root: opts.continuity.repoRoot } };
+              }
+              const byId = Object.entries(opts.studioRepos ?? {}).find(([id]) => has(c, 'id', id));
+              // A superset row: the repo for the continuity / reuse check, and
+              // the ownership columns an explicit studio anchor authorizes on.
+              if (byId) {
+                return {
+                  data: {
+                    repo_root: byId[1],
+                    user_id: 'user-456',
+                    agent_id: 'wren',
+                    sb_id: 'sb-wren',
+                    status: 'active',
+                  },
+                };
+              }
+              const selected = String(c.find((call) => call.method === 'select')?.args[0] ?? '');
+              // The occupancy read — every candidate is free.
+              if (selected.includes('lease')) {
+                return {
+                  data: { lease: null, worktree_path: '/x', ephemeral: false, status: 'active' },
+                };
+              }
+              if (c.some((call) => call.method === 'not' && call.args[0] === 'route_patterns')) {
+                const scope = eqArg(c, 'repo_root');
+                const rows = (opts.patternStudios ?? []).filter(
+                  (s) => scope === undefined || s.repo_root === scope
+                );
+                return { data: rows.map((s) => ({ id: s.id, route_patterns: s.route_patterns })) };
+              }
+              if (has(c, 'ephemeral', false)) {
+                const id = opts.studiosByRepo?.[String(eqArg(c, 'repo_root'))];
+                return { data: id ? { id } : null };
+              }
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        });
+        return { supabase: { from }, queries };
+      }
+
+      const senderLookupRan = (queries: Array<{ table: string; calls: RecordedCall[] }>) =>
+        queries.some((q) => q.table === 'studios' && has(q.calls, 'id', 'sender-studio-1'));
+
+      it('reuses the recipient studio in the PROJECT repo and never consults the sender repo', async () => {
+        const { supabase, queries } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+          studiosByRepo: {
+            '/repos/inkwell': 'studio-inkwell-wren',
+            '/repos/inktrade': 'studio-inktrade-wren',
+          },
+        });
+        const service = serviceWith(supabase);
+
+        await service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'inktrade:pr:1',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        });
+
+        expect(mockRepository.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studioId: 'studio-inktrade-wren',
+            metadata: expect.objectContaining({
+              routing_decision: expect.objectContaining({ tier: 'project-repo-reuse' }),
+            }),
+          })
+        );
+        // The project is read by workspace + pinned slug, never re-parsed.
+        const projectQuery = queries.find((q) => q.table === 'projects');
+        expect(projectQuery).toBeDefined();
+        expect(has(projectQuery!.calls, 'slug', 'inktrade')).toBe(true);
+        expect(has(projectQuery!.calls, 'workspace_id')).toBe(true);
+        // The sender's repo was not consulted — it is what put the review in
+        // the wrong repository.
+        expect(senderLookupRan(queries)).toBe(false);
+      });
+
+      it('holds a thread pinned to a project with no repo_root — reason names the project and the fix', async () => {
+        const { supabase, queries } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: null },
+          studiosByRepo: { '/repos/inkwell': 'studio-inkwell-wren' },
+        });
+        const service = serviceWith(supabase);
+
+        const rejection = await service
+          .getOrCreateSession('user-456', 'wren', {
+            threadKey: 'inktrade:pr:1',
+            callerStudioId: 'sender-studio-1',
+            callerSessionId: 'sender-session-1',
+          })
+          .then(
+            () => null,
+            (err: Error & { detail?: Record<string, unknown> }) => err
+          );
+
+        expect(rejection).toMatchObject({
+          code: 'ROUTING_REFUSED',
+          threadKey: 'inktrade:pr:1',
+          detail: {
+            reason: 'project-without-repo',
+            triedCallerRepo: false,
+            project: { slug: 'inktrade', cause: 'unset' },
+          },
+        });
+        expect(rejection?.message).toContain('inktrade');
+        expect(rejection?.message).toContain('repo_root');
+        expect(rejection?.message).toContain('save_project');
+        // Held, not placed in the sender's repo: no session row, and the
+        // sender-repo tier never ran.
+        expect(mockRepository.create).not.toHaveBeenCalled();
+        expect(senderLookupRan(queries)).toBe(false);
+      });
+
+      it('holds when the pinned project no longer resolves to a row, and when the projects read fails', async () => {
+        for (const [project, cause] of [
+          [null, 'unresolved'],
+          ['error', 'unreadable'],
+        ] as const) {
+          mockRepository.create.mockClear();
+          const { supabase } = projectRoutingSupabase({
+            project,
+            studiosByRepo: { '/repos/inkwell': 'studio-inkwell-wren' },
+          });
+          const service = serviceWith(supabase);
+          await expect(
+            service.getOrCreateSession('user-456', 'wren', {
+              threadKey: 'inktrade:pr:1',
+              callerStudioId: 'sender-studio-1',
+              callerSessionId: 'sender-session-1',
+            })
+          ).rejects.toMatchObject({
+            code: 'ROUTING_REFUSED',
+            detail: { reason: 'project-without-repo', project: { slug: 'inktrade', cause } },
+          });
+          expect(mockRepository.create).not.toHaveBeenCalled();
+        }
+      });
+
+      it('skips thread continuity to a studio in another repo — the incident rows must not keep winning', async () => {
+        const { supabase } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+          // The live session from the mis-route, bound to the inkwell overflow.
+          continuity: { studioId: 'studio-wrong-repo', repoRoot: '/repos/inkwell' },
+          studiosByRepo: { '/repos/inktrade': 'studio-inktrade-wren' },
+        });
+        const service = serviceWith(supabase);
+
+        await service.getOrCreateSession('user-456', 'wren', { threadKey: 'inktrade:pr:1' });
+
+        expect(mockRepository.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studioId: 'studio-inktrade-wren',
+            metadata: expect.objectContaining({
+              routing_decision: expect.objectContaining({ tier: 'project-repo-reuse' }),
+            }),
+          })
+        );
+      });
+
+      it('keeps thread continuity when the studio IS in the project repo', async () => {
+        // Control for the test above: continuity is skipped for the repo, not
+        // for being continuity.
+        const { supabase } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+          continuity: { studioId: 'studio-inktrade-eph', repoRoot: '/repos/inktrade' },
+          studiosByRepo: { '/repos/inktrade': 'studio-inktrade-wren' },
+        });
+        const service = serviceWith(supabase);
+
+        await service.getOrCreateSession('user-456', 'wren', { threadKey: 'inktrade:pr:1' });
+
+        expect(mockRepository.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studioId: 'studio-inktrade-eph',
+            metadata: expect.objectContaining({
+              routing_decision: expect.objectContaining({ tier: 'thread-continuity' }),
+            }),
+          })
+        );
+      });
+
+      it('scopes the route-pattern tier to the project repo', async () => {
+        const { supabase, queries } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+          patternStudios: [
+            // A catch-all in the wrong repo would have captured this thread.
+            { id: 'studio-inkwell-catchall', route_patterns: ['*'], repo_root: '/repos/inkwell' },
+            {
+              id: 'studio-inktrade-review',
+              route_patterns: ['inktrade:*'],
+              repo_root: '/repos/inktrade',
+            },
+          ],
+        });
+        const service = serviceWith(supabase);
+
+        await service.getOrCreateSession('user-456', 'wren', { threadKey: 'inktrade:pr:1' });
+
+        const patternQuery = queries.find(
+          (q) =>
+            q.table === 'studios' &&
+            q.calls.some((c) => c.method === 'not' && c.args[0] === 'route_patterns')
+        );
+        expect(patternQuery).toBeDefined();
+        expect(has(patternQuery!.calls, 'repo_root', '/repos/inktrade')).toBe(true);
+        expect(mockRepository.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studioId: 'studio-inktrade-review',
+            metadata: expect.objectContaining({
+              routing_decision: expect.objectContaining({ tier: 'route-pattern' }),
+            }),
+          })
+        );
+      });
+
+      it('creates the D1 parent in the PROJECT repo when the recipient has no studio there', async () => {
+        const parentSpy = vi
+          .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+          .mockResolvedValue({ id: 'studio-inktrade-new', slug: 'inktrade--wren' } as never);
+        try {
+          const { supabase } = projectRoutingSupabase({
+            project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+            // Only an inkwell studio exists; the sender is in inkwell too.
+            studiosByRepo: { '/repos/inkwell': 'studio-inkwell-wren' },
+          });
+          const service = serviceWith(supabase);
+
+          await service.getOrCreateSession('user-456', 'wren', {
+            threadKey: 'inktrade:pr:1',
+            callerStudioId: 'sender-studio-1',
+            callerSessionId: 'sender-session-1',
+          });
+
+          expect(parentSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ repoRoot: '/repos/inktrade', sbSlug: 'wren' })
+          );
+          expect(mockRepository.create).toHaveBeenCalledWith(
+            expect.objectContaining({
+              studioId: 'studio-inktrade-new',
+              metadata: expect.objectContaining({
+                routing_decision: expect.objectContaining({ tier: 'project-repo-created' }),
+              }),
+            })
+          );
+        } finally {
+          parentSpy.mockRestore();
+        }
+      });
+
+      it('an unprefixed thread is untouched: no project read, and the caller repo still decides', async () => {
+        const { supabase, queries } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+          keyProject: null,
+          studiosByRepo: {
+            '/repos/inkwell': 'studio-inkwell-wren',
+            '/repos/inktrade': 'studio-inktrade-wren',
+          },
+        });
+        const service = serviceWith(supabase);
+
+        await service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        });
+
+        expect(queries.some((q) => q.table === 'projects')).toBe(false);
+        expect(mockRepository.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studioId: 'studio-inkwell-wren',
+            metadata: expect.objectContaining({
+              routing_decision: expect.objectContaining({ tier: 'caller-repo-reuse' }),
+            }),
+          })
+        );
+      });
+
+      /*
+       * The thread-key REUSE rung (Lumen, #681 round 1). It runs after
+       * routing, and when routing produced no studio — a deferred D1 create,
+       * or a refusal — it runs unscoped: any live session on the thread
+       * qualifies. For a project-pinned thread that is the incident's own
+       * session, bound to the wrong-repo overflow, reselected before the
+       * create boundary could provision in the project repo or the refusal
+       * could hold. The rung must apply the same repo test as continuity.
+       */
+      function serviceWithRepo(mockSupabase: unknown, oldSession: Record<string, unknown>) {
+        const repository = {
+          ...mockRepository,
+          findByThreadKey: vi.fn(async (_u: string, _s: string, key: string, studio?: string) =>
+            key === 'inktrade:pr:1' && (!studio || studio === oldSession.studioId)
+              ? oldSession
+              : null
+          ),
+        };
+        const service = new SessionService(
+          repository as never,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+          mockCodexRunner,
+          mockSupabase as never
+        );
+        return { service, repository };
+      }
+      const oldSessionIn = (studioId: string) => ({
+        id: 'old-session',
+        userId: 'user-456',
+        sbSlug: 'wren',
+        sbId: 'sb-wren',
+        studioId,
+        threadKey: 'inktrade:pr:1',
+        endedAt: null,
+      });
+
+      it('does not reuse an old session in another repo while the D1 parent is still deferred', async () => {
+        const parentSpy = vi
+          .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+          .mockResolvedValue({ id: 'studio-inktrade-new', slug: 'inktrade--wren' } as never);
+        try {
+          const { supabase } = projectRoutingSupabase({
+            project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+            studiosByRepo: { '/repos/inkwell': 'studio-inkwell-wren' },
+            studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+          });
+          const { service, repository } = serviceWithRepo(
+            supabase,
+            oldSessionIn('studio-wrong-repo')
+          );
+
+          const session = await service.getOrCreateSession('user-456', 'wren', {
+            threadKey: 'inktrade:pr:1',
+            callerStudioId: 'sender-studio-1',
+            callerSessionId: 'sender-session-1',
+          });
+
+          expect(repository.findByThreadKey).toHaveBeenCalled();
+          expect(session.id).not.toBe('old-session');
+          expect(parentSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ repoRoot: '/repos/inktrade' })
+          );
+          expect(mockRepository.create).toHaveBeenCalledWith(
+            expect.objectContaining({
+              studioId: 'studio-inktrade-new',
+              metadata: expect.objectContaining({
+                routing_decision: expect.objectContaining({ tier: 'project-repo-created' }),
+              }),
+            })
+          );
+        } finally {
+          parentSpy.mockRestore();
+        }
+      });
+
+      it('holds a project without a repo even when an old session exists on the thread', async () => {
+        const { supabase } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: null },
+          studiosByRepo: { '/repos/inkwell': 'studio-inkwell-wren' },
+          studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+        });
+        const { service } = serviceWithRepo(supabase, oldSessionIn('studio-wrong-repo'));
+
+        await expect(
+          service.getOrCreateSession('user-456', 'wren', { threadKey: 'inktrade:pr:1' })
+        ).rejects.toMatchObject({
+          code: 'ROUTING_REFUSED',
+          detail: { reason: 'project-without-repo', project: { slug: 'inktrade', cause: 'unset' } },
+        });
+        expect(mockRepository.create).not.toHaveBeenCalled();
+      });
+
+      it('still reuses an old session whose studio IS in the project repo', async () => {
+        // Control for the two above: the rung is gated on the repo, not
+        // removed. Routing resolves the project studio, and the reuse lookup
+        // is scoped to it, so the old session lives there.
+        const { supabase } = projectRoutingSupabase({
+          project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+          studiosByRepo: { '/repos/inktrade': 'studio-inktrade-wren' },
+          studioRepos: { 'studio-inktrade-wren': '/repos/inktrade' },
+        });
+        const { service } = serviceWithRepo(supabase, oldSessionIn('studio-inktrade-wren'));
+
+        const session = await service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'inktrade:pr:1',
+        });
+
+        expect(session.id).toBe('old-session');
+        expect(mockRepository.create).not.toHaveBeenCalled();
+      });
+
+      it('keeps continuity in a caller-named studio even outside the project repo (Lumen, #681 r2)', async () => {
+        // An explicit studioId is addressing, and the reuse lookup is already
+        // scoped to it. Rejecting the live match there created a NEW session
+        // in the very same studio — the escape hatch lost its continuity, not
+        // its placement. Both project states: repo set, and repo unset.
+        for (const repo_root of ['/repos/inktrade', null] as const) {
+          mockRepository.create.mockClear();
+          const { supabase } = projectRoutingSupabase({
+            project: { slug: 'inktrade', repo_root },
+            studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+          });
+          const { service, repository } = serviceWithRepo(
+            supabase,
+            oldSessionIn('studio-wrong-repo')
+          );
+
+          const session = await service.getOrCreateSession('user-456', 'wren', {
+            threadKey: 'inktrade:pr:1',
+            studioId: 'studio-wrong-repo',
+          });
+
+          expect(repository.findByThreadKey).toHaveBeenCalledWith(
+            'user-456',
+            'wren',
+            'inktrade:pr:1',
+            'studio-wrong-repo',
+            undefined,
+            'sb-wren'
+          );
+          expect(session.id).toBe('old-session');
+          expect(mockRepository.create).not.toHaveBeenCalled();
+        }
+      });
+
+      it('drops an INFERRED recipient-session hint outside the project repo, keeps a caller-explicit one', async () => {
+        // The trigger path passes a recipientSessionId inferred from thread
+        // history or the participant stamp with no caller provenance
+        // (Lumen, #681 r2). For a pinned thread that hint is the incident's
+        // own session; it is a continuity hint, never an address. A
+        // caller-explicit one is addressing and wins as before.
+        const old = oldSessionIn('studio-wrong-repo');
+        const world = () => {
+          const { supabase } = projectRoutingSupabase({
+            project: { slug: 'inktrade', repo_root: '/repos/inktrade' },
+            studiosByRepo: { '/repos/inktrade': 'studio-inktrade-wren' },
+            studioRepos: { 'studio-wrong-repo': '/repos/inkwell' },
+            sessionStudios: { 'old-session': 'studio-wrong-repo' },
+          });
+          const built = serviceWithRepo(supabase, old);
+          built.repository.findById = vi.fn(async (id: string) =>
+            id === 'old-session' ? old : null
+          );
+          return built;
+        };
+
+        const { service: inferredService } = world();
+        const inferred = await inferredService.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'inktrade:pr:1',
+          recipientSessionId: 'old-session',
+        });
+        expect(inferred.id).not.toBe('old-session');
+        expect(mockRepository.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studioId: 'studio-inktrade-wren',
+            metadata: expect.objectContaining({
+              routing_decision: expect.objectContaining({ tier: 'project-repo-reuse' }),
+            }),
+          })
+        );
+
+        mockRepository.create.mockClear();
+        const { service: explicitService } = world();
+        const explicit = await explicitService.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'inktrade:pr:1',
+          recipientSessionId: 'old-session',
+          recipientSessionExplicit: true,
+        });
+        expect(explicit.id).toBe('old-session');
+        expect(mockRepository.create).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('v18 S2 — same-holder pass-through (sessions conflict, threads multiplex)', () => {
@@ -6502,7 +7650,12 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       let releaseFirst!: () => void;
+      let firstEntered!: () => void;
+      const untilFirstEntered = new Promise<void>((r) => {
+        firstEntered = r;
+      });
       vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        firstEntered();
         await new Promise<void>((r) => {
           releaseFirst = r;
         });
@@ -6510,7 +7663,10 @@ describe('SessionService', () => {
       });
 
       const p1 = sessionService.handleMessage(createMockRequest({ content: 'lock holder' }));
-      await new Promise((r) => setTimeout(r, 10));
+      // The lock holder is inside its runner: awaited, not assumed after ten
+      // milliseconds, because the path there includes real I/O (the studio
+      // checklist's stat, PR #699) whose duration is the filesystem's.
+      await untilFirstEntered;
       const p2 = sessionService.handleMessage(createMockRequest({ content: 'queued' }));
       await new Promise((r) => setTimeout(r, 10));
 

@@ -383,9 +383,13 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(ride.eqs).toContainEqual(['turn_epoch', 'epoch-1']);
     });
 
-    it('a HEADLESS prompt keeps the plain lifecycle write — the server owns its epoch', async () => {
+    it('a HEADLESS prompt stamps the marker and writes no lifecycle — the server owns its epoch', async () => {
+      // The run's pre-turn write already said `running`. A second `running`
+      // write is not a no-op: landing on a row something idled mid-run, it
+      // makes the installed trigger mint a fresh epoch, and the run's
+      // finalize then matches zero rows (2026-09-29).
       const updates = await post({ lifecycle: 'running', event: 'prompt', headless: true });
-      expect(updates.lifecycle).toBe('running');
+      expect('lifecycle' in updates).toBe(false);
       expect(typeof updates.cliTurnAt).toBe('string');
       expect(rpcCalls).toHaveLength(0);
     });

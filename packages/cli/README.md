@@ -216,7 +216,7 @@ Testing and regression workflows for session-candidate resolution live in [`pack
 ### Quick reference
 
 ```bash
-sb init                         # Set up Inkwell in current repo
+sb init                         # Set up Inkwell in current repo; in a studio worktree, complete or repair it
 sb doctor                       # Check linked studio CLI binary health
 sb doctor --fix                 # Prompt to relink current studio binary
 sb mission                      # Mission control (sessions + unread inbox by SB)

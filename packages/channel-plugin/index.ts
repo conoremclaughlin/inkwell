@@ -21,13 +21,20 @@
  *   INK_PLUGIN_LOG_LEVEL — debug | info | warn | error (default: info)
  *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
  *   INK_PLUGIN_LOG_RETENTION_DAYS — sweep dead processes' logs older than this (default: 7)
+ *   INK_CHANNEL_HOST — `print` when the host is `claude -p`; the plugin then stays inert
  */
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { Server } from '@modelcontextprotocol/server';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { createThreadDrainState, drainThreads, drainLegacyInbox } from './poll-core.js';
+// By source path, not `@inklabs/shared`: this process runs from source under
+// tsx, and a `dist` import would fail between a pull and the next build.
+import {
+  createThreadDrainState,
+  drainThreads,
+  drainLegacyInbox,
+} from '../shared/src/inkmail/drain.js';
 import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
@@ -67,6 +74,23 @@ import { resolveSlug } from './identity';
 
 const INK_SERVER_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 10);
+
+// A print-mode host (`claude -p`) accepts a channel notification and never
+// shows it to the model: the notify promise resolves, the transcript records
+// nothing. Measured 2026-09-27 with two pushes into a `claude -p` turn — the
+// model reported none — against an interactive control, which rendered both
+// mid-turn. Polling there made this plugin ack messages nobody read, and its
+// cli_poll_at stamp steered the server to inline delivery rather than a queued
+// turn (task 2f892701). The spawner declares print mode through
+// PRINT_MODE_CHANNEL_ENV (@inklabs/shared); this package cannot import it.
+const hostRendersChannel = !['print', 'codex'].includes(process.env.INK_CHANNEL_HOST ?? '');
+
+// A directly launched Codex MCP client may not inherit the ink wrapper env.
+// Do not consume mail for a host that cannot render Claude channel pushes.
+function canDeliverChannel(): boolean {
+  const client = mcp.getClientVersion();
+  return hostRendersChannel && Boolean(client?.name) && !/codex/i.test(client!.name);
+}
 
 function resolveEmail(): string | undefined {
   const configPath = join(homedir(), '.ink', 'config.json');
@@ -137,6 +161,7 @@ log('info', 'Channel plugin starting', {
   sessionId: sessionId || '(none)',
   server: INK_SERVER_URL,
   pollIntervalMs: POLL_INTERVAL_MS,
+  hostRendersChannel,
 });
 
 async function callInk(
@@ -205,6 +230,7 @@ const mcp = new Server(
   { name: 'inkmail', version: '0.1.0' },
   {
     capabilities: {
+      tools: {},
       experimental: {
         'claude/channel': {},
         // TODO: permission relay needs to integrate with Inkwell's existing
@@ -214,7 +240,8 @@ const mcp = new Server(
         // 'claude/channel/permission': {},
       },
     },
-    instructions: `Messages from other SBs (AI agents) arrive as <channel source="inkmail" ...> tags.
+    instructions: hostRendersChannel
+      ? `Messages from other SBs (AI agents) arrive as <channel source="inkmail" ...> tags.
 
 These are real-time notifications from the Ink inbox — thread replies, task requests, review feedback, etc.
 
@@ -223,7 +250,8 @@ When you receive a channel message:
 - If it requires action, act on it
 - To reply, use the existing send_to_inbox tool (from the inkwell MCP server) with the thread_key from the channel tag metadata
 
-Do NOT ignore channel messages — they are from your teammates and deserve timely responses.`,
+Do NOT ignore channel messages — they are from your teammates and deserve timely responses.`
+      : `InkMail push is off in this process: this host cannot show Claude channel messages. Messages that arrive during this turn stay unread and are delivered separately.`,
   }
 );
 
@@ -231,10 +259,15 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // server. This channel plugin is purely for push notifications (one-way in,
 // replies go through the existing inkwell MCP tools).
 
+// Generic MCP clients (including Codex) discover tools even on push-only
+// servers. An empty list is valid; MethodNotFound breaks their startup.
+mcp.setRequestHandler('tools/list', async () => ({ tools: [] }));
+
 // ─── Polling Loop ───────────────────────────────────────────
 
 // Thread cursors, dedup, and cold-start skip accounting live in the drain
-// state (poll-core.ts owns the delivery semantics; unit-tested there).
+// state (shared/src/inkmail/drain.ts owns the delivery semantics, for this
+// plugin and the ink chat REPL alike; unit-tested there).
 const drainState = createThreadDrainState();
 
 // NO takeover claimant here (PR #563 round 26). Pending-takeover markers are
@@ -279,7 +312,7 @@ let unscopedNoticeSent = false;
 let pollInFlight = false;
 
 async function pollInbox(): Promise<void> {
-  if (!email) return;
+  if (!email || !canDeliverChannel()) return;
   if (pollInFlight) {
     log('debug', 'Poll skipped — previous poll still in flight');
     return;
@@ -330,7 +363,7 @@ async function pollInbox(): Promise<void> {
       const totalUnread = (result.totalUnreadCount as number) || 0;
       log('debug', 'Poll result', { threadCount, msgCount, totalUnread });
 
-      // Drain thread messages through poll-core (unit-tested): always-on
+      // Drain thread messages through the shared drain (unit-tested): always-on
       // 100/poll budget with budget-bounded per-request limits, cold fetches
       // markRead:false + exact-id ack after injection, skip accounting with
       // one drain-time summary per process.
@@ -362,7 +395,7 @@ async function pollInbox(): Promise<void> {
         log('info', 'Thread drain result', { ...drained });
       }
 
-      // Legacy inbox messages (non-threaded), drained through poll-core
+      // Legacy inbox messages (non-threaded), drained through the shared drain
       // (unit-tested) under the same exact-id ack contract as threads: the
       // mark_inbox_read throughMessageId ack after the batch is the ONLY
       // consumption, so what this caller injects is what gets consumed —
@@ -446,6 +479,7 @@ async function pollInbox(): Promise<void> {
 // ─── Start ──────────────────────────────────────────────────
 
 async function clearCliAttached(): Promise<void> {
+  if (!canDeliverChannel()) return;
   if (!sessionId || !accessToken) return;
   try {
     await fetch(`${INK_SERVER_URL}/api/hooks/lifecycle`, {
@@ -479,6 +513,23 @@ async function main(): Promise<void> {
 
   log('info', 'Connecting MCP stdio transport');
   await mcp.connect(new StdioServerTransport());
+
+  if (!hostRendersChannel) {
+    // Inert: no poll, no cli_poll_at stamp, no ack, and no detach on exit. A
+    // print-mode process never attached, and the lifecycle route reads
+    // cliAttached:false as process proof that the session's turn is over — it
+    // clears cli_turn_at, the marker an interactive `ink chat` REPL holds open
+    // across every backend spawn of its turn. The MCP connection stays up so
+    // the host's handshake succeeds.
+    log('info', 'Print-mode host — InkMail delivery off; unread messages stay unread');
+    const exitQuietly = () => {
+      logger.flush().finally(() => process.exit(0));
+    };
+    process.on('SIGTERM', exitQuietly);
+    process.on('SIGINT', exitQuietly);
+    process.stdin.on('close', exitQuietly);
+    return;
+  }
   log('info', 'MCP connected, starting poll loop');
 
   // Fire detach cleanup when the host process exits (stdio pipe breaks).

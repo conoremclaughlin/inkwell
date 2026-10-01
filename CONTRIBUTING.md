@@ -378,6 +378,7 @@ yarn linked:migrate        # Apply linked (remote) migrations
 yarn db:migrate <file>     # Apply one migration file to the local stack, recorded under the file's version (any worktree)
 yarn db:migrate:status     # Local ledger vs the files in this checkout
 yarn db:migrate:pending    # Apply every pending file in version order (yarn dev runs this first)
+yarn db:migrate:scan <file> # The judgement apply makes before it connects, with no database: CI runs it over every file
 yarn dev:no-migrations     # Start without applying pending migrations, on purpose
 yarn test:integration:db:local   # DB integration suite against isolated local Supabase
 yarn test:integration:runtime    # Runtime/CLI integration suite

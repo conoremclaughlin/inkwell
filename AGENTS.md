@@ -308,6 +308,8 @@ Within the Inkwell repo, the project prefix is optional — `pr:389` is unambigu
 
 The project goes in the **prefix slot, never the identifier**: `inktrade:pr:42`, not `pr:inktrade-42` or `pr:inktrade-supabase-auth`. Baking the project into the identifier defeats pattern matching and prefix-based routing.
 
+**The prefix decides the repository.** A project-prefixed thread is placed in the project's `repo_root` (`save_project(name, repoRoot: "/absolute/path")`), whatever repo the sender happens to be in; the sender's repo is not consulted. A registered project with no `repo_root` holds the message with a reason that names the fix. On 2026-09-24 an `inktrade:pr:1` review was routed by the sender's repo and checked out inkwell's PR #1 instead — that path no longer exists.
+
 Each repo's AGENTS.md should carry this threadKey section so agents working there natively derive project-prefixed keys.
 
 ### Sender Rules
@@ -421,6 +423,9 @@ ink wait --timeout 300
 
 # Include pending trigger queue (for CLI-attached sessions)
 ink wait --pending --timeout 300
+
+# Keep watching: print each new batch until Ctrl-C/SIGTERM (or --timeout, if given)
+ink wait --thread pr:239 --follow
 ```
 
 **In Claude Code**, run via `run_in_background` to hold while waiting:
@@ -437,6 +442,8 @@ run_in_background: ink wait --thread pr:239 --timeout 300
 ```
 
 This replaces manual `sleep` + poll loops. Exit code 0 = new content found, 1 = timed out.
+
+**Continuous watching: `--follow` (`-f`).** Plain `ink wait` exits on the first batch, so a reply that lands after it has woken you goes unwatched until you start another one. `--follow` keeps going and prints each batch of new messages as it arrives, from a cursor of its own that neither replays nor skips a message. It runs until Ctrl-C or SIGTERM (exit 130 or 143), or until `--timeout` if you pass one (then exit 0 if any batch was printed, 1 if none). `--interval` and the error backoff are the same as the one-shot form. In follow mode stdout carries only batches and every status line goes to stderr, so each stdout line is an event. In Claude Code, run it under the Monitor tool: `run_in_background` reports only when the process exits. A follow watcher keeps the thread _monitored_; it does not wake a model or inject into a live session by itself.
 
 ## Development Commands
 
@@ -529,6 +536,27 @@ node ./packages/cli/dist/cli.js <subcommand>
 The global link stays where it was. Your studio's build is for you to exercise, not for every other session on the machine to run.
 
 **The server never uses the global link.** For the hooks it writes and the chat loops it spawns, it resolves its own checkout's `packages/cli/dist/cli.js` (see `packages/api/src/services/ink-cli.ts`), runs it through node, and takes `INK_CLI_PATH` as an explicit override. A checkout with no CLI build falls back to `ink` on PATH with a one-time warning; build it with `yarn workspace @inklabs/cli build`. A new call site that reaches for `ink` without going through that resolver is a code problem, not a reason to relink: route it through `resolveInkCli` and open a PR.
+
+## Studios: One Checklist, One Routine
+
+A studio is a linked git worktree, and a worktree is only a studio once it carries the full set of local files a session needs. Until 2026-09-28 no creator produced that set: the server wrote `.mcp.json` and Claude hooks but no identity file and no Codex or Gemini hooks, `ink studio create` wrote identity and hooks but no permissions and no `.env.local`, and a bare `git worktree add` wrote nothing. A partial studio is invisible until a session inside it finds it has no tools, and without `.ink/identity.json` its hooks book the work to the root studio.
+
+**The checklist** (`auditStudio` in `packages/shared/src/studio/checklist.ts`) is what a complete studio carries, each item judged on the file that carries it:
+
+| Item                                | Required in a studio | In the main worktree |
+| ----------------------------------- | -------------------- | -------------------- |
+| `.mcp.json` with the inkwell server | yes                  | yes                  |
+| `.env.local`                        | reported only        | reported only        |
+| `.ink/identity.json` naming the SB  | yes                  | reported only        |
+| `studioId` in identity.json         | yes                  | no                   |
+| Claude permissions                  | yes                  | no                   |
+| Claude ink hooks (six events)       | yes                  | yes                  |
+| Codex MCP section and three hooks   | yes                  | yes                  |
+| Gemini MCP section and three hooks  | yes                  | yes                  |
+
+**The routine** is `ink init`. In a linked worktree it completes the studio and is the repair for a partial one: `cd` into the worktree and run it. By default it syncs `.mcp.json`, `.env.local` and the Claude permissions from the main worktree (`--no-root-sync` generates the defaults instead) and writes the identity file and registers the studio row (`--no-studio-setup` for a checkout deliberately not tracked as a studio). It never overwrites a customised file, never clobbers an identity field, and never writes through a symlink; a second run reports every step as `exists`, and a file it had to rewrite (Inkwell hooks under an older ink path, an identity missing a field) reports `updated`, never `created`. In the main worktree it behaves as before: hooks, backend config, skills.
+
+**Every creator runs it.** `ink studio create` calls it after `git worktree add`; the server's `create_studio`, `adopt_studio`, the overflow service (on creation and on the revive that puts a closed ephemeral back onto a fresh worktree for the next review round) and the strategy service run `ink init --json` in the worktree (this checkout's CLI build via `resolveInkCli`, never the global link) with the studio row id they hold. Before every spawn, whatever the backend, the session service reads the checklist and runs the routine only when something is missing; `ink -a <slug>` and `ink claude`/`codex`/`gemini` do the same before resolving the session. Until 2026-09-29 only the Claude runner did, so a Codex SB's studio was never repaired and a revived review checkout came up bare. The owner written into a missing identity file is always the studio row's SB, never the SB launching or spawned into it. `ink init` also records the owner's backend in `identity.json` (`--backend`, or their identity record) while still writing every backend's config. `ink doctor` prints the checklist plus whether the studio is registered — by the id in `identity.json`, or by path when the file does not carry one — and names `ink init` as the repair.
 
 ## Supabase Project ID
 

@@ -45,6 +45,7 @@ import {
 } from '@/components/ui/dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ThemeToggle } from '@/components/theme/theme-toggle';
+import { SystemStatusNote } from './system-status-note';
 
 interface NavItem {
   name: string;
@@ -654,8 +655,9 @@ export function Sidebar() {
         </div>
       </nav>
 
-      {/* Footer: theme toggle */}
+      {/* Footer: a prod server's stale-build note, when there is one, and the theme toggle */}
       <div className="border-t border-white/[0.06] px-3 py-2">
+        <SystemStatusNote />
         <ThemeToggle className="w-full" />
       </div>
     </div>
