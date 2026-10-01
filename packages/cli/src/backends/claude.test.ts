@@ -7,9 +7,11 @@ import { decodeContextToken, PRINT_MODE_CHANNEL_ENV } from '@inklabs/shared';
 import {
   ClaudeAdapter,
   classifyMedia,
+  encodeContextImageBlocks,
   encodeMediaBlocks,
   readMediaBounded,
   MAX_MEDIA_FILE_BYTES,
+  MAX_MEDIA_TOTAL_BYTES,
 } from './claude.js';
 
 // Keep user-installed skills out of the merged MCP config.
@@ -619,5 +621,166 @@ describe('ClaudeAdapter prepare — media injection', () => {
     } finally {
       prepared.cleanup();
     }
+  });
+});
+
+describe('ClaudeAdapter prepare — images a tool put in context', () => {
+  const PNG_BYTES = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+
+  let tmpDir: string;
+  let savedCwd: string;
+  let pngPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'claude-context-images-'));
+    writeFileSync(join(tmpDir, '.mcp.json'), JSON.stringify({ mcpServers: {} }));
+    pngPath = join(tmpDir, 'viewed.png');
+    writeFileSync(pngPath, PNG_BYTES);
+    savedCwd = process.cwd();
+    process.chdir(tmpDir);
+  });
+
+  afterEach(() => {
+    process.chdir(savedCwd);
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('embeds them on a resumed continuation, each labelled with its ref', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      sbSlug: 'myra',
+      prompt: '[Tool results from previous turn]\nTool view_image (executed): {...}',
+      promptParts: [],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      backendSessionId: 'live-session',
+      contextImages: [
+        { path: pngPath, mimeType: 'image/png', ref: 'img:0123456789abcdef' } as never,
+      ],
+    });
+    try {
+      expect(prepared.args).toContain('--resume');
+      expect(prepared.args[prepared.args.indexOf('--input-format') + 1]).toBe('stream-json');
+      const line = JSON.parse(prepared.stdinData!.trim());
+      const content = line.message.content;
+      expect(content[0].text).toContain('Tool view_image (executed)');
+      expect(content[1]).toEqual({ type: 'text', text: '[image img:0123456789abcdef]' });
+      expect(content[2].type).toBe('image');
+      expect(Buffer.from(content[2].source.data, 'base64').equals(PNG_BYTES)).toBe(true);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('never move the --tools gate, which stays a function of the turn media alone', () => {
+    // A legacy caller: attachment dirs and no threaded media keeps native Read
+    // open. Adding a context image must not close it — nor would its absence
+    // open it on a turn whose media had closed it.
+    const adapter = new ClaudeAdapter();
+    const base = {
+      sbSlug: 'myra',
+      prompt: 'continue',
+      promptParts: [],
+      passthroughArgs: [],
+      toolRouting: 'local' as const,
+      attachmentDirs: [tmpDir],
+    };
+    const without = adapter.prepare(base);
+    const withImage = adapter.prepare({
+      ...base,
+      contextImages: [{ path: pngPath, mimeType: 'image/png' }],
+    });
+    try {
+      const gate = (args: string[]) => args[args.indexOf('--tools') + 1];
+      expect(gate(without.args)).toBe('Read');
+      expect(gate(withImage.args)).toBe('Read');
+    } finally {
+      without.cleanup();
+      withImage.cleanup();
+    }
+  });
+
+  it('names an image that could not be attached, and tells the model it has not seen it', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      sbSlug: 'myra',
+      prompt: 'continue',
+      promptParts: [],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      contextImages: [
+        {
+          path: join(tmpDir, 'gone.png'),
+          mimeType: 'image/png',
+          ref: 'img:feedfacefeedface',
+        } as never,
+      ],
+    });
+    try {
+      expect(prepared.args).not.toContain('--input-format');
+      expect(prepared.stdinData).toContain('[image note]');
+      expect(prepared.stdinData).toContain('img:feedfacefeedface');
+      expect(prepared.stdinData).toContain('you have not seen them');
+      expect(prepared.stdinData).toContain('goes again with your next message');
+      expect(prepared).not.toHaveProperty('contextImagesDelivered');
+    } finally {
+      warn.mockRestore();
+      prepared.cleanup();
+    }
+  });
+
+  it('reports only the images its input carries, so a refused one is not counted as seen', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const adapter = new ClaudeAdapter();
+    const carried = { path: pngPath, mimeType: 'image/png', ref: 'img:0000000000000001' };
+    const refused = {
+      path: join(tmpDir, 'gone.png'),
+      mimeType: 'image/png',
+      ref: 'img:0000000000000002',
+    };
+    const prepared = adapter.prepare({
+      sbSlug: 'myra',
+      prompt: 'continue',
+      promptParts: [],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      contextImages: [carried, refused] as never,
+    });
+    try {
+      expect(prepared.contextImagesDelivered).toEqual([carried]);
+      const line = JSON.parse(prepared.stdinData!.trim());
+      const labels = line.message.content
+        .filter((b: { type: string; text?: string }) => b.type === 'text')
+        .map((b: { text: string }) => b.text);
+      expect(labels).toContain('[image img:0000000000000001]');
+      expect(labels.join('\n')).not.toContain('[image img:0000000000000002]');
+    } finally {
+      warn.mockRestore();
+      prepared.cleanup();
+    }
+  });
+
+  it('share one request budget with the turn media, which is encoded first', () => {
+    const reader = (_path: string, maxBytes: number) =>
+      maxBytes >= 1024 ? Buffer.alloc(1024) : null;
+    const nearlyFull = encodeContextImageBlocks(
+      [{ path: '/virtual/a.png', mimeType: 'image/png' }],
+      MAX_MEDIA_TOTAL_BYTES - 10,
+      reader
+    );
+    expect(nearlyFull.blocks).toEqual([]);
+    expect(nearlyFull.rejected).toHaveLength(1);
+
+    const roomy = encodeContextImageBlocks(
+      [{ path: '/virtual/a.png', mimeType: 'image/png' }],
+      0,
+      reader
+    );
+    expect(roomy.blocks.map((b) => b.type)).toEqual(['text', 'image']);
+    expect(roomy.totalBytes).toBe(1024);
   });
 });

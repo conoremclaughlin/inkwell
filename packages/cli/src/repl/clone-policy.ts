@@ -134,6 +134,10 @@ export const CLONE_DENIED_TOOLS: readonly string[] = [
   'write',
   'edit',
   'bash',
+  // A clone's turns never carry an image block, so what it viewed would reach
+  // it only as a note that the image was not shown. Refused here rather than
+  // run and then withheld.
+  'view_image',
   // Authority over authority.
   'set_permission',
   'reset_permission',

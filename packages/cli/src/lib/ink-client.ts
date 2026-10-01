@@ -30,6 +30,47 @@ interface JsonRpcResponse {
   error?: { code?: number; message?: string };
 }
 
+/**
+ * A text-derived payload with the call's image blocks kept beside it.
+ *
+ * The text is the payload callers read, so it is unwrapped as it always was;
+ * but a result can carry an image next to that text, and unwrapping alone
+ * dropped it (Lumen, PR #708). The images go on a top-level `content`, where
+ * the chat runtime's capture step looks. With no image blocks the payload is
+ * returned exactly as parsed.
+ *
+ * The payload is never edited. `content` is added only to an object that has
+ * no `content` of its own; anything else — a JSON value that is not an object,
+ * or an object whose own `content` is application data of any shape — is kept
+ * whole under `result`. Merging into that key erased a string or object and
+ * blended image blocks into an array (Lumen, PR #708 round 2).
+ *
+ * A wrapped payload's failure flags are copied up beside it, as they are.
+ * `success` and `isError` are read at the top level by every failure predicate
+ * (isSemanticFailure, isErrorPayload); nested under `result` a failed call read
+ * as a receipt (Lumen, PR #708 round 3). The predicates stay as they are:
+ * treating arbitrary nested data as a failure signal would be its own bug.
+ */
+const FAILURE_FLAGS = ['success', 'isError'] as const;
+
+function withImageBlocks(
+  parsed: unknown,
+  content: JsonRpcToolResult['content']
+): InkToolCallResult {
+  const images = (content ?? []).filter((item) => item?.type === 'image');
+  if (images.length === 0) return parsed as InkToolCallResult;
+  const isObject = Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
+  const own = (key: string) => isObject && Object.prototype.hasOwnProperty.call(parsed, key);
+  if (isObject && !own('content')) {
+    return { ...(parsed as InkToolCallResult), content: images };
+  }
+  const flags: InkToolCallResult = {};
+  for (const key of FAILURE_FLAGS) {
+    if (own(key)) flags[key] = (parsed as InkToolCallResult)[key];
+  }
+  return { ...flags, result: parsed, content: images };
+}
+
 let jsonRpcId = 1;
 
 /**
@@ -271,7 +312,7 @@ export class InkClient {
     const firstText = toolResult?.content?.find((item) => typeof item.text === 'string')?.text;
     if (typeof firstText === 'string') {
       try {
-        return JSON.parse(firstText) as InkToolCallResult;
+        return withImageBlocks(JSON.parse(firstText), toolResult?.content);
       } catch {
         // Unparseable text on an isError result is a protocol-level failure —
         // argument validation, an unknown tool, a thrown handler. The server
@@ -286,7 +327,7 @@ export class InkClient {
         if (toolResult?.isError) {
           throw new Error(`Inkwell tool call failed: ${firstText}`);
         }
-        return { text: firstText };
+        return withImageBlocks({ text: firstText }, toolResult?.content);
       }
     }
 

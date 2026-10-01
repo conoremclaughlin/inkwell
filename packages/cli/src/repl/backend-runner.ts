@@ -76,6 +76,8 @@ export interface BackendRunRequest {
   media?: TurnMedia[];
   /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
   deliverMedia?: boolean;
+  /** Tool-captured images this spawn must carry (see BackendConfig.contextImages). */
+  contextImages?: TurnMedia[];
   /**
    * Whether the chat process that owns this turn is attached — an
    * interactive REPL, not `--non-interactive`/`--message`. Required: the
@@ -103,6 +105,12 @@ export interface BackendRunResult {
   /** Whether the process was reaped by a timeout, and which kind. */
   timedOut?: boolean;
   timeoutType?: 'idle' | 'hard';
+  /**
+   * The requested `contextImages` this spawn's input actually carried, as the
+   * adapter reported them (PreparedBackend.contextImagesDelivered). Absent
+   * means none — so nothing may be recorded as seen.
+   */
+  contextImagesDelivered?: TurnMedia[];
 }
 
 export interface BackendTurnHandle {
@@ -131,6 +139,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     toolRouting: request.toolRouting,
     media: request.media,
     deliverMedia: request.deliverMedia,
+    contextImages: request.contextImages,
     cliAttached: request.cliAttached,
   });
 
@@ -199,6 +208,9 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
         ...(resumeFailedNoSession ? { resumeFailedNoSession: true } : {}),
         timedOut: spawnResult.timedOut,
         timeoutType: spawnResult.timeoutType,
+        ...(prepared.contextImagesDelivered
+          ? { contextImagesDelivered: prepared.contextImagesDelivered }
+          : {}),
       };
     }),
     abort: () => {

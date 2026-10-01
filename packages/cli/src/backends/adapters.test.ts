@@ -151,6 +151,29 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  it('attaches images a tool put in context with the same flag, after the turn media', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      sbSlug: 'lumen',
+      model: undefined,
+      promptParts: ['exec', 'continue'],
+      passthroughArgs: [],
+      media: [{ path: '/tmp/photo.png', mimeType: 'image/png' }],
+      contextImages: [{ path: '/tmp/ink-tool-images-x/abc.jpg', mimeType: 'image/jpeg' }],
+    });
+    try {
+      const execIndex = prepared.args.indexOf('exec');
+      const promptIndex = prepared.args.indexOf('continue');
+      expect(prepared.args.slice(execIndex + 1, promptIndex)).toEqual([
+        '--image=/tmp/photo.png',
+        '--image=/tmp/ink-tool-images-x/abc.jpg',
+        '--',
+      ]);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
   it('media-free exec turns get no --image flags and no -- terminator', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
