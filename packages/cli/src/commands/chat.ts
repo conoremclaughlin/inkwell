@@ -1622,9 +1622,12 @@ export function isAttachableSessionSummary(session: SessionSummary): boolean {
   if (session.endedAt) return false;
   if (session.lifecycle === 'completed') return false;
 
-  const phase = (session.currentPhase || '').trim().toLowerCase();
-  if (phase === 'complete' || phase.startsWith('complete:')) return false;
-
+  // The agent-set work phase is deliberately not read. `complete` there
+  // means a piece of work finished on a live conversation, and reading it as
+  // the conversation's end hid the row, made its transcript look untracked,
+  // and had the launcher start a second Inkwell session for the same
+  // conversation on every relaunch (2026-10-01). Mirrors isSessionResumable
+  // in claude.ts and the server's `active`/`attachable` filters.
   const status = (session.status || '').trim().toLowerCase();
   if (status === 'completed' || status.startsWith('completed:')) return false;
 
@@ -1686,7 +1689,7 @@ export function reopenSucceeded(session: SessionSummary | null | undefined): Reo
       ? 'ended_at is still set'
       : session.lifecycle === 'completed'
         ? "lifecycle is still 'completed'"
-        : `phase/status still reads ${session.currentPhase || session.status}`;
+        : `status still reads ${session.status}`;
     return { ok: false, reason: `${stuck} (an older server may not support reopen)` };
   }
   return { ok: true };

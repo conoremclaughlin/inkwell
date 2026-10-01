@@ -67,6 +67,32 @@ describe('MemoryRepository', () => {
       expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
     });
 
+    it('getActiveSessionByBackendSessionId matches either backend column and scopes by sb_id', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByBackendSessionId('user-1', 'claude-abc', 'myra', 'sb-myra');
+
+      const orCalls = (mockSupabase._queryBuilder.or as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls;
+      expect(orCalls).toContainEqual([
+        'backend_session_id.eq.claude-abc,claude_session_id.eq.claude-abc',
+      ]);
+      expect(eqCalls()).toContainEqual(['sb_id', 'sb-myra']);
+      expect(eqCalls()).not.toContainEqual(['agent_id', 'myra']);
+      const isCalls = (mockSupabase._queryBuilder.is as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls;
+      expect(isCalls).toContainEqual(['ended_at', null]);
+    });
+
+    it('getActiveSessionByBackendSessionId falls back to agent_id without a canonical owner', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByBackendSessionId('user-1', 'claude-abc', 'myra');
+
+      expect(eqCalls()).toContainEqual(['agent_id', 'myra']);
+      expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
+    });
+
     it('getActiveSessionByThreadKey filters on sb_id and not agent_id', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 

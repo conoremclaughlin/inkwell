@@ -81,6 +81,7 @@ function createMockDataComposer() {
     getActiveSession: vi.fn(),
     findOwnedActiveSessions: vi.fn().mockResolvedValue([]),
     getActiveSessionByThreadKey: vi.fn(),
+    getActiveSessionByBackendSessionId: vi.fn().mockResolvedValue(null),
     updateSession: vi.fn(),
     remember: vi.fn(),
     startSession: vi.fn(),
@@ -246,6 +247,20 @@ function callerIsAnonymous(): void {
 // =====================================================
 
 describe('startSessionSchema', () => {
+  it('accepts backendSessionId, the conversation the caller is about to resume', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      sbSlug: 'wren',
+      backendSessionId: '6e9ea775-c73a-4936-8c70-51c8b50dff72',
+      forceNew: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.backendSessionId).toBe('6e9ea775-c73a-4936-8c70-51c8b50dff72');
+    }
+  });
+
   it('should accept studioId as optional UUID', () => {
     const result = startSessionSchema.safeParse({
       email: 'test@test.com',
@@ -2221,6 +2236,70 @@ describe('handleStartSession - threadKey matching', () => {
   beforeEach(() => {
     mockDataComposer = createMockDataComposer();
     vi.clearAllMocks();
+  });
+
+  // One backend conversation is one Inkwell session. A launcher that resumes
+  // a Claude transcript names it here; a live row already carrying that id is
+  // the session, whatever else the caller asked for (forceNew included — the
+  // `ink claude` picker used to send forceNew for a transcript whose row it had
+  // hidden, and one conversation grew four live rows).
+  it('reuses the live session already linked to the backend conversation, even with forceNew', async () => {
+    const linked = { ...mockSession, id: 'session-linked', backendSessionId: 'claude-abc' };
+    mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId.mockResolvedValue(
+      linked
+    );
+
+    const result = await handleStartSession(
+      {
+        email: 'test@test.com',
+        sbSlug: 'lumen',
+        backendSessionId: 'claude-abc',
+        forceNew: true,
+        sessionId: '11111111-2222-4333-8444-555555555555',
+      },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.session.id).toBe('session-linked');
+    expect(parsed.session.isExisting).toBe(true);
+    expect(parsed.session.reusedBy).toBe('backendSessionId');
+    expect(
+      mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId
+    ).toHaveBeenCalledWith('user-123', 'claude-abc', 'lumen', undefined);
+    expect(mockDataComposer.repositories.memory.startSession).not.toHaveBeenCalled();
+    expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+  });
+
+  it('creates the session when no live row carries the backend conversation', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', sbSlug: 'lumen', backendSessionId: 'claude-new', forceNew: true },
+      mockDataComposer as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.session.id).toBe('session-new');
+    expect(parsed.session.isExisting).toBeUndefined();
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not consult the backend link when the caller names no conversation', async () => {
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
+
+    await handleStartSession(
+      { email: 'test@test.com', sbSlug: 'lumen' },
+      mockDataComposer as never
+    );
+
+    expect(
+      mockDataComposer.repositories.memory.getActiveSessionByBackendSessionId
+    ).not.toHaveBeenCalled();
   });
 
   it('should match existing session by threadKey', async () => {

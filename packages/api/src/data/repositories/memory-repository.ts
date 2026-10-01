@@ -2006,6 +2006,57 @@ export class MemoryRepository {
   }
 
   /**
+   * The live session already linked to a backend conversation (a Claude Code
+   * session id, a Codex thread id), for one identity.
+   *
+   * One backend conversation is one Inkwell session. A launcher resuming a
+   * transcript asks here before creating anything, so the row the hooks have
+   * been writing to is the row it lands on — not a second one for the same
+   * conversation. Both link columns are read: rows written since the backend
+   * rename carry both, older rows only claude_session_id. Crashed rows
+   * (lifecycle 'failed') count: relaunching the transcript is how a crashed
+   * session resumes. Ended rows do not: ended_at is a fence the caller must
+   * lift deliberately (update_session_state reopen), never by resolution.
+   * Newest-updated first, so of several live rows for one conversation (the
+   * duplicates this lookup now prevents) the one being written to wins.
+   */
+  async getActiveSessionByBackendSessionId(
+    userId: string,
+    backendSessionId: string,
+    sbSlug?: string,
+    sbId?: string
+  ): Promise<Session | null> {
+    // The id goes into a PostgREST filter expression; refuse anything that
+    // could carry its own separators rather than escape it.
+    if (!/^[A-Za-z0-9._:-]{1,200}$/.test(backendSessionId)) return null;
+
+    let query = this.supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .is('ended_at', null)
+      .or(`backend_session_id.eq.${backendSessionId},claude_session_id.eq.${backendSessionId}`)
+      .order('updated_at', { ascending: false })
+      .limit(1);
+
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
+    } else if (sbSlug) {
+      query = query.eq('agent_id', sbSlug);
+    }
+
+    const { data, error } = await query.single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      logger.error('Failed to get active session by backend session id:', error);
+      throw new Error(`Failed to get active session by backend session id: ${error.message}`);
+    }
+
+    return data ? this.rowToSession(data) : null;
+  }
+
+  /**
    * Get active session by threadKey for a user+agent, optionally scoped by studio.
    * Returns the most recent active session with a matching thread_key, or null.
    */

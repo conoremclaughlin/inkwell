@@ -51,19 +51,25 @@ describe('isAttachableSessionSummary', () => {
     expect(isAttachableSessionSummary({ ...base, status: 'completed' })).toBe(false);
   });
 
-  // Agent-declared terminal markers the server-side filter does not read:
-  // an agent that set phase 'complete' is done with that session even though
-  // ended_at is still null. isSessionResumable in claude.ts has always
-  // honoured these, so the two pickers must agree.
-  it('drops agent-declared terminal phases, matching isSessionResumable', () => {
-    expect(isAttachableSessionSummary({ ...base, currentPhase: 'complete' })).toBe(false);
-    expect(isAttachableSessionSummary({ ...base, currentPhase: 'complete:shipped' })).toBe(false);
-    expect(isAttachableSessionSummary({ ...base, status: 'completed:merged' })).toBe(false);
+  // Phase is work-state, not lifecycle. An agent that set phase 'complete'
+  // finished a piece of work; the conversation behind the row is still live
+  // (ended_at null), and a human relaunching that conversation must land on
+  // this row. Until 2026-10-01 both pickers read 'complete' as finished and
+  // hid the row; the local transcript then looked untracked, and every
+  // relaunch of a phase-complete conversation created a second live row (19
+  // of Wren's conversations carried 2-5 rows each). The server's own `active`
+  // and `attachable` filters never read the phase; the pickers now agree
+  // with the server, and isSessionResumable in claude.ts with this.
+  it('keeps agent-declared work phases, including complete', () => {
+    expect(isAttachableSessionSummary({ ...base, currentPhase: 'complete' })).toBe(true);
+    expect(isAttachableSessionSummary({ ...base, currentPhase: 'complete:shipped' })).toBe(true);
+    expect(isAttachableSessionSummary({ ...base, currentPhase: '  Complete  ' })).toBe(true);
   });
 
-  it('is case- and whitespace-insensitive on those markers', () => {
-    expect(isAttachableSessionSummary({ ...base, currentPhase: '  Complete  ' })).toBe(false);
+  it('drops agent-declared terminal statuses, case- and whitespace-insensitively', () => {
+    expect(isAttachableSessionSummary({ ...base, status: 'completed:merged' })).toBe(false);
     expect(isAttachableSessionSummary({ ...base, status: 'COMPLETED' })).toBe(false);
+    expect(isAttachableSessionSummary({ ...base, status: ' completed ' })).toBe(false);
   });
 
   it('does not mistake in-progress phases for terminal ones', () => {
@@ -180,8 +186,6 @@ describe('sessionNeedsReopen', () => {
   it.each([
     ['endedAt set', { ...base, endedAt: '2026-08-30T12:00:00Z' }],
     ['lifecycle completed', { ...base, lifecycle: 'completed' }],
-    ['phase complete', { ...base, currentPhase: 'complete' }],
-    ['phase complete: with reason', { ...base, currentPhase: 'complete:merged' }],
     ['status completed', { ...base, status: 'completed' }],
   ])('requires a reopen for a history row (%s)', (_label, session) => {
     expect(sessionNeedsReopen(session as SessionSummary)).toBe(true);
@@ -192,6 +196,10 @@ describe('sessionNeedsReopen', () => {
     ['idle', { ...base, lifecycle: 'idle' }],
     ['crashed but resumable', { ...base, lifecycle: 'failed' }],
     ['mid-work phase', { ...base, currentPhase: 'implementing' }],
+    // A finished piece of work on a live conversation is not a finished
+    // session; reopening it would be a no-op the server reports as such.
+    ['phase complete', { ...base, currentPhase: 'complete' }],
+    ['phase complete: with reason', { ...base, currentPhase: 'complete:merged' }],
   ])('does not reopen a live row (%s)', (_label, session) => {
     expect(sessionNeedsReopen(session as SessionSummary)).toBe(false);
   });
@@ -283,13 +291,21 @@ describe('reopenSucceeded', () => {
     expect(outcome.reason).toContain('older server');
   });
 
-  it('rejects a row still phased complete, and names the marker', () => {
+  it('accepts a row whose work phase is complete: phase is not a lifecycle marker', () => {
     const outcome = reopenSucceeded({
       ...live,
       currentPhase: 'complete',
     } as unknown as SessionSummary);
+    expect(outcome.ok).toBe(true);
+  });
+
+  it('rejects a row whose status is still completed, and names the marker', () => {
+    const outcome = reopenSucceeded({
+      ...live,
+      status: 'completed',
+    } as unknown as SessionSummary);
     expect(outcome.ok).toBe(false);
-    expect(outcome.reason).toContain('complete');
+    expect(outcome.reason).toContain('completed');
   });
 
   it('rejects a missing session rather than assuming the best', () => {

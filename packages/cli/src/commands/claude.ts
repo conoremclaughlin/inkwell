@@ -368,16 +368,54 @@ function normalizeSessionBackendName(backend: string | null | undefined): string
   return normalized;
 }
 
-function isSessionResumable(session: InkSessionSummary): boolean {
+/**
+ * Is this row one the launcher may list, attach to, or resume?
+ *
+ * Only what the server calls finished counts: an ended_at, a completed
+ * lifecycle, or a completed status. The agent-set work phase is not read.
+ * `complete` there means a piece of work finished, not the conversation: the
+ * row is still the identity of a live backend transcript. Reading it as
+ * finished dropped the row here, the transcript then looked untracked, and
+ * the picker started a second Inkwell session for the same conversation on
+ * every relaunch (2026-10-01: four live rows for one Claude session in the
+ * root checkout; nineteen of Wren's conversations with two to five each).
+ * Mirrors isAttachableSessionSummary in chat.ts; the two pickers must agree,
+ * and both now agree with the server's `active` and `attachable` filters.
+ */
+export function isSessionResumable(session: InkSessionSummary): boolean {
   if (session.endedAt) return false;
 
-  const phase = (session.currentPhase || '').trim().toLowerCase();
-  if (phase === 'complete' || phase.startsWith('complete:')) return false;
+  const lifecycle = (session.lifecycle || '').trim().toLowerCase();
+  if (lifecycle === 'completed') return false;
 
   const status = (session.status || '').trim().toLowerCase();
   if (status === 'completed' || status.startsWith('completed:')) return false;
 
   return true;
+}
+
+/**
+ * One picker entry per backend conversation.
+ *
+ * Rows sharing a backend session id are the same conversation: the
+ * duplicates the old phase rule created, which stay in the table until they
+ * are ended. The list arrives newest first, so the first row wins, the same
+ * choice inkSessionByBackendSessionId makes, and the two cannot disagree
+ * about which row a transcript resumes into. Rows with no backend id yet are
+ * all kept: a fresh session has nothing to collide on.
+ */
+export function dedupeInkSessionsByBackendId(
+  sessions: InkSessionSummary[],
+  resolveLinkedBackendId?: (session: InkSessionSummary) => string | undefined
+): InkSessionSummary[] {
+  const seen = new Set<string>();
+  return sessions.filter((session) => {
+    const backendSessionId = getSessionBackendId(session) || resolveLinkedBackendId?.(session);
+    if (!backendSessionId) return true;
+    if (seen.has(backendSessionId)) return false;
+    seen.add(backendSessionId);
+    return true;
+  });
 }
 
 export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string }>(
@@ -2904,6 +2942,11 @@ async function ensureInkSessionContext(
   let chosen: InkSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
   let createdNewInkSession = false;
+  // Set by startNewInkSession: true only when the server minted the row it
+  // returned. A row it reused (the live session already linked to the
+  // conversation being resumed) is not "created", and the seed/adopt logic
+  // keyed on createdNewInkSession must not treat it as a fresh conversation.
+  let lastStartCreatedNewRow = false;
 
   const normalizedSelectionOverride = options.selectionOverride?.trim();
   const inkSelection = (selection: string): string | undefined => {
@@ -2924,8 +2967,15 @@ async function ensureInkSessionContext(
     return found?.sessionId;
   };
 
-  const startNewInkSession = async (): Promise<InkSessionSummary | undefined> => {
+  // The backend conversation a selected transcript (or --resume) will reopen.
+  // Named to the server so a live row already carrying it is returned instead
+  // of a second row: one backend conversation is one Inkwell session, whatever
+  // the picker could see (its list is capped and context-filtered).
+  const startNewInkSession = async (
+    backendSessionId?: string
+  ): Promise<InkSessionSummary | undefined> => {
     if (!inkAvailable || !email) return undefined;
+    lastStartCreatedNewRow = false;
 
     const resolveCreatedSessionFromList = async (
       requestedSessionId: string | undefined,
@@ -2998,18 +3048,22 @@ async function ensureInkSessionContext(
           backend,
           forceNew: true,
           sessionId: newSessionId,
+          ...(backendSessionId ? { backendSessionId } : {}),
         },
         { callerProfile: 'runtime' }
       );
       const directSession = extractSessionFromStartSessionResponse(started);
       const resolvedSession =
         directSession || (await resolveCreatedSessionFromList(newSessionId, 'with_session_id'));
+      lastStartCreatedNewRow = resolvedSession?.id === newSessionId;
       sbDebugLog('sb', 'ink_start_session_success', {
         backend,
         sbSlug,
         studioId: studioId || null,
         requestedSessionId: newSessionId,
         returnedSessionId: resolvedSession?.id || null,
+        backendSessionId: backendSessionId || null,
+        createdNewRow: lastStartCreatedNewRow,
         mode: 'with_session_id',
       });
       if (resolvedSession) return resolvedSession;
@@ -3038,6 +3092,7 @@ async function ensureInkSessionContext(
             ...(studioId ? { studioId } : {}),
             backend,
             forceNew: true,
+            ...(backendSessionId ? { backendSessionId } : {}),
           },
           { callerProfile: 'runtime' }
         );
@@ -3045,12 +3100,17 @@ async function ensureInkSessionContext(
         const resolvedSession =
           directSession ||
           (await resolveCreatedSessionFromList(undefined, 'legacy_without_session_id'));
+        lastStartCreatedNewRow = Boolean(
+          resolvedSession && !existingSessionIds.has(resolvedSession.id)
+        );
         sbDebugLog('sb', 'ink_start_session_success', {
           backend,
           sbSlug,
           studioId: studioId || null,
           requestedSessionId: newSessionId,
           returnedSessionId: resolvedSession?.id || null,
+          backendSessionId: backendSessionId || null,
+          createdNewRow: lastStartCreatedNewRow,
           mode: 'legacy_without_session_id',
         });
         return resolvedSession;
@@ -3091,8 +3151,8 @@ async function ensureInkSessionContext(
 
     chosen = matchedByBackendId;
     if (!chosen) {
-      chosen = await startNewInkSession();
-      createdNewInkSession = Boolean(chosen?.id);
+      chosen = await startNewInkSession(overrideBackendSessionId || undefined);
+      createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
     }
 
     if (chosen?.id) {
@@ -3130,7 +3190,10 @@ async function ensureInkSessionContext(
     localBackendSessions.map((session) => [session.sessionId, session])
   );
   if (options.listCandidates || options.listCandidatesJson) {
-    const inkCandidates = activeSessions.map((session) => {
+    // One candidate per backend conversation, as in the interactive picker.
+    const inkCandidates = dedupeInkSessionsByBackendId(activeSessions, (row) =>
+      runtimeBackendSessionIdByInkSessionId.get(row.id)
+    ).map((session) => {
       const linkedBackendSessionId =
         getSessionBackendId(session) || runtimeBackendSessionIdByInkSessionId.get(session.id);
       const linkedLocalSession = linkedBackendSessionId
@@ -3322,7 +3385,7 @@ async function ensureInkSessionContext(
     const selection = normalizedSelectionOverride.toLowerCase();
     if (selection === 'new' || selection === '__new__') {
       chosen = await startNewInkSession();
-      createdNewInkSession = Boolean(chosen?.id);
+      createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
     } else if (
       selection.startsWith('ink:') ||
       selection.startsWith('pcp:') || // legacy spelling, still accepted
@@ -3357,8 +3420,8 @@ async function ensureInkSessionContext(
               selectedLocalBackendSessionId,
             });
           } else {
-            chosen = await startNewInkSession();
-            createdNewInkSession = Boolean(chosen?.id);
+            chosen = await startNewInkSession(selectedLocalBackendSessionId);
+            createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
           }
         }
       }
@@ -3386,7 +3449,9 @@ async function ensureInkSessionContext(
       sessionId: string;
     }> = [];
 
-    for (const session of activeSessions) {
+    for (const session of dedupeInkSessionsByBackendId(activeSessions, (row) =>
+      runtimeBackendSessionIdByInkSessionId.get(row.id)
+    )) {
       const value = `__ink__:${session.id}`;
       const linkedBackendSessionId =
         getSessionBackendId(session) || runtimeBackendSessionIdByInkSessionId.get(session.id);
@@ -3494,7 +3559,7 @@ async function ensureInkSessionContext(
       });
       if (selection === '__new__') {
         chosen = await startNewInkSession();
-        createdNewInkSession = Boolean(chosen?.id);
+        createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
       } else if (selection.startsWith('__ink__:')) {
         const sessionId = sessionChoiceByValue.get(selection);
         chosen = activeSessions.find((session) => session.id === sessionId);
@@ -3521,8 +3586,8 @@ async function ensureInkSessionContext(
                 selectedLocalBackendSessionId,
               });
             } else {
-              chosen = await startNewInkSession();
-              createdNewInkSession = Boolean(chosen?.id);
+              chosen = await startNewInkSession(selectedLocalBackendSessionId);
+              createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
             }
           }
         }
@@ -3538,7 +3603,7 @@ async function ensureInkSessionContext(
 
   if (!chosen && !selectedLocalBackendSessionId && inkAvailable) {
     chosen = await startNewInkSession();
-    createdNewInkSession = Boolean(chosen?.id);
+    createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
   }
 
   if (!chosen?.id && !selectedLocalBackendSessionId) return {};

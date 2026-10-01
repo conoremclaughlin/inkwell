@@ -530,6 +530,16 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe('If true, create a new session even if an active one already exists for this scope.'),
+  backendSessionId: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      'The backend conversation this session will run (Claude Code session id, Codex thread id). ' +
+        'When a live session of the same agent already carries it, that session is returned — ' +
+        'forceNew included — because one backend conversation is one Inkwell session.'
+    ),
 });
 
 export const endSessionSchema = userIdentifierBaseSchema.extend({
@@ -1228,8 +1238,35 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   // 1. threadKey match — find active session with same identity+threadKey
   // 2. studioId match — find active session scoped by identity+studio
   let existingSession = null;
+  let reusedBy: 'backendSessionId' | undefined;
 
-  if (!params.forceNew && params.threadKey && sbSlug) {
+  // 0. backend conversation match — the live row already linked to the
+  // transcript the caller is about to resume. Ranked first and exempt from
+  // forceNew: forceNew means "do not hand me whatever is active in this
+  // scope", and a second row for a conversation that already has one is not
+  // a new session but a duplicate (the `ink claude` picker sent exactly this
+  // for every transcript whose row it had hidden, and one Claude session grew
+  // four live rows). Scoped to the caller's identity, never to a studio: the
+  // conversation is the identity, wherever its row was first recorded.
+  if (params.backendSessionId && (creator.sbId || sbSlug)) {
+    existingSession = await dataComposer.repositories.memory.getActiveSessionByBackendSessionId(
+      user.id,
+      params.backendSessionId,
+      sbSlug,
+      creator.sbId
+    );
+    if (existingSession) {
+      reusedBy = 'backendSessionId';
+      logger.info('start_session reused the session already linked to this backend conversation', {
+        sessionId: existingSession.id,
+        sbSlug,
+        backendSessionId: params.backendSessionId,
+        forceNew: params.forceNew === true,
+      });
+    }
+  }
+
+  if (!params.forceNew && !existingSession && params.threadKey && sbSlug) {
     existingSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
       user.id,
       sbSlug,
@@ -1286,6 +1323,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
                   existingSession.backendSessionId || existingSession.claudeSessionId || null,
                 startedAt: existingSession.startedAt.toISOString(),
                 isExisting: true,
+                ...(reusedBy ? { reusedBy } : {}),
               },
             },
             null,
