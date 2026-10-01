@@ -909,10 +909,8 @@ try {
     await until(() => tuiText.includes('SYNTHETIC_UI_WARNING'), 'native warning UI rendering');
     tui.stdin.write(JSON.stringify({ write: '\u001b' }) + '\n');
     await delay(500);
-    const history = await gateway.request('thread/items/list', { threadId: tid, limit: 100 });
-    assert.ok(!JSON.stringify(history).includes('SYNTHETIC_UI_WARNING'));
     assert.ok(!events.some((e) => JSON.stringify(e).includes('SYNTHETIC_UI_WARNING')));
-    report('native_warning_is_ui_only', { badgeAppeared: true, drawerContainsWarning: true, nativeHistoryUnaffected: true });
+    report('native_warning_is_ui_only', { badgeAppeared: true, drawerContainsWarning: true });
     const config = await gateway.request('config/read', { cwd: work, includeLayers: false });
     assert.equal(config.config?.features?.hooks, true, 'effective hook feature missing');
     const hookMetadata = await gateway.request('hooks/list', { cwds: [work] });
@@ -1036,6 +1034,12 @@ try {
     );
     assert.equal(unhealthy, false);
     assert.ok(!JSON.stringify(requests).includes('SYNTHETIC_UI_WARNING'), 'warning reached model context');
+    const rollouts = () => fs.readdirSync(path.join(ch, 'sessions'), { recursive: true })
+      .filter((name) => name.endsWith('.jsonl'))
+      .map((name) => fs.readFileSync(path.join(ch, 'sessions', name), 'utf8'));
+    await until(() => rollouts().some((s) => s.includes('SYNTHETIC_HUMAN')), 'native history positive control');
+    assert.ok(rollouts().every((s) => !s.includes('SYNTHETIC_UI_WARNING')), 'warning reached native history');
+    report('native_warning_history_isolation', { rolloutAndModelContextUnaffected: true });
     fs.writeFileSync(path.join(root, 'events.json'), JSON.stringify(events, null, 2));
     report('gateway_assertions_passed', {
       root,
