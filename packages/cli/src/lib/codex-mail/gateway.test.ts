@@ -107,6 +107,19 @@ describe('owned native Codex gateway', () => {
     expect(statSync(f.gateway.endpoint.slice(7)).mode & 0o777).toBe(0o600);
     expect(statSync(dirname(f.gateway.endpoint.slice(7))).mode & 0o777).toBe(0o700);
   });
+  it('sends bridge warnings only to the native frontend, not the owner or delivery observer', async () => {
+    const f = await setup();
+    const before = f.events.length;
+    expect(f.gateway.warn('fixture warning')).toBe(true);
+    await until(() => f.received.some((m) => m.method === 'warning'));
+    expect(f.received.find((m) => m.method === 'warning')).toEqual({
+      method: 'warning',
+      params: { message: 'Inkwell Inkmail: fixture warning' },
+    });
+    expect(f.events).toHaveLength(before);
+    await f.gateway.stop();
+    expect(f.gateway.warn('after close')).toBe(false);
+  });
   it('passes approval request/response unchanged and never answers on the human behalf', async () => {
     const f = await setup();
     await f.gateway.request('fixture/approval', {});

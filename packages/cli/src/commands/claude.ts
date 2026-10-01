@@ -4274,7 +4274,7 @@ export async function runClaudeInteractive(
       INK_RUNTIME_LINK_ID: runtimeLinkId,
       ...(startupContextBlock ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
     };
-    const mailSelection = selectCodexMailLaunch({
+    const mailSelection = await selectCodexMailLaunch({
       mode: options.codexInkmail,
       backend: options.backend,
       sessionTracked: options.session,
@@ -4300,7 +4300,7 @@ export async function runClaudeInteractive(
           throw new Error('Codex Inkmail requires an exact Inkwell session and studio');
         }
         console.error(
-          'Inkwell Inkmail: live delivery enabled (use --no-codex-inkmail to opt out).'
+          'Inkwell Inkmail: live delivery enabled after hook trust; review /hooks and F2 warnings (use --no-codex-inkmail to opt out).'
         );
         const result = await runCodexMailInteractive(
           {

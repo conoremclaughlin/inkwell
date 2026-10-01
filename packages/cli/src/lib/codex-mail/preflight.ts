@@ -1,6 +1,12 @@
 import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { prepareCodexMailHooks } from './hooks.js';
+import {
+  codexMailHooks,
+  codexMailHookArgs,
+  codexMailHookState,
+  codexMailHookWarning,
+} from './hooks.js';
+import { probeCodexMailHooks } from './hook-probe.js';
 import { isCodexMailHookScope } from './hook-scope.js';
 import { splitCodexMailArgs } from './launch.js';
 
@@ -13,7 +19,7 @@ type LaunchInput = {
 
 /** All refusal/fallback decisions happen before starting an execution owner.
  * No fallback is allowed after a gateway, turn, or mail send has started. */
-export function prepareCodexMailLaunch(options: LaunchInput) {
+export async function prepareCodexMailLaunch(options: LaunchInput) {
   if (process.platform === 'win32') throw new Error('Codex Inkmail requires macOS or Linux');
   const cwd = realpathSync(options.cwd);
   const launch = splitCodexMailArgs(options.args, cwd);
@@ -26,19 +32,35 @@ export function prepareCodexMailLaunch(options: LaunchInput) {
   if (version.status !== 0 || !/^codex-cli 0\.159\.2\s*$/.test(version.stdout)) {
     throw new Error('Codex Inkmail currently requires codex-cli 0.159.2');
   }
-  // Last preflight operation: only supported launches may migrate config.
-  // Unknown/custom blocks refuse without modification. Trust stays human-owned.
-  const expectedHooks = prepareCodexMailHooks(cwd);
+  const expectedHooks = codexMailHooks();
   launch.serverArgs.splice(1, 0, '--enable', 'hooks');
+  const probe = () => probeCodexMailHooks({ ...options, cwd, serverArgs: launch.serverArgs });
+  const before = await probe();
+  if (!before.enabled) throw new Error(codexMailHookWarning('feature-disabled'));
+  let effective = before.hooks;
+  let state = codexMailHookState(effective, expectedHooks);
+  if (state === 'missing') {
+    // Never overwrite a caller's hook arrays. User/project/plugin layers remain
+    // additive and untouched. Native /hooks still owns trust and enablement.
+    if (before.sessionHooks)
+      throw new Error('Codex Inkmail cannot replace custom session hook overrides');
+    launch.serverArgs.push(...codexMailHookArgs(expectedHooks));
+    const after = await probe();
+    effective = after.hooks;
+    state = codexMailHookState(effective, expectedHooks);
+    if (!after.enabled) throw new Error(codexMailHookWarning('feature-disabled'));
+  }
+  if (!['ready', 'untrusted', 'disabled'].includes(state))
+    throw new Error(codexMailHookWarning(state, effective));
   return { ...launch, cwd, expectedHooks };
 }
-export type CodexMailLaunch = ReturnType<typeof prepareCodexMailLaunch>;
+export type CodexMailLaunch = Awaited<ReturnType<typeof prepareCodexMailLaunch>>;
 export type CodexMailSelection =
   | { kind: 'native'; reason?: string }
   | { kind: 'mail'; launch: CodexMailLaunch }
   | { kind: 'error'; reason: string };
 
-export function selectCodexMailLaunch(
+export async function selectCodexMailLaunch(
   options: LaunchInput & {
     mode?: boolean;
     backend: string;
@@ -48,7 +70,7 @@ export function selectCodexMailLaunch(
     studioId?: string;
   },
   prepare = prepareCodexMailLaunch
-): CodexMailSelection {
+): Promise<CodexMailSelection> {
   if (options.mode === false) return { kind: 'native' };
   const eligible = options.backend === 'codex' && options.sessionTracked && options.interactive;
   if (!eligible && options.mode !== true) return { kind: 'native' };
@@ -63,7 +85,7 @@ export function selectCodexMailLaunch(
       !isCodexMailHookScope({ ...options.env, INK_CODEX_INKMAIL: '1' })
     )
       throw new Error('Codex Inkmail requires an exact attached Inkwell session and studio');
-    return { kind: 'mail', launch: prepare(options) };
+    return { kind: 'mail', launch: await prepare(options) };
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'Codex Inkmail preflight failed';
     return { kind: options.mode === true ? 'error' : 'native', reason };

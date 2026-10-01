@@ -7,8 +7,7 @@ ink -b codex --codex-inkmail     # require it; fail instead of falling back
 ```
 
 Requires **codex-cli 0.159.2**, macOS/Linux, a registered studio, and session
-tracking. Use the normal session picker to start or resume. Review the updated
-Inkwell hooks in Codex's native hook-trust prompt (or `/hooks`). The launcher
+tracking. Use the normal session picker to start or resume. Review the Inkwell session hooks in Codex's native hook-trust prompt (or `/hooks`). The launcher
 **does not grant hook trust**. Until the three hooks are enabled and trusted,
 mail remains unread and live delivery is paused.
 
@@ -16,18 +15,40 @@ Live mail is the default for interactive, session-tracked Codex terminals with
 supported arguments and the measured version. Unsupported versions/arguments,
 missing scope or nonstandard hooks produce a visible fallback to the unchanged
 native invocation, with live mail off. `--codex-inkmail` makes these failures
-fatal instead; `--no-codex-inkmail` skips preflight and hook migration entirely.
+fatal instead; `--no-codex-inkmail` skips preflight and session hook setup entirely.
 One-shot prompts, piped/non-terminal runs, `--no-session` and other backends
 keep their normal path. User sandbox, approval and feature overrides are not
 weakened. A failure after the bridge starts never falls back to a second owner;
 relaunch with `--no-codex-inkmail` to use the normal path.
 
-The **project hook migration persists**, but its guarded commands are inert
-outside an attached bridge (see Lifecycle and limits). This does not connect an
-already-running embedded terminal, change the desktop app, use or configure the
-shared daemon, relink `ink`, or restart an Inkwell server. To adopt it for an
-existing conversation, restart `ink` and select that same session; no new
-conversation is required.
+The launcher **does not rewrite project, main-checkout, or user hook files**.
+It reads native effective configuration with the actual launch overrides, reuses
+exact existing guarded handlers when present, or supplies the three handlers as
+non-managed `sessionFlags` hooks. This also works in linked Git worktrees, where
+Codex 0.159.2 may read main's `.codex` contents under the worktree's layer name.
+Hook sources are additive; conflicting/partial Inkwell handlers or custom session
+hook overrides cause a safe refusal/fallback, never another duplicate handler.
+
+Native trust is still human-owned. In the isolated native resume test, approval
+persisted in `CODEX_HOME/config.toml` under `hooks.state` entries for
+`/<session-flags>/config.toml`. Relaunching with the same commands did not prompt
+again. A different node executable, CLI checkout, or hook definition can change
+the hash and require re-review. The session-flags trust slots are shared across
+projects in CODEX_HOME: trusting build B replaces build A's hash in that slot, so
+returning to A needs review again (also measured with synthetic trust records).
+No trust is granted by the bridge.
+
+Bridge warnings use Codex's native warning badge/drawer (**F2**), not raw stderr
+on top of the terminal. Unchanged failures are reported once; changed conditions
+and recovery are reported again. With no connected frontend, bounded diagnostics
+are retained until attachment or printed only after the TUI exits. These warnings
+are UI-only, not model input or queued user messages. Missing handlers, conflicting
+sources, disabled hooks, and untrusted hooks have distinct guidance.
+
+This does not connect an already-running embedded terminal, change the desktop
+app, use or configure the shared daemon, relink `ink`, or restart an Inkwell server.
+To adopt it for an existing conversation, restart `ink` and select that same
+session; no new conversation is required. On/off selection is launch-time only.
 
 ## Delivery
 
@@ -106,13 +127,13 @@ is reported, not silently treated as working delivery.
 
 ## Lifecycle and limits
 
-- A supported launch upgrades only the recognized, marked legacy hook stanza
-  or exact generated prior bridge shape in local `.codex/config.toml` to modern
-  `SessionStart`, `UserPromptSubmit`, and `Stop` handlers. Known generated blocks
-  can migrate across node/checkout relocations. Custom fields, commands or
-  symlinked configurations are refused; unrelated config is preserved and
-  changed commands still need the human's native trust review.
-- **The migration affects the whole studio**, but the commands carry
+- Configuration-only native preflight uses `config/read` and `hooks/list`, with
+  no thread start/resume or model turn. Each request is bounded and its owned
+  child is reaped before proceeding. The linked-worktree fixture verified no MCP
+  server or hook execution; two probes added about 0.34 seconds on the test host,
+  not a general latency guarantee. User feature and configuration overrides stay
+  authoritative, including an explicit hooks disable.
+- The session-scoped commands (and compatible previously installed handlers) carry
   `--codex-inkmail-only`. Before any identity/session reconciliation, lifecycle
   write or inbox read, they require an explicitly attached Codex context matching
   the session/studio/SB environment and a private, live-wrapper binding to the
@@ -134,9 +155,11 @@ is reported, not silently treated as working delivery.
   different thread ID. Binding is revoked on thread switch, connection failure
   and teardown. This is routing isolation, not authentication against a local
   actor forging context/payloads or rewriting files. Custom hooks are not fenced.
-- If a custom/unknown hook block causes fallback, review/back it up first. To
-  deliberately regenerate it, use `ink hooks install --backend codex --force`
-  with the intended CLI build, then relaunch and review native trust again.
+- If conflicting Inkwell sources cause fallback, inspect the named sources with
+  `/hooks` and review/back up their configuration before changing it. The bridge
+  does not rewrite a main checkout shared with other studios. Do not blindly run
+  `ink hooks install --force`: old or malformed marker blocks may need deliberate
+  repair, and installer output alone does not establish native hook discovery.
 - Hook inbox intake stands down while this bridge owns delivery. Hook lifecycle,
   turn epoch and lease behavior remain in the existing handlers.
 - TUI exit stops and reaps the App Server before detach/identity-file cleanup.
@@ -195,3 +218,20 @@ a helper-disabled negative control with a self-terminating fake owner.
 
 Protocol references: [Codex App Server](https://learn.chatgpt.com/docs/app-server)
 and [Codex hooks and explicit trust](https://learn.chatgpt.com/docs/hooks).
+
+### Native worktree regression probes
+
+After building only the CLI (no global relink), run:
+
+```sh
+node scripts/probe-codex-worktree-hooks.mjs
+node scripts/probe-codex-live-input.mjs --linked-worktree --nested-probe
+node scripts/probe-codex-live-input.mjs --gateway
+```
+
+These opt-in probes use fresh HOME/CODEX_HOME, a disposable Git repository for
+worktree cases, and a synthetic loopback provider/API for execution cases. They
+verify source isolation, unchanged configs, native human trust persistence,
+same-thread resume, exact receipts, nested/subagent guards, and UI-only warnings.
+No real account credentials or shared database are used. Native trust approval in
+the harness applies only to its synthetic temporary configuration.

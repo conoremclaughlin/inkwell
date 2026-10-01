@@ -223,6 +223,13 @@ export async function startCodexMailGateway(options: {
     endpoint: `unix://${socketPath}`,
     isHealthy: () => healthy && initialized && native?.readyState === WebSocket.OPEN,
     stop,
+    warn(message: string): boolean {
+      // Native UI notification, never a queued user turn or a context receipt.
+      // A disconnected owner can still report its failure to a connected TUI.
+      if (!initialized || stopped || native?.readyState !== WebSocket.OPEN) return false;
+      forward({ method: 'warning', params: { message: `Inkwell Inkmail: ${message}` } });
+      return true;
+    },
     request(method: string, params: Record<string, unknown>): Promise<Record<string, any>> {
       if (!initialized || !healthy || stopped)
         return Promise.reject(new Error('Codex is not attached'));
