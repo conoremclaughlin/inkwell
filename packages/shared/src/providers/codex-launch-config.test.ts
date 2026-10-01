@@ -38,9 +38,25 @@ describe('classifyCodexPassthrough', () => {
     });
   });
 
-  it('treats a bare dash and everything after `--` as positional', () => {
-    expect(classifyCodexPassthrough(['-', '--', '-p', 'work', '--whatever'])).toEqual({
-      args: [],
+  // After `exec`, a bare word can select a subcommand (`resume`), and any
+  // other positional competes with the prompt (Lumen, #701 279b1412).
+  it('refuses a positional anywhere: a bare word, a bare dash, or anything after `--`', () => {
+    for (const passthrough of [
+      ['resume', '--last'],
+      ['--skip-git-repo-check', 'review'],
+      ['-'],
+      ['--', '-p', 'work'],
+      ['-c', 'a=1', '--', 'extra'],
+    ]) {
+      expect(classifyCodexPassthrough(passthrough), passthrough.join(' ')).toEqual({
+        refusal: CODEX_LAUNCH_REFUSALS.positional,
+      });
+    }
+  });
+
+  it('admits a trailing `--` and an option value that is a bare word (control)', () => {
+    expect(classifyCodexPassthrough(['--sandbox', 'read-only', '-c', 'a=1', '--'])).toEqual({
+      args: ['-c', 'a=1'],
     });
   });
 

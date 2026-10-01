@@ -22,11 +22,18 @@
  *   and approval settings) are passed over, with their values.
  * - Any other option is refused as unclassified: an option the check does not
  *   know could be one that changes the config.
+ * - A positional argument is refused, wherever it sits: `-` or a bare word
+ *   before the prompt, or anything after a pass-through `--`. After `exec`,
+ *   a word like `resume` selects a subcommand, and any other positional
+ *   competes with the prompt. Either way the launch is no longer the model
+ *   turn it was asked to be (Lumen, #701 279b1412). Only the headless run
+ *   reads this (backend-runner.ts), so an interactive launcher's own
+ *   subcommands are untouched.
  *
- * Only the pass-through is read, up to its first `--`. The adapter's own flags
- * are its own, and the prompt is never classified: the adapter places it after
- * a `--`, so Codex reads it as the prompt whatever it begins with (codex.ts).
- * A refusal never quotes the token, which could carry a value (`--api-key=…`).
+ * The adapter's own flags are its own, and the prompt is never classified:
+ * the adapter places it after a `--`, so Codex reads it as the prompt
+ * whatever it begins with (codex.ts). A refusal never quotes the token, which
+ * could carry a value (`--api-key=…`).
  */
 
 import type { LaunchConfig } from './types.js';
@@ -42,6 +49,8 @@ export const CODEX_LAUNCH_REFUSALS = {
     'the launch passes a Codex option without its value; Codex was not started, because its configuration could not be checked',
   unclassified:
     'the launch passes an option to Codex that the effective-config check does not recognise; Codex was not started, because it could change the configuration',
+  positional:
+    'the launch passes a positional argument to Codex besides the prompt, which could select a subcommand; Codex was not started',
 } as const;
 
 /** Options that take a value and do not affect the config Codex loads. */
@@ -109,14 +118,19 @@ function splitOption(token: string): { name: string; attached?: string } {
 /**
  * The config-affecting part of `passthrough`, as `-c V` pairs in order, or
  * why the launch cannot be checked. `-`, and every token after a `--`, are
- * positional.
+ * positional; a `--` with nothing after it is only the terminator.
  */
 export function classifyCodexPassthrough(passthrough: readonly string[]): LaunchConfig {
   const args: string[] = [];
   for (let i = 0; i < passthrough.length; i += 1) {
     const token = passthrough[i]!;
-    if (token === '--') break;
-    if (!token.startsWith('-') || token === '-') continue;
+    if (token === '--') {
+      if (i < passthrough.length - 1) return { refusal: CODEX_LAUNCH_REFUSALS.positional };
+      break;
+    }
+    if (!token.startsWith('-') || token === '-') {
+      return { refusal: CODEX_LAUNCH_REFUSALS.positional };
+    }
     const { name, attached } = splitOption(token);
     const refused = REFUSED_OPTIONS.get(name);
     if (refused) return { refusal: refused };

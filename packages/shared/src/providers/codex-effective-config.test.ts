@@ -349,8 +349,10 @@ describe("CodexAdapter: the check judges the launch's own configuration", () => 
     }
   });
 
-  it('refuses a profile, a working directory, a feature switch or an unknown option, before any listing', async () => {
+  it('refuses a profile, a working directory, a feature switch, an unknown option or a positional, before any listing', async () => {
     const cases: [string[], string][] = [
+      [['resume', '--last'], CODEX_LAUNCH_REFUSALS.positional],
+      [['--', 'extra'], CODEX_LAUNCH_REFUSALS.positional],
       [['-p', 'work'], CODEX_LAUNCH_REFUSALS.profile],
       [['--profile=work'], CODEX_LAUNCH_REFUSALS.profile],
       [['-C', '/synthetic/elsewhere'], CODEX_LAUNCH_REFUSALS.directory],
