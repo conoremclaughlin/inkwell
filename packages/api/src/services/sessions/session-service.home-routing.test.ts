@@ -18,7 +18,8 @@ vi.mock('../../utils/logger.js', () => ({
  *   - a request that addressed a studio, by id or by slug hint;
  *   - an ambiguous slug (two workspaces, no canonical identity);
  *   - a newer failed `task` session sitting in front of the primary home.
- * The four controls pin what the rung is for.
+ * The controls pin what the rung is for, including Lumen's round-2 probes:
+ * a request that names no studio leaves the home's placement standing.
  */
 const USER = 'user-example';
 const SB = 'sb-example';
@@ -210,6 +211,55 @@ describe('home rung — what it is for', () => {
       ],
     });
     const found = await service.getOrCreateSession(USER, SLUG, { studioId: 'studio-example' });
+    expect(found.id).toBe('home-example');
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // Lumen's PR #680 round-2 probes (~/.ink/files/lumen-review/pr680-r2/): a
+  // request that names no studio has addressed nothing, so a home that lives
+  // in a studio is still the home. Red on 78ecf074, where the placement check
+  // compared the home against an unresolved studio and general-active then
+  // handed back the newer twin.
+  for (const twinStudio of [null, 'studio-other-example']) {
+    it(`an unaddressed request keeps a studio-bound home over a newer twin in ${twinStudio}`, async () => {
+      const { service, create } = harness({
+        agent_identities: [identity()],
+        sessions: [
+          session({ studio_id: 'studio-home-example' }),
+          session({
+            id: 'newer-twin-example',
+            studio_id: twinStudio,
+            started_at: '2026-01-02T00:00:00Z',
+          }),
+        ],
+        studios: [
+          {
+            id: 'studio-home-example',
+            user_id: USER,
+            sb_id: SB,
+            agent_id: SLUG,
+            slug: 'home-example',
+            status: 'active',
+          },
+        ],
+      });
+      const found = await service.getOrCreateSession(USER, SLUG, {});
+      expect(found.id).toBe('home-example');
+      expect(found.studioId).toBe('studio-home-example');
+      expect(create).not.toHaveBeenCalled();
+    });
+  }
+
+  it('a "main" hint that resolves to no studio keeps a studioless home', async () => {
+    // Myra's channel route: hint "main", no root studio, home in no studio.
+    const { service, create } = harness({
+      agent_identities: [identity()],
+      sessions: [
+        session(),
+        session({ id: 'newer-twin-example', started_at: '2026-01-02T00:00:00Z' }),
+      ],
+    });
+    const found = await service.getOrCreateSession(USER, SLUG, { studioHint: 'main' });
     expect(found.id).toBe('home-example');
     expect(create).not.toHaveBeenCalled();
   });

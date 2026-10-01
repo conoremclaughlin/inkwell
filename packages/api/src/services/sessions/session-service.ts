@@ -2769,6 +2769,14 @@ export class SessionService implements ISessionService {
     const identityRouting = await this.resolveIdentityRouting(userId, sbSlug, identitySbId);
     const defaultSessionId = identityRouting.defaultSessionId;
 
+    // Whether the caller named a studio. 'explicit' and 'studio-hint' are the
+    // caller-qualified tiers; every tier below them is inferred (route
+    // pattern, caller repo, most-recent, fallback). A rung that pins its
+    // answer to a studio does so only for a named one: pinning to an inferred
+    // studio would turn a resolvable alias or home into a miss — the resolver
+    // refusing to see a session the caller never said anything about.
+    const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
+
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
       // recipientSessionId takes highest priority — this is an explicit "route
@@ -2798,14 +2806,9 @@ export class SessionService implements ISessionService {
           ) => Promise<Session | null>;
         };
 
-        // Pin the alias lookup to a studio only when the caller named one.
-        // 'explicit' and 'studio-hint' are the caller-qualified tiers; every
-        // tier below them is inferred (route pattern, most-recent, fallback),
-        // and pinning to an inferred studio would turn a resolvable alias into
-        // a miss — the resolver would refuse to see a session the caller never
-        // said anything about.
-        const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
-
+        // Pin the alias lookup to a studio only when the caller named one
+        // (callerNamedStudio, above).
+        //
         // Scope to the caller's studio when they named one that resolved.
         // Otherwise the lookup is unscoped, which is safe on its own terms:
         // findByAlias refuses an alias matching across two studios rather
@@ -2946,6 +2949,11 @@ export class SessionService implements ISessionService {
         //    general lookup below answers instead. Myra's channel route
         //    hints "main", which resolves to no studio for her, and her home
         //    has none: that is a match, and it is the case this rung is for.
+        //    Only a NAMED studio is an address (Lumen, PR #680 round 2). With
+        //    none, resolvedStudioId is inferred or empty, and the home
+        //    supplies the placement: comparing against it rejected a home in
+        //    studio A for a bare request, and general-active then picked any
+        //    newer twin — the split this rung exists to close.
         if (defaultSessionId && !options?.contactId) {
           const defaultSession = await this.repository.findById(defaultSessionId);
           const usable = defaultSession
@@ -2953,7 +2961,8 @@ export class SessionService implements ISessionService {
               ? 'ended'
               : !anchorBelongsToTarget(defaultSession)
                 ? 'foreign-identity'
-                : (defaultSession.studioId ?? null) !== (resolvedStudioId ?? null)
+                : callerNamedStudio &&
+                    (defaultSession.studioId ?? null) !== (resolvedStudioId ?? null)
                   ? 'other-placement'
                   : 'home'
             : 'missing';
