@@ -122,7 +122,11 @@ is reported, not silently treated as working delivery.
 - Subagent payloads carrying `agent_id`, `agent_type` or `agent_transcript_path`
   are refused even when `session_id` matches. On measured Codex 0.159.2, a
   subagent's `UserPromptSubmit` uses the **parent** session ID plus agent fields;
-  thread equality alone is insufficient. This is version-specific evidence,
+  thread equality alone is insufficient. The captured child emitted
+  `SubagentStart`/`SubagentStop`, which the managed block does not register;
+  child `SessionStart`/ordinary `Stop` were not observed. Tests replay their
+  captured Subagent\* shapes defensively, not as evidence of ordinary child
+  SessionStart/Stop. This is version-specific evidence,
   not a promise about future native payloads.
 - Headless, parent-owned, unbound, malformed and foreign-thread hooks skip all
   business handlers, appending only a local diagnostic. Nested raw `codex exec`

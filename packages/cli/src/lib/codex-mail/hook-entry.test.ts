@@ -8,6 +8,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { modernCodexMailHooks } from './hooks.js';
+import { capturedSubagentHooks } from './fixtures/subagent-hooks.js';
 
 const run = promisify(execFile);
 const cli = fileURLToPath(new URL('../../../dist/cli.js', import.meta.url));
@@ -22,9 +24,24 @@ afterEach(async () => {
 });
 
 describe('guarded hook CLI entry points', () => {
+  it('registers only the root events, never SubagentStart or SubagentStop', () => {
+    const legacy =
+      '# ink-managed:hooks:start\n[hooks]\nsession_start = "ink hooks on-session-start --backend codex"\nsession_end = "ink hooks on-stop --backend codex"\nuser_prompt = "ink hooks on-prompt --backend codex"\n# ink-managed:hooks:end';
+    const generated = modernCodexMailHooks(legacy, "'node' 'fixture-cli'");
+    expect([...generated.content.matchAll(/^\[\[hooks\.(\w+)\]\]$/gm)].map((m) => m[1])).toEqual([
+      'SessionStart',
+      'UserPromptSubmit',
+      'Stop',
+    ]);
+    expect(generated.hooks.map((h) => h.event)).toEqual([
+      'SessionStart',
+      'UserPromptSubmit',
+      'Stop',
+    ]);
+  });
   it.each(
-    ['server', 'plain', 'parent', 'nested', 'subagent', 'prebind', 'bridge'].flatMap((mode) =>
-      ['on-session-start', 'on-prompt', 'on-stop'].map((hook) => [mode, hook])
+    ['server', 'plain', 'parent', 'nested', 'subagent-replay', 'prebind', 'bridge'].flatMap(
+      (mode) => ['on-session-start', 'on-prompt', 'on-stop'].map((hook) => [mode, hook])
     )
   )(
     '%s context: %s admits only the exact bound bridge thread',
@@ -98,7 +115,12 @@ describe('guarded hook CLI entry points', () => {
       running.child.stdin?.end(
         JSON.stringify({
           session_id: mode === 'nested' ? 'child-thread' : 'parent-thread',
-          ...(mode === 'subagent' ? { agent_id: 'child-thread', agent_type: 'default' } : {}),
+          // Captured UserPromptSubmit is an actual child invocation. The
+          // SubagentStart/Stop replays through root handlers are defensive;
+          // the generated block above never registers those native events.
+          ...(mode === 'subagent-replay'
+            ? capturedSubagentHooks[hook as keyof typeof capturedSubagentHooks]
+            : {}),
         })
       );
       const { stdout, stderr } = await running;
