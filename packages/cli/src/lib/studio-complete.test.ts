@@ -23,6 +23,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { auditStudio, DEFAULT_CLAUDE_ALLOW_RULES } from '@inklabs/shared';
 import { completeStudio, type StepResult } from './studio-complete.js';
+import { installHooks } from '../commands/hooks.js';
 
 let root: string;
 let main: string;
@@ -83,6 +84,30 @@ const baseOptions = () => ({
       detail: 'stubbed',
     })
   ),
+});
+
+describe('completeStudio — hook steps say whether they created or repaired', () => {
+  it('a hook file that carried the Inkwell hooks under an older ink path reports updated, then exists', async () => {
+    installHooks(studio, { backend: 'claude-code' });
+    const configPath = join(studio, '.claude', 'settings.local.json');
+    const config = readJson(configPath);
+    const stale = JSON.parse(
+      JSON.stringify(config.hooks).replace(
+        /"command":"[^"]*? hooks /g,
+        '"command":"/old/checkout/ink hooks '
+      )
+    ) as Record<string, unknown>;
+    writeFileSync(configPath, JSON.stringify({ ...config, hooks: stale }, null, 2));
+
+    const first = await completeStudio(studio, baseOptions());
+    expect(statusOf(first.steps, 'hooks (claude-code)')).toBe('updated');
+    expect(statusOf(first.steps, 'hooks (codex)')).toBe('created');
+    expect(statusOf(first.steps, 'hooks (gemini)')).toBe('created');
+    expect(JSON.stringify(readJson(configPath).hooks)).not.toContain('/old/checkout/ink');
+
+    const second = await completeStudio(studio, baseOptions());
+    expect(statusOf(second.steps, 'hooks (claude-code)')).toBe('exists');
+  });
 });
 
 describe('completeStudio — a fresh linked worktree', () => {
@@ -217,6 +242,45 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(report.audit.complete).toBe(false);
     expect(report.audit.missing).toEqual(['studio-id']);
     expect(readJson(join(studio, '.ink', 'identity.json')).studioId).toBeUndefined();
+  });
+
+  it('a Codex config the sync cannot repair fails the backend configs step, naming the hand edit, rather than reporting a repair (Myra, #701)', async () => {
+    const opts = baseOptions();
+    await completeStudio(studio, opts);
+    const codexPath = join(studio, '.codex', 'config.toml');
+    writeFileSync(
+      codexPath,
+      `${readFileSync(codexPath, 'utf-8')}\n[mcp_servers.inkwell]\nurl = "http://localhost:9999/stale"\n`
+    );
+
+    const again = await completeStudio(studio, opts);
+
+    const step = again.steps.find((s) => s.label === 'backend configs');
+    expect(step?.status).toBe('failed');
+    expect(step?.detail).toContain("kept outside ink's Codex block, as defined there: inkwell");
+    expect(step?.detail).toContain(
+      "defines the inkwell server outside ink's managed block, where the sync cannot update it"
+    );
+    expect(again.audit.missing).toEqual(['codex-mcp']);
+  });
+
+  it('names a server it kept outside the Codex block, and the studio stays complete (Myra, #701 73a3b6fd)', async () => {
+    const opts = baseOptions();
+    await completeStudio(studio, opts);
+    const codexPath = join(studio, '.codex', 'config.toml');
+    writeFileSync(
+      codexPath,
+      `${readFileSync(codexPath, 'utf-8')}\n[mcp_servers.trusted]\ncommand = "node"\n`
+    );
+
+    const again = await completeStudio(studio, opts);
+
+    const step = again.steps.find((s) => s.label === 'backend configs');
+    expect(step?.status).toBe('updated');
+    expect(step?.detail).toBe(
+      ".codex/, .gemini/; kept outside ink's Codex block, as defined there: trusted"
+    );
+    expect(again.audit.complete).toBe(true);
   });
 
   it('never writes identity or settings through a symlink', async () => {

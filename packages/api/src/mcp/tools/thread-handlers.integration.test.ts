@@ -369,4 +369,142 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     );
     expect(result.messages.map((m) => m.content)).toEqual(['b', 'c', 'd']);
   });
+
+  // ── A page never ends partway through a timestamp (#702) ─────────────
+  //
+  // Every cursor over this table is a strict `created_at >`. A page that
+  // stops inside a group of rows sharing one timestamp leaves the rest of the
+  // group behind the next cursor for good. `ink wait --follow` pages on
+  // exactly that cursor: the last `createdAt` it read, passed back verbatim
+  // as `newerThan`.
+  //
+  // The group straddles the page: one earlier row, then the group, then a
+  // later reply. A 200-row page holds the earlier row and 199 of the group,
+  // so the server has to complete it. 1200 is past PostgREST's max_rows, so a
+  // single sibling select cannot complete it either.
+
+  const TIE_AT = '2026-06-18T19:00:01.234567+00:00';
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawClient = (): any => dataComposer.getClient();
+
+  async function insertAt(
+    threadId: string,
+    sender: string,
+    content: string,
+    createdAt: string
+  ): Promise<string> {
+    const { data, error } = await rawClient()
+      .from('inbox_thread_messages')
+      .insert({
+        thread_id: threadId,
+        sender_kind: 'sb',
+        sender_sb_id: sbIdBySlug.get(sender),
+        sender_agent_id: sender,
+        content,
+        message_type: 'message',
+        created_at: createdAt,
+      })
+      .select('id')
+      .single();
+    if (error || !data) throw new Error(`message insert: ${error?.message}`);
+    return (data as { id: string }).id;
+  }
+
+  /** `n` rows sharing `createdAt`, their ids in the server's (id) order. */
+  async function insertTied(
+    threadId: string,
+    sender: string,
+    n: number,
+    createdAt: string
+  ): Promise<string[]> {
+    const ids = Array.from({ length: n }, () => crypto.randomUUID());
+    const { error } = await rawClient()
+      .from('inbox_thread_messages')
+      .insert(
+        ids.map((id, i) => ({
+          id,
+          thread_id: threadId,
+          sender_kind: 'sb',
+          sender_sb_id: sbIdBySlug.get(sender),
+          sender_agent_id: sender,
+          content: `tied ${i}`,
+          message_type: 'message',
+          created_at: createdAt,
+        }))
+      );
+    if (error) throw new Error(`tied insert: ${error.message}`);
+    // Lowercase hex UUIDs sort as strings the way Postgres orders uuid.
+    return [...ids].sort();
+  }
+
+  async function countAt(threadId: string, createdAt: string): Promise<number> {
+    const { count, error } = await rawClient()
+      .from('inbox_thread_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('thread_id', threadId)
+      .eq('created_at', createdAt);
+    if (error) throw new Error(`count: ${error.message}`);
+    return count as number;
+  }
+
+  for (const n of [200, 1200]) {
+    it(`completes a ${n}-row tie group across the page boundary, then pages past it exclusively to a later reply`, async () => {
+      const threadKey = `thread:test-cursor-tie${n}-` + Date.now();
+      const { threadId } = await createThreadWithMessages(threadKey, 'lumen', 'wren', []);
+      const earlier = await insertAt(
+        threadId,
+        'lumen',
+        'before',
+        '2026-06-18T19:00:00.000001+00:00'
+      );
+      const tied = await insertTied(threadId, 'lumen', n, TIE_AT);
+      const reply = await insertAt(threadId, 'wren', 'reply', '2026-06-18T19:00:02.000001+00:00');
+
+      // Premise: the whole group really does share one timestamp.
+      expect(await countAt(threadId, TIE_AT)).toBe(n);
+      if (n > 1000) {
+        // Premise: one select cannot return the group, so this case measures
+        // the paged completion rather than a single sibling read.
+        const { data: oneSelect } = await rawClient()
+          .from('inbox_thread_messages')
+          .select('id')
+          .eq('thread_id', threadId)
+          .eq('created_at', TIE_AT);
+        expect(oneSelect.length).toBeLessThan(n);
+      }
+
+      // The follow read: fullHistory, observe-only, the client's page limit.
+      const read = async (newerThan?: string) =>
+        JSON.parse(
+          (
+            await handleGetThreadMessages(
+              {
+                userId,
+                threadKey,
+                sbSlug: 'wren',
+                limit: 200,
+                fullHistory: true,
+                markRead: false,
+                ...(newerThan ? { newerThan } : {}),
+              },
+              dataComposer
+            )
+          ).content[0].text
+        );
+
+      const first = await read();
+      expect(first.success).toBe(true);
+      // The whole group, oldest-first in (created_at, id) order; not the reply.
+      expect(first.messages.map((m: { id: string }) => m.id)).toEqual([earlier, ...tied]);
+      // Truncation is reported against what was actually sent.
+      expect(first.truncatedNewerCount).toBe(1);
+      expect(first.hint).toContain(`OLDEST ${1 + n} messages`);
+
+      // The client's floor: the last createdAt, verbatim and exclusive.
+      const floor = first.messages[first.messages.length - 1].createdAt;
+      const second = await read(floor);
+      expect(second.messages.map((m: { id: string }) => m.id)).toEqual([reply]);
+    });
+  }
 });

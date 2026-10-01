@@ -802,6 +802,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
         studio: {
           id: studio.id,
           studioId: studio.id,
+          slug: studio.slug ?? null,
           sbSlug: studio.sbSlug,
           branch: studio.branch,
           worktreeFolder: path.basename(studio.worktreePath),
@@ -942,6 +943,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studio: {
       id: studio.id,
       studioId: studio.id,
+      slug: studio.slug ?? null,
       sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
@@ -989,6 +991,7 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
     studios: studios.map((w) => ({
       id: w.id,
       studioId: w.id,
+      slug: w.slug ?? null,
       sbSlug: w.sbSlug,
       branch: w.branch,
       worktreePath: w.worktreePath,
@@ -1038,6 +1041,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
     studio: {
       id: studio.id,
       studioId: studio.id,
+      slug: studio.slug ?? null,
       sbSlug: studio.sbSlug,
       branch: studio.branch,
       worktreeFolder: path.basename(studio.worktreePath),
@@ -1137,6 +1141,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     studio: {
       id: updated.id,
       studioId: updated.id,
+      slug: updated.slug ?? null,
       sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),
@@ -1479,6 +1484,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     studio: {
       id: updated.id,
       studioId: updated.id,
+      slug: updated.slug ?? null,
       sbSlug: updated.sbSlug,
       branch: updated.branch,
       worktreeFolder: path.basename(updated.worktreePath),

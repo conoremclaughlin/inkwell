@@ -29,7 +29,7 @@
 import chalk from 'chalk';
 import { auditStudio, type StudioCheckId } from '@inklabs/shared';
 import { detectWorktree, runInit, type WorktreePlacement } from '../commands/init.js';
-import type { CompleteStudioReport } from './studio-complete.js';
+import type { CompleteStudioReport, StepResult } from './studio-complete.js';
 import { callInkTool } from './ink-mcp.js';
 import { sbDebugLog } from './sb-debug.js';
 
@@ -77,7 +77,7 @@ async function lookupStudioByPath(worktreePath: string): Promise<LaunchStudioLoo
     const result = await callInkTool<{ studio?: { id?: string; sbSlug?: string } }>(
       'get_studio',
       { path: worktreePath },
-      { timeoutMs: 3000 }
+      { timeoutMs: 3000, idempotent: true }
     );
     if (result?.studio?.id) {
       return {
@@ -127,22 +127,36 @@ export async function completeStudioForLaunch(
   return { ran: true, owner, missingBefore: audit.missing, report };
 }
 
+/**
+ * What a run wrote, created and updated named apart so a repaired file
+ * (hooks under an older ink path, an identity with a field filled in) reads
+ * as a repair and not as something the studio lacked.
+ */
+function describeStepsWritten(steps: StepResult[]): string {
+  const labels = (status: StepResult['status']) =>
+    steps.filter((step) => step.status === status).map((step) => step.label);
+  const created = labels('created');
+  const updated = labels('updated');
+  return [
+    created.length ? `created ${created.join(', ')}` : '',
+    updated.length ? `updated ${updated.join(', ')}` : '',
+  ]
+    .filter(Boolean)
+    .join('; ');
+}
+
 /** What a run changed, one line per written step, and what it left for later. */
 export function describeLaunchStudioResult(result: LaunchStudioResult): string[] {
   if (!result.ran || !result.report) return [];
-  const changed = result.report.steps
-    .filter((step) => step.status === 'created' || step.status === 'updated')
-    .map((step) => step.label);
+  const changed = describeStepsWritten(result.report.steps);
   const lines: string[] = [];
   if (result.ownerUnknown) {
     lines.push(
-      `Studio partly completed${changed.length ? ` (${changed.join(', ')})` : ''}; its owner is unknown because the server could not be asked (${result.ownerUnknown}). Identity and registration were left alone: run ink init when the server is reachable`
+      `Studio partly completed${changed ? ` (${changed})` : ''}; its owner is unknown because the server could not be asked (${result.ownerUnknown}). Identity and registration were left alone: run ink init when the server is reachable`
     );
     return lines;
   }
-  lines.push(
-    `Studio completed for ${result.owner}${changed.length ? `: ${changed.join(', ')}` : ''}`
-  );
+  lines.push(`Studio completed for ${result.owner}${changed ? `: ${changed}` : ''}`);
   if (!result.report.audit.complete) {
     lines.push(
       `Studio still incomplete (${result.report.audit.missing.join(', ')}). Run: ink init`

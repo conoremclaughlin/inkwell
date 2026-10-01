@@ -62,7 +62,7 @@ export const triggerAgentSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Convenience studio routing hint (e.g., "main" for shared main studio, or a studio name)'
+      'Convenience studio routing hint: "main" for the shared main studio, or a studio `slug` as list_studios and get_studio return it (not `worktreeFolder`). studioId is unambiguous and preferred when you have it.'
     ),
   recipientSessionId: z
     .string()

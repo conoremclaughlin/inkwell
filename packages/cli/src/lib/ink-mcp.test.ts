@@ -156,3 +156,90 @@ describe('ink-mcp callInkTool', () => {
     );
   });
 });
+
+/**
+ * One retry on a socket-level reset, for calls the caller marked idempotent
+ * (task 38af403e). The measured case: the CLI blocked its loop past the
+ * server's keep-alive timeout, the pooled socket was dead when the next
+ * request went out, and the launcher declared the service unavailable while
+ * a concurrent call succeeded. The shapes here are undici's: a TypeError
+ * "fetch failed" whose cause carries the socket error code.
+ */
+describe('ink-mcp callInkTool retry after a socket reset', () => {
+  const originalServerUrl = process.env.INK_SERVER_URL;
+
+  beforeEach(() => {
+    process.env.INK_SERVER_URL = 'http://localhost:3999';
+    mockedGetValidAccessToken.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    process.env.INK_SERVER_URL = originalServerUrl;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const reset = () =>
+    new TypeError('fetch failed', { cause: { code: 'ECONNRESET', errno: -54, syscall: 'read' } });
+  const ok = () =>
+    mockJsonResponse({
+      jsonrpc: '2.0',
+      result: { content: [{ text: '{"sessions":[]}' }] },
+      id: 1,
+    });
+
+  it('an idempotent call reset once is sent again and succeeds', async () => {
+    const fetchSpy = vi.fn().mockRejectedValueOnce(reset()).mockResolvedValueOnce(ok());
+    vi.stubGlobal('fetch', fetchSpy);
+    const result = await callInkTool<{ sessions: unknown[] }>(
+      'list_sessions',
+      { limit: 1 },
+      { idempotent: true }
+    );
+    expect(result).toEqual({ sessions: [] });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('a call not marked idempotent is never sent twice', async () => {
+    const fetchSpy = vi.fn().mockRejectedValueOnce(reset()).mockResolvedValueOnce(ok());
+    vi.stubGlobal('fetch', fetchSpy);
+    await expect(callInkTool('send_to_inbox', { content: 'x' })).rejects.toThrow(/ECONNRESET/);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a second reset is the failure it always was', async () => {
+    const fetchSpy = vi.fn().mockRejectedValue(reset());
+    vi.stubGlobal('fetch', fetchSpy);
+    await expect(callInkTool('get_studio', { path: '/x' }, { idempotent: true })).rejects.toThrow(
+      /ECONNRESET/
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('a timeout or a refused connection is not a reset, and is not retried', async () => {
+    const timeout = Object.assign(new Error('The operation was aborted due to timeout'), {
+      name: 'TimeoutError',
+    });
+    const refused = new TypeError('fetch failed', {
+      cause: { code: 'ECONNREFUSED', errno: -61, syscall: 'connect' },
+    });
+    for (const failure of [timeout, refused]) {
+      const fetchSpy = vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(ok());
+      vi.stubGlobal('fetch', fetchSpy);
+      await expect(
+        callInkTool('get_studio', { path: '/x' }, { idempotent: true })
+      ).rejects.toThrow();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('the other-side-closed message is a reset too', async () => {
+    const closed = new TypeError('fetch failed', {
+      cause: { code: 'UND_ERR_SOCKET', message: 'other side closed' },
+    });
+    const fetchSpy = vi.fn().mockRejectedValueOnce(closed).mockResolvedValueOnce(ok());
+    vi.stubGlobal('fetch', fetchSpy);
+    await callInkTool('get_studio', { path: '/x' }, { idempotent: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+});

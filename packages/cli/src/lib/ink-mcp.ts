@@ -48,6 +48,24 @@ function formatInkFetchFailure(url: string, error: unknown): string {
   return `Inkwell fetch failed for ${url}: ${base}${causeSuffix}`;
 }
 
+/** The error code undici reports for a socket-level failure, when it reports one. */
+function socketErrorCode(error: unknown): string | null {
+  const cause = (error as { cause?: { code?: unknown } } | undefined)?.cause;
+  return cause && typeof cause.code === 'string' ? cause.code : null;
+}
+
+/**
+ * A reset on the socket itself, as opposed to a timeout, a refused
+ * connection or a server that answered: the shapes a pooled keep-alive
+ * socket closed by the other side produces.
+ */
+export function isSocketReset(error: unknown): boolean {
+  const code = socketErrorCode(error);
+  if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET') return true;
+  const cause = (error as { cause?: { message?: unknown } } | undefined)?.cause;
+  return typeof cause?.message === 'string' && /other side closed/i.test(cause.message);
+}
+
 export async function callInkTool<T = Record<string, unknown>>(
   tool: string,
   args: Record<string, unknown>,
@@ -67,6 +85,16 @@ export async function callInkTool<T = Record<string, unknown>>(
      * place that should say. (Lumen, #665 r4.)
      */
     onCredential?: (token: string | null) => void;
+    /**
+     * The call may be sent twice. Set it for reads (get_*, list_*,
+     * bootstrap) and never for a write: a request that was reset on a pooled
+     * keep-alive socket the server had already closed was never processed,
+     * but a reset mid-response after the server acted on it is the same
+     * error from here, and only the caller knows whether a second copy is
+     * harmless. One retry, on a socket-level reset only; a timeout, a refused
+     * connection or an HTTP status is never retried (task 38af403e).
+     */
+    idempotent?: boolean;
   }
 ): Promise<T> {
   const serverUrl = getInkServerUrl();
@@ -100,9 +128,8 @@ export async function callInkTool<T = Record<string, unknown>>(
     argValues: pickDebugArgValues(args || {}),
   });
 
-  let response: Response;
-  try {
-    response = await fetch(url, {
+  const send = () =>
+    fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -113,7 +140,7 @@ export async function callInkTool<T = Record<string, unknown>>(
       }),
       ...(options?.timeoutMs ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}),
     });
-  } catch (error) {
+  const fetchFailure = (error: unknown): Error => {
     const diagnostic = formatInkFetchFailure(url, error);
     sbDebugLog('ink-mcp', 'call_fetch_error', {
       tool,
@@ -126,9 +153,32 @@ export async function callInkTool<T = Record<string, unknown>>(
           ? String((error as { cause?: unknown }).cause)
           : null,
     });
-    throw new Error(
+    return new Error(
       `${diagnostic}. Ensure Inkwell server is running and INK_SERVER_URL is correct.`
     );
+  };
+
+  let response: Response;
+  try {
+    response = await send();
+  } catch (error) {
+    // The stale-pooled-socket case: the CLI blocked its loop past the
+    // server's keep-alive timeout, undici never saw the close, and the next
+    // request went out on a dead socket. Measured 2026-09-29 on `ink -a
+    // lumen`: one of two concurrent list_sessions calls reset in 9 ms while
+    // the other succeeded 110 ms later, and the launcher declared the
+    // service unavailable. Once, and only for a call the caller marked safe.
+    if (!(options?.idempotent && isSocketReset(error))) throw fetchFailure(error);
+    sbDebugLog('ink-mcp', 'call_retry_after_reset', {
+      tool,
+      serverUrl,
+      cause: socketErrorCode(error),
+    });
+    try {
+      response = await send();
+    } catch (retryError) {
+      throw fetchFailure(retryError);
+    }
   }
 
   if (!response.ok) {

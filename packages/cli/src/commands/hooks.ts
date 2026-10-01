@@ -35,7 +35,7 @@ import {
 } from '../session/runtime.js';
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
-import { promptAttachmentWrite } from '../lib/turn-owner.js';
+import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
 import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
@@ -463,16 +463,10 @@ function writeRuntimeFile(cwd: string, filename: string, content: string): void 
  * Decodes the INK_CONTEXT token set by the runner at spawn time — if cliAttached is
  * explicitly false, this is a triggered session that should NOT mark itself CLI-attached.
  * When there's no INK_CONTEXT (interactive `claude` invocation), defaults to true (attached).
+ * The wrapper reads the same token to decide whether a child's exit detaches.
  */
 export function isHeadlessSession(): boolean {
-  const raw = process.env.INK_CONTEXT?.trim();
-  if (!raw) return false;
-  try {
-    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString());
-    return parsed.cliAttached === false;
-  } catch {
-    return false;
-  }
+  return contextDeclaresHeadless(process.env);
 }
 
 function normalizeSessionBackend(backendName: string): string {
@@ -1474,7 +1468,23 @@ export function isInkHookCommand(cmd: string | undefined): boolean {
   return MANAGED_HOOK_MARKER_RE.test(cmd) || looksLikeSbEntrypoint(words[at - 1]);
 }
 
-type InstallResult = 'installed' | 'already-installed' | 'conflict';
+/**
+ * What an installer did. 'installed' wrote the Inkwell hooks where there
+ * were none; 'updated' rewrote hooks that were already there (an older form
+ * of the Inkwell hooks, a different ink path, or another tool's hooks under
+ * --force), so a repair reads as one and never as a first install;
+ * 'already-installed' found the current hooks and wrote nothing; 'conflict'
+ * found another tool's hooks and left them alone.
+ */
+type InstallResult = 'installed' | 'updated' | 'already-installed' | 'conflict';
+
+/** Whether a hooks map carries at least one entry under any event. */
+function hasHookEntries(hooks: unknown): boolean {
+  if (!hooks || typeof hooks !== 'object') return false;
+  return Object.values(hooks as Record<string, unknown>).some(
+    (entries) => Array.isArray(entries) && entries.length > 0
+  );
+}
 
 function hasCodexInkHooks(content: string): boolean {
   if (!content.trim()) return false;
@@ -1617,7 +1627,7 @@ function installClaudeCode(cwd: string, force: boolean): InstallResult {
   // Merge: keep existing non-hooks settings, replace hooks
   const merged = { ...existing, ...inkHooks };
   writeFileSync(configPath, JSON.stringify(merged, null, 2) + '\n');
-  return 'installed';
+  return hasHookEntries(existingHooks) ? 'updated' : 'installed';
 }
 
 function installGemini(cwd: string, force: boolean): InstallResult {
@@ -1726,16 +1736,24 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     }
   }
 
+  // Only the events Inkwell manages are replaced; entries under other
+  // events are kept, and their presence alone does not make this a repair.
+  const existingHooks = (existing.hooks as Record<string, unknown> | undefined) ?? {};
+  const hadInkEvents = Object.keys(inkHooks).some((event) => {
+    const entries = existingHooks[event];
+    return Array.isArray(entries) && entries.length > 0;
+  });
+
   const merged = {
     ...existing,
     hooks: {
-      ...((existing.hooks as Record<string, unknown>) || {}),
+      ...existingHooks,
       ...inkHooks,
     },
   };
 
   writeFileSync(configPath, JSON.stringify(merged, null, 2) + '\n');
-  return 'installed';
+  return hadInkEvents ? 'updated' : 'installed';
 }
 
 function installCodex(cwd: string, force: boolean): InstallResult {
@@ -1772,7 +1790,7 @@ function installCodex(cwd: string, force: boolean): InstallResult {
   ].join('\n');
 
   writeFileSync(configPath, cleaned.trimEnd() + '\n' + inkSection);
-  return 'installed';
+  return existingContent.includes('[hooks]') ? 'updated' : 'installed';
 }
 
 function removeInkTomlSection(content: string): string {
@@ -1835,7 +1853,7 @@ function printInstallResult(
     return;
   }
 
-  console.log(chalk.green(`  ✓ ${targetDir} — installed (${backend.name})`));
+  console.log(chalk.green(`  ✓ ${targetDir} — ${result} (${backend.name})`));
   const events = backend.events;
   if (events.preCompact)
     console.log(
@@ -1930,7 +1948,7 @@ async function installCommand(options: {
       continue;
     }
 
-    console.log(chalk.green(`\nInkwell hooks installed (${backend.name}):`));
+    console.log(chalk.green(`\nInkwell hooks ${result} (${backend.name}):`));
     const events = backend.events;
     if (events.preCompact)
       console.log(

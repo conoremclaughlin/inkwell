@@ -25,6 +25,7 @@
 import { existsSync, lstatSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { readCodexStaticHeaderNames } from './codex-http-headers.js';
+import { readCodexConfig } from './mcp-config-sync.js';
 
 export const STUDIO_CHECK_IDS = [
   'mcp-json',
@@ -308,21 +309,35 @@ export function auditStudio(worktreePath: string, options: { linked: boolean }):
 
   // .codex/config.toml — the MCP section `ink mcp sync` writes and the
   // hooks table `ink hooks install --backend codex` writes.
+  // Read by what its keys resolve to, not by how a header is spelled: a
+  // table defined twice in any spelling is a parse error, and Codex refuses
+  // to start at all (lumen-alpha, 2026-09-29, #701).
   const codex = readText(join(worktreePath, '.codex', 'config.toml'));
-  const codexMcp = !!codex && /^\[mcp_servers\.inkwell\]\s*$/m.test(codex);
+  const codexReading = codex === null ? undefined : readCodexConfig(codex);
   const codexRouting = !!codex && codexBakesRouting(codex);
   add(
     'codex-mcp',
     '.codex/config.toml inkwell MCP section',
     true,
-    codexMcp && !codexRouting,
-    !codexMcp
-      ? codex
-        ? 'no [mcp_servers.inkwell]'
-        : 'missing'
-      : codexRouting
-        ? CODEX_ROUTING_DETAIL
-        : 'inkwell server configured'
+    !!codexReading &&
+      codexReading.unreadableLine === undefined &&
+      codexReading.redefined.length === 0 &&
+      codexReading.definesInkwell &&
+      !codexReading.inkwellOutsideBlock &&
+      !codexRouting,
+    !codexReading
+      ? 'missing'
+      : codexReading.unreadableLine !== undefined
+        ? `could not be read at line ${codexReading.unreadableLine}`
+        : codexReading.redefined.length > 0
+          ? `defines [${codexReading.redefined.join('], [')}] more than once, which Codex cannot parse; run \`ink mcp sync\``
+          : !codexReading.definesInkwell
+            ? 'no [mcp_servers.inkwell]'
+            : codexReading.inkwellOutsideBlock
+              ? "defines [mcp_servers.inkwell] outside ink's managed block, where `ink mcp sync` cannot update it; remove that definition, then run `ink mcp sync`"
+              : codexRouting
+                ? CODEX_ROUTING_DETAIL
+                : 'inkwell server configured'
   );
   const codexCommands = codex
     ? codex
