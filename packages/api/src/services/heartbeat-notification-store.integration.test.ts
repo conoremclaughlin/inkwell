@@ -17,15 +17,17 @@
  *
  * So these ask the schema, not a mock.
  *
- * Requires .env.local with SUPABASE_URL + SUPABASE_SECRET_KEY.
- * Skipped automatically when credentials are unavailable.
+ * ISOLATED STACK ONLY. This writes a user, a reminder and notices, so it runs
+ * only under the isolated integration-DB harness (yarn test:integration:db:local,
+ * which is also what CI runs); without INTEGRATION_SUPABASE_WORKDIR it is
+ * skipped. It used to load .env.local, which points at the shared local
+ * database the main server uses, and insert an active reminder due at once,
+ * which that server's heartbeat could pick up (Lumen, PR #723). The fixture
+ * reminder is now completed and due in 2099 as well.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
 import { randomUUID } from 'crypto';
 import type { Database } from '../data/supabase/types';
 import {
@@ -41,18 +43,10 @@ import {
  */
 const MID_OUTAGE: EpisodeBoundary = { kind: 'none' };
 
-const projectRoot = resolve(__dirname, '../../../../');
-const envLocalPath = resolve(projectRoot, '.env.local');
-if (existsSync(envLocalPath)) {
-  const parsed = dotenv.parse(readFileSync(envLocalPath));
-  for (const [key, value] of Object.entries(parsed)) {
-    if (!process.env[key]) process.env[key] = value;
-  }
-}
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
-const available = !!(SUPABASE_URL && SUPABASE_KEY);
+const isolatedHarness = !!process.env.INTEGRATION_SUPABASE_WORKDIR;
+const available = isolatedHarness && !!(SUPABASE_URL && SUPABASE_KEY);
 
 const d = available ? describe : describe.skip;
 
@@ -148,8 +142,9 @@ d('heartbeat notification store — real schema', () => {
       title: 'notification store integration fixture',
       delivery_channel: 'telegram',
       delivery_target: 'chat-1',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      // Never runnable: the notices only need the row for their foreign key.
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
   });
 
@@ -210,8 +205,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'one outage keeps one key',
       delivery_channel: 'telegram',
       delivery_target: 'chat-6',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     await store.claimNotice({
@@ -256,8 +251,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'owed all-clear with no recovery row',
       delivery_channel: 'telegram',
       delivery_target: 'chat-2',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const key = {
@@ -297,8 +292,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'undelivered outage owes nothing',
       delivery_channel: 'telegram',
       delivery_target: 'chat-3',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const key = {
@@ -451,8 +446,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'failed close must not suppress the next outage',
       delivery_channel: 'telegram',
       delivery_target: 'chat-4',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const base = {
@@ -503,8 +498,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'lost outage acknowledgement still owes an all-clear',
       delivery_channel: 'telegram',
       delivery_target: 'chat-5',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const base = {
@@ -564,8 +559,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'an unreadable acknowledgement is not a negative one',
       delivery_channel: 'telegram',
       delivery_target: 'chat-11',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const base = {
@@ -611,8 +606,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'pending all-clear with no outage row',
       delivery_channel: 'telegram',
       delivery_target: 'chat-7',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const recoveryKey = {
@@ -663,8 +658,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'closed episode owes nothing further',
       delivery_channel: 'telegram',
       delivery_target: 'chat-8',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const base = {
@@ -715,8 +710,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'an attempted all-clear ends the episode',
       delivery_channel: 'telegram',
       delivery_target: 'chat-9',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const base = {
@@ -768,8 +763,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'a newer silent outage must not hide an older debt',
       delivery_channel: 'telegram',
       delivery_target: 'chat-10',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const older = {
@@ -828,8 +823,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'a healthy beat ends an episode with no recovery row',
       delivery_channel: 'telegram',
       delivery_target: 'chat-11',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const base = {
@@ -907,8 +902,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'a live episode survives repeated boundary checks',
       delivery_channel: 'telegram',
       delivery_target: 'chat-13',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     const base = {
@@ -967,8 +962,8 @@ d('heartbeat notification store — real schema', () => {
       title: 'a bounded scan must keep moving',
       delivery_channel: 'telegram',
       delivery_target: 'chat-12',
-      next_run_at: new Date().toISOString(),
-      status: 'active',
+      next_run_at: '2099-01-01T00:00:00Z',
+      status: 'completed',
     } as never);
 
     // The debt: a pending all-clear whose outage row was never written.

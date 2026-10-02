@@ -7,32 +7,25 @@
  * all-clear never comes ahead of its outage, and ineligible rows cannot fill
  * the batch ahead of a due one.
  *
- * Requires .env.local with SUPABASE_URL + SUPABASE_SECRET_KEY, and migration
- * 20261002190637_reminder_quiet_hours_switch applied. Skipped automatically
- * when credentials are unavailable.
+ * ISOLATED STACK ONLY. These write users, reminders and notices, so they run
+ * only under the isolated integration-DB harness (yarn test:integration:db:local,
+ * which is also what CI runs). That harness exports INTEGRATION_SUPABASE_WORKDIR
+ * and the isolated stack's SUPABASE_URL; nothing here reads .env.local, which
+ * points at the shared local database the main server uses. Without the
+ * harness the suite is skipped. As a second line of defence, the fixture
+ * reminders are completed and due in 2099, so no scheduler could ever run them.
  */
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
 import { randomUUID } from 'crypto';
 import type { Database } from '../data/supabase/types';
 import { createHeartbeatNotificationStore } from './heartbeat-notification-store';
 
-const projectRoot = resolve(__dirname, '../../../../');
-const envLocalPath = resolve(projectRoot, '.env.local');
-if (existsSync(envLocalPath)) {
-  const parsed = dotenv.parse(readFileSync(envLocalPath));
-  for (const [key, value] of Object.entries(parsed)) {
-    if (!process.env[key]) process.env[key] = value;
-  }
-}
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
-const available = !!(SUPABASE_URL && SUPABASE_KEY);
+const isolatedHarness = !!process.env.INTEGRATION_SUPABASE_WORKDIR;
+const available = isolatedHarness && !!(SUPABASE_URL && SUPABASE_KEY);
 
 const d = available ? describe : describe.skip;
 
@@ -96,8 +89,9 @@ d('held notices — real schema', () => {
         title: 'held notices integration fixture',
         delivery_channel: 'telegram',
         delivery_target: 'chat-1',
-        next_run_at: new Date().toISOString(),
-        status: 'active',
+        // Never runnable: the notices only need the row for their foreign key.
+        next_run_at: '2099-01-01T00:00:00Z',
+        status: 'completed',
       } as never);
     }
   });
