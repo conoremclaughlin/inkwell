@@ -363,6 +363,27 @@ d('reconcileInterruptedDispatches (real DB)', () => {
     expect((await metadataOf(taskId)).graphDispatchedAt).toBeUndefined();
   });
 
+  it.each([false, true])(
+    'review regression: an old open CLI turn vetoes recovery (ended=%s)',
+    async (ended) => {
+      const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_old_open_turn');
+      await stamp(taskId, {}, new Date(Date.now() - 15 * 60_000));
+      await interruptedSession(threadKey, reviewer, new Date(Date.now() - 14 * 60_000));
+      await newSession({
+        active_thread_key: threadKey,
+        sb_id: reviewer,
+        ended_at: ended ? new Date().toISOString() : null,
+        status: ended ? 'completed' : 'resumable',
+        lifecycle: ended ? 'completed' : 'idle',
+        cli_attached: false,
+        cli_poll_at: null,
+        cli_turn_at: new Date(Date.now() - 11 * 60_000).toISOString(),
+      });
+      await executor.reconcileInterruptedDispatches(LATER());
+      expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
+    }
+  );
+
   /**
    * BLOCKER 2 (Lumen, PR #559). The original cleared the key with a
    * read-modify-write on the whole metadata blob, so a dispatch landing
