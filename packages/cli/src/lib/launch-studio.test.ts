@@ -172,7 +172,12 @@ describe('completeStudioForLaunch', () => {
     expect(result.owner).toBe('lumen');
     expect(result.missingBefore).toContain('identity');
     expect(d.lookupStudio).toHaveBeenCalledWith(studio);
-    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'lumen', studioId: STUDIO_ID });
+    // This row carries no profile, so no permissions are written.
+    expect(d.runInit).toHaveBeenCalledWith(studio, {
+      agent: 'lumen',
+      studioId: STUDIO_ID,
+      permissions: false,
+    });
   });
 
   it('a worktree the server confirms has no row takes the launching slug and registers as ink init would', async () => {
@@ -181,7 +186,9 @@ describe('completeStudioForLaunch', () => {
     });
     const result = await completeStudioForLaunch(studio, 'wren', d);
     expect(result.owner).toBe('wren');
-    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'wren' });
+    // No row, no profile: in a detached PR checkout a default would be kept
+    // by every later run (review 4177f7fe, P2 1).
+    expect(d.runInit).toHaveBeenCalledWith(studio, { agent: 'wren', permissions: false });
   });
 
   it('a worktree whose owner the server could not name is completed with studio setup off', async () => {

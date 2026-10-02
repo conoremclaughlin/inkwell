@@ -27,6 +27,7 @@ import chalk from 'chalk';
 import { execFileSync } from 'child_process';
 import { basename, dirname } from 'path';
 import type { StudioPermissionProfile } from '@inklabs/shared';
+import { lookupStudioByPath, type StudioLookup } from '../lib/studio-lookup.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { readIdentityJson, resolveSlug } from '../backends/identity.js';
 import { lookupAgentBackend } from '../backends/agent-backend.js';
@@ -117,6 +118,12 @@ export interface InitDeps {
    * unknown, unrunnable or ambiguous; nothing is recorded then.
    */
   lookupBackend?: (sbSlug: string) => Promise<string | undefined>;
+  /**
+   * The studio's row by path (default: get_studio through this CLI's
+   * credentials), for a linked worktree completed with no
+   * --permission-profile: only a row names a profile, and none is none.
+   */
+  lookupStudio?: (worktreePath: string) => Promise<StudioLookup>;
 }
 
 /**
@@ -185,6 +192,20 @@ export async function runInit(
     ...(options.inheritClaudePermissions === true ? { inheritPermissions: true } : {}),
     ...(options.permissionProfile ? { permissionProfile: options.permissionProfile } : {}),
     ...(options.permissions === false ? { permissions: false } : {}),
+    // The trusted owner is the one the caller names; the server always does.
+    ...(options.agent ? { permissionOwner: options.agent } : {}),
+    // A manual init with no profile asks the server for the row; a server-run
+    // init always says which profile, or --no-permissions, and never asks.
+    ...(placement.linked && !options.permissionProfile && options.permissions !== false
+      ? {
+          lookupPermissions: async () => {
+            const lookup = await (deps.lookupStudio ?? lookupStudioByPath)(target);
+            return lookup.status === 'found'
+              ? { profile: lookup.row.permissionProfile, owner: lookup.row.sbSlug }
+              : undefined;
+          },
+        }
+      : {}),
     ...(options.force ? { force: true } : {}),
     ...(deps.register ? { register: deps.register } : {}),
     ...(deps.syncSkills ? { syncSkills: deps.syncSkills } : {}),

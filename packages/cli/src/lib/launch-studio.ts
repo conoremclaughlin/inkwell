@@ -29,32 +29,21 @@
  */
 
 import chalk from 'chalk';
-import {
-  auditStudio,
-  studioPermissionProfile,
-  type StudioCheckId,
-  type StudioPermissionProfile,
-} from '@inklabs/shared';
+import { auditStudio, type StudioCheckId } from '@inklabs/shared';
 import { detectWorktree, runInit, type WorktreePlacement } from '../commands/init.js';
 import type { CompleteStudioReport, StepResult } from './studio-complete.js';
-import { callInkTool } from './ink-mcp.js';
+import { lookupStudioByPath, type StudioLookup, type StudioRowSummary } from './studio-lookup.js';
 import { sbDebugLog } from './sb-debug.js';
 
-export interface LaunchStudioRow {
-  id?: string;
-  sbSlug?: string;
-  /** From the row's checkout record (`studioPermissionProfile`), never from the worktree. */
-  permissionProfile?: StudioPermissionProfile;
-}
+/** The studio row a launch completes against (see studio-lookup.ts). */
+export type LaunchStudioRow = StudioRowSummary;
 
 /**
  * What the server said about the worktree: a row, confirmed none, or no
- * answer. Only the first two license an identity write.
+ * answer. Only the first two license an identity write, and only the first
+ * names a permission profile.
  */
-export type LaunchStudioLookup =
-  | { status: 'found'; row: LaunchStudioRow }
-  | { status: 'none' }
-  | { status: 'unknown'; reason: string };
+export type LaunchStudioLookup = StudioLookup;
 
 export interface LaunchStudioDeps {
   placement?: (cwd: string) => WorktreePlacement;
@@ -71,37 +60,6 @@ export interface LaunchStudioResult {
   ownerUnknown?: string;
   missingBefore?: StudioCheckId[];
   report?: CompleteStudioReport;
-}
-
-/** The server's own words for a worktree it has no row for. */
-const NOT_FOUND = /studio not found/i;
-
-/**
- * The launcher's own lookup: get_studio by path, bounded. A "Studio not
- * found" from the server is the one answer that means none; every other
- * failure is no answer at all.
- */
-async function lookupStudioByPath(worktreePath: string): Promise<LaunchStudioLookup> {
-  try {
-    const result = await callInkTool<{
-      studio?: { id?: string; sbSlug?: string; branch?: string; metadata?: unknown };
-    }>('get_studio', { path: worktreePath }, { timeoutMs: 3000, idempotent: true });
-    if (result?.studio?.id) {
-      return {
-        status: 'found',
-        row: {
-          id: result.studio.id,
-          ...(result.studio.sbSlug ? { sbSlug: result.studio.sbSlug } : {}),
-          permissionProfile: studioPermissionProfile(result.studio),
-        },
-      };
-    }
-    return { status: 'unknown', reason: 'the server returned no studio and no error' };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (NOT_FOUND.test(message)) return { status: 'none' };
-    return { status: 'unknown', reason: message };
-  }
 }
 
 /**
@@ -134,12 +92,15 @@ export async function completeStudioForLaunch(
     return { ran: true, ownerUnknown: lookup.reason, missingBefore: audit.missing, report };
   }
   const owner = (lookup.status === 'found' && lookup.row.sbSlug) || launchSlug;
+  // Only a row names a profile. A worktree the server confirms has no row
+  // gets identity and registration as ink init would, and no permissions:
+  // in a detached PR checkout a default would be kept by every later run
+  // (review 4177f7fe, P2 1).
+  const profile = lookup.status === 'found' ? lookup.row.permissionProfile : undefined;
   const report = await init(placement.toplevel, {
     agent: owner,
     ...(lookup.status === 'found' && lookup.row.id ? { studioId: lookup.row.id } : {}),
-    ...(lookup.status === 'found' && lookup.row.permissionProfile
-      ? { permissionProfile: lookup.row.permissionProfile }
-      : {}),
+    ...(profile ? { permissionProfile: profile } : { permissions: false }),
   });
   return { ran: true, owner, missingBefore: audit.missing, report };
 }

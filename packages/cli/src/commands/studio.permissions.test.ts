@@ -200,13 +200,17 @@ describe('create, end to end: the .claude copy plus the completion routine', () 
 });
 
 describe('setup, end to end: all three studios get the builder profile unless asked', () => {
-  it('no flag: review, build and product studios each get the builder profile', async () => {
+  it('no flag: the review studio (template reviewer) is a reviewer; build and product are builders', async () => {
     await studioCommands.setupStudios('wren', {}, deps());
-    for (const suffix of ['review', 'build', 'product']) {
+    for (const [suffix, profile] of [
+      ['review', 'reviewer'],
+      ['build', 'builder'],
+      ['product', 'builder'],
+    ] as const) {
       const settings = readJson(
         join(root, `repo--wren-${suffix}`, '.claude', 'settings.local.json')
       );
-      expect(settings.permissions, suffix).toEqual(shared.studioPermissionRules('builder', 'wren'));
+      expect(settings.permissions, suffix).toEqual(shared.studioPermissionRules(profile, 'wren'));
     }
   });
 

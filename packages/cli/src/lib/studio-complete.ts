@@ -86,11 +86,26 @@ export interface CompleteStudioOptions {
    */
   inheritPermissions?: boolean;
   /**
-   * The profile written into a settings file that has no permissions yet
-   * (default `builder`). The caller takes it from the studio's server-side
-   * record (`studioPermissionProfile`), never from the checkout.
+   * The profile written into a settings file that has no permissions yet.
+   * The caller takes it from the studio's server-side record
+   * (`studioPermissionProfile`) or its own trusted input, never from the
+   * checkout. Absent, and with no `lookupPermissions` to supply one, no
+   * permissions are written: there is no default.
    */
   permissionProfile?: StudioPermissionProfile;
+  /**
+   * Whose scratch paths the profile names (default `sbSlug`, the caller's
+   * own trusted input). Never read from identity.json.
+   */
+  permissionOwner?: string;
+  /**
+   * Looks the studio's row up when no profile was given (a manual
+   * `ink init`); consulted only when permissions are about to be written.
+   * Undefined, or a lookup that fails, is no profile.
+   */
+  lookupPermissions?: () => Promise<
+    { profile?: StudioPermissionProfile; owner?: string } | undefined
+  >;
   /**
    * Write Claude permissions at all (default true). Off when the caller
    * could not read the studio's record, so the profile, and the owner whose
@@ -550,26 +565,54 @@ export async function completeStudio(
       options.inheritPermissions === true && options.mainRoot
         ? readJson(join(options.mainRoot, '.claude', 'settings.local.json'))?.permissions
         : undefined;
-    const profile = options.permissionProfile ?? 'builder';
-    // The scratch paths name the studio's owner, which identity.json keeps
-    // even when the caller is another SB.
-    const owner = typeof identity?.sbSlug === 'string' ? identity.sbSlug : options.sbSlug;
-    const next = {
-      ...settings,
-      permissions: isPlainObject(inherited) ? inherited : studioPermissionRules(profile, owner),
-      enableAllProjectMcpServers: settings.enableAllProjectMcpServers ?? true,
-    };
-    mkdirSync(claudeDir, { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify(next, null, 2) + '\n');
-    steps.push({
-      label: 'permissions',
-      status: 'created',
-      detail: isPlainObject(inherited)
-        ? 'copied from the main worktree'
-        : options.inheritPermissions === true
-          ? `${profile} profile (the main worktree had no permissions to copy)`
-          : `${profile} profile`,
-    });
+    // The profile and its owner come from the caller or the studio's row,
+    // never from the checkout: identity.json is not quarantined in a review
+    // checkout, so a PR could name any owner there (review 4177f7fe, P3).
+    let profile = options.permissionProfile;
+    let owner = options.permissionOwner ?? options.sbSlug;
+    if (!isPlainObject(inherited) && !profile && options.lookupPermissions) {
+      const found = await options.lookupPermissions().catch(() => undefined);
+      profile = found?.profile;
+      if (found?.owner) owner = found.owner;
+    }
+    let rules: ReturnType<typeof studioPermissionRules> | undefined;
+    let refused: string | undefined;
+    if (!isPlainObject(inherited) && profile) {
+      try {
+        rules = studioPermissionRules(profile, owner);
+      } catch (error) {
+        refused = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (!isPlainObject(inherited) && !profile) {
+      // No profile is no permissions: a default written here would be kept
+      // by every later run (review 4177f7fe, P2 1).
+      steps.push({
+        label: 'permissions',
+        status: 'skipped',
+        detail:
+          'no permission profile: the studio has no row to read one from (pass --permission-profile, or let the server complete it)',
+      });
+    } else if (refused) {
+      steps.push({ label: 'permissions', status: 'failed', detail: refused });
+    } else {
+      const next = {
+        ...settings,
+        permissions: isPlainObject(inherited) ? inherited : rules,
+        enableAllProjectMcpServers: settings.enableAllProjectMcpServers ?? true,
+      };
+      mkdirSync(claudeDir, { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify(next, null, 2) + '\n');
+      steps.push({
+        label: 'permissions',
+        status: 'created',
+        detail: isPlainObject(inherited)
+          ? 'copied from the main worktree'
+          : options.inheritPermissions === true
+            ? `${profile} profile (the main worktree had no permissions to copy)`
+            : `${profile} profile`,
+      });
+    }
   }
 
   // Hooks and backend config: every backend, every studio. The Claude

@@ -78,6 +78,8 @@ afterEach(() => {
 
 const baseOptions = () => ({
   sbSlug: 'wren',
+  // Every creator names the profile; there is no default (review 4177f7fe).
+  permissionProfile: 'builder' as const,
   mainRoot: main,
   studioName: 'alpha',
   branch: 'wren/feat/alpha',

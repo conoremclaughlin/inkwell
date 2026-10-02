@@ -353,6 +353,8 @@ describe('Config directory copying', () => {
 
     const report = await completeStudio(wsPath, {
       sbSlug: 'wren',
+      // A creator names the profile; there is no default.
+      permissionProfile: 'builder',
       mainRoot: realRepo,
       studioName: 'complete',
       branch: 'wren/studio/complete',

@@ -61,6 +61,8 @@ afterEach(() => {
 
 const options = (extra: Record<string, unknown> = {}) => ({
   sbSlug: 'wren',
+  // What every creator passes; the no-profile cases override it.
+  permissionProfile: 'builder',
   mainRoot: main,
   studioName: 'alpha',
   branch: 'wren/feat/alpha',
@@ -211,14 +213,25 @@ describe('the profile is the caller’s, from the studio record, never the check
     expect(readSettings().permissions).toEqual(profile('reviewer'));
   });
 
-  it("the scratch paths name the studio's owner from identity.json, not the calling SB", async () => {
+  it("the scratch paths name the caller's owner, never identity.json (a PR could plant one)", async () => {
     mkdirSync(join(studio, '.ink'), { recursive: true });
     writeFileSync(
       join(studio, '.ink', 'identity.json'),
       JSON.stringify({ sbSlug: 'lumen', studioId: STUDIO_ID })
     );
     await completeStudio(studio, options({ sbSlug: 'wren' }));
+    expect(readSettings().permissions).toEqual(profile('builder', 'wren'));
+  });
+
+  it('permissionOwner names the owner when the caller is another SB', async () => {
+    await completeStudio(studio, options({ sbSlug: 'myra', permissionOwner: 'lumen' }));
     expect(readSettings().permissions).toEqual(profile('builder', 'lumen'));
+  });
+
+  it('an owner that would widen a scratch rule fails the step and writes nothing', async () => {
+    const report = await completeStudio(studio, options({ permissionOwner: '*' }));
+    expect(step(report.steps, 'permissions')?.status).toBe('failed');
+    expect(existsSync(settingsPath()) ? readSettings().permissions : undefined).toBeUndefined();
   });
 
   it('permissions: false writes none, says why, and the checklist names the gap', async () => {
@@ -226,5 +239,45 @@ describe('the profile is the caller’s, from the studio record, never the check
     expect(existsSync(settingsPath()) ? readSettings().permissions : undefined).toBeUndefined();
     expect(step(report.steps, 'permissions')?.status).toBe('skipped');
     expect(report.audit.missing).toEqual(['claude-permissions']);
+  });
+});
+
+describe('no profile is no permissions, never a default builder (review 4177f7fe, P2 1)', () => {
+  it('no profile and no lookup: nothing written, the step says why', async () => {
+    const report = await completeStudio(studio, options({ permissionProfile: undefined }));
+    expect(existsSync(settingsPath()) ? readSettings().permissions : undefined).toBeUndefined();
+    expect(step(report.steps, 'permissions')).toMatchObject({ status: 'skipped' });
+    expect(step(report.steps, 'permissions')?.detail).toContain('no permission profile');
+  });
+
+  it("a lookup that finds the row supplies the profile and the row's owner", async () => {
+    const lookupPermissions = vi.fn(async () => ({ profile: 'reviewer' as const, owner: 'lumen' }));
+    await completeStudio(studio, options({ permissionProfile: undefined, lookupPermissions }));
+    expect(lookupPermissions).toHaveBeenCalledTimes(1);
+    expect(readSettings().permissions).toEqual(profile('reviewer', 'lumen'));
+  });
+
+  it('a lookup that finds no row, or fails, is no profile', async () => {
+    for (const lookupPermissions of [
+      vi.fn(async () => undefined),
+      vi.fn(async () => {
+        throw new Error('server down');
+      }),
+    ]) {
+      const report = await completeStudio(
+        studio,
+        options({ permissionProfile: undefined, lookupPermissions })
+      );
+      expect(step(report.steps, 'permissions')?.status).toBe('skipped');
+    }
+    expect(existsSync(settingsPath()) ? readSettings().permissions : undefined).toBeUndefined();
+  });
+
+  it('the lookup is not paid when a profile was given or the policy is authored', async () => {
+    const lookupPermissions = vi.fn(async () => ({ profile: 'reviewer' as const }));
+    await completeStudio(studio, options({ lookupPermissions }));
+    writeSettings(JSON.stringify({ permissions: {} }));
+    await completeStudio(studio, options({ permissionProfile: undefined, lookupPermissions }));
+    expect(lookupPermissions).not.toHaveBeenCalled();
   });
 });

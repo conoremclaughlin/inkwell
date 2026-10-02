@@ -26,6 +26,7 @@ import * as shared from '@inklabs/shared';
 import { Command } from 'commander';
 import { detectWorktree, registerInitCommand, runInit, studioNameFromPath } from './init.js';
 import type { StepResult } from '../lib/studio-complete.js';
+import type { StudioLookup } from '../lib/studio-lookup.js';
 
 let root: string;
 let main: string;
@@ -52,6 +53,13 @@ const stubs = (backend?: string) => ({
   // The owner's backend lookup reaches the server (cached) by default; a
   // test never does.
   lookupBackend: vi.fn(async () => backend),
+  // So does the studio row lookup a manual init makes for its profile.
+  lookupStudio: vi.fn(
+    async (): Promise<StudioLookup> => ({
+      status: 'found',
+      row: { id: STUDIO_ID, sbSlug: 'wren', permissionProfile: 'builder' },
+    })
+  ),
 });
 
 beforeEach(() => {
@@ -322,6 +330,46 @@ describe('runInit permission options (design v3 items 3 and 5)', () => {
     const settings = readJson(join(studio, '.claude', 'settings.local.json'));
     expect(settings.permissions).toBeUndefined();
     expect(report.audit.missing).toEqual(['claude-permissions']);
+  });
+
+  it("a manual init with no profile reads the row's profile and owner by path", async () => {
+    const deps = {
+      ...stubs(),
+      lookupStudio: vi.fn(
+        async (): Promise<StudioLookup> => ({
+          status: 'found',
+          row: { id: STUDIO_ID, sbSlug: 'lumen', permissionProfile: 'reviewer' },
+        })
+      ),
+    };
+    await runInit(studio, {}, deps);
+    expect(deps.lookupStudio).toHaveBeenCalledWith(studio);
+    expect(readJson(join(studio, '.claude', 'settings.local.json')).permissions).toEqual(
+      shared.studioPermissionRules('reviewer', 'lumen')
+    );
+  });
+
+  it('a manual init where the server has no row, or no answer, writes no permissions', async () => {
+    for (const answer of [
+      { status: 'none' } as const,
+      { status: 'unknown', reason: 'offline' } as const,
+    ]) {
+      rmSync(join(studio, '.claude'), { recursive: true, force: true });
+      const deps = { ...stubs(), lookupStudio: vi.fn(async (): Promise<StudioLookup> => answer) };
+      await runInit(studio, { agent: 'wren' }, deps);
+      expect(
+        readJson(join(studio, '.claude', 'settings.local.json')).permissions,
+        answer.status
+      ).toBeUndefined();
+    }
+  });
+
+  it('an explicit profile, or --no-permissions, never asks the server', async () => {
+    const deps = stubs();
+    await runInit(studio, { agent: 'wren', permissionProfile: 'builder' }, deps);
+    rmSync(join(studio, '.claude'), { recursive: true, force: true });
+    await runInit(studio, { agent: 'wren', permissions: false }, deps);
+    expect(deps.lookupStudio).not.toHaveBeenCalled();
   });
 });
 

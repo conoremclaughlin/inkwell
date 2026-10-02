@@ -951,6 +951,11 @@ async function createStudioInner(
     mainRoot: copySourceRoot,
     rootSync: true,
     inheritPermissions: options.inheritClaudePermissions === true,
+    // The creator's own input names the profile: this studio is on a branch
+    // of its own, and its row records the role template, so a 'reviewer'
+    // template is a reviewer (review 4177f7fe, decision 2).
+    permissionProfile: options.template === 'reviewer' ? 'reviewer' : 'builder',
+    permissionOwner: sbSlug,
     studioSetup: true,
     studioName: name,
     ...(options.purpose ? { purpose: options.purpose } : {}),
