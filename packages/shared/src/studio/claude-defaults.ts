@@ -204,10 +204,19 @@ const PUSH_PREFIXES = ['git push', 'git -C * push'] as const;
  *   - force: `--force`, `--force-with-lease`, `-f`, and a `+` refspec;
  *   - the default branch as the destination: `main`, `HEAD:main`, `:main`,
  *     `refs/heads/main`;
- *   - `--no-verify`, which skips the pre-push hook.
- * Other spellings get through (`-uf`, `git -c … push`, a script, a
- * `--git-dir` push), and so does a push to some other branch: a deny
- * cannot say "any branch but this one". Branch ownership is not enforced
+ *   - `--no-verify`, which skips the pre-push hook;
+ *   - pushes that rewrite or delete refs wholesale: `--mirror` (force-
+ *     updates and deletes every ref, main included), `--all`, `--prune`,
+ *     and `--delete` / `-d`.
+ * Other spellings get through: `-uf`, `git -c … push`, a script, a
+ * `--git-dir` push, and git's unique long-option prefixes (`--no-veri`,
+ * `--mirr`, `--forc`), which no glob can enumerate. So does a push to some
+ * other branch: a deny cannot say "any branch but this one". And the
+ * `git -C <dir> push` forms over-match: the `*` standing for the directory
+ * also spans spaces, so `git -C . commit -m "do not push --force"` is
+ * refused too. That is kept on purpose, because SBs push with `git -C` routinely,
+ * and the force backstop matters more there than the rare false refusal.
+ * Branch ownership is not enforced
  * here or by the pre-push hook. The hook (`.husky/pre-push` →
  * `scripts/check-push.sh`, shared by every worktree through
  * `core.hooksPath`) scans content: passing it means nothing matched, not
@@ -229,8 +238,15 @@ export const STUDIO_PUSH_RULES: StudioRuleSet = {
     `Bash(${push} * main *)`,
     `Bash(${push} * *:main)`,
     `Bash(${push} * *:main *)`,
-    `Bash(${push} * *refs/heads/main*)`,
+    `Bash(${push} * *refs/heads/main)`,
+    `Bash(${push} * *refs/heads/main *)`,
     `Bash(${push} *--no-verify*)`,
+    `Bash(${push} *--mirror*)`,
+    `Bash(${push} *--all*)`,
+    `Bash(${push} *--prune*)`,
+    `Bash(${push} *--delete*)`,
+    `Bash(${push} -d *)`,
+    `Bash(${push} * -d *)`,
   ]),
 };
 
@@ -254,13 +270,28 @@ export interface ClaudePermissionRules {
 }
 
 /**
+ * An SB slug that is safe to put in a path rule: lowercase letters, digits,
+ * `-` and `_`, starting with a letter or digit. Anything else (`*`, `/`,
+ * `..`) would widen the rule beyond the SB's own directories.
+ */
+export const SB_SLUG_FOR_RULES = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/**
  * The SB's own scratch and screenshot directories, which every studio
- * session may write. `~/` is Claude Code's home-relative anchor, so the
- * rule names the directory without baking a home path into the file.
+ * session may read and write. `~/` is Claude Code's home-relative anchor,
+ * so the rule names the directory without baking a home path into the
+ * file. `Edit` covers every built-in tool that writes a file; a `Write`
+ * path rule is accepted but never consulted, and warns at startup (Claude
+ * Code docs, permissions, "Read and Edit"). `Read` is needed because
+ * `Read(*)` is anchored at the working directory. Throws on a slug that
+ * would widen the rule.
  */
 export function scratchPathRules(sbSlug: string): string[] {
+  if (!SB_SLUG_FOR_RULES.test(sbSlug)) {
+    throw new Error(`not a slug that can name a scratch path: ${JSON.stringify(sbSlug)}`);
+  }
   const dirs = [`~/.ink/files/${sbSlug}-scratch/**`, `~/.ink/files/${sbSlug}-screenshots/**`];
-  return dirs.flatMap((dir) => [`Edit(${dir})`, `Write(${dir})`]);
+  return dirs.flatMap((dir) => [`Read(${dir})`, `Edit(${dir})`]);
 }
 
 /**
@@ -279,7 +310,6 @@ export const STUDIO_BUILDER_RULES: StudioRuleSet = {
   allow: [
     'Read(*)',
     'Edit(/**)',
-    'Write(/**)',
     'Bash(*)',
     'WebFetch(*)',
     'WebSearch',
@@ -345,34 +375,63 @@ export function studioPermissionRules(
   };
 }
 
+/** The studio record fields the profile is read from. */
+export interface StudioProfileRecord {
+  branch?: string | null;
+  metadata?: unknown;
+  roleTemplate?: string | null;
+  threadKey?: string | null;
+}
+
+/** `pr:<n>` or `<project>:pr:<n>`, the thread shapes a PR review runs on. */
+function isPullRequestThreadKey(threadKey: string | null | undefined): boolean {
+  if (typeof threadKey !== 'string') return false;
+  const segments = threadKey.split(':');
+  if (segments.length < 2 || segments.length > 3) return false;
+  return segments[segments.length - 2] === 'pr' && /^\d+$/.test(segments[segments.length - 1]);
+}
+
+const PULL_REQUEST_REF = /^origin\/pr\/\d+$/;
+
 /**
  * Which profile a studio gets, from its server-side record only: never
- * from anything in the checkout, which may be the code under review. A
- * checkout the server recorded as detached (an overflow studio, a PR
- * review) has no branch of its own to commit to, so it gets the reviewer
- * profile; every other studio is a builder. The record carries the fact
- * twice, as the `detached:<ref>` branch sentinel and as the checkout pin in
- * `metadata.checkout`; either one is enough.
+ * from anything in the checkout, which may be the code under review.
+ *
+ * A reviewer is a studio whose row says so (`roleTemplate: 'reviewer'`),
+ * or a PR-review checkout: detached, and pinned to a pull request's head
+ * (`metadata.checkout.ref` or the `detached:<ref>` branch sentinel naming
+ * `origin/pr/<n>`) or created for a PR thread (`threadKey`), which also
+ * covers a review whose PR fetch failed and fell back to the base branch.
+ * Every other studio is a builder, an ordinary overflow studio detached at
+ * the base included: it does write work, and the reviewer profile would
+ * leave it unable to edit.
+ *
+ * No record means no profile (undefined): callers write no permissions
+ * rather than guess, because a guessed profile is kept by every later run.
  */
 export function studioPermissionProfile(
-  record: { branch?: string | null; metadata?: unknown } | null | undefined
-): StudioPermissionProfile {
-  if (!record) return 'builder';
-  if (typeof record.branch === 'string' && record.branch.startsWith('detached:')) {
-    return 'reviewer';
-  }
-  const metadata = record.metadata;
-  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
-    const checkout = (metadata as Record<string, unknown>).checkout;
-    if (
-      checkout &&
-      typeof checkout === 'object' &&
-      (checkout as Record<string, unknown>).mode === 'detached'
-    ) {
-      return 'reviewer';
-    }
-  }
-  return 'builder';
+  record: StudioProfileRecord | null | undefined
+): StudioPermissionProfile | undefined {
+  if (!record) return undefined;
+  if (record.roleTemplate === 'reviewer') return 'reviewer';
+  const metadata =
+    record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
+      ? (record.metadata as Record<string, unknown>)
+      : {};
+  const checkout =
+    metadata.checkout && typeof metadata.checkout === 'object'
+      ? (metadata.checkout as Record<string, unknown>)
+      : null;
+  const sentinel =
+    typeof record.branch === 'string' && record.branch.startsWith('detached:')
+      ? record.branch.slice('detached:'.length)
+      : null;
+  const detached = checkout?.mode === 'detached' || sentinel !== null;
+  if (!detached) return 'builder';
+  const pinnedToPullRequest =
+    (typeof checkout?.ref === 'string' && PULL_REQUEST_REF.test(checkout.ref)) ||
+    (sentinel !== null && PULL_REQUEST_REF.test(sentinel));
+  return pinnedToPullRequest || isPullRequestThreadKey(record.threadKey) ? 'reviewer' : 'builder';
 }
 
 /**

@@ -5456,10 +5456,11 @@ This session will continue with a fresh context after compaction. Your identity,
           return row?.sbSlug ?? null;
         },
         // The permission profile comes from the row, never the checkout: a
-        // detached review checkout is a reviewer. No studio on the session is
-        // a confirmed builder; a failed read throws, and no permissions are
-        // written (design v3, item 5).
-        profile: async () => (rowId ? studioPermissionProfile(await readRow()) : 'builder'),
+        // PR-review checkout or a 'reviewer' row is a reviewer. No studio on
+        // the session, or a row that is gone, is no profile, and a failed
+        // read throws; either way no permissions are written rather than a
+        // guess (design v3 item 5; review 4177f7fe, P2 1).
+        profile: async () => (rowId ? studioPermissionProfile(await readRow()) : undefined),
       });
     } catch (err) {
       logger.debug('Studio checklist before spawn failed (non-fatal)', {

@@ -185,13 +185,44 @@ describe('the builder profile — composition', () => {
     expect(decide(builder(), bash('yarn workspace @inklabs/shared build'))).toBe('allow');
   });
 
+  it('denies the pushes that rewrite or delete refs wholesale: --mirror, --all, --prune, --delete, -d', () => {
+    for (const command of [
+      'git push --mirror origin',
+      'git push origin --mirror',
+      'git push --all origin',
+      'git push --prune origin',
+      `git push origin --delete ${ownBranch}`,
+      `git push -d origin ${ownBranch}`,
+      `git push origin -d ${ownBranch}`,
+      'git -C . push --mirror origin',
+    ]) {
+      expect(decide(builder(), bash(command)), command).toBe('deny');
+    }
+  });
+
+  it('refs/heads/main is matched exactly: a branch named main-something is not caught', () => {
+    expect(decide(builder(), bash('git push origin HEAD:refs/heads/main'))).toBe('deny');
+    expect(decide(builder(), bash('git push origin HEAD:refs/heads/main --tags'))).toBe('deny');
+    expect(decide(builder(), bash('git push origin HEAD:refs/heads/main-menu'))).toBe('allow');
+  });
+
   it('a spelling the rules do not name gets through: these are backstops, and the test says so', () => {
     // Pinned so a reader of the profile sees the limit measured, not implied.
     expect(decide(builder(), bash(`git -c push.default=current push --force`))).toBe('allow');
     expect(decide(builder(), bash(`git push -uf origin ${ownBranch}`))).toBe('allow');
+    // Git accepts any unique prefix of a long option; no glob enumerates them.
+    expect(decide(builder(), bash(`git push --no-veri origin ${ownBranch}`))).toBe('allow');
+    expect(decide(builder(), bash('git push --mirr origin'))).toBe('allow');
     // And branch ownership is not a rule at all: a deny cannot say "any
     // branch but this one", so another SB's branch is allowed by the lists.
     expect(decide(builder(), bash('git push origin lumen/feat/other'))).toBe('allow');
+  });
+
+  it('the git -C forms over-match, by design: the directory glob spans spaces', () => {
+    // Kept because SBs push with `git -C` routinely; documented in the source.
+    expect(decide(builder(), bash('git -C . commit -m "do not push --force"'))).toBe('deny');
+    // The plain spelling is not affected.
+    expect(decide(builder(), bash('git commit -m "do not push --force"'))).toBe('allow');
   });
 });
 
@@ -229,8 +260,8 @@ describe('the reviewer profile — composition', () => {
   it('runs tests, and edits only the scratch directories (Bash is the backstop caveat)', () => {
     expect(decide(reviewer(), bash('npx vitest run'))).toBe('allow');
     expect(reviewer().allow).not.toContain('Edit(/**)');
-    expect(reviewer().allow).not.toContain('Write(/**)');
     expect(reviewer().allow).toContain('Edit(~/.ink/files/wren-scratch/**)');
+    expect(reviewer().allow).toContain('Read(~/.ink/files/wren-scratch/**)');
   });
 });
 
@@ -270,21 +301,32 @@ describe('the profile lists', () => {
       expect.arrayContaining([
         'Read(*)',
         'Edit(/**)',
-        'Write(/**)',
         'Bash(*)',
         'WebFetch(*)',
         'WebSearch',
         'mcp__inkwell__*',
         'mcp__playwright__*',
+        'Read(~/.ink/files/lumen-scratch/**)',
         'Edit(~/.ink/files/lumen-scratch/**)',
-        'Write(~/.ink/files/lumen-scratch/**)',
+        'Read(~/.ink/files/lumen-screenshots/**)',
         'Edit(~/.ink/files/lumen-screenshots/**)',
-        'Write(~/.ink/files/lumen-screenshots/**)',
       ])
     );
     expect(rules.allow.join('\n')).not.toContain('wren-');
     // The old full-auto checkout-relative rules are not the builder's.
     expect(rules.allow).not.toContain('Edit(*)');
+  });
+
+  it('no Write path rule in either profile: accepted but never consulted, and warns at startup (docs)', () => {
+    for (const rules of [builder(), reviewer()]) {
+      expect(rules.allow.filter((r) => r.startsWith('Write('))).toEqual([]);
+    }
+  });
+
+  it('a slug that would widen a scratch rule is refused', () => {
+    for (const slug of ['*', '../wren', 'wren/x', '', 'Wren', 'a b']) {
+      expect(() => defaults.studioPermissionRules('builder', slug), slug).toThrow();
+    }
   });
 
   it('the builder carries no blanket push deny: deny beats allow, so one would forbid every push', () => {
@@ -314,26 +356,60 @@ describe('the profile lists', () => {
 });
 
 describe('studioPermissionProfile reads the server record only', () => {
-  it('a detached checkout, by branch sentinel or by checkout pin, is a reviewer', () => {
-    expect(defaults.studioPermissionProfile({ branch: 'detached:origin/pr/7' })).toBe('reviewer');
-    expect(defaults.studioPermissionProfile({ branch: 'detached:main' })).toBe('reviewer');
+  const profileOf = defaults.studioPermissionProfile;
+
+  it('a PR-review checkout is a reviewer: pinned to a PR head, by sentinel or pin', () => {
+    expect(profileOf({ branch: 'detached:origin/pr/7' })).toBe('reviewer');
     expect(
-      defaults.studioPermissionProfile({
+      profileOf({
         branch: 'lumen/eph/pr-7',
         metadata: { checkout: { mode: 'detached', ref: 'origin/pr/7', commit: 'abc' } },
       })
     ).toBe('reviewer');
   });
 
-  it('a studio on a branch of its own, or no record, is a builder', () => {
-    expect(defaults.studioPermissionProfile({ branch: 'wren/feat/x', metadata: {} })).toBe(
-      'builder'
+  it('a PR thread whose fetch fell back to the base branch is still a reviewer', () => {
+    expect(
+      profileOf({
+        branch: 'detached:main',
+        metadata: { checkout: { mode: 'detached', ref: 'main', commit: 'abc' } },
+        threadKey: 'inkwell:pr:404',
+      })
+    ).toBe('reviewer');
+    expect(profileOf({ branch: 'detached:main', threadKey: 'pr:12' })).toBe('reviewer');
+  });
+
+  it('an ordinary overflow studio, detached at the base for a non-PR thread, is a builder', () => {
+    for (const threadKey of [
+      'thread:x',
+      'spec:studio-model',
+      'branch:wren/feat/x',
+      'pr:abc',
+      null,
+    ]) {
+      expect(
+        profileOf({
+          branch: 'detached:main',
+          metadata: { checkout: { mode: 'detached', ref: 'main', commit: 'abc' } },
+          threadKey,
+        }),
+        String(threadKey)
+      ).toBe('builder');
+    }
+  });
+
+  it("a row whose roleTemplate is 'reviewer' is a reviewer, on a branch of its own too", () => {
+    expect(profileOf({ branch: 'wren/studio/main-wren-review', roleTemplate: 'reviewer' })).toBe(
+      'reviewer'
     );
-    expect(defaults.studioPermissionProfile({ branch: 'wren/feat/x', metadata: null })).toBe(
-      'builder'
-    );
-    expect(defaults.studioPermissionProfile(null)).toBe('builder');
-    expect(defaults.studioPermissionProfile(undefined)).toBe('builder');
+    expect(profileOf({ branch: 'wren/feat/x', roleTemplate: 'builder' })).toBe('builder');
+  });
+
+  it('a studio on a branch of its own is a builder; no record is no profile', () => {
+    expect(profileOf({ branch: 'wren/feat/x', metadata: {} })).toBe('builder');
+    expect(profileOf({ branch: 'wren/feat/x', metadata: null })).toBe('builder');
+    expect(profileOf(null)).toBeUndefined();
+    expect(profileOf(undefined)).toBeUndefined();
   });
 });
 

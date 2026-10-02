@@ -80,6 +80,8 @@ describe('completeStudioViaCli', () => {
       STUDIO_ID,
       '--purpose',
       'alpha work',
+      // No profile given: the server says so, and init never guesses one.
+      '--no-permissions',
     ]);
   });
 
@@ -99,6 +101,7 @@ describe('completeStudioViaCli', () => {
       STUDIO_ID,
       '--backend',
       'codex',
+      '--no-permissions',
     ]);
   });
 
@@ -116,6 +119,7 @@ describe('completeStudioViaCli', () => {
       'wren',
       '--no-root-sync',
       '--no-studio-setup',
+      '--no-permissions',
     ]);
   });
 

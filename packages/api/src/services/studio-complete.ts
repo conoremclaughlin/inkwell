@@ -51,7 +51,7 @@ export interface CompleteStudioViaCliOptions {
    * then writes no permissions at all, since a guess would be kept by every
    * later run.
    */
-  profile?: () => Promise<StudioPermissionProfile>;
+  profile?: () => Promise<StudioPermissionProfile | undefined>;
   /**
    * The profile itself, passed to `ink init --permission-profile`. Creators
    * take it from the row they hold; `ensureStudioComplete` fills it from
@@ -155,7 +155,12 @@ export async function completeStudioViaCli(
     // Never `--inherit-claude-permissions`: a studio the server creates gets
     // a profile, not the main worktree's lane rules (design v3, item 3).
     ...(options.permissionProfile ? ['--permission-profile', options.permissionProfile] : []),
-    ...(options.writePermissions === false ? ['--no-permissions'] : []),
+    // No profile means no permissions, never a guess: the server always
+    // tells ink init which, so init never falls back to a default or to a
+    // lookup of its own (review 4177f7fe, P2 1).
+    ...(options.writePermissions === false || !options.permissionProfile
+      ? ['--no-permissions']
+      : []),
   ];
 
   let stdout = '';

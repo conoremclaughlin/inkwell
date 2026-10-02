@@ -273,11 +273,11 @@ describe('the studio checklist runs before every spawn, whatever the runner', ()
     expect(await profileOf({ branch: 'lumen/feat/x', metadata: {} })).toBe('builder');
   });
 
-  it('a session with no studio row is offered the builder profile', async () => {
+  it('a session with no studio row is offered no profile: no permissions, never a guessed builder', async () => {
     const { send } = makeService(makeSession({ studioId: null }), 'lumen');
     await send();
-    const lookup = completion.calls[0].options.profile as () => Promise<string>;
-    expect(await lookup()).toBe('builder');
+    const lookup = completion.calls[0].options.profile as () => Promise<string | undefined>;
+    expect(await lookup()).toBeUndefined();
   });
 
   it('a session with no studio row offers no owner and no studio id', async () => {

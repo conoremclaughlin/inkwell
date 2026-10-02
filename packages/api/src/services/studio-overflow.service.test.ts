@@ -891,6 +891,63 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
     }
   });
 
+  it('an ordinary overflow (a non-PR thread, detached at the base) is completed as a builder', async () => {
+    // Every overflow worktree is detached; only a PR review is a reviewer.
+    // An ordinary overflow does write work, and the reviewer profile would
+    // leave it unable to edit (review 4177f7fe, P2 4).
+    const holder = await mkdtemp(path.join(tmpdir(), 'overflow-builder-'));
+    const repoRoot = path.join(holder, 'inkwell-fixture');
+    await mkdir(repoRoot);
+    await execFileAsync('git', ['init', '-b', 'main'], { cwd: repoRoot });
+    await execFileAsync(
+      'git',
+      [
+        '-c',
+        'user.email=test@test',
+        '-c',
+        'user.name=test',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'init',
+      ],
+      { cwd: repoRoot }
+    );
+    let worktree = '';
+    try {
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          worktree = input.worktreePath as string;
+          return Promise.resolve(
+            makeStudio({ id: 'plain-overflow', ...(input as Partial<Studio>) })
+          );
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const service = new StudioOverflowService(studios, {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      completion.calls.length = 0;
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        sbSlug: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'thread:perf-audit',
+      });
+      expect(result?.id).toBe('plain-overflow');
+      expect(completion.calls.at(-1)).toMatchObject({ permissionProfile: 'builder' });
+    } finally {
+      if (worktree) {
+        await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+          cwd: repoRoot,
+        }).catch(() => undefined);
+      }
+      await rm(holder, { recursive: true, force: true });
+    }
+  });
+
   // Scope boundary: durable homes are checkouts a human also lives in. Only
   // the EPHEMERAL mints move; the D1 parent stays a sibling of the repo.
   it('the durable D1 parent studio stays a sibling of the repo, not under the root', async () => {
