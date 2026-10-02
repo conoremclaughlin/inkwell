@@ -5176,7 +5176,27 @@ export type Database = {
       };
     };
     Views: {
-      [_ in never]: never;
+      heartbeat_notifications_drain_eligible: {
+        Row: {
+          created_at: string | null;
+          destination: string | null;
+          episode_key: string | null;
+          failed_beats: number | null;
+          id: string | null;
+          kind: string | null;
+          next_attempt_at: string | null;
+          payload: Json | null;
+          reminder_id: string | null;
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
+      heartbeat_notifications_drain_users: {
+        Row: {
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
     };
     Functions: {
       swap_memory_embedding: {

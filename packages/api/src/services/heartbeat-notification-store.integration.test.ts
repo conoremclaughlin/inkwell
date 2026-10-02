@@ -34,6 +34,7 @@ import {
   createHeartbeatNotificationStore,
   type EpisodeBoundary,
 } from './heartbeat-notification-store';
+import { shouldRunOnIsolatedIntegrationDb } from '../test/isolated-integration-target';
 
 /**
  * "History read cleanly and holds no healthy beat" — the boundary an ordinary
@@ -45,8 +46,9 @@ const MID_OUTAGE: EpisodeBoundary = { kind: 'none' };
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
-const isolatedHarness = !!process.env.INTEGRATION_SUPABASE_WORKDIR;
-const available = isolatedHarness && !!(SUPABASE_URL && SUPABASE_KEY);
+// Exactly the isolated stack the harness reserved, or not at all: a harness
+// marker beside any other SUPABASE_URL fails this file at load.
+const available = shouldRunOnIsolatedIntegrationDb();
 
 const d = available ? describe : describe.skip;
 
@@ -55,6 +57,15 @@ d('heartbeat notification store — real schema', () => {
     auth: { autoRefreshToken: false, persistSession: false },
   });
   const store = createHeartbeatNotificationStore(client);
+
+  /**
+   * Every fixture insert goes through here, so a failed one stops the case
+   * instead of letting it run against rows that are not there (PR #723).
+   */
+  const insertOrThrow = async (table: 'users' | 'scheduled_reminders', row: never) => {
+    const { error } = await client.from(table).insert(row);
+    if (error) throw new Error(`fixture ${table} insert failed: ${error.message}`);
+  };
 
   // A real reminder row, because the table carries an FK to it. Creating one is
   // cheaper than discovering at 3am that the FK rejects our writes.
@@ -132,11 +143,11 @@ d('heartbeat notification store — real schema', () => {
     }) as typeof client;
 
   beforeAll(async () => {
-    await client.from('users').insert({
+    await insertOrThrow('users', {
       id: userId,
       email: `heartbeat-store-${reminderId}@example.test`,
     } as never);
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: reminderId,
       user_id: userId,
       title: 'notification store integration fixture',
@@ -199,7 +210,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const openEpisodeKey = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'one outage keeps one key',
@@ -245,7 +256,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const isolatedEpisode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'owed all-clear with no recovery row',
@@ -286,7 +297,7 @@ d('heartbeat notification store — real schema', () => {
     // an alarm that never rang.
     const isolatedReminder = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'undelivered outage owes nothing',
@@ -440,7 +451,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const recoveredEpisode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'failed close must not suppress the next outage',
@@ -492,7 +503,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const episode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'lost outage acknowledgement still owes an all-clear',
@@ -553,7 +564,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const episode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'an unreadable acknowledgement is not a negative one',
@@ -600,7 +611,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const episode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'pending all-clear with no outage row',
@@ -652,7 +663,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const episode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'closed episode owes nothing further',
@@ -704,7 +715,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const episode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'an attempted all-clear ends the episode',
@@ -757,7 +768,7 @@ d('heartbeat notification store — real schema', () => {
     const olderEpisode = randomUUID();
     const newerEpisode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'a newer silent outage must not hide an older debt',
@@ -817,7 +828,7 @@ d('heartbeat notification store — real schema', () => {
     const isolatedReminder = randomUUID();
     const episode = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'a healthy beat ends an episode with no recovery row',
@@ -896,7 +907,7 @@ d('heartbeat notification store — real schema', () => {
     const finished = randomUUID();
     const current = randomUUID();
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'a live episode survives repeated boundary checks',
@@ -956,7 +967,7 @@ d('heartbeat notification store — real schema', () => {
     const orphanEpisode = randomUUID();
     const destination = 'sb-test|telegram|chat-12';
 
-    await client.from('scheduled_reminders').insert({
+    await insertOrThrow('scheduled_reminders', {
       id: isolatedReminder,
       user_id: userId,
       title: 'a bounded scan must keep moving',
