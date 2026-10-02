@@ -151,9 +151,10 @@ describe('session archive manifest runner', () => {
       ]);
     });
 
-    it('a row the activity log covers, with a zero counter and no evidence, is `empty` (control)', async () => {
+    it('a row with a zero counter and no evidence is still not proven empty', async () => {
+      // No historical row carries trusted loser provenance, and an old activity
+      // row from another session proves nothing about this one.
       harness.rows.sessions = [sessionRow({ started_at: '2026-09-01T00:00:00Z' })];
-      // Another session's activity establishes when the log began.
       harness.rows.activity_stream = [
         {
           id: 'activity-other',
@@ -162,28 +163,6 @@ describe('session archive manifest runner', () => {
           created_at: '2026-02-03T00:00:00Z',
         },
       ];
-
-      expect((await manifest()).archive).toEqual([{ sessionId: 'session-one', reason: 'empty' }]);
-    });
-
-    it('a row older than the activity log is never proven empty', async () => {
-      harness.rows.sessions = [sessionRow({ started_at: '2026-01-15T00:00:00Z' })];
-      harness.rows.activity_stream = [
-        {
-          id: 'activity-other',
-          session_id: 'session-other',
-          type: 'agent_spawn',
-          created_at: '2026-02-03T00:00:00Z',
-        },
-      ];
-
-      expect((await manifest()).archive).toEqual([
-        { sessionId: 'session-one', reason: 'backfill' },
-      ]);
-    });
-
-    it('a row with no activity log to compare against is never proven empty', async () => {
-      harness.rows.sessions = [sessionRow({ started_at: '2026-09-01T00:00:00Z' })];
 
       expect((await manifest()).archive).toEqual([
         { sessionId: 'session-one', reason: 'backfill' },
@@ -240,5 +219,22 @@ describe('session archive manifest runner: physical destination (review round 2)
     expect(await stat(join(nested, 'manifest.json')).catch(() => null)).toBeNull();
     expect(harness.written).toBe(false);
     expect(process.exitCode).toBe(1);
+  });
+});
+
+describe('session archive manifest runner: positive usage evidence (review round 3)', () => {
+  it('recorded token usage keeps a row out of `empty`', async () => {
+    harness.rows.sessions = [sessionRow({ started_at: '2026-09-01T00:00:00Z', token_count: 42 })];
+    // An unrelated older event, which an earlier head mistook for coverage.
+    harness.rows.activity_stream = [
+      {
+        id: 'unrelated-event',
+        session_id: 'unrelated-session',
+        type: 'agent_spawn',
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    ];
+
+    expect((await manifest()).archive).toEqual([{ sessionId: 'session-one', reason: 'backfill' }]);
   });
 });

@@ -64,6 +64,8 @@ function fixture(): ManifestInput {
         messageCount: 0,
         backendSessionId: null,
         lifecycle: 'completed',
+        // Synthetic: no historical row carries trusted loser provenance today.
+        loserProvenance: true,
       }),
       session('keyed-solo', { sessionKey: 'wren:inkwell:solo' }),
       session('keyed-shadowed', { sessionKey: 'WREN:inkwell:main' }),
@@ -310,7 +312,12 @@ describe('classifier predicates', () => {
   });
 
   it('calls a row empty only when nothing shows it ever held a conversation', () => {
-    const blank = { hasExecuted: false, messageCount: 0, backendSessionId: null };
+    const blank = {
+      hasExecuted: false,
+      messageCount: 0,
+      backendSessionId: null,
+      loserProvenance: true,
+    };
     expect(isEmpty(session('a', blank))).toBe(true);
     expect(isEmpty(session('b', { ...blank, hasExecuted: true }))).toBe(false);
     expect(isEmpty(session('c', { ...blank, messageCount: 1 }))).toBe(false);
@@ -497,7 +504,9 @@ describe('classifySessions: review regressions', () => {
             closed: true,
             ephemeral: true,
             threadKey: 'pr:42',
+            parentStudioId: 'studio-parent',
           },
+          { id: 'studio-parent', userId: USER, sbId: WREN, repoRoot: '/repo', closed: false },
           { id: 'studio-open', userId: USER, sbId: WREN, repoRoot: '/repo', closed: false },
         ],
         bindings: [
@@ -580,7 +589,7 @@ describe('classifySessions: review regressions', () => {
             sbId: WREN,
             repoRoot: '/repos/inkwell',
             worktreePath: '/repos/inkwell--review',
-            closed: true,
+            closed: false,
           },
         ],
         bindings: [
@@ -679,7 +688,7 @@ describe('classifySessions: review round 2', () => {
     );
 
     expect(manifest.preserved).toEqual([]);
-    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['project-mismatch']);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['studio-foreign']);
   });
 
   it('never accepts a working directory that climbs out of the project', () => {
@@ -705,18 +714,155 @@ describe('classifySessions: review round 2', () => {
     expect(manifest.preserved).toEqual([{ sessionId: 'bound', references: ['binding'] }]);
   });
 
-  it('never proves a row empty from an unknown counter or a gap in the log', () => {
-    const blank = {
-      hasExecuted: false,
-      backendSessionId: null,
-      claudeSessionId: null,
-      startedAt: '2026-09-01T00:00:00Z',
-    };
-    expect(isEmpty(session('a', { ...blank, messageCount: null }))).toBe(false);
-    expect(isEmpty(session('b', { ...blank, messageCount: 0 }), null)).toBe(false);
-    expect(isEmpty(session('c', { ...blank, messageCount: 0 }), '2026-10-01T00:00:00Z')).toBe(
+  it('never proves a row empty without trusted loser provenance, or with an unknown counter', () => {
+    const blank = { hasExecuted: false, backendSessionId: null, claudeSessionId: null };
+    // A zero counter and a silent log are absence of records, not proof.
+    expect(isEmpty(session('a', { ...blank, messageCount: 0 }))).toBe(false);
+    expect(isEmpty(session('b', { ...blank, messageCount: 0, loserProvenance: false }))).toBe(
       false
     );
-    expect(isEmpty(session('d', { ...blank, messageCount: 0 }), '2026-02-03T00:00:00Z')).toBe(true);
+    expect(isEmpty(session('c', { ...blank, messageCount: null, loserProvenance: true }))).toBe(
+      false
+    );
+    expect(isEmpty(session('d', { ...blank, messageCount: 0, loserProvenance: true }))).toBe(true);
+  });
+});
+
+/** Regressions from Lumen's third review of PR #720; each failed against fe5e1f3b. */
+describe('classifySessions: review round 3', () => {
+  const wren = {
+    id: WREN,
+    userId: USER,
+    workspaceId: 'ws-1',
+    slug: 'wren',
+    backend: 'claude-code',
+    defaultSessionId: null,
+  };
+  const only = (patch: Partial<ManifestInput>): ManifestInput => ({
+    sessions: [],
+    identities: [wren],
+    bindings: [],
+    latestSenders: [],
+    channelRoutes: [],
+    ...patch,
+  });
+  const pinned = (sessionId: string, threadKey = 'pr:42') => ({
+    threadId: `t-${sessionId}`,
+    threadWorkspaceId: 'ws-1',
+    threadKey,
+    sbId: WREN,
+    sessionId,
+    threadProjectRepoRoot: '/repos/one',
+  });
+  const closedEphemeral = {
+    id: 'studio-eph',
+    userId: USER,
+    sbId: WREN,
+    repoRoot: '/repos/one',
+    worktreePath: '/worktrees/eph',
+    closed: true,
+    ephemeral: true,
+    threadKey: 'pr:42',
+  };
+
+  it('a key holder whose identity row belongs to another owner is refused', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('keyed', { sessionKey: 'wren:x:y' })],
+        identities: [{ ...wren, userId: OTHER_USER }],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['identity-owner-mismatch']);
+  });
+
+  it('a key holder with no identity row is refused', () => {
+    const manifest = classifySessions(
+      only({ sessions: [session('keyed', { sessionKey: 'wren:x:y' })], identities: [] })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['unknown-identity']);
+  });
+
+  it('a closed ephemeral is unresolved without an established revival parent', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { studioId: 'studio-eph' })],
+        studios: [closedEphemeral],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.unresolved.map((u) => u.sessionId)).toEqual(['bound']);
+    expect(manifest.archive).toEqual([]);
+  });
+
+  it('a closed ephemeral with an open parent in the same repo is recoverable (control)', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { studioId: 'studio-eph' })],
+        studios: [
+          { ...closedEphemeral, parentStudioId: 'studio-parent' },
+          { id: 'studio-parent', userId: USER, sbId: WREN, repoRoot: '/repos/one', closed: false },
+        ],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([
+      { sessionId: 'bound', references: ['binding'], requires: ['studio-recovery'] },
+    ]);
+  });
+
+  it('a parent in another repo does not establish revival', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { studioId: 'studio-eph' })],
+        studios: [
+          { ...closedEphemeral, parentStudioId: 'studio-parent' },
+          { id: 'studio-parent', userId: USER, sbId: WREN, repoRoot: '/repos/two', closed: false },
+        ],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.unresolved.map((u) => u.sessionId)).toEqual(['bound']);
+  });
+
+  it('a closed studio inferred from the working directory gets the same uncertainty', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { workingDir: '/worktrees/eph/src' })],
+        studios: [{ ...closedEphemeral, ephemeral: false, threadKey: null }],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.unresolved.map((u) => u.sessionId)).toEqual(['bound']);
+  });
+
+  it('a foreign worktree nested in the project never falls back to the plain directory', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { workingDir: '/repos/one/foreign/src' })],
+        studios: [
+          {
+            id: 'studio-foreign',
+            userId: OTHER_USER,
+            sbId: 'sb-foreign',
+            repoRoot: '/repos/one',
+            worktreePath: '/repos/one/foreign',
+            closed: false,
+          },
+        ],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['studio-foreign']);
   });
 });

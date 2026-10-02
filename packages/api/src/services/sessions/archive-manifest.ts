@@ -40,6 +40,12 @@ export interface ManifestSession {
   status: string | null;
   /** The counter the server keeps; null means unknown, not zero. */
   messageCount: number | null;
+  /**
+   * Trusted, positive provenance that the row was created and discarded as a
+   * routing race loser. No historical row carries any today: the loser
+   * cleanup records nothing that sets it apart from an ordinary ended row.
+   */
+  loserProvenance?: boolean;
   startedAt?: string | null;
   /** Working directory the session last reported, when it has no studio. */
   workingDir?: string | null;
@@ -72,6 +78,8 @@ export interface ManifestStudio {
   /** A thread-scoped temporary studio; the revival path can bring it back for its thread. */
   ephemeral?: boolean;
   threadKey?: string | null;
+  /** The studio an ephemeral overflows from; revival is keyed on (parent, thread). */
+  parentStudioId?: string | null;
 }
 
 /** Threads are workspace-scoped; a pointer is valid only inside its SB's workspace. */
@@ -104,6 +112,7 @@ export type ReferenceKind = 'binding' | 'latest-sender' | 'home' | 'channel-rout
 export type InvalidReason =
   | 'missing-session'
   | 'unknown-identity'
+  | 'identity-owner-mismatch'
   | 'workspace-unknown'
   | 'workspace-mismatch'
   | 'user-mismatch'
@@ -127,11 +136,6 @@ export interface ManifestInput {
   channelRoutes: ManifestChannelRoute[];
   /** Optional so callers that do not load studios still classify; unknown studios then fail. */
   studios?: ManifestStudio[];
-  /**
-   * The earliest activity-log record. A row started before it cannot be
-   * proven empty, because the log that would show its activity did not exist.
-   */
-  evidenceSince?: string | null;
 }
 
 /** Expected versus observed, kept in the private manifest so causes can be told apart. */
@@ -213,18 +217,16 @@ export function isEnded(s: ManifestSession): boolean {
 }
 
 /**
- * Proven never to have held a conversation: the server's counter reads zero
- * (unknown is not zero), there is no transcript link, nothing shows the
- * session ran or spoke, and, when the caller knows when the activity log
- * began, the row is younger than the log that would have recorded it.
+ * Proven never to have held a conversation. Absence of records is not proof:
+ * activity logging is fire-and-forget, so neither a quiet log nor the age of
+ * its oldest row can show a session never ran (Lumen, review of PR #720).
+ * Only trusted loser provenance can, together with a zero counter (unknown
+ * is not zero), no transcript link and no evidence the session ran or spoke.
  */
-export function isEmpty(s: ManifestSession, evidenceSince?: string | null): boolean {
+export function isEmpty(s: ManifestSession): boolean {
+  if (s.loserProvenance !== true) return false;
   if (s.messageCount !== 0) return false;
-  if (s.hasExecuted || s.backendSessionId || s.claudeSessionId) return false;
-  if (evidenceSince !== undefined) {
-    if (!evidenceSince || !s.startedAt || s.startedAt < evidenceSince) return false;
-  }
-  return true;
+  return !s.hasExecuted && !s.backendSessionId && !s.claudeSessionId;
 }
 
 export type RuntimeName = 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink';
@@ -282,7 +284,7 @@ export function classifySessions(input: ManifestInput): ArchiveManifest {
   const byId = new Map(input.sessions.map((s) => [s.id, s]));
   const identityById = new Map(input.identities.map((i) => [i.id, i]));
   const studioById = new Map((input.studios ?? []).map((s) => [s.id, s]));
-  const empty = (s: ManifestSession) => isEmpty(s, input.evidenceSince);
+  const empty = isEmpty;
   const references = new Map<string, Set<ReferenceKind>>();
   const recoverable = new Map<string, Set<ReferenceKind>>();
   const unrecoverable = new Map<string, Set<ReferenceKind>>();
@@ -294,51 +296,79 @@ export function classifySessions(input: ManifestInput): ArchiveManifest {
     map.set(sessionId, set);
   };
 
+  /** Legacy rows name an identity only by slug; it counts when exactly one of the owner's matches. */
+  const legacyCandidates = (s: ManifestSession) =>
+    input.identities.filter(
+      (i) => i.userId === s.userId && s.sbSlug !== null && i.slug === s.sbSlug
+    );
+
   /**
-   * The canonical identity a row belongs to. A row with an sb_id names it; a
-   * legacy row with only a slug resolves when exactly one identity of the
-   * same owner carries that slug, and never otherwise.
+   * The canonical identity a row belongs to, read from its identity row. A
+   * row with an sb_id names it, and that identity must exist, belong to the
+   * row's owner and carry a workspace; a legacy row with only a slug
+   * resolves when exactly one identity of the same owner carries that slug.
    */
   const resolveIdentity = (
     s: ManifestSession
-  ):
-    | { id: string }
-    | { unresolved: 'legacy-identity-unresolved' | 'legacy-identity-ambiguous' } => {
-    if (s.sbId) return { id: s.sbId };
-    const candidates = input.identities.filter(
-      (i) => i.userId === s.userId && s.sbSlug !== null && i.slug === s.sbSlug
-    );
-    if (candidates.length === 1) return { id: candidates[0].id };
-    return {
-      unresolved:
-        candidates.length === 0 ? 'legacy-identity-unresolved' : 'legacy-identity-ambiguous',
-    };
+  ): { identity: ManifestIdentity } | { reason: InvalidReason; detail: InvalidDetail } => {
+    let identity: ManifestIdentity | undefined;
+    if (s.sbId) {
+      identity = identityById.get(s.sbId);
+      if (!identity) return { reason: 'unknown-identity', detail: { sbId: s.sbId } };
+    } else {
+      const candidates = legacyCandidates(s);
+      if (candidates.length !== 1) {
+        return {
+          reason:
+            candidates.length === 0 ? 'legacy-identity-unresolved' : 'legacy-identity-ambiguous',
+          detail: { observedSlug: s.sbSlug },
+        };
+      }
+      identity = candidates[0];
+    }
+    if (identity.userId !== s.userId) {
+      return {
+        reason: 'identity-owner-mismatch',
+        detail: { sbId: identity.id, identityUser: identity.userId, sessionUser: s.userId },
+      };
+    }
+    if (!identity.workspaceId) {
+      return {
+        reason: 'workspace-unknown',
+        detail: { sbId: identity.id, identityWorkspace: null },
+      };
+    }
+    return { identity };
+  };
+
+  /**
+   * The studio a session worked in: the one it names, or else the most
+   * specific studio whose worktree holds its working directory (worktrees
+   * sit beside their repository, not under it). Inferred and explicit
+   * studios are then judged by the same rules; a rejected studio never
+   * falls back to the plain directory.
+   */
+  const sessionStudio = (
+    session: ManifestSession
+  ): { studio: ManifestStudio; inferred: boolean } | 'missing' | undefined => {
+    if (session.studioId) {
+      const studio = studioById.get(session.studioId);
+      return studio ? { studio, inferred: false } : 'missing';
+    }
+    const dir = session.workingDir;
+    if (!dir) return undefined;
+    const studio = (input.studios ?? [])
+      .filter((st) => st.worktreePath && underRoot(dir, st.worktreePath))
+      .sort((a, b) => (b.worktreePath?.length ?? 0) - (a.worktreePath?.length ?? 0))[0];
+    return studio ? { studio, inferred: true } : undefined;
   };
 
   /** A studio counts as the session's only when it is the same owner's and identity's. */
   const studioIsTheirs = (studio: ManifestStudio, session: ManifestSession, identityId: string) =>
     studio.userId === session.userId && (studio.sbId === null || studio.sbId === identityId);
 
-  /**
-   * A session with no studio may still have worked in one: a studio's
-   * worktree sits beside its repository, not under it, so the working
-   * directory is matched against the session's own studios' worktrees.
-   */
-  const studioContaining = (session: ManifestSession, identityId: string) => {
-    const dir = session.workingDir;
-    if (!dir) return undefined;
-    return (input.studios ?? [])
-      .filter(
-        (st) =>
-          st.worktreePath &&
-          studioIsTheirs(st, session, identityId) &&
-          underRoot(dir, st.worktreePath)
-      )
-      .sort((a, b) => (b.worktreePath?.length ?? 0) - (a.worktreePath?.length ?? 0))[0];
-  };
-
   type Verdict =
-    | { outcome: 'valid' }
+    | { outcome: 'valid'; studio?: ManifestStudio }
     | { outcome: 'invalid'; reason: InvalidReason; detail: InvalidDetail }
     | { outcome: 'studio-closed'; studio: ManifestStudio };
 
@@ -361,17 +391,11 @@ export function classifySessions(input: ManifestInput): ArchiveManifest {
       });
     }
     const resolved = resolveIdentity(session);
-    if ('unresolved' in resolved) {
-      return invalidVerdict(resolved.unresolved, {
-        expectedSbId: expect.sbId,
-        observedSbId: null,
-        observedSlug: session.sbSlug,
-      });
-    }
-    if (expect.sbId && resolved.id !== expect.sbId) {
+    if ('reason' in resolved) return invalidVerdict(resolved.reason, resolved.detail);
+    if (expect.sbId && resolved.identity.id !== expect.sbId) {
       return invalidVerdict('identity-mismatch', {
         expectedSbId: expect.sbId,
-        observedSbId: resolved.id,
+        observedSbId: resolved.identity.id,
         attribution: session.sbId ? 'canonical' : 'legacy-slug',
       });
     }
@@ -387,24 +411,23 @@ export function classifySessions(input: ManifestInput): ArchiveManifest {
         observedBackend: session.backend,
       });
     }
-    if (session.studioId) {
-      const studio = studioById.get(session.studioId);
-      if (!studio) return invalidVerdict('studio-missing', { studioId: session.studioId });
-      if (!studioIsTheirs(studio, session, resolved.id)) {
+    if (empty(session)) return invalidVerdict('empty-target');
+    const placed = sessionStudio(session);
+    if (placed === 'missing')
+      return invalidVerdict('studio-missing', { studioId: session.studioId });
+    if (placed) {
+      const { studio, inferred } = placed;
+      if (!studioIsTheirs(studio, session, resolved.identity.id)) {
         return invalidVerdict('studio-foreign', {
-          studioId: session.studioId,
+          studioId: studio.id,
           studioUser: studio.userId,
           studioSbId: studio.sbId,
+          inferred: inferred ? 'working-dir' : null,
         });
       }
-      if (studio.closed) {
-        // Empty rows are refused below either way; a closed studio is a
-        // recovery question only for a transcript worth recovering.
-        if (empty(session)) return invalidVerdict('empty-target');
-        return { outcome: 'studio-closed', studio };
-      }
+      if (studio.closed) return { outcome: 'studio-closed', studio };
+      return { outcome: 'valid', studio };
     }
-    if (empty(session)) return invalidVerdict('empty-target');
     return { outcome: 'valid' };
   };
 
@@ -437,17 +460,16 @@ export function classifySessions(input: ManifestInput): ArchiveManifest {
       // historical backend stays valid after the identity's default changes.
       backend: { kind: 'supported' },
     });
-    if (base.outcome === 'invalid' || !session || p.threadProjectRepoRoot === undefined)
+    if (base.outcome === 'invalid' || !session || p.threadProjectRepoRoot === undefined) {
       return base;
+    }
 
-    // A project-pinned thread resumes only sessions working in that project.
+    // A project-pinned thread resumes only sessions working in that project,
+    // judged on the studio the session was placed in, closed or not.
     if (p.threadProjectRepoRoot === null) {
       return invalidVerdict('project-unverifiable', { cause: 'unresolved-project-pin' });
     }
-    const studio = session.studioId
-      ? studioById.get(session.studioId)
-      : studioContaining(session, p.sbId);
-    const sessionRoot = studio?.repoRoot ?? session.workingDir ?? null;
+    const sessionRoot = base.studio?.repoRoot ?? (base.studio ? null : session.workingDir) ?? null;
     if (!sessionRoot) return invalidVerdict('project-unverifiable', { cause: 'no-session-repo' });
     if (!underRoot(sessionRoot, p.threadProjectRepoRoot)) {
       return invalidVerdict('project-mismatch', {
@@ -460,12 +482,21 @@ export function classifySessions(input: ManifestInput): ArchiveManifest {
 
   /**
    * A cleaned studio is recoverable through the existing revival path only
-   * when it was a thread-scoped ephemeral for this very thread (the overflow
-   * service revives such a studio for the next round of its thread). Anything
-   * else cannot be shown recoverable here.
+   * with the evidence that path checks (studio-overflow matchesOverflow): a
+   * thread-scoped ephemeral for this very thread, overflowing from a parent
+   * that still exists, belongs to the same owner and identity, is open, and
+   * shares the studio's repository (revival recreates the worktree from the
+   * parent's repo). Anything less is left unresolved.
    */
-  const recoverableFor = (studio: ManifestStudio, threadKey: string | null | undefined) =>
-    !!studio.ephemeral && !!studio.threadKey && !!threadKey && studio.threadKey === threadKey;
+  const recoverableFor = (studio: ManifestStudio, threadKey: string | null | undefined) => {
+    if (!studio.ephemeral || !studio.threadKey || !threadKey || studio.threadKey !== threadKey) {
+      return false;
+    }
+    const parent = studio.parentStudioId ? studioById.get(studio.parentStudioId) : undefined;
+    if (!parent || parent.closed || parent.userId !== studio.userId) return false;
+    if (parent.sbId !== null && studio.sbId !== null && parent.sbId !== studio.sbId) return false;
+    return !!parent.repoRoot && parent.repoRoot === studio.repoRoot;
+  };
 
   const consider = (
     kind: ReferenceKind,
@@ -644,9 +675,12 @@ export function classifySessions(input: ManifestInput): ArchiveManifest {
     { scope: string; backendSessionId: string; sessionIds: Set<string> }
   >();
   for (const s of input.sessions) {
-    const resolved = resolveIdentity(s);
-    const identityScope =
-      'id' in resolved ? `sb:${resolved.id}` : `unresolved-slug:${s.sbSlug ?? '?'}`;
+    const legacy = s.sbId ? [] : legacyCandidates(s);
+    const identityScope = s.sbId
+      ? `sb:${s.sbId}`
+      : legacy.length === 1
+        ? `sb:${legacy[0].id}`
+        : `unresolved-slug:${s.sbSlug ?? '?'}`;
     const scope = `${s.userId}|${identityScope}`;
     for (const backendId of new Set([s.backendSessionId, s.claudeSessionId])) {
       if (!backendId) continue;

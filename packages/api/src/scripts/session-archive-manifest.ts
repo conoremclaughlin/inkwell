@@ -133,7 +133,7 @@ async function main() {
     selectAll(
       client,
       'sessions',
-      'id, user_id, sb_id, agent_id, studio_id, contact_id, backend, backend_session_id, claude_session_id, alias, ended_at, lifecycle, status, message_count, started_at, working_dir, cli_turn_at, cli_turn_stopped_at',
+      'id, user_id, sb_id, agent_id, studio_id, contact_id, backend, backend_session_id, claude_session_id, alias, ended_at, lifecycle, status, message_count, token_count, started_at, working_dir, cli_turn_at, cli_turn_stopped_at',
       'id'
     ),
     // Any activity row is evidence the session ran: a turn, a tool call.
@@ -151,7 +151,7 @@ async function main() {
     selectAll(
       client,
       'studios',
-      'id, user_id, sb_id, repo_root, worktree_path, status, archived_at, cleaned_at, ephemeral, thread_key',
+      'id, user_id, sb_id, repo_root, worktree_path, status, archived_at, cleaned_at, ephemeral, thread_key, parent_studio_id',
       'id'
     ),
     selectAll(
@@ -172,20 +172,18 @@ async function main() {
   ]);
 
   // Positive evidence that a session ran or spoke: an activity row, a CLI
-  // turn boundary, or an inbox message it authored.
+  // turn boundary, recorded token usage, or an inbox message it authored.
   const evidence = new Set(activityRows.map((r) => r.session_id as string));
-  // When the activity log began: a row started earlier cannot be proven empty.
-  const evidenceSince =
-    activityRows
-      .map((r) => str(r.created_at))
-      .filter((t): t is string => t !== null)
-      .sort()[0] ?? null;
+
   for (const m of messageRows) {
     const authored = str(m.sender_session);
     if (authored) evidence.add(authored);
   }
   for (const r of sessionRows) {
-    if (str(r.cli_turn_at) || str(r.cli_turn_stopped_at)) evidence.add(r.id as string);
+    const usedTokens = typeof r.token_count === 'number' && r.token_count > 0;
+    if (str(r.cli_turn_at) || str(r.cli_turn_stopped_at) || usedTokens) {
+      evidence.add(r.id as string);
+    }
   }
 
   const sessions: ManifestSession[] = sessionRows.map((r) => ({
@@ -225,6 +223,7 @@ async function main() {
     worktreePath: str(r.worktree_path),
     ephemeral: r.ephemeral === true,
     threadKey: str(r.thread_key),
+    parentStudioId: str(r.parent_studio_id),
     closed: r.status === 'cleaned' || !!str(r.archived_at) || !!str(r.cleaned_at),
   }));
 
@@ -297,7 +296,6 @@ async function main() {
     latestSenders,
     channelRoutes,
     studios,
-    evidenceSince,
   });
 
   const out =
