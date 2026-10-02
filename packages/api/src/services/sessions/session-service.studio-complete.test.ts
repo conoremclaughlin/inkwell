@@ -319,6 +319,8 @@ describe('a Claude launch in a studio is given its profile from the row (design 
       profile: 'reviewer',
       owner: 'lumen',
       mainRoot: '/repo',
+      // The runner refuses the launch unless it runs here (P2 2).
+      worktreePath: worktree,
     });
   });
 

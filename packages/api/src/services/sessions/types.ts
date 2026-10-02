@@ -776,6 +776,12 @@ export interface ClaudeRunnerConfig {
     owner: unknown;
     /** The main checkout, for the record of sources; null when not a worktree. */
     mainRoot: string | null;
+    /**
+     * The studio row's worktree. The launch is refused unless it runs
+     * there: a working directory that fell back elsewhere must not be
+     * granted the studio's profile.
+     */
+    worktreePath: string;
   };
   /** Run the backend CLI inside a Docker container instead of on the host */
   container?: {

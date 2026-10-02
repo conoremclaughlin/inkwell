@@ -38,7 +38,7 @@
 import { randomUUID } from 'crypto';
 import { access, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { homedir } from 'os';
-import { isAbsolute, join, normalize } from 'path';
+import { isAbsolute, join, normalize, resolve } from 'path';
 import { studioPermissionRules, type StudioPermissionProfile } from '@inklabs/shared';
 
 export class LaunchSettingsError extends Error {
@@ -48,7 +48,14 @@ export class LaunchSettingsError extends Error {
 export interface LaunchSettingsRequest {
   /** Unique per launch; default a fresh UUID. */
   launchId?: string;
-  /** The studio checkout on the host. */
+  /**
+   * The studio row's worktree. The launch is refused unless `worktreePath`
+   * (where it actually runs) is this directory: a working directory that
+   * fell back to the server's own checkout must not be granted the
+   * studio's profile (review 44db8c0c, P2 2).
+   */
+  studioWorktreePath: unknown;
+  /** The directory the session runs in, on the host. */
   worktreePath: string;
   /** The main checkout when the studio is a linked worktree of it, for the source record. */
   mainRoot: string | null;
@@ -128,6 +135,14 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
   const profile = req.profile as StudioPermissionProfile;
   if (typeof req.owner !== 'string') {
     throw new LaunchSettingsError(`no owner to name scratch paths: ${JSON.stringify(req.owner)}`);
+  }
+  if (
+    typeof req.studioWorktreePath !== 'string' ||
+    resolve(req.studioWorktreePath) !== resolve(req.worktreePath)
+  ) {
+    throw new LaunchSettingsError(
+      `the launch would run in ${req.worktreePath}, not the studio's worktree ${String(req.studioWorktreePath)}`
+    );
   }
   const root = req.executionRoot ?? req.worktreePath;
   if (!isAbsolute(root) || normalize(root) !== root || root.endsWith('/') || root === '/') {

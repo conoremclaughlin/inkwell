@@ -63,7 +63,12 @@ function studio(): string {
 const config = (worktree: string, extra: Partial<ClaudeRunnerConfig> = {}): ClaudeRunnerConfig => ({
   workingDirectory: worktree,
   mcpConfigPath: join(fixtures, '.mcp.json'),
-  launchPermissions: { profile: 'builder', owner: 'wren', mainRoot: join(fixtures, 'repo') },
+  launchPermissions: {
+    profile: 'builder',
+    owner: 'wren',
+    mainRoot: join(fixtures, 'repo'),
+    worktreePath: worktree,
+  },
   ...extra,
 });
 const spawned = (worktree: string) =>
@@ -92,12 +97,37 @@ describe('ClaudeRunner delivers the studio profile at launch', () => {
     const worktree = studio();
     const result = await new ClaudeRunner().run('hello', {
       config: config(worktree, {
-        launchPermissions: { profile: 'admin', owner: 'wren', mainRoot: null },
+        launchPermissions: {
+          profile: 'admin',
+          owner: 'wren',
+          mainRoot: null,
+          worktreePath: worktree,
+        },
       }),
     });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/^Launch refused: unknown permission profile/);
     expect(existsSync(join(worktree, 'spawned.json'))).toBe(false);
+  });
+
+  it("a launch that would run outside the studio's worktree is refused (a fallback directory)", async () => {
+    // resolveWorkingDirectory falls back to the server's checkout when the
+    // studio's worktree is missing; the studio's profile must not be granted
+    // there (review 44db8c0c, P2 2).
+    const fallback = studio();
+    const result = await new ClaudeRunner().run('hello', {
+      config: config(fallback, {
+        launchPermissions: {
+          profile: 'builder',
+          owner: 'wren',
+          mainRoot: null,
+          worktreePath: join(fixtures, 'repo--gone'),
+        },
+      }),
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/^Launch refused: .*not the studio's worktree/);
+    expect(existsSync(join(fallback, 'spawned.json'))).toBe(false);
   });
 
   it('an unreadable worktree policy refuses the launch too', async () => {
@@ -114,7 +144,12 @@ describe('ClaudeRunner delivers the studio profile at launch', () => {
       new ClaudeRunner().run('hello', { config: config(a) }),
       new ClaudeRunner().run('hello', {
         config: config(b, {
-          launchPermissions: { profile: 'reviewer', owner: 'lumen', mainRoot: null },
+          launchPermissions: {
+            profile: 'reviewer',
+            owner: 'lumen',
+            mainRoot: null,
+            worktreePath: b,
+          },
         }),
       }),
     ]);

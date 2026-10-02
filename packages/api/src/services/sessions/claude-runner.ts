@@ -455,6 +455,7 @@ export class ClaudeRunner implements IRunner {
       try {
         launchSettings = await prepareLaunchSettings({
           worktreePath: config.workingDirectory,
+          studioWorktreePath: config.launchPermissions.worktreePath,
           mainRoot: config.launchPermissions.mainRoot,
           profile: config.launchPermissions.profile,
           owner: config.launchPermissions.owner,

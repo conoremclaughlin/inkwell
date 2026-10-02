@@ -5471,6 +5471,7 @@ This session will continue with a fresh context after compaction. Your identity,
       profile: studioPermissionProfile(row),
       owner: row.sbSlug ?? undefined,
       mainRoot: row.repoRoot,
+      worktreePath: row.worktreePath,
     };
   }
 

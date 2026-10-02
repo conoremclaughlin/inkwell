@@ -41,6 +41,7 @@ afterEach(() => {
 
 const request = (extra: Record<string, unknown> = {}) => ({
   worktreePath: worktree,
+  studioWorktreePath: worktree,
   mainRoot,
   profile: 'builder',
   owner: 'wren',
@@ -151,6 +152,13 @@ describe('the launch fails closed, never falling back to builder', () => {
     ['relative execution root', { executionRoot: 'studio' }],
     ['unnormalized execution root', { executionRoot: '/studio/../etc' }],
     ['filesystem root', { executionRoot: '/' }],
+    // The launch must run in the studio's own worktree: a fallback directory
+    // would be granted the studio's profile (review 44db8c0c, P2 2).
+    [
+      'a working directory that is not the studio worktree',
+      { studioWorktreePath: '/elsewhere/repo--x' },
+    ],
+    ['no studio worktree to compare with', { studioWorktreePath: undefined }],
     [
       'unparseable worktree settings',
       {},
