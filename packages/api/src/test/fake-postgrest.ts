@@ -6,7 +6,7 @@
  * being answered by a fixture.
  *
  * Supported: from(table) with select / insert / update, eq (including
- * `column->>key`), in, order, maybeSingle, single, and awaiting the builder
+ * `column->>key`), gt, in, order, limit, maybeSingle, single, and awaiting the builder
  * for many rows; rpc through registered handlers. Unique constraints are
  * declared per table and refuse a write with 23505, as Postgres does. A
  * table with an updated_at column gets a fresh one on every update, as the
@@ -45,6 +45,18 @@ export class FakePostgrest {
   readonly rpcHandlers: Record<string, RpcHandler> = {};
   /** Every operation, in order: what a test asserts was (or was never) touched. */
   readonly log: Array<{ table: string; op: Op | 'rpc'; filters: string[] }> = [];
+  /**
+   * PostgREST's max-rows cap: a select returns at most this many rows, with
+   * no error, whatever limit it asked for (Supabase defaults it to 1000).
+   * Off unless a test sets it.
+   */
+  maxRows: number | undefined;
+  /**
+   * The longest `in` list a request may carry. A real request puts the list
+   * in its URL, so an unbounded one eventually fails; here it fails at this
+   * length. Off unless a test sets it.
+   */
+  maxInList: number | undefined;
   private clock = Date.parse('2026-10-02T08:00:00.000Z');
 
   /** A strictly increasing timestamp, so ordering and updated_at changes are observable. */
@@ -116,6 +128,7 @@ export class FakeQuery implements PromiseLike<FakeResult> {
   private filters: Array<{ label: string; test: (row: Row) => boolean }> = [];
   private ordering: Array<{ column: string; ascending: boolean }> = [];
   private limitCount: number | undefined;
+  private inListLengths: number[] = [];
   private values: Row[] = [];
   private patch: Row = {};
 
@@ -153,7 +166,19 @@ export class FakeQuery implements PromiseLike<FakeResult> {
     return this;
   }
 
+  gt(column: string, value: unknown): this {
+    this.filters.push({
+      label: `${column}>${String(value)}`,
+      test: (row) => {
+        const own = read(row, column);
+        return own !== null && own !== undefined && String(own) > String(value);
+      },
+    });
+    return this;
+  }
+
   in(column: string, values: unknown[]): this {
+    this.inListLengths.push(values.length);
     this.filters.push({
       label: `${column} in (${values.map(String).join(',')})`,
       test: (row) => values.some((v) => sameValue(read(row, column), v)),
@@ -211,6 +236,13 @@ export class FakeQuery implements PromiseLike<FakeResult> {
 
   private async execute(): Promise<FakeResult<Row[]>> {
     this.db.log.push({ table: this.table, op: this.op, filters: this.filters.map((f) => f.label) });
+    const longest = Math.max(0, ...this.inListLengths);
+    if (this.db.maxInList !== undefined && longest > this.db.maxInList) {
+      return {
+        data: [],
+        error: { code: '414', message: `request URI too long: an in list of ${longest} values` },
+      };
+    }
     if (this.op === 'insert') return this.runInsert();
     if (this.op === 'update') return this.runUpdate();
 
@@ -221,7 +253,8 @@ export class FakeQuery implements PromiseLike<FakeResult> {
         return (x < y ? -1 : x > y ? 1 : 0) * (ascending ? 1 : -1);
       });
     }
-    const limited = this.limitCount === undefined ? rows : rows.slice(0, this.limitCount);
+    const cap = Math.min(this.limitCount ?? Infinity, this.db.maxRows ?? Infinity);
+    const limited = cap === Infinity ? rows : rows.slice(0, cap);
     return { data: limited.map((r) => this.project(r)), error: null };
   }
 

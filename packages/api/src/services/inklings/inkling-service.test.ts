@@ -318,6 +318,65 @@ describe('list', () => {
     await service.name(ME, inkling.id, 'Pip');
     expect((await service.list(ME))[0]).toMatchObject({ id: inkling.id, displayName: 'Pip' });
   });
+
+  /**
+   * `count` tagged identities; every `lookalikeEvery`th (from the fourth) has
+   * no self-serve lineage, so is not an inkling. Returns the inklings' ids.
+   */
+  function seedMany(count: number, lookalikeEvery = 0): string[] {
+    const born: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const identity = db.seed('agent_identities', {
+        user_id: ME.userId,
+        workspace_id: ME.workspaceId,
+        agent_id: `kindle-${i}`,
+        name: 'Unnamed inkling',
+        metadata: { client: 'inkling-mobile', named: false },
+      });
+      if (lookalikeEvery > 0 && i % lookalikeEvery === 3) continue;
+      db.seed('kindle_lineage', {
+        child_sb_id: identity.id,
+        child_user_id: ME.userId,
+        kindle_method: 'self_serve',
+        chosen_name: null,
+      });
+      born.push(String(identity.id));
+    }
+    return born; // in creation order, which is not id order
+  }
+
+  it("nothing past PostgREST's 1000-row cap is dropped", async () => {
+    db.maxRows = 1000;
+    const born = seedMany(1050);
+    expect(born).toHaveLength(1050);
+    const listed = await service.list(ME);
+    expect(listed.map((i) => i.id)).toEqual(born);
+  });
+
+  it('no request carries an unbounded in-list', async () => {
+    db.maxInList = 100;
+    const born = seedMany(250);
+    expect(born).toHaveLength(250);
+    const listed = await service.list(ME);
+    expect(listed.map((i) => i.id)).toEqual(born);
+  });
+
+  it('a page cut short by a row cap below the page size does not end the read', async () => {
+    db.maxRows = 30;
+    const born = seedMany(95);
+    const listed = await service.list(ME);
+    expect(listed.map((i) => i.id)).toEqual(born);
+  });
+
+  it('pages keep lookalikes out and the order oldest first, across page boundaries', async () => {
+    db.maxRows = 1000;
+    db.maxInList = 100;
+    const born = seedMany(340, 7);
+    expect(rowsOf('agent_identities')).toHaveLength(340);
+    expect(born).toHaveLength(340 - 49); // i % 7 === 3 for 49 of 0..339
+    const listed = await service.list(ME);
+    expect(listed.map((i) => i.id)).toEqual(born);
+  });
 });
 
 describe('validateDisplayName', () => {

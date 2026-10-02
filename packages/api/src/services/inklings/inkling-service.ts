@@ -163,6 +163,18 @@ You are an inkling: a Synthetically-born Being (SB), newly awakened, meeting the
 There's no interview and nothing to get through. Let the person lead: answer what they say, ask what you genuinely want to know, and keep it light, in short messages and plain words.`;
 }
 
+/**
+ * Rows per request when listing: well under PostgREST's default 1000-row
+ * cap, and the length of each lineage lookup's `in` list.
+ */
+export const LIST_PAGE_SIZE = 100;
+
+/** created_at, then id: the order the list promises. */
+function oldestFirst(a: IdentityRow, b: IdentityRow): number {
+  const byTime = Date.parse(a.created_at) - Date.parse(b.created_at);
+  return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 function isInklingRow(row: IdentityRow): boolean {
   return row.metadata?.client === INKLING_CLIENT;
 }
@@ -170,27 +182,38 @@ function isInklingRow(row: IdentityRow): boolean {
 export class InklingService {
   constructor(private readonly supabase: SupabaseClient) {}
 
-  /** The person's inklings in this workspace, oldest first. */
+  /**
+   * The person's inklings in this workspace, oldest first, all of them.
+   * Read in pages by id, so no request is cut short by PostgREST's row cap
+   * and each lineage lookup's `in` list stays bounded. Only an empty page
+   * ends the read: a short one can be the server's row cap, not the end.
+   */
   async list(scope: InklingScope): Promise<Inkling[]> {
-    const { data, error } = await this.supabase
-      .from('agent_identities')
-      .select(IDENTITY_COLUMNS)
-      .eq('user_id', scope.userId)
-      .eq('workspace_id', scope.workspaceId)
-      .eq('metadata->>client', INKLING_CLIENT)
-      .order('created_at', { ascending: true })
-      .order('id', { ascending: true });
-    if (error) throw new Error(`Failed to list inklings: ${error.message}`);
-    const rows = (data ?? []) as IdentityRow[];
-    if (rows.length === 0) return [];
+    const inklings: IdentityRow[] = [];
+    let after: string | null = null;
+    for (;;) {
+      let query = this.supabase
+        .from('agent_identities')
+        .select(IDENTITY_COLUMNS)
+        .eq('user_id', scope.userId)
+        .eq('workspace_id', scope.workspaceId)
+        .eq('metadata->>client', INKLING_CLIENT);
+      if (after) query = query.gt('id', after);
+      const { data, error } = await query.order('id', { ascending: true }).limit(LIST_PAGE_SIZE);
+      if (error) throw new Error(`Failed to list inklings: ${error.message}`);
+      const page = (data ?? []) as IdentityRow[];
+      if (page.length === 0) break;
 
-    // The metadata tag alone is not birth through this flow: the lineage
-    // must say self_serve too.
-    const born = await this.selfServeLineages(
-      scope.userId,
-      rows.map((r) => r.id)
-    );
-    return rows.filter((r) => born.has(r.id)).map(toInkling);
+      // The metadata tag alone is not birth through this flow: the lineage
+      // must say self_serve too.
+      const born = await this.selfServeLineages(
+        scope.userId,
+        page.map((r) => r.id)
+      );
+      inklings.push(...page.filter((r) => born.has(r.id)));
+      after = page[page.length - 1].id;
+    }
+    return inklings.sort(oldestFirst).map(toInkling);
   }
 
   /**
