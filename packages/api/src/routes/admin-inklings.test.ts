@@ -8,7 +8,7 @@
  * nothing here sends a message or wakes anyone.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { createInklingDb, seedOwnSb } from '../test/fake-inkling-db';
 import type { FakePostgrest } from '../test/fake-postgrest';
@@ -123,6 +123,12 @@ async function call(h: Handler, body: unknown, ctx?: Ctx): Promise<MockResponse>
 beforeEach(() => {
   vi.clearAllMocks();
   db = createInklingDb();
+  // The owner test, open to ME: the server's gate is this env, read per request.
+  vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe('POST /inklings/awaken', () => {
@@ -168,8 +174,13 @@ describe('POST /inklings/awaken', () => {
       expect(res._json).toMatchObject({ role });
     }
     expect(db.log).toEqual([]);
+    // A member may write threads, but the owner test is the workspace owner's alone.
     const member = await call(awaken, { clientRequestId: REQUEST }, { role: 'member' });
-    expect(member._status).toBe(201);
+    expect(member._status).toBe(403);
+    expect(member._json).toMatchObject({ code: 'inklings_disabled' });
+    expect(db.log).toEqual([]);
+    const owner = await call(awaken, { clientRequestId: REQUEST });
+    expect(owner._status).toBe(201);
   });
 
   it('wakes nobody: no message is sent and no thread table is touched', async () => {
@@ -241,11 +252,14 @@ describe('POST /inklings/:id/name', () => {
   });
 
   it("404 for another person's inkling, an unknown id, or a malformed one", async () => {
+    // Their inkling, awakened while the owner test was theirs.
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', SOMEONE_ELSE);
     const theirs = await call(
       awaken,
       { clientRequestId: REQUEST },
       { userId: SOMEONE_ELSE, workspaceId: OTHER_WORKSPACE }
     );
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
     const theirId = (theirs._json.inkling as { id: string }).id;
     for (const id of [theirId, '99999999-9999-4999-8999-999999999999', 'nope']) {
       const res = await call(name, { displayName: 'Pip' }, { params: { id } });

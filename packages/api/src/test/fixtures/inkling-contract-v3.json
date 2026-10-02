@@ -48,6 +48,10 @@
       "capReached": {
         "status": 409,
         "body": { "error": "string", "code": "awakening_cap_reached" }
+      },
+      "disabled": {
+        "status": 403,
+        "body": { "error": "string", "code": "inklings_disabled" }
       }
     },
     "name": {

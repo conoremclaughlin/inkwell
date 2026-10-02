@@ -64,12 +64,27 @@ export interface Inkling {
 export interface InklingScope {
   userId: string;
   workspaceId: string;
+  /** The person's role in this workspace. Awakening and naming need 'owner'. */
+  role?: string;
 }
+
+export interface InklingServiceOptions {
+  /** Awakenings per person, enforced inside redeem_kindle_token; null for none. */
+  awakenCap?: number | null;
+  /**
+   * The owner test's one account (inklingOwnerTestUserId), or null: then
+   * nobody may awaken or name an inkling here.
+   */
+  ownerTestUserId?: string | null;
+}
+
+/** The answer for awakening or naming outside the owner test, whoever is asking. */
+export const INKLINGS_DISABLED = 'inklings_disabled';
 
 /** A refusal the caller can act on, with the HTTP status the route answers. */
 export class InklingError extends Error {
   constructor(
-    readonly status: 400 | 404 | 409,
+    readonly status: 400 | 403 | 404 | 409,
     message: string,
     /** A stable machine-readable reason, for an answer the app must tell apart. */
     readonly code?: string
@@ -186,11 +201,32 @@ function isInklingRow(row: IdentityRow): boolean {
 }
 
 export class InklingService {
+  private readonly awakenCap: number | null;
+  private readonly ownerTestUserId: string | null;
+
   constructor(
     private readonly supabase: SupabaseClient,
-    /** Awakenings per person, enforced inside redeem_kindle_token; null for none. */
-    private readonly awakenCap: number | null = DEFAULT_AWAKEN_CAP
-  ) {}
+    options: InklingServiceOptions = {}
+  ) {
+    this.awakenCap = options.awakenCap === undefined ? DEFAULT_AWAKEN_CAP : options.awakenCap;
+    this.ownerTestUserId = options.ownerTestUserId?.toLowerCase() ?? null;
+  }
+
+  /**
+   * Awakening and naming are open only in the owner test, and only to its
+   * account acting as the owner of the workspace. Everyone else, and
+   * everyone when the test is off, gets the same 403, which does not say
+   * who the owner is.
+   */
+  private assertOwnerTest(scope: InklingScope): void {
+    const isOwner =
+      this.ownerTestUserId !== null &&
+      scope.userId.toLowerCase() === this.ownerTestUserId &&
+      scope.role === 'owner';
+    if (!isOwner) {
+      throw new InklingError(403, 'Inklings are not open on this server', INKLINGS_DISABLED);
+    }
+  }
 
   /**
    * The person's inklings in this workspace, oldest first, all of them.
@@ -237,6 +273,7 @@ export class InklingService {
   ): Promise<{ inkling: Inkling; replayed: boolean }> {
     // A UUID's letter case is spelling, not identity, and the id is stored
     // and compared as text: one spelling for every lookup and the write.
+    this.assertOwnerTest(scope);
     const requestId = clientRequestId.toLowerCase();
     const prior = await this.findByAwakenRequest(scope.userId, requestId);
     if (prior) return this.replay(prior, scope);
@@ -257,6 +294,9 @@ export class InklingService {
           client: INKLING_CLIENT,
           awakenRequestId: requestId,
           named: false,
+          // Born under the owner test: the only inklings a turn may start
+          // for, and only while the test is on for this same account.
+          ownerTest: true,
         },
       },
       p_kindle_method: 'self_serve',
@@ -296,6 +336,7 @@ export class InklingService {
    * slug is never touched; the lineage records the chosen name.
    */
   async name(scope: InklingScope, inklingId: string, displayName: string): Promise<Inkling> {
+    this.assertOwnerTest(scope);
     const identity = isUuid(inklingId) ? await this.readIdentity(inklingId, scope) : null;
     if (!identity) throw new InklingError(404, 'No inkling with that id');
     const lineage = (await this.selfServeLineages(scope.userId, [identity.id])).get(identity.id);

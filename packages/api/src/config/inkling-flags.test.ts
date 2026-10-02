@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_AWAKEN_CAP, inklingAwakenCap } from './inkling-flags';
+import { DEFAULT_AWAKEN_CAP, inklingAwakenCap, inklingOwnerTestUserId } from './inkling-flags';
+
+describe('inklingOwnerTestUserId', () => {
+  const OWNER = '11111111-1111-4111-8111-111111111111';
+
+  it('is off unless it names a user: unset, blank, 1, true and junk are all off', () => {
+    for (const raw of [undefined, '', '  ', '1', 'true', 'on', 'owner', `${OWNER}x`]) {
+      expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: raw })).toBeNull();
+    }
+  });
+
+  it('names one user, in lowercase', () => {
+    expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: ` ${OWNER} ` })).toBe(OWNER);
+    expect(inklingOwnerTestUserId({ INKLING_OWNER_TEST_USER_ID: OWNER.toUpperCase() })).toBe(OWNER);
+  });
+});
 
 describe('inklingAwakenCap', () => {
   it('is 2 when unset or blank', () => {

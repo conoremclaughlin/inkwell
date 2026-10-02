@@ -51,11 +51,14 @@ describe('what bootstrap and the identity reads say an inkling is called (review
 const ME = {
   userId: '11111111-1111-4111-8111-111111111111',
   workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  role: 'owner',
 };
 
 async function awakenedRow(name?: string) {
   const db = createInklingDb();
-  const service = new InklingService(db as unknown as SupabaseClient);
+  const service = new InklingService(db as unknown as SupabaseClient, {
+    ownerTestUserId: ME.userId,
+  });
   const { inkling } = await service.awaken(ME, '0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a');
   if (name) await service.name(ME, inkling.id, name);
   const row = db.rows('agent_identities').find((r) => r.id === inkling.id)!;

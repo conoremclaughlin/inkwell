@@ -18,6 +18,7 @@ import {
   InklingError,
   InklingService,
   MAX_DISPLAY_NAME_CODE_POINTS,
+  type InklingServiceOptions,
   buildInklingSoul,
   validateDisplayName,
 } from './inkling-service';
@@ -27,16 +28,19 @@ import type { FakePostgrest, Row } from '../../test/fake-postgrest';
 const ME = {
   userId: '11111111-1111-4111-8111-111111111111',
   workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  role: 'owner',
 };
 const OTHER_WORKSPACE = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const SOMEONE_ELSE = {
   userId: '22222222-2222-4222-8222-222222222222',
   workspaceId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  role: 'owner',
 };
 /** Another person in MY workspace: only the user filter tells their inklings from mine. */
 const HOUSEMATE = {
   userId: '33333333-3333-4333-8333-333333333333',
   workspaceId: ME.workspaceId,
+  role: 'owner',
 };
 const REQUEST = '0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a';
 
@@ -47,17 +51,54 @@ const REQUEST = '0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a';
 describe('a second person in the same workspace (review bbbbba99, P3)', () => {
   it("does not see my inklings in their list, and I don't see theirs", async () => {
     const mine = await service.awaken(ME, REQUEST);
-    const theirs = await service.awaken(HOUSEMATE, '9e8d7c6b-5a49-4382-8170-6f5e4d3c2b1a');
+    const theirs = await as(HOUSEMATE).awaken(HOUSEMATE, '9e8d7c6b-5a49-4382-8170-6f5e4d3c2b1a');
     expect(await service.list(ME)).toEqual([mine.inkling]);
     expect(await service.list(HOUSEMATE)).toEqual([theirs.inkling]);
   });
 
   it('cannot name my inkling: 404, and the name stays mine to set', async () => {
     const mine = await service.awaken(ME, REQUEST);
-    await expect(service.name(HOUSEMATE, mine.inkling.id, 'Theirs')).rejects.toMatchObject({
+    await expect(as(HOUSEMATE).name(HOUSEMATE, mine.inkling.id, 'Theirs')).rejects.toMatchObject({
       status: 404,
     });
     expect(rowsOf('agent_identities')[0].name).toBe('Unnamed inkling');
+  });
+});
+
+describe('the owner test gate (Lumen 97b1d66a)', () => {
+  const closed = { status: 403, code: 'inklings_disabled' };
+
+  it('off: awakening and naming are refused, and nothing is read or written', async () => {
+    const mine = await service.awaken(ME, REQUEST); // made while the test was open
+    const before = db.log.length;
+    const off = new InklingService(db as unknown as SupabaseClient, { ownerTestUserId: null });
+    await expect(off.awaken(ME, '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a')).rejects.toMatchObject(
+      closed
+    );
+    await expect(off.name(ME, mine.inkling.id, 'Pip')).rejects.toMatchObject(closed);
+    expect(db.log.slice(before)).toEqual([]);
+    // Listing stays open: it shows the person's own inklings and starts nothing.
+    expect(await off.list(ME)).toEqual([mine.inkling]);
+  });
+
+  it('on for one account: anyone else is refused the same way, writing nothing', async () => {
+    await expect(service.awaken(SOMEONE_ELSE, REQUEST)).rejects.toMatchObject(closed);
+    await expect(service.awaken(HOUSEMATE, REQUEST)).rejects.toMatchObject(closed);
+    const mine = await service.awaken(ME, REQUEST);
+    await expect(service.name(HOUSEMATE, mine.inkling.id, 'Pip')).rejects.toMatchObject(closed);
+    expect(rowsOf('agent_identities')).toHaveLength(1);
+  });
+
+  it('the account must act as the workspace owner', async () => {
+    for (const role of ['member', 'trusted', 'viewer', undefined]) {
+      await expect(service.awaken({ ...ME, role }, REQUEST)).rejects.toMatchObject(closed);
+    }
+    expect(rowsOf('kindle_tokens')).toHaveLength(0);
+  });
+
+  it("matches the account in any letter case, as the env's UUID may be written", async () => {
+    const upper = as({ userId: ME.userId.toUpperCase() });
+    await expect(upper.awaken(ME, REQUEST)).resolves.toMatchObject({ replayed: false });
   });
 });
 
@@ -80,8 +121,16 @@ let service: InklingService;
 
 beforeEach(() => {
   db = createInklingDb();
-  service = new InklingService(db as unknown as SupabaseClient);
+  service = as(ME);
 });
+
+/** A service whose owner test is open to `who`, as the server's would be for that account. */
+function as(who: { userId: string }, options: InklingServiceOptions = {}): InklingService {
+  return new InklingService(db as unknown as SupabaseClient, {
+    ownerTestUserId: who.userId,
+    ...options,
+  });
+}
 
 function rowsOf(table: string): Row[] {
   return db.rows(table);
@@ -114,6 +163,7 @@ describe('awaken', () => {
       client: 'inkling-mobile',
       awakenRequestId: REQUEST,
       named: false,
+      ownerTest: true,
       kindleId: expect.any(String),
       onboarding: false,
     });
@@ -246,7 +296,7 @@ describe('awaken', () => {
 
   it("another person may use the same request id: lookups are the person's own", async () => {
     const mine = await service.awaken(ME, REQUEST);
-    const theirs = await service.awaken(SOMEONE_ELSE, REQUEST);
+    const theirs = await as(SOMEONE_ELSE).awaken(SOMEONE_ELSE, REQUEST);
     expect(theirs.replayed).toBe(false);
     expect(theirs.inkling.id).not.toBe(mine.inkling.id);
   });
@@ -284,7 +334,7 @@ describe('awaken', () => {
     });
 
     it('a retry that loses its race at the cap answers with the winner, not the cap', async () => {
-      service = new InklingService(db as unknown as SupabaseClient, 1);
+      service = as(ME, { awakenCap: 1 });
       const realRedeem = db.rpcHandlers.redeem_kindle_token;
       let raced = false;
       db.rpcHandlers.redeem_kindle_token = (args, fake) => {
@@ -306,7 +356,7 @@ describe('awaken', () => {
     });
 
     it('a null cap passes none, so the database applies none', async () => {
-      service = new InklingService(db as unknown as SupabaseClient, null);
+      service = as(ME, { awakenCap: null });
       await awakenTwo();
       await expect(service.awaken(ME, THIRD)).resolves.toMatchObject({ replayed: false });
     });
@@ -344,7 +394,7 @@ describe('list', () => {
   it("lists only the person's inklings in this workspace, oldest first, unnamed as null", async () => {
     // Three awakenings for ME across two workspaces: past the per-person cap,
     // which is not what this test is about.
-    service = new InklingService(db as unknown as SupabaseClient, null);
+    service = as(ME, { awakenCap: null });
     seedOwnSb(db, ME, 'myra'); // the account's own SB: never listed
     const first = await service.awaken(ME, REQUEST);
     const second = await service.awaken(ME, '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a');
@@ -352,7 +402,7 @@ describe('list', () => {
       { ...ME, workspaceId: OTHER_WORKSPACE },
       '5e8a1b2c-3d4f-4e6a-8b9c-0d1e2f3a4b5c'
     );
-    await service.awaken(SOMEONE_ELSE, '7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d');
+    await as(SOMEONE_ELSE).awaken(SOMEONE_ELSE, '7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d');
 
     const listed = await service.list(ME);
     expect(listed).toEqual([first.inkling, second.inkling]);
@@ -528,7 +578,7 @@ describe('name', () => {
   });
 
   it("404s for an unknown id, another person's inkling, or another workspace", async () => {
-    const theirs = await service.awaken(SOMEONE_ELSE, REQUEST);
+    const theirs = await as(SOMEONE_ELSE).awaken(SOMEONE_ELSE, REQUEST);
     const mine = await service.awaken(ME, REQUEST);
 
     for (const [scope, id] of [

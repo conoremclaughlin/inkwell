@@ -15,6 +15,21 @@ function positiveInt(raw: string | undefined, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The owner test's gate: INKLING_OWNER_TEST_USER_ID names the one account
+ * that may awaken, name and talk to inklings on this server, as a trusted
+ * personal SB with the same reach as the account's other SBs (Lumen
+ * 97b1d66a). Unset, or not a UUID, means off: no awakening, no naming, and
+ * no inkling turn. It names a user, not just "on", because this server has
+ * no owner of its own: every account owns its personal workspace.
+ */
+export function inklingOwnerTestUserId(source: EnvSource = process.env): string | null {
+  const raw = source.INKLING_OWNER_TEST_USER_ID?.trim().toLowerCase();
+  return raw && UUID.test(raw) ? raw : null;
+}
+
 /**
  * How many inklings one person may awaken: INKLING_AWAKEN_CAP, else 2.
  * The cap is counted inside redeem_kindle_token under a per-person lock, so

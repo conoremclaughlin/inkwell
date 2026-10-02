@@ -97,7 +97,7 @@ import {
   validateDisplayName,
   type InklingScope,
 } from '../services/inklings/inkling-service';
-import { inklingAwakenCap } from '../config/inkling-flags';
+import { inklingAwakenCap, inklingOwnerTestUserId } from '../config/inkling-flags';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -3846,11 +3846,18 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
 // opens a thread or wakes anyone.
 
 function inklingScope(authReq: AdminAuthRequest): InklingScope {
-  return { userId: authReq.inkUserId, workspaceId: authReq.inkWorkspaceId };
+  return {
+    userId: authReq.inkUserId,
+    workspaceId: authReq.inkWorkspaceId,
+    role: authReq.inkWorkspaceRole,
+  };
 }
 
 async function inklingService(): Promise<InklingService> {
-  return new InklingService((await getDataComposer()).getClient(), inklingAwakenCap());
+  return new InklingService((await getDataComposer()).getClient(), {
+    awakenCap: inklingAwakenCap(),
+    ownerTestUserId: inklingOwnerTestUserId(),
+  });
 }
 
 function answerInklingError(res: Response, label: string, error: unknown): void {

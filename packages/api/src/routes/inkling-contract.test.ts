@@ -14,7 +14,7 @@
 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { createInklingDb, seedOwnSb } from '../test/fake-inkling-db';
 import type { FakePostgrest, Row } from '../test/fake-postgrest';
@@ -139,6 +139,7 @@ function expectMatchesFixture(actual: Answer, expected: Answer): void {
 beforeEach(() => {
   vi.clearAllMocks();
   db = createInklingDb();
+  vi.stubEnv('INKLING_OWNER_TEST_USER_ID', ME);
   // The send handler's stand-in: store, then report one recipient stamped and woken.
   mockHandleSendToInbox.mockImplementation(
     async (
@@ -191,6 +192,10 @@ const name = handler('post', '/inklings/:id/name');
 const create = handler('post', '/threads');
 const reply = handler('post', '/threads/reply');
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe('the server answers in the fixture shapes', () => {
   it('awaken: created, replayed, and another workspace', async () => {
     const { awaken: f } = fixture.inklings;
@@ -210,6 +215,20 @@ describe('the server answers in the fixture shapes', () => {
     expectMatchesFixture(third, f.capReached);
     // The fixture pins the code's value, not only its type: the app branches on it.
     expect(third.body.code).toBe(f.capReached.body.code);
+  });
+
+  it('awaken and name outside the owner test: a 403 with its own code', async () => {
+    const { awaken: f } = fixture.inklings;
+    const awakened = await call(awaken, f.request);
+    const id = (awakened.body.inkling as { id: string }).id;
+    vi.stubEnv('INKLING_OWNER_TEST_USER_ID', '');
+    for (const answer of [
+      await call(awaken, f.request),
+      await call(name, fixture.inklings.name.request, { params: { id } }),
+    ]) {
+      expectMatchesFixture(answer, f.disabled);
+      expect(answer.body.code).toBe(f.disabled.body.code);
+    }
   });
 
   it('list', async () => {
