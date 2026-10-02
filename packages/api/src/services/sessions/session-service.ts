@@ -3400,7 +3400,8 @@ export class SessionService implements ISessionService {
             a: string,
             alias: string,
             studioId?: string,
-            sb?: string | null
+            sb?: string | null,
+            contactId?: string
           ) => Promise<Session | null>;
         };
 
@@ -3432,7 +3433,9 @@ export class SessionService implements ISessionService {
           aliasStudioScope,
           // Identity by UUID: a same-slug session from another identity must
           // not satisfy this alias (Lumen, PR #514 round 6).
-          identitySbId
+          identitySbId,
+          // Contact scope, as on every other rung (task F1).
+          options?.contactId
         );
         if (aliasMatch) {
           logger.debug('Found existing session by alias', {

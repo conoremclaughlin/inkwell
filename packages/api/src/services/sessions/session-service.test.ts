@@ -3311,8 +3311,36 @@ describe('SessionService', () => {
       );
 
       // 4th arg is the studio scope: undefined here because no studio was named.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
+      // 6th is the contact scope: undefined for an owner request (task F1).
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'main',
+        undefined,
+        null,
+        undefined
+      );
       expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
+    });
+
+    it('passes the contact scope to the alias lookup for a contact request', async () => {
+      const mockFindByAlias = vi.fn().mockResolvedValue(null);
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      await sessionService.getOrCreateSession('user-456', 'myra', {
+        alias: 'main',
+        contactId: 'contact-1',
+      });
+
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'main',
+        undefined,
+        null,
+        'contact-1'
+      );
     });
 
     it('should fall through to threadKey when alias has no match', async () => {
@@ -3333,7 +3361,8 @@ describe('SessionService', () => {
         'myra',
         'nonexistent',
         undefined,
-        null
+        null,
+        undefined
       );
       expect(mockFindByThreadKey).toHaveBeenCalledWith(
         'user-456',
@@ -3413,7 +3442,14 @@ describe('SessionService', () => {
       // The alias wins. Unscoped is safe here on its own terms: findByAlias
       // refuses an alias spanning two studios, so no-scope means must-be-
       // unique rather than pick-one.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'main',
+        undefined,
+        null,
+        undefined
+      );
       expect(session.id).toBe('alias-session');
       expect(mockFindByThreadKey).not.toHaveBeenCalled();
     });
