@@ -56,7 +56,12 @@ import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
-import { classifyError, isPreAcceptanceRefusal, type ErrorClassification } from '@inklabs/shared';
+import {
+  classifyError,
+  isPathWithinWorkspaceAsync,
+  isPreAcceptanceRefusal,
+  type ErrorClassification,
+} from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
@@ -344,6 +349,70 @@ export interface ThreadProjectRepo {
   repoRoot: string | null;
   /** Set when repoRoot is null: what stopped the project from naming one. */
   cause?: ProjectRepoCause;
+}
+
+/**
+ * Routing's affirmative decision that this identity's work on a pinned thread
+ * runs with no studio (task bd4657a0). It exists only when routing positively
+ * found no studio for the identity in the project's repo AND the thread type
+ * is presence + reuse-only, so the create boundary proceeds studioless rather
+ * than building a worktree (Conor's ruling: discussions execute). A refusal, a
+ * failed studio lookup, a write-intent thread awaiting provisioning, and a
+ * project with no repo all produce none. A null studio on a session is never
+ * this decision; it is only what the decision leaves behind.
+ *
+ * Studioless presence is repo-neutral. The runner gives a studioless session
+ * the server's default working directory (resolveWorkingDirectory), never the
+ * project's repo, so nothing here claims the session ran in the project.
+ */
+export interface StudiolessPresencePlacement {
+  /** The pinned project's canonical slug. */
+  project: string;
+  /** The project's repo, as routing read it for this decision. */
+  repoRoot: string;
+}
+
+/** routing_decision.placement.kind on a row created under that decision. */
+const STUDIOLESS_PRESENCE = 'studioless-presence';
+
+/**
+ * The decision, read off a routing result. Only the project-repo tier's
+ * deferred create yields one: resolveStudioForRepo returns it after a
+ * successful lookup found no studio and no main studio in the repo, while a
+ * failed lookup returns nothing and routing refuses. The create boundary
+ * proceeds studioless on exactly this condition, and reads it from here.
+ */
+export function studiolessPresenceOf(
+  routing: StudioRoutingDecision,
+  projectRepo: ThreadProjectRepo | null | undefined,
+  writeIntent: WriteIntent,
+  studioPolicy: StudioPolicy
+): StudiolessPresencePlacement | null {
+  const deferred = routing.deferredCreate;
+  if (!deferred || deferred.source !== 'project' || routing.studioId) return null;
+  if (writeIntent !== 'presence' || studioPolicy !== 'reuse-only') return null;
+  if (!projectRepo?.repoRoot || deferred.repoRoot !== projectRepo.repoRoot) return null;
+  return { project: projectRepo.slug, repoRoot: projectRepo.repoRoot };
+}
+
+/**
+ * Whether routing recorded, when it created this row, that it placed the
+ * row studioless for this project and repo. Rows created before the record
+ * existed carry none and are not admitted on a null working_dir.
+ */
+function recordedStudiolessPresence(
+  session: Session,
+  project: { slug: string; repoRoot: string }
+): boolean {
+  const decision = session.metadata?.routing_decision as { placement?: unknown } | undefined;
+  const placement = decision?.placement as
+    | { kind?: unknown; project?: unknown; repoRoot?: unknown }
+    | undefined;
+  return (
+    placement?.kind === STUDIOLESS_PRESENCE &&
+    placement.project === project.slug &&
+    placement.repoRoot === project.repoRoot
+  );
 }
 
 /** The pinned project, as a refusal reports it. */
@@ -1389,11 +1458,19 @@ export class SessionService implements ISessionService {
     userId: string,
     sbId: string | null,
     threadKey: string | undefined,
-    session: Session
+    session: Session,
+    /**
+     * The plan resolution's own studioless-presence decision, reported by
+     * getOrCreateSession's onStudiolessPresence. The winner and any stamp
+     * the repair meets are tested against the decision that produced the
+     * routed candidate, never a fresh one (task bd4657a0). Absent means
+     * none: a studioless session is then refused, as before.
+     */
+    studiolessPresence?: StudiolessPresencePlacement | null
   ): Promise<boolean> {
     if (!threadKey) return true;
     const { project } = await this.resolveThreadBehavior(userId, sbId, threadKey);
-    return this.threadMatchAllowed(userId, session, project, threadKey);
+    return this.threadMatchAllowed(userId, session, project, threadKey, studiolessPresence ?? null);
   }
 
   /**
@@ -1416,24 +1493,117 @@ export class SessionService implements ISessionService {
     );
   }
 
+  /**
+   * The one test a session takes before it may carry a project-pinned
+   * thread: an inferred anchor, a thread-key match, an assignment winner and
+   * a stamp met during repair all go through here (task bd4657a0).
+   *
+   * A session in a studio must be in a studio of the project's repo, as
+   * before. A session with no studio was refused outright, which contradicted
+   * routing: for an identity with no studio in the project's repo, routing
+   * itself places presence work studioless, so every session the thread could
+   * produce was refused on its next message and a new row was minted each
+   * time (Lumen on inkling:thread:app-build, 2026-10-02: 20 rows, 6 that
+   * ran). A studioless session is now admitted when, and only when, routing's
+   * current decision for this thread is that same studioless placement — see
+   * studiolessMatchAllowed for the evidence it must also carry.
+   */
   private async threadMatchAllowed(
     userId: string,
     match: Session,
     projectRepo: ThreadProjectRepo | null | undefined,
-    threadKey: string
+    threadKey: string,
+    studiolessPresence: StudiolessPresencePlacement | null
   ): Promise<boolean> {
     if (!projectRepo) return true;
-    if (!projectRepo.repoRoot || !match.studioId) {
+    if (!projectRepo.repoRoot) {
       logger.warn('[StudioResolve] Thread-key reuse refused — pinned project repo unverifiable', {
         threadKey,
         sessionId: match.id,
         studioId: match.studioId ?? null,
         project: projectRepo.slug,
-        projectRepoRoot: projectRepo.repoRoot,
+        cause: projectRepo.cause ?? null,
       });
       return false;
     }
+    if (!match.studioId) {
+      return this.studiolessMatchAllowed(
+        match,
+        { slug: projectRepo.slug, repoRoot: projectRepo.repoRoot },
+        threadKey,
+        studiolessPresence
+      );
+    }
     return this.continuityStudioAllowed(userId, match.studioId, { threadKey, projectRepo });
+  }
+
+  /**
+   * A studioless session on a project-pinned thread. Two things must hold.
+   *
+   * 1. Routing's decision for THIS resolution is studioless presence for this
+   *    project and repo. That is what makes reuse placement-neutral: reusing
+   *    the session puts the work exactly where a new session would go.
+   * 2. The session itself is evidence of that placement, not merely a row
+   *    with a null studio:
+   *    - a recorded working_dir inside the project's repo is repository
+   *      evidence on its own (the session ran there);
+   *    - otherwise the row must carry the placement routing recorded when it
+   *      created it (routing_decision.placement), and any recorded
+   *      working_dir must be inside the default working directory, which is
+   *      where the runner puts every studioless session. Claude hooks report
+   *      that directory on every lifecycle event, so it is the expected value
+   *      for a spawned presence session, not a stray one.
+   *    A working_dir anywhere else means the session ran in another repo
+   *    (a terminal resumed it elsewhere), and it is refused whatever it
+   *    carries. A missing working_dir never counts as project placement.
+   *
+   * Paths are compared by containment after realpath (path.relative), never
+   * by string prefix.
+   */
+  private async studiolessMatchAllowed(
+    match: Session,
+    project: { slug: string; repoRoot: string },
+    threadKey: string,
+    studiolessPresence: StudiolessPresencePlacement | null
+  ): Promise<boolean> {
+    const refuse = (reason: string): false => {
+      logger.warn('[StudioResolve] Thread-key reuse refused — studioless session', {
+        threadKey,
+        sessionId: match.id,
+        reason,
+        workingDir: match.workingDir ?? null,
+        project: project.slug,
+        projectRepoRoot: project.repoRoot,
+      });
+      return false;
+    };
+    if (
+      !studiolessPresence ||
+      studiolessPresence.project !== project.slug ||
+      studiolessPresence.repoRoot !== project.repoRoot
+    ) {
+      return refuse('routing does not place this thread studioless');
+    }
+    if (
+      match.workingDir &&
+      (await isPathWithinWorkspaceAsync(match.workingDir, project.repoRoot))
+    ) {
+      return true;
+    }
+    if (!recordedStudiolessPresence(match, project)) {
+      return refuse(
+        match.workingDir
+          ? 'working_dir is outside the project repo'
+          : 'no recorded studioless placement, and no working_dir'
+      );
+    }
+    if (
+      match.workingDir &&
+      !(await isPathWithinWorkspaceAsync(match.workingDir, this.config.defaultWorkingDirectory))
+    ) {
+      return refuse('working_dir is outside both the project repo and the default directory');
+    }
+    return true;
   }
 
   private async continuityStudioAllowed(
@@ -3147,6 +3317,14 @@ export class SessionService implements ISessionService {
        * stay unfenced (released as before).
        */
       turnEpochCandidate?: string;
+      /**
+       * Receives this resolution's studioless-presence decision (null when
+       * routing placed the thread anywhere else), once routing has run. The
+       * trigger handler tests the participant stamp's winner against it, so
+       * a winner is judged by the same decision as the routed candidate
+       * (task bd4657a0). Not called when resolution throws before routing.
+       */
+      onStudiolessPresence?: (placement: StudiolessPresencePlacement | null) => void;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -3267,14 +3445,34 @@ export class SessionService implements ISessionService {
     // every repo-scoped rung. Only a caller-explicit anchor is addressing; an
     // inferred one takes the same repo test as continuity, or is dropped and
     // the ladder decides.
-    if (
-      authorizedRecipientSessionId &&
-      recipientCandidate &&
+    //
+    // A studio-bound anchor is tested HERE, before routing, because routing's
+    // recipient-session tier places the thread in the anchor's studio. A
+    // studioless anchor gives that tier nothing to place by, so it is tested
+    // after routing, against routing's own decision (task bd4657a0).
+    const inferredAnchorOnPinnedThread =
+      !!recipientCandidate &&
       options?.recipientSessionExplicit !== true &&
-      projectRepo &&
-      options?.threadKey &&
-      !(await this.threadMatchAllowed(userId, recipientCandidate, projectRepo, options.threadKey))
-    ) {
+      !!projectRepo &&
+      !!options?.threadKey;
+    const dropInferredAnchor = async (
+      studiolessPresence: StudiolessPresencePlacement | null
+    ): Promise<void> => {
+      if (
+        !authorizedRecipientSessionId ||
+        !recipientCandidate ||
+        !projectRepo ||
+        !options?.threadKey ||
+        (await this.threadMatchAllowed(
+          userId,
+          recipientCandidate,
+          projectRepo,
+          options.threadKey,
+          studiolessPresence
+        ))
+      ) {
+        return;
+      }
       logger.warn(
         '[SessionRouting] Dropping inferred recipientSessionId — outside the project repo',
         {
@@ -3286,6 +3484,9 @@ export class SessionService implements ISessionService {
         }
       );
       authorizedRecipientSessionId = undefined;
+    };
+    if (inferredAnchorOnPinnedThread && recipientCandidate?.studioId) {
+      await dropInferredAnchor(null);
     }
 
     let routing = await this.resolveStudioId(userId, sbSlug, {
@@ -3321,6 +3522,20 @@ export class SessionService implements ISessionService {
     if (routing.unresolvedNamedStudio) {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, sbSlug);
     }
+
+    // Routing's own answer to "does this identity's work on this thread run
+    // studioless?" Every studioless session the rungs below consider is
+    // tested against this one decision (task bd4657a0).
+    const studiolessPresence = studiolessPresenceOf(
+      routing,
+      projectRepo,
+      writeIntent,
+      studioPolicy
+    );
+    if (inferredAnchorOnPinnedThread && !recipientCandidate?.studioId) {
+      await dropInferredAnchor(studiolessPresence);
+    }
+    options?.onStudiolessPresence?.(studiolessPresence);
 
     const leaseCtx = {
       userId,
@@ -3478,7 +3693,13 @@ export class SessionService implements ISessionService {
         if (
           threadMatch &&
           (this.matchInCallerNamedStudio(routing, resolvedStudioId, threadMatch) ||
-            (await this.threadMatchAllowed(userId, threadMatch, projectRepo, options.threadKey)))
+            (await this.threadMatchAllowed(
+              userId,
+              threadMatch,
+              projectRepo,
+              options.threadKey,
+              studiolessPresence
+            )))
         ) {
           this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
           return this.withStudioLease(threadMatch, routing, leaseCtx);
@@ -3647,6 +3868,11 @@ export class SessionService implements ISessionService {
     // about to create a session now — every reuse rung above has missed — so
     // building the worktree here cannot be wasted by an explicit address
     // winning afterwards.
+    //
+    // Read before the presence branch below clears deferredCreate: a row
+    // created under studioless presence records it, and that record is what
+    // lets the thread's next message reuse the row (task bd4657a0).
+    const createdStudioless = studiolessPresenceOf(routing, projectRepo, writeIntent, studioPolicy);
     if (routing.deferredCreate && !resolvedStudioId && studioPolicy === 'reuse-only') {
       // The third worktree-creating path, gated like the other two (Lumen
       // #523 r1 P1): the D1 parent is durable rather than ephemeral, but it
@@ -3803,6 +4029,9 @@ export class SessionService implements ISessionService {
           threadKey: options?.threadKey ?? null,
           occupancyChecked: routing.occupancyChecked,
           ...(routing.diverted ? { diverted: { ...routing.diverted } } : {}),
+          ...(createdStudioless && !resolvedStudioId
+            ? { placement: { kind: STUDIOLESS_PRESENCE, ...createdStudioless } }
+            : {}),
           resolvedAt: new Date().toISOString(),
           ...(homeSiblings.length > 0 ? { homeSiblings: homeSiblings.map((s) => s.id) } : {}),
         },

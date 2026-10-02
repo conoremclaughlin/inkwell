@@ -139,6 +139,7 @@ function mapDbToSession(row: DbSession): Session {
     sbSlug: row.agent_id || '',
     sbId: row.sb_id || undefined,
     studioId: row.studio_id || undefined,
+    workingDir: row.working_dir || undefined,
     contactId: row.contact_id || undefined,
     backendSessionId: row.backend_session_id || row.claude_session_id,
 
