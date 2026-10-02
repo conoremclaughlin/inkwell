@@ -25,7 +25,13 @@ import {
   participantSlugs,
   reopenThreadRow,
 } from '../mcp/tools/thread-handlers';
-import { resolveSbsByIds, userPrincipal } from '../services/principals';
+import {
+  resolveSbsByIds,
+  resolveSbsInWorkspace,
+  userPrincipal,
+  type SbPrincipal,
+} from '../services/principals';
+import { boundThreadTitle } from '../mcp/tools/thread-bounds';
 import { describePeople, resolvePersonNames } from '../services/person-display';
 import { carrierScopeFilter, workspaceSbIds } from '../services/carrier-scope';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
@@ -8054,11 +8060,11 @@ router.post('/threads', async (req: Request, res: Response) => {
 
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
-    type KeyedThread = { id: string; created_by_user_id: string | null };
+    type KeyedThread = { id: string; created_by_user_id: string | null; title: string | null };
     const findThread = async (): Promise<KeyedThread | null> => {
       const { data } = await supabase
         .from('inbox_threads')
-        .select('id, created_by_user_id')
+        .select('id, created_by_user_id, title')
         .eq('workspace_id', authReq.inkWorkspaceId)
         .eq('thread_key', key)
         .maybeSingle();
@@ -8097,6 +8103,13 @@ router.post('/threads', async (req: Request, res: Response) => {
         await new Promise((resolve) => setTimeout(resolve, OWN_CREATE_SETTLE_INTERVAL_MS));
         lookup = await lookUp();
       }
+      // Still nothing stored: the request that made this conversation died
+      // before its first message, or is slower than the wait. A correct
+      // retry completes it rather than being stranded on a 409.
+      if (lookup.kind === 'none' && (await adoptable(thread))) {
+        await sendCreate({ createOnly: false, created: false });
+        return;
+      }
       if (lookup.kind === 'replay') {
         res.json({
           success: true,
@@ -8116,97 +8129,134 @@ router.post('/threads', async (req: Request, res: Response) => {
       });
     };
 
+    // A conversation this person's own earlier attempt created and then died
+    // in before its first message landed (the thread, its participants and
+    // the message are separate writes): no message, this create's title, and
+    // exactly this create's inklings with nobody else but this person. Two
+    // retries adopting it at once are settled by the client-message index.
+    const adoptable = async (thread: KeyedThread): Promise<boolean> => {
+      if (thread.created_by_user_id !== authReq.inkUserId) return false;
+      if ((thread.title ?? null) !== boundThreadTitle(title || null)) return false;
+      const { data: anyMessage, error: messageError } = await supabase
+        .from('inbox_thread_messages')
+        .select('id')
+        .eq('thread_id', thread.id)
+        .limit(1);
+      if (messageError) throw new Error(`Failed to read the conversation: ${messageError.message}`);
+      if ((anyMessage ?? []).length > 0) return false;
+      const { data: members, error: membersError } = await supabase
+        .from('inbox_thread_participants')
+        .select('sb_id, user_id')
+        .eq('thread_id', thread.id);
+      if (membersError) {
+        throw new Error(`Failed to read the conversation's members: ${membersError.message}`);
+      }
+      const rows = (members ?? []) as Array<{ sb_id: string | null; user_id: string | null }>;
+      if (rows.some((r) => r.user_id && r.user_id !== authReq.inkUserId)) return false;
+      const present = new Set(rows.map((r) => r.sb_id).filter((id): id is string => !!id));
+      let requested: SbPrincipal[];
+      try {
+        requested = await resolveSbsInWorkspace(supabase, authReq.inkWorkspaceId, uniqueRecipients);
+      } catch {
+        return false;
+      }
+      return present.size === requested.length && requested.every((sb) => present.has(sb.sbId));
+    };
+
+    const sendCreate = async (send: { createOnly: boolean; created: boolean }): Promise<void> => {
+      let result: Awaited<ReturnType<typeof handleSendToInbox>>;
+      try {
+        result = await handleSendToInbox(
+          {
+            userId: authReq.inkUserId,
+            threadKey: key,
+            content,
+            // A studio-pinned send is the handler's single-recipient form; the
+            // group form (recipients[]) cannot carry a studio.
+            ...(studioSlug
+              ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
+              : { recipients: uniqueRecipients, triggerAll: true }),
+            ...(title ? { subject: title } : {}),
+            ...(priority ? { priority } : {}),
+            metadata: {
+              sentBy: 'user',
+              channel: 'admin-api',
+              ...(clientMessageId.value
+                ? { clientMessageId: clientMessageId.value, pcp: { createRequest } }
+                : {}),
+            },
+          },
+          dataComposer,
+          // The person is the sender, in the workspace the middleware resolved —
+          // server-side context the public tool schema never carries (§3, §6).
+          // A client-identified create must create: if a concurrent request
+          // takes the key first, the handler refuses before writing anything.
+          {
+            sender: {
+              principal: userPrincipal(authReq.inkUserId),
+              workspaceId: authReq.inkWorkspaceId,
+            },
+            ...(send.createOnly ? { createOnly: true } : {}),
+          }
+        );
+      } catch (error) {
+        // A concurrent request took the key first, or stored this client
+        // message id first (two adopting retries). The thread decides the
+        // answer: a replay of the same submission, or a 409.
+        if (
+          clientMessageId.value &&
+          (error instanceof ThreadKeyTakenError || isClientMessageConflict(error))
+        ) {
+          const taken = await findThread();
+          if (taken) {
+            await answerForExistingThread(taken);
+            return;
+          }
+        }
+        throw error;
+      }
+
+      const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
+      const parsed = JSON.parse(text) as Record<string, unknown> & {
+        success?: boolean;
+        error?: string;
+        messageId?: string;
+        threadId?: string;
+        warning?: string;
+        threadKeyWarning?: string;
+      };
+
+      if (parsed.messageId == null && parsed.success === false) {
+        // Nothing was stored: an unknown recipient, a refused key. That is the
+        // caller's mistake to fix, not a server fault.
+        res.status(400).json({ error: parsed.error || 'Could not start the thread' });
+        return;
+      }
+
+      const delivery = deliveryFromSendResult(parsed);
+      if (clientMessageId.value && parsed.messageId) {
+        await recordDelivery(supabase, parsed.messageId, delivery);
+      }
+
+      res.json({
+        success: true,
+        created: send.created,
+        messageId: parsed.messageId ?? null,
+        threadId: parsed.threadId ?? existing?.id ?? null,
+        threadKey: key,
+        warning: parsed.warning ?? null,
+        threadKeyWarning: parsed.threadKeyWarning ?? null,
+        delivery,
+        replayed: false,
+      });
+    };
+
     const existing = await findThread();
     if (clientMessageId.value && existing) {
       await answerForExistingThread(existing);
       return;
     }
-
-    let result: Awaited<ReturnType<typeof handleSendToInbox>>;
-    try {
-      result = await handleSendToInbox(
-        {
-          userId: authReq.inkUserId,
-          threadKey: key,
-          content,
-          // A studio-pinned send is the handler's single-recipient form; the
-          // group form (recipients[]) cannot carry a studio.
-          ...(studioSlug
-            ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
-            : { recipients: uniqueRecipients, triggerAll: true }),
-          ...(title ? { subject: title } : {}),
-          ...(priority ? { priority } : {}),
-          metadata: {
-            sentBy: 'user',
-            channel: 'admin-api',
-            ...(clientMessageId.value
-              ? { clientMessageId: clientMessageId.value, pcp: { createRequest } }
-              : {}),
-          },
-        },
-        dataComposer,
-        // The person is the sender, in the workspace the middleware resolved —
-        // server-side context the public tool schema never carries (§3, §6).
-        // A client-identified create must create: if a concurrent request
-        // takes the key first, the handler refuses before writing anything.
-        {
-          sender: {
-            principal: userPrincipal(authReq.inkUserId),
-            workspaceId: authReq.inkWorkspaceId,
-          },
-          ...(clientMessageId.value ? { createOnly: true } : {}),
-        }
-      );
-    } catch (error) {
-      // A concurrent request took the key first (or, belt and braces, stored
-      // this client message id first). The thread it made decides the answer:
-      // a replay of the same submission, or a 409.
-      if (
-        clientMessageId.value &&
-        (error instanceof ThreadKeyTakenError || isClientMessageConflict(error))
-      ) {
-        const taken = await findThread();
-        if (taken) {
-          await answerForExistingThread(taken);
-          return;
-        }
-      }
-      throw error;
-    }
-
-    const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
-    const parsed = JSON.parse(text) as Record<string, unknown> & {
-      success?: boolean;
-      error?: string;
-      messageId?: string;
-      threadId?: string;
-      warning?: string;
-      threadKeyWarning?: string;
-    };
-
-    if (parsed.messageId == null && parsed.success === false) {
-      // Nothing was stored: an unknown recipient, a refused key. That is the
-      // caller's mistake to fix, not a server fault.
-      res.status(400).json({ error: parsed.error || 'Could not start the thread' });
-      return;
-    }
-
-    const delivery = deliveryFromSendResult(parsed);
-    if (clientMessageId.value && parsed.messageId) {
-      await recordDelivery(supabase, parsed.messageId, delivery);
-    }
-
-    res.json({
-      success: true,
-      created: !existing,
-      messageId: parsed.messageId ?? null,
-      threadId: parsed.threadId ?? existing?.id ?? null,
-      threadKey: key,
-      warning: parsed.warning ?? null,
-      threadKeyWarning: parsed.threadKeyWarning ?? null,
-      delivery,
-      replayed: false,
-    });
+    await sendCreate({ createOnly: !!clientMessageId.value, created: !existing });
   } catch (error) {
     logger.error('Failed to start thread:', error);
     res.status(500).json(errorJson('Failed to start thread', error));

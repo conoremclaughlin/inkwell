@@ -132,6 +132,8 @@ interface Script {
   beforeStore?: (thread: Row) => void;
   /** Fails after the store, before dispatch: a request that died mid-send. */
   failAfterStore?: boolean;
+  /** Dies after creating the thread and its participants, before storing the message. */
+  dieBeforeStore?: boolean;
 }
 
 let script: Script;
@@ -156,18 +158,30 @@ function participants(): string[] {
   const thread = db.rows('inbox_threads').find((t) => t.thread_key === KEY);
   return db
     .rows('inbox_thread_participants')
-    .filter((p) => p.thread_id === thread?.id)
+    .filter((p) => p.thread_id === thread?.id && p.sb_slug)
     .map((p) => String(p.sb_slug))
     .sort();
 }
 
+/** SB participant rows as the handler writes them (sb_id), with the slug kept for reading. */
 function addParticipants(thread: Row, slugs: string[]): void {
   for (const slug of slugs) {
     const there = db
       .rows('inbox_thread_participants')
       .some((p) => p.thread_id === thread.id && p.sb_slug === slug);
-    if (!there) db.seed('inbox_thread_participants', { thread_id: thread.id, sb_slug: slug });
+    if (!there) {
+      db.seed('inbox_thread_participants', {
+        thread_id: thread.id,
+        sb_id: `sb-${slug}`,
+        sb_slug: slug,
+        user_id: null,
+      });
+    }
   }
+}
+
+function addPerson(thread: Row, userId: string): void {
+  db.seed('inbox_thread_participants', { thread_id: thread.id, sb_id: null, user_id: userId });
 }
 
 /** A conversation another request already created under KEY, with its own first message. */
@@ -182,6 +196,7 @@ function seedConversation(
     created_by_user_id: createdBy,
   });
   addParticipants(thread, slugs);
+  addPerson(thread, createdBy);
   if (firstMessage) storeMessage(thread, firstMessage.content, firstMessage.metadata, createdBy);
   return thread;
 }
@@ -189,6 +204,16 @@ function seedConversation(
 beforeEach(() => {
   vi.clearAllMocks();
   db = createInklingDb();
+  for (const slug of ['wren', 'lumen']) {
+    db.seed('agent_identities', {
+      id: `sb-${slug}`,
+      user_id: ME,
+      workspace_id: WORKSPACE,
+      agent_id: slug,
+      name: slug,
+      metadata: {},
+    });
+  }
   wakes = [];
   script = { recipients: ['wren', 'lumen'], triggered: ['wren', 'lumen'] };
   mockGetParticipants.mockResolvedValue([
@@ -216,15 +241,19 @@ beforeEach(() => {
         .rows('inbox_threads')
         .find((t) => t.thread_key === args.threadKey && t.workspace_id === workspaceId);
       if (thread && internal.createOnly) throw new ThreadKeyTakenError(String(args.threadKey));
-      thread ??= db.seed('inbox_threads', {
-        thread_key: args.threadKey,
-        workspace_id: workspaceId,
-        created_by_user_id: internal.sender.principal.userId,
-      });
+      if (!thread) {
+        thread = db.seed('inbox_threads', {
+          thread_key: args.threadKey,
+          workspace_id: workspaceId,
+          created_by_user_id: internal.sender.principal.userId,
+        });
+        addPerson(thread, internal.sender.principal.userId);
+      }
       addParticipants(
         thread,
         (args.recipients as string[] | undefined) ?? [String(args.recipientSlug)]
       );
+      if (script.dieBeforeStore) throw new Error('connection reset');
       script.beforeStore?.(thread);
 
       const metadata = args.metadata as Row;
@@ -262,7 +291,7 @@ beforeEach(() => {
               // and woken, including participants nobody requested.
               dispatched: db
                 .rows('inbox_thread_participants')
-                .filter((p) => p.thread_id === thread.id)
+                .filter((p) => p.thread_id === thread.id && p.sb_slug)
                 .map((p) => ({ sbSlug: p.sb_slug, wake: true })),
               triggered: script.triggered,
               ...script.extra,
@@ -568,6 +597,58 @@ describe('a client-identified create never changes who is in a conversation', ()
     expect(participants()).toEqual(['wren']);
     expect(stored().map((m) => m.content)).toEqual(['just you']);
     expect(wakes).toEqual([]);
+  });
+
+  describe('a create that died between making the thread and storing its message', () => {
+    // Review 15fac9a8 (P2): the thread, its participants and the first
+    // message are separate writes. A correct retry must not be stranded on a
+    // 409 by the empty conversation its own dead original left behind.
+    async function dieAfterCreatingTheThread(body: Record<string, unknown>): Promise<void> {
+      script.dieBeforeStore = true;
+      const died = await call(create, createBody(body));
+      expect(died._status).toBe(500);
+      expect(stored()).toHaveLength(0);
+      script.dieBeforeStore = false;
+    }
+
+    it('a correct retry adopts the empty conversation and stores exactly one message', async () => {
+      await dieAfterCreatingTheThread({ clientMessageId: CMID });
+      const retry = await call(create, createBody({ clientMessageId: CMID }));
+      expect(retry._status).toBe(200);
+      expect(retry._json).toMatchObject({ success: true, replayed: false });
+      expect(stored()).toHaveLength(1);
+      expect(stored()[0].id).toBe(retry._json.messageId);
+      expect(participants()).toEqual(['lumen', 'wren']);
+
+      // And a retry of that retry replays it.
+      const again = await call(create, createBody({ clientMessageId: CMID }));
+      expect(again._json).toMatchObject({ messageId: retry._json.messageId, replayed: true });
+    });
+
+    it('a retry naming different inklings is still a 409, and nobody is added', async () => {
+      await dieAfterCreatingTheThread({ recipients: ['wren'], clientMessageId: CMID });
+      const res = await call(
+        create,
+        createBody({ recipients: ['wren', 'lumen'], clientMessageId: CMID })
+      );
+      expect(res._status).toBe(409);
+      expect(participants()).toEqual(['wren']);
+      expect(stored()).toHaveLength(0);
+    });
+
+    it('a retry with a different title is still a 409', async () => {
+      await dieAfterCreatingTheThread({ title: 'Just us', clientMessageId: CMID });
+      const res = await call(create, createBody({ title: 'Everyone', clientMessageId: CMID }));
+      expect(res._status).toBe(409);
+      expect(stored()).toHaveLength(0);
+    });
+
+    it('an empty conversation someone else created is never adopted', async () => {
+      seedConversation(['wren', 'lumen'], undefined, 'user-2');
+      const res = await call(create, createBody({ clientMessageId: CMID }));
+      expect(res._status).toBe(409);
+      expect(stored()).toHaveLength(0);
+    });
   });
 
   it('without a client id, a create still continues a thread under its key, as before', async () => {

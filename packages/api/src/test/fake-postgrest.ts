@@ -11,6 +11,12 @@
  * declared per table and refuse a write with 23505, as Postgres does. A
  * table with an updated_at column gets a fresh one on every update, as the
  * canonical trigger does.
+ *
+ * Why not services/sessions/fake-supabase.ts: that fake has no unique
+ * constraints (every insert succeeds, and an array insert becomes one
+ * keyless row), so it cannot raise the 23505 that the awakening and
+ * client-message races turn on. Its lease tests depend on its exact
+ * behaviour, so it was left as it is.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -109,6 +115,7 @@ export class FakeQuery implements PromiseLike<FakeResult> {
   private returning = false;
   private filters: Array<{ label: string; test: (row: Row) => boolean }> = [];
   private ordering: Array<{ column: string; ascending: boolean }> = [];
+  private limitCount: number | undefined;
   private values: Row[] = [];
   private patch: Row = {};
 
@@ -156,6 +163,11 @@ export class FakeQuery implements PromiseLike<FakeResult> {
 
   order(column: string, options: { ascending?: boolean } = {}): this {
     this.ordering.push({ column, ascending: options.ascending !== false });
+    return this;
+  }
+
+  limit(count: number): this {
+    this.limitCount = count;
     return this;
   }
 
@@ -209,7 +221,8 @@ export class FakeQuery implements PromiseLike<FakeResult> {
         return (x < y ? -1 : x > y ? 1 : 0) * (ascending ? 1 : -1);
       });
     }
-    return { data: rows.map((r) => this.project(r)), error: null };
+    const limited = this.limitCount === undefined ? rows : rows.slice(0, this.limitCount);
+    return { data: limited.map((r) => this.project(r)), error: null };
   }
 
   private runInsert(): FakeResult<Row[]> {
