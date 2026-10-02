@@ -26,6 +26,7 @@ import {
   SessionService,
   RoutingRefusedError,
   type SessionServiceConfig,
+  type StudiolessPresencePlacement,
 } from './services/sessions';
 import type {
   SessionRequest,
@@ -1275,8 +1276,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // Only a delivery that actually admits a spawn provisions, inside
     // handleMessage's own full resolution below.
     try {
+      // The plan's studioless-presence decision. The stamp's winner, and a
+      // newer stamp met during repair, are tested against it, so neither is
+      // judged by a different decision than the routed candidate (task
+      // bd4657a0). Stays null if the plan never reached routing.
+      let studiolessPresence: StudiolessPresencePlacement | null = null;
       const routedSession = await sessionService!.getOrCreateSession(userId, targetSlug, {
         planOnly: true,
+        onStudiolessPresence: (placement) => {
+          studiolessPresence = placement;
+        },
         threadKey: payload.threadKey,
         alias: payload.sessionKey,
         studioId: payload.studioId,
@@ -1352,7 +1361,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                   userId,
                   resolvedIdentityId,
                   payload.threadKey,
-                  winner
+                  winner,
+                  studiolessPresence
                 )
               : false;
             if (winner && winnerAllowed) {
@@ -1402,7 +1412,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                       userId,
                       resolvedIdentityId,
                       payload.threadKey,
-                      newer
+                      newer,
+                      studiolessPresence
                     )
                   : false;
                 if (newer && newerAllowed) {

@@ -113,6 +113,12 @@ export interface Session {
   sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
+  /**
+   * The directory the session's process last reported running in (CLI hooks
+   * and update_session_state write it; routing never does). Read-only here:
+   * it is repository evidence for a studioless session, never a placement.
+   */
+  workingDir?: string;
   /** Contact scope for per-sender session isolation */
   contactId?: string;
   /** Backend-specific session ID for resume (Claude Code, Codex thread UUID, Gemini session) */
