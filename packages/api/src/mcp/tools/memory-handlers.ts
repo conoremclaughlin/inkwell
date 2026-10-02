@@ -361,6 +361,7 @@ const topicsSchema = z
 // Moved to services/memory/knowledge-summary.ts so the ContextBuilder can use
 // the same budgeted renderer. Re-exported here for existing importers.
 import { buildKnowledgeSummary } from '../../services/memory/knowledge-summary';
+import { isUnnamed, nameOf } from '../../services/identity-name';
 import { resolveCallerWorkspace } from './caller-principal';
 
 export { buildKnowledgeSummary };
@@ -2616,6 +2617,28 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
 // ==============================================// BOOTSTRAP HANDLER
 // ==============================================
 /**
+ * Who bootstrap tells the calling SB it is. An inkling that hasn't been named
+ * yet gets a null name and a plain statement of that, never its stored
+ * placeholder: its first act on waking is to call bootstrap.
+ */
+export function bootstrapAgentInfo(dbIdentity: Record<string, unknown>): {
+  name: string | null;
+  role: string;
+  capabilities: Record<string, unknown> | null;
+  naming?: string;
+} {
+  const identity = dbIdentity as { name: string; metadata?: unknown };
+  return {
+    name: nameOf(identity),
+    role: dbIdentity.role as string,
+    capabilities: dbIdentity.capabilities as Record<string, unknown> | null,
+    ...(isUnnamed(identity)
+      ? { naming: "You haven't been named yet. The person may name you, or never; don't ask." }
+      : {}),
+  };
+}
+
+/**
  * Bootstrap loads identity core + active context in one call.
  * This is the recommended way to start a new session.
  *
@@ -2889,13 +2912,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     : null;
 
   // Build agent info from dbIdentity
-  const agentInfo = dbIdentity
-    ? {
-        name: dbIdentity.name as string,
-        role: dbIdentity.role as string,
-        capabilities: dbIdentity.capabilities as Record<string, unknown> | null,
-      }
-    : null;
+  const agentInfo = dbIdentity ? bootstrapAgentInfo(dbIdentity) : null;
 
   // Build knowledge summary (or use cache for the text)
   let knowledgeSummaryResult: ReturnType<typeof buildKnowledgeSummary> | null = null;
@@ -3046,7 +3063,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             dbIdentity: dbIdentity
               ? {
                   sbSlug: dbIdentity.agent_id,
-                  name: dbIdentity.name,
+                  name: nameOf(dbIdentity as { name: string; metadata?: unknown }),
                   role: dbIdentity.role,
                   description: dbIdentity.description,
                   values: dbIdentity.values,

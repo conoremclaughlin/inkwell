@@ -21,6 +21,32 @@ import { formatInjectedContext, mapAgentIdentity } from '../sessions/context-bui
 import { buildIdentityPrompt } from '../sessions/claude-runner';
 import type { InjectedContext } from '../sessions/types';
 import { createInklingDb } from '../../test/fake-inkling-db';
+import { bootstrapAgentInfo } from '../../mcp/tools/memory-handlers';
+import { nameOf } from '../identity-name';
+
+describe('what bootstrap and the identity reads say an inkling is called (review edf2c819)', () => {
+  it('bootstrap gives an unnamed inkling no name, says so, and never the placeholder', async () => {
+    const row = (await awakenedRow()) as Record<string, unknown>;
+    const info = bootstrapAgentInfo(row);
+    expect(info.name).toBeNull();
+    expect(info.naming).toMatch(/haven't been named yet/);
+    expect(JSON.stringify(info)).not.toContain('Unnamed inkling');
+    // The same rule at get_identity, list_identities and meet_family.
+    expect(nameOf(row as { name: string; metadata?: unknown })).toBeNull();
+  });
+
+  it('once named, bootstrap and the identity reads say its name', async () => {
+    const row = (await awakenedRow('Pip')) as Record<string, unknown>;
+    expect(bootstrapAgentInfo(row)).toEqual({ name: 'Pip', role: 'Inkling', capabilities: [] });
+    expect(nameOf(row as { name: string; metadata?: unknown })).toBe('Pip');
+  });
+
+  it('an SB with no naming flag keeps its stored name everywhere', () => {
+    const myra = { name: 'Myra', role: 'Personal SB', capabilities: [], metadata: {} };
+    expect(bootstrapAgentInfo(myra).name).toBe('Myra');
+    expect(nameOf(myra)).toBe('Myra');
+  });
+});
 
 const ME = {
   userId: '11111111-1111-4111-8111-111111111111',

@@ -21,6 +21,7 @@ import { MemoryRepository } from '../../data/repositories/memory-repository.js';
 import { buildKnowledgeSummary } from '../memory/knowledge-summary.js';
 import type { Memory } from '../../data/models/memory.js';
 import { logger } from '../../utils/logger.js';
+import { isUnnamed } from '../identity-name.js';
 
 /** Matches the `bootstrap` defaults so both paths select the same memories. */
 const HIGH_MEMORY_LIMIT = 10;
@@ -36,7 +37,7 @@ type DbContact = Database['public']['Tables']['contacts']['Row'];
  */
 export function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
   // Keyed off the stored flag, never off the placeholder text.
-  const unnamed = (row.metadata as { named?: unknown } | null)?.named === false;
+  const unnamed = isUnnamed(row);
   return {
     sbSlug: row.agent_id,
     name: row.name,
