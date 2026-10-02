@@ -224,6 +224,9 @@ describe.skipIf(!ADMIN_URL)('inkling self-serve awakening migration (throwaway P
   const REDEEM_SELF_SERVE = `SELECT * FROM public.redeem_kindle_token(
       p_token => $1, p_new_user_id => $2, p_workspace_id => $3, p_identity => $4::jsonb,
       p_kindle_method => 'self_serve')`;
+  const REDEEM_SELF_SERVE_CAPPED = `SELECT * FROM public.redeem_kindle_token(
+      p_token => $1, p_new_user_id => $2, p_workspace_id => $3, p_identity => $4::jsonb,
+      p_kindle_method => 'self_serve', p_awaken_cap => $5)`;
   const REDEEM_DEFAULT = `SELECT * FROM public.redeem_kindle_token(
       p_token => $1, p_new_user_id => $2, p_workspace_id => $3, p_identity => $4::jsonb)`;
 
@@ -503,6 +506,93 @@ describe.skipIf(!ADMIN_URL)('inkling self-serve awakening migration (throwaway P
       }
     });
 
+    /** One capped self-serve awakening with a fresh request id: the error, or null. */
+    async function awakenCapped(
+      who: { userId: string; workspaceId: string },
+      cap: number | null,
+      client: Client = db
+    ): Promise<PgError | null> {
+      const args = [
+        await ownToken(who.userId),
+        who.userId,
+        who.workspaceId,
+        JSON.stringify(identity(randomUUID())),
+        cap,
+      ];
+      return client.query(REDEEM_SELF_SERVE_CAPPED, args).then(
+        () => null,
+        (e: PgError) => e
+      );
+    }
+
+    it('the awakening cap refuses the one past it, whole: IK001, token still active', async () => {
+      const who = await person();
+      expect(await awakenCapped(who, 2)).toBeNull();
+      expect(await awakenCapped(who, 2)).toBeNull();
+      const third = await ownToken(who.userId);
+      const error = await db
+        .query(REDEEM_SELF_SERVE_CAPPED, [
+          third,
+          who.userId,
+          who.workspaceId,
+          JSON.stringify(identity(randomUUID())),
+          2,
+        ])
+        .then(
+          () => null,
+          (e: PgError) => e
+        );
+      expect(error?.code).toBe('IK001');
+      expect(await countLineages(who.userId)).toBe(2);
+      expect(await tokenStatus(third)).toBe('active');
+    });
+
+    it('no cap given, or NULL, is no cap; a referral never counts against it', async () => {
+      const who = await person();
+      for (let i = 0; i < 3; i++) {
+        await db.query(REDEEM_SELF_SERVE, [
+          await ownToken(who.userId),
+          who.userId,
+          who.workspaceId,
+          JSON.stringify(identity(randomUUID())),
+        ]);
+      }
+      expect(await awakenCapped(who, null)).toBeNull();
+      expect(await countLineages(who.userId)).toBe(4);
+
+      const other = await person();
+      await db.query(REDEEM_DEFAULT, [
+        await ownToken(other.userId),
+        other.userId,
+        other.workspaceId,
+        JSON.stringify(identity(randomUUID())),
+      ]);
+      expect(await awakenCapped(other, 1)).toBeNull();
+    });
+
+    it('two racing awakenings one below the cap: the second waits on the person lock, then is refused', async () => {
+      const who = await person();
+      expect(await awakenCapped(who, 2)).toBeNull();
+      const [a, b] = await raceClients();
+      try {
+        await a.client.query('BEGIN');
+        await b.client.query('BEGIN');
+        expect(await awakenCapped(who, 2, a.client)).toBeNull();
+
+        const pending = awakenCapped(who, 2, b.client);
+        // B is genuinely concurrent: it is parked on A's per-person lock.
+        await waitUntilBlocked(b.pid);
+        await a.client.query('COMMIT');
+
+        expect((await pending)?.code).toBe('IK001');
+        await b.client.query('ROLLBACK');
+      } finally {
+        await a.client.end();
+        await b.client.end();
+      }
+      expect(await countLineages(who.userId)).toBe(2);
+    }, 20_000);
+
     it('stays service-role only, with one signature', async () => {
       const signatures = await db.query(
         `SELECT pg_get_function_identity_arguments(p.oid) AS args
@@ -511,10 +601,10 @@ describe.skipIf(!ADMIN_URL)('inkling self-serve awakening migration (throwaway P
       );
       expect(signatures.rows).toEqual([
         {
-          args: 'p_token text, p_new_user_id uuid, p_workspace_id uuid, p_identity jsonb, p_kindle_method text',
+          args: 'p_token text, p_new_user_id uuid, p_workspace_id uuid, p_identity jsonb, p_kindle_method text, p_awaken_cap integer',
         },
       ]);
-      const fn = 'public.redeem_kindle_token(text, uuid, uuid, jsonb, text)';
+      const fn = 'public.redeem_kindle_token(text, uuid, uuid, jsonb, text, integer)';
       const grants = await one<Record<string, boolean>>(
         `SELECT has_function_privilege('anon', $1, 'EXECUTE') AS anon,
                 has_function_privilege('authenticated', $1, 'EXECUTE') AS authenticated,

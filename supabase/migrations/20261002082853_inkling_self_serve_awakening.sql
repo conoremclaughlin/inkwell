@@ -18,6 +18,10 @@
 --    keeps working against this function; server code that passes it needs
 --    this migration applied first (PROCESS: "When a function is
 --    unavoidable").
+--    It also gains p_awaken_cap (default NULL, no cap): a self-serve
+--    awakening beyond that many for the same person is refused with
+--    SQLSTATE IK001. The count runs under a per-person transaction lock, so
+--    concurrent awakenings cannot pass the cap together.
 --
 -- 2. One identity per awakening request: a client sends the same
 --    awakenRequestId on every retry of one awakening, and this index makes
@@ -38,12 +42,14 @@
 
 DROP FUNCTION IF EXISTS public.redeem_kindle_token(text, uuid, uuid, jsonb);
 DROP FUNCTION IF EXISTS public.redeem_kindle_token(text, uuid, uuid, jsonb, text);
+DROP FUNCTION IF EXISTS public.redeem_kindle_token(text, uuid, uuid, jsonb, text, integer);
 CREATE FUNCTION public.redeem_kindle_token(
   p_token text,
   p_new_user_id uuid,
   p_workspace_id uuid,
   p_identity jsonb,
-  p_kindle_method text DEFAULT 'referral'
+  p_kindle_method text DEFAULT 'referral',
+  p_awaken_cap integer DEFAULT NULL
 ) RETURNS public.kindle_lineage AS $$
 DECLARE
   v_token public.kindle_tokens%ROWTYPE;
@@ -52,11 +58,27 @@ DECLARE
   v_sb_id uuid;
   v_method text := COALESCE(p_kindle_method, 'referral');
   v_self_serve boolean;
+  v_awakened integer;
 BEGIN
   IF v_method NOT IN ('referral', 'self_serve') THEN
     RAISE EXCEPTION 'unsupported kindle method %', v_method;
   END IF;
   v_self_serve := v_method = 'self_serve';
+
+  -- The awakening cap: at most p_awaken_cap self-serve awakenings per person
+  -- (NULL: no cap). The lock is per person and held to the end of this
+  -- transaction, so two awakenings for one person count one after the
+  -- other, and a race cannot take the count past the cap.
+  IF v_self_serve AND p_awaken_cap IS NOT NULL THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended('inkling-awaken:' || p_new_user_id::text, 0));
+    SELECT count(*) INTO v_awakened
+    FROM public.kindle_lineage
+    WHERE child_user_id = p_new_user_id AND kindle_method = 'self_serve';
+    IF v_awakened >= p_awaken_cap THEN
+      RAISE EXCEPTION 'inkling awakening cap reached (% of %)', v_awakened, p_awaken_cap
+        USING ERRCODE = 'IK001';
+    END IF;
+  END IF;
 
   UPDATE public.kindle_tokens
   SET status = 'used', used_by_user_id = p_new_user_id, used_at = now()
@@ -131,8 +153,8 @@ $$ LANGUAGE plpgsql;
 -- Service-role only, as before (Lumen #528 r3 P2), and granted back
 -- explicitly rather than through default privileges (#528 r4 P2-1): the DROP
 -- above took the old grant with it.
-REVOKE ALL ON FUNCTION public.redeem_kindle_token(text, uuid, uuid, jsonb, text) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.redeem_kindle_token(text, uuid, uuid, jsonb, text) TO service_role;
+REVOKE ALL ON FUNCTION public.redeem_kindle_token(text, uuid, uuid, jsonb, text, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.redeem_kindle_token(text, uuid, uuid, jsonb, text, integer) TO service_role;
 
 CREATE UNIQUE INDEX IF NOT EXISTS agent_identities_user_awaken_request_key
   ON public.agent_identities (user_id, (metadata->>'awakenRequestId'))
