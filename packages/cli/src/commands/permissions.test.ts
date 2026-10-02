@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
+import { DEFAULT_CLAUDE_ALLOW_RULES, DEFAULT_CLAUDE_DENY_RULES } from '@inklabs/shared';
 
 const CLI_PATH = join(__dirname, '..', '..', 'dist', 'cli.js');
 
@@ -41,6 +42,15 @@ describe('sb permissions', () => {
     expect(perms.deny).toContain('Bash(rm -rf *)');
     expect(perms.deny).toContain('Bash(git push --force *)');
     expect(perms.deny).toContain('Bash(git reset --hard *)');
+  });
+
+  it('auto writes the one shared list, not a copy of it (design v3, item 6)', () => {
+    runSb(['permissions', 'auto'], tmpDir);
+    const perms = readSettings(tmpDir).permissions as { allow: string[]; deny: string[] };
+    expect(perms.allow).toEqual([...DEFAULT_CLAUDE_ALLOW_RULES]);
+    expect(perms.deny).toEqual([...DEFAULT_CLAUDE_DENY_RULES]);
+    // The drifted copy never had it.
+    expect(perms.allow).toContain('mcp__playwright__*');
   });
 
   it('preserves existing non-permission settings', () => {
