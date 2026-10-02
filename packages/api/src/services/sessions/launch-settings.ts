@@ -24,11 +24,15 @@
  * the checkout's path in the filesystem the session executes in (`/studio`
  * inside a container) as `//abs/**`, or kept when it is home-anchored (`~/`).
  *
- * AUTHORED POLICY IS KEPT AT LAUNCH TOO. When the worktree's own settings
- * hold a permissions object other than the generated profile (an empty
- * object, mode-only, deny-only and so on), the launch file carries no
- * permissions: injecting the profile into the process would replace the
- * authored policy there, as surely as overwriting the file would.
+ * A BUILDER'S AUTHORED POLICY IS KEPT AT LAUNCH TOO. When a builder
+ * worktree's own settings hold a permissions object other than the
+ * generated profile (an empty object, mode-only, deny-only and so on), the
+ * launch file carries no permissions: injecting the profile into the
+ * process would replace the authored policy there, as surely as
+ * overwriting the file would. A REVIEWER ALWAYS GETS ITS PROFILE: its
+ * checkout is the code under review, which can track that file to suppress
+ * the denies, and since deny wins across sources (documented, not
+ * measured) delivering them only adds restrictions.
  *
  * FAILS CLOSED. An unknown profile, an owner that cannot name a scratch
  * path, a root that is not absolute, or a worktree settings file that cannot
@@ -177,7 +181,11 @@ export async function prepareLaunchSettings(req: LaunchSettingsRequest): Promise
       if (!isPlainObject(parsed.permissions)) {
         throw new LaunchSettingsError(`${localPath}: permissions is not an object`);
       }
-      authored = JSON.stringify(parsed.permissions) !== JSON.stringify(generated);
+      // A builder's own policy stands. A reviewer's checkout is the code under
+      // review, which can track this file to suppress the profile, so a
+      // reviewer always gets it (review 44db8c0c, P2 3).
+      authored =
+        profile === 'builder' && JSON.stringify(parsed.permissions) !== JSON.stringify(generated);
     }
   }
 

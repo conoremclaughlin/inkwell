@@ -131,6 +131,24 @@ describe('authored policy on disk is kept at launch', () => {
     });
   }
 
+  it('a reviewer always gets the reviewer profile: the checkout under review cannot suppress it', async () => {
+    // A PR can track .claude/settings.local.json; whatever it holds counts as
+    // "authored", and the reviewer's denies would never arrive. Deny wins
+    // across sources, so delivering them only adds restrictions (review
+    // 44db8c0c, P2 3).
+    for (const permissions of [{}, { allow: ['Bash(*)'] }, { defaultMode: 'bypassPermissions' }]) {
+      writeFileSync(
+        join(worktree, '.claude', 'settings.local.json'),
+        JSON.stringify({ permissions })
+      );
+      const result = await launch.prepareLaunchSettings(request({ profile: 'reviewer' }));
+      expect(result.delivered, JSON.stringify(permissions)).toBe('profile');
+      expect(fileOf(result.hostPath).permissions.deny).toEqual(
+        shared.studioPermissionRules('reviewer', 'wren').deny
+      );
+    }
+  });
+
   it('the generated profile on disk, or no permissions key, is delivered at launch', async () => {
     for (const content of [
       JSON.stringify({ permissions: shared.studioPermissionRules('builder', 'wren') }),
