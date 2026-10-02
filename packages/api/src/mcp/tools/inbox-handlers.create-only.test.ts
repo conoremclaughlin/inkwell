@@ -175,6 +175,26 @@ describe('createOnly sends', () => {
     expect(tables.inbox_thread_messages).toHaveLength(1);
   });
 
+  it('report every target dispatched to, not only the requested recipients', async () => {
+    // A person addresses Moss in Fern's thread; the reply wakes Fern too, so
+    // a send receipt must judge delivery over both (review bbbbba99, P2 1).
+    const { db } = client(true);
+    const result = await handleSendToInbox(
+      { recipients: ['moss'], threadKey: KEY, content: 'hello', triggerAll: true },
+      { getClient: () => db } as never,
+      { sender: { principal: userPrincipal('user-a'), workspaceId: 'ws-a' } }
+    );
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    expect(parsed.recipients).toEqual(['moss']);
+    const dispatched = [...parsed.dispatched].sort((a: { sbSlug: string }, b: { sbSlug: string }) =>
+      a.sbSlug.localeCompare(b.sbSlug)
+    );
+    expect(dispatched).toEqual([
+      { sbSlug: 'fern', wake: true },
+      { sbSlug: 'moss', wake: true },
+    ]);
+  });
+
   it("control: without createOnly the same interleaving adds Moss to Fern's conversation", async () => {
     const { db, tables } = client(false);
     takeKeyMidSend(db, tables);

@@ -1153,6 +1153,11 @@ export async function handleSendToInbox(
             ...(prefixWarning ? { threadKeyWarning: prefixWarning } : {}),
             recipients: allRecipients,
             participants: participantSbs.map((p) => p.sbSlug),
+            // Who this send actually routed to, which can be wider than
+            // `recipients` (a reply wakes the thread's other SBs too), and
+            // whether each was meant to be woken. A send receipt judges
+            // delivery from this, never from the requested list.
+            dispatched: routingSet.map((t) => ({ sbSlug: t.sbSlug, wake: wakeIds.has(t.sbId) })),
             messageType,
             priority,
             triggered: triggeredAgents,

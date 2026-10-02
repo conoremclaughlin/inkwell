@@ -175,6 +175,7 @@ beforeEach(() => {
               messageId: (data as Row).id,
               threadId: thread.id,
               recipients,
+              dispatched: recipients.map((sbSlug) => ({ sbSlug, wake: true })),
               triggered: recipients,
             }),
           },

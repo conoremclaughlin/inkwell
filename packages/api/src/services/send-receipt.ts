@@ -72,15 +72,33 @@ function slugList(value: unknown): string[] | null {
   return value.filter((v): v is string => typeof v === 'string').map((v) => v.toLowerCase());
 }
 
+/** The handler's `dispatched`: every target it routed to, and whether each was meant to wake. */
+function dispatchedTargets(value: unknown): Array<{ sbSlug: string; wake: boolean }> | null {
+  if (!Array.isArray(value)) return null;
+  const targets = new Map<string, boolean>();
+  for (const entry of value) {
+    const { sbSlug, wake } = (entry ?? {}) as { sbSlug?: unknown; wake?: unknown };
+    if (typeof sbSlug !== 'string') continue;
+    const slug = sbSlug.toLowerCase();
+    targets.set(slug, targets.get(slug) === true || wake === true);
+  }
+  return [...targets].map(([sbSlug, wake]) => ({ sbSlug, wake }));
+}
+
 /**
- * The delivery a send handler's result proves. Reads the handler's own
- * fields: `recipients` (who was dispatched to), `triggered` (whose wake was
- * accepted) and `routingFailures` (whose routing stamp failed).
+ * The delivery a send handler's result proves, from its own fields:
+ * `dispatched` (every target it routed to, which can be wider than the
+ * requested recipients, and whether each was meant to wake), `triggered`
+ * (whose wake was accepted) and `routingFailures` (whose routing stamp
+ * failed). A target is delivered when its stamp held and, if it was meant
+ * to wake, its wake was accepted. Without `dispatched` and `triggered` there
+ * is no evidence and the answer is `unknown`: the requested list says who
+ * was asked for, not who was routed to.
  */
 export function deliveryFromSendResult(result: Record<string, unknown>): Delivery {
-  const recipients = slugList(result.recipients);
+  const dispatched = dispatchedTargets(result.dispatched);
   const triggered = slugList(result.triggered);
-  if (!recipients || recipients.length === 0 || !triggered) return { ...UNKNOWN_DELIVERY };
+  if (!dispatched || dispatched.length === 0 || !triggered) return { ...UNKNOWN_DELIVERY };
 
   const failed = new Set(
     (Array.isArray(result.routingFailures) ? result.routingFailures : [])
@@ -89,11 +107,13 @@ export function deliveryFromSendResult(result: Record<string, unknown>): Deliver
       .map((s) => s.toLowerCase())
   );
   const woken = new Set(triggered);
-  const unrouted = [...new Set(recipients)].filter((s) => failed.has(s) || !woken.has(s));
+  const unrouted = dispatched
+    .filter((t) => failed.has(t.sbSlug) || (t.wake && !woken.has(t.sbSlug)))
+    .map((t) => t.sbSlug);
   const status: DeliveryStatus =
     unrouted.length === 0
       ? 'routed'
-      : unrouted.length === new Set(recipients).size
+      : unrouted.length === dispatched.length
         ? 'unrouted'
         : 'partial';
   return { status, unrouted };

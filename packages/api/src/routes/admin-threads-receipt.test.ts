@@ -258,6 +258,12 @@ beforeEach(() => {
               messageId: (data as Row).id,
               threadId: thread.id,
               recipients: script.recipients,
+              // Like the real handler: every SB on the thread is routed to
+              // and woken, including participants nobody requested.
+              dispatched: db
+                .rows('inbox_thread_participants')
+                .filter((p) => p.thread_id === thread.id)
+                .map((p) => ({ sbSlug: p.sb_slug, wake: true })),
               triggered: script.triggered,
               ...script.extra,
             }),
@@ -632,10 +638,47 @@ describe('delivery status from positive evidence', () => {
     expect(
       deliveryFromSendResult({ messageId: 'm', recipients: ['wren'], routingFailures: [] })
     ).toEqual({ status: 'unknown', unrouted: [] });
-    expect(deliveryFromSendResult({ messageId: 'm', recipients: [], triggered: [] })).toEqual({
+    expect(deliveryFromSendResult({ messageId: 'm', dispatched: [], triggered: [] })).toEqual({
       status: 'unknown',
       unrouted: [],
     });
+    // The requested list is not evidence of who was routed to.
+    expect(
+      deliveryFromSendResult({ messageId: 'm', recipients: ['wren'], triggered: ['wren'] })
+    ).toEqual({ status: 'unknown', unrouted: [] });
+  });
+
+  it('a target routed without a wake (routeOnly) is delivered once its stamp holds', () => {
+    expect(
+      deliveryFromSendResult({
+        dispatched: [
+          { sbSlug: 'wren', wake: true },
+          { sbSlug: 'lumen', wake: false },
+        ],
+        triggered: ['wren'],
+      })
+    ).toEqual({ status: 'routed', unrouted: [] });
+    expect(
+      deliveryFromSendResult({
+        dispatched: [
+          { sbSlug: 'wren', wake: true },
+          { sbSlug: 'lumen', wake: false },
+        ],
+        triggered: ['wren'],
+        routingFailures: [{ sbSlug: 'lumen', error: 'x' }],
+      })
+    ).toEqual({ status: 'partial', unrouted: ['lumen'] });
+  });
+
+  it("a participant nobody requested still counts: its failed routing is not 'routed'", async () => {
+    // Thread K holds wren and lumen; the person addresses only wren. The
+    // handler wakes both, and lumen's routing fails (review bbbbba99, P2 1).
+    seedConversation(['wren', 'lumen']);
+    script.recipients = ['wren'];
+    script.triggered = ['wren', 'lumen'];
+    script.routingFailures = [{ sbSlug: 'lumen', error: 'no live session' }];
+    const res = await call(create, createBody({ recipients: ['wren'] }));
+    expect(res._json.delivery).toEqual({ status: 'partial', unrouted: ['lumen'] });
   });
 
   it('a replay of a message stored before dispatch finished reports unknown', async () => {
