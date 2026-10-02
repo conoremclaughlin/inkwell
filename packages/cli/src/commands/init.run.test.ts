@@ -20,7 +20,11 @@ import {
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { auditStudio } from '@inklabs/shared';
-import { detectWorktree, runInit, studioNameFromPath } from './init.js';
+// Namespace imports: against a tree without the profiles or the new flags,
+// each test that needs one fails on its own.
+import * as shared from '@inklabs/shared';
+import { Command } from 'commander';
+import { detectWorktree, registerInitCommand, runInit, studioNameFromPath } from './init.js';
 import type { StepResult } from '../lib/studio-complete.js';
 
 let root: string;
@@ -132,10 +136,10 @@ describe('runInit in a linked worktree', () => {
         purpose: 'alpha work',
       })
     );
-    const settings = readJson(join(studio, '.claude', 'settings.local.json')) as {
-      permissions: { allow: string[] };
-    };
-    expect(settings.permissions.allow).toEqual(['Bash(git *)']);
+    // The builder profile, not the main worktree's rules: `ink init` is the
+    // path every server creator takes, and none of them passes inheritance.
+    const settings = readJson(join(studio, '.claude', 'settings.local.json'));
+    expect(settings.permissions).toEqual(shared.studioPermissionRules('builder', 'wren'));
   });
 
   it('--no-root-sync and --no-studio-setup turn the two switches off', async () => {
@@ -294,5 +298,62 @@ describe('runInit in the main worktree', () => {
     expect(JSON.stringify(settings.hooks)).toContain('hooks on-stop --backend claude-code');
     expect(existsSync(join(main, '.codex', 'config.toml'))).toBe(true);
     expect(existsSync(join(main, '.gemini', 'settings.json'))).toBe(true);
+  });
+});
+
+describe('runInit permission options (design v3 items 3 and 5)', () => {
+  it('--inherit-claude-permissions copies the main worktree rules', async () => {
+    await runInit(studio, { agent: 'wren', inheritClaudePermissions: true }, stubs());
+    expect(readJson(join(studio, '.claude', 'settings.local.json')).permissions).toEqual({
+      allow: ['Bash(git *)'],
+      deny: [],
+    });
+  });
+
+  it('--permission-profile reviewer writes the reviewer profile', async () => {
+    await runInit(studio, { agent: 'wren', permissionProfile: 'reviewer' }, stubs());
+    expect(readJson(join(studio, '.claude', 'settings.local.json')).permissions).toEqual(
+      shared.studioPermissionRules('reviewer', 'wren')
+    );
+  });
+
+  it('--no-permissions writes none', async () => {
+    const report = await runInit(studio, { agent: 'wren', permissions: false }, stubs());
+    const settings = readJson(join(studio, '.claude', 'settings.local.json'));
+    expect(settings.permissions).toBeUndefined();
+    expect(report.audit.missing).toEqual(['claude-permissions']);
+  });
+});
+
+describe('ink init flags parse to the options runInit reads', () => {
+  async function parse(args: string[]): Promise<Record<string, unknown>> {
+    const program = new Command();
+    program.exitOverride();
+    registerInitCommand(program);
+    let captured: Record<string, unknown> = {};
+    program.commands
+      .find((c) => c.name() === 'init')!
+      .action((opts: Record<string, unknown>) => {
+        captured = opts;
+      });
+    await program.parseAsync(['node', 'ink', 'init', ...args]);
+    return captured;
+  }
+
+  it('no flag: no inheritance, no profile, permissions on', async () => {
+    const opts = await parse([]);
+    expect(opts.inheritClaudePermissions).toBeUndefined();
+    expect(opts.permissionProfile).toBeUndefined();
+    expect(opts.permissions).not.toBe(false);
+  });
+
+  it('each flag sets its option', async () => {
+    expect((await parse(['--inherit-claude-permissions'])).inheritClaudePermissions).toBe(true);
+    expect((await parse(['--permission-profile', 'reviewer'])).permissionProfile).toBe('reviewer');
+    expect((await parse(['--no-permissions'])).permissions).toBe(false);
+  });
+
+  it('an unknown profile is refused by the parser', async () => {
+    await expect(parse(['--permission-profile', 'admin'])).rejects.toThrow();
   });
 });
