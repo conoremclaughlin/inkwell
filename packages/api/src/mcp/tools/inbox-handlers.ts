@@ -61,6 +61,7 @@ import {
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
+import type { WakeSourceTag } from '../../services/wake-source-breaker.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -375,9 +376,17 @@ export interface InternalSendContext {
    * The trusted server-side sender. A system sender may leave `workspaceId`
    * null: the message lands in the first recipient's workspace, as a
    * watchdog or heartbeat send always has. This context is the ONLY way a
-   * message is authored as the system — no tool call reaches it.
+   * message is authored as the system — no tool call reaches it. Absent, the
+   * sender resolves as it does for a tool call.
    */
-  sender: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  sender?: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
+  /**
+   * A wake source's tag (wake-source-breaker.ts): the trigger handler counts
+   * the wake's completed turn against it. Written to the message metadata
+   * only from here; a `wakeSource` a caller puts in `metadata` is dropped, so
+   * a tool call can never count attempts against someone else's source.
+   */
+  wakeSource?: WakeSourceTag;
 }
 
 export async function handleSendToInbox(
@@ -401,7 +410,7 @@ export async function handleSendToInbox(
     recipientStudioSlug,
     recipientStudioHint,
     relatedArtifactUri,
-    metadata = {},
+    metadata: callerMetadata = {},
     expiresAt,
     triggerType,
     triggerSummary,
@@ -410,6 +419,11 @@ export async function handleSendToInbox(
     triggerAgents,
     sessionAlias,
   } = parsed;
+
+  // The wake-source tag is server-set only (InternalSendContext.wakeSource).
+  const metadata: Record<string, unknown> = { ...callerMetadata };
+  delete metadata.wakeSource;
+  if (internal?.wakeSource) metadata.wakeSource = internal.wakeSource;
 
   // One spelling on the wire: sessionKey, with sessionAlias accepted for a
   // release. Normalised here so the key the resolver sees is the key the

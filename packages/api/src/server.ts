@@ -52,6 +52,7 @@ import {
 import { buildHeartbeatReminderPrompt } from './services/heartbeat-prompt';
 import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
+import { recordWakeSourceCompletion } from './services/wake-source-breaker';
 import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
@@ -1744,6 +1745,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // routingRecovery untouched by this dispatch, so the stamp's generation
     // guard passed.)
     await clearHoldAtTerminal();
+
+    // A completed, admitted wake: count it against its source's no-progress
+    // breaker (spec session-lifecycle-model §5). Only a message a wake source
+    // tagged is counted; never throws.
+    await recordWakeSourceCompletion(dataComposer!, userId, payload.metadata);
 
     // Stamp execution_phase → worker_active now that a session is actually running
     const strategyGroupId =
