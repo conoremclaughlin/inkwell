@@ -170,6 +170,16 @@ describe('SessionService', () => {
       update: vi
         .fn()
         .mockImplementation(async (id, updates) => createMockSession({ id, ...updates })),
+      // The conditional reopen (T4): reports the row reopened from the state
+      // the caller observed.
+      reopenEnded: vi.fn().mockImplementation(async (id, observed) => ({
+        kind: 'reopened',
+        session: createMockSession({
+          id,
+          endedAt: null,
+          lifecycle: observed.lifecycle === 'completed' ? 'idle' : observed.lifecycle,
+        }),
+      })),
       updateTokenUsage: vi.fn().mockResolvedValue(undefined),
       markCompacted: vi.fn().mockResolvedValue(undefined),
       tryAcquireCompactionLock: vi.fn().mockResolvedValue(true),
@@ -2680,6 +2690,11 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.update).mockImplementation(async (id, updates) =>
         id === authoring.id ? { ...authoring, ...updates } : createMockSession({ id, ...updates })
       );
+      vi.mocked(mockRepository.reopenEnded!).mockImplementation(async (id) =>
+        id === authoring.id
+          ? { kind: 'reopened', session: { ...authoring, endedAt: null } }
+          : { kind: 'missing' }
+      );
       // General reuse: what an unanchored reply lands in.
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(home);
 
@@ -2832,12 +2847,38 @@ describe('SessionService', () => {
       const session = await reply(service, { turnEpochCandidate: 'epoch-1' });
 
       expect(session.id).toBe('authoring');
-      expect(mockRepository.update).toHaveBeenCalledWith(
-        'authoring',
-        expect.objectContaining({ endedAt: null })
-      );
+      expect(mockRepository.reopenEnded).toHaveBeenCalledWith('authoring', expect.any(Object));
       expect(mockRepository.create).not.toHaveBeenCalled();
       expect(tables.studios[0].lease).toMatchObject({ sessionId: 'authoring' });
+    });
+
+    it('keeps a newer running turn when another resume reopened the session first (Lumen, #725)', async () => {
+      // The reply read the authoring session ended; a human resume reopened
+      // it and entered running with a new epoch before this reopen landed.
+      const { service } = replyFixture({
+        authoring: { endedAt: new Date(), lifecycle: 'completed' },
+      });
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({
+        kind: 'open',
+        session: createMockSession({
+          id: 'authoring',
+          sbSlug: 'wren',
+          sbId: 'sb-wren',
+          endedAt: null,
+          lifecycle: 'running',
+          turnEpoch: 'epoch-2',
+        }),
+      });
+
+      const session = await reply(service);
+
+      expect(session.id).toBe('authoring');
+      expect(session.lifecycle).toBe('running');
+      expect(session.turnEpoch).toBe('epoch-2');
+      expect(mockRepository.update).not.toHaveBeenCalledWith(
+        'authoring',
+        expect.objectContaining({ lifecycle: 'idle' })
+      );
     });
 
     it('declines when its session key is now held by a live session, and routes without its studio', async () => {
@@ -2849,9 +2890,7 @@ describe('SessionService', () => {
         authoring: { ...inPrStudio, endedAt: new Date(), alias: 'wren:inkwell:pr' },
       });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
-      vi.mocked(mockRepository.update).mockRejectedValueOnce(
-        Object.assign(new Error('duplicate key value'), { code: '23505' })
-      );
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({ kind: 'key-held' });
 
       const session = await reply(service);
 
@@ -3033,10 +3072,7 @@ describe('SessionService', () => {
 
       expect(resumed).toEqual(['backend-authoring', 'backend-authoring']);
       expect(queued.sessionId).toBe('authoring');
-      expect(mockRepository.update).toHaveBeenCalledWith(
-        'authoring',
-        expect.objectContaining({ endedAt: null })
-      );
+      expect(mockRepository.reopenEnded).toHaveBeenCalledWith('authoring', expect.anything());
     });
   });
 
@@ -3727,19 +3763,16 @@ describe('SessionService', () => {
         status: 'completed',
       });
       vi.mocked(mockRepository.findById).mockResolvedValue(ended);
-      vi.mocked(mockRepository.update).mockImplementation(async (_id, updates) => ({
-        ...ended,
-        ...updates,
-      }));
 
       const result = await sessionService.handleMessage(named('ended-session'));
 
       expect(result.success).toBe(true);
       expect(result.sessionId).toBe('ended-session');
-      expect(mockRepository.update).toHaveBeenCalledWith('ended-session', {
-        endedAt: null,
-        lifecycle: 'idle',
-        status: 'active',
+      // A compare-and-set on the state this resolution observed, never an
+      // update by id from the snapshot (Lumen, #725).
+      expect(mockRepository.reopenEnded).toHaveBeenCalledWith('ended-session', {
+        lifecycle: 'completed',
+        status: 'completed',
       });
       expect(mockRepository.create).not.toHaveBeenCalled();
     });
@@ -3758,6 +3791,54 @@ describe('SessionService', () => {
 
       expect(session.id).toBe('ended-session');
       expect(mockRepository.update).not.toHaveBeenCalled();
+      expect(mockRepository.reopenEnded).not.toHaveBeenCalled();
+    });
+
+    it('keeps a newer running turn when another resume reopened the session first', async () => {
+      // Lumen's interleaving (#725): this resolution read the row ended and
+      // completed; a concurrent resume reopened it and entered running with a
+      // new epoch. The conditional reopen finds it open and hands it back as
+      // it stands; nothing writes idle over the newer turn.
+      const stale = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        endedAt: new Date(),
+        lifecycle: 'completed',
+      });
+      const resumed = createMockSession({
+        id: 'ended-session',
+        sbSlug: 'wren',
+        endedAt: null,
+        lifecycle: 'running',
+        turnEpoch: 'epoch-2',
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(stale);
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({
+        kind: 'open',
+        session: resumed,
+      });
+
+      const session = await sessionService.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:210',
+        recipientSessionId: 'ended-session',
+        recipientSessionExplicit: true,
+        recipientSessionNamed: true,
+      });
+
+      expect(session.lifecycle).toBe('running');
+      expect(session.turnEpoch).toBe('epoch-2');
+      expect(mockRepository.update).not.toHaveBeenCalledWith(
+        'ended-session',
+        expect.objectContaining({ lifecycle: 'idle' })
+      );
+    });
+
+    it('refuses a named ended session that is gone by the time it reopens', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(
+        createMockSession({ id: 'ended-session', sbSlug: 'wren', endedAt: new Date() })
+      );
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({ kind: 'missing' });
+      expectRefused(await sessionService.handleMessage(named('ended-session')), 'unknown-session');
     });
 
     it('refuses a named ended session whose key a live session now holds', async () => {
@@ -3768,9 +3849,7 @@ describe('SessionService', () => {
         alias: 'wren:inkwell:review',
       });
       vi.mocked(mockRepository.findById).mockResolvedValue(ended);
-      vi.mocked(mockRepository.update).mockRejectedValueOnce(
-        Object.assign(new Error('duplicate key value'), { code: '23505' })
-      );
+      vi.mocked(mockRepository.reopenEnded!).mockResolvedValueOnce({ kind: 'key-held' });
       expectRefused(await sessionService.handleMessage(named('ended-session')), 'session-key-held');
     });
   });

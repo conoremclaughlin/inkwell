@@ -395,7 +395,12 @@ export interface SessionResult {
       explicit?: {
         sessionId?: string;
         sessionKey?: string;
-        cause: 'unknown-session' | 'contact-scope' | 'session-key-miss' | 'session-key-held';
+        cause:
+          | 'unknown-session'
+          | 'contact-scope'
+          | 'session-key-miss'
+          | 'session-key-held'
+          | 'binding-held';
       };
     };
   };
@@ -582,6 +587,21 @@ export interface ISessionService {
 
 // ─── Repository Interface ───
 
+/**
+ * What a conditional reopen found (SessionRepository.reopenEnded):
+ * - `reopened`: this call cleared the ended state it observed.
+ * - `open`: the row is no longer ended (another resolution or a human resume
+ *   reopened it first), and `session` is it as it stands now.
+ * - `key-held`: its session key is held by another live session, so the key's
+ *   unique index refuses a second live holder.
+ * - `missing`: the row is gone.
+ */
+export type ReopenEndedResult =
+  | { kind: 'reopened'; session: Session }
+  | { kind: 'open'; session: Session }
+  | { kind: 'key-held' }
+  | { kind: 'missing' };
+
 export interface ISessionRepository {
   findById(id: string): Promise<Session | null>;
 
@@ -604,6 +624,15 @@ export interface ISessionRepository {
       includeFailed?: boolean;
     }
   ): Promise<Session | null>;
+
+  /**
+   * Reopen an ended session, conditional on the ended state the caller
+   * observed (T4; Lumen, #725). See SessionRepository.reopenEnded.
+   */
+  reopenEnded?(
+    id: string,
+    observed: Pick<Session, 'lifecycle' | 'status'>
+  ): Promise<ReopenEndedResult>;
 
   findByThreadKey?(
     userId: string,

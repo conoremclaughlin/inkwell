@@ -1347,6 +1347,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           } else {
             stampedSessionId = assignment.sessionId;
           }
+          // A named session is an address (T4; Lumen, #725). If its stamp could
+          // not be written and another session holds the binding, the message
+          // is held and reported, never delivered to that other session.
+          if (assignment.rerouted && payload.explicitRecipientSession) {
+            throw new RoutingRefusedError(payload.threadKey || '(unthreaded)', targetSlug, {
+              triedCallerRepo: false,
+              reason: 'explicit-address',
+              anchor: 'session',
+              explicit: { sessionId: payload.recipientSessionId, cause: 'binding-held' },
+            });
+          }
           if (assignment.rerouted) {
             // A concurrent dispatch (or an existing live binding) won — deliver
             // to the winner, and archive our freshly-created loser candidate so
@@ -1445,6 +1456,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             }
           }
         } catch (err) {
+          // A refused address is a routing decision, not a failed write: it
+          // holds the message instead of degrading to the routed candidate.
+          if (err instanceof RoutingRefusedError) throw err;
           assignmentFailure = err instanceof Error ? err.message : String(err);
           logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,

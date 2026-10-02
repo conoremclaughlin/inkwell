@@ -15,6 +15,7 @@ import type {
   SessionStatus,
   SessionType,
   ISessionRepository,
+  ReopenEndedResult,
   UsageCheckpoint,
   ModelUsageTotals,
 } from './types.js';
@@ -689,6 +690,58 @@ export class SessionRepository implements ISessionRepository {
     }
 
     return mapDbToSession(data);
+  }
+
+  /**
+   * Reopen an ended session for an address that names it (T4), as a
+   * compare-and-set on the ended state the caller observed (Lumen, #725).
+   *
+   * The write clears ended_at, and resets lifecycle and status only when they
+   * still read `completed`. It matches only while ended_at is set and
+   * lifecycle and status are exactly what was observed. A concurrent resume
+   * that got there first (a human pick, another resolution, a turn entering
+   * `running`) changes one of them, so this write matches nothing and the row
+   * is reread: no longer ended means `open`, returned as it now stands; still
+   * ended with a different lifecycle or status means try again from the fresh
+   * state. It never writes turn_epoch, so a newer turn's epoch survives.
+   */
+  async reopenEnded(
+    id: string,
+    observed: Pick<Session, 'lifecycle' | 'status'>
+  ): Promise<ReopenEndedResult> {
+    let expected = observed;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const status = String(expected.status ?? '').toLowerCase();
+      const updates: DbSessionUpdate = {
+        ended_at: null,
+        ...(expected.lifecycle === 'completed' ? { lifecycle: 'idle' } : {}),
+        ...(status === 'completed' || status.startsWith('completed:') ? { status: 'active' } : {}),
+      };
+      let query = this.supabase
+        .from('sessions')
+        .update(updates)
+        .eq('id', id)
+        .not('ended_at', 'is', null);
+      query = expected.lifecycle
+        ? query.eq('lifecycle', expected.lifecycle)
+        : query.is('lifecycle', null);
+      query = expected.status ? query.eq('status', expected.status) : query.is('status', null);
+      const { data, error } = await query.select().maybeSingle();
+      if (error) {
+        if ((error as { code?: string }).code === '23505') return { kind: 'key-held' };
+        logger.error('Error reopening session', { id, error });
+        throw error;
+      }
+      if (data) return { kind: 'reopened', session: mapDbToSession(data) };
+
+      const current = await this.findById(id);
+      if (!current) return { kind: 'missing' };
+      if (!current.endedAt) return { kind: 'open', session: current };
+      expected = { lifecycle: current.lifecycle, status: current.status };
+    }
+    // Still ended after three changes under us: the row is being written as
+    // fast as it is read. Fail rather than guess at a state to write.
+    throw new Error(`Session ${id} kept changing while being reopened`);
   }
 
   /**

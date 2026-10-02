@@ -541,7 +541,12 @@ export class UnresolvedStudioError extends Error {
 export interface ExplicitAddressHold {
   sessionId?: string;
   sessionKey?: string;
-  cause: 'unknown-session' | 'contact-scope' | 'session-key-miss' | 'session-key-held';
+  cause:
+    | 'unknown-session'
+    | 'contact-scope'
+    | 'session-key-miss'
+    | 'session-key-held'
+    | 'binding-held';
 }
 
 export class RoutingRefusedError extends Error {
@@ -597,6 +602,9 @@ export class RoutingRefusedError extends Error {
         'session-key-held':
           `which ended, and its session key is now held by another live session, ` +
           `so it cannot be reopened without taking that key`,
+        'binding-held':
+          `but the thread's binding could not be moved to it and another session ` +
+          `holds it, so delivery would have gone to a session you did not name`,
       };
       return (
         `Refusing to route "${threadKey}" for agent "${sbSlug}": the sender addressed ` +
@@ -3196,40 +3204,50 @@ export class SessionService implements ISessionService {
    * Reopen an ended session for an address that names it: a session the
    * caller named, or the session a reply answers (spec session-lifecycle-model
    * §3 rungs 1 and 3). Clears ended_at and the completed spellings of
-   * lifecycle and status in one write; the agent's work phase is its own and
-   * is left alone. Returns null when the row's session key is now held by
-   * another live session, which the key's unique index refuses: the caller
-   * decides whether that is a refusal or a decline.
+   * lifecycle and status in one conditional write; the agent's work phase is
+   * its own and is left alone. Refuses when the row's session key is now held
+   * by another live session (the key's unique index admits one live holder)
+   * or the row is gone: the caller decides whether that is a refusal or a
+   * decline.
    */
   private async reopenEndedSession(
     session: Session,
     via: 'named-session' | 'reply-anchor'
-  ): Promise<Session | null> {
-    const status = String(session.status ?? '').toLowerCase();
-    try {
-      const reopened = await this.repository.update(session.id, {
-        endedAt: null,
-        ...(session.lifecycle === 'completed' ? { lifecycle: 'idle' as const } : {}),
-        ...(status === 'completed' || status.startsWith('completed:')
-          ? { status: 'active' as const }
-          : {}),
-      });
-      logger.info('[SessionRouting] Reopened an ended session for an address that names it', {
-        sessionId: session.id,
-        via,
-        endedAt: session.endedAt?.toISOString() ?? null,
-      });
-      return reopened;
-    } catch (err) {
-      if ((err as { code?: string } | null)?.code === '23505') {
+  ): Promise<{ session: Session } | { refused: 'key-held' | 'missing' }> {
+    // A conditional write of the ended state this resolution observed, never
+    // an update by id from a snapshot (Lumen, #725): a resume that got there
+    // first is kept as it stands, newer lifecycle and epoch included.
+    if (!this.repository.reopenEnded) {
+      throw new Error('Session repository cannot reopen an ended session conditionally');
+    }
+    const result = await this.repository.reopenEnded(session.id, {
+      lifecycle: session.lifecycle,
+      status: session.status,
+    });
+    switch (result.kind) {
+      case 'reopened':
+        logger.info('[SessionRouting] Reopened an ended session for an address that names it', {
+          sessionId: session.id,
+          via,
+          endedAt: session.endedAt?.toISOString() ?? null,
+        });
+        return { session: result.session };
+      case 'open':
+        logger.info('[SessionRouting] Session was already reopened; resuming it as it stands', {
+          sessionId: session.id,
+          via,
+          lifecycle: result.session.lifecycle,
+        });
+        return { session: result.session };
+      case 'key-held':
         logger.warn('[SessionRouting] Cannot reopen: its session key is held by a live session', {
           sessionId: session.id,
           sessionKey: session.alias ?? null,
           via,
         });
-        return null;
-      }
-      throw err;
+        return { refused: 'key-held' };
+      case 'missing':
+        return { refused: 'missing' };
     }
   }
 
@@ -3359,8 +3377,12 @@ export class SessionService implements ISessionService {
     // studio. A plan resolution writes nothing.
     if (session.endedAt && !ctx.planOnly) {
       const reopened = await this.reopenEndedSession(session, 'reply-anchor');
-      if (!reopened) return decline('ended_key_held', { sessionKey: session.alias ?? null });
-      session = reopened;
+      if (!('session' in reopened)) {
+        return decline(reopened.refused === 'missing' ? 'missing' : 'ended_key_held', {
+          sessionKey: session.alias ?? null,
+        });
+      }
+      session = reopened.session;
     }
     const leases = this.getLeaseService();
     if (leases && session.studioId && session.threadKey && !ctx.planOnly) {
@@ -3783,11 +3805,15 @@ export class SessionService implements ISessionService {
         if (recipientSession?.endedAt && recipientSessionNamed) {
           const reopened =
             options?.planOnly === true
-              ? recipientSession
+              ? { session: recipientSession }
               : await this.reopenEndedSession(recipientSession, 'named-session');
-          if (!reopened) return refuseNamedSession('session-key-held');
-          this.logRungMatch('recipient-session', reopened, routing, options?.threadKey);
-          return this.withStudioLease(reopened, routing, leaseCtx);
+          if (!('session' in reopened)) {
+            return refuseNamedSession(
+              reopened.refused === 'missing' ? 'unknown-session' : 'session-key-held'
+            );
+          }
+          this.logRungMatch('recipient-session', reopened.session, routing, options?.threadKey);
+          return this.withStudioLease(reopened.session, routing, leaseCtx);
         }
         if (recipientSession && !recipientSession.endedAt) {
           this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);

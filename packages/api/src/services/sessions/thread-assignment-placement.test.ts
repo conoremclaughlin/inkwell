@@ -418,6 +418,65 @@ describe('thread assignment cannot undo project-safe placement (Lumen, #681 roun
   });
 });
 
+describe('a named session is never swapped for a winner (T4; Lumen, #725)', () => {
+  beforeEach(() => {
+    resetActiveRuns();
+    resetPendingFinalizations();
+  });
+
+  it('holds the message when the binding goes to another session instead of the named one', async () => {
+    const w = makeWorld();
+    // The stamp write for the named session failed and another session holds
+    // the binding: assignment hands back that winner.
+    w.assignment.mockImplementation(async () => ({
+      sessionId: 'other-session',
+      rerouted: true,
+      boundVia: 'continuity',
+      stampPersisted: true,
+    }));
+
+    const error = await w.trigger({
+      recipientSessionId: 'old-session',
+      explicitRecipientTarget: true,
+      explicitRecipientSession: true,
+    });
+
+    expect(error).toBeInstanceOf(RoutingRefusedError);
+    expect((error as RoutingRefusedError).detail).toMatchObject({
+      reason: 'explicit-address',
+      explicit: { sessionId: 'old-session', cause: 'binding-held' },
+    });
+    expect(w.handleMessage).not.toHaveBeenCalled();
+    expect(w.logInkmail).toHaveBeenCalledWith(
+      'inkmail_fail',
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ error: expect.stringContaining('routing_held') })
+    );
+  });
+
+  it('control: an unnamed anchor still follows the winner', async () => {
+    const w = makeWorld();
+    // A winner in the project's studio, so the project test admits it.
+    w.tables.sessions.push({
+      ...w.tables.sessions[0],
+      id: 'other-session',
+      studio_id: 'studio-correct',
+    });
+    w.assignment.mockImplementation(async () => ({
+      sessionId: 'other-session',
+      rerouted: true,
+      boundVia: 'continuity',
+      stampPersisted: true,
+    }));
+
+    const error = await w.trigger({ recipientSessionId: 'old-session' });
+
+    expect(error).toBeNull();
+    expect(w.requested()?.recipientSessionId).toBe('other-session');
+  });
+});
+
 describe('repair is a CAS, and inline delivery needs the stamp (Lumen, #681 round 3)', () => {
   beforeEach(() => {
     resetActiveRuns();
