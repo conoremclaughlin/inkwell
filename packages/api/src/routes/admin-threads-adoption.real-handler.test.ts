@@ -15,7 +15,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 import { createInklingDb } from '../test/fake-inkling-db';
 import type { FakePostgrest, Row } from '../test/fake-postgrest';
-import { createIntentOf, createRequestOf } from '../services/send-receipt';
+import {
+  CLIENT_MESSAGE_CONFLICT,
+  THREAD_KEY_TAKEN_ERROR,
+  createIntentOf,
+  createRequestOf,
+} from '../services/send-receipt';
 
 const ME = '11111111-1111-4111-8111-111111111111';
 const WS = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -194,6 +199,28 @@ function failNextInsert(table: string): void {
   }) as never;
 }
 
+/**
+ * A message lands at adoption's emptiness check (its id-only read of the
+ * conversation's messages), after the route's last client-message lookup
+ * found nothing.
+ */
+function landsAtTheEmptinessRead(message: Row): { landed: () => Row | undefined } {
+  const from = db.from.bind(db);
+  let stored: Row | undefined;
+  db.from = ((name: string) => {
+    const query = from(name);
+    if (name === 'inbox_thread_messages') {
+      const select = query.select.bind(query);
+      query.select = ((columns = '*') => {
+        if (!stored && columns === 'id') stored = db.seed('inbox_thread_messages', message);
+        return select(columns);
+      }) as never;
+    }
+    return query;
+  }) as never;
+  return { landed: () => stored };
+}
+
 function people(): string[] {
   return db
     .rows('inbox_thread_participants')
@@ -333,5 +360,71 @@ describe('the create that recorded its intent is the one that may adopt', () => 
     expect(result.body).toMatchObject({ replayed: true });
     expect(db.rows('inbox_thread_messages')).toHaveLength(1);
     expect(members()).toEqual(['sb-fern']);
+  });
+});
+
+describe('a message that lands at the adoption check decides the answer (Lumen eb07e3df)', () => {
+  const fromMe = (thread: Row, extra: Row): Row => ({
+    thread_id: thread.id,
+    sender_kind: 'user',
+    sender_user_id: ME,
+    ...extra,
+  });
+
+  it('the exact original replays, with its own message id and unknown delivery', async () => {
+    const thread = emptyConversation(fernsIntent);
+    const race = landsAtTheEmptinessRead(
+      fromMe(thread, {
+        content: 'private words',
+        metadata: { clientMessageId: ID, pcp: { createRequest: createRequestOf(['fern'], '') } },
+      })
+    );
+
+    const result = await call(body());
+
+    expect(race.landed()).toBeDefined();
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      replayed: true,
+      created: false,
+      messageId: race.landed()?.id,
+      delivery: { status: 'unknown', unrouted: [] },
+    });
+    expect(sends).toBe(0);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+    expect(members()).toEqual(['sb-fern']);
+  });
+
+  it('an unrelated message is still a taken key: 409, nothing written', async () => {
+    const thread = emptyConversation(fernsIntent);
+    const race = landsAtTheEmptinessRead(
+      fromMe(thread, { content: 'something else', metadata: {} })
+    );
+
+    const result = await call(body());
+
+    expect(race.landed()).toBeDefined();
+    expect(result.status).toBe(409);
+    expect(result.body).toEqual({ error: THREAD_KEY_TAKEN_ERROR });
+    expect(sends).toBe(0);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
+  });
+
+  it('the same id with other words is a conflict, never a replay', async () => {
+    const thread = emptyConversation(fernsIntent);
+    const race = landsAtTheEmptinessRead(
+      fromMe(thread, {
+        content: 'other words',
+        metadata: { clientMessageId: ID, pcp: { createRequest: createRequestOf(['fern'], '') } },
+      })
+    );
+
+    const result = await call(body());
+
+    expect(race.landed()).toBeDefined();
+    expect(result.status).toBe(409);
+    expect(result.body).toEqual({ error: CLIENT_MESSAGE_CONFLICT });
+    expect(sends).toBe(0);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(1);
   });
 });

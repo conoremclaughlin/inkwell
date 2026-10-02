@@ -8112,9 +8112,17 @@ router.post('/threads', async (req: Request, res: Response) => {
       // Still nothing stored: the request that made this conversation died
       // before its first message, or is slower than the wait. A correct
       // retry completes it rather than being stranded on a 409.
-      if (lookup.kind === 'none' && (await adoptable(thread))) {
-        await sendCreate({ createOnly: false, created: false });
-        return;
+      if (lookup.kind === 'none') {
+        if (await adoptable(thread)) {
+          await sendCreate({ createOnly: false, created: false });
+          return;
+        }
+        // Adoption read the conversation after that lookup, and may have
+        // refused because the original's message has just landed. Look again,
+        // so the answer covers at least what adoption saw: that message
+        // replays, rather than a 409 that sends the person to a new
+        // conversation (review eb07e3df).
+        lookup = await lookUp();
       }
       if (lookup.kind === 'replay') {
         res.json({
