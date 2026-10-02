@@ -9,6 +9,7 @@ import { getAuditService, type AuditAction, type AuditCategory } from '../../ser
 import { getClaudeCodeAdapter } from '../../agent/adapters';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
+import { getAuthenticatedPrincipal } from '../../utils/request-context';
 
 // ============== Schemas ==============
 
@@ -235,9 +236,16 @@ export async function handleResetPermission(args: unknown, dataComposer: DataCom
 export async function handleQueryAuditLog(args: unknown, dataComposer: DataComposer) {
   const params = queryAuditLogSchema.parse(args);
 
-  // User is optional for audit queries (can query all if admin)
+  // User is optional for audit queries (can query all if admin). An
+  // authenticated caller is not an admin of other users: it reads its own.
   let userId: string | undefined;
-  if (params.userId || params.email || params.phone || (params.platform && params.platformId)) {
+  if (
+    getAuthenticatedPrincipal() ||
+    params.userId ||
+    params.email ||
+    params.phone ||
+    (params.platform && params.platformId)
+  ) {
     const { user } = await resolveUserOrThrow(params, dataComposer);
     userId = user.id;
   }
