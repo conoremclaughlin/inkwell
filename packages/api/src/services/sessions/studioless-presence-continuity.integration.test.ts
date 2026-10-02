@@ -426,5 +426,54 @@ describe('a pinned presence thread keeps one session (integration, task bd4657a0
     expect(await send()).toBe(inserted.id);
     expect(runs.at(-1)!.resumed).toBe(`project-transcript-${run}`);
     expect(await rows()).toHaveLength(before);
+
+    // The spawn recorded the placement it ran the row under, through the
+    // real repository's metadata merge (Lumen, #721 r1) …
+    const adopted = (await rows()).find((r) => r.id === inserted.id);
+    expect(adopted.metadata.routing_decision.placement).toMatchObject({
+      kind: 'studioless-presence',
+      project: slug,
+      repoRoot: projectRepo,
+    });
+    expect(typeof adopted.metadata.routing_decision.placement.adoptedAt).toBe('string');
+
+    // … so once its hook reports where the runner actually put it, it
+    // still keeps the thread.
+    await supabase.from('sessions').update({ working_dir: defaultDir }).eq('id', inserted.id);
+    expect(await send()).toBe(inserted.id);
+    expect(runs.at(-1)!.resumed).toBe(`project-transcript-${run}`);
+    expect(await rows()).toHaveLength(before);
+  });
+
+  it('a relative working_dir is not evidence', async () => {
+    const { data: inserted, error } = await supabase
+      .from('sessions')
+      .insert({
+        user_id: userId,
+        agent_id: agent,
+        sb_id: sbId,
+        thread_key: threadKey,
+        backend: 'claude-code',
+        lifecycle: 'idle',
+        status: 'active',
+        backend_session_id: `relative-transcript-${run}`,
+        working_dir: 'app',
+        metadata: {},
+      })
+      .select('id')
+      .single();
+    if (error) throw new Error(`session insert failed: ${error.message}`);
+    const moved = await assignThreadParticipant(supabase, {
+      threadId,
+      sbId,
+      candidateSessionId: inserted.id,
+      explicitAnchor: true,
+      source: 'studioless-presence-continuity.integration',
+    });
+    expect(moved).toMatchObject({ sessionId: inserted.id, stampPersisted: true });
+
+    const ran = await send();
+    expect(ran).not.toBe(inserted.id);
+    expect(runs.at(-1)!.resumed).toBeNull();
   });
 });

@@ -731,6 +731,115 @@ describe('a pinned presence thread with no studio in the project repo keeps one 
   });
 });
 
+describe('working_dir evidence must be absolute, and adoption keeps it (Lumen, #721 r1)', () => {
+  beforeEach(() => {
+    resetActiveRuns();
+    resetPendingFinalizations();
+  });
+
+  it.each(['.', 'app'])('a relative working_dir %s is not project evidence', async (workingDir) => {
+    // Containment resolved a relative path against the root being tested,
+    // so it was "inside" every root.
+    const w = makeWorld({
+      sessions: [
+        sessionRow('relative', {
+          working_dir: workingDir,
+          backend_session_id: 'relative-transcript',
+        }),
+      ],
+      stamp: 'relative',
+    });
+    expect(await w.send()).toEqual({ routeOnly: null, wake: null });
+    expect(await w.ranIn(0)).not.toBe('relative');
+    expect(w.runs[0].resumed).toBeNull();
+  });
+
+  it('a relative working_dir is refused even beside a placement record', async () => {
+    const w = makeWorld({
+      sessions: [
+        sessionRow('relative-recorded', {
+          working_dir: 'app',
+          backend_session_id: 'relative-recorded-transcript',
+          metadata: recordedPlacement(),
+        }),
+      ],
+      stamp: 'relative-recorded',
+    });
+    await w.send();
+    expect(await w.ranIn(0)).not.toBe('relative-recorded');
+  });
+
+  it('a row admitted on its working_dir keeps the thread after its hook reports the default directory', async () => {
+    const legacy = sessionRow('legacy-project', {
+      working_dir: `${REPO_PROJECT}/app`,
+      backend_session_id: 'legacy-project-transcript',
+    });
+    const w = makeWorld({ sessions: [legacy], stamp: 'legacy-project' });
+
+    expect(await w.send()).toEqual({ routeOnly: null, wake: null });
+    expect(await w.ranIn(0)).toBe('legacy-project');
+    expect(w.runs[0]).toMatchObject({ cwd: DEFAULT_DIR, resumed: 'legacy-project-transcript' });
+    // The spawn recorded the placement it ran the row under.
+    expect((legacy.metadata as Row).routing_decision).toMatchObject({
+      placement: { kind: 'studioless-presence', project: PROJECT, repoRoot: REPO_PROJECT },
+    });
+
+    // What its hook writes once it has run here.
+    legacy.working_dir = w.runs[0].cwd;
+    expect(await w.send()).toEqual({ routeOnly: null, wake: null });
+    expect(await w.ranIn(1)).toBe('legacy-project');
+    expect(w.runs[1].resumed).toBe('legacy-project-transcript');
+    expect(w.tables.sessions).toHaveLength(1);
+  });
+
+  it('a spawn resolution with no anchor records the placement at the thread-key rung', async () => {
+    // The trigger path always anchors a spawn on the delivered session, so
+    // this is the rung a non-trigger caller reaches.
+    const legacy = sessionRow('legacy-project', {
+      working_dir: `${REPO_PROJECT}/app`,
+      backend_session_id: 'legacy-project-transcript',
+    });
+    const w = makeWorld({ sessions: [legacy] });
+    const session = await w.service.getOrCreateSession(USER, SLUG, {
+      threadKey: THREAD_KEY,
+      sbId: SB_ID,
+    });
+    expect(session.id).toBe('legacy-project');
+    expect((legacy.metadata as Row).routing_decision).toMatchObject({
+      placement: { kind: 'studioless-presence', project: PROJECT, repoRoot: REPO_PROJECT },
+    });
+  });
+
+  it('control: a plan alone records nothing', async () => {
+    const legacy = sessionRow('legacy-project', {
+      working_dir: `${REPO_PROJECT}/app`,
+      backend_session_id: 'legacy-project-transcript',
+    });
+    const w = makeWorld({ sessions: [legacy], stamp: 'legacy-project' });
+    expect(await w.dispatch({ routeOnly: true, recipientSessionId: 'legacy-project' })).toBeNull();
+    expect(w.stamp()).toBe('legacy-project');
+    expect((legacy.metadata as Row).routing_decision).toBeUndefined();
+  });
+
+  it('control: an explicit address runs a row but does not make it continuity', async () => {
+    // Addressed by the caller, the predicate never runs, so nothing was
+    // verified and nothing is recorded. The next inferred message refuses it.
+    const addressed = sessionRow('addressed', {
+      working_dir: DEFAULT_DIR,
+      backend_session_id: 'addressed-transcript',
+    });
+    const w = makeWorld({ sessions: [addressed], stamp: null });
+    expect(
+      await w.dispatch({ recipientSessionId: 'addressed', explicitRecipientTarget: true })
+    ).toBeNull();
+    expect(await w.ranIn(0)).toBe('addressed');
+    expect((addressed.metadata as Row).routing_decision).toBeUndefined();
+
+    await w.send();
+    expect(await w.ranIn(1)).not.toBe('addressed');
+  });
+});
+
 describe('studioless continuity needs routing to place the thread studioless (controls)', () => {
   beforeEach(() => {
     resetActiveRuns();
