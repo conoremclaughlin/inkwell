@@ -84,7 +84,7 @@ const makeTriggerHandler = (deps: Record<string, unknown>): any =>
        logger, dataComposer, sessionService, getUserFromContext, logInkmail,
        loadThreadDescriptor, formatThreadDescriptorLines, assignThreadParticipant,
        stampRoutingHold, clearRoutingHold, storedTriggerMedia, decideDelivery,
-       RoutingRefusedError, routeResponses, triggerRetryScheduler, resolveThreadTriggerScope
+       RoutingRefusedError, routeResponses, triggerRetryScheduler, recordWakeSourceCompletion, resolveThreadTriggerScope
      } = deps;
      ${compiledHandler}
      return handler;`
@@ -266,6 +266,8 @@ describe('a pinned presence thread keeps one session (integration, task bd4657a0
       RoutingRefusedError,
       routeResponses: vi.fn(async () => undefined),
       triggerRetryScheduler: { cancelFor: vi.fn() },
+      // The no-progress breaker's completion hook (T1): inert here.
+      recordWakeSourceCompletion: vi.fn(async () => null),
     });
   });
 

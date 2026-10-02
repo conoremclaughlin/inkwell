@@ -179,14 +179,29 @@ function createMockDataComposer() {
 // Tests
 // ============================================================================
 
+/**
+ * A stand-in for the no-progress breaker, so its reads never consume the
+ * positional client chains these tests script. Admits by default.
+ */
+function createFakeBreaker() {
+  return {
+    readFingerprint: vi.fn().mockResolvedValue('fp-group-1'),
+    admit: vi.fn().mockResolvedValue({ allowed: true, clearTrip: false }),
+    resetGroup: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 describe('StrategyService', () => {
   let dc: ReturnType<typeof createMockDataComposer>;
   let service: StrategyService;
+  let breaker: ReturnType<typeof createFakeBreaker>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     dc = createMockDataComposer();
     service = new StrategyService(dc as any);
+    breaker = createFakeBreaker();
+    service.setWakeBreaker(breaker as any);
   });
 
   describe('startStrategy', () => {
@@ -1600,6 +1615,9 @@ describe('StrategyService', () => {
 
       const result = await service.resumeStrategy('group-1', 'user-123');
 
+      // A resume restarts a tripped watchdog with a fresh count.
+      expect(breaker.resetGroup).toHaveBeenCalledWith('user-123', 'strategy_watchdog', 'group-1');
+
       expect(result.action).toBe('next_task');
       expect(result.nextTask).toBeDefined();
       expect(result.nextTask!.id).toBe('task-3');
@@ -2221,6 +2239,80 @@ describe('StrategyService', () => {
       expect(payload.messageType).toBe('session_resume');
       expect(payload.content).toContain('Current work');
       expect((payload.metadata as Record<string, unknown>).reason).toBe('watchdog');
+    });
+
+    // No-progress breaker (spec session-lifecycle-model §5).
+    it('triggerWatchdog tags its wake so the trigger handler can count the turn', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+      const group = createMockGroup({
+        strategy: 'persistence',
+        status: 'active',
+        sb_id: 'sb-wren-uuid',
+      });
+      const tasks = [createMockTask({ id: 't1', status: 'in_progress', task_order: 0 })];
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      setupChains(dc, [chainGroupTasks(tasks)]);
+
+      const result = await service.triggerWatchdog('group-1');
+
+      expect(result.outcome).toBe('fired');
+      expect(breaker.admit).toHaveBeenCalledWith(
+        {
+          userId: 'user-123',
+          source: 'strategy_watchdog',
+          workKind: 'task_group',
+          workId: 'group-1',
+          revision: '',
+        },
+        'fp-group-1'
+      );
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      expect(call[2]).toEqual({
+        wakeSource: {
+          source: 'strategy_watchdog',
+          workKind: 'task_group',
+          workId: 'group-1',
+          revision: '',
+          fingerprint: 'fp-group-1',
+          dispatchedAt: expect.any(String),
+          taskGroupId: 'group-1',
+          ownerSbId: 'sb-wren-uuid',
+        },
+      });
+    });
+
+    it('triggerWatchdog sends untagged when the group state cannot be read', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+      breaker.readFingerprint.mockResolvedValue(null);
+      const group = createMockGroup({ strategy: 'persistence', status: 'active' });
+      const tasks = [createMockTask({ id: 't1', status: 'in_progress', task_order: 0 })];
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      setupChains(dc, [chainGroupTasks(tasks)]);
+
+      const result = await service.triggerWatchdog('group-1');
+
+      expect(result.outcome).toBe('fired');
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      expect(call).toHaveLength(2);
+    });
+
+    it('a tripped breaker pauses the strategy instead of waking the owner (PR #349)', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+      breaker.admit.mockResolvedValue({ allowed: false, trippedAt: '2026-10-02T10:10:00.000Z' });
+      const group = createMockGroup({ strategy: 'persistence', status: 'active' });
+      const tasks = [createMockTask({ id: 't1', status: 'in_progress', task_order: 0 })];
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      setupChains(dc, [chainGroupTasks(tasks), chainNoop()]);
+
+      const result = await service.triggerWatchdog('group-1');
+
+      expect(result.outcome).toBe('skipped');
+      expect(result).toMatchObject({ reason: expect.stringContaining('no-progress breaker') });
+      expect(sendMock).not.toHaveBeenCalled();
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({ status: 'paused' })
+      );
     });
 
     // 'skipped', not 'failed'. A paused group is the watchdog standing down

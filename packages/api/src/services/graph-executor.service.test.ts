@@ -447,3 +447,98 @@ describe('GraphExecutorService dispatch', () => {
     expect(ctx.activities.some((a) => a.subtype === 'graph_awaiting_human')).toBe(true);
   });
 });
+
+// No-progress breaker (spec session-lifecycle-model §5). A fake breaker keeps
+// these tests independent of the composer's one-size table chain.
+function fakeBreaker(held: string[] = []) {
+  return {
+    readTaskStates: vi.fn(
+      async (_userId: string, ids: string[]) =>
+        new Map(ids.map((id) => [id, { fingerprint: `fp-${id}`, revision: '0' }]))
+    ),
+    admitMany: vi.fn(
+      async (_userId: string, _source: string, items: Array<{ workId: string }>) =>
+        new Map(
+          items.map((i) => [
+            i.workId,
+            held.includes(i.workId)
+              ? { allowed: false as const, trippedAt: '2026-10-02T10:10:00.000Z' }
+              : { allowed: true as const, clearTrip: false },
+          ])
+        )
+    ),
+    resetGroup: vi.fn(async () => undefined),
+  };
+}
+
+describe('GraphExecutorService no-progress breaker', () => {
+  beforeEach(() => {
+    sendMock.mockClear();
+  });
+
+  it('does not dispatch a node the breaker holds, even past the redispatch interval', async () => {
+    const { composer } = makeComposer({
+      taskStamps: { 't-1': new Date(Date.now() - 45 * 60_000).toISOString() },
+    });
+    const service = new GraphExecutorService(composer);
+    const breaker = fakeBreaker(['t-1']);
+    service.setWakeBreaker(breaker as never);
+    const result = await service.dispatchEvaluation(
+      USER,
+      baseGroup,
+      {
+        ...emptyEval,
+        readyWork: [
+          { id: 't-1', title: 'stuck node' },
+          { id: 't-2', title: 'moving node' },
+        ],
+      },
+      { dedupe: true }
+    );
+    expect(result.skipped).toEqual(['t-1']);
+    expect(result.triggered).toEqual(['t-2']);
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(breaker.admitMany).toHaveBeenCalledWith(USER, 'graph_dispatch', [
+      { workId: 't-1', revision: '0', fingerprint: 'fp-t-1' },
+      { workId: 't-2', revision: '0', fingerprint: 'fp-t-2' },
+    ]);
+  });
+
+  it('tags a dispatch with the node state and the identity it reached', async () => {
+    const { composer } = makeComposer();
+    const service = new GraphExecutorService(composer);
+    service.setWakeBreaker(fakeBreaker() as never);
+    await service.dispatchEvaluation(
+      USER,
+      baseGroup,
+      { ...emptyEval, readyWork: [{ id: 't-1', title: 'node', assigneeIdentityId: 'ident-9' }] },
+      { dedupe: false }
+    );
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][2]).toEqual({
+      wakeSource: {
+        source: 'graph_dispatch',
+        workKind: 'graph_node',
+        workId: 't-1',
+        revision: '0',
+        fingerprint: 'fp-t-1',
+        dispatchedAt: expect.any(String),
+        taskGroupId: 'g-1',
+        ownerSbId: 'ident-9',
+      },
+    });
+  });
+
+  it('starting execution gives every node a fresh count', async () => {
+    const ctx = makeComposer();
+    const repos = ctx.composer.repositories.taskGroups as unknown as {
+      sweepTaskGraph: ReturnType<typeof vi.fn>;
+    };
+    repos.sweepTaskGraph.mockResolvedValue({ success: true, evaluation: emptyEval, claims: [] });
+    const service = new GraphExecutorService(ctx.composer);
+    const breaker = fakeBreaker();
+    service.setWakeBreaker(breaker as never);
+    await service.startGroup(USER, 'g-1');
+    expect(breaker.resetGroup).toHaveBeenCalledWith(USER, 'graph_dispatch', 'g-1');
+  });
+});
