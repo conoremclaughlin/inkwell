@@ -4,8 +4,10 @@
  * The DB owns the transitions (integration-tested in
  * ../data/task-graph-executor.integration.test.ts); what these tests pin is
  * the app half's POSTURE:
- *   - reclaim fires only for provably-ended sessions and fails closed on
- *     every uncertainty (live, unverifiable, missing)
+ *   - reclaim fires only on process facts (a crash nobody is present for,
+ *     or an idle window plus no open turn), never on ended_at or a completed
+ *     status, and fails closed on every uncertainty (live, unverifiable,
+ *     missing)
  *   - sweep dedupe never suppresses a fresh gate opening, and never
  *     re-triggers a recently-dispatched standing node
  *   - a complete evaluation finalizes the group instead of dispatching
@@ -17,6 +19,7 @@ import type { DataComposer } from '../data/composer';
 import type { TaskGroup } from '../data/repositories/task-groups.repository';
 import {
   GraphExecutorService,
+  releaseGraphClaimsForSession,
   type GraphEvaluation,
   type GraphClaimRef,
 } from './graph-executor.service';
@@ -32,12 +35,15 @@ vi.mock('../auth/resolve-identity', () => ({
 // The #506 boundary primitive: tests drive it directly. Defaults to
 // MID-TURN (the fail-closed answer) so no test accidentally passes because
 // the mock was permissive.
-const { midTurnMock } = vi.hoisted(() => ({
+const { midTurnMock, liveMock } = vi.hoisted(() => ({
   midTurnMock: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
+  // Presence, same fail-closed default: LIVE unless a test says otherwise.
+  liveMock: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
 }));
 vi.mock('./studio-lease.service', () => ({
   StudioLeaseService: class {
     isSessionMidTurn = midTurnMock;
+    isSessionLive = liveMock;
   },
 }));
 
@@ -73,6 +79,7 @@ interface ComposerConfig {
     status: string | null;
     ended_at: string | null;
     lifecycle?: string | null;
+    turn_epoch?: string | null;
   } | null;
   sessionLookupError?: boolean;
   taskStamps?: Record<string, string>;
@@ -82,9 +89,11 @@ function makeComposer(cfg: ComposerConfig = {}) {
   const releases: Array<Record<string, unknown>> = [];
   const groupUpdates: Array<Record<string, unknown>> = [];
   const activities: Array<Record<string, unknown>> = [];
+  const tablesRead: string[] = [];
 
   const client = {
     from(table: string) {
+      tablesRead.push(table);
       const chain: Record<string, unknown> = {
         select: () => chain,
         eq: () => chain,
@@ -139,6 +148,7 @@ function makeComposer(cfg: ComposerConfig = {}) {
     releases,
     groupUpdates,
     activities,
+    tablesRead,
   };
 }
 
@@ -181,24 +191,132 @@ describe('GraphExecutorService reclaim (fail-closed)', () => {
     sendMock.mockClear();
     midTurnMock.mockClear();
     midTurnMock.mockResolvedValue(true);
+    liveMock.mockClear();
+    liveMock.mockResolvedValue(true);
   });
 
-  it('reclaims a claim whose holder session has ended', async () => {
-    const { releases, result } = await runSweep(
-      { sessionRow: { id: 's-1', status: 'active', ended_at: new Date().toISOString() } },
-      [claim]
-    );
-    expect(result.reclaimed).toBe(1);
-    expect(releases[0]).toMatchObject({ taskId: 't-1', claimToken: 'tok-1', reclaim: true });
-  });
-
-  it("reclaims a claim whose holder crashed — lifecycle 'failed' is terminal (round-1 P1)", async () => {
+  it("reclaims at once from a crashed holder nobody is present for — lifecycle 'failed' (round-1 P1)", async () => {
+    liveMock.mockResolvedValue(false);
     const { releases, result } = await runSweep(
       { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'failed' } },
       [claim]
     );
     expect(result.reclaimed).toBe(1);
+    expect(releases[0]).toMatchObject({ taskId: 't-1', claimToken: 'tok-1', reclaim: true });
+    expect(liveMock).toHaveBeenCalledWith('s-1', USER);
+  });
+
+  /**
+   * T6 (session lifecycle §6). A crashed row is a statement about the LAST
+   * run. A turn that has started since (an attached CLI, a run admitted
+   * before its running write) is present, and its claim is not ours to take.
+   */
+  it('keeps the claim of a crashed holder that is present again', async () => {
+    liveMock.mockResolvedValue(true);
+    const { releases, result } = await runSweep(
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'failed' } },
+      [claim]
+    );
+    expect(result.reclaimed).toBe(0);
+    expect(releases).toHaveLength(0);
+  });
+
+  /**
+   * T6. ended_at, status 'completed' and lifecycle 'completed' are written
+   * by the agent (end_session, update_session_state) from inside a live turn,
+   * and an ended session can be resumed. None of them is evidence the turn is
+   * over: a fresh claim is kept, whatever the row says about the session.
+   */
+  it.each([
+    ['ended_at', { status: 'active', ended_at: new Date().toISOString(), lifecycle: 'running' }],
+    ["status 'completed'", { status: 'completed', ended_at: null, lifecycle: 'running' }],
+    ["lifecycle 'completed'", { status: 'active', ended_at: null, lifecycle: 'completed' }],
+  ])('a fresh claim survives %s on its holder — not proof the turn is over', async (_l, row) => {
+    liveMock.mockResolvedValue(false);
+    midTurnMock.mockResolvedValue(false);
+    const { releases, result } = await runSweep({ sessionRow: { id: 's-1', ...row } }, [claim]);
+    expect(result.reclaimed).toBe(0);
+    expect(releases).toHaveLength(0);
+  });
+
+  it('an ended holder mid-turn keeps even an old claim', async () => {
+    midTurnMock.mockResolvedValue(true);
+    const { releases, result } = await runSweep(
+      {
+        sessionRow: {
+          id: 's-1',
+          status: 'completed',
+          ended_at: new Date().toISOString(),
+          lifecycle: 'completed',
+        },
+      },
+      [oldClaim]
+    );
+    expect(result.reclaimed).toBe(0);
+    expect(releases).toHaveLength(0);
+  });
+
+  it('an ended holder past the window loses its claim once provably not mid-turn', async () => {
+    midTurnMock.mockResolvedValue(false);
+    const { releases, result } = await runSweep(
+      {
+        sessionRow: {
+          id: 's-1',
+          status: 'completed',
+          ended_at: new Date().toISOString(),
+          lifecycle: 'completed',
+        },
+      },
+      [oldClaim]
+    );
+    expect(result.reclaimed).toBe(1);
     expect(releases[0]).toMatchObject({ reclaim: true });
+  });
+
+  /**
+   * PR #724 review (Lumen). Both paths decide on a snapshot of the holder,
+   * and the claim token does not change when a new turn takes the session.
+   * The release is therefore fenced on the turn_epoch read WITH the
+   * decision, so release_graph_claim refuses if the turn moved since.
+   */
+  it.each([
+    ['crashed, nothing present', { lifecycle: 'failed' }, claim],
+    ['idle past the window, not mid-turn', { lifecycle: 'idle' }, oldClaim],
+  ] as const)('fences the release on the epoch it decided on — %s', async (_l, row, c) => {
+    liveMock.mockResolvedValue(false);
+    midTurnMock.mockResolvedValue(false);
+    const { releases, result } = await runSweep(
+      {
+        sessionRow: { id: 's-1', status: 'active', ended_at: null, turn_epoch: 'epoch-1', ...row },
+      },
+      [c]
+    );
+    expect(result.reclaimed).toBe(1);
+    expect(releases[0]).toMatchObject({ fenceTurnEpoch: true, expectedTurnEpoch: 'epoch-1' });
+  });
+
+  it('fences on a NULL epoch too — a row that never had one must still not have one', async () => {
+    liveMock.mockResolvedValue(false);
+    const { releases } = await runSweep(
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'failed' } },
+      [claim]
+    );
+    expect(releases[0]).toMatchObject({ fenceTurnEpoch: true, expectedTurnEpoch: null });
+  });
+
+  /**
+   * T6. Activity rows are fire-and-forget telemetry (agent_complete is logged
+   * before the final session write, and a failed run logs error instead). The
+   * decision never reads them, so a missing row cannot change it.
+   */
+  it('decides from the session row and presence alone — no activity row is read', async () => {
+    liveMock.mockResolvedValue(false);
+    const { tablesRead, result } = await runSweep(
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'failed' } },
+      [claim]
+    );
+    expect(result.reclaimed).toBe(1);
+    expect(tablesRead.filter((t) => t !== 'sessions')).toEqual([]);
   });
 
   it('a fresh claim on a live session is kept without even consulting the turn signal', async () => {
@@ -242,6 +360,60 @@ describe('GraphExecutorService reclaim (fail-closed)', () => {
     const { releases, result } = await runSweep({ sessionRow: null }, [oldClaim]);
     expect(result.reclaimed).toBe(0);
     expect(releases).toHaveLength(0);
+  });
+});
+
+/**
+ * PR #724 review (Lumen). The boundary release checked the session's epoch,
+ * then released by token. The release now hands the same epoch to
+ * release_graph_claim, which re-checks it under the row lock.
+ */
+describe('releaseGraphClaimsForSession fences each release on the boundary epoch', () => {
+  function boundaryClient(turnEpoch: string | null) {
+    const rpcCalls: Array<Record<string, unknown>> = [];
+    const client = {
+      from(table: string) {
+        const chain: Record<string, unknown> = {
+          select: () => chain,
+          eq: () => chain,
+          lte: () =>
+            Promise.resolve({
+              data: table === 'tasks' ? [{ id: 't-1', user_id: USER, claim_token: 'tok-1' }] : [],
+              error: null,
+            }),
+          maybeSingle: () => Promise.resolve({ data: { turn_epoch: turnEpoch }, error: null }),
+        };
+        return chain;
+      },
+      rpc: (_fn: string, args: Record<string, unknown>) => {
+        rpcCalls.push(args);
+        return Promise.resolve({ data: { success: true }, error: null });
+      },
+    };
+    return { client, rpcCalls };
+  }
+
+  it('passes the epoch it checked to the release', async () => {
+    const { client, rpcCalls } = boundaryClient('epoch-1');
+    const released = await releaseGraphClaimsForSession(
+      client as never,
+      's-1',
+      'cli-turn-stopped',
+      new Date().toISOString(),
+      'epoch-1'
+    );
+    expect(released).toBe(1);
+    expect(rpcCalls[0]).toMatchObject({
+      p_session_id: 's-1',
+      p_fence_turn_epoch: true,
+      p_expected_turn_epoch: 'epoch-1',
+    });
+  });
+
+  it('an unfenced (legacy) boundary stays unfenced', async () => {
+    const { client, rpcCalls } = boundaryClient(null);
+    await releaseGraphClaimsForSession(client as never, 's-1', 'legacy-stop');
+    expect(rpcCalls[0]).toMatchObject({ p_fence_turn_epoch: false, p_expected_turn_epoch: null });
   });
 });
 

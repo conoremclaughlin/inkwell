@@ -122,8 +122,9 @@ export async function releaseGraphClaimsForSession(
     // owner on the row means this boundary's releases are not ours to run.
     // Combined with the claimed_at cutoff this covers both interleavings: a
     // parked new turn has no claims yet, and a landed new turn fails this
-    // check. Residual is this read → release window, atop the per-claim
-    // token CAS in release_graph_claim itself.
+    // check. The read → release window is closed in SQL: each release passes
+    // the same epoch to release_graph_claim, which re-checks it under the row
+    // lock (Lumen, PR #724), atop the per-claim token CAS.
     if (expectedTurnEpoch !== undefined) {
       const { data: sessionRow, error: epochError } = await client
         .from('sessions')
@@ -157,6 +158,8 @@ export async function releaseGraphClaimsForSession(
         p_session_id: sessionId,
         p_reclaim: false,
         p_reason: reason,
+        p_fence_turn_epoch: expectedTurnEpoch !== undefined,
+        p_expected_turn_epoch: expectedTurnEpoch ?? null,
       });
       if (rpcError) {
         logger.warn(`Graph boundary release failed for task ${row.id}:`, rpcError);
@@ -434,15 +437,29 @@ export class GraphExecutorService {
    * Reclaim abandoned claims — the #506 boundary, wired (Lumen round 1 P1).
    * Two paths, both fail-closed:
    *
-   *   TERMINAL: the holder session ended, completed, or crashed
-   *     (`ended_at`, status 'completed', lifecycle 'failed'/'completed') —
-   *     reclaimed immediately; a dead session holds nothing.
+   *   CRASHED: the holder's last run reads lifecycle 'failed' AND the lease
+   *     service finds nobody present (isSessionLive: no in-process run, no
+   *     fresh CLI poll, no open CLI turn; an unreadable row reports live) —
+   *     reclaimed immediately. 'failed' is normally the server's record of a
+   *     crash, but the session tool also accepts it from a caller, so it is
+   *     never enough alone: presence is what protects a live turn here.
    *   IDLE PAST THE WINDOW: the claim is older than CLAIM_IDLE_RECLAIM_MS
    *     AND the lease service proves the holder is NOT mid-turn
    *     (isSessionMidTurn fails closed: active run, open turn signal, or an
    *     unreadable row all report mid-turn and the claim is kept).
    *
-   * A session we cannot verify keeps its claim in every branch.
+   * `ended_at`, status 'completed' and lifecycle 'completed' take no path of
+   * their own (session lifecycle §6, T6). The agent writes them, through
+   * end_session or update_session_state, from inside the very turn that holds
+   * the claim, and an ended session can be resumed. Such a holder is judged
+   * like any idle one. A session we cannot verify keeps its claim in every
+   * branch.
+   *
+   * Both paths decide on a snapshot, so the release itself is fenced on the
+   * holder's turn_epoch as read with that snapshot (Lumen, PR #724): a turn
+   * that takes the session after the decision, a resumed run or a CLI
+   * prompt, moves the epoch, and release_graph_claim refuses ('turn-moved')
+   * in the same transaction as the release.
    */
   private async reclaimAbandonedClaims(
     userId: string,
@@ -456,21 +473,20 @@ export class GraphExecutorService {
       try {
         const { data: session, error } = await client
           .from('sessions')
-          .select('id, status, ended_at, lifecycle')
+          .select('id, lifecycle, turn_epoch')
           .eq('id', claim.sessionId)
           .maybeSingle();
         if (error) continue; // cannot verify → keep the claim
         if (!session) continue; // absence is not proof of death
 
-        const terminal =
-          Boolean(session.ended_at) ||
-          session.status === 'completed' ||
-          session.lifecycle === 'failed' ||
-          session.lifecycle === 'completed';
-
         let reason: string | null = null;
-        if (terminal) {
-          reason = `holder session ${claim.sessionId} ended (${session.lifecycle ?? session.status})`;
+        if (session.lifecycle === 'failed') {
+          // A 'failed' row describes the LAST run, and a caller can write it
+          // too. A turn that has begun since is present, and its claim is not
+          // ours to take.
+          const present = await this.getLeaseService().isSessionLive(claim.sessionId, userId);
+          if (present) continue;
+          reason = `holder session ${claim.sessionId} failed and nothing is present`;
         } else {
           const age = Date.now() - Date.parse(claim.claimedAt);
           if (Number.isNaN(age) || age < CLAIM_IDLE_RECLAIM_MS) continue;
@@ -485,6 +501,8 @@ export class GraphExecutorService {
           claimToken: claim.claimToken,
           reclaim: true,
           reason,
+          fenceTurnEpoch: true,
+          expectedTurnEpoch: session.turn_epoch ?? null,
         });
         if (result.success) {
           reclaimed += 1;

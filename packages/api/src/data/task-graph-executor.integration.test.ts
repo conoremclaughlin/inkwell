@@ -749,6 +749,97 @@ d('workflow graph executor (real DB)', () => {
     }
   });
 
+  /**
+   * PR #724 review (Lumen). The reclaim and the boundary release decide on a
+   * snapshot of the holder session, and the claim token does not change when
+   * a new turn takes the session. The fence is checked by release_graph_claim
+   * itself, under the row lock, against the epoch the caller decided on.
+   */
+  it('PR #724: a release fenced on the holder turn refuses once a new turn took the session', async () => {
+    const gF = randomUUID();
+    const node = randomUUID();
+    const { data: holderRow, error: hErr } = await client
+      .from('sessions')
+      .insert({ user_id: USER, turn_epoch: 'decided-epoch' } as never)
+      .select('id')
+      .single();
+    if (hErr) throw new Error(`fixture session: ${hErr.message}`);
+    const holder = holderRow!.id;
+    sessionIds.push(holder);
+    await client
+      .from('task_groups')
+      .insert([{ id: gF, user_id: USER, title: 'exec-itest turn-fence' }]);
+    await client
+      .from('tasks')
+      .insert([
+        { id: node, user_id: USER, task_group_id: gF, title: 'node', task_type: 'work' },
+      ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: gF,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: node, sessionId: holder });
+      expect(claim.success).toBe(true);
+      const claimToken = claim.claimToken as string;
+
+      // A new turn takes the session after the caller decided.
+      await client
+        .from('sessions')
+        .update({ turn_epoch: 'successor-epoch' } as never)
+        .eq('id', holder);
+
+      for (const mode of [{ reclaim: true }, { reclaim: false, sessionId: holder }]) {
+        const refused = await groups.releaseGraphClaim({
+          userId: USER,
+          taskId: node,
+          claimToken,
+          ...mode,
+          fenceTurnEpoch: true,
+          expectedTurnEpoch: 'decided-epoch',
+        });
+        expect(refused).toMatchObject({ success: false, reason: 'turn-moved' });
+      }
+      const { data: stillClaimed } = await client
+        .from('tasks')
+        .select('claimed_by_session_id, claim_token')
+        .eq('id', node)
+        .single();
+      expect(stillClaimed).toMatchObject({
+        claimed_by_session_id: holder,
+        claim_token: claimToken,
+      });
+
+      // A NULL expectation does not match a row that has an epoch.
+      const nullFence = await groups.releaseGraphClaim({
+        userId: USER,
+        taskId: node,
+        claimToken,
+        reclaim: true,
+        fenceTurnEpoch: true,
+        expectedTurnEpoch: null,
+      });
+      expect(nullFence).toMatchObject({ success: false, reason: 'turn-moved' });
+
+      // The epoch the session is actually on releases.
+      const released = await groups.releaseGraphClaim({
+        userId: USER,
+        taskId: node,
+        claimToken,
+        reclaim: true,
+        fenceTurnEpoch: true,
+        expectedTurnEpoch: 'successor-epoch',
+      });
+      expect(released).toMatchObject({ success: true, reclaimed: true });
+    } finally {
+      await client.from('tasks').delete().eq('id', node);
+      await client.from('task_groups').delete().eq('id', gF);
+    }
+  });
+
   it('P1 regression: mutating an OPEN gate’s inbound set resets it — fresh window, stale verdicts bounce, cut reopens in-transaction', async () => {
     const g4 = randomUUID();
     const m1 = randomUUID();
