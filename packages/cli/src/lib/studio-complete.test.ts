@@ -21,9 +21,15 @@ import {
 } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { auditStudio, DEFAULT_CLAUDE_ALLOW_RULES } from '@inklabs/shared';
+import { auditStudio } from '@inklabs/shared';
+// A namespace import: against a tree without the profiles, each test that
+// needs one fails on its own instead of the file failing to load.
+import * as shared from '@inklabs/shared';
 import { completeStudio, type StepResult } from './studio-complete.js';
 import { installHooks } from '../commands/hooks.js';
+
+const profile = (name: 'builder' | 'reviewer', sbSlug = 'wren') =>
+  shared.studioPermissionRules(name, sbSlug);
 
 let root: string;
 let main: string;
@@ -111,7 +117,7 @@ describe('completeStudio — hook steps say whether they created or repaired', (
 });
 
 describe('completeStudio — a fresh linked worktree', () => {
-  it('ends complete by the checklist, with the main worktree config, its permissions, identity, registration and hooks for all three backends', async () => {
+  it('ends complete by the checklist, with the main worktree config, the builder profile, identity, registration and hooks for all three backends', async () => {
     const opts = baseOptions();
     const report = await completeStudio(studio, opts);
 
@@ -123,12 +129,11 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(readFileSync(join(studio, '.env.local'), 'utf-8')).toBe(
       readFileSync(join(main, '.env.local'), 'utf-8')
     );
-    // Permissions come from the main worktree, not the defaults.
+    // Permissions are the builder profile, not the main worktree's rules:
+    // root sync no longer carries them (design v3, item 3).
     const settings = readJson(join(studio, '.claude', 'settings.local.json'));
-    expect(settings.permissions).toEqual({
-      allow: ['Bash(git *)', 'Read(*)'],
-      deny: ['Bash(rm -rf *)'],
-    });
+    expect(settings.permissions).toEqual(profile('builder'));
+    expect(statusOf(report.steps, 'permissions')).toBe('created');
     expect(settings.enableAllProjectMcpServers).toBe(true);
     // Identity names this studio, its branch and its row.
     const identity = readJson(join(studio, '.ink', 'identity.json'));
@@ -177,7 +182,7 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(opts.register).toHaveBeenCalledTimes(1);
   });
 
-  it('without root sync it generates the default .mcp.json and the default permissions, and copies no env file', async () => {
+  it('without root sync it generates the default .mcp.json and the builder profile, and copies no env file', async () => {
     const opts = { ...baseOptions(), rootSync: false };
     const report = await completeStudio(studio, opts);
 
@@ -186,10 +191,8 @@ describe('completeStudio — a fresh linked worktree', () => {
     expect(mcp.mcpServers).toHaveProperty('inkwell');
     expect(mcp.mcpServers).not.toHaveProperty('trusted');
     expect(existsSync(join(studio, '.env.local'))).toBe(false);
-    const settings = readJson(join(studio, '.claude', 'settings.local.json')) as {
-      permissions: { allow: string[] };
-    };
-    expect(settings.permissions.allow).toEqual([...DEFAULT_CLAUDE_ALLOW_RULES]);
+    const settings = readJson(join(studio, '.claude', 'settings.local.json'));
+    expect(settings.permissions).toEqual(profile('builder'));
     expect(statusOf(report.steps, 'permissions')).toBe('created');
   });
 
