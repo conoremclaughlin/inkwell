@@ -213,7 +213,30 @@ export interface HeartbeatNotificationStore {
    * so the decision itself lives in one place rather than being re-derived by
    * every caller.
    */
-  claimNotice(key: NoticeKey): Promise<{ shouldSend: boolean; record: NoticeRecord | null }>;
+  claimNotice(
+    key: NoticeKey,
+    opts?: {
+      /**
+       * The exact send this notice stands for. Recorded with the claim, which
+       * makes the row drain-owned at once, so no later write is needed for the
+       * drain to find it.
+       */
+      payload?: HeldNoticePayload;
+    }
+  ): Promise<{ shouldSend: boolean; record: NoticeRecord | null }>;
+  /**
+   * Whether the outage an all-clear closes has reached the human. Every
+   * recovery sender asks this before sending, so an all-clear can never
+   * overtake its outage.
+   * - `pending`: owed and drain-owned, so it will be sent; the all-clear waits.
+   * - `stranded`: owed but carrying no payload (a row from before notices
+   *   recorded their send). Nothing will ever send it, so the all-clear must
+   *   not wait on it, or it would wait forever.
+   * - `unknown`: the read failed; the all-clear waits.
+   */
+  outageStatus(
+    key: NoticeKey
+  ): Promise<'delivered' | 'pending' | 'stranded' | 'absent' | 'unknown'>;
   /** Record the outcome of an attempt. */
   settleNotice(key: NoticeKey, outcome: { delivered: boolean; error?: string }): Promise<void>;
   /**
@@ -298,10 +321,12 @@ interface NoticeRow {
   destination: string | null;
   failed_beats: number | null;
   next_attempt_at: string | null;
+  payload: Json | null;
+  drain_owned: boolean | null;
 }
 
 const NOTICE_COLUMNS =
-  'id, status, attempts, episode_key, destination, failed_beats, next_attempt_at';
+  'id, status, attempts, episode_key, destination, failed_beats, next_attempt_at, payload, drain_owned';
 
 export function createHeartbeatNotificationStore(
   client: SupabaseClient<Database>
@@ -479,8 +504,18 @@ export function createHeartbeatNotificationStore(
     }
   };
 
-  /** Create the row for an episode we have not considered before. */
-  const insertNotice = async (key: NoticeKey): Promise<NoticeRow | null> => {
+  /**
+   * Create the row for an episode we have not considered before.
+   *
+   * With a payload, the row is drain-owned from this one INSERT: the send it
+   * stands for is recorded together with the obligation, so a hold write that
+   * fails later, or a crash before it, still leaves a notice the drain can
+   * find and send (PR #723 review).
+   */
+  const insertNotice = async (
+    key: NoticeKey,
+    payload?: HeldNoticePayload
+  ): Promise<NoticeRow | null> => {
     const { data, error } = await table()
       .insert({
         reminder_id: key.reminderId,
@@ -491,6 +526,7 @@ export function createHeartbeatNotificationStore(
         failed_beats: key.failedBeats ?? 0,
         status: 'pending',
         attempts: 0,
+        ...(payload ? { payload: payload as unknown as Json, drain_owned: true } : {}),
       })
       .select(NOTICE_COLUMNS)
       .single();
@@ -512,7 +548,7 @@ export function createHeartbeatNotificationStore(
     return data as NoticeRow;
   };
 
-  const claimNotice: HeartbeatNotificationStore['claimNotice'] = async (key) => {
+  const claimNotice: HeartbeatNotificationStore['claimNotice'] = async (key, opts) => {
     let record: NoticeRow | null;
     try {
       record = await load(key);
@@ -520,7 +556,21 @@ export function createHeartbeatNotificationStore(
         // First time we have considered this episode. Create the row up front so
         // a crash between here and the send still leaves evidence that a notice
         // was owed — a missing row is indistinguishable from "never happened".
-        record = await insertNotice(key);
+        record = await insertNotice(key, opts?.payload);
+      } else if (opts?.payload && record.status === 'pending' && !record.payload) {
+        // A row from before notices carried their send (or one recreated by a
+        // bookkeeping path): give it the payload now so the drain can own it.
+        // Best effort — the caller still sends or holds as it would have.
+        const { error } = await table()
+          .update({ payload: opts.payload as unknown as Json, drain_owned: true })
+          .eq('id', record.id);
+        if (error) {
+          logger.warn('[Heartbeat] Could not record the send on an existing notice', {
+            reminderId: key.reminderId,
+            kind: key.kind,
+            error: error.message,
+          });
+        }
       }
     } catch (err) {
       logger.warn('[Heartbeat] Notice acknowledgement lookup threw', {
@@ -1140,6 +1190,34 @@ export function createHeartbeatNotificationStore(
     }
   };
 
+  const outageStatus: HeartbeatNotificationStore['outageStatus'] = async (key) => {
+    try {
+      const { data, error } = await table()
+        .select('status, drain_owned, payload')
+        .eq('reminder_id', key.reminderId)
+        .eq('kind', 'outage')
+        .eq('episode_key', key.episodeKey)
+        .maybeSingle();
+      if (error) {
+        logger.warn('[Heartbeat] Could not read the outage behind an all-clear', {
+          reminderId: key.reminderId,
+          error: error.message,
+        });
+        return 'unknown';
+      }
+      if (!data) return 'absent';
+      const row = data as { status: string; drain_owned: boolean | null; payload: Json | null };
+      if (row.status === 'delivered') return 'delivered';
+      return row.drain_owned && row.payload ? 'pending' : 'stranded';
+    } catch (err) {
+      logger.warn('[Heartbeat] Reading the outage behind an all-clear threw', {
+        reminderId: key.reminderId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 'unknown';
+    }
+  };
+
   return {
     openEpisode,
     claimNotice,
@@ -1150,5 +1228,6 @@ export function createHeartbeatNotificationStore(
     holdNotice,
     listDrainUsers,
     listDrainCandidates,
+    outageStatus,
   };
 }

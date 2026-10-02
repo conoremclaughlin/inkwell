@@ -193,6 +193,8 @@ export interface HeldNoticeDrainStats {
   held: number;
   /** Owned by the drain but unsendable as stored: no payload or no destination. */
   skipped: number;
+  /** An all-clear whose outage notice is not delivered yet; it goes after. */
+  waiting: number;
 }
 
 /** How many held notices one tick sends at most. */
@@ -212,6 +214,13 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
    * case the caller sends nothing and settles nothing: a hold is not an
    * attempt. The drain sends it when quiet hours end.
    */
+  /** The exact direct send a notice stands for, recorded with its claim. */
+  const payloadFor = (reminder: DueReminder, content: string) => ({
+    channel: reminder.delivery_channel,
+    target: reminder.delivery_target ?? '',
+    content,
+  });
+
   const holdForQuietHours = async (
     reminder: DueReminder,
     key: NoticeKey,
@@ -502,9 +511,19 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
+    const outageContent =
+      `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
+      `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
+      `Whatever this beat monitors is NOT being checked. ` +
+      `I will send one more message when it runs again.`;
+
     // The real dedup: has a notice for THIS outage actually been delivered?
-    // Not "did an earlier beat fail" — that was the round-two defect.
-    const { shouldSend, record } = await store.claimNotice(key);
+    // Not "did an earlier beat fail" — that was the round-two defect. The
+    // claim records the send itself, so the notice is drain-owned from here
+    // on: whatever happens after this line, nothing strands it.
+    const { shouldSend, record } = await store.claimNotice(key, {
+      payload: payloadFor(reminder, outageContent),
+    });
     if (!shouldSend) {
       logger.warn('[Heartbeat] Outage already announced for this episode — inbox only', {
         reminderId: reminder.id,
@@ -516,12 +535,6 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       });
       return { alerted: false };
     }
-
-    const outageContent =
-      `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
-      `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
-      `Whatever this beat monitors is NOT being checked. ` +
-      `I will send one more message when it runs again.`;
 
     if (await holdForQuietHours(reminder, key, outageContent)) {
       return { alerted: false };
@@ -577,7 +590,13 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    const { shouldSend, record } = await store.claimNotice(key);
+    const recoveryContent =
+      `✅ Heartbeat recovered: "${reminder.title}"\n\n` +
+      `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`;
+
+    const { shouldSend, record } = await store.claimNotice(key, {
+      payload: payloadFor(reminder, recoveryContent),
+    });
     if (!shouldSend) {
       logger.info('[Heartbeat] Recovery already announced for this episode', {
         reminderId: reminder.id,
@@ -588,9 +607,26 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    const recoveryContent =
-      `✅ Heartbeat recovered: "${reminder.title}"\n\n` +
-      `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`;
+    // An all-clear never overtakes its outage (PR #723 review). If the outage
+    // notice is still owed (held overnight, or its send failing) or its state
+    // cannot be read, this all-clear waits: it is already drain-owned from the
+    // claim, and the drain sends it once the outage is delivered. Only when
+    // the claim itself could not be recorded is there nothing to wait on, and
+    // then the old send-anyway rule stands.
+    if (record) {
+      const outage = await store.outageStatus(key);
+      if (outage === 'pending' || outage === 'unknown') {
+        logger.info(
+          '[Heartbeat] All-clear waits for its outage notice — the drain sends it after',
+          {
+            reminderId: reminder.id,
+            failedBeats,
+            outage,
+          }
+        );
+        return { alerted: false };
+      }
+    }
 
     if (await holdForQuietHours(reminder, key, recoveryContent)) {
       return { alerted: false };
@@ -636,7 +672,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
    * each notice before the beat path reads it.
    */
   const drainHeldNotices = async (): Promise<HeldNoticeDrainStats> => {
-    const stats: HeldNoticeDrainStats = { sent: 0, failed: 0, held: 0, skipped: 0 };
+    const stats: HeldNoticeDrainStats = { sent: 0, failed: 0, held: 0, skipped: 0, waiting: 0 };
 
     const users = await store.listDrainUsers();
     if (!users || users.length === 0) return stats;
@@ -659,6 +695,17 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
         });
         stats.skipped++;
         continue;
+      }
+
+      // The same causal check the beat path makes: the store's selection
+      // already leaves out an all-clear whose outage is pending, and this
+      // re-asks at the moment of sending, as the quiet-hours gate does.
+      if (key.kind === 'recovery') {
+        const outage = await store.outageStatus(key);
+        if (outage === 'pending' || outage === 'unknown') {
+          stats.waiting++;
+          continue;
+        }
       }
 
       const gate = await quietGate(key.userId);
