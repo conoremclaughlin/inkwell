@@ -13,7 +13,12 @@
  * no token, no request.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resolveUser, resolveUserOrThrow, PrincipalMismatchError } from './user-resolver';
+import {
+  resolveUser,
+  resolveUserOrThrow,
+  PrincipalMismatchError,
+  type UserIdentifier,
+} from './user-resolver';
 import {
   clearSessionContext,
   mergeWithContext,
@@ -21,6 +26,9 @@ import {
   setSessionContext,
 } from '../utils/request-context';
 import { resetSharedBreakerForTests } from '../utils/supabase-retry';
+
+/** mergeWithContext types platform as a string; handlers parse it to the enum first. */
+const merged = (args: Record<string, unknown>) => mergeWithContext(args) as UserIdentifier;
 
 const ALPHA = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -112,7 +120,7 @@ describe('resolveUser with an authenticated principal — the probe cases', () =
 
   it("refuses another account's userId passed through mergeWithContext", async () => {
     await expect(
-      asAlpha(() => resolveUser(mergeWithContext({ userId: BETA.id }), dc))
+      asAlpha(() => resolveUser(merged({ userId: BETA.id }), dc))
     ).rejects.toBeInstanceOf(PrincipalMismatchError);
   });
 
@@ -127,13 +135,13 @@ describe('resolveUser with an authenticated principal — the probe cases', () =
     // email. An explicit identifier naming someone else is a refusal, not a
     // hint to drop.
     await expect(
-      asAlpha(() => resolveUser(mergeWithContext({ email: BETA.email }), dc))
+      asAlpha(() => resolveUser(merged({ email: BETA.email }), dc))
     ).rejects.toBeInstanceOf(PrincipalMismatchError);
   });
 
   it('refuses a missing userId with another account’s email as the fallback', async () => {
     await expect(
-      asAlpha(() => resolveUser(mergeWithContext({ userId: NOBODY_ID, email: BETA.email }), dc))
+      asAlpha(() => resolveUser(merged({ userId: NOBODY_ID, email: BETA.email }), dc))
     ).rejects.toBeInstanceOf(PrincipalMismatchError);
   });
 });
@@ -225,7 +233,7 @@ describe('resolveUser with an authenticated principal — same-user identifiers 
   });
 
   it('resolves the principal through mergeWithContext with its own email', async () => {
-    const result = await asAlpha(() => resolveUser(mergeWithContext({ email: ALPHA.email }), dc));
+    const result = await asAlpha(() => resolveUser(merged({ email: ALPHA.email }), dc));
     expect(result?.user.id).toBe(ALPHA.id);
   });
 
@@ -234,7 +242,7 @@ describe('resolveUser with an authenticated principal — same-user identifiers 
     // lock its own caller out.
     const renamed = { ...ALPHA, email: 'alpha.renamed@example.com' };
     repo.findById.mockImplementation(async (id: string) => (id === ALPHA.id ? renamed : null));
-    const result = await asAlpha(() => resolveUser(mergeWithContext({}), dc));
+    const result = await asAlpha(() => resolveUser(merged({}), dc));
     expect(result?.user.id).toBe(ALPHA.id);
   });
 

@@ -143,7 +143,7 @@ const FAMILIES: Family[] = [
   ['links', (dc, who) => handleSearchLinks({ ...who }, dc)],
   ['projects', (dc, who) => handleListProjects({ ...who }, dc)],
   ['thread key types', (dc, who) => handleListThreadKeyTypes({ ...who }, dc)],
-  ['tasks', (dc, who) => handleListTasks({ ...who }, dc)],
+  ['tasks', (dc, who) => handleListTasks({ ...who } as Parameters<typeof handleListTasks>[0], dc)],
   ['task graphs', (dc, who) => handleGetTaskGraph({ ...who, taskGroupId: SOME_UUID }, dc)],
   ['strategies', (dc, who) => handleGetStrategyStatus({ ...who, groupId: SOME_UUID }, dc)],
   ['memory', (dc, who) => handleRecall({ ...who, query: 'synthetic' }, dc)],
@@ -158,7 +158,10 @@ const FAMILIES: Family[] = [
   ['identities', (dc, who) => handleListIdentities({ ...who }, dc)],
   ['user identity', (dc, who) => handleGetUserIdentity({ ...who }, dc)],
   ['team constitution', (dc, who) => handleGetTeamConstitution({ ...who }, dc)],
-  ['reminders', (dc, who) => handleListReminders({ ...who }, dc)],
+  [
+    'reminders',
+    (dc, who) => handleListReminders({ ...who } as Parameters<typeof handleListReminders>[0], dc),
+  ],
   ['user settings', (dc, who) => handleGetTimezone({ ...who }, dc)],
   ['artifacts', (dc, who) => handleListArtifacts({ ...who }, dc)],
   ['inbox read', (dc, who) => handleGetInbox({ ...who, sbSlug: 'synthetic-alpha' }, dc)],
@@ -167,7 +170,14 @@ const FAMILIES: Family[] = [
     (dc, who) =>
       handleSendToInbox({ ...who, recipientSlug: 'synthetic-beta', content: 'synthetic' }, dc),
   ],
-  ['threads', (dc, who) => handleListThreads({ ...who, sbSlug: 'synthetic-alpha' }, dc)],
+  [
+    'threads',
+    (dc, who) =>
+      handleListThreads(
+        { ...who, sbSlug: 'synthetic-alpha' } as Parameters<typeof handleListThreads>[0],
+        dc
+      ),
+  ],
   ['activity stream', (dc, who) => handleGetActivity({ ...who }, dc)],
   ['studios', (dc, who) => handleListStudios({ ...who }, dc)],
   ['workspaces', (dc, who) => handleListWorkspaces({ ...who }, dc)],
