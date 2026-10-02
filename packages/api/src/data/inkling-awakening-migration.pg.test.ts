@@ -394,6 +394,27 @@ describe.skipIf(!ADMIN_URL)('inkling self-serve awakening migration (throwaway P
       expect(await tokenStatus(token)).toBe('active');
     });
 
+    it('an explicit NULL method means referral, as an omitted one does', async () => {
+      const { userId, workspaceId } = await person();
+      const inviter = await person();
+      const token = (
+        await one<{ token: string }>(
+          `INSERT INTO public.kindle_tokens (creator_user_id, creator_agent_id)
+           VALUES ($1, 'myra') RETURNING token`,
+          [inviter.userId]
+        )
+      ).token;
+      const lineage = await one(
+        `SELECT * FROM public.redeem_kindle_token(p_token => $1, p_new_user_id => $2,
+           p_workspace_id => $3, p_identity => '{}'::jsonb, p_kindle_method => NULL)`,
+        [token, userId, workspaceId]
+      );
+      expect(lineage).toMatchObject({
+        kindle_method: 'referral',
+        onboarding_status: 'values_interview',
+      });
+    });
+
     it('a second redemption for the same awakening request fails whole: no identity, no lineage, token intact', async () => {
       const { userId, workspaceId } = await person();
       const requestId = randomUUID();
@@ -501,6 +522,36 @@ describe.skipIf(!ADMIN_URL)('inkling self-serve awakening migration (throwaway P
         [fn]
       );
       expect(grants).toEqual({ anon: false, authenticated: false, service_role: true });
+    });
+  });
+
+  describe("the code's lookups can use the partial indexes", () => {
+    /** The plan for `sql` with sequential scans priced out, so any usable index shows. */
+    async function planFor(sql: string): Promise<string> {
+      await db.query('BEGIN');
+      try {
+        await db.query('SET LOCAL enable_seqscan = off');
+        const { rows } = await db.query(`EXPLAIN ${sql}`);
+        return rows.map((r: Row) => String(r['QUERY PLAN'])).join('\n');
+      } finally {
+        await db.query('ROLLBACK');
+      }
+    }
+
+    it('the awakening request lookup (InklingService.findByAwakenRequest)', async () => {
+      const plan = await planFor(
+        `SELECT id FROM public.agent_identities
+         WHERE user_id = '${randomUUID()}' AND metadata->>'awakenRequestId' = '${randomUUID()}'`
+      );
+      expect(plan).toContain('agent_identities_user_awaken_request_key');
+    });
+
+    it('the client message lookup (lookUpClientMessage)', async () => {
+      const plan = await planFor(
+        `SELECT id FROM public.inbox_thread_messages
+         WHERE thread_id = '${randomUUID()}' AND metadata->>'clientMessageId' = '${randomUUID()}'`
+      );
+      expect(plan).toContain('inbox_thread_messages_thread_client_message_key');
     });
   });
 

@@ -3,7 +3,8 @@
 -- Three changes, all additive for existing callers:
 --
 -- 1. redeem_kindle_token gains an optional p_kindle_method (default
---    'referral', so every existing call means what it meant). With
+--    'referral', so every existing call means what it meant; an explicit
+--    NULL means 'referral' too, rather than failing). With
 --    'self_serve', the awakening is complete the moment it is created: the
 --    lineage is written 'complete' with completed_at, and the identity's
 --    onboarding flag is false. There is no open state to get stuck in, and
@@ -29,6 +30,9 @@
 --    (POST /api/admin/threads takes it from the request), so a retried
 --    create lands on the same thread and is caught here too.
 --
+-- Both indexes are partial on `(metadata->>'key') IS NOT NULL`, which the
+-- code's `metadata->>'key' = $1` lookups imply, so the planner can use them
+-- for those lookups (`metadata ? 'key'` cannot be proved from the equality).
 -- Neither metadata key exists in any row today (read on 2026-10-01), so both
 -- indexes build without conflict.
 
@@ -46,12 +50,13 @@ DECLARE
   v_lineage public.kindle_lineage%ROWTYPE;
   v_temp_agent_id text;
   v_sb_id uuid;
+  v_method text := COALESCE(p_kindle_method, 'referral');
   v_self_serve boolean;
 BEGIN
-  IF p_kindle_method IS NULL OR p_kindle_method NOT IN ('referral', 'self_serve') THEN
-    RAISE EXCEPTION 'unsupported kindle method %', p_kindle_method;
+  IF v_method NOT IN ('referral', 'self_serve') THEN
+    RAISE EXCEPTION 'unsupported kindle method %', v_method;
   END IF;
-  v_self_serve := p_kindle_method = 'self_serve';
+  v_self_serve := v_method = 'self_serve';
 
   UPDATE public.kindle_tokens
   SET status = 'used', used_by_user_id = p_new_user_id, used_at = now()
@@ -80,7 +85,7 @@ BEGIN
     v_token.creator_agent_id,
     CASE WHEN v_self_serve THEN NULL ELSE v_token.creator_user_id END,
     v_token.creator_user_id,
-    v_temp_agent_id, p_new_user_id, p_kindle_method, v_token.value_seed,
+    v_temp_agent_id, p_new_user_id, v_method, v_token.value_seed,
     CASE WHEN v_self_serve THEN 'complete' ELSE 'values_interview' END,
     CASE WHEN v_self_serve THEN now() ELSE NULL END
   ) RETURNING * INTO v_lineage;
@@ -131,8 +136,8 @@ GRANT EXECUTE ON FUNCTION public.redeem_kindle_token(text, uuid, uuid, jsonb, te
 
 CREATE UNIQUE INDEX IF NOT EXISTS agent_identities_user_awaken_request_key
   ON public.agent_identities (user_id, (metadata->>'awakenRequestId'))
-  WHERE metadata ? 'awakenRequestId';
+  WHERE (metadata->>'awakenRequestId') IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS inbox_thread_messages_thread_client_message_key
   ON public.inbox_thread_messages (thread_id, (metadata->>'clientMessageId'))
-  WHERE metadata ? 'clientMessageId';
+  WHERE (metadata->>'clientMessageId') IS NOT NULL;
