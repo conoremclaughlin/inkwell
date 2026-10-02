@@ -14,10 +14,10 @@
  * The approved manifest is evidence for the cutover, not authorization: the
  * cutover revalidates it inside the window against changes made since.
  */
-import { lstat, mkdir, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, realpath, unlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createSupabaseClient } from '../data/supabase/client';
 import {
   classifySessions,
@@ -67,19 +67,44 @@ function enclosingCheckout(dir: string): string | null {
   }
 }
 
+/** The physical path of the nearest ancestor of `p` that exists. */
+async function realAncestor(p: string): Promise<string> {
+  let current = resolve(p);
+  for (;;) {
+    try {
+      return await realpath(current);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return current;
+      current = parent;
+    }
+  }
+}
+
 /**
  * Write the manifest only where it stays private: never inside a git
- * checkout, never through a symlink, always mode 0600. An existing regular
- * file is replaced, not rewritten in place, so its old mode cannot survive;
- * exclusive creation refuses anything that appears at the path in between.
+ * checkout, never through a symlink, always mode 0600. Every check runs on
+ * the physical location as well as the spelled one, because a symlinked
+ * parent can lead into a checkout while every spelled ancestor looks clean.
+ * An existing regular file is replaced, not rewritten in place, so its old
+ * mode cannot survive; exclusive creation refuses anything that appears at
+ * the path in between.
  */
 export async function writePrivateManifest(out: string, contents: string): Promise<void> {
-  const target = resolve(out);
-  const checkout = enclosingCheckout(dirname(target));
-  if (checkout) {
-    throw new Error(`Refusing to write the manifest inside a git checkout (${checkout})`);
-  }
-  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const spelled = resolve(out);
+  const refuseCheckout = (dir: string) => {
+    const checkout = enclosingCheckout(dir);
+    if (checkout) {
+      throw new Error(`Refusing to write the manifest inside a git checkout (${checkout})`);
+    }
+  };
+  refuseCheckout(dirname(spelled));
+  refuseCheckout(await realAncestor(dirname(spelled)));
+  await mkdir(dirname(spelled), { recursive: true, mode: 0o700 });
+  const physicalDir = await realpath(dirname(spelled));
+  refuseCheckout(physicalDir);
+
+  const target = join(physicalDir, basename(spelled));
   const existing = await lstat(target).catch(() => null);
   if (existing?.isSymbolicLink()) {
     throw new Error('Refusing to write the manifest through a symlink');
@@ -108,11 +133,11 @@ async function main() {
     selectAll(
       client,
       'sessions',
-      'id, user_id, sb_id, agent_id, studio_id, contact_id, backend, backend_session_id, claude_session_id, alias, ended_at, lifecycle, status, message_count, working_dir, cli_turn_at, cli_turn_stopped_at',
+      'id, user_id, sb_id, agent_id, studio_id, contact_id, backend, backend_session_id, claude_session_id, alias, ended_at, lifecycle, status, message_count, started_at, working_dir, cli_turn_at, cli_turn_stopped_at',
       'id'
     ),
     // Any activity row is evidence the session ran: a turn, a tool call.
-    selectAll(client, 'activity_stream', 'id, session_id', 'id', (q) =>
+    selectAll(client, 'activity_stream', 'id, session_id, created_at', 'id', (q) =>
       q.not('session_id', 'is', null)
     ),
     selectAll(
@@ -121,12 +146,12 @@ async function main() {
       'id, user_id, workspace_id, agent_id, backend, default_session_id',
       'id'
     ),
-    selectAll(client, 'inbox_threads', 'id, workspace_id, key_project', 'id'),
+    selectAll(client, 'inbox_threads', 'id, workspace_id, key_project, thread_key', 'id'),
     selectAll(client, 'projects', 'id, slug, repo_root, workspace_id', 'id'),
     selectAll(
       client,
       'studios',
-      'id, user_id, sb_id, repo_root, worktree_path, status, archived_at, cleaned_at',
+      'id, user_id, sb_id, repo_root, worktree_path, status, archived_at, cleaned_at, ephemeral, thread_key',
       'id'
     ),
     selectAll(
@@ -149,6 +174,12 @@ async function main() {
   // Positive evidence that a session ran or spoke: an activity row, a CLI
   // turn boundary, or an inbox message it authored.
   const evidence = new Set(activityRows.map((r) => r.session_id as string));
+  // When the activity log began: a row started earlier cannot be proven empty.
+  const evidenceSince =
+    activityRows
+      .map((r) => str(r.created_at))
+      .filter((t): t is string => t !== null)
+      .sort()[0] ?? null;
   for (const m of messageRows) {
     const authored = str(m.sender_session);
     if (authored) evidence.add(authored);
@@ -172,6 +203,7 @@ async function main() {
     lifecycle: str(r.lifecycle),
     status: str(r.status),
     messageCount: typeof r.message_count === 'number' ? r.message_count : null,
+    startedAt: str(r.started_at),
     workingDir: str(r.working_dir),
     hasExecuted: evidence.has(r.id as string),
   }));
@@ -191,6 +223,8 @@ async function main() {
     sbId: str(r.sb_id),
     repoRoot: str(r.repo_root),
     worktreePath: str(r.worktree_path),
+    ephemeral: r.ephemeral === true,
+    threadKey: str(r.thread_key),
     closed: r.status === 'cleaned' || !!str(r.archived_at) || !!str(r.cleaned_at),
   }));
 
@@ -208,6 +242,7 @@ async function main() {
         t.id as string,
         {
           workspaceId,
+          threadKey: str(t.thread_key),
           // Undefined: not pinned. Null: pinned to a project with no known root.
           projectRepoRoot: pin ? (projectRoot.get(`${workspaceId}|${pin}`) ?? null) : undefined,
         },
@@ -218,6 +253,7 @@ async function main() {
     const info = threadInfo.get(threadId);
     return {
       threadWorkspaceId: info?.workspaceId ?? null,
+      threadKey: info?.threadKey ?? null,
       ...(info && info.projectRepoRoot !== undefined
         ? { threadProjectRepoRoot: info.projectRepoRoot }
         : {}),
@@ -261,6 +297,7 @@ async function main() {
     latestSenders,
     channelRoutes,
     studios,
+    evidenceSince,
   });
 
   const out =

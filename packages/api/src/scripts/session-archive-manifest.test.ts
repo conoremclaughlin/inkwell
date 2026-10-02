@@ -151,10 +151,43 @@ describe('session archive manifest runner', () => {
       ]);
     });
 
-    it('a row with no evidence at all is still `empty` (control)', async () => {
-      harness.rows.sessions = [sessionRow()];
+    it('a row the activity log covers, with a zero counter and no evidence, is `empty` (control)', async () => {
+      harness.rows.sessions = [sessionRow({ started_at: '2026-09-01T00:00:00Z' })];
+      // Another session's activity establishes when the log began.
+      harness.rows.activity_stream = [
+        {
+          id: 'activity-other',
+          session_id: 'session-other',
+          type: 'agent_spawn',
+          created_at: '2026-02-03T00:00:00Z',
+        },
+      ];
 
       expect((await manifest()).archive).toEqual([{ sessionId: 'session-one', reason: 'empty' }]);
+    });
+
+    it('a row older than the activity log is never proven empty', async () => {
+      harness.rows.sessions = [sessionRow({ started_at: '2026-01-15T00:00:00Z' })];
+      harness.rows.activity_stream = [
+        {
+          id: 'activity-other',
+          session_id: 'session-other',
+          type: 'agent_spawn',
+          created_at: '2026-02-03T00:00:00Z',
+        },
+      ];
+
+      expect((await manifest()).archive).toEqual([
+        { sessionId: 'session-one', reason: 'backfill' },
+      ]);
+    });
+
+    it('a row with no activity log to compare against is never proven empty', async () => {
+      harness.rows.sessions = [sessionRow({ started_at: '2026-09-01T00:00:00Z' })];
+
+      expect((await manifest()).archive).toEqual([
+        { sessionId: 'session-one', reason: 'backfill' },
+      ]);
     });
   });
 
@@ -189,5 +222,23 @@ describe('session archive manifest runner', () => {
       expect(errors).toHaveBeenCalledWith(expect.stringContaining('git checkout'));
       expect(harness.written).toBe(false);
     });
+  });
+});
+
+describe('session archive manifest runner: physical destination (review round 2)', () => {
+  it('refuses a parent symlink that leads into a checkout subdirectory', async () => {
+    const repo = join(dir, 'checkout');
+    const nested = join(repo, 'nested');
+    const link = join(dir, 'outside-link');
+    await mkdir(join(repo, '.git'), { recursive: true });
+    await mkdir(nested);
+    await symlink(nested, link);
+    vi.stubEnv('SESSION_ARCHIVE_MANIFEST_OUT', join(link, 'manifest.json'));
+
+    await run();
+
+    expect(await stat(join(nested, 'manifest.json')).catch(() => null)).toBeNull();
+    expect(harness.written).toBe(false);
+    expect(process.exitCode).toBe(1);
   });
 });

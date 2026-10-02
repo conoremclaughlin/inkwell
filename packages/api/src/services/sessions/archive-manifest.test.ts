@@ -264,6 +264,8 @@ describe('classifySessions (session lifecycle cutover dry run)', () => {
       live: 2,
       ended: 18,
       preserved: 7,
+      preservedNeedingRecovery: 0,
+      unresolved: 0,
       archiveBackfill: 10,
       archiveEmpty: 1,
       invalidReferences: 7,
@@ -383,7 +385,7 @@ describe('classifySessions: review regressions', () => {
     expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['workspace-unknown']);
   });
 
-  it('refuses a binding to a session on a backend the identity does not run', () => {
+  it('refuses a binding to a session on a runtime nothing supports', () => {
     const manifest = classifySessions(
       only({
         sessions: [session('bound', { backend: 'unsupported-runtime' })],
@@ -392,7 +394,31 @@ describe('classifySessions: review regressions', () => {
     );
 
     expect(manifest.preserved).toEqual([]);
-    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['backend-mismatch']);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['backend-unsupported']);
+  });
+
+  it('keeps a bound transcript on its supported runtime after the identity default changes', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { backend: 'claude-code' })],
+        identities: [{ ...wren, backend: 'codex' }],
+        bindings: [bind('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([{ sessionId: 'bound', references: ['binding'] }]);
+  });
+
+  it('never admits a runtime because two rows agree on an unsupported name', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { backend: 'unsupported-runtime' })],
+        identities: [{ ...wren, backend: 'unsupported-runtime' }],
+        bindings: [bind('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
   });
 
   it('reports ended key holders that all archive as an unresolved conflict', () => {
@@ -452,27 +478,72 @@ describe('classifySessions: review regressions', () => {
     expect(manifest.duplicateBackendIdentities).toEqual([]);
   });
 
-  it('refuses a session whose studio is gone or closed', () => {
+  it('treats a cleaned studio as a recovery question, never as an archive decision', () => {
     const manifest = classifySessions(
       only({
         sessions: [
           session('in-closed', { studioId: 'studio-closed' }),
+          session('in-revivable', { studioId: 'studio-revivable' }),
           session('in-missing', { studioId: 'studio-missing' }),
           session('in-open', { studioId: 'studio-open' }),
         ],
         studios: [
           { id: 'studio-closed', userId: USER, sbId: WREN, repoRoot: '/repo', closed: true },
+          {
+            id: 'studio-revivable',
+            userId: USER,
+            sbId: WREN,
+            repoRoot: '/repo',
+            closed: true,
+            ephemeral: true,
+            threadKey: 'pr:42',
+          },
           { id: 'studio-open', userId: USER, sbId: WREN, repoRoot: '/repo', closed: false },
         ],
-        bindings: [bind('in-closed'), bind('in-missing'), bind('in-open')],
+        bindings: [
+          bind('in-closed'),
+          bind('in-revivable', { threadKey: 'pr:42' }),
+          bind('in-missing'),
+          bind('in-open'),
+        ],
       })
     );
 
-    expect(manifest.preserved).toEqual([{ sessionId: 'in-open', references: ['binding'] }]);
+    // A cleaned ephemeral studio for this very thread can be revived, so the
+    // transcript stays routable behind a recovery step; a cleaned studio that
+    // cannot be shown recoverable is left for the cutover to decide.
+    expect(manifest.preserved).toEqual([
+      { sessionId: 'in-open', references: ['binding'] },
+      { sessionId: 'in-revivable', references: ['binding'], requires: ['studio-recovery'] },
+    ]);
+    expect(manifest.unresolved).toEqual([
+      { sessionId: 'in-closed', reason: 'studio-recovery-unproven', references: ['binding'] },
+    ]);
+    expect(manifest.archive.map((a) => a.sessionId)).toEqual(['in-missing']);
     expect(manifest.invalidReferences.map((i) => [i.sessionId, i.reason])).toEqual([
-      ['in-closed', 'studio-closed'],
       ['in-missing', 'studio-missing'],
     ]);
+  });
+
+  it('refuses a studio that belongs to another identity of the same owner', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { studioId: 'studio-other-sb' })],
+        identities: [wren, { ...wren, id: 'sb-other', slug: 'other' }],
+        studios: [
+          {
+            id: 'studio-other-sb',
+            userId: USER,
+            sbId: 'sb-other',
+            repoRoot: '/repo',
+            closed: false,
+          },
+        ],
+        bindings: [bind('bound')],
+      })
+    );
+
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['studio-foreign']);
   });
 
   it('keeps a pinned thread to sessions working inside its project', () => {
@@ -533,5 +604,119 @@ describe('classifySessions: review regressions', () => {
       ['nowhere', 'project-unverifiable'],
       ['unpinned-project', 'project-unverifiable'],
     ]);
+  });
+});
+
+/** Regressions from Lumen's second review of PR #720; each failed against b8fcc639. */
+describe('classifySessions: review round 2', () => {
+  const wren = {
+    id: WREN,
+    userId: USER,
+    workspaceId: 'ws-1',
+    slug: 'wren',
+    backend: 'claude-code',
+    defaultSessionId: null,
+  };
+  const only = (patch: Partial<ManifestInput>): ManifestInput => ({
+    sessions: [],
+    identities: [wren],
+    bindings: [],
+    latestSenders: [],
+    channelRoutes: [],
+    ...patch,
+  });
+  const pinned = (sessionId: string) => ({
+    threadId: `t-${sessionId}`,
+    threadWorkspaceId: 'ws-1',
+    sbId: WREN,
+    sessionId,
+    threadProjectRepoRoot: '/repos/one',
+  });
+
+  it('a session key cannot preserve a row whose legacy identity is ambiguous', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('keyed', { sbId: null, sessionKey: 'wren:inkwell:review' })],
+        identities: [wren, { ...wren, id: 'sb-wren-elsewhere', workspaceId: 'ws-2' }],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => [i.kind, i.reason])).toEqual([
+      ['session-key', 'legacy-identity-ambiguous'],
+    ]);
+  });
+
+  it('a session key cannot preserve a row on an unsupported runtime', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('keyed', { backend: 'unsupported-runtime', sessionKey: 'wren:x:y' })],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => [i.kind, i.reason])).toEqual([
+      ['session-key', 'backend-unsupported'],
+    ]);
+  });
+
+  it('never takes project evidence from another owner’s worktree', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { workingDir: '/worktrees/foreign/src' })],
+        studios: [
+          {
+            id: 'studio-foreign',
+            userId: OTHER_USER,
+            sbId: 'sb-foreign',
+            repoRoot: '/repos/one',
+            worktreePath: '/worktrees/foreign',
+            closed: false,
+          },
+        ],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['project-mismatch']);
+  });
+
+  it('never accepts a working directory that climbs out of the project', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { workingDir: '/repos/one/../two' })],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['project-mismatch']);
+  });
+
+  it('accepts a working directory inside the project after normalisation (control)', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { workingDir: '/repos/one/packages/../src' })],
+        bindings: [pinned('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([{ sessionId: 'bound', references: ['binding'] }]);
+  });
+
+  it('never proves a row empty from an unknown counter or a gap in the log', () => {
+    const blank = {
+      hasExecuted: false,
+      backendSessionId: null,
+      claudeSessionId: null,
+      startedAt: '2026-09-01T00:00:00Z',
+    };
+    expect(isEmpty(session('a', { ...blank, messageCount: null }))).toBe(false);
+    expect(isEmpty(session('b', { ...blank, messageCount: 0 }), null)).toBe(false);
+    expect(isEmpty(session('c', { ...blank, messageCount: 0 }), '2026-10-01T00:00:00Z')).toBe(
+      false
+    );
+    expect(isEmpty(session('d', { ...blank, messageCount: 0 }), '2026-02-03T00:00:00Z')).toBe(true);
   });
 });
