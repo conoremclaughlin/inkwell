@@ -176,21 +176,62 @@ export const INSTALL_DENY_RULES: readonly string[] = [
 ];
 
 /**
- * Push, in one place. Design v3 (Conor, 2026-10-02): a studio does not
- * push; publishing goes through a separately authorized session after
- * review. Every rule is a backstop: `Bash(git push *)` also matches a bare
- * `git push`, but no rule matches every spelling (Claude Code's
- * documentation names `git -C . push` and `git -c push.default=current
- * push`), so the `-C` and `--git-dir` forms are listed and the rest stay
- * possible with `Bash(*)`.
+ * Every push, by the spellings a rule can name. The reviewer profile denies
+ * them all. Backstops: `Bash(git push *)` also matches a bare `git push`,
+ * but no rule matches every spelling (Claude Code's documentation names
+ * `git -C . push` and `git -c push.default=current push`), so the `-C` and
+ * `--git-dir` forms are listed and the rest stay possible with `Bash(*)`.
+ */
+export const PUSH_DENY_RULES: readonly string[] = [
+  'Bash(git push *)',
+  'Bash(git -C * push *)',
+  'Bash(git --git-dir* push *)',
+];
+
+/** The push spellings the restricted denies are written for. */
+const PUSH_PREFIXES = ['git push', 'git -C * push'] as const;
+
+/**
+ * The builder's push policy, in one place. Design v4 (Conor, 2026-10-02:
+ * "it's working on its own branch"; Lumen agreed): a studio pushes its own
+ * feature branch normally, so push is a plain allow, and the forms that
+ * rewrite or bypass are denied. Nothing here lifts a deny: the blanket push
+ * denies are simply not in the builder's list, because deny beats allow and
+ * they would forbid every push.
  *
- * `allow` is empty by design. A v4 that lets a studio push its own branch
- * changes this constant and nothing else here; it would also need the
- * branch name, which the profile does not take today.
+ * Denied, as backstops (a `*` in a Bash rule spans spaces, so each one
+ * matches its flag or destination anywhere after `push`):
+ *   - force: `--force`, `--force-with-lease`, `-f`, and a `+` refspec;
+ *   - the default branch as the destination: `main`, `HEAD:main`, `:main`,
+ *     `refs/heads/main`;
+ *   - `--no-verify`, which skips the pre-push hook.
+ * Other spellings get through (`-uf`, `git -c … push`, a script, a
+ * `--git-dir` push), and so does a push to some other branch: a deny
+ * cannot say "any branch but this one". Branch ownership is not enforced
+ * here or by the pre-push hook. The hook (`.husky/pre-push` →
+ * `scripts/check-push.sh`, shared by every worktree through
+ * `core.hooksPath`) scans content: passing it means nothing matched, not
+ * that the push is clean. The session that pushes still checks that the
+ * repository, the remote and the destination ref are the studio's
+ * assigned ones, runs the preview, reads every message back and checks
+ * authors. Opening and merging PRs stay behind review and Conor's OK; the
+ * GitHub tools for them are denied in `GITHUB_PUBLISH_TOOLS`.
  */
 export const STUDIO_PUSH_RULES: StudioRuleSet = {
-  allow: [],
-  deny: ['Bash(git push *)', 'Bash(git -C * push *)', 'Bash(git --git-dir* push *)'],
+  allow: ['Bash(git push *)'],
+  deny: PUSH_PREFIXES.flatMap((push) => [
+    `Bash(${push} *--force*)`,
+    `Bash(${push} -f *)`,
+    `Bash(${push} * -f *)`,
+    `Bash(${push} * -f)`,
+    `Bash(${push} * +*)`,
+    `Bash(${push} * main)`,
+    `Bash(${push} * main *)`,
+    `Bash(${push} * *:main)`,
+    `Bash(${push} * *:main *)`,
+    `Bash(${push} * *refs/heads/main*)`,
+    `Bash(${push} *--no-verify*)`,
+  ]),
 };
 
 /** Local commits: the reviewer profile does not stage or commit. Backstops. */
@@ -224,8 +265,9 @@ export function scratchPathRules(sbSlug: string): string[] {
 
 /**
  * The builder profile: a development session in its own studio. Edits
- * anywhere in its checkout, commits locally on its own branch, reads
- * GitHub and Supabase, and is not pre-approved to push, install, open or
+ * anywhere in its checkout, commits locally and pushes its own branch
+ * (STUDIO_PUSH_RULES), reads GitHub and Supabase, and is not pre-approved
+ * to force-push, push to main, skip the pre-push hook, install, open or
  * merge a pull request, or write the database.
  *
  * `Edit(/**)`: a single leading slash anchors at the session's primary
@@ -280,20 +322,27 @@ export const STUDIO_REVIEWER_RULES: StudioRuleSet = {
     ...DEFAULT_CLAUDE_DENY_RULES,
     ...INSTALL_DENY_RULES,
     ...COMMIT_DENY_RULES,
-    ...STUDIO_PUSH_RULES.deny,
+    ...PUSH_DENY_RULES,
     ...GITHUB_PUBLISH_TOOLS,
     ...GITHUB_OTHER_WRITE_TOOLS,
     ...SUPABASE_WRITE_TOOLS,
   ],
 };
 
-/** The rules a studio gets for a profile, with the SB's scratch paths expanded. */
+/**
+ * The rules a studio gets for a profile, with the SB's scratch paths
+ * expanded. Each list is deduplicated: the profiles compose overlapping
+ * groups (the default force-push denies and the push policy's).
+ */
 export function studioPermissionRules(
   profile: StudioPermissionProfile,
   sbSlug: string
 ): ClaudePermissionRules {
   const base = profile === 'reviewer' ? STUDIO_REVIEWER_RULES : STUDIO_BUILDER_RULES;
-  return { allow: [...base.allow, ...scratchPathRules(sbSlug)], deny: [...base.deny] };
+  return {
+    allow: [...new Set([...base.allow, ...scratchPathRules(sbSlug)])],
+    deny: [...new Set(base.deny)],
+  };
 }
 
 /**
