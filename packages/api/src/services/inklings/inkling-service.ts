@@ -108,9 +108,16 @@ export function toInkling(row: IdentityRow): Inkling {
 const REFUSED_IN_NAME = /[\p{Cc}\p{Cs}\u2028\u2029]/u;
 
 /**
- * Trimmed, 1–32 code points ("小墨" is two), and no control characters. A
- * code point is what the app counts ([...name].length), so a name the app
- * accepts is never refused here for its length.
+ * Something that draws: neither white space nor a default-ignorable code
+ * point (zero-width spaces and joiners, the Hangul filler and the like).
+ */
+const VISIBLE = /[^\p{White_Space}\p{Default_Ignorable_Code_Point}]/u;
+
+/**
+ * Trimmed, 1–32 code points ("小墨" is two), at least one visible character,
+ * and no control characters. A code point is what the app counts
+ * ([...name].length), so a name the app accepts is never refused here for
+ * its length.
  */
 export function validateDisplayName(
   input: unknown
@@ -127,6 +134,9 @@ export function validateDisplayName(
   }
   if (REFUSED_IN_NAME.test(value)) {
     return { ok: false, reason: 'displayName must not contain control characters' };
+  }
+  if (!VISIBLE.test(value)) {
+    return { ok: false, reason: 'displayName must contain at least one visible character' };
   }
   return { ok: true, value };
 }

@@ -310,6 +310,24 @@ describe('validateDisplayName', () => {
     }
   });
 
+  it('refuses a name with no visible character (review bbbbba99, P3)', () => {
+    const zeroWidthSpace = String.fromCodePoint(0x200b);
+    const zeroWidthJoiner = String.fromCodePoint(0x200d);
+    const hangulFiller = String.fromCodePoint(0x3164);
+    for (const invisible of [
+      zeroWidthSpace,
+      zeroWidthSpace + zeroWidthJoiner,
+      hangulFiller,
+      ` ${zeroWidthSpace} `,
+    ]) {
+      expect(validateDisplayName(invisible), JSON.stringify(invisible)).toMatchObject({
+        ok: false,
+      });
+    }
+    // One visible character among them is a name.
+    expect(validateDisplayName(`Pip${zeroWidthSpace}`)).toMatchObject({ ok: true });
+  });
+
   it('keeps joiners inside emoji sequences', () => {
     expect(validateDisplayName('👩‍🎨')).toEqual({ ok: true, value: '👩‍🎨' });
   });
