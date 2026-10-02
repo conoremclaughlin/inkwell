@@ -906,6 +906,29 @@ export class MCPServer {
         return;
       }
 
+      // Delegation narrows authority and never widens it. A user-level token
+      // may mint a token for any SB its user owns. A token already bound to
+      // an SB may re-mint only for that SB: one refusal for another SB and for
+      // a missing one, so a bound token cannot list its siblings.
+      const boundSlug = userData.sbSlug?.trim().toLowerCase();
+      const isBound = Boolean(boundSlug || userData.sbId);
+      const refuseBoundDelegation = () => {
+        logger.warn('Refused delegation beyond the presenting token', {
+          userId: userData.userId,
+          boundSlug,
+          boundSbId: userData.sbId,
+          requestedSlug,
+        });
+        res.status(403).json({
+          error: 'forbidden',
+          error_description: 'A token bound to an SB can only be delegated to that same SB',
+        });
+      };
+      if (boundSlug && boundSlug !== requestedSlug) {
+        refuseBoundDelegation();
+        return;
+      }
+
       const { data: identity, error: identityError } = await this.dataComposer
         .getClient()
         .from('agent_identities')
@@ -927,10 +950,31 @@ export class MCPServer {
         return;
       }
 
+      // The canonical id settles a slug that was renamed or reused.
+      if (isBound && (!identity || (userData.sbId && identity.id !== userData.sbId))) {
+        refuseBoundDelegation();
+        return;
+      }
+
       if (!identity) {
         res.status(403).json({
           error: 'forbidden',
           error_description: 'Agent identity not found for this user',
+        });
+        return;
+      }
+
+      // The new token keeps the session and contact the presenting token was
+      // bound to, and expires no later than it does.
+      const remainingSeconds =
+        typeof userData.expiresAt === 'number'
+          ? userData.expiresAt - Math.floor(Date.now() / 1000)
+          : DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS;
+      const lifetimeSeconds = Math.min(DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS, remainingSeconds);
+      if (lifetimeSeconds <= 0) {
+        res.status(401).json({
+          error: 'invalid_token',
+          error_description: 'Missing or invalid bearer token',
         });
         return;
       }
@@ -943,14 +987,16 @@ export class MCPServer {
           scope: 'mcp:tools',
           sbSlug: identity.agent_id,
           identityId: identity.id,
+          ...(userData.sessionId ? { sessionId: userData.sessionId } : {}),
+          ...(userData.contactId ? { contactId: userData.contactId } : {}),
         },
-        DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS
+        lifetimeSeconds
       );
 
       res.json({
         access_token: accessToken,
         token_type: 'Bearer',
-        expires_in: DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS,
+        expires_in: lifetimeSeconds,
         scope: 'mcp:tools',
         delegated_agent_id: identity.agent_id,
         sb_id: identity.id,
