@@ -40,6 +40,10 @@ const HOUSEMATE = {
 };
 const REQUEST = '0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a';
 
+// The list is scoped to the person twice: the identity query's user_id and
+// the self-serve lineage's child_user_id. Removing either alone changes
+// nothing (measured); removing both fails the first test below. readIdentity
+// has only its own user filter, and removing it fails the second.
 describe('a second person in the same workspace (review bbbbba99, P3)', () => {
   it("does not see my inklings in their list, and I don't see theirs", async () => {
     const mine = await service.awaken(ME, REQUEST);

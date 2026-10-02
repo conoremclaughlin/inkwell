@@ -2732,7 +2732,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
       // All active sessions (filter by sbSlug if provided) — client picks the right one
       dataComposer.repositories.memory.getActiveSessions(user.id, sbSlug),
-      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul).
+      // Keep `metadata` in this select: bootstrapAgentInfo and nameOf read
+      // metadata.named, and without it an unnamed inkling would be told its
+      // placeholder name again (review 3ce682bd).
       sbSlug
         ? dataComposer
             .getClient()
@@ -2760,7 +2763,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       // Agents cross-reference this with their personal `relationships` notes.
       supabase
         .from('agent_identities')
-        .select('agent_id, name, role, backend, session_scope, capabilities, description')
+        // `metadata` is what nameOf reads: an unnamed inkling is listed with
+        // no name, never as its placeholder.
+        .select('agent_id, name, role, backend, session_scope, capabilities, description, metadata')
         .eq('user_id', user.id)
         .order('created_at', { ascending: true })
         .then(({ data }) => data || []),
@@ -3082,7 +3087,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
               .filter((s) => s.agent_id !== sbSlug)
               .map((s) => ({
                 sbSlug: s.agent_id,
-                name: s.name,
+                name: nameOf(s),
                 role: s.role,
                 backend: s.backend,
                 sessionScope: s.session_scope,
