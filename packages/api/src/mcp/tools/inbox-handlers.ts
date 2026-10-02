@@ -62,6 +62,7 @@ import {
 import { resolveStudioHint } from '../../services/sessions/index.js';
 import { readTieRemainder } from './tie-completion.js';
 import { ThreadKeyTakenError } from './thread-key-taken.js';
+import { assertInklingThreadAllowed } from '../../services/inklings/inkling-thread-gate.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -650,6 +651,14 @@ export async function handleSendToInbox(
 
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, workspaceId, threadKey);
+
+    // A conversation with an inkling is only between it and its owner, in
+    // the owner test (Lumen 97b1d66a). Asked before anything is written.
+    await assertInklingThreadAllowed(supabase, {
+      sender,
+      participantSbs,
+      existingThreadId: existingThread?.id ?? null,
+    });
 
     // Only meaningful before creation: an existing thread's identity was pinned
     // when it was made and cannot be revised now.

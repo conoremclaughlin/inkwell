@@ -98,6 +98,7 @@ import {
   type InklingScope,
 } from '../services/inklings/inkling-service';
 import { inklingAwakenCap, inklingOwnerTestUserId } from '../config/inkling-flags';
+import { InklingThreadRefusedError } from '../services/inklings/inkling-thread-gate';
 import {
   CLIENT_MESSAGE_CONFLICT,
   OWN_CREATE_SETTLE_ATTEMPTS,
@@ -3858,6 +3859,17 @@ async function inklingService(): Promise<InklingService> {
     awakenCap: inklingAwakenCap(),
     ownerTestUserId: inklingOwnerTestUserId(),
   });
+}
+
+/**
+ * A send refused because it would put an inkling in a conversation outside
+ * the owner test: 403 with the refusal's code. Nothing was written. Answers
+ * and returns true for that refusal only.
+ */
+function answerInklingThreadRefusal(res: Response, error: unknown): boolean {
+  if (!(error instanceof InklingThreadRefusedError)) return false;
+  res.status(403).json({ error: error.message, code: error.code });
+  return true;
 }
 
 function answerInklingError(res: Response, label: string, error: unknown): void {
@@ -8306,6 +8318,7 @@ router.post('/threads', async (req: Request, res: Response) => {
     }
     await sendCreate({ createOnly: !!clientMessageId.value, created: !existing });
   } catch (error) {
+    if (answerInklingThreadRefusal(res, error)) return;
     logger.error('Failed to start thread:', error);
     res.status(500).json(errorJson('Failed to start thread', error));
   }
@@ -8498,6 +8511,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       replayed: false,
     });
   } catch (error) {
+    if (answerInklingThreadRefusal(res, error)) return;
     logger.error('Failed to send thread reply:', error);
     res.status(500).json(errorJson('Failed to send reply', error));
   }
