@@ -1273,7 +1273,10 @@ describe('runChat integration', () => {
 
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
     const backendRequest = testState.runBackendImpl.mock.calls[0][0] as { prompt: string };
-    expect(backendRequest.prompt).toContain('Inbox task from wren (Task request).');
+    expect(backendRequest.prompt).toContain('[Inkmail]\nFrom: wren\nThread: pr:77');
+    expect(backendRequest.prompt).toContain('Subject: Task request');
+    expect(backendRequest.prompt).toContain('If it requires action, act on it');
+    expect(backendRequest.prompt).toContain('normal trust and permission boundaries');
     expect(backendRequest.prompt).toContain('Please handle PR 77 now.');
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Auto-run processed 1 inbox message.');
