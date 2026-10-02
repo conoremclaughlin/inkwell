@@ -184,32 +184,49 @@ describe('classifySessions (session lifecycle cutover dry run)', () => {
         ref: 't-contact|sb-wren',
         sessionId: 'contact-bound',
         reason: 'contact-scope',
+        detail: { observedContact: 'contact-1' },
       },
       {
         kind: 'binding',
         ref: 't-elsewhere|sb-wren',
         sessionId: 'other-workspace',
         reason: 'workspace-mismatch',
+        detail: { identityWorkspace: 'ws-1', threadWorkspace: 'ws-2' },
       },
-      { kind: 'binding', ref: 't-empty|sb-wren', sessionId: 'empty', reason: 'empty-target' },
+      {
+        kind: 'binding',
+        ref: 't-empty|sb-wren',
+        sessionId: 'empty',
+        reason: 'empty-target',
+        detail: {},
+      },
       {
         kind: 'binding',
         ref: 't-foreign|sb-wren',
         sessionId: 'foreign-bound',
         reason: 'user-mismatch',
+        detail: { expectedUser: USER, observedUser: OTHER_USER },
       },
-      { kind: 'binding', ref: 't-missing|sb-wren', sessionId: 'gone', reason: 'missing-session' },
+      {
+        kind: 'binding',
+        ref: 't-missing|sb-wren',
+        sessionId: 'gone',
+        reason: 'missing-session',
+        detail: {},
+      },
       {
         kind: 'binding',
         ref: 't-stranger|sb-unknown',
         sessionId: 'unreferenced',
         reason: 'unknown-identity',
+        detail: { sbId: 'sb-unknown' },
       },
       {
         kind: 'home',
         ref: 'sb-lumen',
         sessionId: 'lumen-home-wrong-backend',
         reason: 'backend-mismatch',
+        detail: { expectedBackend: 'codex', observedBackend: 'claude-code' },
       },
     ]);
   });
@@ -220,7 +237,12 @@ describe('classifySessions (session lifecycle cutover dry run)', () => {
     // twin-a and twin-b are both preserved by bindings and share a key; the
     // shadowed row is archived, so it does not collide with the live holder.
     expect(manifest.keyCollisions).toEqual([
-      { scope: 'user-1|wren|-', key: 'wren:inkwell:twin', sessionIds: ['twin-a', 'twin-b'] },
+      {
+        kind: 'index',
+        scope: 'user-1|wren|-',
+        key: 'wren:inkwell:twin',
+        sessionIds: ['twin-a', 'twin-b'],
+      },
     ]);
   });
 
@@ -228,7 +250,11 @@ describe('classifySessions (session lifecycle cutover dry run)', () => {
     const manifest = classifySessions(fixture());
 
     expect(manifest.duplicateBackendIdentities).toEqual([
-      { scope: 'sb:sb-wren', backendSessionId: 'backend-shared', sessionIds: ['dup-a', 'dup-b'] },
+      {
+        scope: 'user-1|sb:sb-wren',
+        backendSessionId: 'backend-shared',
+        sessionIds: ['dup-a', 'dup-b'],
+      },
     ]);
   });
 
@@ -295,5 +321,217 @@ describe('classifier predicates', () => {
     expect(sameBackend('ink', 'ink')).toBe(true);
     expect(sameBackend('codex', 'claude-code')).toBe(false);
     expect(sameBackend(null, 'ink')).toBe(false);
+  });
+});
+
+/**
+ * Regressions from Lumen's review of PR #720: each case failed against the
+ * first head (1645ce34). Synthetic rows only.
+ */
+describe('classifySessions: review regressions', () => {
+  const wren = {
+    id: WREN,
+    userId: USER,
+    workspaceId: 'ws-1',
+    slug: 'wren',
+    backend: 'claude-code',
+    defaultSessionId: null,
+  };
+  const bind = (sessionId: string, extra: Record<string, unknown> = {}) => ({
+    threadId: `t-${sessionId}`,
+    threadWorkspaceId: 'ws-1',
+    sbId: WREN,
+    sessionId,
+    ...extra,
+  });
+  const only = (patch: Partial<ManifestInput>): ManifestInput => ({
+    sessions: [],
+    identities: [wren],
+    bindings: [],
+    latestSenders: [],
+    channelRoutes: [],
+    ...patch,
+  });
+
+  it('never infers an identity from a legacy slug two identities of the owner share', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('legacy', { sbId: null })],
+        identities: [wren, { ...wren, id: 'sb-wren-elsewhere', workspaceId: 'ws-2' }],
+        bindings: [bind('legacy')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['legacy-identity-ambiguous']);
+  });
+
+  it('resolves a legacy slug that exactly one identity of the owner carries (control)', () => {
+    const manifest = classifySessions(
+      only({ sessions: [session('legacy', { sbId: null })], bindings: [bind('legacy')] })
+    );
+
+    expect(manifest.preserved).toEqual([{ sessionId: 'legacy', references: ['binding'] }]);
+  });
+
+  it('refuses a binding whose thread workspace is unknown', () => {
+    const manifest = classifySessions(
+      only({ sessions: [session('bound')], bindings: [bind('bound', { threadWorkspaceId: null })] })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['workspace-unknown']);
+  });
+
+  it('refuses a binding to a session on a backend the identity does not run', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [session('bound', { backend: 'unsupported-runtime' })],
+        bindings: [bind('bound')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([]);
+    expect(manifest.invalidReferences.map((i) => i.reason)).toEqual(['backend-mismatch']);
+  });
+
+  it('reports ended key holders that all archive as an unresolved conflict', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [
+          session('first', { sessionKey: 'wren:inkwell:review' }),
+          session('second', { sessionKey: 'WREN:inkwell:review' }),
+        ],
+      })
+    );
+
+    expect(manifest.archive.map((a) => a.sessionId)).toEqual(['first', 'second']);
+    expect(manifest.keyCollisions).toEqual([
+      {
+        kind: 'unresolved',
+        scope: 'user-1|wren|-',
+        key: 'wren:inkwell:review',
+        sessionIds: ['first', 'second'],
+      },
+    ]);
+  });
+
+  it('groups a legacy row with its canonical twin when the slug resolves uniquely', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [
+          session('legacy', { sbId: null, backendSessionId: 'same-transcript' }),
+          session('canonical', { backendSessionId: 'same-transcript' }),
+        ],
+      })
+    );
+
+    expect(manifest.duplicateBackendIdentities).toEqual([
+      {
+        scope: 'user-1|sb:sb-wren',
+        backendSessionId: 'same-transcript',
+        sessionIds: ['canonical', 'legacy'],
+      },
+    ]);
+  });
+
+  it('never groups legacy rows of different owners', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [
+          session('owner-one', { sbId: null, backendSessionId: 'same-transcript' }),
+          session('owner-two', {
+            userId: OTHER_USER,
+            sbId: null,
+            backendSessionId: 'same-transcript',
+          }),
+        ],
+      })
+    );
+
+    expect(manifest.duplicateBackendIdentities).toEqual([]);
+  });
+
+  it('refuses a session whose studio is gone or closed', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [
+          session('in-closed', { studioId: 'studio-closed' }),
+          session('in-missing', { studioId: 'studio-missing' }),
+          session('in-open', { studioId: 'studio-open' }),
+        ],
+        studios: [
+          { id: 'studio-closed', userId: USER, sbId: WREN, repoRoot: '/repo', closed: true },
+          { id: 'studio-open', userId: USER, sbId: WREN, repoRoot: '/repo', closed: false },
+        ],
+        bindings: [bind('in-closed'), bind('in-missing'), bind('in-open')],
+      })
+    );
+
+    expect(manifest.preserved).toEqual([{ sessionId: 'in-open', references: ['binding'] }]);
+    expect(manifest.invalidReferences.map((i) => [i.sessionId, i.reason])).toEqual([
+      ['in-closed', 'studio-closed'],
+      ['in-missing', 'studio-missing'],
+    ]);
+  });
+
+  it('keeps a pinned thread to sessions working inside its project', () => {
+    const manifest = classifySessions(
+      only({
+        sessions: [
+          session('in-project', { studioId: 'studio-inkwell' }),
+          session('elsewhere', { studioId: 'studio-other' }),
+          session('root-checkout', { workingDir: '/repos/inkwell/packages/api' }),
+          // No studio row on the session, but its working directory is a
+          // studio's worktree, which sits beside the repository root.
+          session('in-worktree', { workingDir: '/repos/inkwell--review/packages/api' }),
+          session('nowhere'),
+          session('unpinned-project'),
+        ],
+        studios: [
+          {
+            id: 'studio-inkwell',
+            userId: USER,
+            sbId: WREN,
+            repoRoot: '/repos/inkwell',
+            closed: false,
+          },
+          {
+            id: 'studio-other',
+            userId: USER,
+            sbId: WREN,
+            repoRoot: '/repos/inktrade',
+            closed: false,
+          },
+          {
+            id: 'studio-review',
+            userId: USER,
+            sbId: WREN,
+            repoRoot: '/repos/inkwell',
+            worktreePath: '/repos/inkwell--review',
+            closed: true,
+          },
+        ],
+        bindings: [
+          bind('in-project', { threadProjectRepoRoot: '/repos/inkwell' }),
+          bind('elsewhere', { threadProjectRepoRoot: '/repos/inkwell' }),
+          bind('root-checkout', { threadProjectRepoRoot: '/repos/inkwell' }),
+          bind('in-worktree', { threadProjectRepoRoot: '/repos/inkwell' }),
+          bind('nowhere', { threadProjectRepoRoot: '/repos/inkwell' }),
+          bind('unpinned-project', { threadProjectRepoRoot: null }),
+        ],
+      })
+    );
+
+    expect(manifest.preserved.map((p) => p.sessionId)).toEqual([
+      'in-project',
+      'in-worktree',
+      'root-checkout',
+    ]);
+    expect(manifest.invalidReferences.map((i) => [i.sessionId, i.reason])).toEqual([
+      ['elsewhere', 'project-mismatch'],
+      ['nowhere', 'project-unverifiable'],
+      ['unpinned-project', 'project-unverifiable'],
+    ]);
   });
 });

@@ -6,7 +6,7 @@
  *
  * Loads every session and every pointer that can keep one routable, runs the
  * classifier, prints counts only, and writes the per-row manifest to a
- * private path outside the repository (default ~/.ink/files/
+ * private path outside any checkout (default ~/.ink/files/
  * session-archive-manifest/, or SESSION_ARCHIVE_MANIFEST_OUT). The manifest
  * names real sessions and must never be committed, pasted into a PR, or
  * quoted in a commit message. It writes nothing to the database.
@@ -14,9 +14,10 @@
  * The approved manifest is evidence for the cutover, not authorization: the
  * cutover revalidates it inside the window against changes made since.
  */
-import { mkdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, unlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { createSupabaseClient } from '../data/supabase/client';
 import {
   classifySessions,
@@ -24,6 +25,7 @@ import {
   type ManifestIdentity,
   type ManifestLatestSender,
   type ManifestSession,
+  type ManifestStudio,
   type ManifestThreadBinding,
 } from '../services/sessions/archive-manifest';
 
@@ -54,48 +56,106 @@ async function selectAll(
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
 
+/** The nearest directory at or above `dir` that holds a `.git` entry, if any. */
+function enclosingCheckout(dir: string): string | null {
+  let current = resolve(dir);
+  for (;;) {
+    if (existsSync(join(current, '.git'))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/**
+ * Write the manifest only where it stays private: never inside a git
+ * checkout, never through a symlink, always mode 0600. An existing regular
+ * file is replaced, not rewritten in place, so its old mode cannot survive;
+ * exclusive creation refuses anything that appears at the path in between.
+ */
+export async function writePrivateManifest(out: string, contents: string): Promise<void> {
+  const target = resolve(out);
+  const checkout = enclosingCheckout(dirname(target));
+  if (checkout) {
+    throw new Error(`Refusing to write the manifest inside a git checkout (${checkout})`);
+  }
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const existing = await lstat(target).catch(() => null);
+  if (existing?.isSymbolicLink()) {
+    throw new Error('Refusing to write the manifest through a symlink');
+  }
+  if (existing && !existing.isFile()) {
+    throw new Error('Refusing to write the manifest over something that is not a regular file');
+  }
+  if (existing) await unlink(target);
+  await writeFile(target, contents, { flag: 'wx', mode: 0o600 });
+}
+
 async function main() {
   const client = createSupabaseClient();
 
-  const [sessionRows, executedRows, identityRows, threadRows, bindingRows, messageRows, routeRows] =
-    await Promise.all([
-      selectAll(
-        client,
-        'sessions',
-        'id, user_id, sb_id, agent_id, studio_id, contact_id, backend, backend_session_id, claude_session_id, alias, ended_at, lifecycle, status, message_count',
-        'id'
-      ),
-      selectAll(client, 'activity_stream', 'id, session_id', 'id', (q) =>
-        q.in('type', ['agent_spawn', 'agent_complete']).not('session_id', 'is', null)
-      ),
-      selectAll(
-        client,
-        'agent_identities',
-        'id, user_id, workspace_id, agent_id, backend, default_session_id',
-        'id'
-      ),
-      selectAll(client, 'inbox_threads', 'id, workspace_id', 'id'),
-      selectAll(
-        client,
-        'inbox_thread_participants',
-        'thread_id, sb_id, session_id',
-        'thread_id',
-        (q) => q.not('session_id', 'is', null).not('sb_id', 'is', null)
-      ),
-      selectAll(
-        client,
-        'inbox_thread_messages',
-        'id, thread_id, sender_sb_id, created_at, sender_session:metadata->pcp->sender->>sessionId',
-        'id',
-        (q) => q.not('sender_sb_id', 'is', null)
-      ),
-      selectAll(client, 'channel_routes', 'id, user_id, sb_id, active_session_id, is_active', 'id'),
-    ]);
+  const [
+    sessionRows,
+    activityRows,
+    identityRows,
+    threadRows,
+    projectRows,
+    studioRows,
+    bindingRows,
+    messageRows,
+    routeRows,
+  ] = await Promise.all([
+    selectAll(
+      client,
+      'sessions',
+      'id, user_id, sb_id, agent_id, studio_id, contact_id, backend, backend_session_id, claude_session_id, alias, ended_at, lifecycle, status, message_count, working_dir, cli_turn_at, cli_turn_stopped_at',
+      'id'
+    ),
+    // Any activity row is evidence the session ran: a turn, a tool call.
+    selectAll(client, 'activity_stream', 'id, session_id', 'id', (q) =>
+      q.not('session_id', 'is', null)
+    ),
+    selectAll(
+      client,
+      'agent_identities',
+      'id, user_id, workspace_id, agent_id, backend, default_session_id',
+      'id'
+    ),
+    selectAll(client, 'inbox_threads', 'id, workspace_id, key_project', 'id'),
+    selectAll(client, 'projects', 'id, slug, repo_root, workspace_id', 'id'),
+    selectAll(
+      client,
+      'studios',
+      'id, user_id, sb_id, repo_root, worktree_path, status, archived_at, cleaned_at',
+      'id'
+    ),
+    selectAll(
+      client,
+      'inbox_thread_participants',
+      'thread_id, sb_id, session_id',
+      'thread_id',
+      (q) => q.not('session_id', 'is', null).not('sb_id', 'is', null)
+    ),
+    selectAll(
+      client,
+      'inbox_thread_messages',
+      'id, thread_id, sender_sb_id, created_at, sender_session:metadata->pcp->sender->>sessionId',
+      'id',
+      (q) => q.not('sender_sb_id', 'is', null)
+    ),
+    selectAll(client, 'channel_routes', 'id, user_id, sb_id, active_session_id, is_active', 'id'),
+  ]);
 
-  const executed = new Set(executedRows.map((r) => r.session_id as string));
-  const threadWorkspace = new Map(
-    threadRows.map((t) => [t.id as string, str(t.workspace_id)] as const)
-  );
+  // Positive evidence that a session ran or spoke: an activity row, a CLI
+  // turn boundary, or an inbox message it authored.
+  const evidence = new Set(activityRows.map((r) => r.session_id as string));
+  for (const m of messageRows) {
+    const authored = str(m.sender_session);
+    if (authored) evidence.add(authored);
+  }
+  for (const r of sessionRows) {
+    if (str(r.cli_turn_at) || str(r.cli_turn_stopped_at)) evidence.add(r.id as string);
+  }
 
   const sessions: ManifestSession[] = sessionRows.map((r) => ({
     id: r.id as string,
@@ -112,7 +172,8 @@ async function main() {
     lifecycle: str(r.lifecycle),
     status: str(r.status),
     messageCount: typeof r.message_count === 'number' ? r.message_count : null,
-    hasExecuted: executed.has(r.id as string),
+    workingDir: str(r.working_dir),
+    hasExecuted: evidence.has(r.id as string),
   }));
 
   const identities: ManifestIdentity[] = identityRows.map((r) => ({
@@ -124,11 +185,50 @@ async function main() {
     defaultSessionId: str(r.default_session_id),
   }));
 
+  const studios: ManifestStudio[] = studioRows.map((r) => ({
+    id: r.id as string,
+    userId: r.user_id as string,
+    sbId: str(r.sb_id),
+    repoRoot: str(r.repo_root),
+    worktreePath: str(r.worktree_path),
+    closed: r.status === 'cleaned' || !!str(r.archived_at) || !!str(r.cleaned_at),
+  }));
+
+  // A pinned thread's project, by slug inside the thread's workspace.
+  const projectRoot = new Map(
+    projectRows
+      .filter((p) => str(p.slug))
+      .map((p) => [`${str(p.workspace_id)}|${p.slug}`, str(p.repo_root)] as const)
+  );
+  const threadInfo = new Map(
+    threadRows.map((t) => {
+      const workspaceId = str(t.workspace_id);
+      const pin = str(t.key_project);
+      return [
+        t.id as string,
+        {
+          workspaceId,
+          // Undefined: not pinned. Null: pinned to a project with no known root.
+          projectRepoRoot: pin ? (projectRoot.get(`${workspaceId}|${pin}`) ?? null) : undefined,
+        },
+      ] as const;
+    })
+  );
+  const threadFields = (threadId: string) => {
+    const info = threadInfo.get(threadId);
+    return {
+      threadWorkspaceId: info?.workspaceId ?? null,
+      ...(info && info.projectRepoRoot !== undefined
+        ? { threadProjectRepoRoot: info.projectRepoRoot }
+        : {}),
+    };
+  };
+
   const bindings: ManifestThreadBinding[] = bindingRows.map((r) => ({
     threadId: r.thread_id as string,
-    threadWorkspaceId: threadWorkspace.get(r.thread_id as string) ?? null,
     sbId: r.sb_id as string,
     sessionId: r.session_id as string,
+    ...threadFields(r.thread_id as string),
   }));
 
   // The latest message each SB sent on each thread, and the session it came from.
@@ -141,9 +241,9 @@ async function main() {
   }
   const latestSenders: ManifestLatestSender[] = [...latest.values()].map((m) => ({
     threadId: m.thread_id as string,
-    threadWorkspaceId: threadWorkspace.get(m.thread_id as string) ?? null,
     sbId: m.sender_sb_id as string,
     sessionId: m.sender_session as string,
+    ...threadFields(m.thread_id as string),
   }));
 
   const channelRoutes: ManifestChannelRoute[] = routeRows.map((r) => ({
@@ -160,6 +260,7 @@ async function main() {
     bindings,
     latestSenders,
     channelRoutes,
+    studios,
   });
 
   const out =
@@ -171,13 +272,9 @@ async function main() {
       'session-archive-manifest',
       `manifest-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
     );
-  await mkdir(dirname(out), { recursive: true });
-  await writeFile(
+  await writePrivateManifest(
     out,
-    `${JSON.stringify({ generatedAt: new Date().toISOString(), ...manifest }, null, 2)}\n`,
-    {
-      mode: 0o600,
-    }
+    `${JSON.stringify({ generatedAt: new Date().toISOString(), ...manifest }, null, 2)}\n`
   );
 
   // Counts only on stdout: the per-row manifest stays in the private file.
@@ -188,5 +285,5 @@ async function main() {
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   console.error(message);
-  process.exit(1);
+  process.exitCode = 1;
 });
