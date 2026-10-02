@@ -162,7 +162,7 @@ function succeedingRunner(name: string): IRunner {
 }
 
 /** A service whose session sits in studio-1, a row owned by `owner` on a real directory. */
-function makeService(session: Session, owner: string) {
+function makeService(session: Session, owner: string, row: Row = {}) {
   const { repo } = makeStatefulRepo(session);
   const tables: Record<string, Row[]> = {
     sessions: [{ id: session.id, user_id: 'user-456', studio_id: session.studioId }],
@@ -174,6 +174,7 @@ function makeService(session: Session, owner: string) {
         worktree_path: worktree,
         status: 'active',
         lease: null,
+        ...row,
       },
     ],
     agent_identities: [],
@@ -251,6 +252,32 @@ describe('the studio checklist runs before every spawn, whatever the runner', ()
     const owner = completion.calls[0]?.options.owner as (() => Promise<string | null>) | undefined;
     expect(typeof owner).toBe('function');
     expect(await owner!()).toBe('aster');
+  });
+
+  it("the permission profile offered is the ROW's: a detached checkout is a reviewer, a branch studio a builder", async () => {
+    const profileOf = async (row: Row) => {
+      completion.calls.length = 0;
+      const { send } = makeService(makeSession(), 'lumen', row);
+      await send();
+      const lookup = completion.calls[0]?.options.profile as (() => Promise<string>) | undefined;
+      expect(typeof lookup).toBe('function');
+      return lookup!();
+    };
+    expect(await profileOf({ branch: 'detached:origin/pr/7' })).toBe('reviewer');
+    expect(
+      await profileOf({
+        branch: 'lumen/eph/pr-7',
+        metadata: { checkout: { mode: 'detached', ref: 'origin/pr/7', commit: 'abc' } },
+      })
+    ).toBe('reviewer');
+    expect(await profileOf({ branch: 'lumen/feat/x', metadata: {} })).toBe('builder');
+  });
+
+  it('a session with no studio row is offered the builder profile', async () => {
+    const { send } = makeService(makeSession({ studioId: null }), 'lumen');
+    await send();
+    const lookup = completion.calls[0].options.profile as () => Promise<string>;
+    expect(await lookup()).toBe('builder');
   });
 
   it('a session with no studio row offers no owner and no studio id', async () => {

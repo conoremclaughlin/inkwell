@@ -51,6 +51,7 @@ const completion = vi.hoisted(() => ({
     studioId?: string;
     sbSlug: string;
     present: string[];
+    permissionProfile?: string;
   }>,
 }));
 vi.mock('./studio-complete', async () => {
@@ -58,7 +59,10 @@ vi.mock('./studio-complete', async () => {
   const pathMod = await import('path');
   return {
     completeStudioViaCli: vi.fn(
-      async (worktreePath: string, opts: { sbSlug: string; studioId?: string }) => {
+      async (
+        worktreePath: string,
+        opts: { sbSlug: string; studioId?: string; permissionProfile?: string }
+      ) => {
         const present: string[] = [];
         for (const rel of ['.mcp.json', '.env.local', '.env', '.claude', '.codex', '.gemini']) {
           if (
@@ -75,6 +79,7 @@ vi.mock('./studio-complete', async () => {
           studioId: opts.studioId,
           sbSlug: opts.sbSlug,
           present,
+          permissionProfile: opts.permissionProfile,
         });
         return { ok: true, complete: true, missing: [] };
       }
@@ -1016,8 +1021,13 @@ describe('StudioOverflowService.ensureParentStudio — a closed home is revived'
       });
       expect(stdout.trim()).toBe('lumen/studio/lumen');
       // Completed as a new home is, against the revived row's id.
+      // A home on its own branch is a builder.
       expect(completion.calls).toEqual([
-        expect.objectContaining({ worktreePath: home.worktreePath, studioId: 'home-1' }),
+        expect.objectContaining({
+          worktreePath: home.worktreePath,
+          studioId: 'home-1',
+          permissionProfile: 'builder',
+        }),
       ]);
     } finally {
       await removeWorktree(repoRoot, home.worktreePath);
@@ -1475,6 +1485,11 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         overflow: true,
         checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
       });
+      // A review checkout is completed with the reviewer profile, from the row.
+      expect(completion.calls.at(-1)).toMatchObject({
+        worktreePath: worktree,
+        permissionProfile: 'reviewer',
+      });
 
       // The worktree really sits on the PR's commit, detached.
       const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
@@ -1537,6 +1552,11 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       expect(createdInputs[0].metadata).toEqual({
         overflow: true,
         checkout: { mode: 'detached', ref: 'main', commit: mainHead },
+      });
+      // Detached at the base after a failed fetch is still a detached checkout.
+      expect(completion.calls.at(-1)).toMatchObject({
+        worktreePath: worktree,
+        permissionProfile: 'reviewer',
       });
       const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
       expect(head.trim()).toBe(mainHead);
@@ -1613,8 +1633,15 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       // The revived row sits on a FRESH worktree, so it is completed exactly
       // as a created one is: with the row's id, after the row was updated.
       // Every review round after the first takes this path (task 2841c7a9).
+      // Detached on the PR head, so the revived row is a reviewer (design v3,
+      // item 5): the profile is read from the row, never the checkout.
       expect(completion.calls).toEqual([
-        expect.objectContaining({ worktreePath: worktree, studioId: 'stale-row', sbSlug: 'lumen' }),
+        expect.objectContaining({
+          worktreePath: worktree,
+          studioId: 'stale-row',
+          sbSlug: 'lumen',
+          permissionProfile: 'reviewer',
+        }),
       ]);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {

@@ -64,6 +64,28 @@ describe('applyPermissionOverlay', () => {
     expect(restored.permissions.allow).not.toContain('Bash(docker *)');
   });
 
+  it('never lifts a deny: an overlay allow for a denied action leaves the deny in place (design v3, item 2)', async () => {
+    await mkdir(join(tempDir, '.claude'), { recursive: true });
+    const deny = [
+      'Bash(git push * main)',
+      'Bash(git push *--force*)',
+      'mcp__github__merge_pull_request',
+    ];
+    await writeFile(
+      join(tempDir, '.claude', 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: ['Bash(*)'], deny } })
+    );
+    const restore = await applyPermissionOverlay(tempDir, {
+      allow: ['Bash(git push origin main)', 'mcp__github__merge_pull_request'],
+    });
+    const settings = JSON.parse(
+      await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8')
+    );
+    // Every deny survives, so deny-before-allow still refuses the action.
+    expect(settings.permissions.deny).toEqual(deny);
+    await restore();
+  });
+
   it('deduplicates overlay rules', async () => {
     await seedSettings(tempDir);
 
