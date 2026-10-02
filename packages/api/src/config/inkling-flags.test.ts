@@ -1,5 +1,22 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_AWAKEN_CAP, inklingAwakenCap, inklingOwnerTestUserId } from './inkling-flags';
+import {
+  DEFAULT_AWAKEN_CAP,
+  DEFAULT_TURN_CAP,
+  inklingAwakenCap,
+  inklingOwnerTestUserId,
+  inklingTurnCap,
+} from './inkling-flags';
+
+describe('inklingTurnCap', () => {
+  it('is 20 unless INKLING_TURN_CAP is a positive whole number', () => {
+    expect(DEFAULT_TURN_CAP).toBe(20);
+    expect(inklingTurnCap({})).toBe(20);
+    expect(inklingTurnCap({ INKLING_TURN_CAP: '3' })).toBe(3);
+    for (const raw of ['0', '-1', 'lots', '1.5']) {
+      expect(inklingTurnCap({ INKLING_TURN_CAP: raw })).toBe(20);
+    }
+  });
+});
 
 describe('inklingOwnerTestUserId', () => {
   const OWNER = '11111111-1111-4111-8111-111111111111';

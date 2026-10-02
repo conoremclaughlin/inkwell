@@ -78,10 +78,10 @@ import { StudiosRepository, type Studio } from '../../data/repositories/studios.
 import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
-import { inklingTurnRefusal } from '../inklings/inkling-turn-gate.js';
+import { claimInklingTurn, inklingTurnRefusal } from '../inklings/inkling-turn-gate.js';
 import { ensureInklingFolder, inklingsRoot } from '../inklings/inkling-folder.js';
 import { INKLING_CLIENT } from '../inklings/inkling-service.js';
-import { inklingOwnerTestUserId } from '../../config/inkling-flags.js';
+import { inklingOwnerTestUserId, inklingTurnCap } from '../../config/inkling-flags.js';
 
 /**
  * Configuration for SessionService.
@@ -1990,20 +1990,9 @@ export class SessionService implements ISessionService {
       // account, for its owner's own message (Lumen 97b1d66a). Refused
       // here, before anything is logged, registered or spawned, and not
       // retryable: nothing about it is transient.
-      const inklingRefusal = inklingTurnRefusal(
-        {
-          identityMetadata: identity?.metadata as Record<string, unknown> | null | undefined,
-          userId,
-          senderId: request.sender?.id,
-        },
-        inklingOwnerTestUserId()
-      );
-      if (inklingRefusal) {
-        logger.warn('[Inkling] Turn refused', {
-          sbSlug,
-          sbId: session.sbId,
-          reason: inklingRefusal,
-        });
+      const identityMetadata = identity?.metadata as Record<string, unknown> | null | undefined;
+      const refuseInklingTurn = (reason: string): SessionResult => {
+        logger.warn('[Inkling] Turn refused', { sbSlug, sbId: session.sbId, reason });
         return {
           success: false,
           sessionId: session.id,
@@ -2012,24 +2001,32 @@ export class SessionService implements ISessionService {
           sessionStatus: 'failed',
           compactionTriggered: false,
           finalTextResponse: undefined,
-          error: `Inkling turn refused: ${inklingRefusal}`,
+          error: `Inkling turn refused: ${reason}`,
           errorCode: 'INKLING_TURN_REFUSED',
           classification: {
             category: 'config',
-            summary: `Inkling turn refused: ${inklingRefusal}`,
+            summary: `Inkling turn refused: ${reason}`,
             retryable: false,
           },
         };
-      }
+      };
+      const inklingRefusal = inklingTurnRefusal(
+        { identityMetadata, userId, senderId: request.sender?.id },
+        inklingOwnerTestUserId()
+      );
+      if (inklingRefusal) return refuseInklingTurn(inklingRefusal);
 
-      // An inkling's turn runs in its own folder, never the Inkwell checkout
-      // or the server's default directory (organisation, not isolation:
-      // inkling-folder.ts). Routing gave it no studio to resolve from.
-      if (
-        session.sbId &&
-        (identity?.metadata as Record<string, unknown> | null | undefined)?.client ===
-          INKLING_CLIENT
-      ) {
+      if (session.sbId && identityMetadata?.client === INKLING_CLIENT) {
+        // A bounded first test: each turn is counted against the inkling's
+        // cap before anything is spawned.
+        const cap = inklingTurnCap();
+        const claim = await claimInklingTurn(this.supabase, session.sbId, userId, cap);
+        if (!claim.allowed) {
+          return refuseInklingTurn(`turn cap reached (${claim.used} of ${cap})`);
+        }
+        // Its turn runs in its own folder, never the Inkwell checkout or the
+        // server's default directory (organisation, not isolation:
+        // inkling-folder.ts). Routing gave it no studio to resolve from.
         resolvedWorkingDirectory = await ensureInklingFolder(
           session.sbId,
           this.config.inklingsRoot ?? inklingsRoot()

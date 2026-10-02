@@ -30,6 +30,17 @@ export function inklingOwnerTestUserId(source: EnvSource = process.env): string 
   return raw && UUID.test(raw) ? raw : null;
 }
 
+/** The first test's turns per inkling, unless INKLING_TURN_CAP says otherwise. */
+export const DEFAULT_TURN_CAP = 20;
+
+/**
+ * How many turns one inkling may take in the owner test: INKLING_TURN_CAP,
+ * else 20. Counted on the identity before each turn is spawned.
+ */
+export function inklingTurnCap(source: EnvSource = process.env): number {
+  return positiveInt(source.INKLING_TURN_CAP, DEFAULT_TURN_CAP);
+}
+
 /**
  * How many inklings one person may awaken: INKLING_AWAKEN_CAP, else 2.
  * The cap is counted inside redeem_kindle_token under a per-person lock, so

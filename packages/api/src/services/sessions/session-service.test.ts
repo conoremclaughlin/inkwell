@@ -927,7 +927,15 @@ describe('SessionService', () => {
           // agent_id is the request's slug, as an inkling's own slug is: routing
           // resolves the identity by it.
           agent_identities: [
-            { id: SB, agent_id: 'myra', user_id: OWNER, sandbox_bypass: false, metadata },
+            {
+              id: SB,
+              agent_id: 'myra',
+              user_id: OWNER,
+              sandbox_bypass: false,
+              metadata,
+              // NOT NULL in the table; the turn-cap claim's conditional update needs it.
+              updated_at: '2026-10-02T08:00:00.000Z',
+            },
           ],
           studios: [],
         });
@@ -985,6 +993,46 @@ describe('SessionService', () => {
           expect(result.errorCode, JSON.stringify(named)).not.toBe('ROUTING_REFUSED');
           expect(cwdPassedToRunner()).toBe(join(inklingsRoot, SB));
         }
+      });
+
+      it('the turn past the cap is refused before anything is spawned', async () => {
+        vi.stubEnv('INKLING_OWNER_TEST_USER_ID', OWNER);
+        vi.stubEnv('INKLING_TURN_CAP', '2');
+        const row = {
+          id: SB,
+          agent_id: 'myra',
+          user_id: OWNER,
+          sandbox_bypass: false,
+          metadata: INKLING,
+          updated_at: '2026-10-02T08:00:00.000Z',
+        };
+        const service = new SessionService(
+          mockRepository,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json', inklingsRoot },
+          mockCodexRunner,
+          makeFakeSupabase({ agent_identities: [row], studios: [] }),
+          undefined,
+          mockInkRunner
+        );
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+          createMockSession({ sbId: SB, userId: OWNER } as never)
+        );
+        const results = [];
+        for (let i = 0; i < 3; i++) {
+          results.push(
+            await service.handleMessage(createMockRequest({ userId: OWNER, ...fromOwner }))
+          );
+        }
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+        expect(results[2]).toMatchObject({
+          errorCode: 'INKLING_TURN_REFUSED',
+          error: expect.stringContaining('turn cap reached (2 of 2)'),
+          classification: { retryable: false },
+        });
+        expect((row.metadata as Record<string, unknown>).ownerTestTurns).toBe(2);
       });
 
       it('nothing wakes it while the test is off: no spawn, and not retryable', async () => {
