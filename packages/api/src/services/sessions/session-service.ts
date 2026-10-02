@@ -78,6 +78,8 @@ import { StudiosRepository, type Studio } from '../../data/repositories/studios.
 import { logger } from '../../utils/logger.js';
 import { personalWorkspaceOf, workspaceOfSb } from '../principals.js';
 import { mayHaveProjectPrefix } from '../thread-key/unregistered-prefix.js';
+import { inklingTurnRefusal } from '../inklings/inkling-turn-gate.js';
+import { inklingOwnerTestUserId } from '../../config/inkling-flags.js';
 
 /**
  * Configuration for SessionService.
@@ -1976,6 +1978,43 @@ export class SessionService implements ISessionService {
             .maybeSingle()
         : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+
+      // An inkling's turn starts only in the owner test, on its owner's
+      // account, for its owner's own message (Lumen 97b1d66a). Refused
+      // here, before anything is logged, registered or spawned, and not
+      // retryable: nothing about it is transient.
+      const inklingRefusal = inklingTurnRefusal(
+        {
+          identityMetadata: identity?.metadata as Record<string, unknown> | null | undefined,
+          userId,
+          senderId: request.sender?.id,
+        },
+        inklingOwnerTestUserId()
+      );
+      if (inklingRefusal) {
+        logger.warn('[Inkling] Turn refused', {
+          sbSlug,
+          sbId: session.sbId,
+          reason: inklingRefusal,
+        });
+        return {
+          success: false,
+          sessionId: session.id,
+          backendSessionId: session.backendSessionId ?? null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: `Inkling turn refused: ${inklingRefusal}`,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: {
+            category: 'config',
+            summary: `Inkling turn refused: ${inklingRefusal}`,
+            retryable: false,
+          },
+        };
+      }
+
       const parsed = parseRuntimeConfig(identity?.metadata);
       runtimeMaxTurns = parsed.maxTurns;
       runtimeToolRouting = parsed.toolRouting;

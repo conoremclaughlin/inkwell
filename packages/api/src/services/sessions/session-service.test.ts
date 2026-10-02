@@ -890,6 +890,85 @@ describe('SessionService', () => {
       return call[1].config.model;
     };
 
+    describe('an inkling turn starts only in the owner test (Lumen 97b1d66a)', () => {
+      const OWNER = '11111111-1111-4111-8111-111111111111';
+      const INKLING = { client: 'inkling-mobile', named: false, ownerTest: true };
+      const fromOwner = { sender: { id: 'user', name: 'Owner' } };
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      /** A turn for sb-1 (with `metadata`) on OWNER's account, the gate set to `gate`. */
+      const turn = async (
+        metadata: Record<string, unknown>,
+        request: Record<string, unknown> = fromOwner,
+        gate = OWNER
+      ) => {
+        vi.stubEnv('INKLING_OWNER_TEST_USER_ID', gate);
+        const supabase = makeFakeSupabase({
+          agent_identities: [{ id: 'sb-1', user_id: OWNER, sandbox_bypass: false, metadata }],
+          studios: [],
+        });
+        const service = new SessionService(
+          mockRepository,
+          mockContextBuilder,
+          mockClaudeRunner,
+          mockActivityStream,
+          { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+          mockCodexRunner,
+          supabase,
+          undefined,
+          mockInkRunner
+        );
+        vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+          createMockSession({ sbId: 'sb-1', userId: OWNER } as never)
+        );
+        return service.handleMessage(createMockRequest({ userId: OWNER, ...request }));
+      };
+
+      it("the owner's own message wakes an inkling born under the test", async () => {
+        const result = await turn(INKLING);
+        expect(mockClaudeRunner.run).toHaveBeenCalled();
+        expect(result.errorCode).not.toBe('INKLING_TURN_REFUSED');
+      });
+
+      it('nothing wakes it while the test is off: no spawn, and not retryable', async () => {
+        const result = await turn(INKLING, fromOwner, '');
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          success: false,
+          errorCode: 'INKLING_TURN_REFUSED',
+          classification: { retryable: false },
+        });
+      });
+
+      it('a heartbeat, the system, an SB or a channel message never wakes it', async () => {
+        for (const id of ['system', 'myra', '123456789', OWNER]) {
+          const result = await turn(INKLING, { sender: { id, name: 'not a person here' } });
+          expect(result.errorCode, id).toBe('INKLING_TURN_REFUSED');
+        }
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      });
+
+      it('an inkling not born under the test, or on another account, never wakes', async () => {
+        const unborn = await turn({ client: 'inkling-mobile', named: false });
+        const elsewhere = await turn(INKLING, fromOwner, '33333333-3333-4333-8333-333333333333');
+        expect([unborn.errorCode, elsewhere.errorCode]).toEqual([
+          'INKLING_TURN_REFUSED',
+          'INKLING_TURN_REFUSED',
+        ]);
+        expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      });
+
+      it('any other SB is untouched, gate on or off', async () => {
+        for (const gate of [OWNER, '']) {
+          await turn({}, { sender: { id: 'system', name: 'heartbeat' } }, gate);
+        }
+        expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+      });
+    });
+
     it('passes a pinned model through to the runner config', async () => {
       const service = serviceWithIdentity(
         { runtimeConfig: { model: 'claude-opus-5' } },
