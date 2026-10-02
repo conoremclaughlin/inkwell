@@ -31,9 +31,9 @@ class FakeStdout extends EventEmitter {
 }
 
 const LONG_ASCII =
-  'Therapy finished 45 minutes ago! It ends up there is some timezone confusion due to daylight ' +
-  'savings. Go ahead and create another therapy session for me for next Wednesday at 9am PT with ' +
-  'Richard. We can update the event to include the information after.';
+  'Choir rehearsal ended 45 minutes ago! It turns out there was some confusion over the room ' +
+  'booking at the hall. Go ahead and create another rehearsal slot for me for next Wednesday at ' +
+  '7pm PT with Ada. We can update the event to include the sheet music after.';
 
 const LONG_EVENT =
   '🛠 myra · remember (executed) — {"success":true,"message":"Memory saved successfully",' +
@@ -78,7 +78,7 @@ describe('<Static> width pin (scrollback wrap-overflow regression)', () => {
     const lines = all.split('\n');
 
     // Sanity: the content actually rendered (wrapped across lines).
-    expect(all).toContain('Therapy finished 45 minutes ago!');
+    expect(all).toContain('Choir rehearsal ended 45 minutes ago!');
 
     for (const line of lines) {
       expect(
