@@ -122,8 +122,10 @@ export function deliveryFromSendResult(result: Record<string, unknown>): Deliver
 
 /** What a stored message recorded about its own dispatch, or unknown. */
 export function deliveryFromStoredMetadata(metadata: unknown): Delivery {
-  const pcp = (metadata as { pcp?: { delivery?: unknown } } | null)?.pcp;
-  const recorded = pcp?.delivery as { status?: unknown; unrouted?: unknown } | undefined;
+  const inkMeta = (metadata as Record<string, unknown> | null)?.pcp as
+    | { delivery?: unknown }
+    | undefined;
+  const recorded = inkMeta?.delivery as { status?: unknown; unrouted?: unknown } | undefined;
   const statuses: DeliveryStatus[] = ['routed', 'partial', 'unrouted'];
   if (!recorded || !statuses.includes(recorded.status as DeliveryStatus)) {
     return { ...UNKNOWN_DELIVERY };
@@ -305,13 +307,13 @@ export async function recordDelivery(
     if (readError || !data) throw new Error(readError?.message ?? 'message not found');
     const metadata = ((data as { metadata: Record<string, unknown> | null }).metadata ??
       {}) as Record<string, unknown>;
-    const pcp = (metadata.pcp ?? {}) as Record<string, unknown>;
+    const inkMeta = (metadata.pcp ?? {}) as Record<string, unknown>;
     const { error } = await supabase
       .from('inbox_thread_messages')
       .update({
         metadata: {
           ...metadata,
-          pcp: { ...pcp, delivery: { ...delivery, recordedAt: new Date().toISOString() } },
+          pcp: { ...inkMeta, delivery: { ...delivery, recordedAt: new Date().toISOString() } },
         },
       })
       .eq('id', messageId);

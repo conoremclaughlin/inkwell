@@ -972,9 +972,9 @@ export async function handleSendToInbox(
     const wakeMetadata: Record<string, unknown> = { ...rawMeta };
     delete wakeMetadata.clientMessageId;
     if (wakeMetadata.pcp && typeof wakeMetadata.pcp === 'object') {
-      const pcpForWake = { ...(wakeMetadata.pcp as Record<string, unknown>) };
-      delete pcpForWake.createRequest;
-      if (Object.keys(pcpForWake).length > 0) wakeMetadata.pcp = pcpForWake;
+      const inkForWake = { ...(wakeMetadata.pcp as Record<string, unknown>) };
+      delete inkForWake.createRequest;
+      if (Object.keys(inkForWake).length > 0) wakeMetadata.pcp = inkForWake;
       else delete wakeMetadata.pcp;
     }
     const wakeIds = new Set(agentsToTrigger.map((t) => t.sbId));
