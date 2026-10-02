@@ -78,7 +78,8 @@
 
 import { randomUUID } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Database } from '../data/supabase/types.js';
+import type { Database, Json } from '../data/supabase/types.js';
+import type { DueReminder } from './heartbeat.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -165,6 +166,23 @@ export interface NoticeKey {
   failedBeats?: number;
 }
 
+/**
+ * What a held notice needs to be sent later without rerunning its reminder:
+ * the direct send, exactly as it would have gone out.
+ */
+export interface HeldNoticePayload {
+  channel: string;
+  target: string;
+  content: string;
+}
+
+/** A notice held for the user's quiet hours (task 2301cb3c). */
+export interface NoticeHold {
+  /** When the window was due to end at the moment of the hold. Display only. */
+  heldUntil: string;
+  payload: HeldNoticePayload;
+}
+
 /** An all-clear we still owe, reconstructed from its outage row. */
 export interface OwedRecovery {
   episodeKey: string;
@@ -196,7 +214,30 @@ export interface HeartbeatNotificationStore {
    * so the decision itself lives in one place rather than being re-derived by
    * every caller.
    */
-  claimNotice(key: NoticeKey): Promise<{ shouldSend: boolean; record: NoticeRecord | null }>;
+  claimNotice(
+    key: NoticeKey,
+    opts?: {
+      /**
+       * The exact send this notice stands for. Recorded with the claim, which
+       * makes the row drain-owned at once, so no later write is needed for the
+       * drain to find it.
+       */
+      payload?: HeldNoticePayload;
+    }
+  ): Promise<{ shouldSend: boolean; record: NoticeRecord | null }>;
+  /**
+   * Whether the outage an all-clear closes has reached the human. Every
+   * recovery sender asks this before sending, so an all-clear can never
+   * overtake its outage.
+   * - `pending`: owed and drain-owned, so it will be sent; the all-clear waits.
+   * - `stranded`: owed but carrying no payload (a row from before notices
+   *   recorded their send). Nothing will ever send it, so the all-clear must
+   *   not wait on it, or it would wait forever.
+   * - `unknown`: the read failed; the all-clear waits.
+   */
+  outageStatus(
+    key: NoticeKey
+  ): Promise<'delivered' | 'pending' | 'stranded' | 'absent' | 'unknown'>;
   /** Record the outcome of an attempt. */
   settleNotice(key: NoticeKey, outcome: { delivered: boolean; error?: string }): Promise<void>;
   /**
@@ -233,6 +274,67 @@ export interface HeartbeatNotificationStore {
    * outcome rule the rest of this module turns on.
    */
   closeEpisode(key: NoticeKey): Promise<void>;
+  /**
+   * Hold a due notice for the user's quiet hours, and hand it to the drain.
+   *
+   * A hold is not an attempt and not a delivery: it touches no attempt count,
+   * status, backoff or episode. It records why (`hold_reason`), when the window
+   * was due to end (`held_until`, display only), what to send (`payload`), and
+   * marks the row `drain_owned`, which stays set until the notice is
+   * delivered. `next_attempt_at` stays the channel-retry backoff, so quiet
+   * hours changed or disabled later can release the notice at once.
+   *
+   * Returns whether the hold was persisted. The caller holds either way: a
+   * known quiet-hours hold is never overridden by a store failure.
+   */
+  holdNotice(key: NoticeKey, hold: NoticeHold): Promise<boolean>;
+  /**
+   * Users who have undelivered notices the drain owns, so the drain can run
+   * the quiet-hours gate once per user before selecting rows. Null when the
+   * read failed.
+   */
+  listDrainUsers(): Promise<string[] | null>;
+  /**
+   * Up to `limit` drain-owned notices that may be sent now, oldest first, for
+   * users whose gate allows sending. Ineligible rows are filtered out BEFORE
+   * the limit, so a page of rows still in backoff (or recoveries waiting on
+   * their outage) cannot keep a due notice from being reached:
+   * - still in channel backoff (`next_attempt_at` in the future): excluded by
+   *   the query;
+   * - a recovery whose episode's outage notice is not yet delivered: excluded,
+   *   so an all-clear never arrives before the outage it closes.
+   * Null when the read failed.
+   */
+  listDrainCandidates(userIds: string[], limit: number): Promise<DrainCandidate[] | null>;
+  /**
+   * Every all-clear owed for an episode that has ended, where nothing durable
+   * holds the all-clear itself (PR #723 review): the outage notice was
+   * delivered from a recorded send, a delivered beat followed it in
+   * `reminder_history`, and the episode has no recovery row that is delivered
+   * or that the drain can send. That happens when the recovery beat waited
+   * behind its outage and could not record its own claim, or when a rebuilt
+   * all-clear's claim and send both failed and the settle recreated an empty
+   * row. Oldest recovery first, each with the reminder the all-clear is
+   * composed from. All of them, not a page: one that can never be sent stays
+   * in the view, and a page of those would hide the rest. Null when a read
+   * failed.
+   */
+  listOwedRecoveries(): Promise<OwedRecoveryNotice[] | null>;
+}
+
+/** A drain-owned notice that may be sent now. */
+export interface DrainCandidate {
+  key: NoticeKey;
+  payload: HeldNoticePayload | null;
+}
+
+/** An all-clear owed for an ended episode that nothing durable will send. */
+export interface OwedRecoveryNotice {
+  reminder: DueReminder;
+  episodeKey: string;
+  destination: string | null;
+  /** Failed beats in the episode, counted from `reminder_history`. */
+  failedBeats: number;
 }
 
 interface NoticeRow {
@@ -243,10 +345,27 @@ interface NoticeRow {
   destination: string | null;
   failed_beats: number | null;
   next_attempt_at: string | null;
+  payload: Json | null;
+  drain_owned: boolean | null;
 }
 
 const NOTICE_COLUMNS =
-  'id, status, attempts, episode_key, destination, failed_beats, next_attempt_at';
+  'id, status, attempts, episode_key, destination, failed_beats, next_attempt_at, payload, drain_owned';
+
+/**
+ * A timestamptz as PostgREST returns it, in microseconds since the epoch, so
+ * rows read by separate queries merge in the order Postgres gave each query.
+ * `Date.parse` keeps milliseconds only, and PostgREST trims trailing zeros
+ * from the fraction, so neither the parsed value nor the text compares
+ * exactly on its own. The fraction is read separately and the rest parsed
+ * whole, so no parser rounding enters.
+ */
+export function createdAtMicros(timestamp: string): number {
+  const match = /\.(\d+)/.exec(timestamp);
+  const whole = match ? timestamp.replace(match[0], '') : timestamp;
+  const fraction = (match?.[1] ?? '').padEnd(6, '0').slice(0, 6);
+  return Date.parse(whole) * 1000 + Number(fraction);
+}
 
 export function createHeartbeatNotificationStore(
   client: SupabaseClient<Database>
@@ -424,8 +543,18 @@ export function createHeartbeatNotificationStore(
     }
   };
 
-  /** Create the row for an episode we have not considered before. */
-  const insertNotice = async (key: NoticeKey): Promise<NoticeRow | null> => {
+  /**
+   * Create the row for an episode we have not considered before.
+   *
+   * With a payload, the row is drain-owned from this one INSERT: the send it
+   * stands for is recorded together with the obligation, so a hold write that
+   * fails later, or a crash before it, still leaves a notice the drain can
+   * find and send (PR #723 review).
+   */
+  const insertNotice = async (
+    key: NoticeKey,
+    payload?: HeldNoticePayload
+  ): Promise<NoticeRow | null> => {
     const { data, error } = await table()
       .insert({
         reminder_id: key.reminderId,
@@ -436,6 +565,7 @@ export function createHeartbeatNotificationStore(
         failed_beats: key.failedBeats ?? 0,
         status: 'pending',
         attempts: 0,
+        ...(payload ? { payload: payload as unknown as Json, drain_owned: true } : {}),
       })
       .select(NOTICE_COLUMNS)
       .single();
@@ -457,7 +587,7 @@ export function createHeartbeatNotificationStore(
     return data as NoticeRow;
   };
 
-  const claimNotice: HeartbeatNotificationStore['claimNotice'] = async (key) => {
+  const claimNotice: HeartbeatNotificationStore['claimNotice'] = async (key, opts) => {
     let record: NoticeRow | null;
     try {
       record = await load(key);
@@ -465,7 +595,21 @@ export function createHeartbeatNotificationStore(
         // First time we have considered this episode. Create the row up front so
         // a crash between here and the send still leaves evidence that a notice
         // was owed — a missing row is indistinguishable from "never happened".
-        record = await insertNotice(key);
+        record = await insertNotice(key, opts?.payload);
+      } else if (opts?.payload && record.status === 'pending' && !record.payload) {
+        // A row from before notices carried their send (or one recreated by a
+        // bookkeeping path): give it the payload now so the drain can own it.
+        // Best effort — the caller still sends or holds as it would have.
+        const { error } = await table()
+          .update({ payload: opts.payload as unknown as Json, drain_owned: true })
+          .eq('id', record.id);
+        if (error) {
+          logger.warn('[Heartbeat] Could not record the send on an existing notice', {
+            reminderId: key.reminderId,
+            kind: key.kind,
+            error: error.message,
+          });
+        }
       }
     } catch (err) {
       logger.warn('[Heartbeat] Notice acknowledgement lookup threw', {
@@ -909,6 +1053,274 @@ export function createHeartbeatNotificationStore(
     }
   };
 
+  const holdNotice: HeartbeatNotificationStore['holdNotice'] = async (key, hold) => {
+    const patch = {
+      hold_reason: 'quiet-hours',
+      held_until: hold.heldUntil,
+      drain_owned: true,
+      payload: hold.payload as unknown as Json,
+    };
+    try {
+      const { data, error } = await table()
+        .update(patch)
+        .eq('reminder_id', key.reminderId)
+        .eq('kind', key.kind)
+        .eq('episode_key', key.episodeKey)
+        .select('id');
+
+      if (error) {
+        logger.error(
+          '[Heartbeat] Could not record a quiet-hours hold — the notice is held unrecorded',
+          {
+            reminderId: key.reminderId,
+            kind: key.kind,
+            error: error.message,
+          }
+        );
+        return false;
+      }
+      if (((data as { id: string }[] | null)?.length ?? 0) > 0) return true;
+
+      // claimNotice creates the row before any send, so a zero-row UPDATE means
+      // that INSERT failed. Rebuild it, as settleNotice does, so the drain can
+      // still find what it owes.
+      const created = await insertNotice(key);
+      if (!created) {
+        logger.error('[Heartbeat] Quiet-hours hold matched no row and none could be created', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+        });
+        return false;
+      }
+      const { error: patchError } = await table().update(patch).eq('id', created.id);
+      if (patchError) {
+        logger.error('[Heartbeat] Could not record a hold on the recreated notice row', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+          error: patchError.message,
+        });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logger.error('[Heartbeat] Recording a quiet-hours hold threw', {
+        reminderId: key.reminderId,
+        kind: key.kind,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  };
+
+  /**
+   * Users are read a page at a time from a DISTINCT view, so one user's many
+   * rows cannot take up a page another user needs (PR #723 review). Every page
+   * is read: a page bound would return the same prefix of users every tick and
+   * never reach the rest. The keyset cursor only moves forward, and a page
+   * that fails to move it ends the listing.
+   */
+  const USERS_PAGE = 200;
+  /** Users per candidate query, to keep the IN list a sensible size. */
+  const USERS_PER_QUERY = 100;
+
+  const listDrainUsers: HeartbeatNotificationStore['listDrainUsers'] = async () => {
+    try {
+      const users: string[] = [];
+      let after: string | null = null;
+      for (;;) {
+        let query = client
+          .from('heartbeat_notifications_drain_users')
+          .select('user_id')
+          .order('user_id', { ascending: true })
+          .limit(USERS_PAGE);
+        if (after) query = query.gt('user_id', after);
+        const { data, error } = await query;
+        if (error) {
+          logger.warn('[Heartbeat] Could not list users with held notices', {
+            error: error.message,
+          });
+          return null;
+        }
+        const rows = ((data as { user_id: string | null }[] | null) ?? []).filter(
+          (r): r is { user_id: string } => !!r.user_id
+        );
+        users.push(...rows.map((r) => r.user_id));
+        if (rows.length < USERS_PAGE) return users;
+        const last = rows[rows.length - 1].user_id;
+        if (last === after) {
+          logger.warn('[Heartbeat] Held-notice user listing stopped advancing', {
+            users: users.length,
+          });
+          return users;
+        }
+        after = last;
+      }
+    } catch (err) {
+      logger.warn('[Heartbeat] Listing users with held notices threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
+  const listDrainCandidates: HeartbeatNotificationStore['listDrainCandidates'] = async (
+    userIds,
+    limit
+  ) => {
+    if (userIds.length === 0 || limit <= 0) return [];
+    type Row = {
+      id: string;
+      reminder_id: string;
+      user_id: string;
+      kind: 'outage' | 'recovery';
+      episode_key: string;
+      destination: string | null;
+      failed_beats: number | null;
+      payload: Json | null;
+      created_at: string;
+    };
+    try {
+      const nowIso = new Date().toISOString();
+      const rows: Row[] = [];
+      // Every eligibility rule except the per-user quiet-hours gate lives in
+      // the view or in these filters, so the limit applies to eligible rows
+      // only: drain-owned, pending, carrying a payload, past backoff, and no
+      // all-clear whose outage the drain still owes.
+      //
+      // Every chunk of users is read, each for its own oldest `limit` rows,
+      // and the batch is the oldest `limit` of them all (PR #723 review).
+      // Stopping once the first chunk filled the batch let users who sort
+      // early starve an older notice belonging to a user who sorts late.
+      for (let i = 0; i < userIds.length; i += USERS_PER_QUERY) {
+        const { data, error } = await client
+          .from('heartbeat_notifications_drain_eligible')
+          .select(
+            'id, reminder_id, user_id, kind, episode_key, destination, failed_beats, payload, created_at'
+          )
+          .in('user_id', userIds.slice(i, i + USERS_PER_QUERY))
+          .or(`next_attempt_at.is.null,next_attempt_at.lte.${nowIso}`)
+          .order('created_at', { ascending: true })
+          .order('id', { ascending: true })
+          .limit(limit);
+        if (error) {
+          logger.warn('[Heartbeat] Could not read held notices', { error: error.message });
+          return null;
+        }
+        rows.push(...((data as Row[] | null) ?? []));
+      }
+      rows.sort(
+        (a, b) =>
+          createdAtMicros(a.created_at) - createdAtMicros(b.created_at) ||
+          (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+      );
+
+      return rows.slice(0, limit).map((r) => ({
+        key: {
+          reminderId: r.reminder_id,
+          userId: r.user_id,
+          kind: r.kind,
+          episodeKey: r.episode_key,
+          destination: r.destination,
+          failedBeats: r.failed_beats ?? undefined,
+        },
+        payload: (r.payload as unknown as HeldNoticePayload | null) ?? null,
+      }));
+    } catch (err) {
+      logger.warn('[Heartbeat] Reading held notices threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
+  /** Rows per read of the owed-recovery view; every page is read. */
+  const OWED_PAGE = 100;
+
+  const listOwedRecoveries: HeartbeatNotificationStore['listOwedRecoveries'] = async () => {
+    try {
+      // Every rule lives in the view; a row leaves it as soon as its
+      // all-clear has a recovery row or its episode is closed. All pages are
+      // read before any is acted on, so nothing shifts between them.
+      const owed: OwedRecoveryNotice[] = [];
+      for (let from = 0; ; from += OWED_PAGE) {
+        const { data, error } = await client
+          .from('heartbeat_notifications_owed_recoveries')
+          .select('id, reminder_id, episode_key, destination, failed_beats, recovered_at')
+          .order('recovered_at', { ascending: true })
+          .order('id', { ascending: true })
+          .range(from, from + OWED_PAGE - 1);
+        if (error) {
+          logger.warn('[Heartbeat] Could not read owed all-clears', { error: error.message });
+          return null;
+        }
+        const page = data ?? [];
+        const rows = page.filter(
+          (r): r is typeof r & { reminder_id: string; episode_key: string } =>
+            !!r.reminder_id && !!r.episode_key
+        );
+        if (rows.length > 0) {
+          const { data: reminders, error: reminderError } = await client
+            .from('scheduled_reminders')
+            .select('*')
+            .in('id', [...new Set(rows.map((r) => r.reminder_id))]);
+          if (reminderError) {
+            logger.warn('[Heartbeat] Could not read the reminders behind owed all-clears', {
+              error: reminderError.message,
+            });
+            return null;
+          }
+          const byId = new Map(
+            (reminders ?? []).map((r) => [r.id, r as unknown as DueReminder] as const)
+          );
+          for (const r of rows) {
+            const reminder = byId.get(r.reminder_id);
+            if (!reminder) continue;
+            owed.push({
+              reminder,
+              episodeKey: r.episode_key,
+              destination: r.destination,
+              failedBeats: r.failed_beats ?? 0,
+            });
+          }
+        }
+        if (page.length < OWED_PAGE) return owed;
+      }
+    } catch (err) {
+      logger.warn('[Heartbeat] Reading owed all-clears threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
+  const outageStatus: HeartbeatNotificationStore['outageStatus'] = async (key) => {
+    try {
+      const { data, error } = await table()
+        .select('status, drain_owned, payload')
+        .eq('reminder_id', key.reminderId)
+        .eq('kind', 'outage')
+        .eq('episode_key', key.episodeKey)
+        .maybeSingle();
+      if (error) {
+        logger.warn('[Heartbeat] Could not read the outage behind an all-clear', {
+          reminderId: key.reminderId,
+          error: error.message,
+        });
+        return 'unknown';
+      }
+      if (!data) return 'absent';
+      const row = data as { status: string; drain_owned: boolean | null; payload: Json | null };
+      if (row.status === 'delivered') return 'delivered';
+      return row.drain_owned && row.payload ? 'pending' : 'stranded';
+    } catch (err) {
+      logger.warn('[Heartbeat] Reading the outage behind an all-clear threw', {
+        reminderId: key.reminderId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 'unknown';
+    }
+  };
+
   return {
     openEpisode,
     claimNotice,
@@ -916,5 +1328,10 @@ export function createHeartbeatNotificationStore(
     markCoveredBySibling,
     findOwedRecovery,
     closeEpisode,
+    holdNotice,
+    listDrainUsers,
+    listDrainCandidates,
+    listOwedRecoveries,
+    outageStatus,
   };
 }

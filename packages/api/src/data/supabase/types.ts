@@ -1521,14 +1521,18 @@ export type Database = {
           created_at: string;
           delivered_at: string | null;
           destination: string | null;
+          drain_owned: boolean;
           episode_closed_at: string | null;
           episode_key: string;
           failed_beats: number;
+          held_until: string | null;
+          hold_reason: string | null;
           id: string;
           kind: string;
           last_attempt_at: string | null;
           last_error: string | null;
           next_attempt_at: string | null;
+          payload: Json | null;
           reminder_id: string;
           status: string;
           updated_at: string;
@@ -1539,14 +1543,18 @@ export type Database = {
           created_at?: string;
           delivered_at?: string | null;
           destination?: string | null;
+          drain_owned?: boolean;
           episode_closed_at?: string | null;
           episode_key: string;
           failed_beats?: number;
+          held_until?: string | null;
+          hold_reason?: string | null;
           id?: string;
           kind: string;
           last_attempt_at?: string | null;
           last_error?: string | null;
           next_attempt_at?: string | null;
+          payload?: Json | null;
           reminder_id: string;
           status?: string;
           updated_at?: string;
@@ -1557,14 +1565,18 @@ export type Database = {
           created_at?: string;
           delivered_at?: string | null;
           destination?: string | null;
+          drain_owned?: boolean;
           episode_closed_at?: string | null;
           episode_key?: string;
           failed_beats?: number;
+          held_until?: string | null;
+          hold_reason?: string | null;
           id?: string;
           kind?: string;
           last_attempt_at?: string | null;
           last_error?: string | null;
           next_attempt_at?: string | null;
+          payload?: Json | null;
           reminder_id?: string;
           status?: string;
           updated_at?: string;
@@ -3252,6 +3264,7 @@ export type Database = {
           metadata: Json | null;
           next_run_at: string;
           run_count: number | null;
+          run_during_quiet_hours: boolean;
           sb_id: string | null;
           status: string;
           studio_hint: string | null;
@@ -3271,6 +3284,7 @@ export type Database = {
           metadata?: Json | null;
           next_run_at: string;
           run_count?: number | null;
+          run_during_quiet_hours?: boolean;
           sb_id?: string | null;
           status?: string;
           studio_hint?: string | null;
@@ -3290,6 +3304,7 @@ export type Database = {
           metadata?: Json | null;
           next_run_at?: string;
           run_count?: number | null;
+          run_during_quiet_hours?: boolean;
           sb_id?: string | null;
           status?: string;
           studio_hint?: string | null;
@@ -5161,7 +5176,39 @@ export type Database = {
       };
     };
     Views: {
-      [_ in never]: never;
+      heartbeat_notifications_drain_eligible: {
+        Row: {
+          created_at: string | null;
+          destination: string | null;
+          episode_key: string | null;
+          failed_beats: number | null;
+          id: string | null;
+          kind: string | null;
+          next_attempt_at: string | null;
+          payload: Json | null;
+          reminder_id: string | null;
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
+      heartbeat_notifications_drain_users: {
+        Row: {
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
+      heartbeat_notifications_owed_recoveries: {
+        Row: {
+          destination: string | null;
+          episode_key: string | null;
+          failed_beats: number | null;
+          id: string | null;
+          recovered_at: string | null;
+          reminder_id: string | null;
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
     };
     Functions: {
       swap_memory_embedding: {

@@ -46,8 +46,10 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   type DueReminder,
+  type HeartbeatDeliveryContext,
   type HeartbeatDeliveryOutcome,
 } from './services/heartbeat';
+import { buildHeartbeatReminderPrompt } from './services/heartbeat-prompt';
 import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
@@ -547,7 +549,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
    * exactly when a monitor is most likely to be broken.
    */
   const deliverReminderViaSession = async (
-    reminder: DueReminder
+    reminder: DueReminder,
+    deliveryContext?: HeartbeatDeliveryContext
   ): Promise<HeartbeatDeliveryOutcome> => {
     const userId = reminder.user_id;
 
@@ -688,19 +691,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // cascade (agent's own studio → main studio) instead of searching
     // for a studio literally named 'home' which doesn't exist.
 
-    const reminderContent = `[HEARTBEAT REMINDER]
-Title: ${reminder.title}
-Description: ${reminder.description || 'No description'}
-Delivery: ${reminder.delivery_channel} → ${reminder.delivery_target || 'default'}
-
----
-IMPORTANT: This reminder was triggered by the heartbeat service.
-Refer to your HEARTBEAT identity document for how to handle scheduled tasks.
-If you need to message a user on Telegram, use send_response with:
-- channel: "${reminder.delivery_channel}"
-- conversationId: "${reminder.delivery_target}"
-
-Do NOT just respond here — you MUST explicitly call send_response to reach external channels.`;
+    // A quiet-hours firing (the reminder's switch is on) is told not to contact
+    // the user until the window ends, in place of the send_response lines.
+    const reminderContent = buildHeartbeatReminderPrompt(reminder, deliveryContext);
 
     const request: SessionRequest = {
       userId,
@@ -803,7 +796,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         const stats = await processHeartbeat(
           deliverReminderViaSession,
           heartbeatEscalation?.onFailure,
-          heartbeatEscalation?.onRecovery
+          heartbeatEscalation?.onRecovery,
+          heartbeatEscalation?.drainHeldNotices
         );
         logger.info('Heartbeat complete', stats);
 

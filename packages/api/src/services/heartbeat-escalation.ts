@@ -92,8 +92,52 @@ import type {
 import type { ChannelResponse, ChannelType } from './sessions/types.js';
 import type { HeartbeatNotificationStore, NoticeKey } from './heartbeat-notification-store.js';
 import { createHeartbeatNotificationStore } from './heartbeat-notification-store.js';
+import { quietHoursAt } from './quiet-hours.js';
 import { classifyError, failureExcerpt, DISPLAY_EXCERPT } from '@inklabs/shared';
 import { logger } from '../utils/logger.js';
+
+/**
+ * Whether a direct notice may go out right now (task 2301cb3c).
+ *
+ * - hold: the user is in quiet hours. The notice is held and sent when they
+ *   end. A known hold always holds.
+ * - clear: send.
+ * - unreadable: the quiet-hours setting could not be read. Send, which is the
+ *   same availability tradeoff alert-dispatch makes ("failing to read quiet
+ *   hours must not silence an alert"), logged so it is never mistaken for a
+ *   verified clear window.
+ */
+export type QuietGateDecision =
+  | { kind: 'hold'; until: Date; timezone: string }
+  | { kind: 'clear' }
+  | { kind: 'unreadable'; error: string };
+
+/** The default gate: the user's `heartbeat_state` quiet window, evaluated now. */
+export function createQuietGate(
+  client: SupabaseClient<Database>
+): (userId: string) => Promise<QuietGateDecision> {
+  return async (userId) => {
+    try {
+      const { data, error } = await client
+        .from('heartbeat_state')
+        .select('quiet_start, quiet_end, timezone')
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (error) return { kind: 'unreadable', error: error.message };
+      if (!data?.quiet_start || !data?.quiet_end) return { kind: 'clear' };
+      const verdict = quietHoursAt(new Date(), {
+        start: data.quiet_start,
+        end: data.quiet_end,
+        timezone: data.timezone,
+      });
+      return verdict.quiet
+        ? { kind: 'hold', until: verdict.until, timezone: verdict.timezone }
+        : { kind: 'clear' };
+    } catch (err) {
+      return { kind: 'unreadable', error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+}
 
 /**
  * Channels we will send an unsolicited outage alert over.
@@ -124,16 +168,107 @@ export interface HeartbeatEscalationDeps {
    * the streak bug survived sixty-one passing tests.
    */
   store?: HeartbeatNotificationStore;
+  /**
+   * Evaluated immediately before every direct send. Injectable for tests;
+   * defaults to the user's quiet window from `heartbeat_state`.
+   */
+  quietGate?: (userId: string) => Promise<QuietGateDecision>;
 }
 
 export interface HeartbeatEscalation {
   onFailure: HeartbeatFailureHook;
   onRecovery: HeartbeatRecoveryHook;
+  /**
+   * Send held notices whose quiet hours have ended. Called at the start of
+   * every heartbeat tick, before due reminders are read, so it runs when no
+   * reminder is due and before the beat path looks at the same notices.
+   */
+  drainHeldNotices: () => Promise<HeldNoticeDrainStats>;
 }
+
+export interface HeldNoticeDrainStats {
+  sent: number;
+  failed: number;
+  /** Still in quiet hours at the moment of sending (the prefilter is a hint). */
+  held: number;
+  /** Owned by the drain but unsendable as stored: no payload or no destination. */
+  skipped: number;
+  /** An all-clear whose outage notice is not delivered yet; it goes after. */
+  waiting: number;
+  /**
+   * All-clears owed for an ended episode that nothing durable will send, handed back to
+   * the recovery path. Those that were delivered are also counted in `sent`.
+   */
+  rebuilt: number;
+}
+
+/** How many held notices one tick sends at most. */
+const DRAIN_BATCH = 20;
 
 export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): HeartbeatEscalation {
   const { client, sendToChannel, defaultSlug } = deps;
   const store = deps.store ?? createHeartbeatNotificationStore(client);
+  const quietGate = deps.quietGate ?? createQuietGate(client);
+
+  /**
+   * Hold a notice that is about to be sent, if the user is in quiet hours.
+   *
+   * Runs after claimNotice has said the notice is due and immediately before
+   * the send, so a notice claimed just before quiet hours and sent just after
+   * they start is still held. Returns true when the notice was held, in which
+   * case the caller sends nothing and settles nothing: a hold is not an
+   * attempt. The drain sends it when quiet hours end.
+   */
+  /** The exact direct send a notice stands for, recorded with its claim. */
+  const payloadFor = (reminder: DueReminder, content: string) => ({
+    channel: reminder.delivery_channel,
+    target: reminder.delivery_target ?? '',
+    content,
+  });
+
+  const holdForQuietHours = async (
+    reminder: DueReminder,
+    key: NoticeKey,
+    content: string
+  ): Promise<boolean> => {
+    const gate = await quietGate(reminder.user_id);
+    if (gate.kind === 'clear') return false;
+    if (gate.kind === 'unreadable') {
+      logger.warn('[Heartbeat] quiet-policy-unreadable — sending the notice anyway', {
+        reminderId: reminder.id,
+        kind: key.kind,
+        error: gate.error,
+      });
+      return false;
+    }
+
+    const persisted = await store.holdNotice(key, {
+      heldUntil: gate.until.toISOString(),
+      payload: {
+        channel: reminder.delivery_channel,
+        target: reminder.delivery_target ?? '',
+        content,
+      },
+    });
+    const fields = {
+      reminderId: reminder.id,
+      kind: key.kind,
+      heldUntil: gate.until.toISOString(),
+      timezone: gate.timezone,
+    };
+    if (persisted) {
+      logger.info(
+        '[Heartbeat] Notice held for quiet hours — the drain sends it when they end',
+        fields
+      );
+    } else {
+      // Still held. A known quiet-hours hold is never overridden by a store
+      // failure (Lumen, review of task 2301cb3c); the store has already logged
+      // why it could not record it.
+      logger.error('[Heartbeat] Notice held for quiet hours but the hold was not recorded', fields);
+    }
+    return true;
+  };
 
   /**
    * Whether this reminder has anywhere to send an unsolicited notice.
@@ -381,9 +516,19 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
+    const outageContent =
+      `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
+      `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
+      `Whatever this beat monitors is NOT being checked. ` +
+      `I will send one more message when it runs again.`;
+
     // The real dedup: has a notice for THIS outage actually been delivered?
-    // Not "did an earlier beat fail" — that was the round-two defect.
-    const { shouldSend, record } = await store.claimNotice(key);
+    // Not "did an earlier beat fail" — that was the round-two defect. The
+    // claim records the send itself, so the notice is drain-owned from here
+    // on: whatever happens after this line, nothing strands it.
+    const { shouldSend, record } = await store.claimNotice(key, {
+      payload: payloadFor(reminder, outageContent),
+    });
     if (!shouldSend) {
       logger.warn('[Heartbeat] Outage already announced for this episode — inbox only', {
         reminderId: reminder.id,
@@ -396,13 +541,11 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    const alert = await alertOwnerDirectly(
-      reminder,
-      `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
-        `${classification.category}${classification.retryable ? ' (retryable)' : ''}: ${readableError}\n\n` +
-        `Whatever this beat monitors is NOT being checked. ` +
-        `I will send one more message when it runs again.`
-    );
+    if (await holdForQuietHours(reminder, key, outageContent)) {
+      return { alerted: false };
+    }
+
+    const alert = await alertOwnerDirectly(reminder, outageContent);
 
     // Settle before returning: an unrecorded successful send would re-alert on
     // the next beat, and an unrecorded failure would never be retried.
@@ -452,7 +595,13 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    const { shouldSend, record } = await store.claimNotice(key);
+    const recoveryContent =
+      `✅ Heartbeat recovered: "${reminder.title}"\n\n` +
+      `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`;
+
+    const { shouldSend, record } = await store.claimNotice(key, {
+      payload: payloadFor(reminder, recoveryContent),
+    });
     if (!shouldSend) {
       logger.info('[Heartbeat] Recovery already announced for this episode', {
         reminderId: reminder.id,
@@ -463,11 +612,49 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return { alerted: false };
     }
 
-    const alert = await alertOwnerDirectly(
-      reminder,
-      `✅ Heartbeat recovered: "${reminder.title}"\n\n` +
-        `Running again after ${failedBeats} failed ${failedBeats === 1 ? 'beat' : 'beats'}.`
-    );
+    // An all-clear does not overtake an outage notice known to be owed (PR
+    // #723 review), whether or not its own claim produced a row: a failed
+    // recovery INSERT is no evidence that the outage was delivered.
+    // - Outage pending: wait. With the claim recorded, the all-clear is
+    //   drain-owned and the drain sends it once the outage is delivered.
+    //   Without it, the drain rebuilds the all-clear from the outage row and
+    //   this beat's delivered row in reminder_history (sendOwedRecoveries),
+    //   with no further reminder run needed.
+    // - Outage unknown, claim recorded: wait, durably, as for pending.
+    // - Outage unknown, claim not recorded: nothing durable could hold the
+    //   all-clear, so it is sent now, best effort (product decision, option
+    //   A, 2026-10-02, task 2301cb3c). It may arrive before its outage notice,
+    //   or without one; that uncertainty is logged. Quiet hours still hold it.
+    // A delivered, absent or stranded outage lets the all-clear through as
+    // before, including the send-through rule when the claim failed.
+    const outage = await store.outageStatus(key);
+    const fields = { reminderId: reminder.id, failedBeats, outage, claimRecorded: !!record };
+    if (outage === 'pending' || (outage === 'unknown' && record)) {
+      if (record) {
+        logger.info(
+          '[Heartbeat] All-clear waits for its outage notice — the drain sends it after',
+          fields
+        );
+      } else {
+        logger.warn(
+          '[Heartbeat] All-clear waits for its outage notice, unrecorded — the drain rebuilds it once the outage is delivered',
+          fields
+        );
+      }
+      return { alerted: false };
+    }
+
+    if (await holdForQuietHours(reminder, key, recoveryContent)) {
+      return { alerted: false };
+    }
+
+    if (outage === 'unknown') {
+      logger.error(
+        '[Heartbeat] Attempting an all-clear without knowing whether its outage notice landed — its claim was not recorded and the outage could not be read, so it may arrive first or alone',
+        fields
+      );
+    }
+    const alert = await alertOwnerDirectly(reminder, recoveryContent);
 
     await store.settleNotice(key, { delivered: alert.sent, error: alert.reason });
 
@@ -485,5 +672,181 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     return { alerted: alert.sent };
   };
 
-  return { onFailure, onRecovery };
+  /**
+   * Send the notices quiet hours held (task 2301cb3c).
+   *
+   * Independent of reminder runs: a one-time reminder that failed overnight is
+   * already completed, and nothing else would ever send its outage notice.
+   *
+   * 1. The gate is evaluated once per user with held notices. That is only a
+   *    prefilter, so rows for users still in quiet hours never take up the
+   *    batch.
+   * 2. The store returns eligible rows only, oldest first: past their channel
+   *    backoff, and no all-clear ahead of its outage.
+   * 3. The gate is evaluated AGAIN immediately before each send, because the
+   *    prefilter is a hint, not a guarantee.
+   * 4. Each send is settled as a real attempt. Delivered closes it (and its
+   *    episode, for an all-clear); a failure records the attempt and its
+   *    backoff, and the row stays drain-owned until a later pass delivers it.
+   * 5. Then the all-clears owed for episodes that ended with nothing durable
+   *    holding them (see sendOwedRecoveries).
+   *
+   * Duplicates are at-least-once across processes, as everywhere else in this
+   * module: claimNotice reserves nothing. Within one process the drain settles
+   * each notice before the beat path reads it.
+   */
+  const drainHeldNotices = async (): Promise<HeldNoticeDrainStats> => {
+    const stats: HeldNoticeDrainStats = {
+      sent: 0,
+      failed: 0,
+      held: 0,
+      skipped: 0,
+      waiting: 0,
+      rebuilt: 0,
+    };
+    await sendHeldCandidates(stats);
+    await sendOwedRecoveries(stats);
+    return stats;
+  };
+
+  /**
+   * All-clears owed for episodes that have ended, where nothing durable holds
+   * the all-clear (PR #723 review).
+   *
+   * The recovery beat waits while its outage notice is still owed. If it also
+   * could not record its own claim, the beat-path sweep (retryOwedRecovery)
+   * would rebuild the all-clear on a later healthy beat, and a reminder on its
+   * final run, or paused after recovering, never has one. The store finds
+   * these from records that claim did not write: the delivered outage notice
+   * and the delivered beat after it in `reminder_history`. Each goes back
+   * through onRecovery, so it gets the same claim, causal check, quiet-hours
+   * hold and episode closure as the beat path.
+   *
+   * Runs after the held notices, so an outage delivered in this pass has its
+   * all-clear follow in the same pass.
+   *
+   * Oldest first, and the batch limit counts all-clears sent, not rows read:
+   * one that can neither be recorded nor sent stays owed and is tried again
+   * next pass, but cannot use up the batch ahead of the rest.
+   */
+  const sendOwedRecoveries = async (stats: HeldNoticeDrainStats): Promise<void> => {
+    const owed = await store.listOwedRecoveries();
+    if (!owed) return;
+    let sent = 0;
+    for (const debt of owed) {
+      if (sent >= DRAIN_BATCH) return;
+      stats.rebuilt++;
+      logger.info('[Heartbeat] Rebuilding an all-clear owed for an ended episode', {
+        reminderId: debt.reminder.id,
+        episodeKey: debt.episodeKey,
+        failedBeats: debt.failedBeats,
+      });
+      try {
+        const { alerted } = await onRecovery(debt.reminder, debt.failedBeats, {
+          destinationAlreadyAlerted: false,
+          episodeKey: debt.episodeKey,
+          destination: debt.destination,
+        });
+        if (alerted) {
+          sent++;
+          stats.sent++;
+        }
+      } catch (err) {
+        // One all-clear that throws must not cost the rest of the pass.
+        logger.error('[Heartbeat] Rebuilding an owed all-clear threw', {
+          reminderId: debt.reminder.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  };
+
+  const sendHeldCandidates = async (stats: HeldNoticeDrainStats): Promise<void> => {
+    const users = await store.listDrainUsers();
+    if (!users || users.length === 0) return;
+
+    const sendable: string[] = [];
+    for (const userId of users) {
+      const gate = await quietGate(userId);
+      if (gate.kind !== 'hold') sendable.push(userId);
+    }
+    if (sendable.length === 0) return;
+
+    const candidates = await store.listDrainCandidates(sendable, DRAIN_BATCH);
+    if (!candidates) return;
+
+    for (const { key, payload } of candidates) {
+      if (!payload || !payload.target || !ALERTABLE_CHANNELS.has(payload.channel as ChannelType)) {
+        logger.error('[Heartbeat] Held notice has nothing sendable recorded — skipping', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+        });
+        stats.skipped++;
+        continue;
+      }
+
+      // The same causal check the beat path makes: the store's selection
+      // already leaves out an all-clear whose outage is pending, and this
+      // re-asks at the moment of sending, as the quiet-hours gate does.
+      if (key.kind === 'recovery') {
+        const outage = await store.outageStatus(key);
+        if (outage === 'pending' || outage === 'unknown') {
+          stats.waiting++;
+          continue;
+        }
+      }
+
+      const gate = await quietGate(key.userId);
+      if (gate.kind === 'hold') {
+        stats.held++;
+        continue;
+      }
+      if (gate.kind === 'unreadable') {
+        logger.warn('[Heartbeat] quiet-policy-unreadable — releasing the held notice anyway', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+          error: gate.error,
+        });
+      }
+
+      let sent = false;
+      let reason: string | undefined;
+      try {
+        await sendToChannel({
+          channel: payload.channel as ChannelType,
+          conversationId: payload.target,
+          content: payload.content,
+          format: 'text',
+          metadata: {
+            source: 'heartbeat-escalation',
+            reminderId: key.reminderId,
+            heldNotice: true,
+          },
+        });
+        sent = true;
+      } catch (err) {
+        reason = err instanceof Error ? err.message : String(err);
+      }
+
+      await store.settleNotice(key, { delivered: sent, error: reason });
+      if (sent && key.kind === 'recovery') await store.closeEpisode(key);
+
+      if (sent) {
+        stats.sent++;
+        logger.info('[Heartbeat] Sent a notice held over quiet hours', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+        });
+      } else {
+        stats.failed++;
+        logger.error('[Heartbeat] Held notice failed to send — it stays owed', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+          error: reason,
+        });
+      }
+    }
+  };
+
+  return { onFailure, onRecovery, drainHeldNotices };
 }
