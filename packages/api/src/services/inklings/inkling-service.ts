@@ -296,6 +296,14 @@ export class InklingService {
     if (row.workspace_id !== scope.workspaceId) {
       throw new InklingError(409, 'This awakening request was already used in another workspace');
     }
+    // Only this flow writes awakenRequestId, but a replay hands back an
+    // identity, so it must be one the app may hold: never another SB.
+    if (!isInklingRow(row)) {
+      throw new InklingError(
+        409,
+        'This awakening request belongs to something that is not an inkling'
+      );
+    }
     return { inkling: toInkling(row), replayed: true };
   }
 

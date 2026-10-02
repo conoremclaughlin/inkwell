@@ -33,7 +33,43 @@ const SOMEONE_ELSE = {
   userId: '22222222-2222-4222-8222-222222222222',
   workspaceId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
 };
+/** Another person in MY workspace: only the user filter tells their inklings from mine. */
+const HOUSEMATE = {
+  userId: '33333333-3333-4333-8333-333333333333',
+  workspaceId: ME.workspaceId,
+};
 const REQUEST = '0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a';
+
+describe('a second person in the same workspace (review bbbbba99, P3)', () => {
+  it("does not see my inklings in their list, and I don't see theirs", async () => {
+    const mine = await service.awaken(ME, REQUEST);
+    const theirs = await service.awaken(HOUSEMATE, '9e8d7c6b-5a49-4382-8170-6f5e4d3c2b1a');
+    expect(await service.list(ME)).toEqual([mine.inkling]);
+    expect(await service.list(HOUSEMATE)).toEqual([theirs.inkling]);
+  });
+
+  it('cannot name my inkling: 404, and the name stays mine to set', async () => {
+    const mine = await service.awaken(ME, REQUEST);
+    await expect(service.name(HOUSEMATE, mine.inkling.id, 'Theirs')).rejects.toMatchObject({
+      status: 404,
+    });
+    expect(rowsOf('agent_identities')[0].name).toBe('Unnamed inkling');
+  });
+});
+
+describe('an awakening replay hands back only an inkling', () => {
+  it('a request id found on an identity that is not an inkling is a 409', async () => {
+    db.seed('agent_identities', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      agent_id: 'myra',
+      name: 'Myra',
+      metadata: { awakenRequestId: REQUEST },
+    });
+    await expect(service.awaken(ME, REQUEST)).rejects.toMatchObject({ status: 409 });
+    expect(rowsOf('kindle_tokens')).toHaveLength(0);
+  });
+});
 
 let db: FakePostgrest;
 let service: InklingService;
