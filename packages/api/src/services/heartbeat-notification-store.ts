@@ -264,6 +264,30 @@ export interface HeartbeatNotificationStore {
    * known quiet-hours hold is never overridden by a store failure.
    */
   holdNotice(key: NoticeKey, hold: NoticeHold): Promise<boolean>;
+  /**
+   * Users who have undelivered notices the drain owns, so the drain can run
+   * the quiet-hours gate once per user before selecting rows. Null when the
+   * read failed.
+   */
+  listDrainUsers(): Promise<string[] | null>;
+  /**
+   * Up to `limit` drain-owned notices that may be sent now, oldest first, for
+   * users whose gate allows sending. Ineligible rows are filtered out BEFORE
+   * the limit, so a page of rows still in backoff (or recoveries waiting on
+   * their outage) cannot keep a due notice from being reached:
+   * - still in channel backoff (`next_attempt_at` in the future): excluded by
+   *   the query;
+   * - a recovery whose episode's outage notice is not yet delivered: excluded,
+   *   so an all-clear never arrives before the outage it closes.
+   * Null when the read failed.
+   */
+  listDrainCandidates(userIds: string[], limit: number): Promise<DrainCandidate[] | null>;
+}
+
+/** A drain-owned notice that may be sent now. */
+export interface DrainCandidate {
+  key: NoticeKey;
+  payload: HeldNoticePayload | null;
 }
 
 interface NoticeRow {
@@ -999,6 +1023,123 @@ export function createHeartbeatNotificationStore(
     }
   };
 
+  /**
+   * The drain reads at most this many rows per query. Far above any real
+   * backlog (one user, a handful of reminders); hitting it is logged, and the
+   * oldest rows are still served first.
+   */
+  const DRAIN_SCAN_CAP = 200;
+
+  const listDrainUsers: HeartbeatNotificationStore['listDrainUsers'] = async () => {
+    try {
+      const { data, error } = await table()
+        .select('user_id')
+        .eq('drain_owned', true)
+        .eq('status', 'pending')
+        .limit(DRAIN_SCAN_CAP);
+      if (error) {
+        logger.warn('[Heartbeat] Could not list users with held notices', { error: error.message });
+        return null;
+      }
+      return [...new Set(((data as { user_id: string }[] | null) ?? []).map((r) => r.user_id))];
+    } catch (err) {
+      logger.warn('[Heartbeat] Listing users with held notices threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
+  const listDrainCandidates: HeartbeatNotificationStore['listDrainCandidates'] = async (
+    userIds,
+    limit
+  ) => {
+    if (userIds.length === 0 || limit <= 0) return [];
+    try {
+      const nowIso = new Date().toISOString();
+      const { data, error } = await table()
+        .select('reminder_id, user_id, kind, episode_key, destination, failed_beats, payload')
+        .eq('drain_owned', true)
+        .eq('status', 'pending')
+        .in('user_id', userIds)
+        .or(`next_attempt_at.is.null,next_attempt_at.lte.${nowIso}`)
+        .order('created_at', { ascending: true })
+        .limit(DRAIN_SCAN_CAP);
+      if (error) {
+        logger.warn('[Heartbeat] Could not read held notices', { error: error.message });
+        return null;
+      }
+
+      type Row = {
+        reminder_id: string;
+        user_id: string;
+        kind: 'outage' | 'recovery';
+        episode_key: string;
+        destination: string | null;
+        failed_beats: number | null;
+        payload: Json | null;
+      };
+      const rows = (data as Row[] | null) ?? [];
+      if (rows.length === DRAIN_SCAN_CAP) {
+        logger.warn('[Heartbeat] Held-notice drain read its full scan cap', {
+          cap: DRAIN_SCAN_CAP,
+        });
+      }
+
+      // Causal order: an all-clear waits until the outage it closes has been
+      // delivered. Read those outages' status in one query.
+      const recoveryEpisodes = rows.filter((r) => r.kind === 'recovery').map((r) => r.episode_key);
+      let blocked = new Set<string>();
+      if (recoveryEpisodes.length > 0) {
+        const { data: outages, error: outageError } = await table()
+          .select('reminder_id, episode_key, status')
+          .eq('kind', 'outage')
+          .in('episode_key', recoveryEpisodes);
+        if (outageError) {
+          // Unknown outage state: hold every recovery back this pass rather
+          // than risk an all-clear arriving before its outage.
+          logger.warn('[Heartbeat] Could not check outages behind held all-clears', {
+            error: outageError.message,
+          });
+          blocked = new Set(
+            rows
+              .filter((r) => r.kind === 'recovery')
+              .map((r) => `${r.reminder_id}|${r.episode_key}`)
+          );
+        } else {
+          blocked = new Set(
+            (
+              (outages as { reminder_id: string; episode_key: string; status: string }[] | null) ??
+              []
+            )
+              .filter((o) => o.status !== 'delivered')
+              .map((o) => `${o.reminder_id}|${o.episode_key}`)
+          );
+        }
+      }
+
+      return rows
+        .filter((r) => r.kind !== 'recovery' || !blocked.has(`${r.reminder_id}|${r.episode_key}`))
+        .slice(0, limit)
+        .map((r) => ({
+          key: {
+            reminderId: r.reminder_id,
+            userId: r.user_id,
+            kind: r.kind,
+            episodeKey: r.episode_key,
+            destination: r.destination,
+            failedBeats: r.failed_beats ?? undefined,
+          },
+          payload: (r.payload as unknown as HeldNoticePayload | null) ?? null,
+        }));
+    } catch (err) {
+      logger.warn('[Heartbeat] Reading held notices threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
   return {
     openEpisode,
     claimNotice,
@@ -1007,5 +1148,7 @@ export function createHeartbeatNotificationStore(
     findOwedRecovery,
     closeEpisode,
     holdNotice,
+    listDrainUsers,
+    listDrainCandidates,
   };
 }

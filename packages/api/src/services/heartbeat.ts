@@ -559,7 +559,8 @@ export async function processHeartbeat(
     context?: HeartbeatDeliveryContext
   ) => Promise<HeartbeatDeliverResult>,
   onFailure?: HeartbeatFailureHook,
-  onRecovery?: HeartbeatRecoveryHook
+  onRecovery?: HeartbeatRecoveryHook,
+  drainHeldNotices?: () => Promise<unknown>
 ): Promise<{
   processed: number;
   delivered: number;
@@ -574,6 +575,22 @@ export async function processHeartbeat(
   const now = new Date().toISOString();
 
   logger.debug('Processing heartbeat', { timestamp: now });
+
+  // Notices held over quiet hours go out first (task 2301cb3c). Before the
+  // due-reminder read, because the reminder that owes a notice may never be
+  // due again (a one-time reminder that failed overnight is already
+  // completed), and before the beat path, so in one process a released notice
+  // is settled before anything else looks at it. Its failure must not cost
+  // this tick its reminders.
+  if (drainHeldNotices) {
+    try {
+      await drainHeldNotices();
+    } catch (err) {
+      logger.error('[Heartbeat] Held-notice drain threw — continuing with due reminders', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Fetch due reminders
   const { data: dueReminders, error } = await supabase

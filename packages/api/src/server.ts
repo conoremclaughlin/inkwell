@@ -796,7 +796,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         const stats = await processHeartbeat(
           deliverReminderViaSession,
           heartbeatEscalation?.onFailure,
-          heartbeatEscalation?.onRecovery
+          heartbeatEscalation?.onRecovery,
+          heartbeatEscalation?.drainHeldNotices
         );
         logger.info('Heartbeat complete', stats);
 

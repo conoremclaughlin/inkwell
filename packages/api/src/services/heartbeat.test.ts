@@ -502,6 +502,38 @@ describe('Heartbeat Service', () => {
       expect(stats.skipped).toBe(1);
     });
 
+    it('runs the held-notice drain on a tick with no due reminders, before the due read', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+      setQueryResult('scheduled_reminders', []); // nothing due
+      const order: string[] = [];
+      mockSupabase.from.mockImplementationOnce((table: string) => {
+        order.push(`from:${table}`);
+        return getBuilder(table);
+      });
+      const drain = vi.fn(async () => {
+        order.push('drain');
+      });
+
+      await processHeartbeat(vi.fn(), undefined, undefined, drain);
+
+      expect(drain).toHaveBeenCalledTimes(1);
+      expect(order[0]).toBe('drain');
+    });
+
+    it('a drain that throws does not cost the tick its reminders', async () => {
+      vi.setSystemTime(OUTSIDE);
+      initHeartbeatService({ enableLocalCron: false });
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+
+      const stats = await processHeartbeat(mockDeliver, undefined, undefined, async () => {
+        throw new Error('store down');
+      });
+
+      expect(stats.delivered).toBe(1);
+    });
+
     it('outside quiet hours a switch-on reminder is delivered with no quiet context', async () => {
       vi.setSystemTime(OUTSIDE);
       initHeartbeatService({ enableLocalCron: false });

@@ -178,7 +178,25 @@ export interface HeartbeatEscalationDeps {
 export interface HeartbeatEscalation {
   onFailure: HeartbeatFailureHook;
   onRecovery: HeartbeatRecoveryHook;
+  /**
+   * Send held notices whose quiet hours have ended. Called at the start of
+   * every heartbeat tick, before due reminders are read, so it runs when no
+   * reminder is due and before the beat path looks at the same notices.
+   */
+  drainHeldNotices: () => Promise<HeldNoticeDrainStats>;
 }
+
+export interface HeldNoticeDrainStats {
+  sent: number;
+  failed: number;
+  /** Still in quiet hours at the moment of sending (the prefilter is a hint). */
+  held: number;
+  /** Owned by the drain but unsendable as stored: no payload or no destination. */
+  skipped: number;
+}
+
+/** How many held notices one tick sends at most. */
+const DRAIN_BATCH = 20;
 
 export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): HeartbeatEscalation {
   const { client, sendToChannel, defaultSlug } = deps;
@@ -596,5 +614,106 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     return { alerted: alert.sent };
   };
 
-  return { onFailure, onRecovery };
+  /**
+   * Send the notices quiet hours held (task 2301cb3c).
+   *
+   * Independent of reminder runs: a one-time reminder that failed overnight is
+   * already completed, and nothing else would ever send its outage notice.
+   *
+   * 1. The gate is evaluated once per user with held notices. That is only a
+   *    prefilter, so rows for users still in quiet hours never take up the
+   *    batch.
+   * 2. The store returns eligible rows only, oldest first: past their channel
+   *    backoff, and no all-clear ahead of its outage.
+   * 3. The gate is evaluated AGAIN immediately before each send, because the
+   *    prefilter is a hint, not a guarantee.
+   * 4. Each send is settled as a real attempt. Delivered closes it (and its
+   *    episode, for an all-clear); a failure records the attempt and its
+   *    backoff, and the row stays drain-owned until a later pass delivers it.
+   *
+   * Duplicates are at-least-once across processes, as everywhere else in this
+   * module: claimNotice reserves nothing. Within one process the drain settles
+   * each notice before the beat path reads it.
+   */
+  const drainHeldNotices = async (): Promise<HeldNoticeDrainStats> => {
+    const stats: HeldNoticeDrainStats = { sent: 0, failed: 0, held: 0, skipped: 0 };
+
+    const users = await store.listDrainUsers();
+    if (!users || users.length === 0) return stats;
+
+    const sendable: string[] = [];
+    for (const userId of users) {
+      const gate = await quietGate(userId);
+      if (gate.kind !== 'hold') sendable.push(userId);
+    }
+    if (sendable.length === 0) return stats;
+
+    const candidates = await store.listDrainCandidates(sendable, DRAIN_BATCH);
+    if (!candidates) return stats;
+
+    for (const { key, payload } of candidates) {
+      if (!payload || !payload.target || !ALERTABLE_CHANNELS.has(payload.channel as ChannelType)) {
+        logger.error('[Heartbeat] Held notice has nothing sendable recorded — skipping', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+        });
+        stats.skipped++;
+        continue;
+      }
+
+      const gate = await quietGate(key.userId);
+      if (gate.kind === 'hold') {
+        stats.held++;
+        continue;
+      }
+      if (gate.kind === 'unreadable') {
+        logger.warn('[Heartbeat] quiet-policy-unreadable — releasing the held notice anyway', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+          error: gate.error,
+        });
+      }
+
+      let sent = false;
+      let reason: string | undefined;
+      try {
+        await sendToChannel({
+          channel: payload.channel as ChannelType,
+          conversationId: payload.target,
+          content: payload.content,
+          format: 'text',
+          metadata: {
+            source: 'heartbeat-escalation',
+            reminderId: key.reminderId,
+            heldNotice: true,
+          },
+        });
+        sent = true;
+      } catch (err) {
+        reason = err instanceof Error ? err.message : String(err);
+      }
+
+      await store.settleNotice(key, { delivered: sent, error: reason });
+      if (sent && key.kind === 'recovery') await store.closeEpisode(key);
+
+      if (sent) {
+        stats.sent++;
+        logger.info('[Heartbeat] Sent a notice held over quiet hours', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+        });
+      } else {
+        stats.failed++;
+        logger.error('[Heartbeat] Held notice failed to send — it stays owed', {
+          reminderId: key.reminderId,
+          kind: key.kind,
+          error: reason,
+        });
+      }
+    }
+
+    return stats;
+  };
+
+  return { onFailure, onRecovery, drainHeldNotices };
 }

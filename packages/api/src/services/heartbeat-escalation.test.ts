@@ -39,6 +39,7 @@ interface FakeRow {
   nextAttemptAt: number | null;
   episodeClosedAt: string | null;
   // Quiet-hours hold (task 2301cb3c).
+  userId?: string;
   holdReason?: string | null;
   heldUntil?: string | null;
   drainOwned?: boolean;
@@ -172,6 +173,7 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
           nextAttemptAt: null,
           episodeClosedAt: null,
         };
+        row.userId = (key as never as { userId: string }).userId;
         row.holdReason = 'quiet-hours';
         row.heldUntil = hold.heldUntil;
         row.drainOwned = true;
@@ -180,6 +182,40 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
         return true;
       }
     ),
+    // The drain's reads, with the real store's rules: pending and drain-owned,
+    // past backoff, oldest (insertion) first, no all-clear ahead of its outage.
+    listDrainUsers: vi.fn(async (): Promise<string[] | null> => {
+      const users = new Set<string>();
+      for (const row of rows.values()) {
+        if (row.drainOwned && row.status === 'pending' && row.userId) users.add(row.userId);
+      }
+      return [...users];
+    }),
+    listDrainCandidates: vi.fn(async (userIds: string[], limit: number) => {
+      const out: Array<{ key: never; payload: never }> = [];
+      for (const [k, row] of rows) {
+        if (!row.drainOwned || row.status !== 'pending') continue;
+        if (!row.userId || !userIds.includes(row.userId)) continue;
+        if (row.nextAttemptAt !== null && row.nextAttemptAt > Date.now()) continue;
+        const [reminderId, kind, episodeKey] = k.split('|');
+        if (kind === 'recovery') {
+          const outage = rows.get(`${reminderId}|outage|${episodeKey}`);
+          if (outage && outage.status !== 'delivered') continue;
+        }
+        out.push({
+          key: {
+            reminderId,
+            userId: row.userId,
+            kind,
+            episodeKey,
+            destination: null,
+            failedBeats: row.failedBeats,
+          } as never,
+          payload: (row.payload ?? null) as never,
+        });
+      }
+      return out.slice(0, limit);
+    }),
   };
   return store;
 }
@@ -1378,5 +1414,181 @@ describe('createQuietGate', () => {
       error: 'no client',
     });
     vi.useRealTimers();
+  });
+});
+
+/**
+ * The drain that sends what quiet hours held (task 2301cb3c). Every case runs
+ * with no reminder involved at all: the drain must not depend on a future run.
+ */
+describe('held notices drain when quiet hours end', () => {
+  let sendToChannel: ReturnType<typeof vi.fn>;
+  let decision: QuietGateDecision;
+  const HOLD: QuietGateDecision = {
+    kind: 'hold',
+    until: new Date(Date.now() + 6 * 60 * 60_000), // still hours away
+    timezone: 'America/Los_Angeles',
+  };
+  const outageKey = `rem-001|outage|${FIRST_FOR_DESTINATION.episodeKey}`;
+  const recoveryKey = `rem-001|recovery|${FIRST_FOR_DESTINATION.episodeKey}`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sendToChannel = vi.fn().mockResolvedValue(undefined);
+    decision = HOLD;
+  });
+
+  const escalation = (store: ReturnType<typeof makeFakeStore>) =>
+    createHeartbeatEscalation({
+      client: makeClient().client,
+      sendToChannel,
+      defaultSlug: 'myra',
+      store,
+      quietGate: vi.fn(async () => decision),
+    });
+
+  it('a one-time reminder failed overnight: its outage goes out once the window ends', async () => {
+    const store = makeFakeStore();
+    const { onFailure, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder({ cron_expression: null }), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    expect(sendToChannel).not.toHaveBeenCalled();
+
+    // Still night: nothing goes, and the rows are never even read.
+    expect(await drainHeldNotices()).toEqual({ sent: 0, failed: 0, held: 0, skipped: 0 });
+    expect(store.listDrainCandidates).not.toHaveBeenCalled();
+
+    // Morning (or quiet hours switched off): sent once, settled, closed out.
+    decision = { kind: 'clear' };
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1, failed: 0 });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat FAILED');
+    expect(store.rows.get(outageKey)).toMatchObject({ status: 'delivered', attempts: 1 });
+
+    // Nothing left to send.
+    expect(await drainHeldNotices()).toMatchObject({ sent: 0 });
+    expect(sendToChannel).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases on the next pass once the gate clears, whatever held_until said', async () => {
+    const store = makeFakeStore();
+    const { onFailure, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    // held_until is hours away; the backoff is untouched by the hold.
+    expect(Date.parse(store.rows.get(outageKey)!.heldUntil!)).toBeGreaterThan(Date.now());
+    expect(store.rows.get(outageKey)!.nextAttemptAt).toBeNull();
+
+    decision = { kind: 'clear' }; // e.g. quiet hours disabled early
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+  });
+
+  it('keeps a notice whose morning send failed, and retries it after its backoff', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const store = makeFakeStore();
+      const { onFailure, drainHeldNotices } = escalation(store);
+      await onFailure(
+        makeReminder({ cron_expression: null }),
+        AUTH_ERROR,
+        1,
+        FIRST_FOR_DESTINATION
+      );
+
+      decision = { kind: 'clear' };
+      sendToChannel.mockRejectedValueOnce(new Error('telegram blip'));
+      expect(await drainHeldNotices()).toMatchObject({ sent: 0, failed: 1 });
+      expect(store.rows.get(outageKey)).toMatchObject({
+        status: 'pending',
+        attempts: 1,
+        drainOwned: true,
+      });
+
+      // The first retry is immediate (backoff 0), and it lands.
+      expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+      expect(store.rows.get(outageKey)).toMatchObject({ status: 'delivered', attempts: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a notice in backoff is not sent early', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const store = makeFakeStore();
+      const { onFailure, drainHeldNotices } = escalation(store);
+      await onFailure(
+        makeReminder({ cron_expression: null }),
+        AUTH_ERROR,
+        1,
+        FIRST_FOR_DESTINATION
+      );
+      decision = { kind: 'clear' };
+      sendToChannel.mockRejectedValue(new Error('telegram down'));
+      await drainHeldNotices(); // attempt 1, immediate retry allowed
+      await drainHeldNotices(); // attempt 2, now backed off
+      expect(sendToChannel).toHaveBeenCalledTimes(2);
+
+      await drainHeldNotices(); // still inside the backoff
+      expect(sendToChannel).toHaveBeenCalledTimes(2);
+
+      vi.setSystemTime(Date.now() + backoffForAttempt(2) + 1_000);
+      sendToChannel.mockResolvedValue(undefined);
+      expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an outage and its all-clear both held: the outage goes first, then the all-clear', async () => {
+    const store = makeFakeStore();
+    const { onFailure, onRecovery, drainHeldNotices } = escalation(store);
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+    // The fake's onRecovery path only claims a recovery that is owed; the
+    // outage is still pending here, which is exactly the overnight case.
+    await onRecovery(makeReminder(), 1, FIRST_FOR_DESTINATION);
+    expect(store.rows.get(recoveryKey)?.drainOwned).toBe(true);
+
+    decision = { kind: 'clear' };
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat FAILED');
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+
+    expect(await drainHeldNotices()).toMatchObject({ sent: 1 });
+    expect(sendToChannel.mock.calls[1][0].content).toContain('Heartbeat recovered');
+    expect(store.closeEpisode).toHaveBeenCalledTimes(1);
+  });
+
+  it('rechecks quiet hours immediately before each send', async () => {
+    const store = makeFakeStore();
+    const gate = vi.fn<(userId: string) => Promise<QuietGateDecision>>();
+    const { onFailure, drainHeldNotices } = createHeartbeatEscalation({
+      client: makeClient().client,
+      sendToChannel,
+      defaultSlug: 'myra',
+      store,
+      quietGate: gate,
+    });
+    gate.mockResolvedValueOnce(HOLD); // the hold in onFailure
+    await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+    // The prefilter says clear; the moment of sending says hold.
+    gate.mockResolvedValueOnce({ kind: 'clear' }).mockResolvedValueOnce(HOLD);
+    expect(await drainHeldNotices()).toMatchObject({ sent: 0, held: 1 });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.rows.get(outageKey)).toMatchObject({ status: 'pending', attempts: 0 });
+  });
+
+  it('a held row with nothing recorded to send is skipped loudly, never sent blind', async () => {
+    const store = makeFakeStore({
+      [outageKey]: { drainOwned: true, userId: 'user-1', payload: null },
+    });
+    const { drainHeldNotices } = escalation(store);
+    decision = { kind: 'clear' };
+
+    expect(await drainHeldNotices()).toMatchObject({ sent: 0, skipped: 1 });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('nothing sendable'),
+      expect.anything()
+    );
   });
 });
