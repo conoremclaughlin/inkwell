@@ -192,8 +192,6 @@ export async function runInit(
     ...(options.inheritClaudePermissions === true ? { inheritPermissions: true } : {}),
     ...(options.permissionProfile ? { permissionProfile: options.permissionProfile } : {}),
     ...(options.permissions === false ? { permissions: false } : {}),
-    // The trusted owner is the one the caller names; the server always does.
-    ...(options.agent ? { permissionOwner: options.agent } : {}),
     // A manual init with no profile asks the server for the row; a server-run
     // init always says which profile, or --no-permissions, and never asks.
     ...(placement.linked && !options.permissionProfile && options.permissions !== false
