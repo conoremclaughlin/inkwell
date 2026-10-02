@@ -1867,7 +1867,89 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     expect(advances).toHaveLength(0);
   });
 
-  it('does NOT advance the sender pointer for sessionAlias self-sends either', async () => {
+  it('does NOT advance the sender pointer for sessionKey self-sends either', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-890',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientSlug: 'wren',
+        senderSlug: 'wren',
+        sessionKey: 'wren:inkwell:review',
+        threadKey: 'thread:self-key-handoff',
+        content: 'Pick this up in the review session',
+        messageType: 'task_request',
+      },
+      mockDc as never
+    );
+
+    const advances = mockSb.getRpcCalls().filter((c) => c.fn === 'advance_thread_read_pointer');
+    expect(advances).toHaveLength(0);
+  });
+
+  it('refuses a blank sessionKey rather than sending without its target', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-892',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientSlug: 'wren',
+          senderSlug: 'lumen',
+          sessionKey: '   ',
+          threadKey: 'thread:blank-key',
+          content: 'never sent',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow(/sessionKey/);
+    expect(mockSb.getRpcCalls()).toHaveLength(0);
+  });
+
+  it('refuses a sessionKey it cannot normalise before anything is sent', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-891',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientSlug: 'wren',
+          senderSlug: 'lumen',
+          sessionKey: 'wren main',
+          threadKey: 'thread:bad-key',
+          content: 'never sent',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow(/sessionKey/);
+    expect(mockSb.getRpcCalls()).toHaveLength(0);
+  });
+
+  it('does NOT advance the sender pointer for self-sends under the deprecated sessionAlias spelling', async () => {
     // Lumen PR #454 review blocker 1: the exemption must cover ALL explicit
     // self-target forms — alias included — with the same predicate that
     // drives trigger self-inclusion.

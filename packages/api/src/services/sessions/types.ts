@@ -113,6 +113,12 @@ export interface Session {
   sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
+  /**
+   * The directory the session's process last reported running in (CLI hooks
+   * and update_session_state write it; routing never does). Read-only here:
+   * it is repository evidence for a studioless session, never a placement.
+   */
+  workingDir?: string;
   /** Contact scope for per-sender session isolation */
   contactId?: string;
   /** Backend-specific session ID for resume (Claude Code, Codex thread UUID, Gemini session) */
@@ -178,7 +184,7 @@ export interface Session {
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
 
-  // Human-readable alias for explicit routing (e.g., "main", "review")
+  // The session key for explicit routing (e.g., "wren:inkwell:main"); stored in the `alias` column
   alias?: string;
 
   // Whether a CLI process with a channel plugin is attached to this session
@@ -252,8 +258,8 @@ export interface SessionRequest {
     // unlike recipientSessionId: honoured only while that session can safely
     // take the turn, otherwise the message routes unanchored.
     replyToSessionId?: string;
-    // Target a session by alias (e.g., "main", "review")
-    sessionAlias?: string;
+    // Target a session by its key (e.g., "wren:inkwell:main"), normalised by the sender
+    sessionKey?: string;
     // For task sessions
     sessionType?: SessionType;
     taskDescription?: string;
@@ -560,6 +566,13 @@ export interface ISessionRepository {
       contactId?: string;
       /** Canonical identity UUID — preferred over the ambiguous slug. */
       sbId?: string | null;
+      /**
+       * Return the newest unended session even when its lifecycle is
+       * `failed`. Routing reuse wants this: a crashed home session is still
+       * the session its agent resumes next, and skipping it is how a twin
+       * gets created. Session pickers and liveness readers do not.
+       */
+      includeFailed?: boolean;
     }
   ): Promise<Session | null>;
 

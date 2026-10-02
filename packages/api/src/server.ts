@@ -26,6 +26,7 @@ import {
   SessionService,
   RoutingRefusedError,
   type SessionServiceConfig,
+  type StudiolessPresencePlacement,
 } from './services/sessions';
 import type {
   SessionRequest,
@@ -45,8 +46,10 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   type DueReminder,
+  type HeartbeatDeliveryContext,
   type HeartbeatDeliveryOutcome,
 } from './services/heartbeat';
+import { buildHeartbeatReminderPrompt } from './services/heartbeat-prompt';
 import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
@@ -546,7 +549,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
    * exactly when a monitor is most likely to be broken.
    */
   const deliverReminderViaSession = async (
-    reminder: DueReminder
+    reminder: DueReminder,
+    deliveryContext?: HeartbeatDeliveryContext
   ): Promise<HeartbeatDeliveryOutcome> => {
     const userId = reminder.user_id;
 
@@ -687,19 +691,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // cascade (agent's own studio → main studio) instead of searching
     // for a studio literally named 'home' which doesn't exist.
 
-    const reminderContent = `[HEARTBEAT REMINDER]
-Title: ${reminder.title}
-Description: ${reminder.description || 'No description'}
-Delivery: ${reminder.delivery_channel} → ${reminder.delivery_target || 'default'}
-
----
-IMPORTANT: This reminder was triggered by the heartbeat service.
-Refer to your HEARTBEAT identity document for how to handle scheduled tasks.
-If you need to message a user on Telegram, use send_response with:
-- channel: "${reminder.delivery_channel}"
-- conversationId: "${reminder.delivery_target}"
-
-Do NOT just respond here — you MUST explicitly call send_response to reach external channels.`;
+    // A quiet-hours firing (the reminder's switch is on) is told not to contact
+    // the user until the window ends, in place of the send_response lines.
+    const reminderContent = buildHeartbeatReminderPrompt(reminder, deliveryContext);
 
     const request: SessionRequest = {
       userId,
@@ -802,7 +796,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         const stats = await processHeartbeat(
           deliverReminderViaSession,
           heartbeatEscalation?.onFailure,
-          heartbeatEscalation?.onRecovery
+          heartbeatEscalation?.onRecovery,
+          heartbeatEscalation?.drainHeldNotices
         );
         logger.info('Heartbeat complete', stats);
 
@@ -1149,7 +1144,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
-        sessionAlias: payload.sessionAlias,
+        sessionKey: payload.sessionKey,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -1275,10 +1270,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // Only a delivery that actually admits a spawn provisions, inside
     // handleMessage's own full resolution below.
     try {
+      // The plan's studioless-presence decision. The stamp's winner, and a
+      // newer stamp met during repair, are tested against it, so neither is
+      // judged by a different decision than the routed candidate (task
+      // bd4657a0). Stays null if the plan never reached routing.
+      let studiolessPresence: StudiolessPresencePlacement | null = null;
       const routedSession = await sessionService!.getOrCreateSession(userId, targetSlug, {
         planOnly: true,
+        onStudiolessPresence: (placement) => {
+          studiolessPresence = placement;
+        },
         threadKey: payload.threadKey,
-        alias: payload.sessionAlias,
+        alias: payload.sessionKey,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
@@ -1352,7 +1355,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                   userId,
                   resolvedIdentityId,
                   payload.threadKey,
-                  winner
+                  winner,
+                  studiolessPresence
                 )
               : false;
             if (winner && winnerAllowed) {
@@ -1402,7 +1406,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
                       userId,
                       resolvedIdentityId,
                       payload.threadKey,
-                      newer
+                      newer,
+                      studiolessPresence
                     )
                   : false;
                 if (newer && newerAllowed) {

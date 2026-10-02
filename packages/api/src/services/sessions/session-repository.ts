@@ -6,6 +6,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
+import { sessionKeyMatchPattern } from './session-key';
 import type { Database, Json } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -32,13 +33,22 @@ export class AmbiguousAliasError extends Error {
   constructor(
     readonly alias: string,
     readonly sbSlug: string,
-    readonly candidates: Array<{ sessionId: string; studioId: string | null }>
+    readonly candidates: Array<{ sessionId: string; studioId: string | null; alias?: string }>
   ) {
-    const studios = candidates.map((c) => c.studioId ?? '(no studio)').join(', ');
+    const distinctStudios = new Set(candidates.map((c) => c.studioId ?? null));
+    const described = candidates
+      .map(
+        (c) =>
+          `${c.sessionId.slice(0, 8)} ("${c.alias ?? alias}" in ${c.studioId ?? '(no studio)'})`
+      )
+      .join(', ');
+    const fix =
+      distinctStudios.size > 1
+        ? 'Qualify the address with recipientStudioSlug or recipientStudioId.'
+        : 'Two live sessions carry this key in different spellings; end or rename one (update_session_state sessionKey).';
     super(
-      `Session alias "${alias}" for agent "${sbSlug}" is ambiguous — it matches ` +
-        `${candidates.length} active sessions across studios: ${studios}. ` +
-        `Qualify the address with recipientStudioSlug or recipientStudioId.`
+      `Session key "${alias}" for agent "${sbSlug}" is ambiguous — it matches ` +
+        `${candidates.length} live sessions: ${described}. ${fix}`
     );
     this.name = 'AmbiguousAliasError';
   }
@@ -129,6 +139,7 @@ function mapDbToSession(row: DbSession): Session {
     sbSlug: row.agent_id || '',
     sbId: row.sb_id || undefined,
     studioId: row.studio_id || undefined,
+    workingDir: row.working_dir || undefined,
     contactId: row.contact_id || undefined,
     backendSessionId: row.backend_session_id || row.claude_session_id,
 
@@ -244,6 +255,8 @@ export class SessionRepository implements ISessionRepository {
       contactId?: string;
       /** Canonical identity UUID — preferred over the ambiguous slug. */
       sbId?: string | null;
+      /** See ISessionRepository.findByUserAndAgent. */
+      includeFailed?: boolean;
     }
   ): Promise<Session | null> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -252,9 +265,27 @@ export class SessionRepository implements ISessionRepository {
       .select('*')
       .eq('user_id', userId)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+    // `failed` is a lifecycle, not an ending: the row is unended and its
+    // agent resumes it next (list_sessions' own `attachable` filter says so).
+    // Routing reuse therefore asks for it explicitly. Everything else keeps
+    // the exclusion — a crashed session is not what a picker or a liveness
+    // badge means by "active".
+    if (!options?.includeFailed) {
+      query = query.neq('lifecycle', 'failed');
+    }
+    // The type predicate belongs in the query, before LIMIT (Lumen, PR #680
+    // round 1). Checking the one fetched row afterwards let any newer
+    // non-primary session hide an older primary; with failed rows admitted,
+    // a crashed task in front of the home turned "reuse the home" into
+    // "create a twin". Rows with no metadata.type are primary by convention
+    // (mapDbToSession reads them so), and the predicate keeps them.
+    if (options?.type === 'primary') {
+      query = query.or('metadata->>type.eq.primary,metadata->>type.is.null');
+    } else if (options?.type) {
+      query = query.eq('metadata->>type', options.type);
+    }
     // Same-slug siblings must not satisfy general reuse (Lumen, #514 r7).
     query = options?.sbId ? query.eq('sb_id', options.sbId) : query.eq('agent_id', sbSlug);
 
@@ -323,7 +354,8 @@ export class SessionRepository implements ISessionRepository {
     sbSlug: string,
     alias: string,
     studioId?: string,
-    sbId?: string | null
+    sbId?: string | null,
+    contactId?: string
   ): Promise<Session | null> {
     // alias column not yet in generated Supabase types — cast
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -334,14 +366,25 @@ export class SessionRepository implements ISessionRepository {
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('alias', alias)
-      .is('ended_at', null)
-      .neq('lifecycle', 'failed');
+      // Case-insensitive, exact: keys are normalised to lowercase on write
+      // since #717, but rows the earlier setter stored as written must stay
+      // addressable by the normalised spelling (Lumen, #717 review).
+      .ilike('alias', sessionKeyMatchPattern(alias))
+      .is('ended_at', null);
+    // No lifecycle exclusion: `failed` is a lifecycle, not an ending (see
+    // findByUserAndAgent). A crashed session is the one its agent resumes
+    // next, and a key is how a sender names that transcript; excluding it
+    // here made a crashed session unaddressable by its own key and sent the
+    // message through thread routing instead (finished-session audit, row 4).
     query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
     if (studioId !== undefined) {
       query = query.eq('studio_id', studioId);
     }
+    // A key is an address, and an address carries its contact scope: an
+    // owner send never lands in a per-sender contact session that carries the
+    // same key, and a contact send never lands in the owner's.
+    query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
 
     const { data, error } = (await query.order('started_at', { ascending: false })) as {
       data: DbSession[] | null;
@@ -356,16 +399,21 @@ export class SessionRepository implements ISessionRepository {
     const rows = data ?? [];
     if (rows.length === 0) return null;
 
-    // A studio-pinned lookup is unique by index, so anything past the first
-    // row would mean the index is gone. Take it and move on.
-    if (studioId !== undefined) return mapDbToSession(rows[0]);
-
-    const distinctStudios = new Set(rows.map((r) => r.studio_id ?? null));
-    if (distinctStudios.size > 1) {
+    // More than one match is a refusal, pinned or not. The uniqueness index
+    // is case-sensitive and this lookup is not (#717), so `Main` and `main`
+    // can both be live in one studio; the index used to prove a pinned
+    // lookup unique and no longer does. Choosing the newest row would route
+    // into whichever spelling was written last, and the caller could not
+    // tell (Lumen, #717 round 2).
+    if (rows.length > 1) {
       throw new AmbiguousAliasError(
         alias,
         sbSlug,
-        rows.map((r) => ({ sessionId: r.id, studioId: r.studio_id ?? null }))
+        rows.map((r) => ({
+          sessionId: r.id,
+          studioId: r.studio_id ?? null,
+          alias: ((r as Record<string, unknown>).alias as string | undefined) ?? undefined,
+        }))
       );
     }
 
@@ -381,40 +429,54 @@ export class SessionRepository implements ISessionRepository {
     sbId?: string | null
   ): Promise<Session | null> {
     // See findByAlias: identity by UUID when known, slug only as a fallback.
-    let query = (this.supabase as any)
-      .from('sessions')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('thread_key', threadKey)
-      .is('ended_at', null)
-      // `ended_at IS NULL` was doing none of the work it looks like it is
-      // doing: nothing set `ended_at` on completion, so finished sessions
-      // stayed NULL and kept matching here. A thread whose conversation was
-      // over would route the next trigger back into the completed session
-      // instead of starting a fresh one. Filter on lifecycle directly, and
-      // see handleUpdateSessionPhase — which now stamps `ended_at` too, so
-      // the clause above finally means something (PR #349, revived).
-      .not('lifecycle', 'in', '(completed,failed)')
-      .order('started_at', { ascending: false })
-      .limit(1);
-    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
+    //
+    // Live first, crashed as the fallback. `failed` is a lifecycle, not an
+    // ending: a thread whose session crashed resumes that session on its
+    // next message rather than starting a fresh one (finished-session audit,
+    // row 5, corrected by Lumen on #718). A completed lifecycle is an ending
+    // and is never matched. Two queries rather than one, so a newer crashed
+    // row cannot outrank an older live one under started_at DESC.
+    const run = async (lifecycle: 'live' | 'failed'): Promise<Session | null> => {
+      let query = (this.supabase as any)
+        .from('sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('thread_key', threadKey)
+        .is('ended_at', null)
+        // `ended_at IS NULL` was doing none of the work it looks like it is
+        // doing: nothing set `ended_at` on completion, so finished sessions
+        // stayed NULL and kept matching here. A thread whose conversation was
+        // over would route the next trigger back into the completed session
+        // instead of starting a fresh one. Filter on lifecycle directly, and
+        // see handleUpdateSessionPhase — which now stamps `ended_at` too, so
+        // the clause above finally means something (PR #349, revived).
+        .order('started_at', { ascending: false })
+        .limit(1);
+      query =
+        lifecycle === 'live'
+          ? query.not('lifecycle', 'in', '(completed,failed)')
+          : query.eq('lifecycle', 'failed');
+      query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', sbSlug);
 
-    if (studioId) {
-      query = query.eq('studio_id', studioId);
-    }
+      if (studioId) {
+        query = query.eq('studio_id', studioId);
+      }
 
-    if (contactId) {
-      query = query.eq('contact_id', contactId);
-    }
+      // Owner lookups match only owner sessions. Filtering on the contact
+      // only when one was passed let an owner lookup resolve a per-sender
+      // contact session on the same thread key (task F1).
+      query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
 
-    const { data, error } = await query;
+      const { data, error } = await query;
 
-    if (error) {
-      logger.error('Error finding session by thread key', { userId, sbSlug, threadKey, error });
-      throw error;
-    }
+      if (error) {
+        logger.error('Error finding session by thread key', { userId, sbSlug, threadKey, error });
+        throw error;
+      }
 
-    return data && data.length > 0 ? mapDbToSession(data[0]) : null;
+      return data && data.length > 0 ? mapDbToSession(data[0]) : null;
+    };
+    return (await run('live')) ?? (await run('failed'));
   }
 
   async findByUser(

@@ -5,6 +5,8 @@
  * passthrough flags, and session tracking.
  */
 
+import { runCodexMailInteractive } from '../lib/codex-mail/interactive.js';
+import { selectCodexMailLaunch } from '../lib/codex-mail/preflight.js';
 import { spawn, spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
@@ -52,6 +54,7 @@ export interface SbOptions {
   sessionCandidatesAll?: boolean;
   sessionChoice?: string;
   dangerous?: boolean;
+  codexInkmail?: boolean;
 }
 
 interface InkUserConfig {
@@ -367,16 +370,54 @@ function normalizeSessionBackendName(backend: string | null | undefined): string
   return normalized;
 }
 
-function isSessionResumable(session: InkSessionSummary): boolean {
+/**
+ * Is this row one the launcher may list, attach to, or resume?
+ *
+ * Only what the server calls finished counts: an ended_at, a completed
+ * lifecycle, or a completed status. The agent-set work phase is not read.
+ * `complete` there means a piece of work finished, not the conversation: the
+ * row is still the identity of a live backend transcript. Reading it as
+ * finished dropped the row here, the transcript then looked untracked, and
+ * the picker started a second Inkwell session for the same conversation on
+ * every relaunch (2026-10-01: four live rows for one Claude session in the
+ * root checkout; nineteen of Wren's conversations with two to five each).
+ * Mirrors isAttachableSessionSummary in chat.ts; the two pickers must agree,
+ * and both now agree with the server's `active` and `attachable` filters.
+ */
+export function isSessionResumable(session: InkSessionSummary): boolean {
   if (session.endedAt) return false;
 
-  const phase = (session.currentPhase || '').trim().toLowerCase();
-  if (phase === 'complete' || phase.startsWith('complete:')) return false;
+  const lifecycle = (session.lifecycle || '').trim().toLowerCase();
+  if (lifecycle === 'completed') return false;
 
   const status = (session.status || '').trim().toLowerCase();
   if (status === 'completed' || status.startsWith('completed:')) return false;
 
   return true;
+}
+
+/**
+ * One picker entry per backend conversation.
+ *
+ * Rows sharing a backend session id are the same conversation: the
+ * duplicates the old phase rule created, which stay in the table until they
+ * are ended. The list arrives newest first, so the first row wins, the same
+ * choice inkSessionByBackendSessionId makes, and the two cannot disagree
+ * about which row a transcript resumes into. Rows with no backend id yet are
+ * all kept: a fresh session has nothing to collide on.
+ */
+export function dedupeInkSessionsByBackendId(
+  sessions: InkSessionSummary[],
+  resolveLinkedBackendId?: (session: InkSessionSummary) => string | undefined
+): InkSessionSummary[] {
+  const seen = new Set<string>();
+  return sessions.filter((session) => {
+    const backendSessionId = getSessionBackendId(session) || resolveLinkedBackendId?.(session);
+    if (!backendSessionId) return true;
+    if (seen.has(backendSessionId)) return false;
+    seen.add(backendSessionId);
+    return true;
+  });
 }
 
 export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string }>(
@@ -2903,6 +2944,11 @@ async function ensureInkSessionContext(
   let chosen: InkSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
   let createdNewInkSession = false;
+  // Set by startNewInkSession: true only when the server minted the row it
+  // returned. A row it reused (the live session already linked to the
+  // conversation being resumed) is not "created", and the seed/adopt logic
+  // keyed on createdNewInkSession must not treat it as a fresh conversation.
+  let lastStartCreatedNewRow = false;
 
   const normalizedSelectionOverride = options.selectionOverride?.trim();
   const inkSelection = (selection: string): string | undefined => {
@@ -2923,8 +2969,15 @@ async function ensureInkSessionContext(
     return found?.sessionId;
   };
 
-  const startNewInkSession = async (): Promise<InkSessionSummary | undefined> => {
+  // The backend conversation a selected transcript (or --resume) will reopen.
+  // Named to the server so a live row already carrying it is returned instead
+  // of a second row: one backend conversation is one Inkwell session, whatever
+  // the picker could see (its list is capped and context-filtered).
+  const startNewInkSession = async (
+    backendSessionId?: string
+  ): Promise<InkSessionSummary | undefined> => {
     if (!inkAvailable || !email) return undefined;
+    lastStartCreatedNewRow = false;
 
     const resolveCreatedSessionFromList = async (
       requestedSessionId: string | undefined,
@@ -2997,18 +3050,22 @@ async function ensureInkSessionContext(
           backend,
           forceNew: true,
           sessionId: newSessionId,
+          ...(backendSessionId ? { backendSessionId } : {}),
         },
         { callerProfile: 'runtime' }
       );
       const directSession = extractSessionFromStartSessionResponse(started);
       const resolvedSession =
         directSession || (await resolveCreatedSessionFromList(newSessionId, 'with_session_id'));
+      lastStartCreatedNewRow = resolvedSession?.id === newSessionId;
       sbDebugLog('sb', 'ink_start_session_success', {
         backend,
         sbSlug,
         studioId: studioId || null,
         requestedSessionId: newSessionId,
         returnedSessionId: resolvedSession?.id || null,
+        backendSessionId: backendSessionId || null,
+        createdNewRow: lastStartCreatedNewRow,
         mode: 'with_session_id',
       });
       if (resolvedSession) return resolvedSession;
@@ -3037,6 +3094,7 @@ async function ensureInkSessionContext(
             ...(studioId ? { studioId } : {}),
             backend,
             forceNew: true,
+            ...(backendSessionId ? { backendSessionId } : {}),
           },
           { callerProfile: 'runtime' }
         );
@@ -3044,12 +3102,17 @@ async function ensureInkSessionContext(
         const resolvedSession =
           directSession ||
           (await resolveCreatedSessionFromList(undefined, 'legacy_without_session_id'));
+        lastStartCreatedNewRow = Boolean(
+          resolvedSession && !existingSessionIds.has(resolvedSession.id)
+        );
         sbDebugLog('sb', 'ink_start_session_success', {
           backend,
           sbSlug,
           studioId: studioId || null,
           requestedSessionId: newSessionId,
           returnedSessionId: resolvedSession?.id || null,
+          backendSessionId: backendSessionId || null,
+          createdNewRow: lastStartCreatedNewRow,
           mode: 'legacy_without_session_id',
         });
         return resolvedSession;
@@ -3090,8 +3153,8 @@ async function ensureInkSessionContext(
 
     chosen = matchedByBackendId;
     if (!chosen) {
-      chosen = await startNewInkSession();
-      createdNewInkSession = Boolean(chosen?.id);
+      chosen = await startNewInkSession(overrideBackendSessionId || undefined);
+      createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
     }
 
     if (chosen?.id) {
@@ -3129,7 +3192,10 @@ async function ensureInkSessionContext(
     localBackendSessions.map((session) => [session.sessionId, session])
   );
   if (options.listCandidates || options.listCandidatesJson) {
-    const inkCandidates = activeSessions.map((session) => {
+    // One candidate per backend conversation, as in the interactive picker.
+    const inkCandidates = dedupeInkSessionsByBackendId(activeSessions, (row) =>
+      runtimeBackendSessionIdByInkSessionId.get(row.id)
+    ).map((session) => {
       const linkedBackendSessionId =
         getSessionBackendId(session) || runtimeBackendSessionIdByInkSessionId.get(session.id);
       const linkedLocalSession = linkedBackendSessionId
@@ -3321,7 +3387,7 @@ async function ensureInkSessionContext(
     const selection = normalizedSelectionOverride.toLowerCase();
     if (selection === 'new' || selection === '__new__') {
       chosen = await startNewInkSession();
-      createdNewInkSession = Boolean(chosen?.id);
+      createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
     } else if (
       selection.startsWith('ink:') ||
       selection.startsWith('pcp:') || // legacy spelling, still accepted
@@ -3356,8 +3422,8 @@ async function ensureInkSessionContext(
               selectedLocalBackendSessionId,
             });
           } else {
-            chosen = await startNewInkSession();
-            createdNewInkSession = Boolean(chosen?.id);
+            chosen = await startNewInkSession(selectedLocalBackendSessionId);
+            createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
           }
         }
       }
@@ -3385,7 +3451,9 @@ async function ensureInkSessionContext(
       sessionId: string;
     }> = [];
 
-    for (const session of activeSessions) {
+    for (const session of dedupeInkSessionsByBackendId(activeSessions, (row) =>
+      runtimeBackendSessionIdByInkSessionId.get(row.id)
+    )) {
       const value = `__ink__:${session.id}`;
       const linkedBackendSessionId =
         getSessionBackendId(session) || runtimeBackendSessionIdByInkSessionId.get(session.id);
@@ -3493,7 +3561,7 @@ async function ensureInkSessionContext(
       });
       if (selection === '__new__') {
         chosen = await startNewInkSession();
-        createdNewInkSession = Boolean(chosen?.id);
+        createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
       } else if (selection.startsWith('__ink__:')) {
         const sessionId = sessionChoiceByValue.get(selection);
         chosen = activeSessions.find((session) => session.id === sessionId);
@@ -3520,8 +3588,8 @@ async function ensureInkSessionContext(
                 selectedLocalBackendSessionId,
               });
             } else {
-              chosen = await startNewInkSession();
-              createdNewInkSession = Boolean(chosen?.id);
+              chosen = await startNewInkSession(selectedLocalBackendSessionId);
+              createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
             }
           }
         }
@@ -3537,7 +3605,7 @@ async function ensureInkSessionContext(
 
   if (!chosen && !selectedLocalBackendSessionId && inkAvailable) {
     chosen = await startNewInkSession();
-    createdNewInkSession = Boolean(chosen?.id);
+    createdNewInkSession = Boolean(chosen?.id) && lastStartCreatedNewRow;
   }
 
   if (!chosen?.id && !selectedLocalBackendSessionId) return {};
@@ -4278,6 +4346,92 @@ export async function runClaudeInteractive(
     };
     const executionStartedAt = Date.now();
     const backendStartActivityId = await logBackendExecutionStart(executionContext);
+
+    const mailEnv = {
+      ...process.env,
+      ...authEnv,
+      ...prepared.env,
+      INK_RUNTIME_LINK_ID: runtimeLinkId,
+      ...(startupContextBlock ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
+    };
+    const mailSelection = await selectCodexMailLaunch({
+      mode: options.codexInkmail,
+      backend: options.backend,
+      sessionTracked: options.session,
+      interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
+      sessionId: sessionContext.inkSessionId,
+      studioId,
+      binary: prepared.binary,
+      args: prepared.args,
+      env: mailEnv,
+      cwd: process.cwd(),
+    });
+    if (mailSelection.kind === 'native' && mailSelection.reason) {
+      console.error(
+        `Inkwell Inkmail unavailable: ${mailSelection.reason}. Using the normal Codex launcher; live mail is off.`
+      );
+    }
+    if (mailSelection.kind !== 'native') {
+      let stderrText = '';
+      let code: number | null = 1;
+      try {
+        if (mailSelection.kind === 'error') throw new Error(mailSelection.reason);
+        if (!sessionContext.inkSessionId || !studioId) {
+          throw new Error('Codex Inkmail requires an exact Inkwell session and studio');
+        }
+        console.error(
+          'Inkwell Inkmail: live delivery enabled after hook trust; review /hooks and F2 warnings (use --no-codex-inkmail to opt out).'
+        );
+        const result = await runCodexMailInteractive(
+          {
+            binary: prepared.binary,
+            args: prepared.args,
+            cwd: process.cwd(),
+            env: mailEnv,
+            sbSlug,
+            sessionId: sessionContext.inkSessionId,
+            studioId,
+            onBound: async (backendSessionId) => {
+              finalCapturedBackendSessionId = backendSessionId;
+              await persistBackendSessionLink({
+                inkSessionId: sessionContext.inkSessionId,
+                backendSessionId,
+                backend: options.backend,
+                sbSlug,
+                runtimeLinkId,
+                studioId,
+                sbId,
+                email: inkConfig?.email,
+              });
+            },
+            onStderr: (chunk) => {
+              stderrText += chunk.toString();
+              process.stderr.write(chunk);
+            },
+          },
+          mailSelection.launch
+        );
+        code = result.code;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Codex Inkmail launch failed';
+        stderrText += message;
+        console.error(message);
+        if (options.codexInkmail !== true && mailSelection.kind === 'mail') {
+          console.error('To use the normal Codex launcher, rerun with --no-codex-inkmail.');
+        }
+      } finally {
+        prepared.cleanup();
+        await detachOnChildExit(options.backend, prepared.env, sessionContext.inkSessionId, sbSlug);
+        await logBackendExecutionResult({
+          context: executionContext,
+          parentActivityId: backendStartActivityId,
+          exitCode: code,
+          durationMs: Date.now() - executionStartedAt,
+          backendSessionId: finalCapturedBackendSessionId,
+        });
+      }
+      return { code, stderrText };
+    }
 
     return await new Promise<{ code: number | null; stderrText: string }>((resolve) => {
       let stderrText = '';

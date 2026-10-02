@@ -363,16 +363,18 @@ describe("listSessions status 'attachable'", () => {
   });
 
   /**
-   * The same defect one column further in, and the reason the agent-declared
-   * markers cannot be left to the client.
-   *
-   * `update_session_state({ phase: 'complete' })` writes current_phase and
-   * nothing else — ended_at stays null, lifecycle stays 'idle'. Excluding
-   * only the authoritative columns server-side lets those rows fill the
-   * page, and the client discards them afterwards, leaving the picker empty
-   * with the older attachable session never having been sent.
+   * The agent-set work phase is not a lifecycle. `update_session_state({
+   * phase: 'complete' })` writes current_phase and nothing else — ended_at
+   * stays null, lifecycle stays 'idle' — because it closes a piece of work,
+   * not the conversation. This filter used to exclude those rows (so a page
+   * would not be spent on rows the client then discarded), and the client
+   * predicates agreed; the row then vanished from every picker while its
+   * transcript lived on, the transcript looked untracked, and each relaunch
+   * minted a second Inkwell session for the same conversation (2026-10-01:
+   * four live rows for one Claude session). Phase-complete rows are live
+   * sessions and take their place on the page by recency like any other.
    */
-  it('does not let newer phase-complete sessions push a crashed one off the page', async () => {
+  it('keeps phase-complete sessions, which are live conversations, on the page by recency', async () => {
     const olderCrashed = session({
       id: 'older-crashed',
       lifecycle: 'failed',
@@ -393,10 +395,15 @@ describe("listSessions status 'attachable'", () => {
       limit: 3,
     });
 
-    expect(sessions.map((s) => s.id)).toEqual(['older-crashed']);
+    expect(sessions.map((s) => s.id)).toEqual([
+      'phase-complete-4',
+      'phase-complete-3',
+      'phase-complete-2',
+    ]);
+    expect(await idsFor([...newerPhaseComplete, olderCrashed], 'attachable')).toHaveLength(6);
   });
 
-  it('excludes the prefixed spellings of both markers before the limit', async () => {
+  it('excludes the prefixed spellings of a completed status before the limit, and only those', async () => {
     const rows = [
       session({ id: 'phase-complete-prefixed', current_phase: 'complete:shipped' }),
       session({ id: 'status-completed-prefixed', status: 'completed:merged' }),
@@ -404,40 +411,37 @@ describe("listSessions status 'attachable'", () => {
       session({ id: 'live-row', current_phase: 'implementing' }),
     ];
 
-    expect(await idsFor(rows, 'attachable')).toEqual(['live-row']);
+    expect(await idsFor(rows, 'attachable')).toEqual(['live-row', 'phase-complete-prefixed']);
   });
 
-  it('keeps a session that never declared a phase', async () => {
-    // NULL current_phase means "never set", which is attachable — but SQL's
-    // `col <> x` over NULL is NULL, so without the paired is.null allowance
-    // every such row would silently vanish.
+  it('keeps a session that never declared a phase, and one that declared complete', async () => {
+    // NULL current_phase means "never set"; a phase of 'complete' means a
+    // piece of work finished. Both rows are live sessions.
     const rows = [
       session({ id: 'no-phase', current_phase: null }),
       session({ id: 'phase-complete', current_phase: 'complete' }),
     ];
 
-    expect(await idsFor(rows, 'attachable')).toEqual(['no-phase']);
+    expect(await idsFor(rows, 'attachable')).toEqual(['no-phase', 'phase-complete']);
   });
 
-  it('does not mistake an in-progress phase for a terminal one', async () => {
-    // 'completing-review' starts with 'complete' — a prefix match rather than
-    // the exact/`complete:` forms would wrongly drop it.
+  it('reads no phase at all: in-progress, blocked and complete rows are alike attachable', async () => {
     const rows = [
       session({ id: 'completing', current_phase: 'completing-review' }),
       session({ id: 'blocked', current_phase: 'blocked:backend-error' }),
       session({ id: 'done', current_phase: 'complete' }),
     ];
 
-    expect(await idsFor(rows, 'attachable')).toEqual(['blocked', 'completing']);
+    expect(await idsFor(rows, 'attachable')).toEqual(['blocked', 'completing', 'done']);
   });
 
-  it('matches the markers case-insensitively, as the client predicate does', async () => {
+  it('matches the status marker case-insensitively, as the client predicate does', async () => {
     const rows = [
       session({ id: 'shouty', current_phase: 'COMPLETE' }),
       session({ id: 'mixed', status: 'Completed' }),
       session({ id: 'live-row', current_phase: 'reviewing' }),
     ];
 
-    expect(await idsFor(rows, 'attachable')).toEqual(['live-row']);
+    expect(await idsFor(rows, 'attachable')).toEqual(['live-row', 'shouty']);
   });
 });

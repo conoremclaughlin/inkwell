@@ -65,6 +65,14 @@ class FakeQuery {
     else if (op === 'eq') this.filters.push((r) => getCol(r, col) !== val);
     return this;
   }
+  neq(col: string, val: unknown) {
+    // PostgREST `neq` is `not.eq`; like SQL `<>`, a NULL column never matches.
+    this.filters.push((r) => {
+      const cur = getCol(r, col);
+      return cur != null && cur !== val;
+    });
+    return this;
+  }
   in(col: string, vals: unknown[]) {
     this.filters.push((r) => vals.includes(getCol(r, col)));
     return this;

@@ -36,6 +36,7 @@ import {
 import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { contextDeclaresHeadless, promptAttachmentWrite } from '../lib/turn-owner.js';
+import { admitsCodexMailHook } from '../lib/codex-mail/hook-binding.js';
 import { sessionStartStateArgs } from '../lib/session-start-state.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { formatCurrentWork } from '../lib/current-work.js';
@@ -1152,6 +1153,7 @@ export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): st
  * injection is skipped to avoid duplicate messages.
  */
 function hasActiveChannelPlugin(cwd: string): boolean {
+  if (process.env.INK_CODEX_INKMAIL === '1') return true;
   try {
     const mcpJsonPath = join(cwd, '.mcp.json');
     if (!existsSync(mcpJsonPath)) return false;
@@ -1488,6 +1490,15 @@ function hasHookEntries(hooks: unknown): boolean {
 
 function hasCodexInkHooks(content: string): boolean {
   if (!content.trim()) return false;
+  if (
+    ['SessionStart', 'UserPromptSubmit', 'Stop'].every((event) =>
+      content.includes(`[[hooks.${event}]]`)
+    ) &&
+    ['on-session-start', 'on-prompt', 'on-stop'].every((hook) =>
+      content.includes(`hooks ${hook} --backend codex`)
+    )
+  )
+    return true;
   return (
     /session_start\s*=\s*".*hooks on-session-start[^"]*"/.test(content) &&
     /session_end\s*=\s*".*hooks on-stop[^"]*"/.test(content) &&
@@ -2194,18 +2205,21 @@ async function postCompactHandler(): Promise<void> {
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
-  // Check inbox — grab last 10 for orientation context, not delivery
-  try {
-    const inbox = await callInkTool('get_inbox', {
-      email: config?.email,
-      sbSlug,
-      limit: 10,
-    });
-    inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
-    writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
-  } catch {
-    inboxBlock =
-      '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+  // The Codex bridge owns fetch/receipt/ack; startup must not consume its mail.
+  if (process.env.INK_CODEX_INKMAIL !== '1') {
+    // Check inbox — grab last 10 for orientation context, not delivery
+    try {
+      const inbox = await callInkTool('get_inbox', {
+        email: config?.email,
+        sbSlug,
+        limit: 10,
+      });
+      inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
+      writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
+    } catch {
+      inboxBlock =
+        '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+    }
   }
 
   // Load available skills
@@ -2268,8 +2282,15 @@ export async function hydrateThreadKeyFromServer(
   return inkThreadKey;
 }
 
-async function onSessionStartHandler(options?: { backend?: string }): Promise<void> {
+async function onSessionStartHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-session-start' });
+    return;
+  }
   const cwd = process.cwd();
   const config = getInkUserConfig();
   const sbSlug = resolveSlug() || 'unknown';
@@ -2385,18 +2406,21 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     }
   }
 
-  // Check inbox — grab last 10 for orientation context, not delivery
-  try {
-    const inbox = await callInkTool('get_inbox', {
-      email: config?.email,
-      sbSlug,
-      limit: 10,
-    });
-    inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
-    writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
-  } catch {
-    inboxBlock =
-      '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+  // The bridge owns all mailbox consumption for this process.
+  if (process.env.INK_CODEX_INKMAIL !== '1') {
+    // Check inbox — grab last 10 for orientation context, not delivery
+    try {
+      const inbox = await callInkTool('get_inbox', {
+        email: config?.email,
+        sbSlug,
+        limit: 10,
+      });
+      inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
+      writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
+    } catch {
+      inboxBlock =
+        '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+    }
   }
 
   // Load available skills (guide content included inline)
@@ -2751,8 +2775,15 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   process.exit(1);
 }
 
-async function onPromptHandler(options?: { backend?: string }): Promise<void> {
+async function onPromptHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-prompt' });
+    return;
+  }
   const cwd = process.cwd();
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
   sbDebugLog('hooks', 'on_prompt_begin', {
@@ -3010,8 +3041,15 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   }
 }
 
-async function onStopHandler(options?: { backend?: string }): Promise<void> {
+async function onStopHandler(options?: {
+  backend?: string;
+  codexInkmailOnly?: boolean;
+}): Promise<void> {
   const stdin = await readStdin();
+  if (options?.codexInkmailOnly && (options.backend !== 'codex' || !admitsCodexMailHook(stdin))) {
+    hookLog('codex_inkmail_hook_skipped', { hook: 'on-stop' });
+    return;
+  }
   const cwd = process.cwd();
 
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
@@ -3259,6 +3297,7 @@ export function registerHooksCommands(program: Command): void {
     .command('on-session-start')
     .description('Hook: bootstrap identity and context at session start')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onSessionStartHandler(opts));
 
   hooks
@@ -3271,11 +3310,13 @@ export function registerHooksCommands(program: Command): void {
     .command('on-prompt')
     .description('Hook: periodic inbox check on user prompt')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onPromptHandler(opts));
 
   hooks
     .command('on-stop')
     .description('Hook: session nudge and inbox check on stop')
     .option('--backend <name>', 'Backend context for this hook invocation')
+    .option('--codex-inkmail-only', 'Run only in an attached Codex Inkmail bridge')
     .action((opts) => onStopHandler(opts));
 }

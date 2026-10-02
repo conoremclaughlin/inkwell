@@ -67,6 +67,186 @@ describe('MemoryRepository', () => {
       expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
     });
 
+    it('getActiveSessionByBackendSessionId matches either backend column and scopes by sb_id', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByBackendSessionId('user-1', 'claude-abc', 'myra', 'sb-myra');
+
+      const orCalls = (mockSupabase._queryBuilder.or as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls;
+      expect(orCalls).toContainEqual([
+        'backend_session_id.eq.claude-abc,claude_session_id.eq.claude-abc',
+      ]);
+      expect(eqCalls()).toContainEqual(['sb_id', 'sb-myra']);
+      expect(eqCalls()).not.toContainEqual(['agent_id', 'myra']);
+      const isCalls = (mockSupabase._queryBuilder.is as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls;
+      expect(isCalls).toContainEqual(['ended_at', null]);
+    });
+
+    it('getActiveSessionByBackendSessionId fences on the completed lifecycle and status, keeping crashed rows', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByBackendSessionId('user-1', 'claude-abc', 'myra');
+
+      const neqCalls = (
+        mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(neqCalls).toContainEqual(['lifecycle', 'completed']);
+      expect(neqCalls).not.toContainEqual(['lifecycle', 'failed']);
+      const orCalls = (mockSupabase._queryBuilder.or as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls;
+      expect(orCalls).toContainEqual(['status.is.null,status.not.ilike.completed']);
+      expect(orCalls).toContainEqual(['status.is.null,status.not.ilike.completed:*']);
+    });
+
+    it('startSession writes the supplied backend conversation to both link columns', async () => {
+      mockSupabase._setReturnData({
+        id: 's2',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        sb_id: 'sb-myra',
+        backend_session_id: 'claude-abc',
+        claude_session_id: 'claude-abc',
+        started_at: '2026-10-01T00:00:00Z',
+      });
+
+      await repo.startSession({
+        userId: 'user-1',
+        sbSlug: 'myra',
+        sbId: 'sb-myra',
+        backendSessionId: 'claude-abc',
+      });
+
+      const insertCalls = (
+        mockSupabase._queryBuilder.insert as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(insertCalls).toHaveLength(1);
+      expect(insertCalls[0][0]).toMatchObject({
+        backend_session_id: 'claude-abc',
+        claude_session_id: 'claude-abc',
+      });
+    });
+
+    it('startSession leaves both link columns alone when no conversation is supplied', async () => {
+      mockSupabase._setReturnData({
+        id: 's3',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        sb_id: 'sb-myra',
+        started_at: '2026-10-01T00:00:00Z',
+      });
+
+      await repo.startSession({ userId: 'user-1', sbSlug: 'myra', sbId: 'sb-myra' });
+
+      const insertCalls = (
+        mockSupabase._queryBuilder.insert as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(insertCalls[0][0]).not.toHaveProperty('backend_session_id');
+      expect(insertCalls[0][0]).not.toHaveProperty('claude_session_id');
+    });
+
+    it('listSessions matches the key case-insensitively on the alias column, with metacharacters escaped', async () => {
+      mockSupabase._setReturnData([]);
+
+      await repo.listSessions('user-1', { sbSlug: 'wren', sessionKey: 'pr_716' });
+
+      const ilikeCalls = (
+        mockSupabase._queryBuilder.ilike as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls;
+      expect(ilikeCalls).toContainEqual(['alias', 'pr\\_716']);
+      expect(eqCalls().some((c) => c[0] === 'alias')).toBe(false);
+    });
+
+    it('getActiveSessionByBackendSessionId falls back to agent_id without a canonical owner', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByBackendSessionId('user-1', 'claude-abc', 'myra');
+
+      expect(eqCalls()).toContainEqual(['agent_id', 'myra']);
+      expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
+    });
+
+    // start_session passes includeFailed so a plain relaunch after a crash
+    // reuses the crashed row instead of minting a second one for the same
+    // transcript (finished-session audit, rows 10 and 11). Everything else
+    // keeps the exclusion: a crashed session is not what a badge means by
+    // "active".
+    it('getActiveSession keeps crashed rows only when asked to', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSession('user-1', 'myra');
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+
+      vi.clearAllMocks();
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSession('user-1', 'myra', undefined, undefined, undefined, {
+        includeFailed: true,
+      });
+      // live first (neq), then the crashed fallback (eq) once nothing is live
+      expect(eqCalls()).toContainEqual(['lifecycle', 'failed']);
+    });
+
+    // Live first, crashed as the fallback (Lumen, #718): with crashed rows
+    // admitted to one ordered query, a newer crashed row would outrank an
+    // older live one under started_at DESC and the relaunch would land on the
+    // crash instead of the conversation still running.
+    it('getActiveSession with includeFailed asks for live rows first and crashed rows only when none is live', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSession('user-1', 'myra', undefined, undefined, undefined, {
+        includeFailed: true,
+      });
+
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+      expect(eqCalls()).toContainEqual(['lifecycle', 'failed']);
+      expect(neqCalls().findIndex((c) => c[1] === 'failed')).toBeGreaterThanOrEqual(0);
+    });
+
+    it('getActiveSession with includeFailed never asks for crashed rows when a live one exists', async () => {
+      mockSupabase._setReturnData({
+        id: 'live-1',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        lifecycle: 'idle',
+        started_at: '2026-10-01T00:00:00Z',
+      });
+
+      const found = await repo.getActiveSession('user-1', 'myra', undefined, undefined, undefined, {
+        includeFailed: true,
+      });
+
+      expect(found?.id).toBe('live-1');
+      expect(eqCalls()).not.toContainEqual(['lifecycle', 'failed']);
+    });
+
+    it('getActiveSessionByThreadKey keeps crashed rows only when asked to', async () => {
+      const neqCalls = () =>
+        (mockSupabase._queryBuilder.neq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSessionByThreadKey('user-1', 'myra', 'pr:501');
+      expect(neqCalls()).toContainEqual(['lifecycle', 'failed']);
+
+      vi.clearAllMocks();
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      await repo.getActiveSessionByThreadKey(
+        'user-1',
+        'myra',
+        'pr:501',
+        undefined,
+        undefined,
+        undefined,
+        { includeFailed: true }
+      );
+      // live first (neq), then the crashed fallback (eq) once nothing is live
+      expect(eqCalls()).toContainEqual(['lifecycle', 'failed']);
+    });
+
     it('getActiveSessionByThreadKey filters on sb_id and not agent_id', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 

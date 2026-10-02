@@ -36,6 +36,7 @@
     "backfill:artifact-embeddings": "tsx src/scripts/backfill-artifact-embeddings.ts",
     "audit:memory-llm-extractions": "tsx src/scripts/audit-memory-llm-extractions.ts",
     "extract:memory-llm-views": "tsx src/scripts/extract-memory-llm-views.ts",
+    "manifest:session-archive": "tsx src/scripts/session-archive-manifest.ts",
     "lint": "eslint src --ext .ts",
     "type-check": "yarn workspace @inklabs/shared build && tsc --noEmit",
     "clean": "rm -rf dist"

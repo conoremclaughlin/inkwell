@@ -429,6 +429,126 @@ describe('Heartbeat Service', () => {
   // ═══════════════════════════════════════════════════════════════
   // ensureDefaultReminders — identity-creation seeding
   // ═══════════════════════════════════════════════════════════════
+  /**
+   * runDuringQuietHours in the scheduler (task 2301cb3c). The clock is pinned to
+   * 02:00 PDT inside a 22:00–08:00 Los Angeles window, so "inside quiet hours"
+   * is a fact of the fixture rather than of when the suite happens to run.
+   */
+  describe('processHeartbeat - quiet-hours switch', () => {
+    const INSIDE = new Date('2026-09-02T09:00:00Z'); // 02:00 PDT
+    const OUTSIDE = new Date('2026-09-02T20:00:00Z'); // 13:00 PDT
+
+    function primeQuietWindow() {
+      queryResultQueues.delete('heartbeat_state');
+      setQueryResult('heartbeat_state', {
+        quiet_start: '22:00:00',
+        quiet_end: '08:00:00',
+        timezone: 'America/Los_Angeles',
+      });
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('a switch-on reminder fires inside quiet hours and is told when they end', async () => {
+      vi.setSystemTime(INSIDE);
+      initHeartbeatService({ enableLocalCron: false });
+      primeQuietWindow();
+      const reminder = makeDueReminder({ run_during_quiet_hours: true });
+      setQueryResult('scheduled_reminders', [reminder]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      const stats = await processHeartbeat(mockDeliver);
+
+      expect(stats.delivered).toBe(1);
+      expect(mockDeliver).toHaveBeenCalledWith(expect.objectContaining({ id: 'rem-001' }), {
+        quietHours: { until: '2026-09-02T15:00:00.000Z', timezone: 'America/Los_Angeles' },
+      });
+    });
+
+    it('control: the same reminder with the switch off is held and never delivered', async () => {
+      vi.setSystemTime(INSIDE);
+      initHeartbeatService({ enableLocalCron: false });
+      primeQuietWindow();
+      setQueryResult('scheduled_reminders', [makeDueReminder({ run_during_quiet_hours: false })]);
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      const stats = await processHeartbeat(mockDeliver);
+
+      expect(mockDeliver).not.toHaveBeenCalled();
+      expect(stats.skipped).toBe(1);
+    });
+
+    it('a strategy watchdog is held even with the switch set on its row', async () => {
+      vi.setSystemTime(INSIDE);
+      initHeartbeatService({ enableLocalCron: false });
+      primeQuietWindow();
+      setQueryResult('scheduled_reminders', [
+        makeDueReminder({
+          run_during_quiet_hours: true,
+          metadata: { strategyWatchdog: true, groupId: 'g1' },
+        }),
+      ]);
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      const stats = await processHeartbeat(mockDeliver);
+
+      expect(mockDeliver).not.toHaveBeenCalled();
+      expect(stats.skipped).toBe(1);
+    });
+
+    it('runs the held-notice drain on a tick with no due reminders, before the due read', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+      setQueryResult('scheduled_reminders', []); // nothing due
+      const order: string[] = [];
+      mockSupabase.from.mockImplementationOnce((table: string) => {
+        order.push(`from:${table}`);
+        return getBuilder(table);
+      });
+      const drain = vi.fn(async () => {
+        order.push('drain');
+      });
+
+      await processHeartbeat(vi.fn(), undefined, undefined, drain);
+
+      expect(drain).toHaveBeenCalledTimes(1);
+      expect(order[0]).toBe('drain');
+    });
+
+    it('a drain that throws does not cost the tick its reminders', async () => {
+      vi.setSystemTime(OUTSIDE);
+      initHeartbeatService({ enableLocalCron: false });
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+
+      const stats = await processHeartbeat(mockDeliver, undefined, undefined, async () => {
+        throw new Error('store down');
+      });
+
+      expect(stats.delivered).toBe(1);
+    });
+
+    it('outside quiet hours a switch-on reminder is delivered with no quiet context', async () => {
+      vi.setSystemTime(OUTSIDE);
+      initHeartbeatService({ enableLocalCron: false });
+      primeQuietWindow();
+      setQueryResult('scheduled_reminders', [makeDueReminder({ run_during_quiet_hours: true })]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      await processHeartbeat(mockDeliver);
+
+      expect(mockDeliver).toHaveBeenCalledTimes(1);
+      expect(mockDeliver.mock.calls[0]).toHaveLength(1);
+    });
+  });
+
   describe('ensureDefaultReminders', () => {
     it('should create a daily-checkin reminder for a new identity', async () => {
       // No existing checkin (idempotency check returns empty)

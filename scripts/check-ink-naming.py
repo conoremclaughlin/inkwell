@@ -66,6 +66,7 @@ ALLOWED: list[tuple[str, str]] = [
     (r"(?:metadata|metadataRecord|rawMeta|meta)\.pcp", "persisted inbox metadata key"),
     (r"pcp\.(?:sender|recipient|subject)", "persisted inbox metadata key"),
     (r"pcp(?=:\s*\{)", "persisted inbox metadata key, as an object literal"),
+    (r"metadata->pcp(?=->)", "persisted inbox metadata key, as a PostgREST JSON path"),
     (r"project:pcp/[a-z-]+", "topic keys on memory rows already written"),
     # The checkout lives at ~/ws/pcp/…; Claude Code and Gemini flatten that
     # path to Users-…-ws-pcp-… for their project directories, so both spellings
