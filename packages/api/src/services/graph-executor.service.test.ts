@@ -19,6 +19,7 @@ import type { DataComposer } from '../data/composer';
 import type { TaskGroup } from '../data/repositories/task-groups.repository';
 import {
   GraphExecutorService,
+  releaseGraphClaimsForSession,
   type GraphEvaluation,
   type GraphClaimRef,
 } from './graph-executor.service';
@@ -78,6 +79,7 @@ interface ComposerConfig {
     status: string | null;
     ended_at: string | null;
     lifecycle?: string | null;
+    turn_epoch?: string | null;
   } | null;
   sessionLookupError?: boolean;
   taskStamps?: Record<string, string>;
@@ -272,6 +274,37 @@ describe('GraphExecutorService reclaim (fail-closed)', () => {
   });
 
   /**
+   * PR #724 review (Lumen). Both paths decide on a snapshot of the holder,
+   * and the claim token does not change when a new turn takes the session.
+   * The release is therefore fenced on the turn_epoch read WITH the
+   * decision, so release_graph_claim refuses if the turn moved since.
+   */
+  it.each([
+    ['crashed, nothing present', { lifecycle: 'failed' }, claim],
+    ['idle past the window, not mid-turn', { lifecycle: 'idle' }, oldClaim],
+  ] as const)('fences the release on the epoch it decided on — %s', async (_l, row, c) => {
+    liveMock.mockResolvedValue(false);
+    midTurnMock.mockResolvedValue(false);
+    const { releases, result } = await runSweep(
+      {
+        sessionRow: { id: 's-1', status: 'active', ended_at: null, turn_epoch: 'epoch-1', ...row },
+      },
+      [c]
+    );
+    expect(result.reclaimed).toBe(1);
+    expect(releases[0]).toMatchObject({ fenceTurnEpoch: true, expectedTurnEpoch: 'epoch-1' });
+  });
+
+  it('fences on a NULL epoch too — a row that never had one must still not have one', async () => {
+    liveMock.mockResolvedValue(false);
+    const { releases } = await runSweep(
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'failed' } },
+      [claim]
+    );
+    expect(releases[0]).toMatchObject({ fenceTurnEpoch: true, expectedTurnEpoch: null });
+  });
+
+  /**
    * T6. Activity rows are fire-and-forget telemetry (agent_complete is logged
    * before the final session write, and a failed run logs error instead). The
    * decision never reads them, so a missing row cannot change it.
@@ -327,6 +360,60 @@ describe('GraphExecutorService reclaim (fail-closed)', () => {
     const { releases, result } = await runSweep({ sessionRow: null }, [oldClaim]);
     expect(result.reclaimed).toBe(0);
     expect(releases).toHaveLength(0);
+  });
+});
+
+/**
+ * PR #724 review (Lumen). The boundary release checked the session's epoch,
+ * then released by token. The release now hands the same epoch to
+ * release_graph_claim, which re-checks it under the row lock.
+ */
+describe('releaseGraphClaimsForSession fences each release on the boundary epoch', () => {
+  function boundaryClient(turnEpoch: string | null) {
+    const rpcCalls: Array<Record<string, unknown>> = [];
+    const client = {
+      from(table: string) {
+        const chain: Record<string, unknown> = {
+          select: () => chain,
+          eq: () => chain,
+          lte: () =>
+            Promise.resolve({
+              data: table === 'tasks' ? [{ id: 't-1', user_id: USER, claim_token: 'tok-1' }] : [],
+              error: null,
+            }),
+          maybeSingle: () => Promise.resolve({ data: { turn_epoch: turnEpoch }, error: null }),
+        };
+        return chain;
+      },
+      rpc: (_fn: string, args: Record<string, unknown>) => {
+        rpcCalls.push(args);
+        return Promise.resolve({ data: { success: true }, error: null });
+      },
+    };
+    return { client, rpcCalls };
+  }
+
+  it('passes the epoch it checked to the release', async () => {
+    const { client, rpcCalls } = boundaryClient('epoch-1');
+    const released = await releaseGraphClaimsForSession(
+      client as never,
+      's-1',
+      'cli-turn-stopped',
+      new Date().toISOString(),
+      'epoch-1'
+    );
+    expect(released).toBe(1);
+    expect(rpcCalls[0]).toMatchObject({
+      p_session_id: 's-1',
+      p_fence_turn_epoch: true,
+      p_expected_turn_epoch: 'epoch-1',
+    });
+  });
+
+  it('an unfenced (legacy) boundary stays unfenced', async () => {
+    const { client, rpcCalls } = boundaryClient(null);
+    await releaseGraphClaimsForSession(client as never, 's-1', 'legacy-stop');
+    expect(rpcCalls[0]).toMatchObject({ p_fence_turn_epoch: false, p_expected_turn_epoch: null });
   });
 });
 
