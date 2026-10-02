@@ -134,6 +134,8 @@ interface Script {
   failAfterStore?: boolean;
   /** Dies after creating the thread and its participants, before storing the message. */
   dieBeforeStore?: boolean;
+  /** Dies after writing only these participants, before the rest and the message. */
+  dieAfterParticipants?: string[];
 }
 
 let script: Script;
@@ -248,6 +250,11 @@ beforeEach(() => {
           created_by_user_id: internal.sender.principal.userId,
         });
         addPerson(thread, internal.sender.principal.userId);
+      }
+      if (script.dieAfterParticipants) {
+        // The participant rows are separate writes; this create died partway.
+        addParticipants(thread, script.dieAfterParticipants);
+        throw new Error('connection reset');
       }
       addParticipants(
         thread,
@@ -625,15 +632,27 @@ describe('a client-identified create never changes who is in a conversation', ()
       expect(again._json).toMatchObject({ messageId: retry._json.messageId, replayed: true });
     });
 
-    it('a retry naming different inklings is still a 409, and nobody is added', async () => {
-      await dieAfterCreatingTheThread({ recipients: ['wren'], clientMessageId: CMID });
-      const res = await call(
-        create,
-        createBody({ recipients: ['wren', 'lumen'], clientMessageId: CMID })
-      );
+    it('a retry that does not ask for an inkling already on it is still a 409', async () => {
+      // The privacy guard: never adopt a conversation holding someone this
+      // create did not name.
+      await dieAfterCreatingTheThread({ recipients: ['wren', 'lumen'], clientMessageId: CMID });
+      const res = await call(create, createBody({ recipients: ['wren'], clientMessageId: CMID }));
       expect(res._status).toBe(409);
-      expect(participants()).toEqual(['wren']);
+      expect(participants()).toEqual(['lumen', 'wren']);
       expect(stored()).toHaveLength(0);
+    });
+
+    it('one that died between participant writes is adopted, and the rest join (review e8d78cd9)', async () => {
+      script.dieAfterParticipants = ['wren'];
+      const died = await call(create, createBody({ clientMessageId: CMID }));
+      expect(died._status).toBe(500);
+      expect(participants()).toEqual(['wren']);
+      script.dieAfterParticipants = undefined;
+
+      const retry = await call(create, createBody({ clientMessageId: CMID }));
+      expect(retry._status).toBe(200);
+      expect(stored()).toHaveLength(1);
+      expect(participants()).toEqual(['lumen', 'wren']);
     });
 
     it('a retry with a different title is still a 409', async () => {

@@ -8160,7 +8160,12 @@ router.post('/threads', async (req: Request, res: Response) => {
       } catch {
         return false;
       }
-      return present.size === requested.length && requested.every((sb) => present.has(sb.sbId));
+      // Every SB already on it was asked for by this create. One that died
+      // between its participant writes may have added only some; with no
+      // message there is no history to expose, so adding the rest is what
+      // that create meant to do. An SB this create did not ask for refuses.
+      const requestedIds = new Set(requested.map((sb) => sb.sbId));
+      return [...present].every((id) => requestedIds.has(id));
     };
 
     const sendCreate = async (send: { createOnly: boolean; created: boolean }): Promise<void> => {
