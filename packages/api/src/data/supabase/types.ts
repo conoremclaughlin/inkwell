@@ -5197,6 +5197,18 @@ export type Database = {
         };
         Relationships: [];
       };
+      heartbeat_notifications_owed_recoveries: {
+        Row: {
+          destination: string | null;
+          episode_key: string | null;
+          failed_beats: number | null;
+          id: string | null;
+          recovered_at: string | null;
+          reminder_id: string | null;
+          user_id: string | null;
+        };
+        Relationships: [];
+      };
     };
     Functions: {
       swap_memory_embedding: {

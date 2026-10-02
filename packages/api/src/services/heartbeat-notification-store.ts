@@ -79,6 +79,7 @@
 import { randomUUID } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../data/supabase/types.js';
+import type { DueReminder } from './heartbeat.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -305,12 +306,33 @@ export interface HeartbeatNotificationStore {
    * Null when the read failed.
    */
   listDrainCandidates(userIds: string[], limit: number): Promise<DrainCandidate[] | null>;
+  /**
+   * Every all-clear owed for an episode that has ended, where nothing durable
+   * holds the all-clear itself (PR #723 review): the outage notice was
+   * delivered from a recorded send, a delivered beat followed it in
+   * `reminder_history`, and the episode has no recovery row. That happens when
+   * the recovery beat waited behind its outage and could not record its own
+   * claim. Oldest recovery first, each with the reminder the all-clear is
+   * composed from. All of them, not a page: one that can never be sent stays
+   * in the view, and a page of those would hide the rest. Null when a read
+   * failed.
+   */
+  listOwedRecoveries(): Promise<OwedRecoveryNotice[] | null>;
 }
 
 /** A drain-owned notice that may be sent now. */
 export interface DrainCandidate {
   key: NoticeKey;
   payload: HeldNoticePayload | null;
+}
+
+/** An all-clear owed for an ended episode that has no recovery row. */
+export interface OwedRecoveryNotice {
+  reminder: DueReminder;
+  episodeKey: string;
+  destination: string | null;
+  /** Failed beats in the episode, counted from `reminder_history`. */
+  failedBeats: number;
 }
 
 interface NoticeRow {
@@ -1209,6 +1231,66 @@ export function createHeartbeatNotificationStore(
     }
   };
 
+  /** Rows per read of the owed-recovery view; every page is read. */
+  const OWED_PAGE = 100;
+
+  const listOwedRecoveries: HeartbeatNotificationStore['listOwedRecoveries'] = async () => {
+    try {
+      // Every rule lives in the view; a row leaves it as soon as its
+      // all-clear has a recovery row or its episode is closed. All pages are
+      // read before any is acted on, so nothing shifts between them.
+      const owed: OwedRecoveryNotice[] = [];
+      for (let from = 0; ; from += OWED_PAGE) {
+        const { data, error } = await client
+          .from('heartbeat_notifications_owed_recoveries')
+          .select('id, reminder_id, episode_key, destination, failed_beats, recovered_at')
+          .order('recovered_at', { ascending: true })
+          .order('id', { ascending: true })
+          .range(from, from + OWED_PAGE - 1);
+        if (error) {
+          logger.warn('[Heartbeat] Could not read owed all-clears', { error: error.message });
+          return null;
+        }
+        const page = data ?? [];
+        const rows = page.filter(
+          (r): r is typeof r & { reminder_id: string; episode_key: string } =>
+            !!r.reminder_id && !!r.episode_key
+        );
+        if (rows.length > 0) {
+          const { data: reminders, error: reminderError } = await client
+            .from('scheduled_reminders')
+            .select('*')
+            .in('id', [...new Set(rows.map((r) => r.reminder_id))]);
+          if (reminderError) {
+            logger.warn('[Heartbeat] Could not read the reminders behind owed all-clears', {
+              error: reminderError.message,
+            });
+            return null;
+          }
+          const byId = new Map(
+            (reminders ?? []).map((r) => [r.id, r as unknown as DueReminder] as const)
+          );
+          for (const r of rows) {
+            const reminder = byId.get(r.reminder_id);
+            if (!reminder) continue;
+            owed.push({
+              reminder,
+              episodeKey: r.episode_key,
+              destination: r.destination,
+              failedBeats: r.failed_beats ?? 0,
+            });
+          }
+        }
+        if (page.length < OWED_PAGE) return owed;
+      }
+    } catch (err) {
+      logger.warn('[Heartbeat] Reading owed all-clears threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
   const outageStatus: HeartbeatNotificationStore['outageStatus'] = async (key) => {
     try {
       const { data, error } = await table()
@@ -1247,6 +1329,7 @@ export function createHeartbeatNotificationStore(
     holdNotice,
     listDrainUsers,
     listDrainCandidates,
+    listOwedRecoveries,
     outageStatus,
   };
 }

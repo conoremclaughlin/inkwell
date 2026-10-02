@@ -195,6 +195,11 @@ export interface HeldNoticeDrainStats {
   skipped: number;
   /** An all-clear whose outage notice is not delivered yet; it goes after. */
   waiting: number;
+  /**
+   * All-clears owed for an ended episode with no recovery row, handed back to
+   * the recovery path. Those that were delivered are also counted in `sent`.
+   */
+  rebuilt: number;
 }
 
 /** How many held notices one tick sends at most. */
@@ -615,11 +620,13 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     // - Claim recorded: the all-clear is drain-owned, and the drain sends it
     //   once the outage is delivered.
     // - Claim not recorded: nothing durable holds the all-clear. Its outage
-    //   row does: once that row is delivered, the episode stays open and
-    //   findOwedRecovery reconstructs the all-clear on the next healthy beat
-    //   (retryOwedRecovery). If the state was unknown because the outage row
-    //   was never written either (the store failing for the whole episode),
-    //   nothing reconstructs it, and the error below is the only record.
+    //   row and this beat's delivered row in reminder_history do: once the
+    //   outage is delivered, the drain rebuilds the all-clear from them
+    //   (sendOwedRecoveries), with no further reminder run needed, and a
+    //   later healthy beat would too (retryOwedRecovery). If the state was
+    //   unknown because the outage row was never written either (the store
+    //   failing for the whole episode), nothing rebuilds it, and the error
+    //   below is the only record.
     // A delivered, absent or stranded outage lets the all-clear through as
     // before, including the send-through rule when the claim failed.
     const outage = await store.outageStatus(key);
@@ -677,26 +684,92 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
    * 4. Each send is settled as a real attempt. Delivered closes it (and its
    *    episode, for an all-clear); a failure records the attempt and its
    *    backoff, and the row stays drain-owned until a later pass delivers it.
+   * 5. Then the all-clears owed for episodes that ended with nothing durable
+   *    holding them (see sendOwedRecoveries).
    *
    * Duplicates are at-least-once across processes, as everywhere else in this
    * module: claimNotice reserves nothing. Within one process the drain settles
    * each notice before the beat path reads it.
    */
   const drainHeldNotices = async (): Promise<HeldNoticeDrainStats> => {
-    const stats: HeldNoticeDrainStats = { sent: 0, failed: 0, held: 0, skipped: 0, waiting: 0 };
+    const stats: HeldNoticeDrainStats = {
+      sent: 0,
+      failed: 0,
+      held: 0,
+      skipped: 0,
+      waiting: 0,
+      rebuilt: 0,
+    };
+    await sendHeldCandidates(stats);
+    await sendOwedRecoveries(stats);
+    return stats;
+  };
 
+  /**
+   * All-clears owed for episodes that have ended, where nothing durable holds
+   * the all-clear (PR #723 review).
+   *
+   * The recovery beat waits while its outage notice is still owed. If it also
+   * could not record its own claim, the beat-path sweep (retryOwedRecovery)
+   * would rebuild the all-clear on a later healthy beat, and a reminder on its
+   * final run, or paused after recovering, never has one. The store finds
+   * these from records that claim did not write: the delivered outage notice
+   * and the delivered beat after it in `reminder_history`. Each goes back
+   * through onRecovery, so it gets the same claim, causal check, quiet-hours
+   * hold and episode closure as the beat path.
+   *
+   * Runs after the held notices, so an outage delivered in this pass has its
+   * all-clear follow in the same pass.
+   *
+   * Oldest first, and the batch limit counts all-clears sent, not rows read:
+   * one that can neither be recorded nor sent stays owed and is tried again
+   * next pass, but cannot use up the batch ahead of the rest.
+   */
+  const sendOwedRecoveries = async (stats: HeldNoticeDrainStats): Promise<void> => {
+    const owed = await store.listOwedRecoveries();
+    if (!owed) return;
+    let sent = 0;
+    for (const debt of owed) {
+      if (sent >= DRAIN_BATCH) return;
+      stats.rebuilt++;
+      logger.info('[Heartbeat] Rebuilding an all-clear owed for an ended episode', {
+        reminderId: debt.reminder.id,
+        episodeKey: debt.episodeKey,
+        failedBeats: debt.failedBeats,
+      });
+      try {
+        const { alerted } = await onRecovery(debt.reminder, debt.failedBeats, {
+          destinationAlreadyAlerted: false,
+          episodeKey: debt.episodeKey,
+          destination: debt.destination,
+        });
+        if (alerted) {
+          sent++;
+          stats.sent++;
+        }
+      } catch (err) {
+        // One all-clear that throws must not cost the rest of the pass.
+        logger.error('[Heartbeat] Rebuilding an owed all-clear threw', {
+          reminderId: debt.reminder.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  };
+
+  const sendHeldCandidates = async (stats: HeldNoticeDrainStats): Promise<void> => {
     const users = await store.listDrainUsers();
-    if (!users || users.length === 0) return stats;
+    if (!users || users.length === 0) return;
 
     const sendable: string[] = [];
     for (const userId of users) {
       const gate = await quietGate(userId);
       if (gate.kind !== 'hold') sendable.push(userId);
     }
-    if (sendable.length === 0) return stats;
+    if (sendable.length === 0) return;
 
     const candidates = await store.listDrainCandidates(sendable, DRAIN_BATCH);
-    if (!candidates) return stats;
+    if (!candidates) return;
 
     for (const { key, payload } of candidates) {
       if (!payload || !payload.target || !ALERTABLE_CHANNELS.has(payload.channel as ChannelType)) {
@@ -769,8 +842,6 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
         });
       }
     }
-
-    return stats;
   };
 
   return { onFailure, onRecovery, drainHeldNotices };

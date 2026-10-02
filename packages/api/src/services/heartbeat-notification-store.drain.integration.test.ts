@@ -20,7 +20,13 @@ import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { createClient } from '@supabase/supabase-js';
 import { randomUUID } from 'crypto';
 import type { Database } from '../data/supabase/types';
-import { createHeartbeatNotificationStore } from './heartbeat-notification-store';
+import {
+  createHeartbeatNotificationStore,
+  type HeartbeatNotificationStore,
+} from './heartbeat-notification-store';
+import { createHeartbeatEscalation } from './heartbeat-escalation';
+import type { DueReminder } from './heartbeat';
+import type { ChannelResponse } from './sessions/types';
 import { shouldRunOnIsolatedIntegrationDb } from '../test/isolated-integration-target';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -137,6 +143,7 @@ d('held notices — real schema', () => {
       .from('heartbeat_notifications')
       .delete()
       .in('reminder_id', [reminderId, otherReminderId]);
+    await client.from('reminder_history').delete().in('reminder_id', [reminderId, otherReminderId]);
   });
 
   afterAll(async () => {
@@ -383,4 +390,191 @@ d('held notices — real schema', () => {
 
     expect(users.filter((u) => !listed.has(u))).toEqual([]);
   }, 120_000);
+
+  // ── PR #723 re-review: an all-clear owed for an ended episode ───────────
+
+  const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+
+  /** A beat as the heartbeat records it, at a chosen time. */
+  const beat = async (status: 'delivered' | 'failed', at: string, rid = reminderId) => {
+    const { error } = await client
+      .from('reminder_history')
+      .insert({ reminder_id: rid, status, triggered_at: at } as never);
+    expect(error).toBeNull();
+  };
+
+  /** An outage notice with a chosen creation time and state. */
+  const outage = async (opts: {
+    episodeKey: string;
+    at: string;
+    status?: 'pending' | 'delivered';
+    drainOwned?: boolean;
+    closed?: boolean;
+    rid?: string;
+  }) => {
+    const { error } = await client.from('heartbeat_notifications').insert({
+      reminder_id: opts.rid ?? reminderId,
+      user_id: userId,
+      kind: 'outage',
+      episode_key: opts.episodeKey,
+      status: opts.status ?? 'delivered',
+      drain_owned: opts.drainOwned ?? true,
+      payload: opts.drainOwned === false ? null : payload,
+      failed_beats: 1,
+      created_at: opts.at,
+      episode_closed_at: opts.closed ? opts.at : null,
+    } as never);
+    expect(error).toBeNull();
+  };
+
+  const owedFor = async (rids: string[]) =>
+    ((await store.listOwedRecoveries()) ?? []).filter((o) => rids.includes(o.reminder.id));
+
+  it('an ended episode whose all-clear has no row is owed, with its failed beats counted', async () => {
+    const owed = randomUUID();
+    await beat('failed', minutesAgo(70)); // an earlier run, before the last healthy beat
+    await beat('delivered', minutesAgo(60));
+    await beat('failed', minutesAgo(50));
+    await outage({ episodeKey: owed, at: minutesAgo(49) });
+    await beat('failed', minutesAgo(40));
+    await beat('failed', minutesAgo(30));
+    await beat('delivered', minutesAgo(20)); // the episode ends
+    await beat('failed', minutesAgo(10)); // a later run
+
+    const rows = await owedFor([reminderId]);
+
+    expect(rows.map((o) => [o.episodeKey, o.failedBeats])).toEqual([[owed, 3]]);
+    expect(rows[0].reminder).toMatchObject({
+      id: reminderId,
+      title: 'held notices integration fixture',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-1',
+    });
+  });
+
+  it('control: nothing is owed for an episode that has not ended, or that something else holds', async () => {
+    await beat('failed', minutesAgo(50));
+    await beat('failed', minutesAgo(50), otherReminderId);
+    // Ended by the delivered beat below, but each excluded by its own state.
+    const withRecoveryRow = randomUUID();
+    const closed = randomUUID();
+    const legacy = randomUUID();
+    const stillOwed = randomUUID();
+    await outage({ episodeKey: withRecoveryRow, at: minutesAgo(49) });
+    await insertHeld({ kind: 'recovery', episodeKey: withRecoveryRow });
+    await outage({ episodeKey: closed, at: minutesAgo(49), closed: true });
+    await outage({ episodeKey: legacy, at: minutesAgo(49), drainOwned: false });
+    await outage({ episodeKey: stillOwed, at: minutesAgo(49), status: 'pending' });
+    await beat('delivered', minutesAgo(20));
+    // Not ended: the other reminder has failed and never delivered since.
+    await outage({ episodeKey: randomUUID(), at: minutesAgo(49), rid: otherReminderId });
+
+    expect(await owedFor([reminderId, otherReminderId])).toEqual([]);
+  });
+
+  it('every owed all-clear is listed, past a single page of the view', async () => {
+    // 101 episodes ended by one delivered beat: one more than a page.
+    const episodes = Array.from({ length: 101 }, () => randomUUID());
+    await beat('failed', minutesAgo(50));
+    const { error } = await client.from('heartbeat_notifications').insert(
+      episodes.map((e) => ({
+        reminder_id: reminderId,
+        user_id: userId,
+        kind: 'outage',
+        episode_key: e,
+        status: 'delivered',
+        drain_owned: true,
+        payload,
+        failed_beats: 1,
+        created_at: minutesAgo(49),
+      })) as never
+    );
+    expect(error).toBeNull();
+    await beat('delivered', minutesAgo(20));
+
+    const listed = new Set((await owedFor([reminderId])).map((o) => o.episodeKey));
+
+    expect(episodes.filter((e) => !listed.has(e))).toEqual([]);
+  });
+
+  /**
+   * Lumen's scenario. A final run succeeds while its outage notice is still
+   * held, and only the all-clear's own claim fails. After a restart no
+   * reminder is ever due again; the drain alone must send the outage, then
+   * the all-clear, and close the episode.
+   */
+  it('a final run whose all-clear waited unrecorded gets it from the drain alone', async () => {
+    const episodeKey = randomUUID();
+    const { data: fixture, error: fixtureError } = await client
+      .from('scheduled_reminders')
+      .select('*')
+      .eq('id', reminderId)
+      .single();
+    expect(fixtureError).toBeNull();
+    const reminder = fixture as unknown as DueReminder;
+
+    // Scoped to this file's fixture user and reminder: other DB files run in
+    // parallel, and this drain must not send or settle their notices.
+    const scoped = (s: HeartbeatNotificationStore): HeartbeatNotificationStore => ({
+      ...s,
+      listDrainUsers: async () => (await s.listDrainUsers())?.filter((u) => u === userId) ?? null,
+      listOwedRecoveries: async () =>
+        (await s.listOwedRecoveries())?.filter((o) => o.reminder.id === reminderId) ?? null,
+    });
+    const sent: ChannelResponse[] = [];
+    const escalationWith = (s: HeartbeatNotificationStore) =>
+      createHeartbeatEscalation({
+        client,
+        sendToChannel: async (r) => {
+          sent.push(r);
+        },
+        defaultSlug: 'myra',
+        store: scoped(s),
+        quietGate: async () => ({ kind: 'clear' }),
+      });
+
+    // Overnight: a failed beat, its outage notice held.
+    await beat('failed', minutesAgo(31));
+    await outage({ episodeKey, at: minutesAgo(30), status: 'pending' });
+    // The final run succeeds, recorded before the recovery hook runs.
+    await beat('delivered', minutesAgo(5));
+
+    // Only the all-clear's claim fails. It waits behind the held outage.
+    let faulted = false;
+    const faulty: HeartbeatNotificationStore = {
+      ...store,
+      claimNotice: async (key, opts) => {
+        if (key.kind === 'recovery' && !faulted) {
+          faulted = true;
+          return { shouldSend: true, record: null };
+        }
+        return store.claimNotice(key, opts);
+      },
+    };
+    const before = escalationWith(faulty);
+    expect(
+      await before.onRecovery(reminder, 1, {
+        destinationAlreadyAlerted: false,
+        episodeKey,
+        destination: null,
+      })
+    ).toEqual({ alerted: false });
+    expect(faulted).toBe(true);
+    expect(sent).toEqual([]);
+
+    // Restart: a fresh escalation over the healthy store, and only the drain.
+    const after = escalationWith(createHeartbeatNotificationStore(client));
+    await after.drainHeldNotices();
+
+    expect(sent.map((s) => s.content.split('\n')[0])).toEqual([
+      'held content',
+      expect.stringContaining('Heartbeat recovered'),
+    ]);
+    expect(await rowFor('recovery', episodeKey)).toMatchObject({ status: 'delivered' });
+    expect((await rowFor('outage', episodeKey)).episode_closed_at).not.toBeNull();
+
+    // Nothing more is owed.
+    await after.drainHeldNotices();
+    expect(sent).toHaveLength(2);
+  });
 });
