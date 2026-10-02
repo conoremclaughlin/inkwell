@@ -1,8 +1,8 @@
 /**
  * Which reminders may run during the user's quiet hours.
  *
- * Conor, 2026-10-02 ("Yes, do want that"): a reminder can opt in to running
- * overnight, for work an SB does on its own (option B; task 2301cb3c, spec
+ * A reminder can opt in to running overnight, for work an SB does on its own
+ * (Conor's option B, 2026-10-02; task 2301cb3c, spec
  * ink://specs/addressed-reminders §8). Every other reminder is still held until
  * the window ends, exactly as before.
  *
