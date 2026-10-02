@@ -22,6 +22,7 @@
  *   fabricated `routed`.
  */
 
+import { createHash } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
 import { isUuid } from './inklings/inkling-service';
@@ -173,30 +174,49 @@ export function createRequestOf(recipients: string[], title: string): CreateRequ
   };
 }
 
+/** A digest of the words, so the intent can pin them without storing them twice. */
+function contentDigestOf(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
 /**
  * What a client-identified create records on the thread row it creates
  * (inbox_threads.metadata.createIntent), in the same insert, before any
- * participant is written. It is the only durable evidence of what an
- * interrupted create meant, so it is what a retry is held to.
+ * participant is written: its client message id, its recipients as a set,
+ * its full title (not the thread's bounded display title) and a digest of
+ * its words. It is the only durable evidence of what an interrupted create
+ * meant, so it is what a retry is held to.
  */
-export function createIntentOf(clientMessageId: string, request: CreateRequest) {
-  return { clientMessageId, recipients: request.recipients, title: request.title };
+export function createIntentOf(clientMessageId: string, request: CreateRequest, content: string) {
+  return {
+    clientMessageId,
+    recipients: request.recipients,
+    title: request.title,
+    contentDigest: contentDigestOf(content),
+  };
 }
 
 /**
  * Is this thread the one this exact create made? Its recorded intent must
- * name the same client message id, the same recipients (as a set) and the
- * same title. A thread with no recorded intent never matches.
+ * name the same client message id, the same recipients (as a set), the
+ * same title and the same words. A thread with no recorded intent never
+ * matches, and the same id with edited words is not its retry.
  */
 export function matchesCreateIntent(
   threadMetadata: unknown,
   clientMessageId: string,
-  request: CreateRequest
+  request: CreateRequest,
+  content: string
 ): boolean {
   const intent = (threadMetadata as { createIntent?: unknown } | null | undefined)?.createIntent as
-    | { clientMessageId?: unknown; recipients?: unknown; title?: unknown }
+    | { clientMessageId?: unknown; recipients?: unknown; title?: unknown; contentDigest?: unknown }
     | undefined;
-  if (!intent || intent.clientMessageId !== clientMessageId || !Array.isArray(intent.recipients)) {
+  if (
+    !intent ||
+    intent.clientMessageId !== clientMessageId ||
+    intent.contentDigest !== contentDigestOf(content) ||
+    !Array.isArray(intent.recipients)
+  ) {
     return false;
   }
   const recorded = createRequestOf(

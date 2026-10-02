@@ -8149,7 +8149,12 @@ router.post('/threads', async (req: Request, res: Response) => {
       if (thread.created_by_user_id !== authReq.inkUserId) return false;
       if (
         !createRequest ||
-        !matchesCreateIntent(thread.metadata, clientMessageId.value as string, createRequest)
+        !matchesCreateIntent(
+          thread.metadata,
+          clientMessageId.value as string,
+          createRequest,
+          content
+        )
       ) {
         return false;
       }
@@ -8220,7 +8225,7 @@ router.post('/threads', async (req: Request, res: Response) => {
             ...(send.createOnly ? { createOnly: true } : {}),
             // Recorded on the thread row if this send creates it.
             ...(clientMessageId.value && createRequest
-              ? { createIntent: createIntentOf(clientMessageId.value, createRequest) }
+              ? { createIntent: createIntentOf(clientMessageId.value, createRequest, content) }
               : {}),
           }
         );

@@ -146,7 +146,9 @@ function emptyConversation(metadata: Row = {}): Row {
   return thread;
 }
 
-const fernsIntent = { createIntent: createIntentOf(ID, createRequestOf(['fern'], '')) };
+const fernsIntent = {
+  createIntent: createIntentOf(ID, createRequestOf(['fern'], ''), 'private words'),
+};
 
 function members(): string[] {
   return db
@@ -262,6 +264,17 @@ describe('Lumen 09b80921: an interrupted create cannot be taken over', () => {
   }
 });
 
+describe('the recorded intent pins the words (Lumen 77379fb4, 345e579e)', () => {
+  it('the same id, people and title with edited words cannot adopt the empty conversation', async () => {
+    emptyConversation(fernsIntent);
+    const result = await call(body({ content: 'edited words' }));
+    expect(result.status).toBe(409);
+    expect(members()).toEqual(['sb-fern']);
+    expect(db.rows('inbox_thread_messages')).toHaveLength(0);
+    expect(sends).toBe(0);
+  });
+});
+
 describe('the create that recorded its intent is the one that may adopt', () => {
   it('records its intent on the thread row, and its exact retry completes it', async () => {
     failNextMessageInsert();
@@ -269,7 +282,7 @@ describe('the create that recorded its intent is the one that may adopt', () => 
     expect(died.status).toBe(500);
     const [thread] = db.rows('inbox_threads');
     expect((thread.metadata as Row).createIntent).toEqual(
-      createIntentOf(ID, createRequestOf(['fern'], ''))
+      createIntentOf(ID, createRequestOf(['fern'], ''), 'private words')
     );
     expect(db.rows('inbox_thread_messages')).toHaveLength(0);
 
