@@ -327,4 +327,60 @@ d('held notices — real schema', () => {
     expect(users).toContain(userId);
     expect(users).toContain(otherUserId);
   });
+
+  // ── PR #723 re-review: every chunk of users, every page of users ─────────
+
+  /**
+   * The candidate read takes users 100 at a time. 100 users fill the first
+   * chunk with 20 newer notices; the 101st user's notice is older than all of
+   * them. Notices need only the reminder's foreign key, so the users here are
+   * ids on the fixture reminder.
+   */
+  const crossChunkFixture = async () => {
+    const firstChunk = Array.from({ length: 100 }, () => randomUUID());
+    const lateUser = randomUUID();
+    const oldest = `oldest-${randomUUID()}`;
+    // Its own INSERT, before the others, so its created_at is the earliest.
+    await insertHeld({ kind: 'outage', episodeKey: oldest, uid: lateUser });
+    await insertMany(
+      firstChunk
+        .slice(0, 20)
+        .map((uid) => ({ kind: 'outage' as const, episodeKey: `newer-${randomUUID()}`, uid }))
+    );
+    return { firstChunk, lateUser, oldest };
+  };
+
+  it('an older notice for a user past the first 100 is not starved by newer ones', async () => {
+    const { firstChunk, lateUser, oldest } = await crossChunkFixture();
+
+    const batch = await store.listDrainCandidates([...firstChunk, lateUser], 20);
+
+    expect(batch).toHaveLength(20);
+    expect(batch![0].key.episodeKey).toBe(oldest);
+  });
+
+  it('control: the same older notice is first when its user is in the first chunk', async () => {
+    const { firstChunk, lateUser, oldest } = await crossChunkFixture();
+
+    const batch = await store.listDrainCandidates([lateUser, ...firstChunk], 20);
+
+    expect(batch).toHaveLength(20);
+    expect(batch![0].key.episodeKey).toBe(oldest);
+  });
+
+  it('lists every user, past any fixed number of pages', async () => {
+    // 10,001 users: one more than fifty pages of two hundred.
+    const users = Array.from({ length: 10_001 }, () => randomUUID());
+    for (let i = 0; i < users.length; i += 1_000) {
+      await insertMany(
+        users
+          .slice(i, i + 1_000)
+          .map((uid) => ({ kind: 'outage' as const, episodeKey: randomUUID(), uid }))
+      );
+    }
+
+    const listed = new Set(await store.listDrainUsers());
+
+    expect(users.filter((u) => !listed.has(u))).toEqual([]);
+  }, 120_000);
 });

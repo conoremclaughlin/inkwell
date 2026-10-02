@@ -328,6 +328,21 @@ interface NoticeRow {
 const NOTICE_COLUMNS =
   'id, status, attempts, episode_key, destination, failed_beats, next_attempt_at, payload, drain_owned';
 
+/**
+ * A timestamptz as PostgREST returns it, in microseconds since the epoch, so
+ * rows read by separate queries merge in the order Postgres gave each query.
+ * `Date.parse` keeps milliseconds only, and PostgREST trims trailing zeros
+ * from the fraction, so neither the parsed value nor the text compares
+ * exactly on its own. The fraction is read separately and the rest parsed
+ * whole, so no parser rounding enters.
+ */
+export function createdAtMicros(timestamp: string): number {
+  const match = /\.(\d+)/.exec(timestamp);
+  const whole = match ? timestamp.replace(match[0], '') : timestamp;
+  const fraction = (match?.[1] ?? '').padEnd(6, '0').slice(0, 6);
+  return Date.parse(whole) * 1000 + Number(fraction);
+}
+
 export function createHeartbeatNotificationStore(
   client: SupabaseClient<Database>
 ): HeartbeatNotificationStore {
@@ -1075,11 +1090,12 @@ export function createHeartbeatNotificationStore(
 
   /**
    * Users are read a page at a time from a DISTINCT view, so one user's many
-   * rows cannot take up a page another user needs (PR #723 review). The page
-   * count is a runaway bound, far above any real number of users.
+   * rows cannot take up a page another user needs (PR #723 review). Every page
+   * is read: a page bound would return the same prefix of users every tick and
+   * never reach the rest. The keyset cursor only moves forward, and a page
+   * that fails to move it ends the listing.
    */
   const USERS_PAGE = 200;
-  const USERS_MAX_PAGES = 50;
   /** Users per candidate query, to keep the IN list a sensible size. */
   const USERS_PER_QUERY = 100;
 
@@ -1087,7 +1103,7 @@ export function createHeartbeatNotificationStore(
     try {
       const users: string[] = [];
       let after: string | null = null;
-      for (let page = 0; page < USERS_MAX_PAGES; page += 1) {
+      for (;;) {
         let query = client
           .from('heartbeat_notifications_drain_users')
           .select('user_id')
@@ -1106,13 +1122,15 @@ export function createHeartbeatNotificationStore(
         );
         users.push(...rows.map((r) => r.user_id));
         if (rows.length < USERS_PAGE) return users;
-        after = rows[rows.length - 1].user_id;
+        const last = rows[rows.length - 1].user_id;
+        if (last === after) {
+          logger.warn('[Heartbeat] Held-notice user listing stopped advancing', {
+            users: users.length,
+          });
+          return users;
+        }
+        after = last;
       }
-      logger.warn('[Heartbeat] Held-notice user listing reached its page bound', {
-        pages: USERS_MAX_PAGES,
-        pageSize: USERS_PAGE,
-      });
-      return users;
     } catch (err) {
       logger.warn('[Heartbeat] Listing users with held notices threw', {
         error: err instanceof Error ? err.message : String(err),
@@ -1127,6 +1145,7 @@ export function createHeartbeatNotificationStore(
   ) => {
     if (userIds.length === 0 || limit <= 0) return [];
     type Row = {
+      id: string;
       reminder_id: string;
       user_id: string;
       kind: 'outage' | 'recovery';
@@ -1134,6 +1153,7 @@ export function createHeartbeatNotificationStore(
       destination: string | null;
       failed_beats: number | null;
       payload: Json | null;
+      created_at: string;
     };
     try {
       const nowIso = new Date().toISOString();
@@ -1142,20 +1162,33 @@ export function createHeartbeatNotificationStore(
       // the view or in these filters, so the limit applies to eligible rows
       // only: drain-owned, pending, carrying a payload, past backoff, and no
       // all-clear whose outage the drain still owes.
-      for (let i = 0; i < userIds.length && rows.length < limit; i += USERS_PER_QUERY) {
+      //
+      // Every chunk of users is read, each for its own oldest `limit` rows,
+      // and the batch is the oldest `limit` of them all (PR #723 review).
+      // Stopping once the first chunk filled the batch let users who sort
+      // early starve an older notice belonging to a user who sorts late.
+      for (let i = 0; i < userIds.length; i += USERS_PER_QUERY) {
         const { data, error } = await client
           .from('heartbeat_notifications_drain_eligible')
-          .select('reminder_id, user_id, kind, episode_key, destination, failed_beats, payload')
+          .select(
+            'id, reminder_id, user_id, kind, episode_key, destination, failed_beats, payload, created_at'
+          )
           .in('user_id', userIds.slice(i, i + USERS_PER_QUERY))
           .or(`next_attempt_at.is.null,next_attempt_at.lte.${nowIso}`)
           .order('created_at', { ascending: true })
-          .limit(limit - rows.length);
+          .order('id', { ascending: true })
+          .limit(limit);
         if (error) {
           logger.warn('[Heartbeat] Could not read held notices', { error: error.message });
           return null;
         }
         rows.push(...((data as Row[] | null) ?? []));
       }
+      rows.sort(
+        (a, b) =>
+          createdAtMicros(a.created_at) - createdAtMicros(b.created_at) ||
+          (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+      );
 
       return rows.slice(0, limit).map((r) => ({
         key: {
