@@ -361,19 +361,32 @@ interface OwnedChildRecord {
 const ownedChildren = new Set<OwnedChildRecord>();
 
 /**
+ * Whether `turnEpoch` is the generation admitted for `sessionId` right now,
+ * with intake open. Synchronous, so a caller can act on the answer before
+ * anything else runs.
+ *
+ * This is the local registration, taken before the turn's durable `running`
+ * write lands. Telling it apart from a confirmed durable admission is the
+ * caller's job (P2d).
+ */
+export function isGenerationAdmitted(sessionId: string, turnEpoch: string): boolean {
+  if (!intakeOpen) return false;
+  const entry = active.get(sessionId);
+  return entry !== undefined && entry.turnEpoch !== undefined && entry.turnEpoch === turnEpoch;
+}
+
+/**
  * Put a child under the generation `turnEpoch` of `sessionId`. Refused (and
  * undefined) unless that generation is the one admitted for the session now,
- * and once intake has closed: the caller then stops the child itself.
- * Compare-and-act on the epoch, like clearActiveRunIfOwner.
+ * and once intake has closed. Compare-and-act on the epoch, like
+ * clearActiveRunIfOwner.
  */
 export function attachRunChild(
   sessionId: string,
   turnEpoch: string,
   child: OwnedChild
 ): ChildOwnership | undefined {
-  if (!intakeOpen) return undefined;
-  const entry = active.get(sessionId);
-  if (!entry || entry.turnEpoch === undefined || entry.turnEpoch !== turnEpoch) return undefined;
+  if (!isGenerationAdmitted(sessionId, turnEpoch)) return undefined;
   const record: OwnedChildRecord = { sessionId, turnEpoch, child };
   ownedChildren.add(record);
   return {

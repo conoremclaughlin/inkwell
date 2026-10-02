@@ -15,8 +15,18 @@
 
 import { isAbsolute } from 'path';
 import { STOP_GIVE_UP_MS, STOP_GRACE_MS } from '@inklabs/shared';
-import type { BackendHost, BackendTurnHandle } from '@inklabs/shared/providers';
-import { attachRunChild, getActiveRun, type ChildOwnership } from './active-runs.js';
+import {
+  startBackendTurn,
+  type BackendHost,
+  type BackendRunRequest,
+  type BackendTurnHandle,
+} from '@inklabs/shared/providers';
+import {
+  attachRunChild,
+  getActiveRun,
+  isGenerationAdmitted,
+  type ChildOwnership,
+} from './active-runs.js';
 
 /**
  * Added to a minted credential's lifetime for clock skew between this server
@@ -30,7 +40,23 @@ export const SERVER_HOST_REFUSALS = {
   invalidCeiling: 'a spawn asked for credentials without a finite, positive ceiling',
   missingCredential:
     'no Inkwell credential could be minted for this hosted spawn, so it was not started',
+  notAdmitted:
+    "the run's generation is no longer the one admitted for its session, or intake has closed; nothing is minted or started for it",
+  wrongSession: 'a hosted turn must name the session its generation was admitted for',
 } as const;
+
+/**
+ * A refusal from the host's sessionEnv. The runner asks for credentials
+ * before it spawns and spawns nothing when the ask throws (BackendHost.
+ * sessionEnv), so a turn that rejects with one of these provably started no
+ * child. Any other rejection says nothing about the child.
+ */
+export class HostedSpawnRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HostedSpawnRefusal';
+  }
+}
 
 export interface ServerBackendHostInput {
   /**
@@ -71,13 +97,17 @@ function requireFinitePositive(value: number, what: string): void {
 /**
  * The host for one admitted run. Throws unless the generation named is the
  * one admitted for its session now, and unless every input is usable.
+ *
+ * Admission at creation is not standing authority: a takeover or a shutdown
+ * can end it at any time. The host asks again before and after each mint,
+ * and once more right before each spawn (admitSpawn), so an old host mints
+ * nothing and starts nothing (Lumen, #701 873209b4).
  */
 export function createServerBackendHost(input: ServerBackendHostInput): BackendHost {
   const { admission } = input;
+  const admitted = () => isGenerationAdmitted(admission.sessionId, admission.turnEpoch);
   const run = getActiveRun(admission.sessionId);
-  if (!run || run.turnEpoch === undefined || run.turnEpoch !== admission.turnEpoch) {
-    throw new Error('a server backend host serves only the generation admitted for its session');
-  }
+  if (!run || !admitted()) throw new Error(SERVER_HOST_REFUSALS.notAdmitted);
   requireFinitePositive(input.budgetMs, 'the run budget');
   if (!Number.isFinite(run.startedAt)) {
     throw new RangeError('the admitted run has no usable start time');
@@ -109,18 +139,22 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
     skillMcpServers: (cwd) => input.skillMcpServers(cwd),
     async sessionEnv({ hardTimeoutMs }) {
       if (!Number.isFinite(hardTimeoutMs) || hardTimeoutMs <= 0) {
-        throw new RangeError(SERVER_HOST_REFUSALS.invalidCeiling);
+        throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.invalidCeiling);
       }
       // The runner already clamps the ceiling to the deadline; the lifetime
       // is measured from the deadline here too, so no ceiling a caller passes
       // can stretch a credential past the run.
       const remainingMs = deadlineAt - now();
-      if (remainingMs <= 0) throw new Error(SERVER_HOST_REFUSALS.deadlinePassed);
+      if (remainingMs <= 0) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.deadlinePassed);
+      if (!admitted()) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.notAdmitted);
       const lifetimeMs =
         Math.min(hardTimeoutMs, remainingMs) + STOP_GRACE_MS + STOP_GIVE_UP_MS + MINT_SKEW_MS;
       const token = await input.mintAccessToken({ ttlSeconds: Math.ceil(lifetimeMs / 1000) });
+      // Asked again after the await: admission lost during the mint means the
+      // credential exists but is handed to nothing.
+      if (!admitted()) throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.notAdmitted);
       if (typeof token !== 'string' || token.length === 0) {
-        throw new Error(SERVER_HOST_REFUSALS.missingCredential);
+        throw new HostedSpawnRefusal(SERVER_HOST_REFUSALS.missingCredential);
       }
       return {
         INK_ACCESS_TOKEN: token,
@@ -131,38 +165,75 @@ export function createServerBackendHost(input: ServerBackendHostInput): BackendH
     inkwellMcpUrl: input.inkwellMcpUrl,
     resolveBinary: (name) => input.resolveBinary(name),
     warn: (message) => input.warn(message),
+    admitSpawn: admitted,
   };
 }
 
+export interface HostedBackendTurn {
+  handle: BackendTurnHandle;
+  /** The turn's place under its generation, held from before it started. */
+  ownership: ChildOwnership;
+}
+
 /**
- * Put a started turn's child under its admitted generation, and give it back
- * only once its exit is confirmed. A turn that settles without a confirmed
- * exit (childExited false, or a rejection) stays owned, so shutdown still
- * stops it and reports it as unconfirmed. When the generation is no longer
- * the admitted one, or intake has closed, the turn is aborted at once and
- * nothing is owned.
+ * Start a turn for an admitted run, owned from before it can spawn: the one
+ * public launch for the server host. Synchronous from the admission check to
+ * the start, so no takeover or shutdown can fall between them.
+ *
+ * Throws, with nothing started and nothing owned, unless the generation is
+ * admitted now and the request names its session. Once started, the turn is
+ * given back only on a confirmed exit. A turn that settles without one
+ * (childExited false, or a rejection) stays owned, so a drain still stops it
+ * and reports it unconfirmed. Losing admission later does not drop it: the
+ * host then mints and spawns nothing for it (admitSpawn), and the refusal
+ * itself is a confirmed exit, since no child started.
  */
-export function ownBackendTurn(
-  admission: { sessionId: string; turnEpoch: string },
-  handle: BackendTurnHandle
-): ChildOwnership | undefined {
-  const settled = handle.result.then((result) => ({ childExited: result.childExited }));
+export function startHostedBackendTurn(
+  hostInput: ServerBackendHostInput,
+  request: Omit<BackendRunRequest, 'host'>
+): HostedBackendTurn {
+  const { sessionId, turnEpoch } = hostInput.admission;
+  if (request.inkSessionId !== sessionId) throw new Error(SERVER_HOST_REFUSALS.wrongSession);
+  const host = createServerBackendHost(hostInput);
+
+  let handle: BackendTurnHandle | undefined;
+  let confirm!: (value: { childExited: boolean }) => void;
+  let fail!: (error: unknown) => void;
+  const settled = new Promise<{ childExited: boolean }>((resolve, reject) => {
+    confirm = resolve;
+    fail = reject;
+  });
   // Handled here so a rejection waiting for a reader never crashes the
   // process; stopOwnedChildren still sees it reject.
   settled.catch(() => undefined);
-  const ownership = attachRunChild(admission.sessionId, admission.turnEpoch, {
-    abort: () => handle.abort(),
+
+  const ownership = attachRunChild(sessionId, turnEpoch, {
+    abort: () => handle?.abort(),
     settled,
   });
-  if (!ownership) {
-    handle.abort();
-    return undefined;
+  if (!ownership) throw new Error(SERVER_HOST_REFUSALS.notAdmitted);
+
+  try {
+    handle = startBackendTurn({ ...request, host });
+  } catch (error) {
+    // Nothing started: the reservation is given back.
+    ownership.release();
+    throw error;
   }
   handle.result.then(
     (result) => {
+      confirm({ childExited: result.childExited });
       if (result.childExited) ownership.release();
     },
-    () => undefined
+    (error: unknown) => {
+      if (error instanceof HostedSpawnRefusal) {
+        // The host withheld the credentials, so no child ever started.
+        confirm({ childExited: true });
+        ownership.release();
+        return;
+      }
+      fail(error);
+    }
   );
-  return ownership;
+  return { handle, ownership };
 }

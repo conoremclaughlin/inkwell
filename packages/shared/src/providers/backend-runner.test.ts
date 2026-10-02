@@ -50,6 +50,7 @@ import {
   startBackendTurn,
   CONFIG_REFUSED_EXIT_CODE,
   DEFAULT_TURN_HARD_TIMEOUT_MS,
+  SPAWN_NOT_ADMITTED_EXIT_CODE,
   EFFECTIVE_CONFIG_CHECK_FAILED,
   type BackendRunRequest,
 } from './backend-runner.js';
@@ -264,6 +265,58 @@ describe('runBackendTurn', () => {
       ).rejects.toThrow('synthetic mint failure');
       expect(spawnMock).not.toHaveBeenCalled();
       expect(state.cleanups).toBe(1);
+    } finally {
+      spawnMock.mockReset();
+    }
+  });
+
+  // A run that loses its admission during the mint (a takeover, intake
+  // closing) must start no child (Lumen, #701 873209b4). The host is asked
+  // after the mint, and a false answer spawns nothing.
+  it('starts no child when the host withdraws admission after the mint', async () => {
+    spawnMock.mockReset().mockImplementation(() => createMockChild(0));
+    state.cleanups = 0;
+    const order: string[] = [];
+    let admitted = true;
+    try {
+      const host = fakeHost({
+        sessionEnv: async () => {
+          order.push('mint');
+          admitted = false;
+          return {};
+        },
+        admitSpawn: () => {
+          order.push('admit');
+          return admitted;
+        },
+      });
+      const result = await runBackendTurn({
+        ...spawnContext,
+        backend: 'claude',
+        sbSlug: 'wren',
+        prompt: 'ping',
+        host,
+      });
+      expect(order).toEqual(['mint', 'admit']);
+      expect(result).toMatchObject({
+        success: false,
+        exitCode: SPAWN_NOT_ADMITTED_EXIT_CODE,
+        childExited: true,
+      });
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(state.cleanups).toBe(1);
+
+      // Control: the same host, still admitted, spawns.
+      admitted = true;
+      const spawned = await runBackendTurn({
+        ...spawnContext,
+        backend: 'claude',
+        sbSlug: 'wren',
+        prompt: 'ping',
+        host: fakeHost({ admitSpawn: () => true }),
+      });
+      expect(spawned.success).toBe(true);
+      expect(spawnMock).toHaveBeenCalledTimes(1);
     } finally {
       spawnMock.mockReset();
     }

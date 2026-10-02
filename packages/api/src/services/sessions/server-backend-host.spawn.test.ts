@@ -48,8 +48,9 @@ vi.mock('../../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { runBackendTurn, startBackendTurn } from '@inklabs/shared/providers';
+import { SPAWN_NOT_ADMITTED_EXIT_CODE, runBackendTurn } from '@inklabs/shared/providers';
 import {
+  closeIntakeAndDrain,
   listOwnedChildren,
   registerActiveRun,
   resetActiveRuns,
@@ -58,27 +59,35 @@ import {
 import {
   SERVER_HOST_REFUSALS,
   createServerBackendHost,
-  ownBackendTurn,
+  startHostedBackendTurn,
   type ServerBackendHostInput,
 } from './server-backend-host.js';
 
 const admission = { sessionId: 'sess-hosted', turnEpoch: 'epoch-hosted' };
 let home: string;
 
-function admit(startedAt = Date.now()) {
+function admit(startedAt = Date.now(), turnEpoch = admission.turnEpoch) {
   registerActiveRun({
     sessionId: admission.sessionId,
     userId: 'user-synthetic',
     sbSlug: 'synthetic-sb',
     backend: 'ink',
     startedAt,
-    turnEpoch: admission.turnEpoch,
+    turnEpoch,
   });
 }
 
+/** A takeover: a newer generation admitted for the same session. */
+const takeOver = () => admit(Date.now(), 'epoch-newer');
+
 function host(overrides: Partial<ServerBackendHostInput> = {}) {
+  const { input, mintAccessToken } = hostInput(overrides);
+  return { host: createServerBackendHost(input), mintAccessToken };
+}
+
+function hostInput(overrides: Partial<ServerBackendHostInput> = {}) {
   const mintAccessToken = vi.fn(() => 'minted-for-this-spawn');
-  const made = createServerBackendHost({
+  const input: ServerBackendHostInput = {
     admission,
     budgetMs: 60_000,
     // The server's captured env: its own session, credentials and a key no
@@ -106,8 +115,8 @@ function host(overrides: Partial<ServerBackendHostInput> = {}) {
     skillMcpServers: async () => [],
     warn: () => undefined,
     ...overrides,
-  });
-  return { host: made, mintAccessToken };
+  };
+  return { input, mintAccessToken };
 }
 
 const request = (backend: string, made: ReturnType<typeof host>['host']) => ({
@@ -120,6 +129,11 @@ const request = (backend: string, made: ReturnType<typeof host>['host']) => ({
   studioId: 'studio-hosted',
   host: made,
 });
+
+const unhosted = (backend: string) => {
+  const { host: _host, ...rest } = request(backend, undefined as never);
+  return rest;
+};
 
 beforeEach(() => {
   resetActiveRuns();
@@ -239,9 +253,7 @@ describe('a turn run through the server host', () => {
   it('is stopped through its admitted generation, which waits for the child to close', async () => {
     admit();
     exitAtOnce.value = false;
-    const { host: made } = host();
-    const handle = startBackendTurn(request('claude', made));
-    expect(ownBackendTurn(admission, handle)).toBeDefined();
+    const { handle } = startHostedBackendTurn(hostInput().input, unhosted('claude'));
     await vi.waitFor(() => expect(spawned).toHaveLength(1));
 
     const stopped = await stopOwnedChildren(2_000);
@@ -250,5 +262,64 @@ describe('a turn run through the server host', () => {
     expect(stopped).toEqual({ confirmed: [admission], unconfirmed: [] });
     expect(listOwnedChildren()).toEqual([]);
     expect(await handle.result).toMatchObject({ childExited: true, exitCode: 143 });
+  });
+
+  // Lumen, #701 873209b4: creation-time admission is not standing authority.
+  it('a takeover after the start: nothing is minted or spawned, and the turn is given back', async () => {
+    admit();
+    const { input, mintAccessToken } = hostInput();
+    const { handle } = startHostedBackendTurn(input, unhosted('codex'));
+    takeOver();
+
+    await expect(handle.result).rejects.toThrow(SERVER_HOST_REFUSALS.notAdmitted);
+    await vi.waitFor(() => expect(listOwnedChildren()).toEqual([]));
+    expect(mintAccessToken).not.toHaveBeenCalled();
+    expect(spawned).toHaveLength(0);
+    expect(execFile).not.toHaveBeenCalled();
+  });
+
+  it('a takeover after the mint, before the spawn: the host withdraws the spawn', async () => {
+    admit();
+    const { input } = hostInput({
+      // The last host call before the spawn; the takeover lands during it.
+      resolveBinary: async (name) => {
+        takeOver();
+        return name;
+      },
+    });
+    const { handle } = startHostedBackendTurn(input, unhosted('claude'));
+
+    expect(await handle.result).toMatchObject({
+      success: false,
+      exitCode: SPAWN_NOT_ADMITTED_EXIT_CODE,
+      childExited: true,
+    });
+    expect(spawned).toHaveLength(0);
+    await vi.waitFor(() => expect(listOwnedChildren()).toEqual([]));
+  });
+
+  it('a takeover after the spawn: the older child stays owned and a drain still stops it', async () => {
+    admit();
+    exitAtOnce.value = false;
+    const { handle } = startHostedBackendTurn(hostInput().input, unhosted('claude'));
+    await vi.waitFor(() => expect(spawned).toHaveLength(1));
+    takeOver();
+
+    expect(listOwnedChildren()).toEqual([admission]);
+    const stopped = await stopOwnedChildren(2_000);
+
+    expect(stopped).toEqual({ confirmed: [admission], unconfirmed: [] });
+    expect(await handle.result).toMatchObject({ childExited: true });
+  });
+
+  it('intake closing before the start: nothing starts', async () => {
+    admit();
+    await closeIntakeAndDrain(10);
+
+    expect(() => startHostedBackendTurn(hostInput().input, unhosted('claude'))).toThrow(
+      SERVER_HOST_REFUSALS.notAdmitted
+    );
+    expect(spawned).toHaveLength(0);
+    expect(listOwnedChildren()).toEqual([]);
   });
 });
