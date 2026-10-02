@@ -12,10 +12,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { CLIENT_MESSAGE_INDEX } from '../services/send-receipt';
 import { FakePostgrest, type Row } from './fake-postgrest';
 
 export const AWAKEN_REQUEST_INDEX = 'agent_identities_user_awaken_request_key';
-export const CLIENT_MESSAGE_INDEX = 'inbox_thread_messages_thread_client_message_key';
+export { CLIENT_MESSAGE_INDEX };
 
 function metadataKey(row: Row, key: string): string | null {
   const value = (row.metadata as Row | null | undefined)?.[key];

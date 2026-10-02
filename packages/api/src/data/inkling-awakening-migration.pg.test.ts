@@ -24,11 +24,19 @@
  * Without the variable the suite is skipped, so CI passes it by.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { Client } from 'pg';
+
+// The real logger loads .env.local into the process. Nothing here may see
+// the shared stack's settings, even unused.
+vi.mock('../utils/logger', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+import { CLIENT_MESSAGE_INDEX, isClientMessageConflict } from '../services/send-receipt';
 
 const ADMIN_URL = process.env.INKLING_PG_TEST_ADMIN_URL;
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../../supabase/migrations');
@@ -516,7 +524,12 @@ describe.skipIf(!ADMIN_URL)('inkling self-serve awakening migration (throwaway P
         (e: PgError) => e
       );
       expect(error?.code).toBe('23505');
-      expect(error?.constraint).toBe('inbox_thread_messages_thread_client_message_key');
+      expect(error?.constraint).toBe(CLIENT_MESSAGE_INDEX);
+      // The routes recognise a lost race by this wording, carried through
+      // the send handler's "Failed to send thread message: <message>".
+      expect(
+        isClientMessageConflict(new Error(`Failed to send thread message: ${error?.message}`))
+      ).toBe(true);
 
       await expect(db.query(INSERT, [t2, 'hello', meta])).resolves.toBeTruthy();
       await db.query(INSERT, [t1, 'no id', '{}']);

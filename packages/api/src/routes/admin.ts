@@ -92,6 +92,14 @@ import {
   validateDisplayName,
   type InklingScope,
 } from '../services/inklings/inkling-service';
+import {
+  CLIENT_MESSAGE_CONFLICT,
+  deliveryFromSendResult,
+  isClientMessageConflict,
+  lookUpClientMessage,
+  parseClientMessageId,
+  recordDelivery,
+} from '../services/send-receipt';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -7943,8 +7951,20 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads
- * Body: { key, recipients: string[], content, title?, priority?, studioSlug? }
- *   → { success, created, messageId, threadId, threadKey }
+ * Body: { key, recipients: string[], content, title?, priority?, studioSlug?,
+ *         clientMessageId?: uuid }
+ *   → { success, created, messageId, threadId, threadKey, warning,
+ *       threadKeyWarning, delivery, replayed }
+ *
+ * Retries (services/send-receipt.ts): the client sends the same
+ * clientMessageId on every retry of one message. The thread key is the
+ * client's too, and stays the same across retries, so a retried create
+ * lands on the same thread, where a unique index on (thread, clientMessageId)
+ * refuses a second copy. A retry answers with the original messageId and
+ * replayed: true, and wakes nobody. If a server ever generated the key
+ * instead, a retry would open a second thread and this guarantee would not
+ * hold. `delivery` comes from positive evidence only (routed, partial,
+ * unrouted, or unknown).
  *
  * Start a thread from the dashboard or phone — or continue one that already
  * exists under that key. This is the only admin route that CREATES threads;
@@ -8004,7 +8024,13 @@ router.post('/threads', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'studioSlug applies to a single recipient' });
       return;
     }
+    const clientMessageId = parseClientMessageId(req.body?.clientMessageId);
+    if (!clientMessageId.ok) {
+      res.status(400).json({ error: 'clientMessageId must be a UUID' });
+      return;
+    }
 
+    // Membership first: a replay is only ever looked up for a member.
     if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
       refuseThreadWrite(res, authReq.inkWorkspaceRole, 'start a thread');
       return;
@@ -8012,45 +8038,99 @@ router.post('/threads', async (req: Request, res: Response) => {
 
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
-    const { data: existing } = await supabase
-      .from('inbox_threads')
-      .select('id')
-      .eq('workspace_id', authReq.inkWorkspaceId)
-      .eq('thread_key', key)
-      .maybeSingle();
-
-    const result = await handleSendToInbox(
-      {
+    const findThread = async (): Promise<{ id: string } | null> => {
+      const { data } = await supabase
+        .from('inbox_threads')
+        .select('id')
+        .eq('workspace_id', authReq.inkWorkspaceId)
+        .eq('thread_key', key)
+        .maybeSingle();
+      return (data as { id: string } | null) ?? null;
+    };
+    // A retry of a message this thread already stored: the original answers,
+    // and nobody is woken again.
+    const answeredAsReplay = async (threadId: string | undefined): Promise<boolean> => {
+      if (!clientMessageId.value || !threadId) return false;
+      const lookup = await lookUpClientMessage(supabase, {
+        threadId,
+        clientMessageId: clientMessageId.value,
         userId: authReq.inkUserId,
-        threadKey: key,
         content,
-        // A studio-pinned send is the handler's single-recipient form; the
-        // group form (recipients[]) cannot carry a studio.
-        ...(studioSlug
-          ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
-          : { recipients: uniqueRecipients, triggerAll: true }),
-        ...(title ? { subject: title } : {}),
-        ...(priority ? { priority } : {}),
-        metadata: { sentBy: 'user', channel: 'admin-api' },
-      },
-      dataComposer,
-      // The person is the sender, in the workspace the middleware resolved —
-      // server-side context the public tool schema never carries (§3, §6).
-      {
-        sender: {
-          principal: userPrincipal(authReq.inkUserId),
-          workspaceId: authReq.inkWorkspaceId,
-        },
+      });
+      if (lookup.kind === 'conflict') {
+        res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
+        return true;
       }
-    );
+      if (lookup.kind !== 'replay') return false;
+      res.json({
+        success: true,
+        created: false,
+        messageId: lookup.messageId,
+        threadId: lookup.threadId,
+        threadKey: key,
+        warning: null,
+        threadKeyWarning: null,
+        delivery: lookup.delivery,
+        replayed: true,
+      });
+      return true;
+    };
+
+    const existing = await findThread();
+    if (await answeredAsReplay(existing?.id)) return;
+
+    let result: Awaited<ReturnType<typeof handleSendToInbox>>;
+    try {
+      result = await handleSendToInbox(
+        {
+          userId: authReq.inkUserId,
+          threadKey: key,
+          content,
+          // A studio-pinned send is the handler's single-recipient form; the
+          // group form (recipients[]) cannot carry a studio.
+          ...(studioSlug
+            ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
+            : { recipients: uniqueRecipients, triggerAll: true }),
+          ...(title ? { subject: title } : {}),
+          ...(priority ? { priority } : {}),
+          metadata: {
+            sentBy: 'user',
+            channel: 'admin-api',
+            ...(clientMessageId.value ? { clientMessageId: clientMessageId.value } : {}),
+          },
+        },
+        dataComposer,
+        // The person is the sender, in the workspace the middleware resolved —
+        // server-side context the public tool schema never carries (§3, §6).
+        {
+          sender: {
+            principal: userPrincipal(authReq.inkUserId),
+            workspaceId: authReq.inkWorkspaceId,
+          },
+        }
+      );
+    } catch (error) {
+      // A concurrent retry of this message won the store: the unique index
+      // refused this copy before anything was dispatched. Its message is
+      // the answer.
+      if (
+        clientMessageId.value &&
+        isClientMessageConflict(error) &&
+        (await answeredAsReplay((await findThread())?.id))
+      ) {
+        return;
+      }
+      throw error;
+    }
 
     const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
-    const parsed = JSON.parse(text) as {
+    const parsed = JSON.parse(text) as Record<string, unknown> & {
       success?: boolean;
       error?: string;
       messageId?: string;
       threadId?: string;
       warning?: string;
+      threadKeyWarning?: string;
     };
 
     if (parsed.messageId == null && parsed.success === false) {
@@ -8060,6 +8140,11 @@ router.post('/threads', async (req: Request, res: Response) => {
       return;
     }
 
+    const delivery = deliveryFromSendResult(parsed);
+    if (clientMessageId.value && parsed.messageId) {
+      await recordDelivery(supabase, parsed.messageId, delivery);
+    }
+
     res.json({
       success: true,
       created: !existing,
@@ -8067,6 +8152,9 @@ router.post('/threads', async (req: Request, res: Response) => {
       threadId: parsed.threadId ?? existing?.id ?? null,
       threadKey: key,
       warning: parsed.warning ?? null,
+      threadKeyWarning: parsed.threadKeyWarning ?? null,
+      delivery,
+      replayed: false,
     });
   } catch (error) {
     logger.error('Failed to start thread:', error);
@@ -8076,7 +8164,14 @@ router.post('/threads', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads/reply
- * Body: { key, content, priority? } → { success, messageId, threadId, triggered }
+ * Body: { key, content, priority?, clientMessageId?: uuid }
+ *   → { success, messageId, threadId, triggered, warning, threadKeyWarning,
+ *       delivery, replayed }
+ *
+ * A retry carrying the same clientMessageId answers with the original
+ * messageId and replayed: true, and wakes nobody; the same id with other
+ * words is a 409. `delivery` comes from positive evidence only (see
+ * services/send-receipt.ts and POST /threads above).
  *
  * A human reply into an existing thread — the dashboard and mobile analogue of
  * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
@@ -8110,11 +8205,17 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'content exceeds 64KB' });
       return;
     }
+    const clientMessageId = parseClientMessageId(req.body?.clientMessageId);
+    if (!clientMessageId.ok) {
+      res.status(400).json({ error: 'clientMessageId must be a UUID' });
+      return;
+    }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
+    // Membership first: a replay is only ever looked up for a member.
     if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
       refuseThreadWrite(res, authReq.inkWorkspaceRole, 'reply');
       return;
@@ -8136,6 +8237,35 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
+    // A retry of a reply this thread already stored: the original answers,
+    // and nobody is woken again.
+    const answeredAsReplay = async (): Promise<boolean> => {
+      if (!clientMessageId.value) return false;
+      const lookup = await lookUpClientMessage(supabase, {
+        threadId: thread.id,
+        clientMessageId: clientMessageId.value,
+        userId: authReq.inkUserId,
+        content,
+      });
+      if (lookup.kind === 'conflict') {
+        res.status(409).json({ error: CLIENT_MESSAGE_CONFLICT });
+        return true;
+      }
+      if (lookup.kind !== 'replay') return false;
+      res.json({
+        success: true,
+        messageId: lookup.messageId,
+        threadId: lookup.threadId,
+        triggered: [],
+        warning: null,
+        threadKeyWarning: null,
+        delivery: lookup.delivery,
+        replayed: true,
+      });
+      return true;
+    };
+    if (await answeredAsReplay()) return;
+
     const dataComposer = await getDataComposer();
     // Dispatch operates on the SB participants (§7): a person's reply wakes
     // every SB in the thread; the people reading it are never spawned.
@@ -8149,25 +8279,39 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await handleSendToInbox(
-      {
-        userId: authReq.inkUserId,
-        threadKey: key,
-        content,
-        recipients: participants,
-        // Human reply: wake everyone who is part of the conversation.
-        triggerAll: true,
-        ...(priority ? { priority } : {}),
-        metadata: { sentBy: 'user', channel: 'admin-api' },
-      },
-      dataComposer,
-      {
-        sender: {
-          principal: userPrincipal(authReq.inkUserId),
-          workspaceId: authReq.inkWorkspaceId,
+    let result: Awaited<ReturnType<typeof handleSendToInbox>>;
+    try {
+      result = await handleSendToInbox(
+        {
+          userId: authReq.inkUserId,
+          threadKey: key,
+          content,
+          recipients: participants,
+          // Human reply: wake everyone who is part of the conversation.
+          triggerAll: true,
+          ...(priority ? { priority } : {}),
+          metadata: {
+            sentBy: 'user',
+            channel: 'admin-api',
+            ...(clientMessageId.value ? { clientMessageId: clientMessageId.value } : {}),
+          },
         },
+        dataComposer,
+        {
+          sender: {
+            principal: userPrincipal(authReq.inkUserId),
+            workspaceId: authReq.inkWorkspaceId,
+          },
+        }
+      );
+    } catch (error) {
+      // A concurrent retry of this reply won the store: the unique index
+      // refused this copy before anything was dispatched.
+      if (clientMessageId.value && isClientMessageConflict(error) && (await answeredAsReplay())) {
+        return;
       }
-    );
+      throw error;
+    }
 
     const parsed = JSON.parse((result.content[0] as { text: string }).text) as Record<
       string,
@@ -8182,17 +8326,26 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       return;
     }
 
+    const delivery = deliveryFromSendResult(parsed);
+    if (clientMessageId.value) {
+      await recordDelivery(supabase, String(parsed.messageId), delivery);
+    }
+
     res.json({
       // The handler folds trigger-routing outcomes into its own `success`,
       // and it can come back false when the message stored but a wake
       // bounced (observed: fresh user, both participants' triggers failed);
       // this route's success means what the person asked: "is my reply in
-      // the thread" — the messageId is the proof.
+      // the thread" — the messageId is the proof. Whether anyone was woken
+      // is `delivery`'s to say.
       success: true,
       messageId: parsed.messageId,
       threadId: parsed.threadId ?? thread.id,
       triggered: parsed.triggered ?? null,
       warning: parsed.warning ?? null,
+      threadKeyWarning: parsed.threadKeyWarning ?? null,
+      delivery,
+      replayed: false,
     });
   } catch (error) {
     logger.error('Failed to send thread reply:', error);
