@@ -4733,8 +4733,26 @@ export class SessionService implements ISessionService {
     // The repo-scoped main studio — this is the re-scoped former tier 8. It
     // only runs against a repo we resolved, never the server's ambient cwd.
     // Scoped by the canonical identity too — this rung dropped it and looked
-    // up by slug (Lumen, PR #514 round 3).
-    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, sbSlug, sbId);
+    // up by slug (Lumen, PR #514 round 3). A failed read refuses like the
+    // lookup above: reading it as "none" deferred a create, and for a
+    // presence thread that is a studioless placement nobody decided (task
+    // bd4657a0).
+    const { data: main, error: mainError } = await mainStudioQuery(
+      this.supabase,
+      userId,
+      repoRoot,
+      sbSlug,
+      sbId
+    ).maybeSingle();
+    if (mainError) {
+      logger.warn('[StudioResolve] Repo main-studio lookup failed', {
+        repoRoot,
+        sbSlug,
+        error: mainError.message,
+      });
+      return null;
+    }
+    const mainStudioId: string | undefined = main?.id;
     if (mainStudioId) {
       logger.debug('[StudioResolve] Resolved repo-scoped main studio for caller repo', {
         repoRoot,
@@ -5668,6 +5686,35 @@ This session will continue with a fresh context after compaction. Your identity,
 }
 
 /**
+ * The root-checkout studio of a repo: the identity's studio whose worktree IS
+ * the repo root. resolveMainStudio reads a failed lookup as "none"; the repo
+ * tiers cannot, because "no studio in this repo" is what places presence work
+ * studioless (task bd4657a0), so they run this query themselves.
+ */
+function mainStudioQuery(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  repoRoot: string,
+  sbSlug?: string,
+  sbId?: string | null
+) {
+  let q = supabase
+    .from('studios')
+    .select('id, updated_at')
+    .eq('user_id', userId)
+    .eq('repo_root', repoRoot)
+    .eq('worktree_path', repoRoot)
+    .in('status', ['active', 'idle', 'archived'])
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  // Canonical identity when we have it — a slug can name different
+  // identities in different workspaces (Lumen, PR #514 round 3).
+  if (sbId) q = q.eq('sb_id', sbId);
+  else if (sbSlug) q = q.eq('agent_id', sbSlug);
+  return q;
+}
+
+/**
  * Resolve 'main' to a studio ID. "Main" = the root repo.
  *
  * Finds the most recently updated studio whose repo_root matches the
@@ -5688,22 +5735,7 @@ export async function resolveMainStudio(
 ): Promise<string | undefined> {
   const targetRoot = repoRoot || process.cwd();
 
-  const lookupQuery = () => {
-    let q = supabase
-      .from('studios')
-      .select('id, updated_at')
-      .eq('user_id', userId)
-      .eq('repo_root', targetRoot)
-      .eq('worktree_path', targetRoot)
-      .in('status', ['active', 'idle', 'archived'])
-      .order('updated_at', { ascending: false })
-      .limit(1);
-    // Canonical identity when we have it — a slug can name different
-    // identities in different workspaces (Lumen, PR #514 round 3).
-    if (options?.sbId) q = q.eq('sb_id', options.sbId);
-    else if (sbSlug) q = q.eq('agent_id', sbSlug);
-    return q;
-  };
+  const lookupQuery = () => mainStudioQuery(supabase, userId, targetRoot, sbSlug, options?.sbId);
 
   const { data: match } = await lookupQuery().maybeSingle();
   if (match?.id) return match.id;
