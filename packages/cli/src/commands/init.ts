@@ -8,20 +8,25 @@
  * completion routine every creator runs (task c3b34be8), so a studio that
  * came up partial — no identity, no permissions, no Codex hooks — is made
  * whole by `cd`ing into it and running `ink init`. By default it syncs
- * `.mcp.json`, `.env.local` and the Claude permissions from the main
- * worktree (`--no-root-sync` generates defaults instead) and writes the
- * identity file and registers the studio row (`--no-studio-setup` for a
- * checkout deliberately not tracked as a studio). In the main worktree it
- * behaves as it always has: hooks, backend config, skills.
+ * `.mcp.json` and `.env.local` from the main worktree (`--no-root-sync`
+ * generates defaults instead), writes the studio builder permission
+ * profile into a settings file that has none (`--permission-profile
+ * reviewer` for a review checkout; `--inherit-claude-permissions` copies
+ * the main worktree's rules instead), and writes the identity file and
+ * registers the studio row (`--no-studio-setup` for a checkout
+ * deliberately not tracked as a studio). An existing permissions object is
+ * never replaced. In the main worktree it behaves as it always has: hooks,
+ * backend config, skills.
  *
  * Commands:
  *   init    Initialize Ink in the current repo
  */
 
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import chalk from 'chalk';
 import { execFileSync } from 'child_process';
 import { basename, dirname } from 'path';
+import type { StudioPermissionProfile } from '@inklabs/shared';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { readIdentityJson, resolveSlug } from '../backends/identity.js';
 import { lookupAgentBackend } from '../backends/agent-backend.js';
@@ -93,6 +98,12 @@ export interface InitOptions {
   rootSync?: boolean;
   /** commander: `--no-studio-setup` sets studioSetup=false; absent means true. */
   studioSetup?: boolean;
+  /** Copy the main worktree's Claude permissions instead of a profile. Only `true` copies. */
+  inheritClaudePermissions?: boolean;
+  /** The profile for a settings file without permissions; the server passes it from the studio row. */
+  permissionProfile?: StudioPermissionProfile;
+  /** commander: `--no-permissions` sets permissions=false (the studio's record could not be read). */
+  permissions?: boolean;
   json?: boolean;
 }
 
@@ -171,6 +182,9 @@ export async function runInit(
     ...(backend ? { backend } : {}),
     ...(options.purpose ? { purpose: options.purpose } : {}),
     ...(options.studioId ? { studioId: options.studioId } : {}),
+    ...(options.inheritClaudePermissions === true ? { inheritPermissions: true } : {}),
+    ...(options.permissionProfile ? { permissionProfile: options.permissionProfile } : {}),
+    ...(options.permissions === false ? { permissions: false } : {}),
     ...(options.force ? { force: true } : {}),
     ...(deps.register ? { register: deps.register } : {}),
     ...(deps.syncSkills ? { syncSkills: deps.syncSkills } : {}),
@@ -301,11 +315,25 @@ export function registerInitCommand(program: Command): void {
     .option('-p, --purpose <desc>', 'Purpose recorded on the studio identity and row')
     .option(
       '--no-root-sync',
-      'Generate default .mcp.json and permissions instead of copying them from the main worktree'
+      'Generate a default .mcp.json instead of copying .mcp.json and .env.local from the main worktree'
     )
     .option(
       '--no-studio-setup',
       'Skip the identity file and studio registration (a checkout deliberately not tracked as a studio)'
+    )
+    .option(
+      '--inherit-claude-permissions',
+      "Copy the main worktree's Claude permissions instead of the studio profile (an existing permissions object is always kept)"
+    )
+    .addOption(
+      new Option(
+        '--permission-profile <name>',
+        'Claude permission profile for a studio whose settings have none (default: builder)'
+      ).choices(['builder', 'reviewer'])
+    )
+    .option(
+      '--no-permissions',
+      "Leave Claude permissions alone (the server passes this when it could not read the studio's record)"
     )
     .option('--json', 'Print the report as JSON (used by the server)')
     .action(initCommand);

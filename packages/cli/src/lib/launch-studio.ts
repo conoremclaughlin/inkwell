@@ -16,8 +16,10 @@
  * launching slug, and then the routine registers a row for it, as `ink
  * init` there would. When the server cannot say — unreachable, a timeout,
  * a refused credential — the owner is UNKNOWN and nothing that names an
- * owner is written: hooks, permissions and backend config are completed,
- * identity and registration are left for a launch that can ask. A guess
+ * owner is written: hooks and backend config are completed; identity,
+ * registration and Claude permissions (whose profile is read from the same
+ * row, and whose scratch paths name the owner) are left for a launch that
+ * can ask. A guess
  * here is durable: completeStudio never replaces an owner it finds, so a
  * transient failure that wrote the visitor's slug would have kept it after
  * the server came back (Lumen, PR #699 round 1).
@@ -27,7 +29,12 @@
  */
 
 import chalk from 'chalk';
-import { auditStudio, type StudioCheckId } from '@inklabs/shared';
+import {
+  auditStudio,
+  studioPermissionProfile,
+  type StudioCheckId,
+  type StudioPermissionProfile,
+} from '@inklabs/shared';
 import { detectWorktree, runInit, type WorktreePlacement } from '../commands/init.js';
 import type { CompleteStudioReport, StepResult } from './studio-complete.js';
 import { callInkTool } from './ink-mcp.js';
@@ -36,6 +43,8 @@ import { sbDebugLog } from './sb-debug.js';
 export interface LaunchStudioRow {
   id?: string;
   sbSlug?: string;
+  /** From the row's checkout record (`studioPermissionProfile`), never from the worktree. */
+  permissionProfile?: StudioPermissionProfile;
 }
 
 /**
@@ -74,17 +83,16 @@ const NOT_FOUND = /studio not found/i;
  */
 async function lookupStudioByPath(worktreePath: string): Promise<LaunchStudioLookup> {
   try {
-    const result = await callInkTool<{ studio?: { id?: string; sbSlug?: string } }>(
-      'get_studio',
-      { path: worktreePath },
-      { timeoutMs: 3000, idempotent: true }
-    );
+    const result = await callInkTool<{
+      studio?: { id?: string; sbSlug?: string; branch?: string; metadata?: unknown };
+    }>('get_studio', { path: worktreePath }, { timeoutMs: 3000, idempotent: true });
     if (result?.studio?.id) {
       return {
         status: 'found',
         row: {
           id: result.studio.id,
           ...(result.studio.sbSlug ? { sbSlug: result.studio.sbSlug } : {}),
+          permissionProfile: studioPermissionProfile(result.studio),
         },
       };
     }
@@ -116,13 +124,22 @@ export async function completeStudioForLaunch(
   const lookup = await (deps.lookupStudio ?? lookupStudioByPath)(placement.toplevel);
   const init = deps.runInit ?? runInit;
   if (lookup.status === 'unknown') {
-    const report = await init(placement.toplevel, { agent: launchSlug, studioSetup: false });
+    // No row, no profile: permissions are left for a launch that can ask,
+    // as identity is. A guessed profile would be kept by every later run.
+    const report = await init(placement.toplevel, {
+      agent: launchSlug,
+      studioSetup: false,
+      permissions: false,
+    });
     return { ran: true, ownerUnknown: lookup.reason, missingBefore: audit.missing, report };
   }
   const owner = (lookup.status === 'found' && lookup.row.sbSlug) || launchSlug;
   const report = await init(placement.toplevel, {
     agent: owner,
     ...(lookup.status === 'found' && lookup.row.id ? { studioId: lookup.row.id } : {}),
+    ...(lookup.status === 'found' && lookup.row.permissionProfile
+      ? { permissionProfile: lookup.row.permissionProfile }
+      : {}),
   });
   return { ran: true, owner, missingBefore: audit.missing, report };
 }

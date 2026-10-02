@@ -9,37 +9,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import chalk from 'chalk';
 import type { Command } from 'commander';
+import { DEFAULT_CLAUDE_ALLOW_RULES, DEFAULT_CLAUDE_DENY_RULES } from '@inklabs/shared';
 
 const CLAUDE_SETTINGS_PATH = '.claude/settings.local.json';
 
 /**
- * Default deny rules — destructive commands that should require confirmation
- * even when everything else is auto-approved.
+ * The full-auto defaults, from the one list in @inklabs/shared. This file
+ * kept its own copy until design v3 (item 6), and the copy had drifted: it
+ * never gained `mcp__playwright__*`.
  */
-const DEFAULT_DENY_RULES: string[] = [
-  'Bash(rm -rf *)',
-  'Bash(git push --force *)',
-  'Bash(git push -f *)',
-  'Bash(git reset --hard *)',
-  'Bash(git clean -fd *)',
-  'Bash(git clean -f *)',
-  'Bash(git checkout -- .)',
-];
-
-/**
- * Default allow rules — broad permissions for normal development work.
- */
-const DEFAULT_ALLOW_RULES: string[] = [
-  'Bash(*)',
-  'Edit(*)',
-  'Write(*)',
-  'Read(*)',
-  'WebFetch(*)',
-  'WebSearch',
-  'mcp__inkwell__*',
-  'mcp__github__*',
-  'mcp__supabase__*',
-];
+const DEFAULT_DENY_RULES: string[] = [...DEFAULT_CLAUDE_DENY_RULES];
+const DEFAULT_ALLOW_RULES: string[] = [...DEFAULT_CLAUDE_ALLOW_RULES];
 
 interface ClaudeSettings {
   permissions?: {

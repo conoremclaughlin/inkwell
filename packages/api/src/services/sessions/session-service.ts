@@ -60,6 +60,7 @@ import {
   classifyError,
   isPathWithinWorkspaceAsync,
   isPreAcceptanceRefusal,
+  studioPermissionProfile,
   type ErrorClassification,
 } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
@@ -5433,6 +5434,14 @@ This session will continue with a fresh context after compaction. Your identity,
   ): Promise<void> {
     if (!workingDirectory) return;
     const rowId = studioId && studioId !== 'main' ? studioId : undefined;
+    // One read of the row serves both lookups, and only on the incomplete path.
+    let rowRead: ReturnType<StudiosRepository['findById']> | undefined;
+    const readRow = () => {
+      const repo = this.getStudiosRepo();
+      if (!repo) throw new Error('no studios repository to look the studio up in');
+      rowRead ??= repo.findById(rowId as string);
+      return rowRead;
+    };
     try {
       await ensureStudioComplete(workingDirectory, {
         sbSlug,
@@ -5443,11 +5452,14 @@ This session will continue with a fresh context after compaction. Your identity,
         // then writes nothing that names an owner (Lumen, PR #699).
         owner: async () => {
           if (!rowId) return null;
-          const repo = this.getStudiosRepo();
-          if (!repo) throw new Error('no studios repository to look the owner up in');
-          const row = await repo.findById(rowId);
+          const row = await readRow();
           return row?.sbSlug ?? null;
         },
+        // The permission profile comes from the row, never the checkout: a
+        // detached review checkout is a reviewer. No studio on the session is
+        // a confirmed builder; a failed read throws, and no permissions are
+        // written (design v3, item 5).
+        profile: async () => (rowId ? studioPermissionProfile(await readRow()) : 'builder'),
       });
     } catch (err) {
       logger.debug('Studio checklist before spawn failed (non-fatal)', {
