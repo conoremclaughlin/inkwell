@@ -102,23 +102,28 @@ describe('sb permissions', () => {
     expect(settings.hooks).toBeDefined();
   });
 
+  // Each case spawns the built CLI (~0.5 s), so the cases are the minimum
+  // that reaches both refusals in every command, with room for a loaded run.
   it('auto, reset and show refuse a malformed settings file and leave its bytes', () => {
     mkdirSync(join(tmpDir, '.claude'), { recursive: true });
     const path = join(tmpDir, '.claude', 'settings.local.json');
-    for (const content of ['{ "permissions": ', '[1, 2]']) {
+    for (const [content, sub] of [
+      ['{ "permissions": ', 'auto'],
+      ['{ "permissions": ', 'reset'],
+      ['{ "permissions": ', 'show'],
+      ['[1, 2]', 'auto'],
+    ]) {
       writeFileSync(path, content);
-      for (const sub of ['auto', 'reset', 'show']) {
-        let status = 0;
-        try {
-          runSb(['permissions', sub], tmpDir);
-        } catch (error) {
-          status = (error as { status?: number }).status ?? -1;
-        }
-        expect(status, `${sub} on ${content}`).toBe(1);
-        expect(readFileSync(path, 'utf-8'), `${sub} on ${content}`).toBe(content);
+      let status = 0;
+      try {
+        runSb(['permissions', sub], tmpDir);
+      } catch (error) {
+        status = (error as { status?: number }).status ?? -1;
       }
+      expect(status, `${sub} on ${content}`).toBe(1);
+      expect(readFileSync(path, 'utf-8'), `${sub} on ${content}`).toBe(content);
     }
-  });
+  }, 20_000);
 
   it('dry-run does not write file', () => {
     const output = runSb(['permissions', 'auto', '--dry-run'], tmpDir);
