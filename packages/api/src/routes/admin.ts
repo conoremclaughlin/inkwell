@@ -85,6 +85,13 @@ import {
 } from '../services/thread-key/thread-conversation';
 import { openVerifiedMedia } from '../utils/media-path';
 import { describeCurrentWorkFromRow } from '../services/sessions/current-work';
+import {
+  InklingError,
+  InklingService,
+  isUuid,
+  validateDisplayName,
+  type InklingScope,
+} from '../services/inklings/inkling-service';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -3803,6 +3810,114 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to get user identity history:', error);
     res.status(500).json(errorJson('Failed to get user identity history', error));
+  }
+});
+
+// =============================================================================
+// Inklings (the Inkling app's awakening and naming)
+// =============================================================================
+//
+// Contract v3 (inkling:thread:app-build 242d45bf, amended 58202c0a). The
+// logic lives in services/inklings/inkling-service.ts; these handlers check
+// the role, validate the body, and map refusals to their status. Every one
+// is scoped to the person and the workspace the middleware resolved, so an
+// x-ink-workspace-id header moves all three together. None runs a model,
+// opens a thread or wakes anyone.
+
+function inklingScope(authReq: AdminAuthRequest): InklingScope {
+  return { userId: authReq.inkUserId, workspaceId: authReq.inkWorkspaceId };
+}
+
+async function inklingService(): Promise<InklingService> {
+  return new InklingService((await getDataComposer()).getClient());
+}
+
+function answerInklingError(res: Response, label: string, error: unknown): void {
+  if (error instanceof InklingError) {
+    res.status(error.status).json({ error: error.message });
+    return;
+  }
+  logger.error(`${label}:`, error);
+  res.status(500).json(errorJson(label, error));
+}
+
+/**
+ * GET /api/admin/inklings → { inklings: Inkling[] }, oldest first.
+ *
+ * Only inklings born through this flow: never the account's other SBs, and
+ * no fallback to /individuals. Reading is every role's, like threads; the
+ * list holds only the person's own inklings.
+ */
+router.get('/inklings', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const inklings = await (await inklingService()).list(inklingScope(authReq));
+    res.json({ inklings });
+  } catch (error) {
+    answerInklingError(res, 'Failed to list inklings', error);
+  }
+});
+
+/**
+ * POST /api/admin/inklings/awaken
+ * Body: { clientRequestId: uuid }
+ *   201 { inkling, replayed: false }  a new inkling
+ *   200 { inkling, replayed: true }   this request id already awakened one
+ *   409                               the id was used in another workspace
+ *
+ * The client keeps clientRequestId across retries of one awakening; a new
+ * id is a new inkling. Two racing retries create one identity (a unique
+ * index), and the loser answers with the winner.
+ */
+router.post('/inklings/awaken', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'awaken an inkling');
+      return;
+    }
+    const clientRequestId = req.body?.clientRequestId;
+    if (!isUuid(clientRequestId)) {
+      res.status(400).json({ error: 'clientRequestId must be a UUID' });
+      return;
+    }
+
+    const result = await (await inklingService()).awaken(inklingScope(authReq), clientRequestId);
+    res.status(result.replayed ? 200 : 201).json(result);
+  } catch (error) {
+    answerInklingError(res, 'Failed to awaken an inkling', error);
+  }
+});
+
+/**
+ * POST /api/admin/inklings/:id/name
+ * Body: { displayName } → 200 { inkling }
+ *
+ * Trimmed, 1–32 Unicode code points, no control characters (400). The same
+ * name again, or a new one later, answers the same way: naming is optional
+ * and renamable forever. The slug never changes. 409 for an identity not
+ * born through this flow (the app can never rename Myra); 404 for an id
+ * that is unknown or belongs to another person or workspace.
+ */
+router.post('/inklings/:id/name', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.inkWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.inkWorkspaceRole, 'name an inkling');
+      return;
+    }
+    const displayName = validateDisplayName(req.body?.displayName);
+    if (!displayName.ok) {
+      res.status(400).json({ error: displayName.reason });
+      return;
+    }
+
+    const inkling = await (
+      await inklingService()
+    ).name(inklingScope(authReq), req.params.id, displayName.value);
+    res.json({ inkling });
+  } catch (error) {
+    answerInklingError(res, 'Failed to name the inkling', error);
   }
 });
 

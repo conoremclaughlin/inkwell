@@ -1,0 +1,363 @@
+/**
+ * InklingService against an in-memory database that evaluates its filters
+ * (src/test/fake-postgrest.ts), so a lookup that forgets the person or the
+ * workspace finds the wrong rows here too. The redemption function itself
+ * is proven on real Postgres in src/data/inkling-awakening-migration.pg.test.ts;
+ * the race through the unique index there, the service's handling of losing
+ * it here.
+ */
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SupabaseClient } from '@supabase/supabase-js';
+
+vi.mock('../../utils/logger', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+import {
+  InklingError,
+  InklingService,
+  MAX_DISPLAY_NAME_CODE_POINTS,
+  buildInklingSoul,
+  validateDisplayName,
+} from './inkling-service';
+import { createInklingDb, seedOwnSb, AWAKEN_REQUEST_INDEX } from '../../test/fake-inkling-db';
+import type { FakePostgrest, Row } from '../../test/fake-postgrest';
+
+const ME = {
+  userId: '11111111-1111-4111-8111-111111111111',
+  workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+};
+const OTHER_WORKSPACE = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const SOMEONE_ELSE = {
+  userId: '22222222-2222-4222-8222-222222222222',
+  workspaceId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+};
+const REQUEST = '0b6f3c1e-5d1a-4a8e-9c1b-6f0e2d3c4b5a';
+
+let db: FakePostgrest;
+let service: InklingService;
+
+beforeEach(() => {
+  db = createInklingDb();
+  service = new InklingService(db as unknown as SupabaseClient);
+});
+
+function rowsOf(table: string): Row[] {
+  return db.rows(table);
+}
+
+describe('awaken', () => {
+  it('creates one inkling: complete at creation, unnamed, tagged, through a parentless self-serve token', async () => {
+    const { inkling, replayed } = await service.awaken(ME, REQUEST);
+
+    expect(replayed).toBe(false);
+    expect(inkling).toEqual({
+      id: expect.any(String),
+      sbSlug: expect.stringMatching(/^kindle-/),
+      displayName: null,
+      createdAt: expect.any(String),
+      nameable: true,
+    });
+
+    const [identity] = rowsOf('agent_identities');
+    expect(identity).toMatchObject({
+      id: inkling.id,
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      agent_id: inkling.sbSlug,
+      name: 'Unnamed inkling',
+      created_at: inkling.createdAt,
+    });
+    expect(identity.metadata).toEqual({
+      prototype: true,
+      client: 'inkling-mobile',
+      awakenRequestId: REQUEST,
+      named: false,
+      kindleId: expect.any(String),
+      onboarding: false,
+    });
+    expect(identity.soul).toBe(buildInklingSoul());
+
+    const [lineage] = rowsOf('kindle_lineage');
+    expect(lineage).toMatchObject({
+      child_sb_id: inkling.id,
+      kindle_method: 'self_serve',
+      onboarding_status: 'complete',
+      parent_agent_id: null,
+      parent_user_id: null,
+    });
+    expect(lineage.completed_at).toEqual(expect.any(String));
+
+    const [token] = rowsOf('kindle_tokens');
+    expect(token).toMatchObject({
+      creator_user_id: ME.userId,
+      creator_agent_id: null,
+      status: 'used',
+    });
+  });
+
+  it('a sequential retry with the same request id returns the same inkling and creates nothing', async () => {
+    const first = await service.awaken(ME, REQUEST);
+    const second = await service.awaken(ME, REQUEST);
+
+    expect(second).toEqual({ inkling: first.inkling, replayed: true });
+    expect(rowsOf('agent_identities')).toHaveLength(1);
+    expect(rowsOf('kindle_lineage')).toHaveLength(1);
+    // The pre-check answered: no second token was minted, no second redemption ran.
+    expect(rowsOf('kindle_tokens')).toHaveLength(1);
+    expect(db.log.filter((e) => e.op === 'rpc')).toHaveLength(1);
+  });
+
+  it('losing a race to a concurrent retry returns the winner, and revokes the token the loser minted', async () => {
+    // The winner commits after this request's pre-check and before its own
+    // redemption: the redemption then fails on the awakenRequestId index.
+    const realRedeem = db.rpcHandlers.redeem_kindle_token;
+    let raced = false;
+    db.rpcHandlers.redeem_kindle_token = (args, fake) => {
+      if (!raced) {
+        raced = true;
+        const winnerToken = fake.seed('kindle_tokens', {
+          token: 'winner',
+          status: 'active',
+          creator_user_id: ME.userId,
+          creator_agent_id: null,
+        });
+        const won = realRedeem({ ...args, p_token: winnerToken.token }, fake);
+        expect(won.error).toBeNull();
+      }
+      return realRedeem(args, fake);
+    };
+
+    const result = await service.awaken(ME, REQUEST);
+
+    expect(result.replayed).toBe(true);
+    expect(rowsOf('agent_identities')).toHaveLength(1);
+    expect(result.inkling.id).toBe(rowsOf('agent_identities')[0].id);
+    const loserToken = rowsOf('kindle_tokens').find((t) => t.token !== 'winner');
+    expect(loserToken?.status).toBe('revoked');
+  });
+
+  it('the stand-in redemption really fails on the index (the race above is not vacuous)', async () => {
+    await service.awaken(ME, REQUEST);
+    db.seed('kindle_tokens', {
+      token: 'second',
+      status: 'active',
+      creator_user_id: ME.userId,
+      creator_agent_id: null,
+    });
+    const result = await db.rpc('redeem_kindle_token', {
+      p_token: 'second',
+      p_new_user_id: ME.userId,
+      p_workspace_id: ME.workspaceId,
+      p_identity: { metadata: { awakenRequestId: REQUEST } },
+      p_kindle_method: 'self_serve',
+    });
+    expect(result.error?.message).toContain(AWAKEN_REQUEST_INDEX);
+  });
+
+  it("the same request id in another workspace is a 409, never the other workspace's inkling", async () => {
+    await service.awaken(ME, REQUEST);
+
+    const attempt = service.awaken({ ...ME, workspaceId: OTHER_WORKSPACE }, REQUEST);
+    await expect(attempt).rejects.toBeInstanceOf(InklingError);
+    await expect(
+      service.awaken({ ...ME, workspaceId: OTHER_WORKSPACE }, REQUEST)
+    ).rejects.toMatchObject({
+      status: 409,
+    });
+    expect(rowsOf('agent_identities')).toHaveLength(1);
+    expect(rowsOf('kindle_tokens')).toHaveLength(1);
+  });
+
+  it("another person may use the same request id: lookups are the person's own", async () => {
+    const mine = await service.awaken(ME, REQUEST);
+    const theirs = await service.awaken(SOMEONE_ELSE, REQUEST);
+    expect(theirs.replayed).toBe(false);
+    expect(theirs.inkling.id).not.toBe(mine.inkling.id);
+  });
+
+  it('a failed redemption with no winner revokes its token and reports the failure', async () => {
+    db.rpcHandlers.redeem_kindle_token = () => ({ data: null, error: { message: 'boom' } });
+
+    await expect(service.awaken(ME, REQUEST)).rejects.toThrow(/boom/);
+    expect(rowsOf('kindle_tokens')[0].status).toBe('revoked');
+    expect(rowsOf('agent_identities')).toHaveLength(0);
+  });
+
+  it('touches only identity, lineage and token tables: no thread, no message, no wake', async () => {
+    await service.awaken(ME, REQUEST);
+    const touched = [...new Set(db.log.map((e) => e.table))].sort();
+    expect(touched).toEqual(['agent_identities', 'kindle_tokens', 'redeem_kindle_token']);
+  });
+});
+
+describe('the awakening soul', () => {
+  const soul = buildInklingSoul();
+
+  it('has no values interview and proposes no names', () => {
+    expect(soul).not.toMatch(/Values Interview/i);
+    expect(soul).not.toMatch(/propose 3-4 names/i);
+    expect(soul).not.toMatch(/What matters most to you in a collaborator/);
+    expect(soul).toMatch(/There's no interview/);
+  });
+
+  it('leaves naming to the person and never presses', () => {
+    expect(soul).toMatch(/never name you at all/);
+    expect(soul).toMatch(/Don't ask for a name, don't suggest names/);
+  });
+
+  it("starts with nobody else's memories and claims no feelings it can't have", () => {
+    expect(soul).toMatch(/carry nobody else's memories/);
+    expect(soul).toMatch(/Don't claim feelings/);
+  });
+});
+
+describe('list', () => {
+  it("lists only the person's inklings in this workspace, oldest first, unnamed as null", async () => {
+    seedOwnSb(db, ME, 'myra'); // the account's own SB: never listed
+    const first = await service.awaken(ME, REQUEST);
+    const second = await service.awaken(ME, '3c9d2a7e-8f41-4b6c-9a2d-1e0f5b4c3d2a');
+    await service.awaken(
+      { ...ME, workspaceId: OTHER_WORKSPACE },
+      '5e8a1b2c-3d4f-4e6a-8b9c-0d1e2f3a4b5c'
+    );
+    await service.awaken(SOMEONE_ELSE, '7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d');
+
+    const listed = await service.list(ME);
+    expect(listed).toEqual([first.inkling, second.inkling]);
+  });
+
+  it('a tagged identity without a self-serve lineage is not an inkling', async () => {
+    db.seed('agent_identities', {
+      user_id: ME.userId,
+      workspace_id: ME.workspaceId,
+      agent_id: 'lookalike',
+      name: 'Lookalike',
+      metadata: { client: 'inkling-mobile', named: true },
+    });
+    expect(await service.list(ME)).toEqual([]);
+  });
+
+  it('shows the name once named', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    await service.name(ME, inkling.id, 'Pip');
+    expect((await service.list(ME))[0]).toMatchObject({ id: inkling.id, displayName: 'Pip' });
+  });
+});
+
+describe('validateDisplayName', () => {
+  it('counts code points: 32 CJK characters pass, 33 fail', () => {
+    const name32 = '墨'.repeat(MAX_DISPLAY_NAME_CODE_POINTS);
+    expect(validateDisplayName(name32)).toEqual({ ok: true, value: name32 });
+    expect(validateDisplayName(name32 + '墨')).toMatchObject({ ok: false });
+    // An astral character is one code point, though two UTF-16 units.
+    const emoji32 = '🦋'.repeat(32);
+    expect(emoji32.length).toBe(64);
+    expect(validateDisplayName(emoji32)).toEqual({ ok: true, value: emoji32 });
+  });
+
+  it('trims, and refuses empty, non-string and control characters', () => {
+    expect(validateDisplayName('  小墨  ')).toEqual({ ok: true, value: '小墨' });
+    for (const bad of [
+      '',
+      '   ',
+      42,
+      null,
+      'Pi\u0000p',
+      'Pi\np',
+      'Pi\u007fp',
+      'Pi\u2028p',
+      'Pi\ud800p',
+    ]) {
+      expect(validateDisplayName(bad), JSON.stringify(bad)).toMatchObject({ ok: false });
+    }
+  });
+
+  it('keeps joiners inside emoji sequences', () => {
+    expect(validateDisplayName('👩‍🎨')).toEqual({ ok: true, value: '👩‍🎨' });
+  });
+});
+
+describe('name', () => {
+  it('sets the display name, records the chosen name, and never touches the slug', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+
+    const named = await service.name(ME, inkling.id, '小墨');
+
+    expect(named).toEqual({ ...inkling, displayName: '小墨' });
+    const [identity] = rowsOf('agent_identities');
+    expect(identity.agent_id).toBe(inkling.sbSlug);
+    expect(identity.name).toBe('小墨');
+    expect(identity.metadata).toMatchObject({ named: true, awakenRequestId: REQUEST });
+    expect(rowsOf('kindle_lineage')[0].chosen_name).toBe('小墨');
+  });
+
+  it('is idempotent: the same name again writes nothing and answers the same', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    const first = await service.name(ME, inkling.id, 'Pip');
+    const writes = db.log.filter((e) => e.op === 'update').length;
+
+    const again = await service.name(ME, inkling.id, 'Pip');
+
+    expect(again).toEqual(first);
+    expect(db.log.filter((e) => e.op === 'update').length).toBe(writes);
+  });
+
+  it('renames later, any number of times; the slug stays', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    await service.name(ME, inkling.id, 'Pip');
+    const renamed = await service.name(ME, inkling.id, 'Wick');
+    expect(renamed).toMatchObject({ id: inkling.id, sbSlug: inkling.sbSlug, displayName: 'Wick' });
+    expect(rowsOf('kindle_lineage')[0].chosen_name).toBe('Wick');
+  });
+
+  it('409s for an identity that was not born through this flow: the app can never rename Myra', async () => {
+    const myra = seedOwnSb(db, ME, 'myra');
+    await expect(service.name(ME, myra.id as string, 'Not Myra')).rejects.toMatchObject({
+      status: 409,
+    });
+    expect(rowsOf('agent_identities').find((r) => r.id === myra.id)?.name).toBe('Myra');
+  });
+
+  it("404s for an unknown id, another person's inkling, or another workspace", async () => {
+    const theirs = await service.awaken(SOMEONE_ELSE, REQUEST);
+    const mine = await service.awaken(ME, REQUEST);
+
+    for (const [scope, id] of [
+      [ME, theirs.inkling.id],
+      [ME, '99999999-9999-4999-8999-999999999999'],
+      [ME, 'not-a-uuid'],
+      [{ ...ME, workspaceId: OTHER_WORKSPACE }, mine.inkling.id],
+    ] as const) {
+      await expect(service.name(scope, id, 'Pip')).rejects.toMatchObject({ status: 404 });
+    }
+    expect(rowsOf('agent_identities').every((r) => r.name === 'Unnamed inkling')).toBe(true);
+  });
+
+  it('a concurrent metadata write is kept, not clobbered: the losing write re-reads and retries', async () => {
+    const { inkling } = await service.awaken(ME, REQUEST);
+    const identity = rowsOf('agent_identities')[0];
+    const identityReads = () =>
+      db.log.filter((e) => e.table === 'agent_identities' && e.op === 'select').length;
+    const readsBeforeNaming = identityReads();
+    const originalFrom = db.from.bind(db);
+    let interleaved = false;
+    db.from = (table: string) => {
+      // After naming has read the row and before it writes, someone saves
+      // runtimeConfig on the same identity.
+      if (table === 'agent_identities' && !interleaved && identityReads() > readsBeforeNaming) {
+        interleaved = true;
+        identity.metadata = { ...(identity.metadata as Row), runtimeConfig: { model: 'x' } };
+        identity.updated_at = db.now();
+      }
+      return originalFrom(table);
+    };
+
+    await service.name(ME, inkling.id, 'Pip');
+
+    expect(interleaved).toBe(true);
+    expect(identity.name).toBe('Pip');
+    expect(identity.metadata).toMatchObject({ named: true, runtimeConfig: { model: 'x' } });
+  });
+});
