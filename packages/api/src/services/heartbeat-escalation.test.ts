@@ -220,8 +220,12 @@ function makeFakeStore(seed: Record<string, Partial<FakeRow>> = {}) {
         if (row.nextAttemptAt !== null && row.nextAttemptAt > Date.now()) continue;
         const [reminderId, kind, episodeKey] = k.split('|');
         if (kind === 'recovery') {
+          // Only an outage the drain can still send blocks its all-clear, as
+          // in the eligibility view: a stranded one never will be sent.
           const outage = rows.get(`${reminderId}|outage|${episodeKey}`);
-          if (outage && outage.status !== 'delivered') continue;
+          if (outage && outage.status !== 'delivered' && outage.drainOwned && outage.payload) {
+            continue;
+          }
         }
         out.push({
           key: {
@@ -604,10 +608,16 @@ describe('heartbeat escalation', () => {
 
     it('sends exactly one recovery notice carrying the outage length', async () => {
       const { client } = makeClient();
+      // The outage this all-clear closes has landed. An all-clear never goes
+      // out ahead of its outage, so that is the precondition for sending one.
+      const store = makeFakeStore({
+        [`rem-001|outage|${FIRST_FOR_DESTINATION.episodeKey}`]: { status: 'delivered' },
+      });
       const { onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
         defaultSlug: 'myra',
+        store,
       });
 
       await onRecovery(makeReminder(), 8, FIRST_FOR_DESTINATION);
@@ -1689,6 +1699,64 @@ describe('held notices drain when quiet hours end', () => {
       '✅ Heartbeat recovered',
     ]);
     expect(store.closeEpisode).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * PR #723 re-review. The causal check must not depend on the all-clear's
+   * own claim having produced a row: a failed recovery INSERT is no evidence
+   * that the outage was delivered.
+   */
+  it('an all-clear whose own claim failed still waits for a pending outage', async () => {
+    const store = makeFakeStore({
+      [outageKey]: {
+        status: 'pending',
+        drainOwned: true,
+        userId: 'user-1',
+        payload: { channel: 'telegram', target: '123456789', content: 'x' },
+      },
+    });
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+  });
+
+  it('an all-clear whose own claim failed waits when its outage cannot be read either', async () => {
+    // The store can neither record the all-clear nor say whether its outage
+    // landed. Nothing is evidence that the outage reached the human, so the
+    // all-clear waits, and says loudly that nothing durable holds it.
+    const store = makeFakeStore();
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    store.outageStatus.mockResolvedValueOnce('unknown');
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: false });
+    expect(sendToChannel).not.toHaveBeenCalled();
+    expect(store.closeEpisode).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('its own claim was not recorded'),
+      expect.objectContaining({ outage: 'unknown', claimRecorded: false })
+    );
+  });
+
+  it('control: an all-clear whose own claim failed still goes out after a delivered outage', async () => {
+    const store = makeFakeStore({ [outageKey]: { status: 'delivered' } });
+    store.claimNotice.mockImplementationOnce(async () => ({ shouldSend: true, record: null }));
+    decision = { kind: 'clear' };
+    const { onRecovery } = escalation(store);
+
+    const result = await onRecovery(makeReminder(), 2, FIRST_FOR_DESTINATION);
+
+    expect(result).toEqual({ alerted: true });
+    expect(sendToChannel.mock.calls[0][0].content).toContain('Heartbeat recovered');
   });
 
   it('an all-clear does not wait on an outage row that nothing can ever send', async () => {

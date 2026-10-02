@@ -609,23 +609,34 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
 
     // An all-clear never overtakes its outage (PR #723 review). If the outage
     // notice is still owed (held overnight, or its send failing) or its state
-    // cannot be read, this all-clear waits: it is already drain-owned from the
-    // claim, and the drain sends it once the outage is delivered. Only when
-    // the claim itself could not be recorded is there nothing to wait on, and
-    // then the old send-anyway rule stands.
-    if (record) {
-      const outage = await store.outageStatus(key);
-      if (outage === 'pending' || outage === 'unknown') {
+    // cannot be read, this all-clear waits. Asked whether or not the all-clear's
+    // own claim produced a row: a failed recovery INSERT is no evidence that
+    // the outage was delivered.
+    // - Claim recorded: the all-clear is drain-owned, and the drain sends it
+    //   once the outage is delivered.
+    // - Claim not recorded: nothing durable holds the all-clear. Its outage
+    //   row does: once that row is delivered, the episode stays open and
+    //   findOwedRecovery reconstructs the all-clear on the next healthy beat
+    //   (retryOwedRecovery). If the state was unknown because the outage row
+    //   was never written either (the store failing for the whole episode),
+    //   nothing reconstructs it, and the error below is the only record.
+    // A delivered, absent or stranded outage lets the all-clear through as
+    // before, including the send-through rule when the claim failed.
+    const outage = await store.outageStatus(key);
+    if (outage === 'pending' || outage === 'unknown') {
+      const fields = { reminderId: reminder.id, failedBeats, outage, claimRecorded: !!record };
+      if (record) {
         logger.info(
           '[Heartbeat] All-clear waits for its outage notice — the drain sends it after',
-          {
-            reminderId: reminder.id,
-            failedBeats,
-            outage,
-          }
+          fields
         );
-        return { alerted: false };
+      } else {
+        logger.error(
+          '[Heartbeat] All-clear waits for its outage notice, and its own claim was not recorded — only a delivered outage row lets a later healthy beat reconstruct it',
+          fields
+        );
       }
+      return { alerted: false };
     }
 
     if (await holdForQuietHours(reminder, key, recoveryContent)) {
