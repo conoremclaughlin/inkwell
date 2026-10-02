@@ -5453,16 +5453,24 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private async resolveLaunchPermissions(
     studioId: string
-  ): Promise<NonNullable<ClaudeRunnerConfig['launchPermissions']>> {
+  ): Promise<ClaudeRunnerConfig['launchPermissions']> {
     const repo = this.getStudiosRepo();
     if (!repo) throw new Error('Launch refused: no studios repository to read the profile from');
     const row = await repo.findById(studioId);
     if (!row)
       throw new Error(`Launch refused: studio ${studioId} has no row to read a profile from`);
+    // The root (home) studio is the main checkout itself. Its lane rules live
+    // in its own settings.local.json until phase B designs a root launch
+    // profile, so it gets none here: logged, not refused (review 44db8c0c,
+    // P2 1).
+    if (!row.repoRoot || row.worktreePath === row.repoRoot) {
+      logger.info('Root studio: no launch profile (phase B)', { studioId });
+      return undefined;
+    }
     return {
       profile: studioPermissionProfile(row),
       owner: row.sbSlug ?? undefined,
-      mainRoot: row.repoRoot && row.repoRoot !== row.worktreePath ? row.repoRoot : null,
+      mainRoot: row.repoRoot,
     };
   }
 

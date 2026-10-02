@@ -322,6 +322,19 @@ describe('a Claude launch in a studio is given its profile from the row (design 
     });
   });
 
+  it('the root (home) studio is not given one: root profiles are phase B, and the launch goes ahead', async () => {
+    // resolveMainStudio gives a root-repo session a real studio row whose
+    // worktree is the repo root (review 44db8c0c, P2 1).
+    const { send, claude } = makeService(makeSession({ backend: 'claude-code' }), 'lumen', {
+      branch: 'main',
+      repo_root: worktree,
+    });
+    const result = await send();
+    expect(result.success).toBe(true);
+    expect(claude.run).toHaveBeenCalledTimes(1);
+    expect(launchConfig(claude as never)).not.toHaveProperty('launchPermissions');
+  });
+
   it('a Codex launch is not given one: --settings is a Claude Code flag', async () => {
     const { send, codex } = makeService(makeSession(), 'lumen', { branch: 'lumen/feat/x' });
     await send();
