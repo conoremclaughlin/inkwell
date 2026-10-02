@@ -333,8 +333,9 @@ d('reconcileInterruptedDispatches (real DB)', () => {
 
   /**
    * T6. Ending a session says the agent declared its work done, not that the
-   * turn holding the dispatch died. Only the server's own record of a dead
-   * turn (the shutdown breadcrumb, or a crash) is evidence.
+   * turn holding the dispatch died. Only what a dead turn leaves behind (the
+   * shutdown breadcrumb, or lifecycle 'failed') is evidence. A caller can also
+   * write 'failed'; the liveness veto is what protects a live turn then.
    */
   it('does not count an ended session as evidence that the turn is over', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_ended_evidence');
@@ -352,7 +353,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
     expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
   });
 
-  it('still clears after a crash the server recorded (lifecycle failed)', async () => {
+  it('still clears after a recorded crash (lifecycle failed, nothing alive)', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_crashed');
     await stamp(taskId);
     // Inserted after the stamp, so its updated_at post-dates the dispatch.
